@@ -167,14 +167,14 @@ func isDiffHeaderLine(line string) bool {
 // SanitizeMessage normalizes a model- or command-produced commit message.
 //
 // Behaviour is ported from the legacy Python `sanitize_message`:
-//   1. control chars are stripped;
-//   2. blank lines are dropped, then the first surviving line becomes the
-//      subject after bullet/period scrubbing and the SubjectCap word-
-//      boundary truncation;
-//   3. remaining lines are folded into bullets — a leading `-`/`*` opens
-//      a new bullet, anything else is appended to the running bullet;
-//   4. each bullet is re-wrapped at BodyWrap with a `- ` prefix and
-//      two-space hanging indent.
+//  1. control chars are stripped;
+//  2. blank lines are dropped, then the first surviving line becomes the
+//     subject after bullet/period scrubbing and the SubjectCap word-
+//     boundary truncation;
+//  3. remaining lines are folded into bullets — a leading `-`/`*` opens
+//     a new bullet, anything else is appended to the running bullet;
+//  4. each bullet is re-wrapped at BodyWrap with a `- ` prefix and
+//     two-space hanging indent.
 //
 // An empty input yields the safe placeholder `"Update files"` so callers
 // never have to handle "" on top of fallback logic.
