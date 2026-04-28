@@ -603,6 +603,13 @@ func gitDirEnsureSubdir(gitDir, sub string) (string, error) {
 	return dir, nil
 }
 
+// openCentralStats opens (or creates) the central stats.db at the given
+// absolute path. Wraps central.OpenAt so the daemon package owns the
+// "open + log + skip" policy without re-implementing the bootstrap dance.
+func openCentralStats(ctx context.Context, dbPath string) (*central.StatsDB, error) {
+	return central.OpenAt(ctx, dbPath)
+}
+
 // (un)used helpers retained for future phases — keep the symbol exported so
 // the test build doesn't drop them on compile.
 var _ = gitDirEnsureSubdir
