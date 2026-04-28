@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
