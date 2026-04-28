@@ -92,9 +92,11 @@ func TestReplay_Lifecycle(t *testing.T) {
 	}
 }
 
-// TestReplay_Conflict: when the live index diverges from the event's
-// before-state, replay must mark publish_state=conflict and leave the event
-// pending.
+// TestReplay_Conflict: when the scratch index diverges from the event's
+// before-state, replay must terminally settle the event in
+// state.EventStateBlockedConflict and upsert publish_state.status to match.
+// The row must drop out of PendingEvents so a stuck blocker no longer
+// re-runs on every poll tick.
 func TestReplay_Conflict(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -135,19 +137,24 @@ func TestReplay_Conflict(t *testing.T) {
 		t.Fatalf("Published=%d want 0", sum.Published)
 	}
 
-	// Event must remain pending; publish_state.status must be conflict.
+	// Event must NOT remain pending — terminal blocker drops out of FIFO.
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
 		t.Fatalf("PendingEvents: %v", err)
 	}
-	var stillPending bool
 	for _, p := range pending {
 		if p.Seq == seq {
-			stillPending = true
+			t.Fatalf("blocked event seq=%d should NOT be pending; pending=%+v", seq, pending)
 		}
 	}
-	if !stillPending {
-		t.Fatalf("conflicted event seq=%d should still be pending", seq)
+
+	// And it must show up under blocked_conflict.
+	blocked, err := state.CountEventsByState(ctx, f.db, state.EventStateBlockedConflict)
+	if err != nil {
+		t.Fatalf("CountEventsByState: %v", err)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked_conflict count = %d, want 1", blocked)
 	}
 
 	pub, ok, err := state.LoadPublishState(ctx, f.db)
@@ -157,8 +164,11 @@ func TestReplay_Conflict(t *testing.T) {
 	if !ok {
 		t.Fatalf("publish_state row not written")
 	}
-	if pub.Status != "conflict" {
-		t.Fatalf("publish_state.status=%q want conflict", pub.Status)
+	if pub.Status != state.EventStateBlockedConflict {
+		t.Fatalf("publish_state.status=%q want blocked_conflict", pub.Status)
+	}
+	if !pub.EventSeq.Valid || pub.EventSeq.Int64 != seq {
+		t.Fatalf("publish_state.event_seq=%v want %d", pub.EventSeq, seq)
 	}
 }
 
