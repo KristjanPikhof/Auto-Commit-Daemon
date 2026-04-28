@@ -197,7 +197,7 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 	repo, dbPath, d := makeRepoStateDB(t)
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 12345, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
