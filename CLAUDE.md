@@ -80,9 +80,21 @@ make lint           # go vet + gofmt -l (must be empty)
 make release-snapshot   # goreleaser local check
 ./bin/acd version
 ./bin/acd           # no args → help + "acd: no command provided", exit 1
+
+# Integration tests (build-tagged)
+go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 ```
 
-Phase 0 stubs return `errNotImplemented` from `internal/cli/stubs.go` — wire each subcommand in its lane and remove the stubRun reference.
+`internal/cli/stubs.go` only holds the unimplemented commands (post-Phase 6 there are essentially none — `init`, `start`, `stop`, `wake`, `touch`, `daemon run`, `list`, `status`, `stats`, `gc`, `doctor`, `version` are all wired).
+
+## Install paths (dev + prod)
+
+| Path | When to use |
+|------|-------------|
+| `make build && install -m 0755 ./bin/acd ~/.local/bin/acd` | Local iteration. Templates baked at build time, so any `templates/*` edit needs a rebuild before `acd init <harness>` reflects it. |
+| `go install ./cmd/acd` | Quickest dev install. Version string will be `dev (unknown)` — no ldflags injection. |
+| `GOPROXY=direct go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@<branch-or-sha>` | Test a branch from another machine. `direct` bypasses `proxy.golang.org` (which caches stale pseudo-versions for non-semver tags). |
+| `curl -fsSL …/scripts/install.sh \| sh` | Production install from the latest non-prerelease GitHub release. Requires `acd_<VERSION_NUM>_<os>_<arch>.tar.gz` + `checksums.txt` to exist. |
 
 ## Conventions
 
