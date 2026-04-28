@@ -450,6 +450,69 @@ func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, re
 		fmt.Sprintf("seq=%d: %s", ev.Seq, reason))
 }
 
+// checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty
+// human-readable reason when the queued event must not be replayed against
+// the current branch generation, or ("", nil) when the event is safe to
+// publish.
+//
+// Two failure modes are distinguished in the returned reason so operators
+// can tell why the queue stalled:
+//
+//  1. Generation mismatch: ev.BranchGeneration != cctx.BranchGeneration.
+//     The branch token transitioned through a divergence (rebase, reset,
+//     branch switch) since the event was captured. Replaying it would
+//     resurrect work that the operator already rewrote.
+//  2. Ancestry mismatch: ev.BaseHead is not an ancestor of the current
+//     replay parent. Even if generations match (e.g. a daemon restart
+//     missed the bump), the captured baseline is no longer reachable and
+//     the resulting commit would chain off a stale parent.
+//
+// A branch_ref mismatch is also flagged — replaying an event captured for
+// branch X onto branch Y would silently land it on the wrong ref.
+//
+// repoRoot is required for the merge-base ancestry probe. parent is the
+// current replay HEAD (== cctx.BaseHead at the start of a pass, advancing
+// per published commit). When parent or ev.BaseHead is empty we skip the
+// ancestry probe — orphan repos and the very-first commit have no history
+// to compare against.
+func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, cctx CaptureContext) (string, error) {
+	if cctx.BranchRef != "" && ev.BranchRef != "" && ev.BranchRef != cctx.BranchRef {
+		return fmt.Sprintf(
+			"branch ref mismatch: event captured on %s but daemon is on %s",
+			ev.BranchRef, cctx.BranchRef), nil
+	}
+	if ev.BranchGeneration != 0 && ev.BranchGeneration != cctx.BranchGeneration {
+		return fmt.Sprintf(
+			"branch generation mismatch: event captured at generation %d but daemon is at %d (branch was reset/rebased/switched since capture)",
+			ev.BranchGeneration, cctx.BranchGeneration), nil
+	}
+	// Ancestry probe — even when generations match (e.g. daemon restart
+	// missed the bump) we must refuse to chain off a parent that is no
+	// longer reachable from HEAD. Both sides must be present for a
+	// meaningful merge-base call.
+	if parent == "" || ev.BaseHead == "" {
+		return "", nil
+	}
+	if ev.BaseHead == parent {
+		return "", nil
+	}
+	ok, err := git.MergeBaseIsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if err != nil {
+		// merge-base failed — most often because ev.BaseHead is no
+		// longer in the object database (gc'd reset). Treat as a
+		// terminal block so the operator notices.
+		return fmt.Sprintf(
+			"ancestry probe failed for base %s: %v (branch likely rewritten since capture)",
+			ev.BaseHead, err), nil
+	}
+	if !ok {
+		return fmt.Sprintf(
+			"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
+			ev.BaseHead, parent), nil
+	}
+	return "", nil
+}
+
 // errReplay is sentinel for fatal replay errors that should halt the pass.
 // Non-fatal per-event problems are recorded against the event row and the
 // pass continues.
