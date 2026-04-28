@@ -245,6 +245,9 @@ func TestFsnotifyWatcher_WatchBudgetExceeded(t *testing.T) {
 		RepoPath:   dir,
 		MaxWatches: 2,
 	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	d := w.Diagnostics()
 	if d.Mode != "poll" {
 		t.Fatalf("mode=%q want poll", d.Mode)
