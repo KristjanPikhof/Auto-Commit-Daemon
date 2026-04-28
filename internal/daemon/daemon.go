@@ -517,21 +517,60 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 
-		// 4d. Branch-generation token check.
+		// 4d. Branch-generation token check. The token alone cannot
+		// distinguish an ACD-driven fast-forward (the daemon just landed
+		// a commit and HEAD advanced) from an external rewrite (operator
+		// ran `git reset` / rebased / switched branches). We re-resolve
+		// HEAD's ancestry against the previously observed HEAD: if the
+		// new HEAD descends from the old, it is a fast-forward and the
+		// generation counter stays put — queued events with the prior
+		// BaseHead are still safe because their parent is still in
+		// HEAD's history. A divergence (rebase / reset / orphan switch)
+		// bumps the generation; the bump is persisted so a daemon
+		// restart picks up the same value, and the next replay pass
+		// terminally blocks any queued events captured under the prior
+		// generation (their BaseHead is no longer reachable).
 		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
 			logger.Warn("branch token resolve failed", "err", terr.Error())
 		} else if !SameGeneration(currentToken, newToken) {
-			logger.Info("branch generation bumped",
-				"old", currentToken, "new", newToken)
+			transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
+			if cErr != nil {
+				logger.Warn("classify branch transition; treating as diverged",
+					"err", cErr.Error())
+				transition = TokenTransitionDiverged
+			}
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
-			_ = state.MetaSet(ctx, opts.DB, "branch_token_changed_at", ts)
-			_ = state.MetaSet(ctx, opts.DB, "branch_token", newToken)
-			currentToken = newToken
-			// Refresh HEAD for capture/replay.
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, newToken)
+			// Refresh HEAD for capture/replay regardless of transition kind.
 			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
 			cctx.BranchRef = branchRef
 			cctx.BaseHead = headOID
+			currentToken = newToken
+			if transition == TokenTransitionDiverged {
+				cctx.BranchGeneration++
+				logger.Info("branch generation bumped",
+					"old", currentToken, "new", newToken,
+					"generation", cctx.BranchGeneration,
+					"transition", transition.String())
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist bumped branch generation",
+						"err", err.Error())
+				}
+			} else {
+				// Fast-forward: persist the new HEAD so the next
+				// transition compares against the latest baseline,
+				// but keep the generation counter put.
+				logger.Debug("branch fast-forwarded",
+					"old", currentToken, "new", newToken,
+					"generation", cctx.BranchGeneration)
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist branch head", "err", err.Error())
+				}
+			}
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
