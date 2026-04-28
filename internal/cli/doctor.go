@@ -124,7 +124,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		ACDVersion:  version.String(),
 		GoVersion:   runtime.Version(),
 		GoOS:        runtime.GOOS,
-		GoArch:     runtime.GOARCH,
+		GoArch:      runtime.GOARCH,
 	}
 
 	if path, err := exec.LookPath("git"); err == nil {
@@ -445,8 +445,8 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		}
 		// fsnotify-stats.json
 		fsstats := map[string]any{
-			"mode":            rr.FsnotifyMode,
-			"watch_count":     rr.FsnotifyWatches,
+			"mode":           rr.FsnotifyMode,
+			"watch_count":    rr.FsnotifyWatches,
 			"dropped_events": rr.FsnotifyDropped,
 		}
 		fb, _ := json.MarshalIndent(fsstats, "", "  ")

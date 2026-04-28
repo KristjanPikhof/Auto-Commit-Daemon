@@ -21,16 +21,16 @@ import (
 // stopRepoResult is the per-repo result emitted by `acd stop`. Used both
 // for single-repo invocations and as the slice element for `--all`.
 type stopRepoResult struct {
-	Repo            string `json:"repo"`
-	SessionID       string `json:"session_id,omitempty"`
-	Stopped         bool   `json:"stopped"`
-	Deferred        bool   `json:"deferred,omitempty"`
-	Force           bool   `json:"force,omitempty"`
-	Escalated       bool   `json:"escalated,omitempty"`
-	Peers           int    `json:"peers,omitempty"`
-	Reason          string `json:"reason,omitempty"`
-	DaemonPID       int    `json:"daemon_pid,omitempty"`
-	UnknownSession  bool   `json:"unknown_session,omitempty"`
+	Repo           string `json:"repo"`
+	SessionID      string `json:"session_id,omitempty"`
+	Stopped        bool   `json:"stopped"`
+	Deferred       bool   `json:"deferred,omitempty"`
+	Force          bool   `json:"force,omitempty"`
+	Escalated      bool   `json:"escalated,omitempty"`
+	Peers          int    `json:"peers,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	DaemonPID      int    `json:"daemon_pid,omitempty"`
+	UnknownSession bool   `json:"unknown_session,omitempty"`
 }
 
 // stopAllResult is the JSON payload for `acd stop --all`.
