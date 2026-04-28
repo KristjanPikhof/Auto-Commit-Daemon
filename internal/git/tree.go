@@ -141,16 +141,38 @@ type IndexEntry struct {
 	Path  string
 }
 
-// LsFilesStaged returns the staged index entries for the given repo,
-// optionally scoped to the supplied paths. NUL-delimited output so paths
-// with spaces or newlines are handled correctly.
+// LsFilesStaged returns the staged index entries for the given repo's
+// default index, optionally scoped to the supplied paths. NUL-delimited
+// output so paths with spaces or newlines are handled correctly.
+//
+// For inspecting an isolated scratch index (e.g. the per-replay index seeded
+// from BaseHead), use LsFilesIndex instead.
 func LsFilesStaged(ctx context.Context, repoDir string, paths ...string) ([]IndexEntry, error) {
+	return LsFilesIndex(ctx, repoDir, "", paths...)
+}
+
+// LsFilesIndex returns the staged index entries for the given repo,
+// optionally redirected to indexFile via GIT_INDEX_FILE. When indexFile is
+// empty the call falls through to the repo's default index (the legacy
+// LsFilesStaged behavior). Paths are NUL-delimited so spaces and newlines
+// in filenames round-trip correctly.
+//
+// Mirrors snapshot-replay._live_index_entries — the replay loop seeds a
+// scratch index from BaseHead via read-tree, advances it with each event's
+// ops, and reads back through this helper to verify the next op's
+// before-state. The repo's main index is never inspected for normal queued
+// history.
+func LsFilesIndex(ctx context.Context, repoDir, indexFile string, paths ...string) ([]IndexEntry, error) {
 	args := []string{"ls-files", "-s", "-z"}
 	if len(paths) > 0 {
 		args = append(args, "--")
 		args = append(args, paths...)
 	}
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, args...)
+	extra := map[string]string{}
+	if indexFile != "" {
+		extra["GIT_INDEX_FILE"] = indexFile
+	}
+	out, err := Run(ctx, RunOpts{Dir: repoDir, ExtraEnv: extra}, args...)
 	if err != nil {
 		return nil, err
 	}
