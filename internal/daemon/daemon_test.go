@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -956,6 +957,26 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 	if got == "" {
 		t.Fatalf("branch.generation did not bump after sibling reset (still %q); seedHead=%s sibling=%s",
 			"1", seedHead, sibling)
+	}
+
+	// After the divergence the daemon must reseed shadow_paths for the
+	// new (branch_ref, branch_generation) key. Without the reseed, the
+	// next capture pass sees an empty shadow and emits phantom `create`
+	// events for every tracked file in HEAD's tree.
+	branchRef, _ := resolveBranch(ctx, f.dir, slog.Default())
+	deadline = time.Now().Add(3 * time.Second)
+	var shadowRows int
+	for time.Now().Before(deadline) {
+		row := f.db.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+			branchRef, got)
+		if err := row.Scan(&shadowRows); err == nil && shadowRows > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if shadowRows == 0 {
+		t.Fatalf("shadow_paths not reseeded for (%s, gen=%s) after divergence", branchRef, got)
 	}
 
 	cancel()
