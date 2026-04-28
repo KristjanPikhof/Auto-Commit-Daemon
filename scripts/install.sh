@@ -34,20 +34,22 @@ mkdir -p "$INSTALL_DIR"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+ARCHIVE="acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
+
 echo "Downloading $URL"
-curl -fsSL "$URL" -o "$TMP/acd.tar.gz"
+curl -fsSL "$URL" -o "$TMP/$ARCHIVE"
 curl -fsSL "$SUMS_URL" -o "$TMP/checksums.txt"
 
 # Verify checksum (works on both macOS and Linux)
 if command -v sha256sum >/dev/null 2>&1; then
-  ( cd "$TMP" && grep "acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz" checksums.txt | sha256sum -c - )
+  ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | sha256sum -c - )
 elif command -v shasum >/dev/null 2>&1; then
-  ( cd "$TMP" && grep "acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c - )
+  ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | shasum -a 256 -c - )
 else
   echo "warning: no sha256 verifier found; skipping checksum check" >&2
 fi
 
-tar -xzf "$TMP/acd.tar.gz" -C "$TMP"
+tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 install -m 0755 "$TMP/acd" "$INSTALL_DIR/acd"
 
 echo
