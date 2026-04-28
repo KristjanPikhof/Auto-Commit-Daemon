@@ -125,6 +125,7 @@ func Save(roots paths.Roots, reg *Registry) error {
 	if reg.Repos == nil {
 		reg.Repos = []RepoRecord{}
 	}
+	reg.Normalize()
 	return atomicWriteJSON(roots.RegistryPath(), reg)
 }
 
