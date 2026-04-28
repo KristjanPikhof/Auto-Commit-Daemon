@@ -451,11 +451,14 @@ func runCodexE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
 
-	stopHook := pickHookByEvent(t, hooks, "Stop")
-	stopRes := runBash(t, ctx, env, stdin,
-		"cd "+shellQuote(repo)+" && "+stopHook.Command)
+	// Codex template intentionally omits the Stop hook (race vs PostToolUse).
+	// Production cleanup relies on watch_pid death + refcount sweep; in the
+	// test we drive shutdown explicitly with `acd stop --force`.
+	stopRes := runBash(t, ctx, env, "",
+		"cd "+shellQuote(repo)+" && acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
 	if stopRes.ExitCode != 0 {
-		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
+		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitFor(t, "codex daemon mode==stopped", 10*time.Second, func() bool {
