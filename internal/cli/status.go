@@ -212,11 +212,13 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	// (terminal replay blockers — distinct from pending so the operator
 	// can spot a stuck row that the daemon will not retry on its own).
 	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = 'pending'`).Scan(&report.PendingEvents); err != nil {
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return report, fmt.Errorf("pending events: %w", err)
 	}
 	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = 'blocked_conflict'`).Scan(&report.BlockedConflicts); err != nil {
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateBlockedConflict).Scan(&report.BlockedConflicts); err != nil {
 		return report, fmt.Errorf("blocked conflicts: %w", err)
 	}
 
