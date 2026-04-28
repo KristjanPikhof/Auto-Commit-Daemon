@@ -191,6 +191,31 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 	return out, nil
 }
 
+// PrunePublishedEventsBefore deletes capture_events rows whose state is
+// 'published' (terminal success) AND whose captured_ts is strictly older
+// than cutoff. Returns the number of rows removed.
+//
+// 'failed' rows are intentionally retained so operators can inspect why a
+// replay failed. 'pending' rows are retained so an unrecoverable backlog
+// is not silently swept under the rug.
+//
+// CASCADE on the capture_ops foreign key drops the matching ops rows in
+// the same transaction.
+func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
+	res, err := d.conn.ExecContext(ctx,
+		`DELETE FROM capture_events WHERE state = 'published' AND captured_ts < ?`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state: prune published events: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: prune events rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // LatestEventSeq returns the highest seq value present, or 0 if the table is
 // empty. Useful as a smoke-test for monotonic ordering and for the daily
 // rollup window query.
