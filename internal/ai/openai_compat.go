@@ -113,9 +113,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 	if model == "" {
 		model = DefaultOpenAIModel
 	}
-	cap := p.DiffCap
-	if cap == 0 {
-		cap = DiffCap
+	diffCap := p.DiffCap
+	if diffCap == 0 {
+		diffCap = DiffCap
 	}
 	httpClient := p.HTTP
 	if httpClient == nil {
