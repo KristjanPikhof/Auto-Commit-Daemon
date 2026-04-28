@@ -377,17 +377,22 @@ func startPlugin(binary string, extraEnv []string, logger *slog.Logger) (*plugin
 
 // run is the owner goroutine. One request in flight at a time; reads
 // exactly one stdout line per request. Any I/O error tears down the
-// session — the work channel drains by closing on exit so callers blocked
-// in exchange() unblock with ErrClosedPlugin.
+// session by closing s.done, which unblocks any goroutines waiting in
+// exchange().
 func (s *pluginSession) run() {
 	defer close(s.done)
 	defer s.markDead()
 
 	reader := bufio.NewReader(s.stdout)
-	encBuf := make([]byte, 0, 1024)
-	_ = encBuf
 
-	for req := range s.work {
+	for {
+		var req pluginRequest
+		select {
+		case req = <-s.work:
+		case <-s.quit:
+			return
+		}
+
 		// Write request line.
 		toWrite := append(req.bytes, '\n')
 		if _, err := s.stdin.Write(toWrite); err != nil {
