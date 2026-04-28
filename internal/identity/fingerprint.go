@@ -133,4 +133,3 @@ func Match(a, b Fingerprint) bool {
 	}
 	return a.StartTime == b.StartTime && a.ArgvHash == b.ArgvHash
 }
-
