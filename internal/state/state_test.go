@@ -199,28 +199,20 @@ func TestClientsRefcount(t *testing.T) {
 		t.Fatalf("expected s1 last after touch, got %s", clients[1].SessionID)
 	}
 
+	// s1 last_seen=1234.5; s2 was registered at nowSeconds() (real wall time,
+	// > 1.7e9). Cutoff=9999 expires s1 only.
 	expired, err := ExpireClientsBefore(ctx, d, 9999.0)
 	if err != nil {
 		t.Fatalf("expire: %v", err)
 	}
-	// s1 last_seen=1234.5; s2 was registered at nowSeconds() (~real time,
-	// likely > 9999 unix-seconds-as-float since 1970). Use a cutoff strictly
-	// between them and confirm only s1 expires.
-	if expired != 0 {
-		t.Fatalf("expire count = %d, want 0 (cutoff above s1 only)", expired)
-	}
-
-	expired, err = ExpireClientsBefore(ctx, d, 2000.0)
-	if err != nil {
-		t.Fatalf("expire 2: %v", err)
-	}
 	if expired != 1 {
-		t.Fatalf("expire count2 = %d, want 1 (s1 only)", expired)
+		t.Fatalf("expire count = %d, want 1 (s1 only)", expired)
 	}
 
+	// s1 already gone; deregister returns gone=false.
 	gone, err := DeregisterClient(ctx, d, "s1")
 	if err != nil {
-		t.Fatalf("dereg: %v", err)
+		t.Fatalf("dereg s1: %v", err)
 	}
 	if gone {
 		t.Fatalf("expected s1 already gone after expire")
