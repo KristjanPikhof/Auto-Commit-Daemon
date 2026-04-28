@@ -604,6 +604,155 @@ func TestRun_RollupHookAdvancesLastDay(t *testing.T) {
 	}
 }
 
+// stubProvider implements ai.Provider with a fixed subject so the run-loop
+// test can prove the configured provider — not the deterministic fallback —
+// is what ends up on HEAD.
+type stubProvider struct {
+	subject string
+	calls   atomic.Int64
+}
+
+func (s *stubProvider) Name() string { return "stub" }
+
+func (s *stubProvider) Generate(_ context.Context, _ ai.CommitContext) (ai.Result, error) {
+	s.calls.Add(1)
+	return ai.Result{Subject: s.subject, Source: s.Name()}, nil
+}
+
+// closerCounter is an io.Closer whose Close call count is observable;
+// the test asserts Run actually invokes Close on shutdown.
+type closerCounter struct {
+	closed atomic.Int64
+}
+
+func (c *closerCounter) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+// TestRun_AIProvider_FallbackToDeterministic: when ACD_AI_PROVIDER=
+// openai-compat is set without an API key, the daemon must warn-and-degrade
+// to the deterministic generator so commits keep landing.
+func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
+	t.Setenv(ai.EnvProvider, "openai-compat")
+	t.Setenv(ai.EnvAPIKey, "")
+	t.Setenv(ai.EnvBaseURL, "")
+	t.Setenv(ai.EnvModel, "")
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "fallback.txt"), []byte("fb\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	out, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
+		"log", "-1", "--pretty=%s", newHead)
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	subj := strings.TrimSpace(string(out))
+	if subj != "Add fallback.txt" {
+		t.Fatalf("subject=%q want %q (deterministic format)", subj, "Add fallback.txt")
+	}
+
+	cancel()
+	wg.Wait()
+}
+
+// TestRun_AIProvider_InjectedOverride: a non-nil Options.MessageProvider
+// short-circuits env-driven selection and lands its subject on HEAD; the
+// MessageProviderCloser is invoked exactly once on shutdown.
+func TestRun_AIProvider_InjectedOverride(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	stub := &stubProvider{subject: "feat: stub-injected subject"}
+	closer := &closerCounter{}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:              f.dir,
+			GitDir:                f.gitDir,
+			DB:                    f.db,
+			Scheduler:             fastScheduler(),
+			BootGrace:             30 * time.Second,
+			WakeCh:                wakeCh,
+			ShutdownCh:            shutdownCh,
+			SkipSignals:           true,
+			MessageProvider:       stub,
+			MessageProviderCloser: closer,
+		})
+	}()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "stub.txt"), []byte("stub\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	out, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
+		"log", "-1", "--pretty=%s", newHead)
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	subj := strings.TrimSpace(string(out))
+	if subj != stub.subject {
+		t.Fatalf("subject=%q want %q", subj, stub.subject)
+	}
+	if stub.calls.Load() == 0 {
+		t.Fatalf("stub provider Generate never called")
+	}
+
+	cancel()
+	wg.Wait()
+
+	if got := closer.closed.Load(); got != 1 {
+		t.Fatalf("MessageProviderCloser.Close calls=%d want 1", got)
+	}
+}
+
 // TestBranchGenerationToken_RevAndMissing: token shape covers both ref-present
 // and orphan-HEAD cases.
 func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
