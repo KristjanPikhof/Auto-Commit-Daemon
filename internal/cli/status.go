@@ -302,6 +302,9 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	}
 
 	fmt.Fprintf(out, "Pending events: %d\n", r.PendingEvents)
+	if r.BlockedConflicts > 0 {
+		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
+	}
 
 	if r.LastCommitOID != "" {
 		oid := r.LastCommitOID
