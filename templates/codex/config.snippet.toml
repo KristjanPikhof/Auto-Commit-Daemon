@@ -1,4 +1,10 @@
 # acd-managed: true
+#
+# acd registers a daemon at SessionStart with watch_pid set to Codex's own
+# PID. When Codex exits, the daemon's refcount sweep detects the dead pid,
+# drops the client row, and self-terminates after BootGrace + 2 empty sweeps
+# (~30-60s). No Stop hook is wired — racing Stop with PostToolUse causes the
+# daemon to shut down before the last capture+replay drains.
 
 [features]
 codex_hooks = true
@@ -17,8 +23,3 @@ command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\"
 [[hooks.PostToolUse.hooks]]
 type = "command"
 command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
-
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd stop --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
