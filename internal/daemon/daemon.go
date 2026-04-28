@@ -434,10 +434,18 @@ func Run(ctx context.Context, opts Options) error {
 
 		// 4c. Drain any pending wake (the wake channel is buffered cap=1
 		// so we just non-blocking receive once; a real wake is observed
-		// either here or in the sleep select below).
+		// either here or in the sleep select below). The fsnotify wake
+		// channel is drained in the same way so a queued event from
+		// before the previous tick doesn't double-fire.
 		select {
 		case <-wakeCh:
 		default:
+		}
+		if fsWakeReader != nil {
+			select {
+			case <-fsWakeReader:
+			default:
+			}
 		}
 
 		// 4d. Branch-generation token check.
