@@ -6,6 +6,29 @@ import (
 	"fmt"
 )
 
+// Capture event lifecycle state values stored in capture_events.state.
+//
+// The replay queue is a strict FIFO. A non-pending row is terminal — replay
+// must NOT re-queue it. The set is intentionally small:
+//
+//   - EventStatePending        : awaiting replay (the only state PendingEvents returns).
+//   - EventStatePublished      : commit-tree succeeded and the branch ref was advanced.
+//   - EventStateFailed         : malformed event (validation, missing ops, commit-build
+//     error). Operator inspection only — never retried automatically.
+//   - EventStateBlockedConflict: replay refused to commit because the scratch index
+//     disagreed with the event's before-state (e.g. live worktree raced ahead of
+//     the queue, an `update-ref` CAS lost). Distinct from "failed" so operators
+//     can spot index/branch divergence vs malformed input. Like "failed" it is
+//     terminal — a stuck event would otherwise re-run on every poll tick and
+//     prevent later events from making progress (they would replay on top of a
+//     broken predecessor).
+const (
+	EventStatePending         = "pending"
+	EventStatePublished       = "published"
+	EventStateFailed          = "failed"
+	EventStateBlockedConflict = "blocked_conflict"
+)
+
 // CaptureEvent is one row of capture_events (§6.1). seq is autoincrement and
 // monotonic per repo — readers can rely on seq ordering as the canonical
 // "happened before" relation for replay.
