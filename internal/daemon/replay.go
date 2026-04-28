@@ -131,6 +131,24 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
+
+		// Branch-generation / ancestry guard. An event whose generation
+		// no longer matches the active context was captured under a
+		// branch state that has since been rewritten (rebase, reset,
+		// branch switch). An event whose BaseHead is not reachable from
+		// the current replay parent was captured against a HEAD that no
+		// longer descends to the live worktree. Either case must NOT
+		// silently replay — the resulting commit would chain off a stale
+		// parent and diverge from the operator's intent. Block
+		// terminally so operators can spot the mismatch and reconcile.
+		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
+			return sum, err
+		} else if reason != "" {
+			recordConflict(ctx, db, ev, reason, cctx)
+			sum.Conflicts++
+			return sum, nil
+		}
+
 		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
 		if err != nil {
 			return sum, fmt.Errorf("daemon: load ops seq=%d: %w", ev.Seq, err)
