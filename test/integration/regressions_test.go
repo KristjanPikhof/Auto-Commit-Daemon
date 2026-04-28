@@ -605,6 +605,3 @@ func nowFloatSeconds() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
 
-// _ keeps the syscall import quiet under conditional cleanup paths where
-// SIGTERM may be referenced in future test extensions.
-var _ = syscall.SIGTERM
