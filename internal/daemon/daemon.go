@@ -36,6 +36,10 @@ const (
 	// DefaultPruneInterval matches the legacy PRUNE_INTERVAL_SECONDS —
 	// run the capture_events pruner roughly once per minute.
 	DefaultPruneInterval = 60 * time.Second
+	// DefaultRollupInterval is the minimum gap between RunDailyRollup
+	// attempts. The aggregator is also forced once per UTC-day boundary
+	// crossing regardless of this floor.
+	DefaultRollupInterval = 5 * time.Minute
 )
 
 // EnvClientTTLSeconds is the environment knob for ACD_CLIENT_TTL_SECONDS
