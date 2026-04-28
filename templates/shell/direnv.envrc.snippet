@@ -1,0 +1,12 @@
+# acd-managed: true
+# Drop into your repo's .envrc (requires direnv).
+if command -v acd >/dev/null 2>&1; then
+    SID=$(uuidgen)
+    export ACD_SESSION_ID="$SID"
+    acd start --session-id "$SID" --harness shell --watch-pid "$$" --repo "$PWD"
+    # Stop hook fires when you `cd` away from the repo (direnv handles unload).
+    function _acd_stop_on_unload() {
+        acd stop --session-id "$ACD_SESSION_ID" --repo "$PWD" 2>/dev/null || true
+    }
+    trap _acd_stop_on_unload EXIT
+fi
