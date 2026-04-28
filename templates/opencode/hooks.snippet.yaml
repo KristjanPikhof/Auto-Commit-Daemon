@@ -1,0 +1,43 @@
+# acd-managed: true
+hooks:
+  - id: acd-start
+    event: session.created
+    actions:
+      - bash: |
+          acd start \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --harness opencode \
+            --watch-pid "$PPID" \
+            --repo "$OPENCODE_PROJECT_DIR"
+
+  - id: acd-wake-tool-before
+    event: tool.before.*
+    actions:
+      - bash: |
+          acd wake \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --repo "$OPENCODE_PROJECT_DIR"
+
+  - id: acd-wake-tool-after
+    event: tool.after.*
+    actions:
+      - bash: |
+          acd wake \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --repo "$OPENCODE_PROJECT_DIR"
+
+  - id: acd-touch-idle
+    event: session.idle
+    actions:
+      - bash: |
+          acd touch \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --repo "$OPENCODE_PROJECT_DIR"
+
+  - id: acd-stop
+    event: session.deleted
+    actions:
+      - bash: |
+          acd stop \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --repo "$OPENCODE_PROJECT_DIR"
