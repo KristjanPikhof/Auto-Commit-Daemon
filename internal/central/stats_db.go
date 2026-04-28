@@ -173,9 +173,9 @@ func (s *StatsDB) UserVersion(ctx context.Context) (int, error) {
 // long-term backward-compat anchor: this struct grows by adding fields
 // matching new ALTER TABLE ADD COLUMN migrations — never reorder.
 type DailyRollup struct {
-	Day                 string  // YYYY-MM-DD
-	RepoHash            string  // stable cross-repo identity
-	RepoPath            string  // last-known display path
+	Day                 string // YYYY-MM-DD
+	RepoHash            string // stable cross-repo identity
+	RepoPath            string // last-known display path
 	EventsTotal         int64
 	CommitsTotal        int64
 	FilesChanged        int64
