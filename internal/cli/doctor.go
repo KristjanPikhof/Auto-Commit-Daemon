@@ -42,10 +42,11 @@ type doctorRepoReport struct {
 	Harnesses        []string `json:"harnesses,omitempty"`
 	LogPath          string   `json:"log_path"`
 	LogLines         []string `json:"log_tail,omitempty"`
-	FsnotifyMode     string   `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches  int      `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped  int      `json:"fsnotify_dropped,omitempty"`
-	LastCaptureError string   `json:"last_capture_error,omitempty"`
+	FsnotifyMode           string   `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches        int      `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped        int      `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason string   `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError       string   `json:"last_capture_error,omitempty"`
 	Notes            []string `json:"notes,omitempty"`
 }
 
