@@ -400,12 +400,13 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 }
 
 // markFailed flags an event as terminally failed and records the reason.
-// Best-effort: persistence failures here do not propagate, the next pass
-// will see the event still pending and re-attempt (with the same outcome).
+// "failed" is terminal — PendingEvents excludes the row, so the next pass
+// will not re-attempt it. Best-effort: persistence failures here do not
+// propagate.
 func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string) {
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	_ = state.MarkEventPublished(ctx, db,
-		ev.Seq, "failed",
+		ev.Seq, state.EventStateFailed,
 		sql.NullString{}, sql.NullString{String: reason, Valid: true},
 		ev.Message, nowSec)
 }
