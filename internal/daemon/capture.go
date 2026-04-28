@@ -157,9 +157,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			Operation:        op.Op,
 			Path:             op.Path,
 			Fidelity:         op.Fidelity,
-		}
-		if op.OldPath != "" {
-			ev.OldPath = nullStr(op.OldPath)
+			OldPath:          nullString(op.OldPath),
 		}
 		stateOps := []state.CaptureOp{toStateOp(op)}
 		if _, err := state.AppendCaptureEvent(ctx, db, ev, stateOps); err != nil {
