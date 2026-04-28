@@ -201,10 +201,8 @@ func TestDoctor_Bundle_TwoRunsDistinctZips(t *testing.T) {
 	if err := runDoctor(ctx, &out1, true, outDir, true); err != nil {
 		t.Fatalf("first bundle: %v", err)
 	}
-	// Sleep a second so the timestamp differs.
-	if err := waitOneSecond(); err != nil {
-		t.Fatalf("wait: %v", err)
-	}
+	// Sleep ~1.1s so the second-resolution timestamp differs.
+	time.Sleep(1100 * time.Millisecond)
 	if err := runDoctor(ctx, &out2, true, outDir, true); err != nil {
 		t.Fatalf("second bundle: %v", err)
 	}
