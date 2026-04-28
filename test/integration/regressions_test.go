@@ -603,4 +603,3 @@ func sqliteScalar(t *testing.T, dbPath, query string) string {
 func nowFloatSeconds() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
-
