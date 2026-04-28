@@ -19,7 +19,6 @@ import (
 	"context"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // DeterministicMessage produces a commit subject + optional body from the
