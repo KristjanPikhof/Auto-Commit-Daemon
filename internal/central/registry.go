@@ -290,7 +290,3 @@ func flockExclusive(fd int) error {
 func flockUnlock(fd int) error {
 	return syscall.Flock(fd, syscall.LOCK_UN)
 }
-
-// Compile-time assertion that io is referenced even if Save grows away from
-// it during refactors — keeps imports stable for now.
-var _ = io.Discard
