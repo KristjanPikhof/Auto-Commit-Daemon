@@ -134,26 +134,3 @@ func Match(a, b Fingerprint) bool {
 	return a.StartTime == b.StartTime && a.ArgvHash == b.ArgvHash
 }
 
-// itoa is a tiny strconv.Itoa shim to avoid pulling strconv into a file
-// that uses no other strconv functions; it keeps the import surface flat.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	negative := n < 0
-	if negative {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if negative {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
