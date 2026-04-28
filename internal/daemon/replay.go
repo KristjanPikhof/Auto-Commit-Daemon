@@ -242,16 +242,21 @@ func validateOps(ops []state.CaptureOp) string {
 	return ""
 }
 
-// detectConflict checks the live staged index for every path touched by ops
-// and flags a conflict when the live state disagrees with the op's
-// before-state. Mirrors the legacy _verify_op against
-// snapshot_state_for_index. Returns ("", nil) on success.
-func detectConflict(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+// detectConflict checks the scratch replay index for every path touched by
+// ops and flags a conflict when the indexed state disagrees with the op's
+// before-state. Mirrors the legacy _verify_op against the in-memory state
+// dict seeded from snapshot_state_for_index over the GIT_INDEX_FILE scratch
+// index. Returns ("", nil) on success.
+//
+// indexFile must be the per-replay scratch index (the same path passed to
+// UpdateIndexInfo + WriteTree below); empty falls back to the live repo
+// index but the run loop never relies on that — see the comment in Replay.
+func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state.CaptureOp) (string, error) {
 	paths := touchedPaths(ops)
 	if len(paths) == 0 {
 		return "", nil
 	}
-	live, err := git.LsFilesStaged(ctx, repoRoot, paths...)
+	staged, err := git.LsFilesIndex(ctx, repoRoot, indexFile, paths...)
 	if err != nil {
 		return "", fmt.Errorf("ls-files staged: %w", err)
 	}
@@ -259,7 +264,7 @@ func detectConflict(ctx context.Context, repoRoot string, ops []state.CaptureOp)
 		mode, oid string
 	}
 	idx := map[string]entry{}
-	for _, le := range live {
+	for _, le := range staged {
 		idx[le.Path] = entry{mode: le.Mode, oid: le.OID}
 	}
 	for _, op := range ops {
