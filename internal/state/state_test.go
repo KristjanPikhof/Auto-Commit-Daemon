@@ -193,10 +193,13 @@ func TestClientsRefcount(t *testing.T) {
 	if err != nil || len(clients) != 2 {
 		t.Fatalf("list: len=%d err=%v", len(clients), err)
 	}
-	// list is ordered by last_seen_ts ASC, so s2 (untouched, original ts) is
-	// before s1 (touched to 1234.5).
-	if clients[1].SessionID != "s1" {
-		t.Fatalf("expected s1 last after touch, got %s", clients[1].SessionID)
+	// last_seen_ts is REAL: s1 was touched to 1234.5, s2 was registered at
+	// real wall time (>1.7e9). ASC order puts s1 first.
+	if clients[0].SessionID != "s1" {
+		t.Fatalf("expected s1 first after touch, got %s", clients[0].SessionID)
+	}
+	if clients[1].SessionID != "s2" {
+		t.Fatalf("expected s2 second, got %s", clients[1].SessionID)
 	}
 
 	// s1 last_seen=1234.5; s2 was registered at nowSeconds() (real wall time,
