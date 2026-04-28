@@ -525,6 +525,83 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	}
 }
 
+// TestRun_RollupHookAdvancesLastDay: the daemon loop's daily rollup hook
+// (§8.10) fires once per RollupInterval, attributes a synthetic event to a
+// completed UTC day, and advances rollup.last_day. This test confirms the
+// hook is wired to Run with no central stats handle (per-repo only, which
+// matches existing fixture defaults).
+func TestRun_RollupHookAdvancesLastDay(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Seed a synthetic event on 2026-04-01.
+	yesterday := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "deadbeef",
+		Operation: "create", Path: "rollup-seed.txt", Fidelity: "full",
+		CapturedTS:  float64(yesterday.Unix()),
+		PublishedTS: sql.NullFloat64{Float64: float64(yesterday.Unix()), Valid: true},
+		State:       "published",
+		CommitOID:   sql.NullString{String: "c1", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "rollup-seed.txt", Fidelity: "full",
+		AfterMode: sql.NullString{String: "100644", Valid: true},
+		AfterOID:  sql.NullString{String: "abcd", Valid: true},
+	}}); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	// Pin "now" to 2026-04-02 12:00 UTC so yesterday is fully complete.
+	fakeNow := func() time.Time { return time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC) }
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(runCtx, Options{
+			RepoPath:       f.dir,
+			GitDir:         f.gitDir,
+			DB:             f.db,
+			Scheduler:      fastScheduler(),
+			BootGrace:      30 * time.Second,
+			RollupInterval: 1 * time.Millisecond, // fire on every iteration
+			Now:            fakeNow,
+			WakeCh:         wakeCh,
+			ShutdownCh:     shutdownCh,
+			SkipSignals:    true,
+		})
+	}()
+
+	// Poll for rollup.last_day to land.
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		v, present, err := state.MetaGet(ctx, f.db, "rollup.last_day")
+		if err == nil && present && v != "" {
+			got = v
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got != "2026-04-01" {
+		t.Fatalf("rollup.last_day=%q want 2026-04-01", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Run did not exit on cancel")
+	}
+}
+
 // TestBranchGenerationToken_RevAndMissing: token shape covers both ref-present
 // and orphan-HEAD cases.
 func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
