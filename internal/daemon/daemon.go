@@ -560,6 +560,18 @@ func Run(ctx context.Context, opts Options) error {
 					logger.Warn("persist bumped branch generation",
 						"err", err.Error())
 				}
+				// shadow_paths is keyed by (branch_ref, branch_generation).
+				// After a divergence the new key is empty; without
+				// reseeding from HEAD the next capture would classify every
+				// tracked file as a phantom `create`.
+				if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+					logger.Warn("reseed shadow after generation bump",
+						"err", err.Error())
+				} else if seeded > 0 {
+					logger.Info("shadow reseeded",
+						"rows", seeded,
+						"generation", cctx.BranchGeneration)
+				}
 			} else {
 				// Fast-forward: persist the new HEAD so the next
 				// transition compares against the latest baseline,
