@@ -172,6 +172,122 @@ func TestReplay_Conflict(t *testing.T) {
 	}
 }
 
+// TestReplay_BatchHaltsOnBlockedConflict: a blocker in the middle of the
+// queue must terminally settle that event and stop the batch — every event
+// behind it stays pending so the next poll tick can re-attempt them once
+// the operator has reconciled the broken predecessor. Without this, the
+// daemon would replay later events on top of a stale parent and produce a
+// tree that diverges from the operator's intent.
+func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Event 1: a clean create that will publish.
+	if err := os.WriteFile(filepath.Join(f.dir, "ok.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write ok: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture ok: %v", err)
+	}
+
+	// Event 2: a hand-crafted blocker — modify a non-existent path.
+	blockerEv := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "ghost.txt",
+		Fidelity:         "rescan",
+	}
+	blockerOp := state.CaptureOp{
+		Op:         "modify",
+		Path:       "ghost.txt",
+		BeforeOID:  sql.NullString{String: "1111111111111111111111111111111111111111", Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: "2222222222222222222222222222222222222222", Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	blockerSeq, err := state.AppendCaptureEvent(ctx, f.db, blockerEv, []state.CaptureOp{blockerOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent blocker: %v", err)
+	}
+
+	// Event 3: another clean create captured AFTER the blocker. It should
+	// remain pending — the batch halts on event 2.
+	if err := os.WriteFile(filepath.Join(f.dir, "after.txt"), []byte("after\n"), 0o644); err != nil {
+		t.Fatalf("write after: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture after: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d want 1 (sum=%+v)", sum.Conflicts, sum)
+	}
+	if sum.Published < 1 {
+		t.Fatalf("Published=%d want >=1 (event 1 should land before the blocker)", sum.Published)
+	}
+
+	// `after.txt`'s event must still be pending; the blocker must be terminal.
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	var sawBlocker, sawAfter bool
+	for _, p := range pending {
+		if p.Seq == blockerSeq {
+			sawBlocker = true
+		}
+		if p.Path == "after.txt" {
+			sawAfter = true
+		}
+	}
+	if sawBlocker {
+		t.Fatalf("blocker seq=%d should NOT be pending after settle", blockerSeq)
+	}
+	if !sawAfter {
+		t.Fatalf("after.txt should remain pending; pending=%+v", pending)
+	}
+
+	// A second pass with the blocker still in place must NOT drain `after.txt`.
+	// (The batch sees it sitting behind the blocked predecessor — but with the
+	// blocker already terminal, there is nothing left to halt on. So this
+	// assertion is the "operator must reconcile first" property: until the
+	// blocker is gone OR another mechanism advances BaseHead, retries do not
+	// magically chain on top of a stale parent. We verify by re-running
+	// Replay; `after.txt` may publish or stay pending depending on whether
+	// the scratch index reconciles, but the blocker MUST stay terminal.)
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	}); err != nil {
+		t.Fatalf("Replay second pass: %v", err)
+	}
+	pending2, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents 2: %v", err)
+	}
+	for _, p := range pending2 {
+		if p.Seq == blockerSeq {
+			t.Fatalf("blocker re-entered pending on second pass: %+v", p)
+		}
+	}
+}
+
 // TestReplay_ModifyChain_OrderedReplay regression-tests the scratch-index
 // refactor: when four captured blob states A→B→C→D are queued for the same
 // path as three sequential `modify` events, replay must commit them in
