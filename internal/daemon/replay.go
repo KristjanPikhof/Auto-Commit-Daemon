@@ -164,7 +164,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		} else if reason != "" {
 			recordConflict(ctx, db, ev, reason, cctx)
 			sum.Conflicts++
-			continue
+			// Halt the batch: subsequent events were captured assuming
+			// this one would land first. Running them now would replay on
+			// top of a broken predecessor.
+			return sum, nil
 		}
 
 		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
@@ -172,10 +175,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err != nil {
 			markFailed(ctx, db, ev, err.Error())
 			sum.Failed++
-			// Reset the in-memory index from `parent` so a partial apply
-			// does not poison subsequent events.
+			// Halt the batch: a commit-build failure leaves `parent`
+			// pointing at the prior commit, but later events will still
+			// chain from a broken predecessor as soon as the operator
+			// fixes the root cause. Stop here and let the next poll tick
+			// re-attempt from a fresh seed.
 			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
-			continue
+			return sum, nil
 		}
 
 		// Advance the branch ref via CAS against the prior parent.
@@ -185,11 +191,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			oldOID = ""
 		}
 		if err := git.UpdateRef(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID); err != nil {
-			// CAS failed: ref moved out from under us. Mark conflict.
+			// CAS failed: ref moved out from under us. Block terminally —
+			// every queued event downstream was captured against the
+			// stale ref and must wait for branch reconciliation.
 			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), cctx)
 			sum.Conflicts++
 			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
-			continue
+			return sum, nil
 		}
 
 		// Settle the event row + publish_state.
