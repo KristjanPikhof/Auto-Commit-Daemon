@@ -18,12 +18,12 @@ import (
 
 // statsByDay is a single day in the §7.8 by_day series.
 type statsByDay struct {
-	Day           string `json:"day"`
-	Events        int64  `json:"events"`
-	Commits       int64  `json:"commits"`
-	FilesChanged  int64  `json:"files_changed"`
-	BytesChanged  int64  `json:"bytes_changed"`
-	ErrorsTotal   int64  `json:"errors_total"`
+	Day          string `json:"day"`
+	Events       int64  `json:"events"`
+	Commits      int64  `json:"commits"`
+	FilesChanged int64  `json:"files_changed"`
+	BytesChanged int64  `json:"bytes_changed"`
+	ErrorsTotal  int64  `json:"errors_total"`
 }
 
 // statsByRepo is a single repo aggregate over the window.
