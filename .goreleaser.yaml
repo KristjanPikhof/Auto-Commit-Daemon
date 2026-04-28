@@ -1,0 +1,53 @@
+version: 2
+project_name: acd
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: acd
+    main: ./cmd/acd
+    binary: acd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -tags=netgo,osusergo
+    ldflags:
+      - -s -w
+      - -X github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version.Version={{.Version}}
+      - -X github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version.GitSHA={{.ShortCommit}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: acd
+    repository:
+      owner: KristjanPikhof
+      name: homebrew-tap
+    homepage: https://github.com/KristjanPikhof/Auto-Commit-Daemon
+    description: "Atomic commit daemon for git worktrees, multi-harness."
+    license: MIT
+    install: |
+      bin.install "acd"
+    test: |
+      assert_match "acd version", shell_output("#{bin}/acd version")
+
+release:
+  draft: false
+  prerelease: auto
