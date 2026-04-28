@@ -420,6 +420,206 @@ func TestReplay_ModifyChain_OrderedReplay(t *testing.T) {
 	}
 }
 
+// TestReplay_StaleGenerationBlocked: an event captured under a prior
+// branch_generation must be terminally blocked when the daemon's active
+// generation has bumped. The error message must mention the generation
+// mismatch so operators can spot the cause.
+func TestReplay_StaleGenerationBlocked(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Stage one well-formed event captured at generation 1 against the
+	// fixture's seed BaseHead. The event itself is otherwise valid — the
+	// guard fires before validation even runs.
+	stale := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             "stale.txt",
+		Fidelity:         "rescan",
+	}
+	staleOp := state.CaptureOp{
+		Op:        "create",
+		Path:      "stale.txt",
+		AfterOID:  sql.NullString{String: "3333333333333333333333333333333333333333", Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, stale, []state.CaptureOp{staleOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// Daemon now operates at generation 2 — i.e. the branch was
+	// rebased/reset since the event was captured.
+	cctx := f.cctx
+	cctx.BranchGeneration = 2
+
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d want 1 (sum=%+v)", sum.Conflicts, sum)
+	}
+	if sum.Published != 0 {
+		t.Fatalf("Published=%d want 0", sum.Published)
+	}
+
+	// The blocked event must drop out of pending and land in
+	// blocked_conflict.
+	blocked, err := state.CountEventsByState(ctx, f.db, state.EventStateBlockedConflict)
+	if err != nil {
+		t.Fatalf("CountEventsByState: %v", err)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked_conflict count = %d, want 1", blocked)
+	}
+
+	// publish_state.error must mention "generation" so operators can spot
+	// the cause without parsing daemon_meta.
+	pub, ok, err := state.LoadPublishState(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadPublishState: %v", err)
+	}
+	if !ok {
+		t.Fatalf("publish_state row not written")
+	}
+	if !pub.EventSeq.Valid || pub.EventSeq.Int64 != seq {
+		t.Fatalf("publish_state.event_seq=%v want %d", pub.EventSeq, seq)
+	}
+	if !pub.Error.Valid || !strings.Contains(pub.Error.String, "generation") {
+		t.Fatalf("publish_state.error=%q want contains 'generation'", pub.Error.String)
+	}
+}
+
+// TestReplay_StaleAncestryBlocked: even when generations agree (e.g. a
+// daemon restart missed the bump), a queued event whose BaseHead is no
+// longer reachable from the replay parent must be terminally blocked.
+// Replaying it would chain a commit off a stale parent and produce a tree
+// that diverges from the operator's intent.
+func TestReplay_StaleAncestryBlocked(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Build a branch from seed: seed -> alt (a sibling that is NOT an
+	// ancestor of f.cctx.BaseHead). We rewrite BranchRef onto a fresh
+	// commit from a different tree, so the prior BaseHead is no longer
+	// reachable from HEAD.
+	altTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob",
+			OID: "0000000000000000000000000000000000000000", Path: "_skip"},
+	})
+	// Mktree may reject a zero blob OID; the test only needs a sibling
+	// commit, so fall back to a real blob if so.
+	if err != nil {
+		blob, hErr := git.HashObjectStdin(ctx, f.dir, []byte("alt\n"))
+		if hErr != nil {
+			t.Fatalf("hash alt blob: %v", hErr)
+		}
+		altTree, err = git.Mktree(ctx, f.dir, []git.MktreeEntry{
+			{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "alt.txt"},
+		})
+		if err != nil {
+			t.Fatalf("mktree alt: %v", err)
+		}
+	}
+	altCommit, err := git.CommitTree(ctx, f.dir, altTree, "alt root")
+	if err != nil {
+		t.Fatalf("commit-tree alt: %v", err)
+	}
+
+	// Stage an event captured against the original BaseHead.
+	stale := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: 7, // both sides agree → exercises ancestry leg
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             "ancestry.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      "ancestry.txt",
+		AfterOID:  sql.NullString{String: "4444444444444444444444444444444444444444", Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, stale, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// Daemon now sits on altCommit (an unrelated history) at the same
+	// generation 7.
+	cctx := f.cctx
+	cctx.BaseHead = altCommit
+	cctx.BranchGeneration = 7
+
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d want 1 (sum=%+v)", sum.Conflicts, sum)
+	}
+	if sum.Published != 0 {
+		t.Fatalf("Published=%d want 0", sum.Published)
+	}
+
+	// Reason should mention "ancestor" or "ancestry" so operators can
+	// distinguish this from a generation mismatch.
+	pub, ok, err := state.LoadPublishState(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadPublishState: %v", err)
+	}
+	if !ok {
+		t.Fatalf("publish_state row not written")
+	}
+	if !pub.Error.Valid {
+		t.Fatalf("publish_state.error empty; want ancestry message")
+	}
+	got := pub.Error.String
+	if !strings.Contains(got, "ancestor") && !strings.Contains(got, "ancestry") {
+		t.Fatalf("publish_state.error=%q want contains 'ancestor' or 'ancestry'", got)
+	}
+}
+
+// TestReplay_MatchingGeneration_Publishes: a sanity-check counterpart to
+// the stale tests above — when generation + ancestry agree, the guard is
+// transparent and the event publishes normally.
+func TestReplay_MatchingGeneration_Publishes(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "ok.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write ok: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published == 0 || sum.Conflicts != 0 {
+		t.Fatalf("expected clean publish, got %+v", sum)
+	}
+}
+
 // TestDeterministicMessage_Format: subject lines for each op kind plus a
 // multi-op event match the legacy format.
 func TestDeterministicMessage_Format(t *testing.T) {
