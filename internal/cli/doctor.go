@@ -47,6 +47,11 @@ type doctorRepoReport struct {
 	FsnotifyDropped        int      `json:"fsnotify_dropped,omitempty"`
 	FsnotifyFallbackReason string   `json:"fsnotify_fallback_reason,omitempty"`
 	LastCaptureError       string   `json:"last_capture_error,omitempty"`
+	PendingEvents          int      `json:"pending_events"`
+	BlockedConflicts       int      `json:"blocked_conflicts"`
+	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
 	Notes                  []string `json:"notes,omitempty"`
 }
 
