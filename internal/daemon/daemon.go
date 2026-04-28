@@ -286,6 +286,28 @@ func Run(ctx context.Context, opts Options) error {
 	defer func() { _ = ignoreChecker.Close() }()
 	matcher := state.NewSensitiveMatcher()
 
+	// Central stats handle for the rollup hook (§8.10). Caller may
+	// inject a pre-opened *central.StatsDB via opts.CentralStats; if not
+	// and CentralStatsDBPath is set, open one here and own its lifetime.
+	// Empty / nil = skip central push (per-repo aggregation still runs).
+	statsDB := opts.CentralStats
+	closeStats := false
+	if statsDB == nil && opts.CentralStatsDBPath != "" {
+		s, sErr := openCentralStats(ctx, opts.CentralStatsDBPath)
+		if sErr != nil {
+			logger.Warn("open central stats db", "err", sErr.Error(),
+				"path", opts.CentralStatsDBPath)
+		} else {
+			statsDB = s
+			closeStats = true
+		}
+	}
+	defer func() {
+		if closeStats && statsDB != nil {
+			_ = statsDB.Close()
+		}
+	}()
+
 	// Loop state.
 	var (
 		consecutiveErrors    int
