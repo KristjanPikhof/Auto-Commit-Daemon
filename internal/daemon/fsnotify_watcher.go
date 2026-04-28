@@ -52,18 +52,18 @@ const EnvMaxInotifyWatches = "ACD_MAX_INOTIFY_WATCHES"
 // can reference them without magic numbers.
 const (
 	DefaultDebounce          = 100 * time.Millisecond
-	DefaultLinuxWatchBudget  = 8000   // fallback when /proc isn't readable
-	DefaultDarwinWatchBudget = 1024   // half of typical macOS rlimit nofile
-	WatchBudgetMargin        = 0.90   // use 90% of detected platform max
-	MaxConsecutiveErrors     = 10     // streak after which we give up on fsnotify
+	DefaultLinuxWatchBudget  = 8000 // fallback when /proc isn't readable
+	DefaultDarwinWatchBudget = 1024 // half of typical macOS rlimit nofile
+	WatchBudgetMargin        = 0.90 // use 90% of detected platform max
+	MaxConsecutiveErrors     = 10   // streak after which we give up on fsnotify
 )
 
 // FallbackReason values stamped into daemon_meta when fsnotify cannot run.
 const (
-	FallbackDisabled        = "disabled_by_env"
-	FallbackInitFailed      = "fsnotify_init_failed"
-	FallbackBudgetExceeded  = "watch_budget_exceeded"
-	FallbackErrorsExceeded  = "errors_exceeded"
+	FallbackDisabled       = "disabled_by_env"
+	FallbackInitFailed     = "fsnotify_init_failed"
+	FallbackBudgetExceeded = "watch_budget_exceeded"
+	FallbackErrorsExceeded = "errors_exceeded"
 )
 
 // WatcherDiagnostics is the snapshot exported to daemon_meta. The run
@@ -523,7 +523,9 @@ func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
 }
 
 // Stop tears down the watcher and waits for the dispatch goroutine to
-// exit. Safe to call multiple times; only the first does work.
+// exit. Safe to call multiple times; only the first does work. Also safe
+// to call when Start was never invoked: in that case there is no
+// dispatch goroutine to drain so we close doneCh ourselves.
 func (w *FsnotifyWatcher) Stop() error {
 	w.stopOnce.Do(func() {
 		close(w.stopCh)
@@ -533,6 +535,10 @@ func (w *FsnotifyWatcher) Stop() error {
 		if fsw != nil {
 			_ = fsw.Close()
 		}
+		// If Start was never called, no goroutine ever closes doneCh —
+		// claim it ourselves via startOnce so the wait below does not
+		// block forever.
+		w.startOnce.Do(func() { close(w.doneCh) })
 		<-w.doneCh
 	})
 	return nil
