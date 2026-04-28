@@ -239,13 +239,13 @@ func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (stri
 
 // diffSpec carries the rendering knobs for one op's diff section.
 type diffSpec struct {
-	oldPath, newPath          string
-	beforeOID, afterOID       string
-	oldMode, newMode          string
-	newFileMode               string // for "new file mode" header on create
-	deletedFileMode           string // for "deleted file mode" header on delete
-	renameFrom, renameTo      string
-	modeOnly                  bool
+	oldPath, newPath     string
+	beforeOID, afterOID  string
+	oldMode, newMode     string
+	newFileMode          string // for "new file mode" header on create
+	deletedFileMode      string // for "deleted file mode" header on delete
+	renameFrom, renameTo string
+	modeOnly             bool
 }
 
 // renderDiff stitches the op's header lines together with the body diff
