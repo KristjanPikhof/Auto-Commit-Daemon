@@ -107,6 +107,9 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		e.LastCommitOID = summary.lastCommitOID
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
 		if summary.daemon == "stale" {
+			if summary.clients == 0 {
+				continue
+			}
 			e.Status = "stale"
 			e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
 		}
