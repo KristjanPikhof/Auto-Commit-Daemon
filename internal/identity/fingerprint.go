@@ -64,7 +64,7 @@ func Capture(pid int) (Fingerprint, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), fingerprintTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ps", "-p", itoa(pid), "-o", "lstart=,command=").Output()
+	out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=,command=").Output()
 	if err != nil {
 		return Fingerprint{}, err
 	}
