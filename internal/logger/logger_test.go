@@ -297,15 +297,18 @@ func TestShiftBackups_OldestDropped(t *testing.T) {
 	if err := w.shiftBackups(); err != nil {
 		t.Fatalf("shiftBackups: %v", err)
 	}
-	// .3.gz should have been dropped (was at max-backups boundary).
-	if _, err := os.Stat(fmt.Sprintf("%s.3.gz", path)); !os.IsNotExist(err) {
-		t.Errorf("oldest backup not dropped at max-backups boundary")
+	// .1.gz should be empty/gone (its content shifted to .2.gz).
+	if _, err := os.Stat(fmt.Sprintf("%s.1.gz", path)); !os.IsNotExist(err) {
+		t.Errorf(".1.gz still exists after shift: %v", err)
 	}
-	// .1 should now be at .2; .2 at .3.
-	if _, err := os.Stat(fmt.Sprintf("%s.2.gz", path)); err != nil {
-		t.Errorf(".2.gz missing after shift: %v", err)
+	// .2.gz must now hold the original .1.gz content ("old1").
+	if got, _ := os.ReadFile(fmt.Sprintf("%s.2.gz", path)); string(got) != "old1" {
+		t.Errorf(".2.gz content = %q; want old1", got)
 	}
-	if _, err := os.Stat(fmt.Sprintf("%s.3.gz", path)); err != nil {
-		t.Errorf(".3.gz missing after shift: %v", err)
+	// .3.gz must now hold the original .2.gz content ("old2"). The
+	// original .3.gz content ("old3") was at the max-backups boundary
+	// and dropped before the shift.
+	if got, _ := os.ReadFile(fmt.Sprintf("%s.3.gz", path)); string(got) != "old2" {
+		t.Errorf(".3.gz content = %q; want old2 (old3 should have been dropped)", got)
 	}
 }
