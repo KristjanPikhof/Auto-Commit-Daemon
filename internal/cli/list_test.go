@@ -205,6 +205,82 @@ func TestList_CountsOnlyLiveClients(t *testing.T) {
 	}
 }
 
+// TestList_PendingAndBlockedFromState verifies that `acd list` reads
+// pending + blocked_conflict counts from state.db rather than rendering
+// hardcoded zeros, and that human + JSON output agree.
+func TestList_PendingAndBlockedFromState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+
+	// Two pending events.
+	for _, p := range []string{"a.go", "b.go"} {
+		if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: "deadbeef", Operation: "modify", Path: p,
+			Fidelity: "exact", CapturedTS: nowFloat(),
+		}, []state.CaptureOp{{Op: "modify", Path: p, Fidelity: "exact"}}); err != nil {
+			t.Fatalf("append pending: %v", err)
+		}
+	}
+
+	// One blocked-conflict event.
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "ghost.txt",
+		Fidelity: "rescan",
+	}, []state.CaptureOp{{Op: "modify", Path: "ghost.txt", Fidelity: "rescan"}})
+	if err != nil {
+		t.Fatalf("append blocker: %v", err)
+	}
+	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("MarkEventBlocked: %v", err)
+	}
+
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	// Human output exposes both columns and counts.
+	var humanOut, humanErr bytes.Buffer
+	if err := runList(ctx, &humanOut, &humanErr, false); err != nil {
+		t.Fatalf("runList human: %v", err)
+	}
+	human := humanOut.String()
+	if !strings.Contains(human, "PENDING") || !strings.Contains(human, "BLOCKED") {
+		t.Fatalf("human output missing PENDING/BLOCKED columns:\n%s", human)
+	}
+
+	// JSON shape exposes counts as integers and matches the state we wrote.
+	var jsonOut, jsonErr bytes.Buffer
+	if err := runList(ctx, &jsonOut, &jsonErr, true); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(got.Repos))
+	}
+	if got.Repos[0].PendingEvents != 2 {
+		t.Fatalf("PendingEvents=%d, want 2", got.Repos[0].PendingEvents)
+	}
+	if got.Repos[0].BlockedConflicts != 1 {
+		t.Fatalf("BlockedConflicts=%d, want 1", got.Repos[0].BlockedConflicts)
+	}
+}
+
 func TestList_MissingStateDB_Reported(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
