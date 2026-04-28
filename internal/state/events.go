@@ -137,7 +137,9 @@ INSERT INTO capture_ops(
 }
 
 // MarkEventPublished updates an event row when the replay step has produced
-// (or failed to produce) a commit. State is one of "published" or "failed".
+// (or failed to produce) a commit. State is one of EventStatePublished,
+// EventStateFailed, or EventStateBlockedConflict — all three are terminal
+// and remove the row from PendingEvents output.
 func MarkEventPublished(ctx context.Context, d *DB, seq int64, state string, commitOID sql.NullString, errMsg sql.NullString, message sql.NullString, publishedTS float64) error {
 	const q = `
 UPDATE capture_events SET
