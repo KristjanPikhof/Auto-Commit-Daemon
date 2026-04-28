@@ -37,12 +37,25 @@ Open your harness. Edit files. Commits land automatically.
 
 ~~~bash
 acd list                # daemons running across all your repos
-acd status              # current repo's daemon
+                        # columns: REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS
+acd status              # current repo's daemon (shows pending_events + blocked_conflicts)
 acd stats --since 7d    # last week's commits
+acd doctor              # pending : N, blocked : N, last conflict path + age + error
 acd doctor --bundle     # diagnostics zip for issue reports
+acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
+acd gc                  # prune stale central-registry entries
 acd stop --repo X       # graceful stop, refcount-aware
-acd stop --all          # nuke every daemon
+acd stop --all          # stop every daemon
 ~~~
+
+If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
+for a step-by-step troubleshooting checklist.
+
+## Docs
+
+- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, AI diff from captured blobs, operator troubleshooting
+- [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
+- [docs/overview.md](docs/overview.md) — high-level overview
 
 ## Status
 
