@@ -121,6 +121,70 @@ func TestStatus_UnregisteredRepoErrors(t *testing.T) {
 	}
 }
 
+// TestStatus_BlockedConflictCount verifies `acd status` reports a non-zero
+// blocked_conflicts count when the replay loop has terminally settled an
+// event in state.EventStateBlockedConflict, and renders a "Blocked
+// conflicts:" line in human output. Keeps the CLI surface honest about
+// stuck rows that will not retry on their own.
+func TestStatus_BlockedConflictCount(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, db, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, db, "claude-code")
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 99, Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	// Append a blocker event and settle it directly via MarkEventBlocked.
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "ghost.txt",
+		Fidelity: "rescan",
+	}, []state.CaptureOp{{
+		Op: "modify", Path: "ghost.txt", Fidelity: "rescan",
+	}})
+	if err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("MarkEventBlocked: %v", err)
+	}
+
+	// Human output mentions the blocker.
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	if !strings.Contains(humanOut.String(), "Blocked conflicts: 1") {
+		t.Fatalf("missing 'Blocked conflicts: 1' in:\n%s", humanOut.String())
+	}
+
+	// JSON shape exposes the field as an integer count.
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.BlockedConflicts != 1 {
+		t.Fatalf("BlockedConflicts = %d, want 1", rep.BlockedConflicts)
+	}
+	// Pending must be 0 — blocked rows leave the FIFO.
+	if rep.PendingEvents != 0 {
+		t.Fatalf("PendingEvents = %d, want 0 (blocker is terminal)", rep.PendingEvents)
+	}
+}
+
 func TestStatus_JSONShape(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
