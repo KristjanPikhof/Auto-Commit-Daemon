@@ -101,7 +101,7 @@ func runStatus(ctx context.Context, out io.Writer, repo string, jsonOut bool) er
 // findRepo returns the registry record whose Path matches abs.
 func findRepo(reg *central.Registry, abs string) (central.RepoRecord, bool) {
 	for _, r := range reg.Repos {
-		if r.Path == abs {
+		if central.SameRepoPath(r.Path, abs) {
 			return r, true
 		}
 	}
