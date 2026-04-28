@@ -60,6 +60,25 @@ func UpdateRef(ctx context.Context, repoDir, ref, newOID, oldOID string) error {
 	return err
 }
 
+// RunBranchRef returns the symbolic ref the worktree's HEAD points at,
+// e.g. "refs/heads/main". Returns ("", nil) on a detached HEAD; surfaces
+// any other git failure verbatim.
+//
+// The shell-out is `git symbolic-ref --quiet HEAD`. Detached HEAD makes
+// git exit 1 with no stderr; we map that to ("", nil) so the run loop can
+// fall back to a default branch name.
+func RunBranchRef(ctx context.Context, repoDir string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir}, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		var gerr *Error
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // MergeBaseIsAncestor reports whether commit is an ancestor of descendant.
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
