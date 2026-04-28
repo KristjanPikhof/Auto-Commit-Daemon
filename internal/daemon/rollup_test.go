@@ -189,14 +189,14 @@ func TestRunDailyRollup_PreInsertedDayPreserved(t *testing.T) {
 	// aggregator should see (day=2026-04-01, repo_root=h.repo) already
 	// present and leave it alone.
 	if _, err := state.InsertDailyRollup(ctx, h.db, state.DailyRollup{
-		Day:           "2026-04-01",
-		RepoRoot:      h.repo,
-		EventsTotal:   999,
-		CommitsTotal:  999,
-		FilesChanged:  999,
-		BytesChanged:  999,
-		ErrorsTotal:   999,
-		SessionsSeen:  999,
+		Day:          "2026-04-01",
+		RepoRoot:     h.repo,
+		EventsTotal:  999,
+		CommitsTotal: 999,
+		FilesChanged: 999,
+		BytesChanged: 999,
+		ErrorsTotal:  999,
+		SessionsSeen: 999,
 	}); err != nil {
 		t.Fatalf("seed day 1: %v", err)
 	}

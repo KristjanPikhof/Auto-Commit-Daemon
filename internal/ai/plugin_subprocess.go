@@ -79,17 +79,17 @@ type SubprocessOptions struct {
 // child process. Safe for concurrent Generate calls from multiple
 // goroutines: requests are serialised through a single owner goroutine.
 type SubprocessProvider struct {
-	name    string // logical plugin name (without acd-provider- prefix)
-	binary  string // resolved absolute path to acd-provider-<name>
-	resolveErr error // sticky error from initial LookPath; surfaced from Generate
+	name       string // logical plugin name (without acd-provider- prefix)
+	binary     string // resolved absolute path to acd-provider-<name>
+	resolveErr error  // sticky error from initial LookPath; surfaced from Generate
 
 	timeout time.Duration
 	env     []string
 	logger  *slog.Logger
 
-	mu       sync.Mutex // guards plugin/closed
-	plugin   *pluginSession
-	closed   bool
+	mu     sync.Mutex // guards plugin/closed
+	plugin *pluginSession
+	closed bool
 }
 
 // NewSubprocessProvider resolves acd-provider-<name> on $PATH (via opts.
@@ -292,15 +292,15 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 // names so the JSON shape matches the contract regardless of struct
 // renames.
 type subprocessRequest struct {
-	Version  int             `json:"version"`
-	Path     string          `json:"path,omitempty"`
-	Op       string          `json:"op,omitempty"`
-	OldPath  string          `json:"old_path,omitempty"`
-	Diff     string          `json:"diff,omitempty"`
-	RepoRoot string          `json:"repo_root,omitempty"`
-	Branch   string          `json:"branch,omitempty"`
-	MultiOp  []subprocessOp  `json:"multi_op,omitempty"`
-	Now      string          `json:"now,omitempty"`
+	Version  int            `json:"version"`
+	Path     string         `json:"path,omitempty"`
+	Op       string         `json:"op,omitempty"`
+	OldPath  string         `json:"old_path,omitempty"`
+	Diff     string         `json:"diff,omitempty"`
+	RepoRoot string         `json:"repo_root,omitempty"`
+	Branch   string         `json:"branch,omitempty"`
+	MultiOp  []subprocessOp `json:"multi_op,omitempty"`
+	Now      string         `json:"now,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire
@@ -341,9 +341,9 @@ type pluginSession struct {
 	stdout io.ReadCloser
 	logger *slog.Logger
 
-	work chan pluginRequest
-	done chan struct{}    // closed when run() exits
-	quit chan struct{}    // closed by shutdown to ask run() to exit promptly
+	work     chan pluginRequest
+	done     chan struct{} // closed when run() exits
+	quit     chan struct{} // closed by shutdown to ask run() to exit promptly
 	quitOnce sync.Once
 
 	deadMu sync.Mutex
