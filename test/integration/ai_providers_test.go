@@ -403,13 +403,3 @@ exit 0
 	}
 }
 
-// pathHasBash sanity-checks bash availability for the plugin tests; if
-// missing they all skip uniformly.
-func pathHasBash() bool {
-	_, err := exec.LookPath("bash")
-	return err == nil
-}
-
-// jsonDecode is a tiny helper used by ad-hoc decoders above where we don't
-// need the full struct treatment.
-func jsonDecode(b []byte, v any) error { return json.Unmarshal(b, v) }
