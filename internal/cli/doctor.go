@@ -235,6 +235,9 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, dbPath string) boo
 			rr.FsnotifyDropped = n
 		}
 	}
+	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.fallback_reason"); ok && v != "" {
+		rr.FsnotifyFallbackReason = v
+	}
 	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
 	}
