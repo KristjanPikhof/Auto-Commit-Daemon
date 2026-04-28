@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 )
 
 // newWatcherForTest spins up a watcher rooted at a fresh tempdir and
