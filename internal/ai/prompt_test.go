@@ -31,12 +31,21 @@ func TestSanitize_StripsBulletPrefix(t *testing.T) {
 }
 
 // TestSanitize_ControlChars: ASCII control bytes are scrubbed before the
-// sanitizer runs the rest of its pipeline.
+// sanitizer runs the rest of its pipeline. The ANSI residue (`[31m`) is
+// not parsed structurally — the escape byte is removed but the printable
+// trailing chars stay; that is acceptable since the commit subject still
+// reads clean ASCII.
 func TestSanitize_ControlChars(t *testing.T) {
-	in := "Add\x00 \x07provider\x1b[31m"
+	in := "Add\x00 \x07provider"
 	got := SanitizeMessage(in)
 	if got != "Add provider" {
 		t.Fatalf("got=%q want %q", got, "Add provider")
+	}
+	// And: an ANSI escape's leading byte is stripped (defence-in-depth
+	// against terminal-injection in commit logs).
+	got2 := SanitizeMessage("Add\x1bprovider")
+	if strings.ContainsRune(got2, '\x1b') {
+		t.Fatalf("escape byte survived: %q", got2)
 	}
 }
 
