@@ -989,15 +989,30 @@ func TestRun_BranchGenerationStableOnAcdFastForward(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(f.dir, "ff.txt"), []byte("ff\n"), 0o644); err != nil {
 		t.Fatalf("write ff: %v", err)
 	}
-	wakeCh <- struct{}{}
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	// Multiple wakes — the run loop drives capture+replay on each tick;
+	// under -race + -p N the first wake can race the bootstrap.
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
 	if newHead == startHead {
 		t.Fatalf("HEAD did not advance via daemon commit")
 	}
 
-	// Give the next loop iteration a moment to observe the new HEAD and
-	// run the token classifier.
-	time.Sleep(200 * time.Millisecond)
+	// Wait for the next loop iteration to observe the new HEAD and run
+	// the token classifier — poll for branch.head to flip to newHead.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+		if ok && v == newHead {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// Generation must still be 1.
 	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
