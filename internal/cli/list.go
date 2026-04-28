@@ -257,6 +257,19 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 		s.lastCommitOID = lastOID.String
 	}
 
+	// Pending FIFO depth + terminal blocked-conflict count. Same RO conn
+	// already in hand — read both directly so list/status/doctor agree.
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&s.pendingEvents); err != nil {
+		return repoSummary{}, fmt.Errorf("pending events: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateBlockedConflict).Scan(&s.blockedConflicts); err != nil {
+		return repoSummary{}, fmt.Errorf("blocked conflicts: %w", err)
+	}
+
 	return s, nil
 }
 
