@@ -1,3 +1,76 @@
 package git
 
-// TODO(phase 1): HEAD resolution, update-ref helpers.
+import (
+	"context"
+	"errors"
+	"strings"
+)
+
+// ErrRefNotFound is returned by RevParse when the requested rev does not
+// resolve. Callers use it to distinguish "missing ref" (expected, e.g. on
+// an initial commit) from a real git failure.
+var ErrRefNotFound = errors.New("git: ref not found")
+
+// RevParse resolves rev (any acceptable revision spec — HEAD, refs/...,
+// short hash, etc.) to a full SHA. Returns ErrRefNotFound when the rev does
+// not exist; other failures surface as *Error.
+func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", "--quiet", rev)
+	if err != nil {
+		var gerr *Error
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+			return "", ErrRefNotFound
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// ShowToplevel returns the absolute path of the worktree root.
+func ShowToplevel(ctx context.Context, dir string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: dir}, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// AbsoluteGitDir returns the absolute path of the worktree's git dir
+// (`.git` for normal repos, the linked git dir for worktrees).
+func AbsoluteGitDir(ctx context.Context, dir string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: dir}, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// UpdateRef sets ref to newOID. If oldOID is non-empty, it is supplied as
+// the expected current value (compare-and-swap); pass the empty string for
+// a new ref or an unconditional update.
+//
+// Mirrors the legacy replay's compare-and-swap update-ref invocation in
+// snapshot-replay.py.
+func UpdateRef(ctx context.Context, repoDir, ref, newOID, oldOID string) error {
+	args := []string{"update-ref", ref, newOID}
+	if oldOID != "" {
+		args = append(args, oldOID)
+	}
+	_, err := Run(ctx, RunOpts{Dir: repoDir}, args...)
+	return err
+}
+
+// MergeBaseIsAncestor reports whether commit is an ancestor of descendant.
+// Returns (true, nil) when ancestor, (false, nil) when not. A real git
+// failure (e.g. unresolved oid) returns a non-nil error.
+func MergeBaseIsAncestor(ctx context.Context, repoDir, commit, descendant string) (bool, error) {
+	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "merge-base", "--is-ancestor", commit, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var gerr *Error
+	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
+}
