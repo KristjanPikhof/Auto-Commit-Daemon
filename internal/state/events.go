@@ -43,7 +43,7 @@ type CaptureEvent struct {
 	Fidelity         string
 	CapturedTS       float64
 	PublishedTS      sql.NullFloat64
-	State            string // "pending" | "published" | "failed"
+	State            string // EventState* constant ("pending"|"published"|"failed"|"blocked_conflict")
 	CommitOID        sql.NullString
 	Error            sql.NullString
 	Message          sql.NullString
