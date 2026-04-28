@@ -4,10 +4,11 @@
 // the canonical implementation into internal/ai/deterministic.go so the
 // replay path can swap providers without code churn here. This file is
 // now a thin wrapper that:
-//   1. translates the daemon's EventContext into ai.CommitContext;
-//   2. invokes ai.DeterministicProvider.Generate;
-//   3. composes the resulting Result.Subject + Result.Body into the
-//      single-string message MessageFn returns.
+//
+//  1. translates the daemon's EventContext into ai.CommitContext;
+//  2. invokes ai.DeterministicProvider.Generate;
+//  3. composes the resulting Result.Subject + Result.Body into the
+//     single-string message MessageFn returns.
 //
 // Output is **byte-identical** to the previous Phase 1 implementation:
 // single-op events produce just the subject, multi-op events produce
