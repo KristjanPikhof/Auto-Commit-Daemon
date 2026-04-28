@@ -115,6 +115,53 @@ func TestList_StaleHeartbeatMarked(t *testing.T) {
 	}
 }
 
+func TestList_CountsOnlyLiveClients(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID:    "old-client",
+		Harness:      "codex",
+		RegisteredTS: float64(now.Add(-2 * time.Hour).Unix()),
+		LastSeenTS:   float64(now.Add(-2 * time.Hour).Unix()),
+	}); err != nil {
+		t.Fatalf("register old client: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID:    "live-client",
+		Harness:      "codex",
+		RegisteredTS: float64(now.Unix()),
+		LastSeenTS:   float64(now.Unix()),
+	}); err != nil {
+		t.Fatalf("register live client: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(got.Repos))
+	}
+	if got.Repos[0].Clients != 1 {
+		t.Fatalf("clients=%d, want 1 live client", got.Repos[0].Clients)
+	}
+}
+
 func TestList_MissingStateDB_Reported(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
