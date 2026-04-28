@@ -321,12 +321,11 @@ func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
 	}
 }
 
-// writeFileForTest is a lightweight helper used only by message_test.go;
-// keeps the test suite from importing os/path/filepath redundantly.
+// writeFileForTest writes body into dir/rel, creating parent dirs.
 func writeFileForTest(dir, rel, body string) error {
-	full := dir + "/" + rel
-	if err := mkdirAllForTest(full); err != nil {
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return err
 	}
-	return writeBytesForTest(full, []byte(body))
+	return os.WriteFile(full, []byte(body), 0o644)
 }
