@@ -221,11 +221,13 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 		}
 	}
 
-	// Client count.
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM daemon_clients`).Scan(&s.clients); err != nil {
-		return repoSummary{}, fmt.Errorf("count clients: %w", err)
+	// Client count. Count the clients that would survive the daemon's
+	// refcount sweep; otherwise stale rows linger forever once a daemon dies.
+	clients, err := countLiveClients(ctx, conn, now, ttl)
+	if err != nil {
+		return repoSummary{}, err
 	}
+	s.clients = clients
 
 	// Last commit (latest seq with non-null commit_oid).
 	var lastSeq sql.NullInt64
@@ -245,6 +247,36 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 
 	return s, nil
+}
+
+func countLiveClients(ctx context.Context, conn *sql.DB, now time.Time, ttl time.Duration) (int, error) {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT watch_pid, last_seen_ts FROM daemon_clients`)
+	if err != nil {
+		return 0, fmt.Errorf("count clients: %w", err)
+	}
+	defer rows.Close()
+
+	cutoff := float64(now.UnixNano())/1e9 - ttl.Seconds()
+	live := 0
+	for rows.Next() {
+		var watchPID sql.NullInt64
+		var lastSeen float64
+		if err := rows.Scan(&watchPID, &lastSeen); err != nil {
+			return 0, fmt.Errorf("scan clients: %w", err)
+		}
+		if lastSeen < cutoff {
+			continue
+		}
+		if watchPID.Valid && watchPID.Int64 > 0 && !identity.Alive(int(watchPID.Int64)) {
+			continue
+		}
+		live++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iter clients: %w", err)
+	}
+	return live, nil
 }
 
 // silence unused-import warning when paths package is not referenced
