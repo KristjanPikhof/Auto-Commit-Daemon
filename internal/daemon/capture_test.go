@@ -16,11 +16,11 @@ import (
 // commit so HEAD resolves, opens the per-repo state DB, and returns
 // everything the test needs.
 type captureFixture struct {
-	dir   string
-	gitDir string
-	db     *state.DB
-	cctx   CaptureContext
-	ig     *git.IgnoreChecker
+	dir     string
+	gitDir  string
+	db      *state.DB
+	cctx    CaptureContext
+	ig      *git.IgnoreChecker
 	matcher *state.SensitiveMatcher
 }
 
@@ -254,8 +254,9 @@ func TestCapture_OversizeMetaOnly(t *testing.T) {
 }
 
 // TestCapture_RoundTrip: walk twice, the second walk emits the right diff.
-//   pass 1 (first walk):  create foo.txt, modify .gitignore? no — fresh capture
-//   pass 2: modify foo.txt, create bar.txt, delete .gitignore
+//
+//	pass 1 (first walk):  create foo.txt, modify .gitignore? no — fresh capture
+//	pass 2: modify foo.txt, create bar.txt, delete .gitignore
 func TestCapture_RoundTrip(t *testing.T) {
 	f := newCaptureFixture(t)
 
