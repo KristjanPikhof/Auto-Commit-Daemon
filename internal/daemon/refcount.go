@@ -2,9 +2,9 @@
 // per §3.4 + §8.4.
 //
 // A row is dead when ANY of these holds:
-//   1. last_seen_ts + TTL < now              (TTL refresh expired)
-//   2. watch_pid != 0 AND !identity.Alive    (peer died)
-//   3. watch_pid != 0 AND fingerprint != stored (PID reuse defense)
+//  1. last_seen_ts + TTL < now              (TTL refresh expired)
+//  2. watch_pid != 0 AND !identity.Alive    (peer died)
+//  3. watch_pid != 0 AND fingerprint != stored (PID reuse defense)
 //
 // The daemon self-terminates after EmptySweepThreshold consecutive sweeps
 // returning alive==0, but only past BootGrace from boot — a short-lived

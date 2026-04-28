@@ -6,16 +6,16 @@
 //
 // Format mirrors snapshot-replay.deterministic_message verbatim:
 //
-//   1 op:
-//     create   -> "Add <basename>"
-//     modify   -> "Update <basename>"
-//     delete   -> "Remove <basename>"
-//     rename   -> "Rename <oldbasename> to <newbasename>"
-//     mode     -> "Update <basename>"
+//	1 op:
+//	  create   -> "Add <basename>"
+//	  modify   -> "Update <basename>"
+//	  delete   -> "Remove <basename>"
+//	  rename   -> "Rename <oldbasename> to <newbasename>"
+//	  mode     -> "Update <basename>"
 //
-//   N ops:
-//     subject  -> "Update N files in <commonDir>" (when present)
-//                 or "Update N files"
+//	N ops:
+//	  subject  -> "Update N files in <commonDir>" (when present)
+//	              or "Update N files"
 //
 // Body bullets are emitted only when there are >1 ops; for single-op events
 // the message is just the subject. The trailing "tool: daemon" footer is
