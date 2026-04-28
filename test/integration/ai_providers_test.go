@@ -271,9 +271,8 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
-		buf := make([]byte, 64*1024)
-		n, _ := r.Body.Read(buf)
-		body := string(buf[:n])
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
 		capturedBody.Store(&body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(cannedResp))
