@@ -46,8 +46,8 @@ type SweepOpts struct {
 
 // SelfTerminateOpts configures ShouldSelfTerminate.
 type SelfTerminateOpts struct {
-	BootGrace            time.Duration
-	EmptySweepThreshold  int
+	BootGrace           time.Duration
+	EmptySweepThreshold int
 }
 
 // SweepClients runs one refcount-GC pass over daemon_clients (§8.4).
