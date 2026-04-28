@@ -33,6 +33,8 @@ type listEntry struct {
 	LastSeq          int64   `json:"last_seq"`
 	LastCommitOID    string  `json:"last_commit_oid,omitempty"`
 	HeartbeatAgeSecs float64 `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents    int     `json:"pending_events"`
+	BlockedConflicts int     `json:"blocked_conflicts"`
 	Status           string  `json:"status"`
 	StatusNote       string  `json:"status_note,omitempty"`
 }
