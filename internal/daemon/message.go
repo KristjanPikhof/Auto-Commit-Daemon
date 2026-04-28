@@ -1,187 +1,77 @@
-// message.go is the Phase 1 commit-message helper.
+// message.go is the daemon-side adapter onto the Phase 5 ai package.
 //
-// Phase 5 (internal/ai) will subsume this with an AI-backed provider plus a
-// deterministic fallback; for now this package owns the deterministic
-// implementation so the replay path has a stable, reviewable contract.
+// Phase 1 owned a local rule-based generator; Phase 5 (this lane) moved
+// the canonical implementation into internal/ai/deterministic.go so the
+// replay path can swap providers without code churn here. This file is
+// now a thin wrapper that:
+//   1. translates the daemon's EventContext into ai.CommitContext;
+//   2. invokes ai.DeterministicProvider.Generate;
+//   3. composes the resulting Result.Subject + Result.Body into the
+//      single-string message MessageFn returns.
 //
-// Format mirrors snapshot-replay.deterministic_message verbatim:
-//
-//	1 op:
-//	  create   -> "Add <basename>"
-//	  modify   -> "Update <basename>"
-//	  delete   -> "Remove <basename>"
-//	  rename   -> "Rename <oldbasename> to <newbasename>"
-//	  mode     -> "Update <basename>"
-//
-//	N ops:
-//	  subject  -> "Update N files in <commonDir>" (when present)
-//	              or "Update N files"
-//
-// Body bullets are emitted only when there are >1 ops; for single-op events
-// the message is just the subject. The trailing "tool: daemon" footer is
-// dropped here because v1 captures already record the tool name in
-// daemon_meta.
+// Output is **byte-identical** to the previous Phase 1 implementation:
+// single-op events produce just the subject, multi-op events produce
+// `subject + "\n\n" + bullets`. Existing replay tests pin the subject
+// shape and continue to pass unchanged.
 package daemon
 
 import (
 	"context"
-	"fmt"
-	"path"
-	"strings"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // DeterministicMessage produces a commit subject + optional body from the
-// event + ops alone. Pure function; ignores ctx (kept in the signature so
-// it satisfies MessageFn without an adapter).
-func DeterministicMessage(_ context.Context, ec EventContext) (string, error) {
-	ops := ec.Ops
-	if len(ops) == 0 {
-		return "Update files", nil
+// event + ops alone. Pure forwarder over ai.DeterministicProvider.
+func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) {
+	cc := commitContextFromEvent(ec)
+	r, err := (ai.DeterministicProvider{}).Generate(ctx, cc)
+	if err != nil {
+		return "", err
 	}
-	if len(ops) == 1 {
-		return singleOpSubject(ops[0]), nil
+	if r.Body == "" {
+		return r.Subject, nil
 	}
-	// Multi-op subject + body bullets.
-	subject := multiOpSubject(ops)
-	var b strings.Builder
-	b.WriteString(subject)
-	b.WriteString("\n\n")
-	for i, op := range ops {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString(formatBullet(op))
-	}
-	return b.String(), nil
+	return r.Subject + "\n\n" + r.Body, nil
 }
 
-func singleOpSubject(op state.CaptureOp) string {
-	name := basenameOf(op.Path)
-	switch op.Op {
-	case "create":
-		return "Add " + name
-	case "modify":
-		return "Update " + name
-	case "delete":
-		return "Remove " + name
-	case "rename":
-		oldName := basenameOf(op.OldPath.String)
-		if oldName == "" {
-			oldName = name
+// commitContextFromEvent translates the daemon's EventContext into the
+// ai package's CommitContext. Multi-op events are flattened into MultiOp;
+// single-op events populate the top-level Path/Op/OldPath fields so the
+// deterministic generator can take the single-op path.
+func commitContextFromEvent(ec EventContext) ai.CommitContext {
+	cc := ai.CommitContext{
+		Branch: ec.Event.BranchRef,
+	}
+	switch len(ec.Ops) {
+	case 0:
+		// no-op — Generator returns "Update files".
+	case 1:
+		op := ec.Ops[0]
+		cc.Path = op.Path
+		cc.Op = op.Op
+		if op.OldPath.Valid {
+			cc.OldPath = op.OldPath.String
 		}
-		return "Rename " + oldName + " to " + name
-	case "mode":
-		return "Update " + name
 	default:
-		return "Update " + name
-	}
-}
-
-func multiOpSubject(ops []state.CaptureOp) string {
-	paths := make([]string, 0, len(ops))
-	for _, op := range ops {
-		paths = append(paths, op.Path)
-	}
-	shared := commonDir(paths)
-	if shared != "" {
-		return fmt.Sprintf("Update %d files in %s", len(ops), shared)
-	}
-	return fmt.Sprintf("Update %d files", len(ops))
-}
-
-func formatBullet(op state.CaptureOp) string {
-	if op.Op == "rename" {
-		return fmt.Sprintf("- Rename %s -> %s", op.OldPath.String, op.Path)
-	}
-	return fmt.Sprintf("- %s %s", titleCase(op.Op), op.Path)
-}
-
-// titleCase capitalises the leading rune; ASCII-only is fine here because
-// op kinds are a fixed alphabet.
-func titleCase(s string) string {
-	if s == "" {
-		return s
-	}
-	if c := s[0]; c >= 'a' && c <= 'z' {
-		return string(c-'a'+'A') + s[1:]
-	}
-	return s
-}
-
-// basenameOf returns the last path component. Mirrors the legacy _basename:
-// "" -> "", "a/b/" -> "b", "foo" -> "foo".
-func basenameOf(p string) string {
-	p = strings.TrimRight(p, "/")
-	if p == "" {
-		return ""
-	}
-	if i := strings.LastIndex(p, "/"); i >= 0 {
-		return p[i+1:]
-	}
-	return p
-}
-
-// commonDir returns the longest shared directory prefix across paths. If
-// the entire prefix equals one of the paths (i.e. the paths fully nest),
-// the trailing component is dropped so we don't claim a single file as a
-// "directory". Mirrors legacy _common_dir.
-func commonDir(paths []string) string {
-	if len(paths) == 0 {
-		return ""
-	}
-	parts := make([][]string, len(paths))
-	for i, p := range paths {
-		parts[i] = strings.Split(p, "/")
-	}
-	var common []string
-	for col := 0; ; col++ {
-		var first string
-		ok := true
-		for row, segs := range parts {
-			if col >= len(segs) {
-				ok = false
-				break
-			}
-			if row == 0 {
-				first = segs[col]
-				continue
-			}
-			if segs[col] != first {
-				ok = false
-				break
-			}
-		}
-		if !ok {
-			break
-		}
-		common = append(common, first)
-	}
-	if len(common) == 0 {
-		return ""
-	}
-	// If every path's full prefix equals `common`, pop the trailing element
-	// — every file lives directly in this dir, but the dir itself is one
-	// segment shorter.
-	allFullMatch := true
-	for _, segs := range parts {
-		if len(segs) != len(common) {
-			allFullMatch = false
-			break
-		}
-		for i := range common {
-			if segs[i] != common[i] {
-				allFullMatch = false
-				break
-			}
-		}
-		if !allFullMatch {
-			break
+		cc.MultiOp = make([]ai.OpItem, 0, len(ec.Ops))
+		for _, op := range ec.Ops {
+			cc.MultiOp = append(cc.MultiOp, ai.OpItem{
+				Path:    op.Path,
+				Op:      op.Op,
+				OldPath: nullStringOr(op.OldPath, ""),
+			})
 		}
 	}
-	if allFullMatch && len(common) > 0 {
-		common = common[:len(common)-1]
+	return cc
+}
+
+// nullStringOr returns the value of a sql.NullString or a fallback when
+// invalid. Avoids dragging the database/sql import into ai/.
+func nullStringOr(s state.CaptureOpOldPathLike, fallback string) string {
+	if s.Valid {
+		return s.String
 	}
-	return path.Join(common...)
+	return fallback
 }
