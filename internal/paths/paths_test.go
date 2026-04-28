@@ -1,7 +1,9 @@
 package paths
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -156,6 +158,50 @@ func TestRepoHash_CleansInput(t *testing.T) {
 	}
 	if canonical != withDot {
 		t.Errorf("/./ segment differed: %s vs %s", canonical, withDot)
+	}
+}
+
+func TestRepoHash_ResolvesSymlinkedRepoPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink permissions vary on Windows")
+	}
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	link := filepath.Join(base, "repo-link")
+	if err := os.Mkdir(repo, 0o700); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.Symlink(repo, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	a, err := RepoHash(repo)
+	if err != nil {
+		t.Fatalf("RepoHash repo: %v", err)
+	}
+	b, err := RepoHash(link)
+	if err != nil {
+		t.Fatalf("RepoHash link: %v", err)
+	}
+	if a != b {
+		t.Fatalf("symlink path hash differed: %s vs %s", a, b)
+	}
+}
+
+func TestRepoHash_CaseFoldedOnDefaultCaseInsensitivePlatforms(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-folded repo hashes are only enabled on darwin/windows")
+	}
+	a, err := RepoHash("/Users/me/NotesAssistant")
+	if err != nil {
+		t.Fatalf("RepoHash mixed case: %v", err)
+	}
+	b, err := RepoHash("/Users/me/notesassistant")
+	if err != nil {
+		t.Fatalf("RepoHash lower case: %v", err)
+	}
+	if a != b {
+		t.Fatalf("case-only path hash differed: %s vs %s", a, b)
 	}
 }
 
