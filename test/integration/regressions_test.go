@@ -42,6 +42,8 @@ func TestRegressions(t *testing.T) {
 	t.Run("PIDReuseRejectedByFingerprint", regPIDReuseRejectedByFingerprint)
 	t.Run("StopWithPeerDefersKill", regStopWithPeerDefersKill)
 	t.Run("DaemonSelfTerminatesOnEmptySweeps", regDaemonSelfTerminatesOnEmptySweeps)
+	t.Run("RepeatedEditsPublishOrderedCommits", regRepeatedEditsPublishOrderedCommits)
+	t.Run("BlockedConflictTerminalAcrossPolls", regBlockedConflictTerminalAcrossPolls)
 }
 
 // startDaemon is shared scaffolding: `acd start` + wait for mode=running.
