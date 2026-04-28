@@ -22,6 +22,7 @@ package integration_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
