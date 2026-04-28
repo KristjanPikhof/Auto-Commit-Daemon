@@ -60,7 +60,7 @@ func buildAcdBinary(t *testing.T) string {
 	acdBinaryOnce.Do(func() {
 		// Resolve the repo root by climbing up from this file. test/integration
 		// sits two directories below the module root.
-		_, here, _, ok := runtimeCaller()
+		_, here, _, ok := runtime.Caller(0)
 		if !ok {
 			acdBinaryErr = errors.New("integration: cannot resolve test source path")
 			return
