@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"sync"
 	"testing"
@@ -95,6 +96,33 @@ func TestRegistry_UpsertIdempotent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(reg.Repos[0].Harnesses, []string{"claude-code"}) {
 		t.Fatalf("harnesses=%v, want [claude-code]", reg.Repos[0].Harnesses)
+	}
+}
+
+func TestRegistry_NormalizesCaseDuplicateOnCaseFoldedPlatforms(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-folded registry path matching is only enabled on darwin/windows")
+	}
+	reg := NewRegistry()
+	reg.UpsertRepo("/Users/me/NotesAssistant", "h1", "/state/one.db", "codex", 10)
+	reg.UpsertRepo("/Users/me/notesassistant", "h2", "/state/two.db", "claude-code", 20)
+
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := reg.Repos[0]
+	if rec.Path != "/Users/me/notesassistant" {
+		t.Fatalf("path=%q, want latest path spelling", rec.Path)
+	}
+	if rec.RepoHash != "h2" || rec.StateDB != "/state/two.db" {
+		t.Fatalf("metadata not refreshed: %+v", rec)
+	}
+	wantHarnesses := []string{"claude-code", "codex"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 20 {
+		t.Fatalf("timestamps not merged: %+v", rec)
 	}
 }
 
