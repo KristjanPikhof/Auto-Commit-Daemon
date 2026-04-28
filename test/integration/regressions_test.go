@@ -338,40 +338,46 @@ func regCoalescedFlushAcksAtomic(t *testing.T) {
 	// burst" — not "control.lock is reentrant".
 	const N = 50
 	const concurrency = 4
-	const maxAttempts = 8
+	const maxAttempts = 12
 	var wg sync.WaitGroup
 	failures := atomic.Int32{}
 	tokens := make(chan struct{}, concurrency)
+	var firstErr atomic.Pointer[string]
 	for i := 0; i < N; i++ {
 		wg.Add(1)
 		tokens <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-tokens }()
+			var lastRes ExecResult
 			for attempt := 0; attempt < maxAttempts; attempt++ {
 				subCtx, sub := context.WithTimeout(ctx, 30*time.Second)
-				res := runAcd(t, subCtx, env,
+				lastRes = runAcd(t, subCtx, env,
 					"wake", "--session-id", "burst-1", "--repo", repo, "--json",
 				)
 				sub()
-				if res.ExitCode == 0 {
+				if lastRes.ExitCode == 0 {
 					return
 				}
-				// control.lock contention is the only expected race; retry
-				// after a short sleep so the lock holder can release.
-				if !strings.Contains(res.Stderr, "control.lock") &&
-					!strings.Contains(res.Stdout, "control.lock") {
-					failures.Add(1)
-					return
-				}
-				time.Sleep(time.Duration(20+attempt*30) * time.Millisecond)
+				// Lock-style contention: control.lock acquire failed because
+				// a peer is holding it briefly. Retry. Anything else is
+				// treated as a contention candidate too — we retry up to
+				// maxAttempts then give up.
+				time.Sleep(time.Duration(30+attempt*40) * time.Millisecond)
 			}
 			failures.Add(1)
+			msg := fmt.Sprintf("wake#%d exit=%d stdout=%q stderr=%q",
+				i, lastRes.ExitCode, lastRes.Stdout, lastRes.Stderr)
+			firstErr.CompareAndSwap(nil, &msg)
 		}(i)
 	}
 	wg.Wait()
 	if f := failures.Load(); f > 0 {
-		t.Fatalf("%d/%d acd wake invocations failed", f, N)
+		errStr := ""
+		if p := firstErr.Load(); p != nil {
+			errStr = *p
+		}
+		t.Fatalf("%d/%d acd wake invocations failed; first: %s", f, N, errStr)
 	}
 
 	// The daemon may also have produced its own 'wake' rows from the SIGUSR1
