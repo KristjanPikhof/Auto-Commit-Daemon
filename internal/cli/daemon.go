@@ -100,10 +100,21 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 
 	fmt.Fprintf(out, "acd daemon run: repo=%s git_dir=%s pid=%d\n", repo, gitDir, os.Getpid())
 
+	// FsnotifyEnabled is gated by an env flag so the production CLI is
+	// opt-in until we ship the broader Phase-4 cutover. The watcher itself
+	// already honors ACD_DISABLE_FSNOTIFY and ACD_MAX_INOTIFY_WATCHES; this
+	// toggle just turns the watcher on at the daemon Options layer. Any
+	// non-empty value other than "0"/"false" enables it.
+	fsEnabled := false
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
+		fsEnabled = true
+	}
+
 	if err := daemon.Run(cctx, daemon.Options{
-		RepoPath: repo,
-		GitDir:   gitDir,
-		DB:       db,
+		RepoPath:        repo,
+		GitDir:          gitDir,
+		DB:              db,
+		FsnotifyEnabled: fsEnabled,
 	}); err != nil {
 		if errors.Is(err, daemon.ErrDaemonLockHeld) {
 			fmt.Fprintf(errOut, "acd daemon run: another daemon is already running for %s\n", repo)
