@@ -24,7 +24,10 @@ if [ -z "$VERSION" ]; then
 fi
 [ -n "$VERSION" ] || { echo "could not resolve latest acd version" >&2; exit 1; }
 
-URL="https://github.com/$REPO/releases/download/$VERSION/acd_${VERSION}_${OS}_${ARCH}.tar.gz"
+# Tag carries leading "v" (e.g. v2026-04-28); goreleaser archive names omit it.
+VERSION_NUM="${VERSION#v}"
+
+URL="https://github.com/$REPO/releases/download/$VERSION/acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
 SUMS_URL="https://github.com/$REPO/releases/download/$VERSION/checksums.txt"
 
 mkdir -p "$INSTALL_DIR"
