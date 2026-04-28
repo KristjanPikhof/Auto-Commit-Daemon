@@ -203,7 +203,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// Settle the event row + publish_state.
 		nowSec := float64(time.Now().UnixNano()) / 1e9
 		if err := state.MarkEventPublished(ctx, db,
-			ev.Seq, "published",
+			ev.Seq, state.EventStatePublished,
 			sql.NullString{String: commitOID, Valid: true},
 			sql.NullString{},
 			ev.Message, nowSec,
