@@ -500,9 +500,43 @@ func Run(ctx context.Context, opts Options) error {
 			lastPrune = nowTS
 		}
 
-		// 4k. Phase 3 hook: rollup is a no-op in Phase 1.
-		// TODO(phase 3): wire daily_rollups aggregation. Tracked in
-		// Trekoon task 635b9b4c-e986-4898-8c85-44ed69a916ba.
+		// 4k. Phase 3 daily rollup hook (§8.10). Throttled to
+		// RollupInterval, force-fired once when the UTC day changes
+		// underneath the loop. Failure logs + records last_error_at
+		// but never crashes the loop.
+		curUTCDay := nowTS.UTC().Format(dayLayout)
+		dayBoundaryCrossed := lastRollupUTCDay != "" && curUTCDay != lastRollupUTCDay
+		if curUTCDay != lastRollupUTCDay && lastRollupUTCDay == "" {
+			lastRollupUTCDay = curUTCDay
+		}
+		if dayBoundaryCrossed || nowTS.Sub(lastRollup) >= rollupEvery {
+			n, rErr := RunDailyRollup(ctx, opts.DB, RunDailyRollupOpts{
+				RepoPath: opts.RepoPath,
+				Now:      now,
+			})
+			if rErr != nil {
+				logger.Warn("daily rollup", "err", rErr.Error())
+				_ = state.MetaSet(ctx, opts.DB, metaRollupLastErrorAt,
+					strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64))
+			} else if n > 0 {
+				logger.Info("daily rollup", "rows", n)
+			}
+			// Central push is best-effort. Skip when stats handle or
+			// repo_hash is missing — log + continue without erroring.
+			if rErr == nil && statsDB != nil && opts.RepoHash != "" {
+				if pushed, pErr := central.PushRollupsToCentral(
+					ctx, opts.DB, statsDB, opts.RepoHash, opts.RepoPath,
+				); pErr != nil {
+					logger.Warn("central rollup push", "err", pErr.Error())
+					_ = state.MetaSet(ctx, opts.DB, metaRollupLastErrorAt,
+						strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64))
+				} else if pushed > 0 {
+					logger.Info("central rollup pushed", "rows", pushed)
+				}
+			}
+			lastRollup = nowTS
+			lastRollupUTCDay = curUTCDay
+		}
 
 		// 4l. Compute next delay.
 		switch {
