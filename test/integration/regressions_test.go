@@ -196,11 +196,12 @@ func regSensitiveGlobDefaultDeny(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Drop two sensitive files + one harmless file before starting the
-	// daemon; the harmless one is the canary that proves capture+replay is
-	// actually running (otherwise an unrelated bug could appear as a pass).
+	// Drop sensitive files matched by the canonical default-deny list +
+	// one harmless file before starting the daemon. The harmless one is
+	// the canary that proves capture+replay is actually running.
 	writeFile(t, filepath.Join(repo, ".env"), "API_KEY=hunter2\n")
-	writeFile(t, filepath.Join(repo, "secrets.json"), `{"token":"shhh"}`+"\n")
+	writeFile(t, filepath.Join(repo, "credentials.txt"), "user:pw\n")
+	writeFile(t, filepath.Join(repo, "secrets/leak"), "shhh\n")
 	writeFile(t, filepath.Join(repo, "harmless.txt"), "ok-to-capture\n")
 
 	startSession(t, ctx, env, repo, "sens-1", "shell")
@@ -211,17 +212,14 @@ func regSensitiveGlobDefaultDeny(t *testing.T) {
 	// one capture+replay pass.
 	waitForCommitContaining(t, repo, "harmless.txt", 5*time.Second)
 
-	// Now inspect the full git history — neither sensitive path may appear.
+	// Now inspect the full git history — none of the sensitive paths may
+	// appear. Match on exact path so unrelated rows aren't false positives.
 	all := runGitOK(t, repo, "log", "--all", "--name-only", "--pretty=format:")
 	for _, line := range strings.Split(all, "\n") {
 		line = strings.TrimSpace(line)
-		if line == ".env" || line == "secrets.json" {
+		switch line {
+		case ".env", "credentials.txt", "secrets/leak":
 			t.Fatalf("sensitive file %q leaked into history:\n%s", line, all)
-		}
-		// secrets.json is also matched by **/credentials* indirectly; double
-		// check on prefix.
-		if strings.HasSuffix(line, "/secrets.json") {
-			t.Fatalf("sensitive nested file %q leaked: %s", line, all)
 		}
 	}
 }
