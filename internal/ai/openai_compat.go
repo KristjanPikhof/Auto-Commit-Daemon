@@ -122,7 +122,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		httpClient = defaultOpenAIClient()
 	}
 
-	body, err := buildOpenAIRequest(model, cc, cap)
+	body, err := buildOpenAIRequest(model, cc, diffCap)
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
 	}
