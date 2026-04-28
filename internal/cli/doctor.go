@@ -457,9 +457,10 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		}
 		// fsnotify-stats.json
 		fsstats := map[string]any{
-			"mode":           rr.FsnotifyMode,
-			"watch_count":    rr.FsnotifyWatches,
-			"dropped_events": rr.FsnotifyDropped,
+			"mode":            rr.FsnotifyMode,
+			"watch_count":     rr.FsnotifyWatches,
+			"dropped_events":  rr.FsnotifyDropped,
+			"fallback_reason": rr.FsnotifyFallbackReason,
 		}
 		fb, _ := json.MarshalIndent(fsstats, "", "  ")
 		if err := add(base+"fsnotify-stats.json", fb); err != nil {
