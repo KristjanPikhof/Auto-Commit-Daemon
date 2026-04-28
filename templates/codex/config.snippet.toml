@@ -6,19 +6,19 @@ codex_hooks = true
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$PWD\"'"
+command = "bash -c 'SID=$(jq -r .session_id <&0); acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
 
 [[hooks.PreToolUse]]
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\"'"
+command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
 
 [[hooks.PostToolUse]]
 [[hooks.PostToolUse.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\"'"
+command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
 
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd stop --session-id \"$SID\" --repo \"$PWD\"'"
+command = "bash -c 'SID=$(jq -r .session_id <&0); acd stop --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
