@@ -92,6 +92,27 @@ type Options struct {
 	// to DefaultPruneInterval.
 	PruneInterval time.Duration
 
+	// RollupInterval caps how often the daily rollup hook may run. Zero
+	// falls back to DefaultRollupInterval. The aggregator is also fired
+	// immediately when a UTC-day boundary crossing is detected.
+	RollupInterval time.Duration
+
+	// CentralStatsDBPath, when non-empty, opens the central stats.db at
+	// daemon start and pushes per-repo daily_rollups into it after each
+	// rollup pass. Empty means "skip central push" — only the per-repo
+	// daily_rollups table is updated. Tests typically leave this empty.
+	CentralStatsDBPath string
+
+	// CentralStats, when non-nil, is used as the central stats handle
+	// instead of opening one from CentralStatsDBPath. Tests inject a
+	// pre-opened *central.StatsDB this way to avoid filesystem coupling.
+	CentralStats *central.StatsDB
+
+	// RepoHash is the stable cross-repo identifier used when pushing
+	// per-repo daily_rollups into the central stats.db. Empty disables
+	// the central push (logged but non-fatal).
+	RepoHash string
+
 	// MessageFn produces commit messages. Nil falls back to
 	// DeterministicMessage.
 	MessageFn MessageFn
