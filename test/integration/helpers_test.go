@@ -27,12 +27,25 @@ import (
 )
 
 // acdBinaryPath is the per-process build cache. We compile the `acd` binary
-// once and reuse it across every integration scenario.
+// once and reuse it across every integration scenario. The directory is
+// registered for cleanup in TestMain so /tmp does not accumulate stale
+// builds across `go test` runs.
 var (
 	acdBinaryOnce sync.Once
 	acdBinary     string
+	acdBinaryDir  string
 	acdBinaryErr  error
 )
+
+// TestMain owns process-wide setup/teardown — currently just removing the
+// build cache directory after the suite completes so /tmp stays clean.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if acdBinaryDir != "" {
+		_ = os.RemoveAll(acdBinaryDir)
+	}
+	os.Exit(code)
+}
 
 // buildAcdBinary builds (or returns the cached path of) the production `acd`
 // binary. Subsequent calls within the same `go test` process reuse the
