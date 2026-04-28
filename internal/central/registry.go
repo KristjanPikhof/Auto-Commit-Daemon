@@ -286,8 +286,8 @@ func SameRepoPath(a, b string) bool {
 	}
 	infoA, errA := os.Stat(cleanA)
 	infoB, errB := os.Stat(cleanB)
-	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
-		return true
+	if errA == nil && errB == nil {
+		return os.SameFile(infoA, infoB)
 	}
 	if pathCaseFoldedByDefault() {
 		return strings.EqualFold(cleanA, cleanB)
