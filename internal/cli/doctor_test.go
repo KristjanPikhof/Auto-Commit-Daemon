@@ -189,6 +189,166 @@ func TestDoctor_Bundle_LayoutMatchesSpec(t *testing.T) {
 	}
 }
 
+// TestDoctor_JSON_FsnotifyFields verifies that all four fsnotify daemon_meta
+// keys (mode, watch_count, dropped_events, fallback_reason) surface correctly
+// in `acd doctor --json` output. Runs twice: once with mode=fsnotify (no
+// fallback_reason) and once with mode=poll + fallback_reason=watch_budget_exceeded.
+func TestDoctor_JSON_FsnotifyFields(t *testing.T) {
+	tests := []struct {
+		name           string
+		mode           string
+		watchCount     string
+		dropped        string
+		fallbackReason string
+	}{
+		{
+			name:       "fsnotify_mode",
+			mode:       "fsnotify",
+			watchCount: "17",
+			dropped:    "0",
+		},
+		{
+			name:           "poll_fallback",
+			mode:           "poll",
+			watchCount:     "0",
+			dropped:        "3",
+			fallbackReason: "watch_budget_exceeded",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			ctx := context.Background()
+
+			repo, db, d := makeRepoStateDB(t)
+			if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+				PID: 55, Mode: "running", HeartbeatTS: nowFloat(),
+			}); err != nil {
+				t.Fatalf("save daemon state: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.mode", tc.mode); err != nil {
+				t.Fatalf("meta set mode: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.watch_count", tc.watchCount); err != nil {
+				t.Fatalf("meta set watch_count: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.dropped_events", tc.dropped); err != nil {
+				t.Fatalf("meta set dropped_events: %v", err)
+			}
+			if tc.fallbackReason != "" {
+				if err := state.MetaSet(ctx, d, "fsnotify.fallback_reason", tc.fallbackReason); err != nil {
+					t.Fatalf("meta set fallback_reason: %v", err)
+				}
+			}
+			registerRepo(t, roots, repo, db, "claude-code")
+			_ = d.Close()
+
+			var out bytes.Buffer
+			if err := runDoctor(ctx, &out, false, "", true); err != nil {
+				t.Fatalf("runDoctor: %v", err)
+			}
+			var rep doctorReport
+			if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, out.String())
+			}
+			if len(rep.Repos) != 1 {
+				t.Fatalf("expected 1 repo, got %d", len(rep.Repos))
+			}
+			rr := rep.Repos[0]
+			if rr.FsnotifyMode != tc.mode {
+				t.Errorf("FsnotifyMode=%q want %q", rr.FsnotifyMode, tc.mode)
+			}
+			if rr.FsnotifyFallbackReason != tc.fallbackReason {
+				t.Errorf("FsnotifyFallbackReason=%q want %q", rr.FsnotifyFallbackReason, tc.fallbackReason)
+			}
+			// watch_count is only non-zero for fsnotify mode, but the field
+			// must be readable (int) in both cases.
+			if tc.mode == "fsnotify" && rr.FsnotifyWatches == 0 {
+				t.Errorf("FsnotifyWatches=0 want %s (parsed)", tc.watchCount)
+			}
+			if tc.dropped != "0" && rr.FsnotifyDropped == 0 {
+				t.Errorf("FsnotifyDropped=0 want >0 (dropped=%s)", tc.dropped)
+			}
+		})
+	}
+}
+
+// TestDoctor_Human_FsnotifySection verifies the human-readable output
+// includes a "watcher" line per repo, and includes fallback_reason only when
+// mode=poll.
+func TestDoctor_Human_FsnotifySection(t *testing.T) {
+	tests := []struct {
+		name           string
+		mode           string
+		fallbackReason string
+		wantFallback   bool
+	}{
+		{
+			name: "fsnotify_mode_no_fallback",
+			mode: "fsnotify",
+		},
+		{
+			name:           "poll_mode_with_fallback",
+			mode:           "poll",
+			fallbackReason: "watch_budget_exceeded",
+			wantFallback:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			ctx := context.Background()
+
+			repo, db, d := makeRepoStateDB(t)
+			if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+				PID: 12, Mode: "running", HeartbeatTS: nowFloat(),
+			}); err != nil {
+				t.Fatalf("save daemon state: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.mode", tc.mode); err != nil {
+				t.Fatalf("meta mode: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.watch_count", "5"); err != nil {
+				t.Fatalf("meta watch_count: %v", err)
+			}
+			if err := state.MetaSet(ctx, d, "fsnotify.dropped_events", "0"); err != nil {
+				t.Fatalf("meta dropped_events: %v", err)
+			}
+			if tc.fallbackReason != "" {
+				if err := state.MetaSet(ctx, d, "fsnotify.fallback_reason", tc.fallbackReason); err != nil {
+					t.Fatalf("meta fallback_reason: %v", err)
+				}
+			}
+			registerRepo(t, roots, repo, db, "claude-code")
+			_ = d.Close()
+
+			var out bytes.Buffer
+			if err := runDoctor(ctx, &out, false, "", false); err != nil {
+				t.Fatalf("runDoctor: %v", err)
+			}
+			body := out.String()
+
+			// Human output must contain the watcher line with mode.
+			wantMode := "mode=" + tc.mode
+			if !strings.Contains(body, wantMode) {
+				t.Errorf("human output missing %q:\n%s", wantMode, body)
+			}
+			if tc.wantFallback {
+				wantFB := "fallback=" + tc.fallbackReason
+				if !strings.Contains(body, wantFB) {
+					t.Errorf("human output missing %q:\n%s", wantFB, body)
+				}
+			} else {
+				if strings.Contains(body, "fallback=") {
+					t.Errorf("human output unexpectedly contains fallback= when mode=fsnotify:\n%s", body)
+				}
+			}
+		})
+	}
+}
+
 func TestDoctor_Bundle_TwoRunsDistinctZips(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
