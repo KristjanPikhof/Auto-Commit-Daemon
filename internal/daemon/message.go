@@ -25,15 +25,26 @@ import (
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
 func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) {
-	cc := commitContextFromEvent(ec)
-	r, err := (ai.DeterministicProvider{}).Generate(ctx, cc)
-	if err != nil {
-		return "", err
+	return providerMessageFn(ai.DeterministicProvider{})(ctx, ec)
+}
+
+// providerMessageFn adapts an ai.Provider into the daemon's MessageFn
+// signature. Subject + Body are joined with a blank line so the run
+// loop's commit-tree call gets a single string. Errors propagate so
+// Compose'd fallback chains can surface their final outcome to the
+// caller (which logs, marks the event failed, and continues).
+func providerMessageFn(p ai.Provider) MessageFn {
+	return func(ctx context.Context, ec EventContext) (string, error) {
+		cc := commitContextFromEvent(ec)
+		r, err := p.Generate(ctx, cc)
+		if err != nil {
+			return "", err
+		}
+		if r.Body == "" {
+			return r.Subject, nil
+		}
+		return r.Subject + "\n\n" + r.Body, nil
 	}
-	if r.Body == "" {
-		return r.Subject, nil
-	}
-	return r.Subject + "\n\n" + r.Body, nil
 }
 
 // commitContextFromEvent translates the daemon's EventContext into the
