@@ -645,6 +645,13 @@ func Run(ctx context.Context, opts Options) error {
 			// Reset the idle counter so the next tick starts fresh.
 			currentDelay = opts.Scheduler.Reset()
 			consecutiveIdleTicks = 0
+		case <-fsWakeReader:
+			// fsWakeReader is nil when fsnotify is disabled; a nil
+			// receive blocks forever, so this arm is effectively
+			// inactive when there's no watcher.
+			timer.Stop()
+			currentDelay = opts.Scheduler.Reset()
+			consecutiveIdleTicks = 0
 		case <-timer.C:
 		}
 	}
