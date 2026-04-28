@@ -372,6 +372,7 @@ func startPlugin(binary string, extraEnv []string, logger *slog.Logger) (*plugin
 		logger: logger,
 		work:   make(chan pluginRequest),
 		done:   make(chan struct{}),
+		quit:   make(chan struct{}),
 	}
 	go s.run()
 	return s, nil
