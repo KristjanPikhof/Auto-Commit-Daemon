@@ -515,15 +515,14 @@ func (s *pluginSession) kill() {
 	_ = s.stdout.Close()
 }
 
-// shutdown closes stdin to signal EOF, waits up to `grace` for the plugin
-// to exit cleanly, and escalates to SIGKILL on timeout. Always reaps the
-// process to avoid zombies. Pass grace=0 to skip the polite phase entirely
-// (used on the crash path where we already know the plugin is broken).
+// shutdown signals the owner goroutine to exit, closes stdin to give the
+// plugin a clean EOF, and waits up to `grace` for the process to exit. On
+// timeout it escalates to SIGKILL. Always reaps the process to avoid
+// zombies. Pass grace=0 to skip the polite phase entirely (used on the
+// crash path where we already know the plugin is broken).
 func (s *pluginSession) shutdown(grace time.Duration) error {
-	// Signal owner goroutine to drain by closing the work channel
-	// only if not already dead — a racing crash path may have already
-	// closed it.
-	s.closeWorkOnce()
+	// Tell run() to exit; safe to call multiple times.
+	s.quitOnce.Do(func() { close(s.quit) })
 
 	// Close stdin to signal EOF to the plugin.
 	_ = s.stdin.Close()
@@ -534,6 +533,7 @@ func (s *pluginSession) shutdown(grace time.Duration) error {
 		select {
 		case err := <-exited:
 			_ = s.stdout.Close()
+			<-s.done
 			return err
 		case <-time.After(grace):
 			// fall through to kill
@@ -544,24 +544,8 @@ func (s *pluginSession) shutdown(grace time.Duration) error {
 	}
 	_ = s.stdout.Close()
 	_ = s.cmd.Wait()
+	<-s.done
 	return nil
-}
-
-// closeWorkOnce shuts the work channel exactly once. Done via the dead
-// mutex to coordinate with run()'s exit path.
-func (s *pluginSession) closeWorkOnce() {
-	s.deadMu.Lock()
-	defer s.deadMu.Unlock()
-	if s.deadFl {
-		return
-	}
-	defer func() {
-		// run() holds no reference once we close — it will exit on
-		// the next channel read. Recover from a double-close which
-		// can race with run()'s own markDead path.
-		_ = recover()
-	}()
-	close(s.work)
 }
 
 // markDead flips the dead flag once the owner goroutine exits.
