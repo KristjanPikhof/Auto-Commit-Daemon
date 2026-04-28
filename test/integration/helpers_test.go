@@ -84,36 +84,10 @@ func buildAcdBinary(t *testing.T) string {
 	return acdBinary
 }
 
-// runtimeCaller is split out so we can swap implementations in tests if
-// needed. It returns the absolute path of the file that declares it.
+// runtimeCaller returns runtime.Caller(1) for the test source file. Used
+// once at process startup to locate the repo root for `go build`.
 func runtimeCaller() (uintptr, string, int, bool) {
-	return runtimeCallerImpl(1)
-}
-
-// runtimeCallerImpl wraps runtime.Caller for a slightly clearer call site.
-func runtimeCallerImpl(skip int) (uintptr, string, int, bool) {
-	pc, file, line, ok := runtime_Caller(skip + 1)
-	return pc, file, line, ok
-}
-
-// runtime_Caller is a thin shim so we can avoid an import cycle between this
-// file and the runtime package alias. Using runtime directly is fine.
-func runtime_Caller(skip int) (uintptr, string, int, bool) {
-	return runtimeCallerStdlib(skip + 1)
-}
-
-// runtimeCallerStdlib calls into runtime.Caller via the stdlib without
-// requiring an import alias dance up the file. Kept as a one-liner for
-// readability; the helper layering above lets tests stub in synthetic source
-// paths if we ever need to (we don't today).
-func runtimeCallerStdlib(skip int) (uintptr, string, int, bool) {
-	return runtime_CallerActual(skip + 1)
-}
-
-// runtime_CallerActual is the actual stdlib call. Pulled out so the chain
-// above keeps the indirection symmetrical.
-func runtime_CallerActual(skip int) (uintptr, string, int, bool) {
-	return runtime.Caller(skip + 1)
+	return runtime.Caller(1)
 }
 
 // tempRepo creates a fresh git repo with one seed commit so HEAD resolves
