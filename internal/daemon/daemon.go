@@ -329,16 +329,32 @@ func Run(ctx context.Context, opts Options) error {
 		shutdownCh = sig.Shutdown
 	}
 
-	// Resolve the active branch ref / generation up-front. Production
-	// callers will eventually rebuild this on a HEAD change; Phase 1
-	// keeps it stable across the loop.
+	// Resolve the active branch ref / generation up-front. The generation
+	// counter is loaded from daemon_meta so a daemon restart preserves the
+	// last-known value — otherwise queued events captured under generation
+	// N would look fresh against an in-memory seed of 1, defeating the
+	// stale-event guard at replay time. The first daemon run on a new
+	// repo gets the legacy default (1).
 	branchRef, headOID := resolveBranch(ctx, opts.RepoPath, logger)
+	persistedGen, err := LoadBranchGeneration(ctx, opts.DB)
+	if err != nil {
+		logger.Warn("load persisted branch generation", "err", err.Error())
+		persistedGen = 1
+	}
 	cctx := CaptureContext{
 		BranchRef:        branchRef,
-		BranchGeneration: 1,
+		BranchGeneration: persistedGen,
 		BaseHead:         headOID,
 	}
 	currentToken, _ := BranchGenerationToken(ctx, opts.RepoPath)
+	// Persist the seed observation so the next divergence has a baseline
+	// to compare against. Best-effort — log but do not fail on write.
+	if err := SaveBranchGeneration(ctx, opts.DB, cctx.BranchGeneration, headOID); err != nil {
+		logger.Warn("seed branch generation", "err", err.Error())
+	}
+	if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
+		logger.Warn("seed branch token", "err", err.Error())
+	}
 
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
