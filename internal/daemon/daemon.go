@@ -247,7 +247,7 @@ func Run(ctx context.Context, opts Options) error {
 		} else if opts.MessageProviderCloser != nil {
 			providerCloser = opts.MessageProviderCloser
 		}
-		msgFn = providerMessageFn(provider)
+		msgFn = providerMessageFn(provider, opts.RepoPath)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
