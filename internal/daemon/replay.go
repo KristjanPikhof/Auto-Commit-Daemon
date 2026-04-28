@@ -60,7 +60,7 @@ type ReplayOpts struct {
 // ReplaySummary describes one drain.
 type ReplaySummary struct {
 	Published int // events that produced a new commit
-	Conflicts int // events deferred via publish_state.status=conflict
+	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 }
 
