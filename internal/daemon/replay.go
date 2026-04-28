@@ -410,19 +410,23 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason
 		ev.Message, nowSec)
 }
 
-// recordConflict updates publish_state to flag the conflict but leaves the
-// event row in `pending` so the next pass can retry once the operator has
-// reconciled the index. Mirrors the legacy "blocked_conflict" surface but
-// uses the simpler `conflict` status the v1 schema documents.
+// recordConflict terminally settles the event in
+// state.EventStateBlockedConflict and synchronously upserts the singleton
+// publish_state row to status="blocked_conflict" — both writes happen in one
+// transaction via state.MarkEventBlocked so a status reader never observes a
+// stale half-update.
+//
+// The event row leaves `pending` permanently. PendingEvents will skip it on
+// every subsequent poll, so a stuck event no longer blocks the queue with
+// retry churn. Operators see the row via `acd status` (blocked_conflicts
+// count) and via daemon_meta.last_replay_conflict for the human message.
 func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string, cctx CaptureContext) {
-	_ = state.SavePublishState(ctx, db, state.Publish{
-		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
-		SourceHead:       sql.NullString{String: cctx.BaseHead, Valid: true},
-		Status:           "conflict",
-		Error:            sql.NullString{String: reason, Valid: true},
-	})
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	_ = state.MarkEventBlocked(ctx, db, ev.Seq, reason, nowSec,
+		sql.NullString{String: cctx.BranchRef, Valid: true},
+		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		sql.NullString{String: cctx.BaseHead, Valid: true},
+	)
 	_ = state.MetaSet(ctx, db, "last_replay_conflict",
 		fmt.Sprintf("seq=%d: %s", ev.Seq, reason))
 }
