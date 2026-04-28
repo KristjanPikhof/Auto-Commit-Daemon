@@ -194,6 +194,78 @@ ORDER BY seq ASC`
 	return out, nil
 }
 
+// CountEventsByState returns the number of capture_events rows matching the
+// given state (e.g. EventStateBlockedConflict, EventStateFailed). Useful for
+// `acd status` to surface terminal-failure counts distinct from the FIFO
+// pending depth.
+func CountEventsByState(ctx context.Context, d *DB, state string) (int, error) {
+	var n int
+	if err := d.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count events by state: %w", err)
+	}
+	return n, nil
+}
+
+// MarkEventBlocked atomically settles a capture_events row in
+// EventStateBlockedConflict and upserts the singleton publish_state row to
+// status="blocked_conflict" within a single transaction. This pairs the two
+// surfaces so a status reader never sees a "blocked" event with a stale
+// publish_state, or vice versa.
+//
+// errMsg is recorded on both rows. publishedTS is stamped on capture_events
+// (terminal timestamp); publish_state.updated_ts is stamped now.
+func MarkEventBlocked(ctx context.Context, d *DB, seq int64, errMsg string, publishedTS float64,
+	branchRef sql.NullString, branchGeneration sql.NullInt64, sourceHead sql.NullString,
+) error {
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: begin block tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const updEvent = `
+UPDATE capture_events SET
+    state        = ?,
+    error        = ?,
+    published_ts = ?
+WHERE seq = ?`
+	if _, err := tx.ExecContext(ctx, updEvent,
+		EventStateBlockedConflict,
+		sql.NullString{String: errMsg, Valid: true},
+		publishedTS, seq); err != nil {
+		return fmt.Errorf("state: mark event blocked: %w", err)
+	}
+
+	const upsertPub = `
+INSERT INTO publish_state(
+    id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid,
+    status, error, updated_ts
+) VALUES (1, ?, ?, ?, ?, NULL, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    event_seq         = excluded.event_seq,
+    branch_ref        = excluded.branch_ref,
+    branch_generation = excluded.branch_generation,
+    source_head       = excluded.source_head,
+    target_commit_oid = excluded.target_commit_oid,
+    status            = excluded.status,
+    error             = excluded.error,
+    updated_ts        = excluded.updated_ts`
+	if _, err := tx.ExecContext(ctx, upsertPub,
+		sql.NullInt64{Int64: seq, Valid: true},
+		branchRef, branchGeneration, sourceHead,
+		"blocked_conflict",
+		sql.NullString{String: errMsg, Valid: true},
+		publishedTS); err != nil {
+		return fmt.Errorf("state: upsert blocked publish_state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: commit block tx: %w", err)
+	}
+	return nil
+}
+
 // LoadCaptureOps returns ordered ops for an event seq.
 func LoadCaptureOps(ctx context.Context, d *DB, seq int64) ([]CaptureOp, error) {
 	const q = `
