@@ -130,6 +130,10 @@ func gitInit(t *testing.T, dir string) {
 	if out, err := exec.Command("git", "init", "-q", dir).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, out)
 	}
+	// Force branch to main regardless of host's init.defaultBranch.
+	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "HEAD", "refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v\n%s", err, out)
+	}
 }
 
 // runGitOK runs `git -C dir args...` and fails the test on non-zero exit.
