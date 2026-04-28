@@ -40,9 +40,9 @@ curl -fsSL "$SUMS_URL" -o "$TMP/checksums.txt"
 
 # Verify checksum (works on both macOS and Linux)
 if command -v sha256sum >/dev/null 2>&1; then
-  ( cd "$TMP" && grep "acd_${VERSION}_${OS}_${ARCH}.tar.gz" checksums.txt | sha256sum -c - )
+  ( cd "$TMP" && grep "acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz" checksums.txt | sha256sum -c - )
 elif command -v shasum >/dev/null 2>&1; then
-  ( cd "$TMP" && grep "acd_${VERSION}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c - )
+  ( cd "$TMP" && grep "acd_${VERSION_NUM}_${OS}_${ARCH}.tar.gz" checksums.txt | shasum -a 256 -c - )
 else
   echo "warning: no sha256 verifier found; skipping checksum check" >&2
 fi
