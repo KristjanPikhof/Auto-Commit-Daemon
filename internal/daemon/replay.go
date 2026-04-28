@@ -139,10 +139,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			continue
 		}
 
-		// Conflict probe: compare live staged index against each op's
-		// before-state. Mismatch -> mark conflict, skip (event stays
-		// pending for the next pass after operator resolution).
-		if reason, err := detectConflict(ctx, repoRoot, ops); err != nil {
+		// Conflict probe: compare the per-replay scratch index (seeded
+		// from BaseHead and advanced by every prior queued event) against
+		// each op's before-state. The repo's live index is intentionally
+		// NOT inspected — a busy worktree that has moved ahead of the
+		// queue would otherwise spuriously reject valid sequenced events
+		// (e.g. an A→B→C→D modify chain whose disk state already shows D).
+		//
+		// Mirrors snapshot-replay._verify_op against the in-memory state
+		// dict seeded from snapshot_state_for_index over the GIT_INDEX_FILE
+		// scratch index.
+		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
 			recordConflict(ctx, db, ev, reason, cctx)
