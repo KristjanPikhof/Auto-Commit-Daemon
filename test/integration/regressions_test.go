@@ -109,24 +109,31 @@ func waitMode(t *testing.T, repo, want string, timeout time.Duration) {
 	})
 }
 
-// waitForCommitContaining polls `git show HEAD --name-only` until it
-// includes path, or the timeout fires. Returns the matched HEAD oid.
+// waitForCommitContaining polls `git log --name-only` across all commits
+// until path appears, or the timeout fires. Returns the matched commit oid.
+// Scanning the full log (not just HEAD) tolerates the daemon producing
+// multiple atomic commits before the target path lands.
 func waitForCommitContaining(t *testing.T, repo, path string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if names, err := runGit(repo, "show", "--name-only", "--pretty=", "HEAD"); err == nil {
+		if names, err := runGit(repo, "log", "--all", "--name-only", "--pretty=format:COMMIT %H"); err == nil {
+			currentCommit := ""
 			for _, line := range strings.Split(names, "\n") {
-				if strings.TrimSpace(line) == path {
-					head, _ := runGit(repo, "rev-parse", "HEAD")
-					return strings.TrimSpace(head)
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "COMMIT ") {
+					currentCommit = strings.TrimPrefix(line, "COMMIT ")
+					continue
+				}
+				if line == path {
+					return currentCommit
 				}
 			}
 		}
 		time.Sleep(75 * time.Millisecond)
 	}
-	out, _ := runGit(repo, "show", "--name-only", "--pretty=", "HEAD")
-	t.Fatalf("HEAD did not include %q within %v\nlast show:\n%s", path, timeout, out)
+	out, _ := runGit(repo, "log", "--all", "--name-only", "--pretty=format:%h %s")
+	t.Fatalf("history did not include %q within %v\nlast log:\n%s", path, timeout, out)
 	return ""
 }
 
