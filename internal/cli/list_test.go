@@ -18,14 +18,14 @@ func TestList_Human_TwoRepos(t *testing.T) {
 
 	repoA, dbA, dA := makeRepoStateDB(t)
 	if err := state.SaveDaemonState(ctx, dA, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save A: %v", err)
 	}
 
 	repoB, dbB, dB := makeRepoStateDB(t)
 	if err := state.SaveDaemonState(ctx, dB, state.DaemonState{
-		PID: 2, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save B: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestList_JSON_TwoRepos(t *testing.T) {
 
 	repoA, dbA, dA := makeRepoStateDB(t)
 	if err := state.SaveDaemonState(ctx, dA, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save A: %v", err)
 	}
