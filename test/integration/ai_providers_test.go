@@ -401,4 +401,3 @@ exit 0
 		t.Fatalf("no commit carried the plugin subject 'first ok'; subjects=%v", subjects)
 	}
 }
-
