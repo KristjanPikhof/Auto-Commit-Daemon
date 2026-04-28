@@ -246,6 +246,44 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, dbPath string) boo
 	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
 	}
+
+	// Pending FIFO depth + terminal blocked-conflict count.
+	// Best-effort: a missing capture_events table (older schema) yields a
+	// note rather than failing the whole doctor run.
+	if n, err := state.CountEventsByState(ctx, d, state.EventStatePending); err == nil {
+		rr.PendingEvents = n
+	} else {
+		rr.Notes = append(rr.Notes, "pending events count failed: "+err.Error())
+	}
+	if n, err := state.CountEventsByState(ctx, d, state.EventStateBlockedConflict); err == nil {
+		rr.BlockedConflicts = n
+	} else {
+		rr.Notes = append(rr.Notes, "blocked conflicts count failed: "+err.Error())
+	}
+
+	// Most recent terminal blocked_conflict event — gives the operator a
+	// concrete path + timestamp to investigate without rummaging the DB.
+	if rr.BlockedConflicts > 0 {
+		row := d.SQL().QueryRowContext(ctx,
+			`SELECT path, published_ts, error FROM capture_events
+			 WHERE state = ?
+			 ORDER BY seq DESC LIMIT 1`, state.EventStateBlockedConflict)
+		var path string
+		var ts sql.NullFloat64
+		var errMsg sql.NullString
+		if err := row.Scan(&path, &ts, &errMsg); err == nil {
+			rr.LastReplayConflictPath = path
+			if ts.Valid {
+				rr.LastReplayConflictTS = int64(ts.Float64)
+			}
+			if errMsg.Valid {
+				rr.LastReplayConflictErr = errMsg.String
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			rr.Notes = append(rr.Notes, "last replay conflict lookup failed: "+err.Error())
+		}
+	}
+
 	return true
 }
 
