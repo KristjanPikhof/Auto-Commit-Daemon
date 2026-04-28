@@ -547,11 +547,12 @@ func Run(ctx context.Context, opts Options) error {
 			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
 			cctx.BranchRef = branchRef
 			cctx.BaseHead = headOID
+			oldToken := currentToken
 			currentToken = newToken
 			if transition == TokenTransitionDiverged {
 				cctx.BranchGeneration++
 				logger.Info("branch generation bumped",
-					"old", currentToken, "new", newToken,
+					"old", oldToken, "new", newToken,
 					"generation", cctx.BranchGeneration,
 					"transition", transition.String())
 				if err := SaveBranchGeneration(ctx, opts.DB,
@@ -564,7 +565,7 @@ func Run(ctx context.Context, opts Options) error {
 				// transition compares against the latest baseline,
 				// but keep the generation counter put.
 				logger.Debug("branch fast-forwarded",
-					"old", currentToken, "new", newToken,
+					"old", oldToken, "new", newToken,
 					"generation", cctx.BranchGeneration)
 				if err := SaveBranchGeneration(ctx, opts.DB,
 					cctx.BranchGeneration, headOID); err != nil {
