@@ -188,9 +188,9 @@ func TestRepoHash_PinnedFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RepoHash: %v", err)
 	}
-	// sha256("/repo/path") = b6c66ad3f2f6ee3527c25d2e0c1e7b3d3b8b91...
-	// Computed via: printf -- "/repo/path" | shasum -a 256
-	const want = "b6c66ad3f2f6"
+	// sha256("/repo/path") truncated to 12 hex.
+	// Computed via: printf -- "/repo/path" | shasum -a 256 | cut -c1-12
+	const want = "9fb54e78c9f3"
 	if got != want {
 		t.Fatalf("RepoHash(/repo/path) = %q; want %q", got, want)
 	}
