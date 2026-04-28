@@ -70,10 +70,10 @@ func TestGC_DropsDeadDaemon30dOld(t *testing.T) {
 	repo, db, d := makeRepoStateDB(t)
 	registerRepo(t, roots, repo, db, "claude-code")
 
-	// Heartbeat older than 30 days, PID guaranteed not alive.
+	// Heartbeat older than 30 days, PID guaranteed not alive (out of pid_max range).
 	old := float64(time.Now().Add(-40 * 24 * time.Hour).Unix())
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: old,
+		PID: 0x7fffffff, Mode: "running", HeartbeatTS: old,
 	}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
