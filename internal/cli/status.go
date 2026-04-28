@@ -45,6 +45,7 @@ type statusReport struct {
 	BranchGenToken      string         `json:"branch_generation_token,omitempty"`
 	Clients             []statusClient `json:"clients"`
 	PendingEvents       int            `json:"pending_events"`
+	BlockedConflicts    int            `json:"blocked_conflicts"`
 	LastCommitOID       string         `json:"last_commit_oid,omitempty"`
 	LastCommitTS        int64          `json:"last_commit_ts,omitempty"`
 	LastCommitMessage   string         `json:"last_commit_message,omitempty"`
