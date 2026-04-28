@@ -137,6 +137,21 @@ type Options struct {
 	// FlushLimit caps how many flush_requests are drained per iteration.
 	// Zero means "drain them all". Tests set it to 1 for tighter control.
 	FlushLimit int
+
+	// FsnotifyEnabled turns on the recursive fsnotify watcher (D11 hybrid).
+	// Default is false so the existing test suite keeps deterministic
+	// poll-only timing; production callers (and the integration test) opt
+	// in by setting this true. Even when true, ACD_DISABLE_FSNOTIFY=1
+	// forces poll-only mode at watcher construction time.
+	FsnotifyEnabled bool
+
+	// FsnotifyDebounce overrides the trailing-edge debounce on fsnotify
+	// wakes. Zero falls back to DefaultDebounce.
+	FsnotifyDebounce time.Duration
+
+	// FsnotifyMaxWatches caps the OS watch budget. Zero asks the watcher
+	// to derive a sensible default from the platform.
+	FsnotifyMaxWatches int
 }
 
 // resolveClientTTL honors EnvClientTTLSeconds + opt.
