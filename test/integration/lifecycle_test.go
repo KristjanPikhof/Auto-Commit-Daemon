@@ -224,5 +224,4 @@ func TestLifecycle_StartTwiceSameSession(t *testing.T) {
 	waitFor(t, "post-cleanup mode==stopped", 5*time.Second, func() bool {
 		return readDaemonStateMode(repo) == "stopped"
 	})
-	_ = fmt.Sprintf // keep fmt import if we ever extend logging
 }
