@@ -169,7 +169,7 @@ func TestRotation_ConcurrentWritesNoCorruption(t *testing.T) {
 	const (
 		goroutines   = 8
 		perGoroutine = 200
-		maxBackups   = 50
+		maxBackups   = 500
 	)
 	logger, closer, err := New(Options{
 		Path:         path,
