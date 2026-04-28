@@ -33,6 +33,12 @@ func newCaptureFixture(t *testing.T) *captureFixture {
 	if err := git.Init(ctx, dir); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	// Force HEAD onto refs/heads/main regardless of host's init.defaultBranch
+	// (CI runners default to master; the fixture's CaptureContext is pinned
+	// to refs/heads/main).
+	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
 	// Configure identity so commit-tree works on hosts without git config.
 	for _, kv := range [][]string{
 		{"user.email", "acd-test@example.com"},
