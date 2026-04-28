@@ -328,7 +328,9 @@ type pluginSession struct {
 	logger *slog.Logger
 
 	work chan pluginRequest
-	done chan struct{}
+	done chan struct{}    // closed when run() exits
+	quit chan struct{}    // closed by shutdown to ask run() to exit promptly
+	quitOnce sync.Once
 
 	deadMu sync.Mutex
 	deadFl bool
