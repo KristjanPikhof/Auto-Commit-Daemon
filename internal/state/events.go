@@ -157,6 +157,10 @@ WHERE seq = ?`
 
 // PendingEvents returns up to limit pending events ordered by seq ascending
 // (FIFO replay). limit <= 0 means "no limit".
+//
+// Only rows with state = EventStatePending are returned. Terminal states
+// (published, failed, blocked_conflict) are intentionally excluded so a
+// stuck event does not re-run on every poll tick — see EventStateBlockedConflict.
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
 	q := `
 SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
