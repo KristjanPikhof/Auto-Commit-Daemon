@@ -162,6 +162,138 @@ func TestReplay_Conflict(t *testing.T) {
 	}
 }
 
+// TestReplay_ModifyChain_OrderedReplay regression-tests the scratch-index
+// refactor: when four captured blob states A→B→C→D are queued for the same
+// path as three sequential `modify` events, replay must commit them in
+// order even when the live worktree (and live index) have moved past A.
+//
+// Pre-fix this failed with "modify before-state mismatch" because the
+// conflict probe consulted the live repo index, which was empty for
+// chain.txt — the daemon never `git add`s captured blobs. The fix seeds an
+// isolated GIT_INDEX_FILE from BaseHead and advances it per event, so each
+// event's before-state matches the prior event's after-state.
+func TestReplay_ModifyChain_OrderedReplay(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Hash four blob states A, B, C, D.
+	a, err := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	if err != nil {
+		t.Fatalf("hash A: %v", err)
+	}
+	b, err := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	if err != nil {
+		t.Fatalf("hash B: %v", err)
+	}
+	c, err := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	if err != nil {
+		t.Fatalf("hash C: %v", err)
+	}
+	d, err := git.HashObjectStdin(ctx, f.dir, []byte("D\n"))
+	if err != nil {
+		t.Fatalf("hash D: %v", err)
+	}
+
+	// Seed BaseHead with chain.txt=A. The fixture's seed commit only
+	// carried .gitignore; rewrite HEAD to a tree that also pins chain.txt
+	// to blob A so the scratch index sees it as the chain's prior state.
+	gitignoreBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("ignored.txt\n"))
+	if err != nil {
+		t.Fatalf("hash gitignore: %v", err)
+	}
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: gitignoreBlob, Path: ".gitignore"},
+		{Mode: git.RegularFileMode, Type: "blob", OID: a, Path: "chain.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	commit, err := git.CommitTree(ctx, f.dir, tree, "seed: chain.txt=A")
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	// Move main onto the new commit. Use empty-old to bypass CAS — the
+	// fixture is single-threaded and the prior tip is irrelevant for the
+	// regression.
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, commit, ""); err != nil {
+		t.Fatalf("update-ref: %v", err)
+	}
+	f.cctx.BaseHead = commit
+
+	// Live worktree drifts ahead to D — this is the situation the old
+	// live-index probe could not handle.
+	if err := os.WriteFile(filepath.Join(f.dir, "chain.txt"), []byte("D\n"), 0o644); err != nil {
+		t.Fatalf("write chain.txt: %v", err)
+	}
+
+	// Queue three modify events forming the chain A→B, B→C, C→D.
+	chain := []struct{ before, after string }{
+		{a, b},
+		{b, c},
+		{c, d},
+	}
+	for _, step := range chain {
+		ev := state.CaptureEvent{
+			BranchRef:        f.cctx.BranchRef,
+			BranchGeneration: f.cctx.BranchGeneration,
+			BaseHead:         f.cctx.BaseHead,
+			Operation:        "modify",
+			Path:             "chain.txt",
+			Fidelity:         "rescan",
+		}
+		op := state.CaptureOp{
+			Op:         "modify",
+			Path:       "chain.txt",
+			BeforeOID:  sql.NullString{String: step.before, Valid: true},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:   sql.NullString{String: step.after, Valid: true},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:   "rescan",
+		}
+		if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+			t.Fatalf("AppendCaptureEvent: %v", err)
+		}
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 3 {
+		t.Fatalf("Published=%d want 3 (sum=%+v)", sum.Published, sum)
+	}
+	if sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected conflicts/failed: %+v", sum)
+	}
+
+	// Walk the resulting log and assert chain.txt's blob progresses
+	// A → B → C → D commit-by-commit. log --reverse so [0] is the seed.
+	out, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "--reverse", "--format=%H", f.cctx.BranchRef)
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	hashes := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(hashes) != 4 {
+		t.Fatalf("expected 4 commits (seed+3), got %d:\n%s", len(hashes), out)
+	}
+	wantBlobs := []string{a, b, c, d}
+	for i, h := range hashes {
+		entries, err := git.LsTree(ctx, f.dir, h, false, "chain.txt")
+		if err != nil {
+			t.Fatalf("ls-tree %s: %v", h, err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("commit %d (%s) chain.txt missing: %+v", i, h, entries)
+		}
+		if entries[0].OID != wantBlobs[i] {
+			t.Fatalf("commit %d (%s) chain.txt blob=%s want %s", i, h, entries[0].OID, wantBlobs[i])
+		}
+	}
+}
+
 // TestDeterministicMessage_Format: subject lines for each op kind plus a
 // multi-op event match the legacy format.
 func TestDeterministicMessage_Format(t *testing.T) {
