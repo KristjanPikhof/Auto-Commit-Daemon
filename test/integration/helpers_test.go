@@ -98,12 +98,6 @@ func buildAcdBinary(t *testing.T) string {
 	return acdBinary
 }
 
-// runtimeCaller returns runtime.Caller(1) for the test source file. Used
-// once at process startup to locate the repo root for `go build`.
-func runtimeCaller() (uintptr, string, int, bool) {
-	return runtime.Caller(1)
-}
-
 // tempRepo creates a fresh git repo with one seed commit so HEAD resolves
 // for capture+replay. Returns the absolute repo dir; the caller owns no
 // cleanup beyond t.TempDir's automatic teardown.
