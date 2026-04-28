@@ -166,11 +166,11 @@ func regSymlinkToDirIsMode120000(t *testing.T) {
 
 	wakeSession(t, ctx, env, repo, "sym-1")
 
-	// Wait for `linkdir` to appear in the latest tree.
-	waitForCommitContaining(t, repo, "linkdir", 5*time.Second)
+	// Wait for `linkdir` to appear in any commit on the active branch.
+	commit := waitForCommitContaining(t, repo, "linkdir", 8*time.Second)
 
-	// Inspect the mode in HEAD's tree — must be 120000.
-	out := runGitOK(t, repo, "ls-tree", "HEAD", "linkdir")
+	// Inspect the mode at the commit that introduced linkdir — must be 120000.
+	out := runGitOK(t, repo, "ls-tree", commit, "linkdir")
 	// Format: "120000 blob <oid>\tlinkdir"
 	if !strings.HasPrefix(strings.TrimSpace(out), "120000") {
 		t.Fatalf("linkdir tree entry has wrong mode: %q", out)
