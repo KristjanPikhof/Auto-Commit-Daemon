@@ -913,25 +913,37 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 		})
 	}()
 
-	// Wait for the daemon to seed daemon_meta.branch.generation = 1.
-	deadline := time.Now().Add(2 * time.Second)
+	// Wait for the daemon to seed daemon_meta.branch.generation = 1 AND
+	// daemon_meta.branch.head to point at the seed commit. Without the
+	// head check the run loop's first iteration can still be on the path
+	// from "" -> seed and treat the upcoming sibling reset as the boot
+	// transition.
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
-		if ok && v == "1" {
+		gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+		head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+		if gen == "1" && head == seedHead {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
 	// External reset: point main at the sibling. The daemon's next tick
-	// must classify this as a divergence.
+	// must classify this as a divergence. Send several wakes so we don't
+	// race a single buffered slot against a busy iteration.
 	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", sibling, ""); err != nil {
 		t.Fatalf("update-ref to sibling: %v", err)
 	}
-	wakeCh <- struct{}{}
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// Poll for the persisted generation to bump above 1.
-	deadline = time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	var got string
 	for time.Now().Before(deadline) {
 		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
