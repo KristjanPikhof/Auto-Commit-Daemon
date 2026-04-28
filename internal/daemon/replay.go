@@ -70,11 +70,21 @@ type ReplaySummary struct {
 // poll-tick. Coalescing OFF — each event becomes its own commit, with the
 // previous event's commit as the new HEAD's parent.
 //
-// Conflict semantics: when the live index for any path touched by an event
-// disagrees with the event's before-state, the event is left pending and
-// publish_state.status is updated to "conflict". The daemon surfaces the
-// conflict via daemon_meta.last_replay_conflict; resolution is the
+// Conflict semantics: when the scratch replay index for any path touched by
+// an event disagrees with the event's before-state, OR the branch ref CAS
+// fails on update-ref, the event is settled in state.EventStateBlockedConflict
+// (terminal — never retried automatically) and publish_state.status is set
+// to "blocked_conflict". The daemon also stamps daemon_meta.last_replay_conflict
+// so operators can spot a divergence at a glance. Resolution is the
 // operator's job (out of scope for v1 automation).
+//
+// Batch halt: a conflict or commit-build failure short-circuits the rest of
+// the pending queue. Subsequent events were captured assuming the broken
+// predecessor would land first; replaying them on top of a stale parent
+// would produce a tree that diverges from the operator's intent. The next
+// poll tick sees those events still pending and re-attempts them only after
+// the operator has reconciled the blocker (which advances BaseHead /
+// branch_generation and lets the queue drain naturally).
 func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
 	var sum ReplaySummary
 	if repoRoot == "" || db == nil {
