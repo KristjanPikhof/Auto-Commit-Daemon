@@ -167,14 +167,16 @@ func dashIfMissing(status, val string) string {
 
 // repoSummary is the subset of state.db fields the CLI needs.
 type repoSummary struct {
-	daemon        string
-	pid           int
-	clients       int
-	lastSeq       int64
-	lastCommitOID string
-	heartbeatAge  time.Duration
-	startedTS     float64
-	heartbeatTS   float64
+	daemon           string
+	pid              int
+	clients          int
+	lastSeq          int64
+	lastCommitOID    string
+	heartbeatAge     time.Duration
+	startedTS        float64
+	heartbeatTS      float64
+	pendingEvents    int
+	blockedConflicts int
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
