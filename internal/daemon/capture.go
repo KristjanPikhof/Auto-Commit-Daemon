@@ -180,22 +180,21 @@ func toStateOp(op ClassifiedOp) state.CaptureOp {
 		Ord:        0,
 		Op:         op.Op,
 		Path:       op.Path,
-		OldPath:    nullStr(op.OldPath),
-		BeforeOID:  nullStr(op.BeforeOID),
-		BeforeMode: nullStr(op.BeforeMode),
-		AfterOID:   nullStr(op.AfterOID),
-		AfterMode:  nullStr(op.AfterMode),
+		OldPath:    nullString(op.OldPath),
+		BeforeOID:  nullString(op.BeforeOID),
+		BeforeMode: nullString(op.BeforeMode),
+		AfterOID:   nullString(op.AfterOID),
+		AfterMode:  nullString(op.AfterMode),
 		Fidelity:   op.Fidelity,
 	}
 }
 
-func nullStr(s string) (out struct {
-	String string
-	Valid  bool
-}) {
-	// no-op: actual sql.NullString constructed via sqlNullString below.
-	_ = s
-	return out
+// nullString wraps an empty/non-empty string as sql.NullString.
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 // walkOpts bundles inputs to walkLive so the function signature stays
