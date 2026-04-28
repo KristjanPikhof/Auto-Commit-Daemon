@@ -1,1 +1,10 @@
 .plan/
+/bin/
+/dist/
+*.test
+*.log
+.acd/
+.envrc.local
+*.zip
+.idea/
+.vscode/

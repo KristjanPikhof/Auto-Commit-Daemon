@@ -1,0 +1,32 @@
+{
+  "_acd_managed": true,
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "bash -c 'SID=$(jq -r .session_id <&0); acd start --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "command": "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "command": "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "bash -c 'SID=$(jq -r .session_id <&0); acd touch --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "command": "bash -c 'SID=$(jq -r .session_id <&0); acd stop --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+      }
+    ]
+  }
+}
