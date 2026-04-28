@@ -17,6 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
 	_ "modernc.org/sqlite"
 )
