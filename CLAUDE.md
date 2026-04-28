@@ -1,6 +1,4 @@
-# CLAUDE.md — Auto-Commit-Daemon
-
-Fast-access project brief for future Claude Code sessions. Read this first.
+# Agents Guide
 
 ## Identity
 
@@ -9,67 +7,6 @@ Fast-access project brief for future Claude Code sessions. Read this first.
 - **License**: MIT
 - **Versioning**: date-based, `vYYYY-MM-DD` (first tag: `v2026-04-28`)
 - **Platforms**: macOS (arm64, amd64), Linux (arm64, amd64). No Windows in v1.
-- **Mission**: greenfield Go reimplementation of the Python `atomic-commit-worktree-daemon`. Watches a git worktree, captures every meaningful change, lands atomic commits per file. Multi-harness (Claude Code, Codex, OpenCode, Pi, shell).
-
-## Source of truth
-
-- **Plan**: `.plan/acd.md` (gitignored). 2114 lines. Single canonical spec — sections referenced as `§N` throughout the codebase.
-- **Legacy reference**: `.plan/examples/atomic-commit-worktree-daemon/` (gitignored). Frozen Python implementation. Read-only museum exhibit; do not modify or attempt to run alongside `acd`.
-- `.plan/` is in `.gitignore` — all plan/legacy material stays out of git history by design.
-
-## Current state
-
-- **Phase 0–6**: DONE (epic `7c06148c-cbc3-4d86-91a5-f952693c276d`, merged via PR #1).
-- **First release published**: tag `v2026-04-28` on `main`; goreleaser workflow uploads 4 archives + `checksums.txt` (darwin/linux × amd64/arm64). Brew formula generation gated behind `--skip=homebrew` until tap repo + secrets exist.
-- **Open Phase 6 work** (user-side, not codable here):
-  - `KristjanPikhof/homebrew-tap` repo + `HOMEBREW_TAP_TOKEN` / `GH_PAT` secrets, then drop `--skip=homebrew` in `.github/workflows/release.yml`
-  - Re-verify `install.sh` / `brew install acd` / `go install …@latest` on fresh macOS arm64 + Ubuntu 22.04 amd64
-  - §1.4 success-criteria walkthrough on a fresh OS
-
-Use Trekoon as the live progress source: `trekoon --toon session --epic 7c06148c-cbc3-4d86-91a5-f952693c276d`. Do not duplicate task tracking elsewhere.
-
-## Locked decisions (do not renegotiate in v1)
-
-| ID  | Decision                                                                  |
-|-----|---------------------------------------------------------------------------|
-| D1  | Go 1.22+                                                                  |
-| D11 | fsnotify hybrid + poll fallback                                           |
-| D13 | Single binary; `acd daemon run` is the long-running entry                 |
-| D16 | SQLite driver: `modernc.org/sqlite` (pure Go, zero cgo)                   |
-| D17 | Git: subprocess to system `git`. **Never use `go-git`.**                  |
-| D18 | AI plugins: subprocess, JSON-over-stdin/stdout                            |
-| D19 | Logging: `log/slog` JSONL, rotated by size+age                            |
-| D20 | Heartbeat liveness primary; PID liveness fast-path when available         |
-| D21 | Default heartbeat TTL: 30 minutes (env `ACD_CLIENT_TTL_SECONDS`)          |
-
-Full list in `.plan/acd.md §2` (D1–D21).
-
-## Repo layout (canonical paths)
-
-```
-cmd/acd/main.go                       — entry; calls internal/cli.Execute
-internal/cli/                         — cobra root + subcommand stubs (Phase 0); replace stubRun in later phases
-internal/{daemon,state,central,adapter,git,ai,identity,logger,paths}/
-                                      — package stubs; each file has TODO(phase N) marker
-internal/version/version.go           — ldflags-injected Version + GitSHA
-templates/embed.go                    — package templates exposes embed.FS for adapter snippets
-templates/{claude-code,codex,opencode,pi,shell}/  — drop-in snippets + READMEs + uninstall docs
-scripts/install.sh, scripts/uninstall.sh, scripts/dev/*  — release + dev tooling
-.github/workflows/{ci,release,codeql}.yml
-.goreleaser.yaml                      — darwin+linux × amd64+arm64; brew tap auto-publish
-Makefile                              — build/test/lint/release-snapshot
-.plan/acd.md                          — spec (gitignored)
-.plan/examples/atomic-commit-worktree-daemon/  — legacy Python (gitignored, read-only)
-```
-
-State lives **inside** `.git/`:
-- Per-repo state DB: `<repo>/.git/acd/state.db` (greenfield, schema in `§6.1`)
-- Per-repo locks: `<repo>/.git/acd/{daemon,control}.lock`
-- Per-repo logs: `~/.local/state/acd/<repo-hash>/daemon.log`
-
-Central state at `~/.local/share/acd/`:
-- `registry.json` (atomic write + flock)
-- `stats.db` (append-only schema only — `ALTER TABLE ADD COLUMN` exclusively)
 
 ## Build / test / verify
 
@@ -98,17 +35,12 @@ go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 
 ## Conventions
 
-- **Commits**: atomic-commit hook is configured globally; every Edit/Write tool call auto-commits the touched file. Expect dozens of commits per scaffolding pass. Do not amend. If `go.mod`/`go.sum` shows up untracked (because `go get` did not go through the tool), commit explicitly.
 - **Stub format**: `package <name>` + `// TODO(phase N): <intent>`. Stubs must compile (no unused imports).
-- **Plan references**: cite section numbers (`§7.2`, `§8.5`) so readers can find the spec quickly.
 - **Markdown nested code**: README + adapter docs use `~~~` fences when nesting code blocks inside other code blocks.
 - **Embed**: `templates/embed.go` is the single embed point. Add new harness directories alongside existing ones and extend the `//go:embed` line.
-- **Caveman mode** is active in this user's environment for narration; code/commits/PRs/docs stay in normal English.
 
 ## Release & install gotchas
 
-- **Date tags are not semver.** `v2026-04-28` is not valid semver. Two consequences:
-  - `go install …@latest` ignores the tag and falls back to the most recent pseudo-version. Use `GOPROXY=direct go install …@v2026-04-28` (or `@<branch>`) to bypass the cache, or switch to semver in the future to fix permanently.
   - Goreleaser's `release.prerelease: auto` marks date tags as pre-release → `releases/latest` API returns nothing → `install.sh` can't resolve a version. `.goreleaser.yaml` now hardcodes `prerelease: false`. Existing pre-release releases must be flipped manually: `gh release edit <tag> --prerelease=false --latest`.
 - **Release workflow auth**: `.github/workflows/release.yml` uses `secrets.GITHUB_TOKEN` (built-in, auto-injected on every workflow run) for archive upload. The brew step needs `HOMEBREW_TAP_TOKEN` (PAT with repo scope on the tap repo) and is gated behind `--skip=homebrew` until that secret + tap repo exist.
 - **install.sh quirks**:
@@ -128,37 +60,34 @@ go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 
 ## Gotchas
 
-- **`.plan/` is gitignored** — anything in there will never reach git. Do not put runtime artifacts there.
 - **`modernc.org/sqlite`** drives the DB without cgo. If a target platform breaks, that is a §17.1 risk → STOP and surface options. Pinned at `v1.36.0` to keep the `go 1.22` directive (newer sqlite needs go ≥ 1.23).
 - **Symlinks**: always captured as mode `120000`. Never descend into a symlinked directory. The legacy daemon shipped a regression here; the Go port repeats the fix verbatim — fixture covers it (`TestCapture_SymlinkToDirAsMode120000`).
 - **Sensitive globs**: empty `ACD_SENSITIVE_GLOBS` falls back to defaults (security: never let a typo open the gate).
 - **Branch-generation token**: format `rev:<sha>` for an existing ref, `missing` otherwise. Same generation = fast-forward; bumped generation = force-push/reset.
-- **Trekoon compact-spec pipes**: literal `|` inside a description must be `\|`. Only `\|`, `\\`, `\n`, `\r`, `\t` are valid escapes.
-- **Phase 0 exit contract** (still useful for fresh checkouts): `make build` green, `make lint` clean, `make test` clean, `acd version` prints, `acd` no-args exits 1 with `acd: no command provided`. Any deviation = STOP.
-
-## Stop conditions (escalate to user)
-
-Per plan §"STOP CONDITIONS":
-1. A locked decision (D1–D21) does not match implementation reality.
-2. A regression test from the legacy daemon fails to port without behaviour change.
-3. A risk in §17.1 actually fires.
-4. The spec contradicts itself.
-5. You are 30+ minutes deep on one bug with no progress.
-
-In every stop condition: paste the failing command + last 50 lines of relevant output, propose 2–3 options, ask which path.
 
 ## Useful one-liners
 
 ```bash
-# Trekoon orient
-trekoon --toon session --epic 7c06148c-cbc3-4d86-91a5-f952693c276d
 
-# Trekoon next ready
-trekoon --toon task ready --epic 7c06148c-cbc3-4d86-91a5-f952693c276d --limit 5
-
-# Confirm Phase 0 binary still works
+# Confirm binary still works
 make build && ./bin/acd version
+
+# Refresh local install with newest source (needed after any templates/* edit)
+make build && install -m 0755 ./bin/acd ~/.local/bin/acd
 
 # Inspect git auto-commit history
 git log --oneline | head -30
+
+# Cut a new release (assumes secrets + workflow already healthy)
+git tag v2026-MM-DD && git push origin v2026-MM-DD && gh run watch
+
+# Re-tag the same date (delete + recreate; overwrites release artifacts)
+git tag -d v2026-04-28 && git push origin :v2026-04-28
+git tag v2026-04-28 && git push origin v2026-04-28
+
+# Fix a release that goreleaser auto-marked as pre-release
+gh release edit v2026-04-28 --prerelease=false --latest
+
+# Smoke test install.sh end-to-end (env override skips the releases/latest API)
+ACD_VERSION=v2026-04-28 sh scripts/install.sh
 ```
