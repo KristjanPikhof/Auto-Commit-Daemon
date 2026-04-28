@@ -193,6 +193,10 @@ func Run(ctx context.Context, opts Options) error {
 	if pruneEvery <= 0 {
 		pruneEvery = DefaultPruneInterval
 	}
+	rollupEvery := opts.RollupInterval
+	if rollupEvery <= 0 {
+		rollupEvery = DefaultRollupInterval
+	}
 	emptyThreshold := opts.EmptySweepThreshold
 	if emptyThreshold <= 0 {
 		emptyThreshold = DefaultEmptySweepThreshold
