@@ -30,7 +30,6 @@ func rootsForTest(t *testing.T) paths.Roots {
 }
 
 func TestRegistry_RoundTrip(t *testing.T) {
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	want := NewRegistry()
@@ -51,7 +50,6 @@ func TestRegistry_RoundTrip(t *testing.T) {
 }
 
 func TestRegistry_LoadMissingReturnsEmpty(t *testing.T) {
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	reg, err := Load(roots)
@@ -67,7 +65,6 @@ func TestRegistry_LoadMissingReturnsEmpty(t *testing.T) {
 }
 
 func TestRegistry_RejectFutureVersion(t *testing.T) {
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	if err := os.MkdirAll(roots.Share, 0o700); err != nil {
@@ -84,7 +81,6 @@ func TestRegistry_RejectFutureVersion(t *testing.T) {
 }
 
 func TestRegistry_UpsertIdempotent(t *testing.T) {
-	t.Parallel()
 	reg := NewRegistry()
 	reg.UpsertRepo("/tmp/x", "h1", "/tmp/x/.git/acd/state.db", "claude-code", 10)
 	reg.UpsertRepo("/tmp/x", "h1", "/tmp/x/.git/acd/state.db", "claude-code", 20)
@@ -103,7 +99,6 @@ func TestRegistry_UpsertIdempotent(t *testing.T) {
 }
 
 func TestRegistry_UpsertHarnessesDedupAndSort(t *testing.T) {
-	t.Parallel()
 	reg := NewRegistry()
 	reg.UpsertRepo("/tmp/y", "h2", "sd", "codex", 1)
 	reg.UpsertRepo("/tmp/y", "h2", "sd", "claude-code", 2)
@@ -122,7 +117,6 @@ func TestRegistry_UpsertHarnessesDedupAndSort(t *testing.T) {
 // document with all 10 rows present and the JSON well-formed at every
 // observation point.
 func TestRegistry_ConcurrentWriters(t *testing.T) {
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	const N = 10
@@ -211,7 +205,6 @@ func TestRegistry_AtomicWriteSurvivesPartial(t *testing.T) {
 	// by pre-populating registry.json with a known-good document, then
 	// dropping a half-written .tmp into the share dir, and verifying that
 	// Load still returns the original.
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	// Seed a good document.
@@ -250,19 +243,18 @@ func TestRegistry_AtomicWriteSurvivesPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after recover: %v", err)
 	}
-	paths := make([]string, 0, len(got.Repos))
+	gotPaths := make([]string, 0, len(got.Repos))
 	for _, r := range got.Repos {
-		paths = append(paths, r.Path)
+		gotPaths = append(gotPaths, r.Path)
 	}
-	sort.Strings(paths)
+	sort.Strings(gotPaths)
 	want := []string{"/tmp/another", "/tmp/seed"}
-	if !reflect.DeepEqual(paths, want) {
-		t.Fatalf("paths=%v, want %v", paths, want)
+	if !reflect.DeepEqual(gotPaths, want) {
+		t.Fatalf("paths=%v, want %v", gotPaths, want)
 	}
 }
 
 func TestRegistry_FilePermissionsAndLayout(t *testing.T) {
-	t.Parallel()
 	roots := rootsForTest(t)
 
 	if err := WithLock(roots, func(r *Registry) error {
