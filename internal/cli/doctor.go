@@ -303,6 +303,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		fmt.Fprintf(out, "      hash       : %s\n", rr.RepoHash)
 		fmt.Fprintf(out, "      daemon     : %s (pid %d, alive=%v)\n", mode, rr.DaemonPID, rr.DaemonAlive)
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
+		if rr.FsnotifyMode != "" {
+			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
+				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
+			if rr.FsnotifyFallbackReason != "" {
+				fmt.Fprintf(out, " fallback=%s", rr.FsnotifyFallbackReason)
+			}
+			fmt.Fprintln(out)
+		}
 		if rr.LastCaptureError != "" {
 			fmt.Fprintf(out, "      last error : %s\n", rr.LastCaptureError)
 		}
