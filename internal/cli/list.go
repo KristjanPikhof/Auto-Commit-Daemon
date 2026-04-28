@@ -130,10 +130,11 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 	}
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tLAST_COMMIT\tSTATUS")
+	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tLAST_COMMIT\tSTATUS")
 	for _, e := range entries {
 		clients := dashIfMissing(e.Status, fmt.Sprintf("%d", e.Clients))
-		pending := dashIfMissing(e.Status, "0")
+		pending := dashIfMissing(e.Status, fmt.Sprintf("%d", e.PendingEvents))
+		blocked := dashIfMissing(e.Status, fmt.Sprintf("%d", e.BlockedConflicts))
 		lastOID := "-"
 		if e.LastCommitOID != "" {
 			if len(e.LastCommitOID) > 7 {
@@ -146,8 +147,8 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		if e.StatusNote != "" {
 			statusCol = e.Status + " (" + e.StatusNote + ")"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			homeShort(e.Path), e.Daemon, clients, pending, lastOID, statusCol)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			homeShort(e.Path), e.Daemon, clients, pending, blocked, lastOID, statusCol)
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("acd list: flush: %w", err)
