@@ -1,17 +1,24 @@
 # acd-managed: true
 
-[[hooks]]
-event = "SessionStart"
+[features]
+codex_hooks = true
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
 command = "bash -c 'SID=$(jq -r .session_id <&0); acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$PWD\"'"
 
-[[hooks]]
-event = "PreToolUse"
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
 command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\"'"
 
-[[hooks]]
-event = "PostToolUse"
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
 command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\"'"
 
-[[hooks]]
-event = "Stop"
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
 command = "bash -c 'SID=$(jq -r .session_id <&0); acd stop --session-id \"$SID\" --repo \"$PWD\"'"
