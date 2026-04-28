@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // repoHashLen is the truncation point for the repo short-hash.
@@ -36,6 +38,12 @@ func RepoHash(absRepoPath string) (string, error) {
 		return "", errors.New("paths: repo path must be absolute")
 	}
 	cleaned := filepath.Clean(absRepoPath)
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		cleaned = filepath.Clean(resolved)
+	}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		cleaned = strings.ToLower(cleaned)
+	}
 	sum := sha256.Sum256([]byte(cleaned))
 	return hex.EncodeToString(sum[:])[:repoHashLen], nil
 }
