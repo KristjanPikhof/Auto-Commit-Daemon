@@ -347,6 +347,21 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		fmt.Fprintf(out, "      hash       : %s\n", rr.RepoHash)
 		fmt.Fprintf(out, "      daemon     : %s (pid %d, alive=%v)\n", mode, rr.DaemonPID, rr.DaemonAlive)
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
+		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
+		if rr.BlockedConflicts > 0 {
+			fmt.Fprintf(out, "      blocked    : %d\n", rr.BlockedConflicts)
+			if rr.LastReplayConflictPath != "" {
+				bits := []string{rr.LastReplayConflictPath}
+				if rr.LastReplayConflictTS > 0 {
+					age := time.Since(time.Unix(rr.LastReplayConflictTS, 0))
+					bits = append(bits, formatDurationCompact(age)+" ago")
+				}
+				if rr.LastReplayConflictErr != "" {
+					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayConflictErr))
+				}
+				fmt.Fprintf(out, "      last conflict : %s\n", strings.Join(bits, " "))
+			}
+		}
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
 				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
