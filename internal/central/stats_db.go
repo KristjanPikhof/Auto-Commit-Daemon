@@ -88,6 +88,38 @@ func (s *StatsDB) Close() error {
 	return s.conn.Close()
 }
 
+// OpenAt opens (or creates) a central stats database at the given absolute
+// path. Useful for callers (e.g. the daemon run loop) that already have a
+// resolved StatsDBPath() and don't want to re-derive paths.Roots.
+//
+// Lifecycle and PRAGMA matrix are identical to Open — the only difference
+// is the path source.
+func OpenAt(ctx context.Context, dbPath string) (*StatsDB, error) {
+	if dbPath == "" {
+		return nil, fmt.Errorf("central: OpenAt: empty path")
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		return nil, fmt.Errorf("central: mkdir stats parent: %w", err)
+	}
+	dsn := buildStatsDSN(dbPath)
+	conn, err := sql.Open(statsDriverName, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("central: sql.Open stats: %w", err)
+	}
+	conn.SetMaxOpenConns(8)
+	conn.SetMaxIdleConns(4)
+	if err := conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("central: ping stats: %w", err)
+	}
+	s := &StatsDB{conn: conn, path: dbPath}
+	if err := s.bootstrap(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
 // Open opens (or creates) the central stats database under roots.Share. It
 //
 //  1. mkdir -p the share directory with 0o700,
