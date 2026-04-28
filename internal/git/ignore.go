@@ -155,8 +155,11 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 			}
 			fields[f] = string(tok[:len(tok)-1]) // strip NUL
 		}
-		// Ignored when source (gitignore file) is non-empty.
-		results[i] = fields[0] != ""
+		// Ignored when source (gitignore file) is non-empty AND the
+		// matched pattern is not a negation. Git emits negation
+		// patterns with a leading "!" — those un-ignore the path.
+		source, pattern := fields[0], fields[2]
+		results[i] = source != "" && !strings.HasPrefix(pattern, "!")
 	}
 	return results, nil
 }
