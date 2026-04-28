@@ -34,7 +34,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -104,6 +106,7 @@ func Load(roots paths.Roots) (*Registry, error) {
 	if reg.Repos == nil {
 		reg.Repos = []RepoRecord{}
 	}
+	reg.Normalize()
 	return &reg, nil
 }
 
@@ -181,11 +184,14 @@ func (r *Registry) UpsertRepo(path, repoHash, stateDB, harness string, now int64
 		return
 	}
 	for i := range r.Repos {
-		if r.Repos[i].Path == path {
+		if SameRepoPath(r.Repos[i].Path, path) {
 			row := &r.Repos[i]
 			// Refresh the metadata that may have changed since the row was
 			// first written (state_db can move if .git is relocated; the
 			// hash should not, but track it anyway for resilience).
+			if path != "" {
+				row.Path = path
+			}
 			if repoHash != "" {
 				row.RepoHash = repoHash
 			}
@@ -212,6 +218,84 @@ func (r *Registry) UpsertRepo(path, repoHash, stateDB, harness string, now int64
 		rec.Harnesses = []string{}
 	}
 	r.Repos = append(r.Repos, rec)
+}
+
+// Normalize merges duplicate repo records that refer to the same repository.
+// This repairs older registries where the same macOS/Windows path was saved
+// with different casing, or where equivalent paths resolve to the same
+// filesystem object.
+func (r *Registry) Normalize() {
+	if r == nil || len(r.Repos) < 2 {
+		return
+	}
+	out := make([]RepoRecord, 0, len(r.Repos))
+	for _, rec := range r.Repos {
+		merged := false
+		for i := range out {
+			if SameRepoPath(out[i].Path, rec.Path) {
+				mergeRepoRecord(&out[i], rec)
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			out = append(out, rec)
+		}
+	}
+	r.Repos = out
+}
+
+func mergeRepoRecord(dst *RepoRecord, src RepoRecord) {
+	if dst == nil {
+		return
+	}
+	if dst.FirstRegisteredTS == 0 ||
+		(src.FirstRegisteredTS > 0 && src.FirstRegisteredTS < dst.FirstRegisteredTS) {
+		dst.FirstRegisteredTS = src.FirstRegisteredTS
+	}
+	if src.LastSeenTS >= dst.LastSeenTS {
+		if src.Path != "" {
+			dst.Path = src.Path
+		}
+		if src.RepoHash != "" {
+			dst.RepoHash = src.RepoHash
+		}
+		if src.StateDB != "" {
+			dst.StateDB = src.StateDB
+		}
+		dst.LastSeenTS = src.LastSeenTS
+	}
+	for _, h := range src.Harnesses {
+		dst.Harnesses = addHarness(dst.Harnesses, h)
+	}
+}
+
+// SameRepoPath reports whether two registry paths identify the same repo.
+// Existing paths are compared by file identity. As a fallback, platforms
+// whose default filesystems are case-insensitive compare cleaned paths with
+// case folding so stale records from older binaries collapse predictably.
+func SameRepoPath(a, b string) bool {
+	if a == "" || b == "" {
+		return a == b
+	}
+	cleanA := filepath.Clean(a)
+	cleanB := filepath.Clean(b)
+	if cleanA == cleanB {
+		return true
+	}
+	infoA, errA := os.Stat(cleanA)
+	infoB, errB := os.Stat(cleanB)
+	if errA == nil && errB == nil && os.SameFile(infoA, infoB) {
+		return true
+	}
+	if pathCaseFoldedByDefault() {
+		return strings.EqualFold(cleanA, cleanB)
+	}
+	return false
+}
+
+func pathCaseFoldedByDefault() bool {
+	return runtime.GOOS == "darwin" || runtime.GOOS == "windows"
 }
 
 // addHarness returns the slice with name added if it was not already
