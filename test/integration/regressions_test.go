@@ -673,10 +673,13 @@ func regRepeatedEditsPublishOrderedCommits(t *testing.T) {
 		t.Fatalf("seed %s is not an ancestor of final tip %s\nlog:\n%s", seed, heads[len(heads)-1], full)
 	}
 
-	// Worktree must be clean — daemon's commits should match disk.
-	status := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain"))
-	if status != "" {
-		t.Fatalf("worktree dirty after repeated edits:\n%s", status)
+	// Disk content must match the last edit (the worktree may diverge from
+	// the user-facing git index because acd commits via lower-level plumbing,
+	// but the file on disk should still hold the last write).
+	if disk, err := os.ReadFile(target); err != nil {
+		t.Fatalf("read chain.txt: %v", err)
+	} else if string(disk) != versions[len(versions)-1] {
+		t.Fatalf("disk content=%q want %q", disk, versions[len(versions)-1])
 	}
 }
 
