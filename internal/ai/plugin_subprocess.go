@@ -154,15 +154,6 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		return Result{}, p.resolveErr
 	}
 
-	session, err := p.acquire()
-	if err != nil {
-		return Result{}, err
-	}
-
-	// Per-request timeout layered on top of the caller's ctx.
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-
 	req := subprocessRequest{
 		Version:  pluginProtocolVersion,
 		Path:     cc.Path,
@@ -183,12 +174,35 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		req.Now = cc.Now.UTC().Format(time.RFC3339Nano)
 	}
 
-	resp, err := session.exchange(reqCtx, req)
-	if err != nil {
-		// Any I/O / context error trips the crash path so the next
-		// Generate respawns. Soft errors come back via resp.Error and
-		// keep the plugin alive (handled below).
+	// Per-request timeout layered on top of the caller's ctx.
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	// Two-attempt loop: an exited-but-not-yet-detected plugin produces
+	// EPIPE / EOF on the first I/O; we mark crashed, respawn, and retry
+	// exactly once. A second crash on the fresh process surfaces as an
+	// error so Compose() falls back to deterministic.
+	var resp subprocessResponse
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var session *pluginSession
+		session, err = p.acquire()
+		if err != nil {
+			return Result{}, err
+		}
+		resp, err = session.exchange(reqCtx, req)
+		if err == nil {
+			break
+		}
+		// Context errors are not the plugin's fault; never retry.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markCrashed(session)
+			return Result{}, err
+		}
 		p.markCrashed(session)
+		// Loop and retry once with a fresh process.
+	}
+	if err != nil {
 		return Result{}, err
 	}
 	if strings.TrimSpace(resp.Error) != "" {
