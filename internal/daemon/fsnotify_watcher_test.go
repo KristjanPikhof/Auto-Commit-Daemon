@@ -384,5 +384,5 @@ func gitRevParse(t *testing.T, dir string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return revParseHEAD(ctx, dir)
+	return git.RevParse(ctx, dir, "HEAD")
 }
