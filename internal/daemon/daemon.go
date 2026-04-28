@@ -242,6 +242,16 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	currentToken, _ := BranchGenerationToken(ctx, opts.RepoPath)
 
+	// Seed shadow_paths from HEAD before the first capture so files
+	// already at HEAD don't generate spurious creates.
+	if cctx.BaseHead != "" {
+		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+			logger.Warn("bootstrap shadow", "err", err.Error())
+		} else if seeded > 0 {
+			logger.Info("shadow bootstrapped", "rows", seeded)
+		}
+	}
+
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
 	matcher := state.NewSensitiveMatcher()
