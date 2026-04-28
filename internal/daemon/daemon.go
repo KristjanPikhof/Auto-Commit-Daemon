@@ -301,6 +301,61 @@ func Run(ctx context.Context, opts Options) error {
 	defer func() { _ = ignoreChecker.Close() }()
 	matcher := state.NewSensitiveMatcher()
 
+	// 3a. fsnotify watcher (D11 hybrid). Disabled by default so existing
+	// poll-only tests stay deterministic; the run loop subscribes to a
+	// dedicated wake channel that the watcher drives via WakeFn.
+	var (
+		fsWatcher    *FsnotifyWatcher
+		fsWakeCh     chan struct{}
+		fsWakeReader <-chan struct{} // nil-when-disabled receive view
+	)
+	if opts.FsnotifyEnabled {
+		fsWakeCh = make(chan struct{}, 1)
+		fsWakeReader = fsWakeCh
+		wakeFn := func() {
+			select {
+			case fsWakeCh <- struct{}{}:
+			default:
+				// channel already full — wake is coalesced.
+			}
+		}
+		diagFn := func(d WatcherDiagnostics) {
+			_ = state.MetaSet(ctx, opts.DB, "fsnotify.mode", d.Mode)
+			_ = state.MetaSet(ctx, opts.DB, "fsnotify.watch_count",
+				strconv.Itoa(d.WatchCount))
+			_ = state.MetaSet(ctx, opts.DB, "fsnotify.dropped_events",
+				strconv.Itoa(d.DroppedEvents))
+			_ = state.MetaSet(ctx, opts.DB, "fsnotify.fallback_reason",
+				d.FallbackReason)
+		}
+		w, err := NewFsnotifyWatcher(FsnotifyOptions{
+			RepoPath:      opts.RepoPath,
+			GitDir:        opts.GitDir,
+			IgnoreChecker: ignoreChecker,
+			Sensitive:     matcher,
+			Debounce:      opts.FsnotifyDebounce,
+			MaxWatches:    opts.FsnotifyMaxWatches,
+			WakeFn:        wakeFn,
+			Logger:        logger,
+			DiagnosticsFn: diagFn,
+		})
+		if err != nil {
+			logger.Warn("fsnotify watcher init failed; running poll-only",
+				"err", err.Error())
+		} else {
+			fsWatcher = w
+			if startErr := fsWatcher.Start(ctx); startErr != nil {
+				logger.Warn("fsnotify watcher start failed",
+					"err", startErr.Error())
+			}
+		}
+	}
+	defer func() {
+		if fsWatcher != nil {
+			_ = fsWatcher.Stop()
+		}
+	}()
+
 	// Central stats handle for the rollup hook (§8.10). Caller may
 	// inject a pre-opened *central.StatsDB via opts.CentralStats; if not
 	// and CentralStatsDBPath is set, open one here and own its lifetime.
