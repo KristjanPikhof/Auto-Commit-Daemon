@@ -89,7 +89,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 `op` values: `create` | `modify` | `delete` | `rename` | `mode` | `symlink`.  
 `multi_op` is present when one daemon event covers more than one file.  
-`diff` is a unified diff capped at 4000 bytes before transmission (see `DiffCap` in `internal/ai/prompt.go`).
+`diff` is a unified diff capped at 4000 bytes before transmission (`DiffCap` in `internal/ai/prompt.go`). The diff is built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since.
 
 **Response (plugin → daemon, one line per request):**
 
