@@ -287,5 +287,3 @@ func writeFile(t *testing.T, path, body string) {
 	}
 }
 
-// _ keeps unused stdlib imports quiet across the helper indirection chain.
-var _ = io.EOF
