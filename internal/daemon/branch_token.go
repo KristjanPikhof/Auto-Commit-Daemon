@@ -8,7 +8,7 @@
 // A bumped token signals a force-push or reset; the daemon records the
 // transition in daemon_meta so operators can spot the divergence.
 //
-// Generation semantics
+// # Generation semantics
 //
 // The token alone cannot distinguish a normal ACD fast-forward (the daemon
 // just landed a commit and HEAD advanced one step) from an external rewrite
