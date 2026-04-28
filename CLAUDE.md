@@ -19,12 +19,12 @@ Fast-access project brief for future Claude Code sessions. Read this first.
 
 ## Current state
 
-- **Phase 0 (Scaffold)**: DONE.
-- **Phase 1–6**: tracked as a single Trekoon epic. ID `7c06148c-cbc3-4d86-91a5-f952693c276d`.
-- **Wave 1 ready (parallel)**:
-  - `65955c66-ee29-4d16-9235-c42d4b32e1f3` — [State/Phase 1] per-repo SQLite layer
-  - `3581cb3b-1527-4089-90f8-94ad3a335d24` — [Git/Phase 1] git subprocess wrapper
-  - `b335c125-f362-4c3f-9985-5398cb589f37` — [Infra/Phase 1] identity + logger + paths
+- **Phase 0–6**: DONE (epic `7c06148c-cbc3-4d86-91a5-f952693c276d`, merged via PR #1).
+- **First release published**: tag `v2026-04-28` on `main`; goreleaser workflow uploads 4 archives + `checksums.txt` (darwin/linux × amd64/arm64). Brew formula generation gated behind `--skip=homebrew` until tap repo + secrets exist.
+- **Open Phase 6 work** (user-side, not codable here):
+  - `KristjanPikhof/homebrew-tap` repo + `HOMEBREW_TAP_TOKEN` / `GH_PAT` secrets, then drop `--skip=homebrew` in `.github/workflows/release.yml`
+  - Re-verify `install.sh` / `brew install acd` / `go install …@latest` on fresh macOS arm64 + Ubuntu 22.04 amd64
+  - §1.4 success-criteria walkthrough on a fresh OS
 
 Use Trekoon as the live progress source: `trekoon --toon session --epic 7c06148c-cbc3-4d86-91a5-f952693c276d`. Do not duplicate task tracking elsewhere.
 
