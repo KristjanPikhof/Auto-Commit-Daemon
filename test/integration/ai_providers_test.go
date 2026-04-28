@@ -217,6 +217,116 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	}
 }
 
+// TestAI_OpenAICompatReceivesCapturedDiff: end-to-end coverage that the
+// daemon builds CommitContext.DiffText from the captured before/after blobs
+// (BuildOpsDiff) and forwards it to the openai-compat provider. We modify
+// an existing tracked file so the diff carries both `-` and `+` lines, run
+// the daemon through the real binary, and assert the mock OpenAI server's
+// captured request body contains the expected diff hunk plus repo metadata.
+//
+// The unit-level TestOpenAI_ForwardsCommitContext (internal/ai) injects a
+// hand-rolled diff string into CommitContext directly. This integration
+// counterpart proves the full pipe — capture -> shadow -> ops_diff -> AI
+// payload — survives at runtime.
+func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	// Track a file in the seed commit so a subsequent edit produces a real
+	// modify diff (not a `new file` header without `-` lines).
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "before-line\n")
+	runGitOK(t, repo, "add", "tracked.txt")
+	runGitOK(t, repo, "commit", "-q", "-m", "seed-tracked")
+
+	const wantSubject = "AI saw the diff"
+	const cannedResp = `{
+  "id": "chatcmpl-diff",
+  "object": "chat.completion",
+  "model": "gpt-4o-mini",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "call_d",
+        "type": "function",
+        "function": {
+          "name": "commit_message",
+          "arguments": "{\"subject\":\"AI saw the diff\",\"body\":\"\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}`
+
+	var capturedBody atomic.Pointer[string]
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		buf := make([]byte, 64*1024)
+		n, _ := r.Body.Read(buf)
+		body := string(buf[:n])
+		capturedBody.Store(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(cannedResp))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	extra := []string{
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-4o-mini",
+	}
+	startSession(t, ctx, env, repo, "ai-diff", "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+
+	// Modify the tracked file — this becomes a `modify` capture op carrying
+	// before_oid (seed blob) and after_oid (new blob) the daemon turns into
+	// a unified diff before forwarding to the AI provider.
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repo, "tracked.txt"), "after-line\n")
+	wakeSession(t, ctx, envWith(env, extra...), repo, "ai-diff")
+	waitHeadAdvances(t, repo, startHead, 8*time.Second)
+
+	subj := headSubject(t, repo)
+	if subj != wantSubject {
+		t.Fatalf("subject=%q want %q", subj, wantSubject)
+	}
+
+	bodyPtr := capturedBody.Load()
+	if bodyPtr == nil {
+		t.Fatalf("mock OpenAI server received no request body")
+	}
+	body := *bodyPtr
+	// The serialized request encodes the user content as JSON-in-JSON. We
+	// can search the raw request bytes for the diff signatures the daemon
+	// emits via BuildOpsDiff: a `diff --git` header for tracked.txt plus
+	// the `-before-line` / `+after-line` change. The header carries the
+	// repo-relative path, the lines carry the actual content.
+	for _, want := range []string{
+		"diff --git a/tracked.txt b/tracked.txt",
+		"-before-line",
+		"+after-line",
+		"refs/heads/main",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("captured request body missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
 // writePluginScript creates an executable bash script at
 // <dir>/acd-provider-<name> with the given body and returns the absolute
 // directory path. Caller adds the dir to PATH on the spawned daemon's env.
