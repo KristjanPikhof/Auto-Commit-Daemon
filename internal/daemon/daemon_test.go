@@ -38,6 +38,11 @@ func newDaemonFixture(t *testing.T) *daemonFixture {
 	if err := git.Init(ctx, dir); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	// Force HEAD onto refs/heads/main regardless of host's init.defaultBranch
+	// (CI runners default to master; daemon Options pin BranchRef to main).
+	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
 	for _, kv := range [][]string{
 		{"user.email", "acd-test@example.com"},
 		{"user.name", "ACD Test"},
