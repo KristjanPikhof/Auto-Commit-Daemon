@@ -6,7 +6,6 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
