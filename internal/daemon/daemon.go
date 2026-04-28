@@ -211,9 +211,43 @@ func Run(ctx context.Context, opts Options) error {
 	if now == nil {
 		now = time.Now
 	}
+	// MessageFn precedence: explicit MessageFn > injected MessageProvider
+	// > env-driven ai.BuildProvider > deterministic. The closer returned
+	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
+	// by Run and Closed on graceful shutdown.
+	var providerCloser io.Closer
+	closeProviderOnce := func() {
+		if providerCloser != nil {
+			if err := providerCloser.Close(); err != nil {
+				logger.Warn("close ai provider", "err", err.Error())
+			}
+			providerCloser = nil
+		}
+	}
+	defer closeProviderOnce()
+
 	msgFn := opts.MessageFn
 	if msgFn == nil {
-		msgFn = DeterministicMessage
+		provider := opts.MessageProvider
+		if provider == nil {
+			cfg := ai.LoadProviderConfigFromEnv()
+			cfg.Logger = logger
+			built, closer, err := ai.BuildProvider(cfg)
+			if err != nil {
+				logger.Warn("build ai provider; falling back to deterministic",
+					"err", err.Error())
+				provider = ai.DeterministicProvider{}
+			} else {
+				provider = built
+				providerCloser = closer
+			}
+			logger.Info("ai provider selected",
+				"provider", provider.Name(),
+				"mode", cfg.Mode)
+		} else if opts.MessageProviderCloser != nil {
+			providerCloser = opts.MessageProviderCloser
+		}
+		msgFn = providerMessageFn(provider)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
