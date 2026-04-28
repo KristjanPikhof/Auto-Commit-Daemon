@@ -72,6 +72,7 @@ func buildAcdBinary(t *testing.T) string {
 			acdBinaryErr = fmt.Errorf("mkdtemp: %w", err)
 			return
 		}
+		acdBinaryDir = outDir
 		bin := filepath.Join(outDir, "acd")
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
