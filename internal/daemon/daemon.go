@@ -115,9 +115,26 @@ type Options struct {
 	// the central push (logged but non-fatal).
 	RepoHash string
 
-	// MessageFn produces commit messages. Nil falls back to
-	// DeterministicMessage.
+	// MessageFn produces commit messages. Nil falls back to a MessageFn
+	// derived from MessageProvider (or, when MessageProvider is also nil,
+	// from ai.BuildProvider(ai.LoadProviderConfigFromEnv())). Tests may
+	// pin a deterministic MessageFn here directly without involving the
+	// ai package at all.
 	MessageFn MessageFn
+
+	// MessageProvider, when non-nil, is the ai.Provider used to compose
+	// commit messages on the replay path. Nil triggers env-driven
+	// selection via ai.LoadProviderConfigFromEnv + ai.BuildProvider —
+	// production callers leave this nil and rely on ACD_AI_*. Tests can
+	// inject a stub Provider to assert the message reaches the commit.
+	MessageProvider ai.Provider
+
+	// MessageProviderCloser, when non-nil, is closed on Run shutdown.
+	// Pair this with MessageProvider when the provider holds OS
+	// resources (currently only ai.SubprocessProvider). When Run
+	// constructs the provider itself from env vars, the closer returned
+	// by ai.BuildProvider is captured automatically.
+	MessageProviderCloser io.Closer
 
 	// Now lets tests inject a fake clock. Nil falls back to time.Now.
 	Now func() time.Time
