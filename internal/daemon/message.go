@@ -56,21 +56,16 @@ func commitContextFromEvent(ec EventContext) ai.CommitContext {
 	default:
 		cc.MultiOp = make([]ai.OpItem, 0, len(ec.Ops))
 		for _, op := range ec.Ops {
+			old := ""
+			if op.OldPath.Valid {
+				old = op.OldPath.String
+			}
 			cc.MultiOp = append(cc.MultiOp, ai.OpItem{
 				Path:    op.Path,
 				Op:      op.Op,
-				OldPath: nullStringOr(op.OldPath, ""),
+				OldPath: old,
 			})
 		}
 	}
 	return cc
-}
-
-// nullStringOr returns the value of a sql.NullString or a fallback when
-// invalid. Avoids dragging the database/sql import into ai/.
-func nullStringOr(s state.CaptureOpOldPathLike, fallback string) string {
-	if s.Valid {
-		return s.String
-	}
-	return fallback
 }
