@@ -155,6 +155,9 @@ func TestFsnotifyWatcher_SymlinkedDirIgnored(t *testing.T) {
 		RepoPath: dir,
 		Debounce: 30 * time.Millisecond,
 	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 	for _, p := range w.WatchedPaths() {
 		if strings.HasPrefix(filepath.Clean(p), filepath.Clean(link)) {
 			t.Fatalf("symlinked dir %q ended up in watched list: %v", link, w.WatchedPaths())
