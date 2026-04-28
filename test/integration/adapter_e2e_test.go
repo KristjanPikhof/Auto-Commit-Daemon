@@ -179,14 +179,16 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	return out
 }
 
-// parseCodexSnippet pulls `command = "..."` strings out of the codex TOML
-// snippet (avoids a TOML dependency). The snippet has one [[hooks]] block per
-// event and a literal `event = "<Name>"` line — we read both fields per
-// section. Each [[hooks]] section is detected by a leading bracket.
+// parseCodexSnippet walks the codex TOML snippet (avoids a TOML dependency).
+// Codex schema: [[hooks.<EventName>]] is a matcher group, and the runnable
+// handler lives in [[hooks.<EventName>.hooks]] with `type` and `command`. The
+// outer [[hooks.X]] establishes Event; the inner [[hooks.X.hooks]] block
+// supplies the `command` we exec.
 func parseCodexSnippet(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	lines := strings.Split(body, "\n")
 	var hooks []hookSpec
+	var curEvent string
 	var cur hookSpec
 	flush := func() {
 		if cur.Command != "" {
@@ -197,17 +199,22 @@ func parseCodexSnippet(t *testing.T, body string) []hookSpec {
 	for _, raw := range lines {
 		line := strings.TrimSpace(raw)
 		switch {
-		case strings.HasPrefix(line, "[[hooks]]"):
+		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, ".hooks]]"):
+			// Inner handler block; closes any in-flight handler under the same event.
 			flush()
-		case strings.HasPrefix(line, "event"):
-			cur.Event = stripTOMLValue(line)
+			cur.Event = curEvent
+		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, "]]"):
+			// Outer matcher block: [[hooks.SessionStart]] etc. Capture event name.
+			flush()
+			inner := strings.TrimSuffix(strings.TrimPrefix(line, "[[hooks."), "]]")
+			curEvent = inner
 		case strings.HasPrefix(line, "command"):
 			cur.Command = stripTOMLValue(line)
 		}
 	}
 	flush()
 	if len(hooks) == 0 {
-		t.Fatalf("codex snippet contained no [[hooks]] sections:\n%s", body)
+		t.Fatalf("codex snippet contained no hook handlers:\n%s", body)
 	}
 	return hooks
 }
