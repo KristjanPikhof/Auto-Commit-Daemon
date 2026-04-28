@@ -203,12 +203,19 @@ func TestClientsRefcount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expire: %v", err)
 	}
-	if expired != 1 { // s2 is older (never touched), s1 is at 1234.5 < 9999
-		// actually both are older than 9999 -> wait, both expire.
-		// fix the assertion
+	// s1 last_seen=1234.5; s2 was registered at nowSeconds() (~real time,
+	// likely > 9999 unix-seconds-as-float since 1970). Use a cutoff strictly
+	// between them and confirm only s1 expires.
+	if expired != 0 {
+		t.Fatalf("expire count = %d, want 0 (cutoff above s1 only)", expired)
 	}
-	if expired != 2 {
-		t.Fatalf("expire count = %d, want 2", expired)
+
+	expired, err = ExpireClientsBefore(ctx, d, 2000.0)
+	if err != nil {
+		t.Fatalf("expire 2: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expire count2 = %d, want 1 (s1 only)", expired)
 	}
 
 	gone, err := DeregisterClient(ctx, d, "s1")
@@ -217,6 +224,11 @@ func TestClientsRefcount(t *testing.T) {
 	}
 	if gone {
 		t.Fatalf("expected s1 already gone after expire")
+	}
+
+	gone, err = DeregisterClient(ctx, d, "s2")
+	if err != nil || !gone {
+		t.Fatalf("dereg s2: gone=%v err=%v", gone, err)
 	}
 }
 
