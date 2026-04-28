@@ -1075,3 +1075,106 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 		t.Fatalf("empty token=%q want %q", tok2, BranchTokenMissing)
 	}
 }
+
+// TestRun_RepeatedEditsToSameFile_OrderedCommits drives the daemon Run loop
+// with three sequential edits to the same path (v1 -> v2 -> v3), waking the
+// daemon after each edit. The regression target is the scratch-index
+// refactor for replay: the same path's modify chain must publish in order
+// when driven through the real capture+wake+publish loop, not just under
+// direct Replay() calls (covered by TestReplay_ModifyChain_OrderedReplay).
+//
+// Pre-fix this would have either raced (only the last write commits, prior
+// edits get coalesced into a single capture), or — with separate captures
+// per wake — failed with "modify before-state mismatch" because the live
+// index probe would see whichever blob was last written, not the captured
+// before/after blobs the chain expects.
+func TestRun_RepeatedEditsToSameFile_OrderedCommits(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	target := filepath.Join(f.dir, "chain.txt")
+	versions := []string{"v1\n", "v2\n", "v3\n"}
+	prevHead := startHead
+	heads := make([]string, 0, len(versions))
+	for i, body := range versions {
+		if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", target, err)
+		}
+		// Multiple wakes — under -race the first wake may race the loop
+		// boundary; the run loop coalesces extras.
+		for j := 0; j < 4; j++ {
+			select {
+			case wakeCh <- struct{}{}:
+			default:
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+		newHead := waitForCommit(t, f.dir, prevHead, 5*time.Second)
+		if newHead == prevHead {
+			t.Fatalf("edit %d: HEAD did not advance from %s", i+1, prevHead)
+		}
+		heads = append(heads, newHead)
+		prevHead = newHead
+	}
+
+	// Walk the resulting log: chain.txt's blob must trace v1 -> v2 -> v3
+	// commit-by-commit, with each commit a fast-forward of its predecessor.
+	wantBlobs := make([]string, len(versions))
+	for i, body := range versions {
+		oid, err := git.HashObjectStdin(context.Background(), f.dir, []byte(body))
+		if err != nil {
+			t.Fatalf("hash %d: %v", i, err)
+		}
+		wantBlobs[i] = oid
+	}
+	for i, h := range heads {
+		entries, err := git.LsTree(context.Background(), f.dir, h, false, "chain.txt")
+		if err != nil {
+			t.Fatalf("ls-tree %s: %v", h, err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("commit %d (%s): chain.txt missing", i, h)
+		}
+		if entries[0].OID != wantBlobs[i] {
+			t.Fatalf("commit %d (%s): chain.txt blob=%s want %s",
+				i, h, entries[0].OID, wantBlobs[i])
+		}
+	}
+
+	// Final tip must be the v3 commit and reachable from the seed via
+	// fast-forwards only — the daemon must not have force-pushed mid-way.
+	mb, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
+		"merge-base", "--is-ancestor", startHead, heads[len(heads)-1])
+	if err != nil {
+		t.Fatalf("merge-base --is-ancestor: %v\n%s", err, mb)
+	}
+
+	cancel()
+	wg.Wait()
+}
