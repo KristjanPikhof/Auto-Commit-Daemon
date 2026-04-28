@@ -162,18 +162,25 @@ func TestRotation_ConcurrentWritesNoCorruption(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.log")
+	// Sized large enough that *no* records are evicted past retention:
+	// the goal here is to prove records aren't *corrupted* under
+	// concurrency. Rotation churn is exercised by the smaller-size
+	// tests above.
+	const (
+		goroutines   = 8
+		perGoroutine = 200
+		maxBackups   = 50
+	)
 	logger, closer, err := New(Options{
 		Path:         path,
 		MaxSizeBytes: 4096,
-		MaxBackups:   3,
+		MaxBackups:   maxBackups,
 		MaxAgeDays:   14,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	const goroutines = 8
-	const perGoroutine = 200
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
