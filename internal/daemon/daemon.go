@@ -279,7 +279,13 @@ func Run(ctx context.Context, opts Options) error {
 		if fpToken != "" {
 			st.DaemonFingerprint = sql.NullString{String: fpToken, Valid: true}
 		}
-		if err := state.SaveDaemonState(ctx, opts.DB, st); err != nil {
+		// Use a fresh background context with a short timeout — the
+		// run-loop's ctx is already canceled in the most common path
+		// (ctx.Done shutdown). We must still stamp mode=stopped so
+		// controllers can see the daemon left cleanly.
+		shutdownCtx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer scancel()
+		if err := state.SaveDaemonState(shutdownCtx, opts.DB, st); err != nil {
 			logger.Warn("stamp stopped state", "err", err.Error())
 		}
 		logger.Info("daemon stopping", "reason", reason)
