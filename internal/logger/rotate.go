@@ -31,14 +31,14 @@ import (
 // hot paths and stat'ing every backup would be wasteful. Day-granularity
 // pruning at boot is sufficient per §13.2.
 type rotatingWriter struct {
-	mu          sync.Mutex
-	path        string
-	file        *os.File
-	size        int64
-	maxSize     int64
-	maxBackups  int
-	maxAgeDays  int
-	closed      bool
+	mu         sync.Mutex
+	path       string
+	file       *os.File
+	size       int64
+	maxSize    int64
+	maxBackups int
+	maxAgeDays int
+	closed     bool
 }
 
 // newRotatingWriter opens path in append mode, primes the in-memory size
