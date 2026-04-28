@@ -109,6 +109,8 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		e.LastSeq = summary.lastSeq
 		e.LastCommitOID = summary.lastCommitOID
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
+		e.PendingEvents = summary.pendingEvents
+		e.BlockedConflicts = summary.blockedConflicts
 		if summary.daemon == "stale" {
 			if summary.clients == 0 {
 				continue
