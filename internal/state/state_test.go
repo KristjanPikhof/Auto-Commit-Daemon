@@ -470,17 +470,9 @@ func TestConcurrentWritersUnderWAL(t *testing.T) {
 	}
 }
 
-func sqlNullStr(s string) (n nullStr) {
+func sqlNullStr(s string) sql.NullString {
 	if s == "" {
-		return nullStr{}
+		return sql.NullString{}
 	}
-	return nullStr{Valid: true, String: s}
-}
-
-// nullStr is a thin alias around sql.NullString to avoid importing it from
-// every test call site. We declare it here rather than reusing sql.NullString
-// directly because the per-helper test signatures differ slightly.
-type nullStr = struct {
-	String string
-	Valid  bool
+	return sql.NullString{Valid: true, String: s}
 }
