@@ -316,6 +316,8 @@ func Run(ctx context.Context, opts Options) error {
 		currentDelay         = opts.Scheduler.Reset()
 		lastSweep            = time.Time{}
 		lastPrune            = time.Time{}
+		lastRollup           = time.Time{}
+		lastRollupUTCDay     = ""
 		stopped              bool
 	)
 
