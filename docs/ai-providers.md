@@ -62,6 +62,7 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_API_KEY` | (none) | openai-compat only; missing key degrades to deterministic with a warning |
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
+| `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
 | `ACD_AI_SEND_DIFF` | `0` | `1`, `true`, `yes`, or `on` opt in to sending redacted captured diffs; unset/empty/other values send an empty `diff` |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
