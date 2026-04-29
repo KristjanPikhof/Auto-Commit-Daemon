@@ -1156,6 +1156,8 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 }
 
 func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
+	t.Setenv(EnvShadowRetentionGenerations, "0")
+
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	ctx := context.Background()
@@ -1251,6 +1253,15 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	}
 	if shadowRows == 0 {
 		t.Fatalf("shadow_paths not reseeded for startup generation 2")
+	}
+	var oldShadowRows int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+		"refs/heads/main", int64(1)).Scan(&oldShadowRows); err != nil {
+		t.Fatalf("count old shadow rows: %v", err)
+	}
+	if oldShadowRows != 0 {
+		t.Fatalf("old shadow generation rows=%d want 0", oldShadowRows)
 	}
 	time.Sleep(100 * time.Millisecond)
 	var events int
