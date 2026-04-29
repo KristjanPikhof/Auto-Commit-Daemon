@@ -722,9 +722,8 @@ func Run(ctx context.Context, opts Options) error {
 				GitDir:    opts.GitDir,
 			})
 			if repErr == nil && repSum.Published > 0 {
-				// Refresh BaseHead — replay advanced HEAD.
-				_, head := resolveBranch(ctx, opts.RepoPath, logger)
-				cctx.BaseHead = head
+				// Refresh BaseHead to the exact commit replay just wrote.
+				cctx.BaseHead = repSum.BaseHead
 			}
 		}
 
