@@ -112,11 +112,35 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 		fsEnabled = true
 	}
 
+	// Resolve the central stats.db path + this repo's stable hash so the
+	// daemon's rollup pass can push per-repo daily_rollups into the
+	// shared store backing `acd stats`. Both are best-effort: if either
+	// resolution fails, we log + continue with empty values so the daemon
+	// run loop still operates (push is gated on non-nil StatsDB +
+	// non-empty RepoHash). Previously these were never plumbed, which
+	// silently disabled `acd stats` for every install.
+	var (
+		centralStatsPath string
+		repoHash         string
+	)
+	if roots, rErr := paths.Resolve(); rErr != nil {
+		fmt.Fprintf(errOut, "acd daemon run: resolve paths for stats: %v (stats disabled)\n", rErr)
+	} else {
+		centralStatsPath = roots.StatsDBPath()
+	}
+	if h, hErr := paths.RepoHash(repo); hErr != nil {
+		fmt.Fprintf(errOut, "acd daemon run: compute repo hash for stats: %v (stats disabled)\n", hErr)
+	} else {
+		repoHash = h
+	}
+
 	if err := daemon.Run(cctx, daemon.Options{
-		RepoPath:        repo,
-		GitDir:          gitDir,
-		DB:              db,
-		FsnotifyEnabled: fsEnabled,
+		RepoPath:           repo,
+		GitDir:             gitDir,
+		DB:                 db,
+		FsnotifyEnabled:    fsEnabled,
+		CentralStatsDBPath: centralStatsPath,
+		RepoHash:           repoHash,
 	}); err != nil {
 		if errors.Is(err, daemon.ErrDaemonLockHeld) {
 			fmt.Fprintf(errOut, "acd daemon run: another daemon is already running for %s\n", repo)
