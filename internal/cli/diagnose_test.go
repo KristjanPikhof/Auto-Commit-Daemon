@@ -5,8 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -32,6 +32,7 @@ func TestDiagnose_AnchorMismatchDetected(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
+	checksumBefore := mustSHA256(t, dbPath)
 
 	var out bytes.Buffer
 	if err := runDiagnose(ctx, &out, repo, false); err != nil {
@@ -47,8 +48,8 @@ func TestDiagnose_AnchorMismatchDetected(t *testing.T) {
 			t.Fatalf("diagnose output missing %q in:\n%s", want, got)
 		}
 	}
-	if before, after := mustSHA256(t, dbPath), mustSHA256(t, dbPath); before != after {
-		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
+	if checksumAfter := mustSHA256(t, dbPath); checksumBefore != checksumAfter {
+		t.Fatalf("state.db checksum changed: before=%s after=%s", checksumBefore, checksumAfter)
 	}
 }
 
@@ -196,11 +197,5 @@ func mustSHA256(t *testing.T, path string) string {
 }
 
 func itoa64(v int64) string {
-	return strings.TrimSpace(string([]byte(os.Expand("$v", func(string) string {
-		return fmtInt64(v)
-	}))))
-}
-
-func fmtInt64(v int64) string {
 	return strconv.FormatInt(v, 10)
 }
