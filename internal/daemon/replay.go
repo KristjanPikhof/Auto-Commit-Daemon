@@ -364,11 +364,11 @@ func updateReplayRefWithRetry(
 		if !retryable {
 			return err
 		}
-		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
-			return sleepErr
-		}
 		if finalAttempt {
 			return err
+		}
+		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
+			return sleepErr
 		}
 	}
 	return lastErr
