@@ -13,11 +13,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
 // supportedHarnesses is the canonical ordered list of harness identifiers.
-var supportedHarnesses = []string{"claude-code", "codex", "opencode", "pi", "shell"}
+var supportedHarnesses = adapter.Names()
 
 // harnessSnippet describes which file inside templates/<harness>/ is the
 // primary snippet and what comment prefix to use for the header/footer line.
@@ -47,38 +48,55 @@ func newInitCmd() *cobra.Command {
 	var applyFlag bool
 
 	cmd := &cobra.Command{
-		Use:       "init <harness>",
+		Use:       "init [harness]",
 		Short:     "Print install snippet for a harness adapter",
-		Args:      cobra.ExactArgs(1),
+		Args:      cobra.RangeArgs(0, 1),
 		ValidArgs: supportedHarnesses,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInit(cmd, args[0], applyFlag)
+			if applyFlag {
+				fmt.Fprintln(cmd.ErrOrStderr(), "acd init: --apply is not implemented")
+				return fmt.Errorf("acd init: --apply is not implemented")
+			}
+			harness := ""
+			if len(args) == 1 {
+				harness = args[0]
+			}
+			return runInit(cmd, harness)
 		},
 	}
 	cmd.Flags().BoolVar(&applyFlag, "apply", false, "Automatically apply snippet (deferred to v0.2)")
+	_ = cmd.Flags().MarkHidden("apply")
 	return cmd
 }
 
-func runInit(cmd *cobra.Command, harness string, apply bool) error {
-	// Validate harness.
-	known := false
-	for _, h := range supportedHarnesses {
-		if h == harness {
-			known = true
-			break
+func runInit(cmd *cobra.Command, harness string) error {
+	if harness == "" {
+		detected := adapter.DetectInstalled()
+		switch len(detected) {
+		case 0:
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"acd init: no harness specified and no acd-managed harness install was detected\nSupported harnesses: %s\n",
+				strings.Join(supportedHarnesses, ", "))
+			return fmt.Errorf("acd init: no harness specified")
+		case 1:
+			harness = detected[0].Name()
+		default:
+			var names []string
+			for _, h := range detected {
+				names = append(names, h.Name())
+			}
+			fmt.Fprintf(cmd.ErrOrStderr(),
+				"acd init: multiple acd-managed harness installs detected: %s\nRun acd init <harness> with one of the detected harnesses.\n",
+				strings.Join(names, ", "))
+			return fmt.Errorf("acd init: multiple harnesses detected")
 		}
 	}
-	if !known {
+
+	if _, known := adapter.Lookup(harness); !known {
 		fmt.Fprintf(cmd.ErrOrStderr(),
 			"acd init: unknown harness %q\nSupported harnesses: %s\n",
 			harness, strings.Join(supportedHarnesses, ", "))
 		return fmt.Errorf("acd init: unknown harness %q", harness)
-	}
-
-	// --apply deferred to v0.2.
-	if apply {
-		fmt.Fprintf(cmd.OutOrStdout(),
-			"acd init: --apply is not implemented in v0.1; copy the snippet below manually.\n\n")
 	}
 
 	meta := harnessSnippets[harness]
