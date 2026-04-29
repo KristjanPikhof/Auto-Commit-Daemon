@@ -20,6 +20,26 @@ make lint           # go vet + gofmt -l (must be empty)
 go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 ```
 
+## Pre-merge verification (mandatory)
+
+Before declaring work done, before pushing the final commit on a branch, and before opening a PR for review, run the full suite locally with the race detector:
+
+```bash
+make lint
+make test                                                              # ./... -race -count=1
+go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
+go test ./internal/git/... ./internal/daemon/... -race -count=3        # stress concurrency-prone packages
+```
+
+Why: Ubuntu CI has caught real races (e.g. `internal/git/ignore.go` cancellation goroutine racing with `Check` mutex) that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out.
+
+When CI fails on a previously-green branch, do this before retrying:
+
+1. Re-read the failing test name + file:line from the log.
+2. If the failure is a `WARNING: DATA RACE` or `panic: ... nil pointer`, treat it as a real bug and fix at root cause; do not retry.
+3. If the failure is in the timing-sensitive `internal/daemon` lane (see Known issues), reproduce locally with `-count=10` before assuming flake; only retry CI after that.
+4. Cross-check against macOS-only assumptions: fsnotify event ordering, process exec timing, and `/tmp` semantics differ on Linux.
+
 ## Refresh local install
 
 ```bash
