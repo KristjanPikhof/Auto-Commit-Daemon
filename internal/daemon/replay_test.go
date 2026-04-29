@@ -6,8 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
