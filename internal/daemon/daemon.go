@@ -341,12 +341,38 @@ func Run(ctx context.Context, opts Options) error {
 		logger.Warn("load persisted branch generation", "err", err.Error())
 		persistedGen = 1
 	}
+	persistedHead, err := LoadBranchHead(ctx, opts.DB)
+	if err != nil {
+		logger.Warn("load persisted branch head", "err", err.Error())
+	}
+	currentToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
+	if terr != nil {
+		logger.Warn("seed branch token", "err", terr.Error())
+		currentToken = ""
+	}
+	if persistedHead != "" && currentToken != "" {
+		prevToken := "rev:" + persistedHead
+		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, prevToken, currentToken)
+		if cErr != nil {
+			logger.Warn("classify startup branch transition; treating as diverged",
+				"err", cErr.Error())
+			transition = TokenTransitionDiverged
+		}
+		if transition == TokenTransitionDiverged {
+			persistedGen++
+			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
+			logger.Info("branch generation bumped at startup",
+				"old", prevToken, "new", currentToken,
+				"generation", persistedGen,
+				"transition", transition.String())
+		}
+	}
 	cctx := CaptureContext{
 		BranchRef:        branchRef,
 		BranchGeneration: persistedGen,
 		BaseHead:         headOID,
 	}
-	currentToken, _ := BranchGenerationToken(ctx, opts.RepoPath)
 	// Persist the seed observation so the next divergence has a baseline
 	// to compare against. Best-effort — log but do not fail on write.
 	if err := SaveBranchGeneration(ctx, opts.DB, cctx.BranchGeneration, headOID); err != nil {
