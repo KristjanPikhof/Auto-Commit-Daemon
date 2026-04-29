@@ -28,3 +28,10 @@ func traceBootstrapShadow(logger acdtrace.Logger, repoRoot string, cctx CaptureC
 		Generation: cctx.BranchGeneration,
 	})
 }
+
+func traceErrString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
