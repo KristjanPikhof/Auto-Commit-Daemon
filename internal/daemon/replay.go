@@ -45,8 +45,9 @@ type ReplayOpts struct {
 	MessageFn MessageFn
 
 	// IndexFile is the GIT_INDEX_FILE path used for an isolated index. When
-	// empty, defaults to <gitDir>/acd/replay.index. Caller-provided value
-	// lets tests put it on a temp path.
+	// empty, Replay creates a per-pass tempfile under <gitDir>/acd and
+	// removes it before returning. Caller-provided values are left in place
+	// for tests that need to inspect the index.
 	IndexFile string
 
 	// GitDir is the absolute git dir for the worktree. Required to seed a
@@ -62,6 +63,7 @@ type ReplaySummary struct {
 	Published int // events that produced a new commit
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
+	BaseHead  string
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -97,13 +99,27 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	indexFile := opts.IndexFile
+	cleanupIndex := func() {}
 	if indexFile == "" {
 		if opts.GitDir == "" {
 			return sum, fmt.Errorf("daemon: Replay: IndexFile or GitDir required")
 		}
-		indexFile = filepath.Join(opts.GitDir, "acd", "replay.index")
-	}
-	if err := os.MkdirAll(filepath.Dir(indexFile), 0o700); err != nil {
+		indexDir := filepath.Join(opts.GitDir, "acd")
+		if err := os.MkdirAll(indexDir, 0o700); err != nil {
+			return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
+		}
+		tmp, err := os.CreateTemp(indexDir, "replay-*.index")
+		if err != nil {
+			return sum, fmt.Errorf("daemon: replay: create temp index: %w", err)
+		}
+		indexFile = tmp.Name()
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(indexFile)
+			return sum, fmt.Errorf("daemon: replay: close temp index: %w", err)
+		}
+		cleanupIndex = func() { _ = os.Remove(indexFile) }
+		defer cleanupIndex()
+	} else if err := os.MkdirAll(filepath.Dir(indexFile), 0o700); err != nil {
 		return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
 	}
 	// Always start from a clean index: stale entries from a prior crashed
@@ -126,6 +142,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	parent := cctx.BaseHead
+	activeCtx := cctx
+	sum.BaseHead = parent
 
 	for _, ev := range pending {
 		if err := ctx.Err(); err != nil {
@@ -144,7 +162,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
 			return sum, err
 		} else if reason != "" {
-			recordConflict(ctx, db, ev, reason, cctx)
+			recordConflict(ctx, db, ev, reason, activeCtx)
 			sum.Conflicts++
 			return sum, nil
 		}
@@ -180,7 +198,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
-			recordConflict(ctx, db, ev, reason, cctx)
+			recordConflict(ctx, db, ev, reason, activeCtx)
 			sum.Conflicts++
 			// Halt the batch: subsequent events were captured assuming
 			// this one would land first. Running them now would replay on
@@ -212,7 +230,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
-			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), cctx)
+			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), activeCtx)
 			sum.Conflicts++
 			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
 			return sum, nil
@@ -238,6 +256,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		})
 
 		parent = commitOID
+		activeCtx.BaseHead = commitOID
+		sum.BaseHead = commitOID
 		sum.Published++
 	}
 
