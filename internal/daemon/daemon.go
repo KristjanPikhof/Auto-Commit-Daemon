@@ -658,63 +658,8 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
-		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
-		if terr != nil {
-			logger.Warn("branch token resolve failed", "err", terr.Error())
-		} else if !SameGeneration(currentToken, newToken) {
-			transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
-			if cErr != nil {
-				logger.Warn("classify branch transition; treating as diverged",
-					"err", cErr.Error())
-				transition = TokenTransitionDiverged
-			}
-			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
-			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
-			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, newToken)
-			// Refresh HEAD for capture/replay regardless of transition kind.
-			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
-			cctx.BranchRef = branchRef
-			cctx.BaseHead = headOID
-			oldToken := currentToken
-			currentToken = newToken
-			if transition == TokenTransitionDiverged {
-				cctx.BranchGeneration++
-				logger.Info("branch generation bumped",
-					"old", oldToken, "new", newToken,
-					"generation", cctx.BranchGeneration,
-					"transition", transition.String())
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, headOID); err != nil {
-					logger.Warn("persist bumped branch generation",
-						"err", err.Error())
-				}
-				// shadow_paths is keyed by (branch_ref, branch_generation).
-				// After a divergence the new key is empty; without
-				// reseeding from HEAD the next capture would classify every
-				// tracked file as a phantom `create`.
-				if cctx.BranchRef == "" {
-					_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
-					logger.Warn("detached HEAD detected; capture/replay paused")
-				} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-					logger.Warn("reseed shadow after generation bump",
-						"err", err.Error())
-				} else if seeded > 0 {
-					logger.Info("shadow reseeded",
-						"rows", seeded,
-						"generation", cctx.BranchGeneration)
-				}
-			} else {
-				// Fast-forward: persist the new HEAD so the next
-				// transition compares against the latest baseline,
-				// but keep the generation counter put.
-				logger.Debug("branch fast-forwarded",
-					"old", oldToken, "new", newToken,
-					"generation", cctx.BranchGeneration)
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, headOID); err != nil {
-					logger.Warn("persist branch head", "err", err.Error())
-				}
-			}
+		if processBranchTokenChange("branch token") {
+			branchTransitionBlocked = true
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
@@ -741,6 +686,9 @@ func Run(ctx context.Context, opts Options) error {
 				break
 			}
 		}
+		if processBranchTokenChange("pre-capture branch token") {
+			branchTransitionBlocked = true
+		}
 
 		// 4f. Capture pass.
 		var (
@@ -748,7 +696,9 @@ func Run(ctx context.Context, opts Options) error {
 			capErr error
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
-		if detachedHeadPaused {
+		if branchTransitionBlocked {
+			logger.Warn("capture/replay paused until branch transition is classified")
+		} else if detachedHeadPaused {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
 			logger.Warn("detached HEAD detected; capture/replay paused")
