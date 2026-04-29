@@ -77,6 +77,19 @@ acd recover --repo . --auto --yes
 pending/blocked rows to the current attached branch, resets `blocked_conflict`
 rows to `pending`, and clears stale replay metadata.
 
+If a parallel committer already landed the captured edits, do not requeue those
+rows with `recover`: they will usually hit the same before-state mismatch. Use
+`purge-events` to delete the terminal barrier and, when that tail is obsolete,
+the pending rows behind it:
+
+~~~bash
+acd purge-events --repo . --blocked --pending --dry-run
+acd purge-events --repo . --blocked --pending --yes
+~~~
+
+Use `--blocked` alone when you only want to lift the barrier and keep later
+pending rows for replay.
+
 Enable local decision tracing when you need a replay/capture audit trail:
 
 ~~~bash
