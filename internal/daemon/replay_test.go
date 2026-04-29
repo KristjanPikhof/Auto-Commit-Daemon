@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -94,6 +95,120 @@ func TestReplay_Lifecycle(t *testing.T) {
 		if !oid.Valid || oid.String == "" {
 			t.Fatalf("event op=%s path=%s missing commit_oid", op, path)
 		}
+	}
+}
+
+func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	pending := captureOnePendingFile(t, ctx, f, "paused.txt", "paused\n")
+	if err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "operator maintenance",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	trace := &memoryTraceLogger{}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !sum.Skipped || sum.Published != 0 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	assertPendingCount(t, ctx, f.db, pending)
+	events := traceEventsByClass(trace.Events(), "replay.pause")
+	if len(events) != 1 {
+		t.Fatalf("replay.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	if events[0].Reason != "replay_paused" || events[0].Output["source"] != "manual" {
+		t.Fatalf("unexpected trace event: %+v", events[0])
+	}
+}
+
+func TestReplay_SkipsDrainWhenRewindGraceActive(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	pending := captureOnePendingFile(t, ctx, f, "rewind.txt", "rewind\n")
+	until := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !sum.Skipped || sum.Published != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	assertPendingCount(t, ctx, f.db, pending)
+}
+
+func TestReplay_DrainsAfterMarkerExpires(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	captureOnePendingFile(t, ctx, f, "expired-marker.txt", "drain\n")
+	expired := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	if err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason:    "expired",
+		SetAt:     time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339),
+		SetBy:     "test",
+		ExpiresAt: &expired,
+	}, false); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Skipped || sum.Published == 0 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("expected drain after expired marker, got %+v", sum)
+	}
+}
+
+func TestReplay_DrainsAfterRewindGraceExpires(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	captureOnePendingFile(t, ctx, f, "expired-grace.txt", "drain\n")
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatalf("MetaSet: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Skipped || sum.Published == 0 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("expected drain after expired grace, got %+v", sum)
+	}
+	if got, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("expired replay pause meta not cleared: %q", got)
+	}
+}
+
+func TestReplay_MalformedMarkerFailsOpen(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	captureOnePendingFile(t, ctx, f, "bad-marker.txt", "drain\n")
+	if err := os.MkdirAll(filepath.Dir(pausepkg.Path(f.gitDir)), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(pausepkg.Path(f.gitDir), []byte("{bad json"), 0o600); err != nil {
+		t.Fatalf("write malformed marker: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Skipped || sum.Published == 0 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("expected malformed marker to fail open, got %+v", sum)
 	}
 }
 
