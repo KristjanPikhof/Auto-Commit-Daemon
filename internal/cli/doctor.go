@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,11 @@ type doctorRepoReport struct {
 	FsnotifyDropped        int      `json:"fsnotify_dropped,omitempty"`
 	FsnotifyFallbackReason string   `json:"fsnotify_fallback_reason,omitempty"`
 	LastCaptureError       string   `json:"last_capture_error,omitempty"`
+	PendingEvents          int      `json:"pending_events"`
+	BlockedConflicts       int      `json:"blocked_conflicts"`
+	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
 	Notes                  []string `json:"notes,omitempty"`
 }
 
@@ -241,6 +247,44 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, dbPath string) boo
 	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
 	}
+
+	// Pending FIFO depth + terminal blocked-conflict count.
+	// Best-effort: a missing capture_events table (older schema) yields a
+	// note rather than failing the whole doctor run.
+	if n, err := state.CountEventsByState(ctx, d, state.EventStatePending); err == nil {
+		rr.PendingEvents = n
+	} else {
+		rr.Notes = append(rr.Notes, "pending events count failed: "+err.Error())
+	}
+	if n, err := state.CountEventsByState(ctx, d, state.EventStateBlockedConflict); err == nil {
+		rr.BlockedConflicts = n
+	} else {
+		rr.Notes = append(rr.Notes, "blocked conflicts count failed: "+err.Error())
+	}
+
+	// Most recent terminal blocked_conflict event — gives the operator a
+	// concrete path + timestamp to investigate without rummaging the DB.
+	if rr.BlockedConflicts > 0 {
+		row := d.SQL().QueryRowContext(ctx,
+			`SELECT path, published_ts, error FROM capture_events
+			 WHERE state = ?
+			 ORDER BY seq DESC LIMIT 1`, state.EventStateBlockedConflict)
+		var path string
+		var ts sql.NullFloat64
+		var errMsg sql.NullString
+		if err := row.Scan(&path, &ts, &errMsg); err == nil {
+			rr.LastReplayConflictPath = path
+			if ts.Valid {
+				rr.LastReplayConflictTS = int64(ts.Float64)
+			}
+			if errMsg.Valid {
+				rr.LastReplayConflictErr = errMsg.String
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			rr.Notes = append(rr.Notes, "last replay conflict lookup failed: "+err.Error())
+		}
+	}
+
 	return true
 }
 
@@ -303,6 +347,21 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		fmt.Fprintf(out, "      hash       : %s\n", rr.RepoHash)
 		fmt.Fprintf(out, "      daemon     : %s (pid %d, alive=%v)\n", mode, rr.DaemonPID, rr.DaemonAlive)
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
+		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
+		if rr.BlockedConflicts > 0 {
+			fmt.Fprintf(out, "      blocked    : %d\n", rr.BlockedConflicts)
+			if rr.LastReplayConflictPath != "" {
+				bits := []string{rr.LastReplayConflictPath}
+				if rr.LastReplayConflictTS > 0 {
+					age := time.Since(time.Unix(rr.LastReplayConflictTS, 0))
+					bits = append(bits, formatDurationCompact(age)+" ago")
+				}
+				if rr.LastReplayConflictErr != "" {
+					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayConflictErr))
+				}
+				fmt.Fprintf(out, "      last conflict : %s\n", strings.Join(bits, " "))
+			}
+		}
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
 				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)

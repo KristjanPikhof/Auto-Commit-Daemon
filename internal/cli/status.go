@@ -15,6 +15,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
 	_ "modernc.org/sqlite"
 )
@@ -45,6 +46,7 @@ type statusReport struct {
 	BranchGenToken      string         `json:"branch_generation_token,omitempty"`
 	Clients             []statusClient `json:"clients"`
 	PendingEvents       int            `json:"pending_events"`
+	BlockedConflicts    int            `json:"blocked_conflicts"`
 	LastCommitOID       string         `json:"last_commit_oid,omitempty"`
 	LastCommitTS        int64          `json:"last_commit_ts,omitempty"`
 	LastCommitMessage   string         `json:"last_commit_message,omitempty"`
@@ -206,10 +208,18 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	}
 	rows.Close()
 
-	// Pending events.
+	// Pending events (FIFO queue depth) and blocked-conflict count
+	// (terminal replay blockers — distinct from pending so the operator
+	// can spot a stuck row that the daemon will not retry on its own).
 	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = 'pending'`).Scan(&report.PendingEvents); err != nil {
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return report, fmt.Errorf("pending events: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateBlockedConflict).Scan(&report.BlockedConflicts); err != nil {
+		return report, fmt.Errorf("blocked conflicts: %w", err)
 	}
 
 	// Last commit (latest seq with commit_oid).
@@ -295,6 +305,9 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	}
 
 	fmt.Fprintf(out, "Pending events: %d\n", r.PendingEvents)
+	if r.BlockedConflicts > 0 {
+		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
+	}
 
 	if r.LastCommitOID != "" {
 		oid := r.LastCommitOID

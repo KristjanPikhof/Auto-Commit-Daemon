@@ -6,6 +6,29 @@ import (
 	"fmt"
 )
 
+// Capture event lifecycle state values stored in capture_events.state.
+//
+// The replay queue is a strict FIFO. A non-pending row is terminal — replay
+// must NOT re-queue it. The set is intentionally small:
+//
+//   - EventStatePending        : awaiting replay (the only state PendingEvents returns).
+//   - EventStatePublished      : commit-tree succeeded and the branch ref was advanced.
+//   - EventStateFailed         : malformed event (validation, missing ops, commit-build
+//     error). Operator inspection only — never retried automatically.
+//   - EventStateBlockedConflict: replay refused to commit because the scratch index
+//     disagreed with the event's before-state (e.g. live worktree raced ahead of
+//     the queue, an `update-ref` CAS lost). Distinct from "failed" so operators
+//     can spot index/branch divergence vs malformed input. Like "failed" it is
+//     terminal — a stuck event would otherwise re-run on every poll tick and
+//     prevent later events from making progress (they would replay on top of a
+//     broken predecessor).
+const (
+	EventStatePending         = "pending"
+	EventStatePublished       = "published"
+	EventStateFailed          = "failed"
+	EventStateBlockedConflict = "blocked_conflict"
+)
+
 // CaptureEvent is one row of capture_events (§6.1). seq is autoincrement and
 // monotonic per repo — readers can rely on seq ordering as the canonical
 // "happened before" relation for replay.
@@ -20,7 +43,7 @@ type CaptureEvent struct {
 	Fidelity         string
 	CapturedTS       float64
 	PublishedTS      sql.NullFloat64
-	State            string // "pending" | "published" | "failed"
+	State            string // EventState* constant ("pending"|"published"|"failed"|"blocked_conflict")
 	CommitOID        sql.NullString
 	Error            sql.NullString
 	Message          sql.NullString
@@ -114,7 +137,9 @@ INSERT INTO capture_ops(
 }
 
 // MarkEventPublished updates an event row when the replay step has produced
-// (or failed to produce) a commit. State is one of "published" or "failed".
+// (or failed to produce) a commit. State is one of EventStatePublished,
+// EventStateFailed, or EventStateBlockedConflict — all three are terminal
+// and remove the row from PendingEvents output.
 func MarkEventPublished(ctx context.Context, d *DB, seq int64, state string, commitOID sql.NullString, errMsg sql.NullString, message sql.NullString, publishedTS float64) error {
 	const q = `
 UPDATE capture_events SET
@@ -132,6 +157,10 @@ WHERE seq = ?`
 
 // PendingEvents returns up to limit pending events ordered by seq ascending
 // (FIFO replay). limit <= 0 means "no limit".
+//
+// Only rows with state = EventStatePending are returned. Terminal states
+// (published, failed, blocked_conflict) are intentionally excluded so a
+// stuck event does not re-run on every poll tick — see EventStateBlockedConflict.
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
 	q := `
 SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
@@ -163,6 +192,78 @@ ORDER BY seq ASC`
 		return nil, fmt.Errorf("state: iter events: %w", err)
 	}
 	return out, nil
+}
+
+// CountEventsByState returns the number of capture_events rows matching the
+// given state (e.g. EventStateBlockedConflict, EventStateFailed). Useful for
+// `acd status` to surface terminal-failure counts distinct from the FIFO
+// pending depth.
+func CountEventsByState(ctx context.Context, d *DB, state string) (int, error) {
+	var n int
+	if err := d.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count events by state: %w", err)
+	}
+	return n, nil
+}
+
+// MarkEventBlocked atomically settles a capture_events row in
+// EventStateBlockedConflict and upserts the singleton publish_state row to
+// status="blocked_conflict" within a single transaction. This pairs the two
+// surfaces so a status reader never sees a "blocked" event with a stale
+// publish_state, or vice versa.
+//
+// errMsg is recorded on both rows. publishedTS is stamped on capture_events
+// (terminal timestamp); publish_state.updated_ts is stamped now.
+func MarkEventBlocked(ctx context.Context, d *DB, seq int64, errMsg string, publishedTS float64,
+	branchRef sql.NullString, branchGeneration sql.NullInt64, sourceHead sql.NullString,
+) error {
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: begin block tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const updEvent = `
+UPDATE capture_events SET
+    state        = ?,
+    error        = ?,
+    published_ts = ?
+WHERE seq = ?`
+	if _, err := tx.ExecContext(ctx, updEvent,
+		EventStateBlockedConflict,
+		sql.NullString{String: errMsg, Valid: true},
+		publishedTS, seq); err != nil {
+		return fmt.Errorf("state: mark event blocked: %w", err)
+	}
+
+	const upsertPub = `
+INSERT INTO publish_state(
+    id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid,
+    status, error, updated_ts
+) VALUES (1, ?, ?, ?, ?, NULL, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    event_seq         = excluded.event_seq,
+    branch_ref        = excluded.branch_ref,
+    branch_generation = excluded.branch_generation,
+    source_head       = excluded.source_head,
+    target_commit_oid = excluded.target_commit_oid,
+    status            = excluded.status,
+    error             = excluded.error,
+    updated_ts        = excluded.updated_ts`
+	if _, err := tx.ExecContext(ctx, upsertPub,
+		sql.NullInt64{Int64: seq, Valid: true},
+		branchRef, branchGeneration, sourceHead,
+		"blocked_conflict",
+		sql.NullString{String: errMsg, Valid: true},
+		publishedTS); err != nil {
+		return fmt.Errorf("state: upsert blocked publish_state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: commit block tx: %w", err)
+	}
+	return nil
 }
 
 // LoadCaptureOps returns ordered ops for an event seq.

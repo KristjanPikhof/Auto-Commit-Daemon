@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -758,6 +759,310 @@ func TestRun_AIProvider_InjectedOverride(t *testing.T) {
 	}
 }
 
+// TestClassifyTokenTransition: ACD-style fast-forward (the daemon just
+// landed a commit and HEAD advanced) is distinct from external rewrites
+// (rebase, reset, branch switch). Fast-forwards must NOT bump the
+// generation; rewrites must.
+func TestClassifyTokenTransition(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	seed, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+
+	// Build a child commit on top of seed by hand.
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("child\n"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "child.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree child: %v", err)
+	}
+	child, err := git.CommitTree(ctx, f.dir, tree, "child", seed)
+	if err != nil {
+		t.Fatalf("commit-tree child: %v", err)
+	}
+
+	// Build a sibling commit (no shared history with seed) — simulates a
+	// destructive rebase / reset onto an unrelated history.
+	sibling, err := git.CommitTree(ctx, f.dir, tree, "sibling root")
+	if err != nil {
+		t.Fatalf("commit-tree sibling: %v", err)
+	}
+
+	// Same token -> Unchanged.
+	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, "rev:"+seed); err != nil || got != TokenTransitionUnchanged {
+		t.Fatalf("Unchanged: got=%v err=%v", got, err)
+	}
+	// seed -> child (ancestor): FastForward.
+	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, "rev:"+child); err != nil || got != TokenTransitionFastForward {
+		t.Fatalf("FastForward: got=%v err=%v", got, err)
+	}
+	// seed -> sibling (no shared history): Diverged.
+	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, "rev:"+sibling); err != nil || got != TokenTransitionDiverged {
+		t.Fatalf("Diverged: got=%v err=%v", got, err)
+	}
+	// missing -> rev: Diverged (transition through orphan).
+	if got, err := ClassifyTokenTransition(ctx, f.dir, BranchTokenMissing, "rev:"+seed); err != nil || got != TokenTransitionDiverged {
+		t.Fatalf("missing->rev: got=%v err=%v", got, err)
+	}
+	// rev -> missing: Diverged.
+	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, BranchTokenMissing); err != nil || got != TokenTransitionDiverged {
+		t.Fatalf("rev->missing: got=%v err=%v", got, err)
+	}
+	// "" (boot first observation) -> rev: FastForward — no prior history to compare.
+	if got, err := ClassifyTokenTransition(ctx, f.dir, "", "rev:"+seed); err != nil || got != TokenTransitionFastForward {
+		t.Fatalf("empty->rev: got=%v err=%v", got, err)
+	}
+}
+
+// TestLoadSaveBranchGeneration: round-trip the persisted generation +
+// HEAD scalars through daemon_meta. Defaults to 1 when the key is absent.
+func TestLoadSaveBranchGeneration(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	got, err := LoadBranchGeneration(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadBranchGeneration default: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("default generation=%d want 1", got)
+	}
+	head, err := LoadBranchHead(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadBranchHead default: %v", err)
+	}
+	if head != "" {
+		t.Fatalf("default head=%q want empty", head)
+	}
+
+	if err := SaveBranchGeneration(ctx, f.db, 7, "deadbeefcafe"); err != nil {
+		t.Fatalf("SaveBranchGeneration: %v", err)
+	}
+	got, err = LoadBranchGeneration(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadBranchGeneration round-trip: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("round-trip generation=%d want 7", got)
+	}
+	head, err = LoadBranchHead(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadBranchHead round-trip: %v", err)
+	}
+	if head != "deadbeefcafe" {
+		t.Fatalf("round-trip head=%q want deadbeefcafe", head)
+	}
+}
+
+// TestRun_BranchGenerationBumpsOnExternalReset: an external `git reset`
+// onto a sibling commit during the run loop causes the active generation
+// to bump and the persisted value to advance. This is the daemon-side
+// counterpart to the replay-level stale-generation guard.
+func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Build a sibling commit on a fresh tree — no shared history with the
+	// seed commit. We point main at this sibling under the daemon's feet
+	// to simulate `git reset --hard <sibling>`.
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("sibling\n"))
+	if err != nil {
+		t.Fatalf("hash sibling blob: %v", err)
+	}
+	siblingTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "sibling.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree sibling: %v", err)
+	}
+	sibling, err := git.CommitTree(ctx, f.dir, siblingTree, "sibling root")
+	if err != nil {
+		t.Fatalf("commit-tree sibling: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	// Wait for the daemon to seed daemon_meta.branch.generation = 1 AND
+	// daemon_meta.branch.head to point at the seed commit. Without the
+	// head check the run loop's first iteration can still be on the path
+	// from "" -> seed and treat the upcoming sibling reset as the boot
+	// transition.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+		head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+		if gen == "1" && head == seedHead {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// External reset: point main at the sibling. The daemon's next tick
+	// must classify this as a divergence. Send several wakes so we don't
+	// race a single buffered slot against a busy iteration.
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", sibling, ""); err != nil {
+		t.Fatalf("update-ref to sibling: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Poll for the persisted generation to bump above 1.
+	deadline = time.Now().Add(5 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+		if ok && v != "" && v != "1" {
+			got = v
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got == "" {
+		t.Fatalf("branch.generation did not bump after sibling reset (still %q); seedHead=%s sibling=%s",
+			"1", seedHead, sibling)
+	}
+
+	// After the divergence the daemon must reseed shadow_paths for the
+	// new (branch_ref, branch_generation) key. Without the reseed, the
+	// next capture pass sees an empty shadow and emits phantom `create`
+	// events for every tracked file in HEAD's tree.
+	branchRef, _ := resolveBranch(ctx, f.dir, slog.Default())
+	deadline = time.Now().Add(3 * time.Second)
+	var shadowRows int
+	for time.Now().Before(deadline) {
+		row := f.db.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+			branchRef, got)
+		if err := row.Scan(&shadowRows); err == nil && shadowRows > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if shadowRows == 0 {
+		t.Fatalf("shadow_paths not reseeded for (%s, gen=%s) after divergence", branchRef, got)
+	}
+
+	cancel()
+	wg.Wait()
+}
+
+// TestRun_BranchGenerationStableOnAcdFastForward: the daemon's own
+// commit-driven HEAD advance is a fast-forward (newHead descends from
+// prevHead), so the generation must NOT bump even though the token
+// changed.
+func TestRun_BranchGenerationStableOnAcdFastForward(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	// Drop a file and wake — the daemon should commit it (fast-forward).
+	if err := os.WriteFile(filepath.Join(f.dir, "ff.txt"), []byte("ff\n"), 0o644); err != nil {
+		t.Fatalf("write ff: %v", err)
+	}
+	// Multiple wakes — the run loop drives capture+replay on each tick;
+	// under -race + -p N the first wake can race the bootstrap.
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	if newHead == startHead {
+		t.Fatalf("HEAD did not advance via daemon commit")
+	}
+
+	// Wait for the next loop iteration to observe the new HEAD and run
+	// the token classifier — poll for branch.head to flip to newHead.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+		if ok && v == newHead {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Generation must still be 1.
+	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+	if err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	}
+	if !ok {
+		t.Fatalf("branch.generation not seeded")
+	}
+	if v != "1" {
+		t.Fatalf("branch.generation=%q after ACD fast-forward; want 1 (no bump)", v)
+	}
+
+	cancel()
+	wg.Wait()
+}
+
 // TestBranchGenerationToken_RevAndMissing: token shape covers both ref-present
 // and orphan-HEAD cases.
 func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
@@ -790,4 +1095,107 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 	if tok2 != BranchTokenMissing {
 		t.Fatalf("empty token=%q want %q", tok2, BranchTokenMissing)
 	}
+}
+
+// TestRun_RepeatedEditsToSameFile_OrderedCommits drives the daemon Run loop
+// with three sequential edits to the same path (v1 -> v2 -> v3), waking the
+// daemon after each edit. The regression target is the scratch-index
+// refactor for replay: the same path's modify chain must publish in order
+// when driven through the real capture+wake+publish loop, not just under
+// direct Replay() calls (covered by TestReplay_ModifyChain_OrderedReplay).
+//
+// Pre-fix this would have either raced (only the last write commits, prior
+// edits get coalesced into a single capture), or — with separate captures
+// per wake — failed with "modify before-state mismatch" because the live
+// index probe would see whichever blob was last written, not the captured
+// before/after blobs the chain expects.
+func TestRun_RepeatedEditsToSameFile_OrderedCommits(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	target := filepath.Join(f.dir, "chain.txt")
+	versions := []string{"v1\n", "v2\n", "v3\n"}
+	prevHead := startHead
+	heads := make([]string, 0, len(versions))
+	for i, body := range versions {
+		if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", target, err)
+		}
+		// Multiple wakes — under -race the first wake may race the loop
+		// boundary; the run loop coalesces extras.
+		for j := 0; j < 4; j++ {
+			select {
+			case wakeCh <- struct{}{}:
+			default:
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+		newHead := waitForCommit(t, f.dir, prevHead, 5*time.Second)
+		if newHead == prevHead {
+			t.Fatalf("edit %d: HEAD did not advance from %s", i+1, prevHead)
+		}
+		heads = append(heads, newHead)
+		prevHead = newHead
+	}
+
+	// Walk the resulting log: chain.txt's blob must trace v1 -> v2 -> v3
+	// commit-by-commit, with each commit a fast-forward of its predecessor.
+	wantBlobs := make([]string, len(versions))
+	for i, body := range versions {
+		oid, err := git.HashObjectStdin(context.Background(), f.dir, []byte(body))
+		if err != nil {
+			t.Fatalf("hash %d: %v", i, err)
+		}
+		wantBlobs[i] = oid
+	}
+	for i, h := range heads {
+		entries, err := git.LsTree(context.Background(), f.dir, h, false, "chain.txt")
+		if err != nil {
+			t.Fatalf("ls-tree %s: %v", h, err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("commit %d (%s): chain.txt missing", i, h)
+		}
+		if entries[0].OID != wantBlobs[i] {
+			t.Fatalf("commit %d (%s): chain.txt blob=%s want %s",
+				i, h, entries[0].OID, wantBlobs[i])
+		}
+	}
+
+	// Final tip must be the v3 commit and reachable from the seed via
+	// fast-forwards only — the daemon must not have force-pushed mid-way.
+	mb, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
+		"merge-base", "--is-ancestor", startHead, heads[len(heads)-1])
+	if err != nil {
+		t.Fatalf("merge-base --is-ancestor: %v\n%s", err, mb)
+	}
+
+	cancel()
+	wg.Wait()
 }

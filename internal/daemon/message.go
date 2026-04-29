@@ -6,7 +6,7 @@
 // now a thin wrapper that:
 //
 //  1. translates the daemon's EventContext into ai.CommitContext;
-//  2. invokes ai.DeterministicProvider.Generate;
+//  2. invokes the ai.Provider's Generate;
 //  3. composes the resulting Result.Subject + Result.Body into the
 //     single-string message MessageFn returns.
 //
@@ -14,18 +14,50 @@
 // single-op events produce just the subject, multi-op events produce
 // `subject + "\n\n" + bullets`. Existing replay tests pin the subject
 // shape and continue to pass unchanged.
+//
+// Diff text reconstruction
+// ------------------------
+// Network-bound providers (openai-compat, plugin subprocess) want a
+// unified diff describing the captured change so the model can produce a
+// commit subject grounded in the actual delta. The diff is rebuilt from
+// the per-op `before_oid` / `after_oid` blobs persisted at capture time
+// (NOT from the live worktree, which may have moved on by the time the
+// drain runs). Implementation choice: shell `git diff --no-color
+// --no-ext-diff <before> <after>` per op and rewrite the synthetic
+// `a/<oid>` `b/<oid>` paths with the captured path. This keeps us on the
+// same git binary the rest of the daemon already drives — no second
+// diff library, no bespoke text-diff implementation. For create/delete
+// we substitute the well-known empty-blob OID
+// (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side and
+// ensure it is present in the object store via a one-shot
+// `git hash-object -w --stdin < /dev/null`.
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// emptyBlobOID is git's hard-coded SHA-1 of the empty blob. Used as the
+// "missing side" OID when synthesising create/delete diffs so we can
+// always pass two real OIDs to `git diff`.
+const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
+//
+// The deterministic provider does not consult DiffText / RepoRoot, so we
+// pass an empty repo root here — the daemon-side wiring (providerMessageFn)
+// is what populates the diff for AI providers.
 func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) {
-	return providerMessageFn(ai.DeterministicProvider{})(ctx, ec)
+	return providerMessageFn(ai.DeterministicProvider{}, "")(ctx, ec)
 }
 
 // providerMessageFn adapts an ai.Provider into the daemon's MessageFn
@@ -33,9 +65,14 @@ func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) 
 // loop's commit-tree call gets a single string. Errors propagate so
 // Compose'd fallback chains can surface their final outcome to the
 // caller (which logs, marks the event failed, and continues).
-func providerMessageFn(p ai.Provider) MessageFn {
+//
+// repoRoot is used to reconstruct the unified diff from captured blob
+// OIDs; pass "" when the caller cannot supply a repo root (the
+// deterministic provider tolerates an empty DiffText, and AI providers
+// will simply receive an empty diff field).
+func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
 	return func(ctx context.Context, ec EventContext) (string, error) {
-		cc := commitContextFromEvent(ec)
+		cc := commitContextFromEvent(ctx, ec, repoRoot)
 		r, err := p.Generate(ctx, cc)
 		if err != nil {
 			return "", err
@@ -51,9 +88,18 @@ func providerMessageFn(p ai.Provider) MessageFn {
 // ai package's CommitContext. Multi-op events are flattened into MultiOp;
 // single-op events populate the top-level Path/Op/OldPath fields so the
 // deterministic generator can take the single-op path.
-func commitContextFromEvent(ec EventContext) ai.CommitContext {
+//
+// When repoRoot is non-empty, the captured before/after OIDs on each op
+// are diffed via `git diff` and the resulting unified diff text is
+// stitched into CommitContext.DiffText (capped via ai.Truncate before
+// the network-bound providers serialise it). Diff failures are
+// swallowed: an empty DiffText still produces a working commit message
+// (the deterministic fallback is unaffected).
+func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot string) ai.CommitContext {
 	cc := ai.CommitContext{
-		Branch: ec.Event.BranchRef,
+		Branch:   ec.Event.BranchRef,
+		RepoRoot: repoRoot,
+		Now:      time.Now(),
 	}
 	switch len(ec.Ops) {
 	case 0:
@@ -79,5 +125,218 @@ func commitContextFromEvent(ec EventContext) ai.CommitContext {
 			})
 		}
 	}
+	if repoRoot != "" && len(ec.Ops) > 0 {
+		if diff, err := BuildOpsDiff(ctx, repoRoot, ec.Ops); err == nil && diff != "" {
+			cc.DiffText = ai.Truncate(diff, ai.DiffCap)
+		}
+	}
 	return cc
+}
+
+// BuildOpsDiff reconstructs a unified diff for one event's ops by
+// running `git diff` against the per-op `before_oid` / `after_oid`
+// blobs. Each op contributes one diff section; sections are joined with
+// a single newline. Soft errors per-op (missing blob, unknown op) are
+// swallowed and the corresponding section is omitted; the function only
+// returns an error when the underlying git binary is unreachable in a
+// way that should surface up to the caller.
+//
+// The returned text is NOT truncated; callers running against a network
+// provider must apply ai.Truncate themselves. The deterministic
+// provider does not consult DiffText, so internal callers can hand the
+// raw output to it without truncation.
+func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	if repoRoot == "" || len(ops) == 0 {
+		return "", nil
+	}
+	var buf bytes.Buffer
+	for _, op := range ops {
+		section, err := buildOpDiff(ctx, repoRoot, op)
+		if err != nil {
+			// Soft per-op failure: skip this op but keep going so the
+			// model still sees the other ops in a multi-op event.
+			continue
+		}
+		if section == "" {
+			continue
+		}
+		if buf.Len() > 0 && !strings.HasSuffix(buf.String(), "\n") {
+			buf.WriteByte('\n')
+		}
+		buf.WriteString(section)
+	}
+	return buf.String(), nil
+}
+
+// buildOpDiff produces a unified diff section for one captured op.
+// Returns "" + nil when the op carries no usable OIDs (e.g. an oversize
+// metadata-only op), or the textual diff with rewritten path headers
+// for every other case.
+func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (string, error) {
+	path := op.Path
+	oldPath := ""
+	if op.OldPath.Valid {
+		oldPath = op.OldPath.String
+	}
+	beforeOID := ""
+	if op.BeforeOID.Valid {
+		beforeOID = op.BeforeOID.String
+	}
+	afterOID := ""
+	if op.AfterOID.Valid {
+		afterOID = op.AfterOID.String
+	}
+	beforeMode := ""
+	if op.BeforeMode.Valid {
+		beforeMode = op.BeforeMode.String
+	}
+	afterMode := ""
+	if op.AfterMode.Valid {
+		afterMode = op.AfterMode.String
+	}
+
+	switch op.Op {
+	case "create":
+		return renderDiff(ctx, repoRoot, diffSpec{
+			oldPath: path, newPath: path,
+			beforeOID: emptyBlobOID, afterOID: afterOID,
+			newFileMode: afterMode,
+		})
+	case "delete":
+		return renderDiff(ctx, repoRoot, diffSpec{
+			oldPath: path, newPath: path,
+			beforeOID: beforeOID, afterOID: emptyBlobOID,
+			deletedFileMode: beforeMode,
+		})
+	case "modify":
+		return renderDiff(ctx, repoRoot, diffSpec{
+			oldPath: path, newPath: path,
+			beforeOID: beforeOID, afterOID: afterOID,
+			oldMode: beforeMode, newMode: afterMode,
+		})
+	case "rename":
+		from := oldPath
+		if from == "" {
+			from = path
+		}
+		return renderDiff(ctx, repoRoot, diffSpec{
+			oldPath: from, newPath: path,
+			beforeOID: beforeOID, afterOID: afterOID,
+			renameFrom: from, renameTo: path,
+			oldMode: beforeMode, newMode: afterMode,
+		})
+	case "mode":
+		return renderDiff(ctx, repoRoot, diffSpec{
+			oldPath: path, newPath: path,
+			beforeOID: beforeOID, afterOID: afterOID,
+			oldMode: beforeMode, newMode: afterMode,
+			modeOnly: beforeOID == afterOID,
+		})
+	default:
+		return "", nil
+	}
+}
+
+// diffSpec carries the rendering knobs for one op's diff section.
+type diffSpec struct {
+	oldPath, newPath     string
+	beforeOID, afterOID  string
+	oldMode, newMode     string
+	newFileMode          string // for "new file mode" header on create
+	deletedFileMode      string // for "deleted file mode" header on delete
+	renameFrom, renameTo string
+	modeOnly             bool
+}
+
+// renderDiff stitches the op's header lines together with the body diff
+// produced by `git diff <before> <after>`. The body's auto-generated
+// `diff --git a/<oid>` / `--- a/<oid>` / `+++ b/<oid>` lines are
+// stripped and replaced by header lines that reflect the captured path
+// + mode. Anything past the first hunk header (`@@`) is forwarded
+// verbatim so binary-file markers or "No newline" trailers survive.
+func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error) {
+	if err := ensureEmptyBlob(ctx, repoRoot, s); err != nil {
+		return "", err
+	}
+
+	var hdr strings.Builder
+	fmt.Fprintf(&hdr, "diff --git a/%s b/%s\n", s.oldPath, s.newPath)
+	if s.newFileMode != "" {
+		fmt.Fprintf(&hdr, "new file mode %s\n", s.newFileMode)
+	}
+	if s.deletedFileMode != "" {
+		fmt.Fprintf(&hdr, "deleted file mode %s\n", s.deletedFileMode)
+	}
+	if s.renameFrom != "" && s.renameTo != "" && s.renameFrom != s.renameTo {
+		fmt.Fprintf(&hdr, "rename from %s\nrename to %s\n", s.renameFrom, s.renameTo)
+	}
+	if s.oldMode != "" && s.newMode != "" && s.oldMode != s.newMode &&
+		s.newFileMode == "" && s.deletedFileMode == "" {
+		fmt.Fprintf(&hdr, "old mode %s\nnew mode %s\n", s.oldMode, s.newMode)
+	}
+	if s.modeOnly {
+		// Pure mode change carries no content delta — header alone is
+		// the entire section.
+		return hdr.String(), nil
+	}
+
+	if s.beforeOID == "" || s.afterOID == "" {
+		// Defensive: missing OID. Header alone is still informative.
+		return hdr.String(), nil
+	}
+
+	body, err := git.DiffBlobs(ctx, repoRoot, s.beforeOID, s.afterOID)
+	if err != nil {
+		// Best-effort: when git refuses (missing blob, foreign archive),
+		// fall back to header-only so the model still sees the change
+		// shape.
+		return hdr.String(), nil
+	}
+	body = stripGitDiffPreamble(body)
+
+	if body == "" {
+		return hdr.String(), nil
+	}
+	// Reattach our own `--- a/<path>` / `+++ b/<path>` lines so the
+	// hunk(s) are anchored to a real path. `git diff` between two blob
+	// OIDs emits these but with the OIDs in place of paths; we strip
+	// those and supply the captured ones.
+	fmt.Fprintf(&hdr, "--- a/%s\n+++ b/%s\n", s.oldPath, s.newPath)
+	hdr.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		hdr.WriteByte('\n')
+	}
+	return hdr.String(), nil
+}
+
+// stripGitDiffPreamble drops git's auto-generated header (`diff --git`,
+// `index`, `---`, `+++` lines) up to but not including the first hunk
+// (`@@`) or "Binary files" marker. Returns the remainder.
+func stripGitDiffPreamble(body string) string {
+	// Common case: the body starts with `diff --git a/<oid> b/<oid>`.
+	// Walk lines, dropping any that look like the synthetic header
+	// emitted by `git diff <oidA> <oidB>`. Stop at the first `@@` or
+	// `Binary files` line.
+	lines := strings.SplitAfter(body, "\n")
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "@@ "),
+			strings.HasPrefix(line, "Binary files "):
+			return strings.Join(lines[i:], "")
+		}
+	}
+	// No hunks found — nothing useful to forward.
+	return ""
+}
+
+// ensureEmptyBlob makes sure git's empty-blob OID exists in the object
+// store before we ask `git diff` to read it. The first
+// `git hash-object -w --stdin < /dev/null` is idempotent and cheap;
+// subsequent calls are no-ops.
+func ensureEmptyBlob(ctx context.Context, repoRoot string, s diffSpec) error {
+	if s.beforeOID != emptyBlobOID && s.afterOID != emptyBlobOID {
+		return nil
+	}
+	_, err := git.HashObjectStdin(ctx, repoRoot, nil)
+	return err
 }

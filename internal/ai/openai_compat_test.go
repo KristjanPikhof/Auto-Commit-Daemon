@@ -290,3 +290,100 @@ func TestCompose_NilFallbackPanics(t *testing.T) {
 	}()
 	Compose(DeterministicProvider{}, nil)
 }
+
+// TestOpenAI_ForwardsCommitContext: the daemon-side wiring populates
+// DiffText (built from captured blobs), RepoRoot, Branch, and MultiOp on
+// CommitContext before calling Generate. This test asserts each of
+// those fields lands in the JSON payload the mock OpenAI server sees,
+// using a hand-rolled diff text that resembles what BuildOpsDiff
+// produces from before/after blob OIDs.
+func TestOpenAI_ForwardsCommitContext(t *testing.T) {
+	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedToolCall("Update files", "")
+	})
+
+	// Diff shaped like what daemon.BuildOpsDiff emits for a multi-op event:
+	// per-op `diff --git a/<path> b/<path>` headers, anchored hunks, etc.
+	capturedDiff := strings.Join([]string{
+		"diff --git a/src/a.go b/src/a.go",
+		"--- a/src/a.go",
+		"+++ b/src/a.go",
+		"@@ -1 +1 @@",
+		"-old A",
+		"+new A",
+		"diff --git a/src/b.go b/src/b.go",
+		"new file mode 100644",
+		"--- a/src/b.go",
+		"+++ b/src/b.go",
+		"@@ -0,0 +1 @@",
+		"+fresh B",
+		"",
+	}, "\n")
+
+	cc := CommitContext{
+		Branch:   "refs/heads/main",
+		RepoRoot: "/tmp/some-repo",
+		DiffText: capturedDiff,
+		MultiOp: []OpItem{
+			{Path: "src/a.go", Op: "modify"},
+			{Path: "src/b.go", Op: "create"},
+		},
+	}
+	if _, err := p.Generate(context.Background(), cc); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(last.rawBody, &sent); err != nil {
+		t.Fatalf("decode sent: %v", err)
+	}
+	var userContent string
+	for _, m := range sent.Messages {
+		if m.Role == "user" {
+			userContent = m.Content
+		}
+	}
+	if userContent == "" {
+		t.Fatalf("no user message captured")
+	}
+	jsonStart := strings.Index(userContent, "{")
+	if jsonStart < 0 {
+		t.Fatalf("user content missing JSON: %q", userContent)
+	}
+	var inner struct {
+		Branch   string `json:"branch"`
+		RepoRoot string `json:"repo_root"`
+		Diff     string `json:"diff"`
+		MultiOp  []struct {
+			Path string `json:"path"`
+			Op   string `json:"op"`
+		} `json:"multi_op"`
+	}
+	if err := json.Unmarshal([]byte(userContent[jsonStart:]), &inner); err != nil {
+		t.Fatalf("decode user payload: %v", err)
+	}
+	if inner.Branch != "refs/heads/main" {
+		t.Fatalf("branch=%q", inner.Branch)
+	}
+	if inner.RepoRoot != "/tmp/some-repo" {
+		t.Fatalf("repo_root=%q", inner.RepoRoot)
+	}
+	if !strings.Contains(inner.Diff, "diff --git a/src/a.go b/src/a.go") ||
+		!strings.Contains(inner.Diff, "+new A") {
+		t.Fatalf("diff missing first op section:\n%s", inner.Diff)
+	}
+	if !strings.Contains(inner.Diff, "diff --git a/src/b.go b/src/b.go") ||
+		!strings.Contains(inner.Diff, "+fresh B") {
+		t.Fatalf("diff missing second op section:\n%s", inner.Diff)
+	}
+	if len(inner.MultiOp) != 2 ||
+		inner.MultiOp[0].Path != "src/a.go" ||
+		inner.MultiOp[1].Path != "src/b.go" {
+		t.Fatalf("multi_op=%+v", inner.MultiOp)
+	}
+}

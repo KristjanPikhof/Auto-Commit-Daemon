@@ -17,6 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
 	_ "modernc.org/sqlite"
 )
@@ -32,6 +33,8 @@ type listEntry struct {
 	LastSeq          int64   `json:"last_seq"`
 	LastCommitOID    string  `json:"last_commit_oid,omitempty"`
 	HeartbeatAgeSecs float64 `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents    int     `json:"pending_events"`
+	BlockedConflicts int     `json:"blocked_conflicts"`
 	Status           string  `json:"status"`
 	StatusNote       string  `json:"status_note,omitempty"`
 }
@@ -106,6 +109,8 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		e.LastSeq = summary.lastSeq
 		e.LastCommitOID = summary.lastCommitOID
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
+		e.PendingEvents = summary.pendingEvents
+		e.BlockedConflicts = summary.blockedConflicts
 		if summary.daemon == "stale" {
 			if summary.clients == 0 {
 				continue
@@ -125,10 +130,11 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 	}
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tLAST_COMMIT\tSTATUS")
+	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tLAST_COMMIT\tSTATUS")
 	for _, e := range entries {
 		clients := dashIfMissing(e.Status, fmt.Sprintf("%d", e.Clients))
-		pending := dashIfMissing(e.Status, "0")
+		pending := dashIfMissing(e.Status, fmt.Sprintf("%d", e.PendingEvents))
+		blocked := dashIfMissing(e.Status, fmt.Sprintf("%d", e.BlockedConflicts))
 		lastOID := "-"
 		if e.LastCommitOID != "" {
 			if len(e.LastCommitOID) > 7 {
@@ -141,8 +147,8 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		if e.StatusNote != "" {
 			statusCol = e.Status + " (" + e.StatusNote + ")"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			homeShort(e.Path), e.Daemon, clients, pending, lastOID, statusCol)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			homeShort(e.Path), e.Daemon, clients, pending, blocked, lastOID, statusCol)
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("acd list: flush: %w", err)
@@ -161,14 +167,16 @@ func dashIfMissing(status, val string) string {
 
 // repoSummary is the subset of state.db fields the CLI needs.
 type repoSummary struct {
-	daemon        string
-	pid           int
-	clients       int
-	lastSeq       int64
-	lastCommitOID string
-	heartbeatAge  time.Duration
-	startedTS     float64
-	heartbeatTS   float64
+	daemon           string
+	pid              int
+	clients          int
+	lastSeq          int64
+	lastCommitOID    string
+	heartbeatAge     time.Duration
+	startedTS        float64
+	heartbeatTS      float64
+	pendingEvents    int
+	blockedConflicts int
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
@@ -247,6 +255,19 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 	if lastOID.Valid {
 		s.lastCommitOID = lastOID.String
+	}
+
+	// Pending FIFO depth + terminal blocked-conflict count. Same RO conn
+	// already in hand — read both directly so list/status/doctor agree.
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&s.pendingEvents); err != nil {
+		return repoSummary{}, fmt.Errorf("pending events: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateBlockedConflict).Scan(&s.blockedConflicts); err != nil {
+		return repoSummary{}, fmt.Errorf("blocked conflicts: %w", err)
 	}
 
 	return s, nil

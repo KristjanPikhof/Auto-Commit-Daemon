@@ -60,7 +60,7 @@ type ReplayOpts struct {
 // ReplaySummary describes one drain.
 type ReplaySummary struct {
 	Published int // events that produced a new commit
-	Conflicts int // events deferred via publish_state.status=conflict
+	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 }
 
@@ -70,11 +70,21 @@ type ReplaySummary struct {
 // poll-tick. Coalescing OFF — each event becomes its own commit, with the
 // previous event's commit as the new HEAD's parent.
 //
-// Conflict semantics: when the live index for any path touched by an event
-// disagrees with the event's before-state, the event is left pending and
-// publish_state.status is updated to "conflict". The daemon surfaces the
-// conflict via daemon_meta.last_replay_conflict; resolution is the
+// Conflict semantics: when the scratch replay index for any path touched by
+// an event disagrees with the event's before-state, OR the branch ref CAS
+// fails on update-ref, the event is settled in state.EventStateBlockedConflict
+// (terminal — never retried automatically) and publish_state.status is set
+// to "blocked_conflict". The daemon also stamps daemon_meta.last_replay_conflict
+// so operators can spot a divergence at a glance. Resolution is the
 // operator's job (out of scope for v1 automation).
+//
+// Batch halt: a conflict or commit-build failure short-circuits the rest of
+// the pending queue. Subsequent events were captured assuming the broken
+// predecessor would land first; replaying them on top of a stale parent
+// would produce a tree that diverges from the operator's intent. The next
+// poll tick sees those events still pending and re-attempts them only after
+// the operator has reconciled the blocker (which advances BaseHead /
+// branch_generation and lets the queue drain naturally).
 func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
 	var sum ReplaySummary
 	if repoRoot == "" || db == nil {
@@ -121,6 +131,24 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
+
+		// Branch-generation / ancestry guard. An event whose generation
+		// no longer matches the active context was captured under a
+		// branch state that has since been rewritten (rebase, reset,
+		// branch switch). An event whose BaseHead is not reachable from
+		// the current replay parent was captured against a HEAD that no
+		// longer descends to the live worktree. Either case must NOT
+		// silently replay — the resulting commit would chain off a stale
+		// parent and diverge from the operator's intent. Block
+		// terminally so operators can spot the mismatch and reconcile.
+		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
+			return sum, err
+		} else if reason != "" {
+			recordConflict(ctx, db, ev, reason, cctx)
+			sum.Conflicts++
+			return sum, nil
+		}
+
 		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
 		if err != nil {
 			return sum, fmt.Errorf("daemon: load ops seq=%d: %w", ev.Seq, err)
@@ -139,15 +167,25 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			continue
 		}
 
-		// Conflict probe: compare live staged index against each op's
-		// before-state. Mismatch -> mark conflict, skip (event stays
-		// pending for the next pass after operator resolution).
-		if reason, err := detectConflict(ctx, repoRoot, ops); err != nil {
+		// Conflict probe: compare the per-replay scratch index (seeded
+		// from BaseHead and advanced by every prior queued event) against
+		// each op's before-state. The repo's live index is intentionally
+		// NOT inspected — a busy worktree that has moved ahead of the
+		// queue would otherwise spuriously reject valid sequenced events
+		// (e.g. an A→B→C→D modify chain whose disk state already shows D).
+		//
+		// Mirrors snapshot-replay._verify_op against the in-memory state
+		// dict seeded from snapshot_state_for_index over the GIT_INDEX_FILE
+		// scratch index.
+		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
 			recordConflict(ctx, db, ev, reason, cctx)
 			sum.Conflicts++
-			continue
+			// Halt the batch: subsequent events were captured assuming
+			// this one would land first. Running them now would replay on
+			// top of a broken predecessor.
+			return sum, nil
 		}
 
 		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
@@ -155,10 +193,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err != nil {
 			markFailed(ctx, db, ev, err.Error())
 			sum.Failed++
-			// Reset the in-memory index from `parent` so a partial apply
-			// does not poison subsequent events.
+			// Halt the batch: a commit-build failure leaves `parent`
+			// pointing at the prior commit, but later events will still
+			// chain from a broken predecessor as soon as the operator
+			// fixes the root cause. Stop here and let the next poll tick
+			// re-attempt from a fresh seed.
 			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
-			continue
+			return sum, nil
 		}
 
 		// Advance the branch ref via CAS against the prior parent.
@@ -168,17 +209,19 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			oldOID = ""
 		}
 		if err := git.UpdateRef(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID); err != nil {
-			// CAS failed: ref moved out from under us. Mark conflict.
+			// CAS failed: ref moved out from under us. Block terminally —
+			// every queued event downstream was captured against the
+			// stale ref and must wait for branch reconciliation.
 			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), cctx)
 			sum.Conflicts++
 			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
-			continue
+			return sum, nil
 		}
 
 		// Settle the event row + publish_state.
 		nowSec := float64(time.Now().UnixNano()) / 1e9
 		if err := state.MarkEventPublished(ctx, db,
-			ev.Seq, "published",
+			ev.Seq, state.EventStatePublished,
 			sql.NullString{String: commitOID, Valid: true},
 			sql.NullString{},
 			ev.Message, nowSec,
@@ -235,16 +278,21 @@ func validateOps(ops []state.CaptureOp) string {
 	return ""
 }
 
-// detectConflict checks the live staged index for every path touched by ops
-// and flags a conflict when the live state disagrees with the op's
-// before-state. Mirrors the legacy _verify_op against
-// snapshot_state_for_index. Returns ("", nil) on success.
-func detectConflict(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+// detectConflict checks the scratch replay index for every path touched by
+// ops and flags a conflict when the indexed state disagrees with the op's
+// before-state. Mirrors the legacy _verify_op against the in-memory state
+// dict seeded from snapshot_state_for_index over the GIT_INDEX_FILE scratch
+// index. Returns ("", nil) on success.
+//
+// indexFile must be the per-replay scratch index (the same path passed to
+// UpdateIndexInfo + WriteTree below); empty falls back to the live repo
+// index but the run loop never relies on that — see the comment in Replay.
+func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state.CaptureOp) (string, error) {
 	paths := touchedPaths(ops)
 	if len(paths) == 0 {
 		return "", nil
 	}
-	live, err := git.LsFilesStaged(ctx, repoRoot, paths...)
+	staged, err := git.LsFilesIndex(ctx, repoRoot, indexFile, paths...)
 	if err != nil {
 		return "", fmt.Errorf("ls-files staged: %w", err)
 	}
@@ -252,7 +300,7 @@ func detectConflict(ctx context.Context, repoRoot string, ops []state.CaptureOp)
 		mode, oid string
 	}
 	idx := map[string]entry{}
-	for _, le := range live {
+	for _, le := range staged {
 		idx[le.Path] = entry{mode: le.Mode, oid: le.OID}
 	}
 	for _, op := range ops {
@@ -370,31 +418,99 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 }
 
 // markFailed flags an event as terminally failed and records the reason.
-// Best-effort: persistence failures here do not propagate, the next pass
-// will see the event still pending and re-attempt (with the same outcome).
+// "failed" is terminal — PendingEvents excludes the row, so the next pass
+// will not re-attempt it. Best-effort: persistence failures here do not
+// propagate.
 func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string) {
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	_ = state.MarkEventPublished(ctx, db,
-		ev.Seq, "failed",
+		ev.Seq, state.EventStateFailed,
 		sql.NullString{}, sql.NullString{String: reason, Valid: true},
 		ev.Message, nowSec)
 }
 
-// recordConflict updates publish_state to flag the conflict but leaves the
-// event row in `pending` so the next pass can retry once the operator has
-// reconciled the index. Mirrors the legacy "blocked_conflict" surface but
-// uses the simpler `conflict` status the v1 schema documents.
+// recordConflict terminally settles the event in
+// state.EventStateBlockedConflict and synchronously upserts the singleton
+// publish_state row to status="blocked_conflict" — both writes happen in one
+// transaction via state.MarkEventBlocked so a status reader never observes a
+// stale half-update.
+//
+// The event row leaves `pending` permanently. PendingEvents will skip it on
+// every subsequent poll, so a stuck event no longer blocks the queue with
+// retry churn. Operators see the row via `acd status` (blocked_conflicts
+// count) and via daemon_meta.last_replay_conflict for the human message.
 func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string, cctx CaptureContext) {
-	_ = state.SavePublishState(ctx, db, state.Publish{
-		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
-		SourceHead:       sql.NullString{String: cctx.BaseHead, Valid: true},
-		Status:           "conflict",
-		Error:            sql.NullString{String: reason, Valid: true},
-	})
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	_ = state.MarkEventBlocked(ctx, db, ev.Seq, reason, nowSec,
+		sql.NullString{String: cctx.BranchRef, Valid: true},
+		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		sql.NullString{String: cctx.BaseHead, Valid: true},
+	)
 	_ = state.MetaSet(ctx, db, "last_replay_conflict",
 		fmt.Sprintf("seq=%d: %s", ev.Seq, reason))
+}
+
+// checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty
+// human-readable reason when the queued event must not be replayed against
+// the current branch generation, or ("", nil) when the event is safe to
+// publish.
+//
+// Two failure modes are distinguished in the returned reason so operators
+// can tell why the queue stalled:
+//
+//  1. Generation mismatch: ev.BranchGeneration != cctx.BranchGeneration.
+//     The branch token transitioned through a divergence (rebase, reset,
+//     branch switch) since the event was captured. Replaying it would
+//     resurrect work that the operator already rewrote.
+//  2. Ancestry mismatch: ev.BaseHead is not an ancestor of the current
+//     replay parent. Even if generations match (e.g. a daemon restart
+//     missed the bump), the captured baseline is no longer reachable and
+//     the resulting commit would chain off a stale parent.
+//
+// A branch_ref mismatch is also flagged — replaying an event captured for
+// branch X onto branch Y would silently land it on the wrong ref.
+//
+// repoRoot is required for the merge-base ancestry probe. parent is the
+// current replay HEAD (== cctx.BaseHead at the start of a pass, advancing
+// per published commit). When parent or ev.BaseHead is empty we skip the
+// ancestry probe — orphan repos and the very-first commit have no history
+// to compare against.
+func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, cctx CaptureContext) (string, error) {
+	if cctx.BranchRef != "" && ev.BranchRef != "" && ev.BranchRef != cctx.BranchRef {
+		return fmt.Sprintf(
+			"branch ref mismatch: event captured on %s but daemon is on %s",
+			ev.BranchRef, cctx.BranchRef), nil
+	}
+	if ev.BranchGeneration != 0 && ev.BranchGeneration != cctx.BranchGeneration {
+		return fmt.Sprintf(
+			"branch generation mismatch: event captured at generation %d but daemon is at %d (branch was reset/rebased/switched since capture)",
+			ev.BranchGeneration, cctx.BranchGeneration), nil
+	}
+	// Ancestry probe — even when generations match (e.g. daemon restart
+	// missed the bump) we must refuse to chain off a parent that is no
+	// longer reachable from HEAD. Both sides must be present for a
+	// meaningful merge-base call.
+	if parent == "" || ev.BaseHead == "" {
+		return "", nil
+	}
+	if ev.BaseHead == parent {
+		return "", nil
+	}
+	ok, err := git.MergeBaseIsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if err != nil {
+		// merge-base failed — most often because ev.BaseHead is no
+		// longer in the object database (gc'd reset). Treat as a
+		// terminal block so the operator notices.
+		return fmt.Sprintf(
+			"ancestry probe failed for base %s: %v (branch likely rewritten since capture)",
+			ev.BaseHead, err), nil
+	}
+	if !ok {
+		return fmt.Sprintf(
+			"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
+			ev.BaseHead, parent), nil
+	}
+	return "", nil
 }
 
 // errReplay is sentinel for fatal replay errors that should halt the pass.
