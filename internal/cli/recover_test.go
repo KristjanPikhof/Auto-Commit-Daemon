@@ -47,6 +47,10 @@ func TestRecover_DryRunNoMutation(t *testing.T) {
 	if err := state.MetaSet(ctx, db, "last_replay_conflict", `{"seq":1,"error_class":"cas_fail"}`); err != nil {
 		t.Fatalf("MetaSet: %v", err)
 	}
+	fixtureChecksum, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum fixture: %v", err)
+	}
 
 	var out bytes.Buffer
 	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
@@ -63,10 +67,10 @@ func TestRecover_DryRunNoMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checksum after: %v", err)
 	}
-	if before == after {
-		t.Fatalf("expected checksum to differ after fixture setup")
+	if fixtureChecksum != after {
+		t.Fatalf("dry-run mutated state.db: before=%s after=%s", fixtureChecksum, after)
 	}
-	_, _, _ = repo, before, after
+	_ = before
 }
 
 func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
