@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -616,19 +617,19 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 	seedHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD^"))
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 
-	stop := runAcd(t, ctx, env, "stop", "--session-id", "offline-1", "--repo", repo, "--force", "--json")
+	stop := runAcd(t, ctx, env, "stop", "--session-id", "offline-1", "--repo", repo, "--json")
 	if stop.ExitCode != 0 {
 		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stop.ExitCode, stop.Stdout, stop.Stderr)
 	}
 	var stopJSON struct {
-		Stopped bool `json:"stopped"`
+		DaemonPID int `json:"daemon_pid"`
 	}
 	if err := json.Unmarshal([]byte(stop.Stdout), &stopJSON); err != nil {
 		t.Fatalf("decode stop json: %v\nstdout=%s", err, stop.Stdout)
 	}
-	if !stopJSON.Stopped {
-		t.Fatalf("force stop did not report stopped\nstdout=%s\nstderr=%s", stop.Stdout, stop.Stderr)
-	}
+	waitFor(t, "offline daemon pid exited", 15*time.Second, func() bool {
+		return stopJSON.DaemonPID <= 0 || !processAlive(stopJSON.DaemonPID)
+	})
 
 	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
 	runGitOK(t, repo, "reset", "--hard", seedHead)
