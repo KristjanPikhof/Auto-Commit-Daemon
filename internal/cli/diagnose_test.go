@@ -53,6 +53,39 @@ func TestDiagnose_AnchorMismatchDetected(t *testing.T) {
 	}
 }
 
+func TestDiagnose_AnchorFallsBackToBranchToken(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running",
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, "branch_token", "rev:abc refs/heads/main"); err != nil {
+		t.Fatalf("set branch token: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.Anchor.Mismatch {
+		t.Fatalf("anchor mismatch should be false when branch_token matches HEAD: %+v", rep.Anchor)
+	}
+	if rep.Anchor.DaemonBranchRef != "refs/heads/main" {
+		t.Fatalf("daemon branch fallback=%q want refs/heads/main", rep.Anchor.DaemonBranchRef)
+	}
+}
+
 func TestDiagnose_BlockedHistogram(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
