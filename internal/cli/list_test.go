@@ -6,10 +6,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -92,6 +94,84 @@ func TestList_JSON_TwoRepos(t *testing.T) {
 		if r.Path == "" || r.RepoHash == "" {
 			t.Fatalf("missing fields in %+v", r)
 		}
+	}
+}
+
+func TestList_StatusColumnShowsManualPause(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason: "deploy",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	})
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "paused (manual)") {
+		t.Fatalf("missing manual pause status:\n%s", stdout.String())
+	}
+}
+
+func TestList_StatusColumnShowsRewindGrace(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, replayPausedUntilMetaKey, time.Now().UTC().Add(time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatalf("MetaSet: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "paused (rewind grace, expires in") {
+		t.Fatalf("missing rewind grace pause status:\n%s", got)
+	}
+}
+
+func TestList_NoPauseShowsOK(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d want 1", len(got.Repos))
+	}
+	if got.Repos[0].Status != "OK" || got.Repos[0].Paused || got.Repos[0].Pause != nil {
+		t.Fatalf("unexpected clean repo status: %+v", got.Repos[0])
 	}
 }
 
