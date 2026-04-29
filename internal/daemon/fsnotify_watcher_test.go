@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // newWatcherForTest spins up a watcher rooted at a fresh tempdir and
@@ -167,6 +168,38 @@ func TestFsnotifyWatcher_SymlinkedDirIgnored(t *testing.T) {
 		if strings.HasPrefix(filepath.Clean(p), filepath.Clean(external)) {
 			t.Fatalf("watcher descended into symlink target %q: %v", external, w.WatchedPaths())
 		}
+	}
+}
+
+func TestFsnotifyWatcher_DoesNotPruneWildcardSensitiveDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	t.Setenv(state.EnvSensitiveGlobs, "credentials*")
+	dir := t.TempDir()
+	normalDir := filepath.Join(dir, "credentials_repo")
+	if err := os.MkdirAll(filepath.Join(normalDir, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:  dir,
+		Sensitive: state.NewSensitiveMatcher(),
+		Debounce:  30 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var found bool
+	for _, p := range w.WatchedPaths() {
+		if filepath.Clean(p) == filepath.Clean(normalDir) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("credentials_repo should be watched, got watched paths: %v", w.WatchedPaths())
 	}
 }
 
