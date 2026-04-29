@@ -1356,6 +1356,22 @@ func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
 		}
 	})
 
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		tok, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchToken)
+		if ok && strings.Contains(tok, "refs/heads/main") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	tok, ok, err := state.MetaGet(ctx, f.db, MetaKeyBranchToken)
+	if err != nil {
+		t.Fatalf("MetaGet branch token: %v", err)
+	}
+	if !ok || !strings.Contains(tok, "refs/heads/main") {
+		t.Fatalf("daemon did not seed main branch token before switch; token=%q ok=%v", tok, ok)
+	}
+
 	featureRef := "refs/heads/feature/same-sha"
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "-q", "-b", "feature/same-sha"); err != nil {
 		t.Fatalf("checkout feature: %v", err)
