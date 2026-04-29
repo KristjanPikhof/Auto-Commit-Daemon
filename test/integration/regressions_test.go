@@ -96,15 +96,39 @@ func stopSessionForce(t *testing.T, env []string, repo string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = runAcd(t, ctx, env, "stop", "--repo", repo, "--force", "--json")
+	res := runAcd(t, ctx, env, "stop", "--repo", repo, "--force", "--json")
+	var stopJSON struct {
+		DaemonPID int `json:"daemon_pid"`
+	}
+	_ = json.Unmarshal([]byte(res.Stdout), &stopJSON)
 	// Best-effort wait for stopped state — don't fail cleanup.
-	deadline := time.Now().Add(5 * time.Second)
+	if waitStopped(repo, 5*time.Second) {
+		return
+	}
+	pid := stopJSON.DaemonPID
+	if pid <= 0 {
+		pid = readDaemonStatePID(repo)
+	}
+	if pid <= 0 {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if waitStopped(repo, 2*time.Second) || !processAlive(pid) {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	_ = waitStopped(repo, 2*time.Second)
+}
+
+func waitStopped(repo string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if readDaemonStateMode(repo) == "stopped" {
-			return
+			return true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return false
 }
 
 // waitMode is the canonical "wait until daemon_state.mode matches" helper.
