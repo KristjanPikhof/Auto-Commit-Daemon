@@ -28,15 +28,17 @@
 // same git binary the rest of the daemon already drives — no second
 // diff library, no bespoke text-diff implementation. For create/delete
 // we substitute the well-known empty-blob OID
-// (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side and
-// ensure it is present in the object store via a one-shot
-// `git hash-object -w --stdin < /dev/null`.
+// (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
+// Captured diffs are sensitive, so CommitContext.DiffText defaults to empty;
+// set ACD_AI_SEND_DIFF=1 to opt in. Opted-in diffs are redacted before the
+// 4000-byte cap is applied.
 package daemon
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -49,6 +51,8 @@ import (
 // "missing side" OID when synthesising create/delete diffs so we can
 // always pass two real OIDs to `git diff`.
 const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+const envAISendDiff = "ACD_AI_SEND_DIFF"
 
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
@@ -89,10 +93,10 @@ func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
 // single-op events populate the top-level Path/Op/OldPath fields so the
 // deterministic generator can take the single-op path.
 //
-// When repoRoot is non-empty, the captured before/after OIDs on each op
-// are diffed via `git diff` and the resulting unified diff text is
-// stitched into CommitContext.DiffText (capped via ai.Truncate before
-// the network-bound providers serialise it). Diff failures are
+// When repoRoot is non-empty and ACD_AI_SEND_DIFF is truthy, the captured
+// before/after OIDs on each op are diffed via `git diff` and the resulting
+// unified diff text is redacted, capped via ai.Truncate, and stitched into
+// CommitContext.DiffText. Diff failures are
 // swallowed: an empty DiffText still produces a working commit message
 // (the deterministic fallback is unaffected).
 func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot string) ai.CommitContext {
@@ -125,12 +129,21 @@ func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot strin
 			})
 		}
 	}
-	if repoRoot != "" && len(ec.Ops) > 0 {
+	if repoRoot != "" && len(ec.Ops) > 0 && aiSendDiffEnabled() {
 		if diff, err := BuildOpsDiff(ctx, repoRoot, ec.Ops); err == nil && diff != "" {
-			cc.DiffText = ai.Truncate(diff, ai.DiffCap)
+			cc.DiffText = ai.Truncate(ai.RedactDiffSecrets(diff), ai.DiffCap)
 		}
 	}
 	return cc
+}
+
+func aiSendDiffEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envAISendDiff))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // BuildOpsDiff reconstructs a unified diff for one event's ops by
