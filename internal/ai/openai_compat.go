@@ -202,9 +202,11 @@ func truncateForError(s string) string {
 
 // buildOpenAIRequest serializes the chat-completion payload. Keeping
 // this in its own function makes the test-mode "capture the JSON the
-// provider sent" assertion straightforward.
+// provider sent" assertion straightforward. DiffText is redacted before
+// truncation so secrets near either end of a large diff cannot survive
+// provider serialization.
 func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, error) {
-	diff := Truncate(cc.DiffText, diffCap)
+	diff := Truncate(RedactDiffSecrets(cc.DiffText), diffCap)
 
 	type op struct {
 		Path    string `json:"path"`
