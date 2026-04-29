@@ -113,3 +113,52 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 	fmt.Fprintln(out, "acd daemon run: stopped")
 	return nil
 }
+
+// buildDaemonRunOptions assembles the daemon.Options struct for the
+// `acd daemon run` invocation. Centralised so tests can pin the wiring
+// invariants without spinning up the full daemon loop.
+//
+// Behaviour:
+//   - FsnotifyEnabled comes from ACD_FSNOTIFY_ENABLED (any value other
+//     than "" / "0" / "false" enables it).
+//   - CentralStatsDBPath + RepoHash are resolved best-effort. A
+//     resolution failure is logged to errOut but does not abort the
+//     run loop — the daemon's rollup-push step gates on non-empty
+//     values, so missing wiring degrades to "no stats" rather than a
+//     fatal error. Both fields MUST be wired here; the previous
+//     implementation left them blank, which silently disabled
+//     `acd stats` for every install.
+func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) daemon.Options {
+	fsEnabled := false
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
+		fsEnabled = true
+	}
+
+	var (
+		centralStatsPath string
+		repoHash         string
+	)
+	if roots, rErr := paths.Resolve(); rErr != nil {
+		if errOut != nil {
+			fmt.Fprintf(errOut, "acd daemon run: resolve paths for stats: %v (stats disabled)\n", rErr)
+		}
+	} else {
+		centralStatsPath = roots.StatsDBPath()
+	}
+	if h, hErr := paths.RepoHash(repo); hErr != nil {
+		if errOut != nil {
+			fmt.Fprintf(errOut, "acd daemon run: compute repo hash for stats: %v (stats disabled)\n", hErr)
+		}
+	} else {
+		repoHash = h
+	}
+
+	return daemon.Options{
+		RepoPath:           repo,
+		GitDir:             gitDir,
+		DB:                 db,
+		FsnotifyEnabled:    fsEnabled,
+		CentralStatsDBPath: centralStatsPath,
+		RepoHash:           repoHash,
+	}
+}
