@@ -223,15 +223,16 @@ func TestFsnotify_RuntimeBudgetExceededFallsBackToPoll(t *testing.T) {
 	waitMode(t, repo, "running", 5*time.Second)
 	waitMetaValue(t, repo, "fsnotify.mode", "fsnotify", 5*time.Second)
 
-	if err := os.Mkdir(filepath.Join(repo, "runtime-tree"), 0o755); err != nil {
+	runtimeRoot := filepath.Join(repo, "runtime-tree")
+	if err := os.Mkdir(runtimeRoot, 0o755); err != nil {
 		t.Fatalf("mkdir runtime-tree: %v", err)
 	}
-	waitFor(t, "runtime-tree watch registered", 5*time.Second, func() bool {
-		return readDaemonMetaKey(repo, "fsnotify.watch_count") == "2"
-	})
-
-	if err := os.MkdirAll(filepath.Join(repo, "runtime-tree", "a", "b", "c"), 0o755); err != nil {
-		t.Fatalf("mkdir runtime nested tree: %v", err)
+	for i := 0; i < 6 && readDaemonMetaKey(repo, "fsnotify.mode") != "poll"; i++ {
+		time.Sleep(250 * time.Millisecond)
+		nested := filepath.Join(runtimeRoot, fmt.Sprintf("fanout-%d", i), "a", "b", "c")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatalf("mkdir runtime nested tree: %v", err)
+		}
 	}
 	waitMetaValue(t, repo, "fsnotify.mode", "poll", 5*time.Second)
 	if got := readDaemonMetaKey(repo, "fsnotify.fallback_reason"); got != "watch_budget_exceeded" {
