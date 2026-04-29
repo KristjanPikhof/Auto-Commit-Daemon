@@ -241,10 +241,11 @@ func applyPurgePlan(ctx context.Context, stateDB string, plan *purgePlan) error 
 	// The singleton row is keyed at id=1; clear status + error and zero
 	// the conflict cursor fields so `acd status` reads "ok".
 	if plan.BarrierLift {
+		nowSec := float64(time.Now().UnixNano()) / 1e9
 		if _, err := tx.ExecContext(ctx, `
 UPDATE publish_state
-SET status = 'ok', error = NULL, conflict_seq = 0
-WHERE id = 1 AND status = 'blocked_conflict'`); err != nil {
+SET status = 'ok', error = NULL, updated_ts = ?
+WHERE id = 1 AND status = 'blocked_conflict'`, nowSec); err != nil {
 			return fmt.Errorf("acd purge-events: clear publish_state: %w", err)
 		}
 		// Drop the human-readable breadcrumbs so `acd status` does not
