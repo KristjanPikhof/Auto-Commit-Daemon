@@ -358,12 +358,17 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
-	if cctx.BaseHead != "" {
-		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-			logger.Warn("bootstrap shadow", "err", err.Error())
-		} else if seeded > 0 {
-			logger.Info("shadow bootstrapped", "rows", seeded)
+		if cctx.BranchRef != "" {
+			if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+				_ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+			}
 		}
+		if cctx.BranchRef != "" && cctx.BaseHead != "" {
+			if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+				logger.Warn("bootstrap shadow", "err", err.Error())
+			} else if seeded > 0 {
+				logger.Info("shadow bootstrapped", "rows", seeded)
+			}
 	}
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
@@ -564,7 +569,10 @@ func Run(ctx context.Context, opts Options) error {
 				// After a divergence the new key is empty; without
 				// reseeding from HEAD the next capture would classify every
 				// tracked file as a phantom `create`.
-				if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+				if cctx.BranchRef == "" {
+					_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
+					logger.Warn("detached HEAD detected; capture/replay paused")
+				} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 					logger.Warn("reseed shadow after generation bump",
 						"err", err.Error())
 				} else if seeded > 0 {
@@ -616,7 +624,12 @@ func Run(ctx context.Context, opts Options) error {
 			capSum CaptureSummary
 			capErr error
 		)
-		if cctx.BaseHead != "" {
+		detachedHeadPaused := cctx.BranchRef == ""
+		if detachedHeadPaused {
+			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
+			logger.Warn("detached HEAD detected; capture/replay paused")
+		} else if cctx.BaseHead != "" {
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
 				SensitiveMatcher: matcher,
@@ -627,7 +640,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && cctx.BaseHead != "" {
+		if capErr == nil && !detachedHeadPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
@@ -778,15 +791,14 @@ func Run(ctx context.Context, opts Options) error {
 	}
 }
 
-// resolveBranch returns (branchRef, headOID) for the current HEAD. Errors
-// are logged + degrade to empty strings; the run loop tolerates a missing
-// HEAD (orphan repo) by skipping capture/replay until HEAD resolves.
+// resolveBranch returns (branchRef, headOID) for the current HEAD. A detached
+// HEAD returns an empty branchRef so the run loop pauses capture/replay instead
+// of inventing a branch target.
 func resolveBranch(ctx context.Context, repoDir string, logger *slog.Logger) (string, string) {
-	// branch ref via symbolic-ref HEAD; fall back to refs/heads/main on
-	// detached/orphan states for v1 (CLI lane will tighten this later).
-	branch, _ := git.RunBranchRef(ctx, repoDir)
-	if branch == "" {
-		branch = "refs/heads/main"
+	branch, err := git.RunBranchRef(ctx, repoDir)
+	if err != nil {
+		logger.Warn("symbolic-ref HEAD failed", "err", err.Error())
+		return "", ""
 	}
 	head, err := git.RevParse(ctx, repoDir, "HEAD")
 	if err != nil {
