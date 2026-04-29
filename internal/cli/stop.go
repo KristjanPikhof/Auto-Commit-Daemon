@@ -96,9 +96,9 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	out_all := stopAllResult{Stopped: []stopRepoResult{}, Deferred: []stopRepoResult{}}
 	for _, rec := range reg.Repos {
-		// `acd stop --all` is the operator escape hatch — force-stop
-		// every daemon regardless of remaining refcount peers.
-		res, err := stopOneRepo(ctx, rec.Path, "", force || true)
+		// Use the caller's force mode for each repo; without --force,
+		// the per-repo refcount-aware shutdown path applies.
+		res, err := stopOneRepoForAll(ctx, rec.Path, "", force)
 		if err != nil {
 			res = stopRepoResult{Repo: rec.Path, Reason: err.Error()}
 		}
@@ -123,6 +123,8 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	return nil
 }
+
+var stopOneRepoForAll = stopOneRepo
 
 // stopOneRepo handles the per-repo logic shared by single-repo and --all.
 func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
