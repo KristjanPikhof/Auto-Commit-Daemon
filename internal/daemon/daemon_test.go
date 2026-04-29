@@ -1080,6 +1080,112 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	oldCtx := CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         seedHead,
+	}
+	if err := SaveBranchGeneration(ctx, f.db, oldCtx.BranchGeneration, seedHead); err != nil {
+		t.Fatalf("SaveBranchGeneration: %v", err)
+	}
+	if seeded, err := BootstrapShadow(ctx, f.dir, f.db, oldCtx); err != nil {
+		t.Fatalf("BootstrapShadow old generation: %v", err)
+	} else if seeded == 0 {
+		t.Fatalf("BootstrapShadow old generation seeded 0 rows")
+	}
+
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("rebased\n"))
+	if err != nil {
+		t.Fatalf("hash rebased blob: %v", err)
+	}
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "rebased.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree rebased: %v", err)
+	}
+	rebasedHead, err := git.CommitTree(ctx, f.dir, tree, "rebased root")
+	if err != nil {
+		t.Fatalf("commit-tree rebased: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", rebasedHead); err != nil {
+		t.Fatalf("git reset --hard rebased: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+		head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+		if gen == "2" && head == rebasedHead {
+			break
+		}
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+	head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
+	if gen != "2" || head != rebasedHead {
+		t.Fatalf("startup branch meta=(gen=%q head=%q), want (gen=2 head=%s)", gen, head, rebasedHead)
+	}
+
+	var shadowRows int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+		"refs/heads/main", int64(2)).Scan(&shadowRows); err != nil {
+		t.Fatalf("count shadow rows: %v", err)
+	}
+	if shadowRows == 0 {
+		t.Fatalf("shadow_paths not reseeded for startup generation 2")
+	}
+	time.Sleep(100 * time.Millisecond)
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("startup after offline reset captured %d phantom events, want 0", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 // TestRun_BranchGenerationStableOnAcdFastForward: the daemon's own
 // commit-driven HEAD advance is a fast-forward (newHead descends from
 // prevHead), so the generation must NOT bump even though the token
