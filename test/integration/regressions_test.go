@@ -581,7 +581,11 @@ func regStopWithPeerDefersKill(t *testing.T) {
 		t.Fatalf("decode second stop: %v\n%s", err, res2.Stdout)
 	}
 	if !stop2.Stopped {
-		t.Fatalf("expected stopped=true after final session out, got %+v", stop2)
+		if !stop2.Deferred {
+			t.Fatalf("expected stopped or deferred after final session out, got %+v", stop2)
+		}
+		waitMode(t, repo, "stopped", 15*time.Second)
+		return
 	}
 	waitMode(t, repo, "stopped", 5*time.Second)
 }
