@@ -298,16 +298,27 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	defer func() { stopWaitTimeout = prevTO }()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, "", "", false, true, true); err != nil {
+	// `force=true` so per-repo stopper actually delivers SIGTERM
+	// (sessionID is empty in --all). Stub stamps mode=stopped, so
+	// each repo's result lands in the Stopped bucket and runStopAll
+	// returns nil.
+	if err := runStop(ctx, &out, "", "", true, true, true); err != nil {
 		t.Fatalf("runStop --all: %v", err)
 	}
 	var got stopAllResult
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
-	if len(got.Stopped)+len(got.Deferred) != 2 {
-		t.Fatalf("expected 2 repo entries, got %d stopped + %d deferred",
-			len(got.Stopped), len(got.Deferred))
+	if len(got.Stopped)+len(got.Deferred)+len(got.Failed) != 2 {
+		t.Fatalf("expected 2 repo entries, got %d stopped + %d deferred + %d failed",
+			len(got.Stopped), len(got.Deferred), len(got.Failed))
+	}
+	if len(got.Failed) != 0 {
+		t.Fatalf("expected 0 failed when SIGTERM stamps mode=stopped, got %d (%+v)",
+			len(got.Failed), got.Failed)
+	}
+	if sigCount.Load() < 2 {
+		t.Fatalf("expected SIGTERM delivered to both daemons, got count=%d", sigCount.Load())
 	}
 }
 
