@@ -1336,15 +1336,15 @@ func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		runErr = Run(runCtx, Options{
-			RepoPath:     f.dir,
-			GitDir:       f.gitDir,
-			DB:           f.db,
-			Scheduler:    fastScheduler(),
-			BootGrace:    30 * time.Second,
-			WakeCh:       wakeCh,
-			ShutdownCh:   shutdownCh,
-			SkipSignals:  true,
-			MessageFn:    DeterministicMessage,
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     fastScheduler(),
+			BootGrace:     30 * time.Second,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			MessageFn:     DeterministicMessage,
 			PruneInterval: time.Hour,
 		})
 	}()
