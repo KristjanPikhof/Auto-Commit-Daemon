@@ -76,7 +76,11 @@ func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) 
 // will simply receive an empty diff field).
 func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
 	return func(ctx context.Context, ec EventContext) (string, error) {
-		cc := commitContextFromEvent(ctx, ec, repoRoot)
+		effectiveRepoRoot := repoRoot
+		if !ai.ProviderNeedsDiff(p) {
+			effectiveRepoRoot = ""
+		}
+		cc := commitContextFromEvent(ctx, ec, effectiveRepoRoot)
 		r, err := p.Generate(ctx, cc)
 		if err != nil {
 			return "", err
@@ -154,16 +158,19 @@ func aiSendDiffEnabled() bool {
 // returns an error when the underlying git binary is unreachable in a
 // way that should surface up to the caller.
 //
-// The returned text is NOT truncated; callers running against a network
-// provider must apply ai.Truncate themselves. The deterministic
-// provider does not consult DiffText, so internal callers can hand the
-// raw output to it without truncation.
+// The returned text is capped to ai.DiffCap while sections are appended,
+// so large multi-op events stop rendering once the provider budget is
+// consumed. Callers still apply redaction + ai.Truncate before handing the
+// diff to a provider because redaction can change the final byte length.
 func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
 	if repoRoot == "" || len(ops) == 0 {
 		return "", nil
 	}
-	var buf bytes.Buffer
+	var buf cappedDiffBuffer
 	for _, op := range ops {
+		if buf.Full() {
+			break
+		}
 		section, err := buildOpDiff(ctx, repoRoot, op)
 		if err != nil {
 			// Soft per-op failure: skip this op but keep going so the
@@ -173,12 +180,44 @@ func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (
 		if section == "" {
 			continue
 		}
-		if buf.Len() > 0 && !strings.HasSuffix(buf.String(), "\n") {
-			buf.WriteByte('\n')
+		if buf.Len() > 0 && !buf.HasTrailingNewline() {
+			buf.WriteString("\n")
 		}
 		buf.WriteString(section)
 	}
 	return buf.String(), nil
+}
+
+type cappedDiffBuffer struct {
+	buf bytes.Buffer
+}
+
+func (b *cappedDiffBuffer) Len() int {
+	return b.buf.Len()
+}
+
+func (b *cappedDiffBuffer) Full() bool {
+	return b.buf.Len() >= ai.DiffCap
+}
+
+func (b *cappedDiffBuffer) HasTrailingNewline() bool {
+	raw := b.buf.Bytes()
+	return len(raw) > 0 && raw[len(raw)-1] == '\n'
+}
+
+func (b *cappedDiffBuffer) WriteString(s string) {
+	remaining := ai.DiffCap - b.buf.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(s) > remaining {
+		s = s[:remaining]
+	}
+	b.buf.WriteString(s)
+}
+
+func (b *cappedDiffBuffer) String() string {
+	return b.buf.String()
 }
 
 // buildOpDiff produces a unified diff section for one captured op.
