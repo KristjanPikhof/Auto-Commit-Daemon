@@ -400,8 +400,15 @@ func Run(ctx context.Context, opts Options) error {
 	if cctx.BranchRef != "" && cctx.BaseHead != "" {
 		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 			logger.Warn("bootstrap shadow", "err", err.Error())
-		} else if seeded > 0 {
-			logger.Info("shadow bootstrapped", "rows", seeded)
+		} else {
+			if seeded > 0 {
+				logger.Info("shadow bootstrapped", "rows", seeded)
+			}
+			if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+				logger.Warn("prune old shadow generations", "err", pErr.Error())
+			} else if pruned > 0 {
+				logger.Info("pruned old shadow generations", "rows", pruned)
+			}
 		}
 	}
 
@@ -571,10 +578,17 @@ func Run(ctx context.Context, opts Options) error {
 			} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 				logger.Warn("reseed shadow after generation bump",
 					"err", err.Error())
-			} else if seeded > 0 {
-				logger.Info("shadow reseeded",
-					"rows", seeded,
-					"generation", cctx.BranchGeneration)
+			} else {
+				if seeded > 0 {
+					logger.Info("shadow reseeded",
+						"rows", seeded,
+						"generation", cctx.BranchGeneration)
+				}
+				if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+					logger.Warn("prune old shadow generations", "err", pErr.Error())
+				} else if pruned > 0 {
+					logger.Info("pruned old shadow generations", "rows", pruned)
+				}
 			}
 		} else {
 			// Fast-forward: persist the new HEAD so the next transition
@@ -652,9 +666,16 @@ func Run(ctx context.Context, opts Options) error {
 					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 						logger.Warn("bootstrap shadow after reattach",
 							"err", err.Error())
-					} else if seeded > 0 {
-						logger.Info("shadow bootstrapped after reattach",
-							"rows", seeded)
+					} else {
+						if seeded > 0 {
+							logger.Info("shadow bootstrapped after reattach",
+								"rows", seeded)
+						}
+						if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+							logger.Warn("prune old shadow generations", "err", pErr.Error())
+						} else if pruned > 0 {
+							logger.Info("pruned old shadow generations", "rows", pruned)
+						}
 					}
 				}
 			}
