@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,6 +30,13 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
 	ctx := context.Background()
+
+	if got := d.SQL().Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("write pool MaxOpenConnections = %d, want 1", got)
+	}
+	if got := d.readSQL().Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("read pool MaxOpenConnections = %d, want 4", got)
+	}
 
 	v, err := d.UserVersion(ctx)
 	if err != nil {
@@ -512,6 +520,67 @@ func TestConcurrentWritersUnderWAL(t *testing.T) {
 	}
 	if got != int64(goroutines*perG) {
 		t.Fatalf("event seq = %d, want %d", got, goroutines*perG)
+	}
+}
+
+func BenchmarkConcurrentWrites(b *testing.B) {
+	gitDir := filepath.Join(b.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	d, err := Open(context.Background(), dbPath)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	ctx := context.Background()
+	const writers = 10
+	for i := 0; i < writers; i++ {
+		if err := RegisterClient(ctx, d, Client{
+			SessionID: fmt.Sprintf("session-%02d", i),
+			Harness:   "bench",
+		}); err != nil {
+			b.Fatalf("seed client %d: %v", i, err)
+		}
+	}
+
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers)
+	wg.Add(writers)
+	for g := 0; g < writers; g++ {
+		go func(gid int) {
+			defer wg.Done()
+			sessionID := fmt.Sprintf("session-%02d", gid)
+			for i := gid; i < b.N; i += writers {
+				if _, err := TouchClient(ctx, d, sessionID, nowSeconds()); err != nil {
+					errCh <- err
+					return
+				}
+				ev := CaptureEvent{
+					BranchRef:        "refs/heads/main",
+					BranchGeneration: 1,
+					BaseHead:         "abc",
+					Operation:        "modify",
+					Path:             fmt.Sprintf("bench-%d-%d.txt", gid, i),
+					Fidelity:         "exact",
+				}
+				if _, err := AppendCaptureEvent(ctx, d, ev, nil); err != nil {
+					errCh <- err
+					return
+				}
+				if _, err := CountClients(ctx, d); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			b.Fatalf("concurrent write benchmark error: %v", err)
+		}
 	}
 }
 
