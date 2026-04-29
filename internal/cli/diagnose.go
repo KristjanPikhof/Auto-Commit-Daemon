@@ -197,6 +197,9 @@ func diagnoseAnchor(ctx context.Context, conn *sql.DB, repo string) (diagnoseAnc
 		return anchor, fmt.Errorf("branch_token: %w", err)
 	} else if ok {
 		anchor.BranchToken = v
+		if anchor.DaemonBranchRef == "" {
+			anchor.DaemonBranchRef = branchRefFromToken(v)
+		}
 	}
 	if v, ok, err := metaLookup(ctx, conn, "branch.generation"); err != nil {
 		return anchor, fmt.Errorf("branch.generation: %w", err)
@@ -212,6 +215,14 @@ func diagnoseAnchor(ctx context.Context, conn *sql.DB, repo string) (diagnoseAnc
 	anchor.Mismatch = anchor.GitHEADBranch != anchor.DaemonBranchRef &&
 		(anchor.GitHEADBranch != "" || anchor.DaemonBranchRef != "")
 	return anchor, nil
+}
+
+func branchRefFromToken(token string) string {
+	parts := strings.Fields(token)
+	if len(parts) >= 2 && strings.HasPrefix(parts[1], "refs/") {
+		return parts[1]
+	}
+	return ""
 }
 
 func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
