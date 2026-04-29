@@ -349,6 +349,39 @@ fi
 	}
 }
 
+func TestSubprocess_DefaultStderrLogFile(t *testing.T) {
+	skipIfWindows(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+printf 'plugin diagnostic\n' >&2
+while IFS= read -r line; do
+  printf '{"version":1,"subject":"OK","body":"","error":""}\n'
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+	})
+
+	if _, err := p.Generate(context.Background(), CommitContext{Path: "a", Op: "modify"}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	logPath := filepath.Join(home, ".local", "state", "acd", "plugin-test.log")
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stderr log: %v", err)
+	}
+	if !strings.Contains(string(body), "plugin diagnostic") {
+		t.Fatalf("stderr log missing diagnostic: %q", string(body))
+	}
+}
+
 // TestSubprocess_MissingBinary checks the constructor records the lookup
 // error rather than panicking, and Generate surfaces it on the first call.
 // Compose() with deterministic falls back cleanly so the daemon keeps
