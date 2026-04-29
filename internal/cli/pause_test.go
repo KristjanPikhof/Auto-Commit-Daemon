@@ -20,7 +20,7 @@ func TestPause_WritesMarkerWithReason(t *testing.T) {
 		t.Fatalf("runPause: %v", err)
 	}
 
-	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	markerPath := pauseMarkerPath(mustResolveGitDir(t, ctx, repo))
 	info, err := os.Stat(markerPath)
 	if err != nil {
 		t.Fatalf("stat marker: %v", err)
@@ -55,7 +55,7 @@ func TestPause_WritesMarkerWithReason(t *testing.T) {
 func TestPause_RefusesOverwriteWithoutYes(t *testing.T) {
 	ctx := context.Background()
 	repo := makeStartRepo(t)
-	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	markerPath := pauseMarkerPath(mustResolveGitDir(t, ctx, repo))
 
 	var out bytes.Buffer
 	if err := runPause(ctx, &out, repo, "first", "", false, true); err != nil {
@@ -100,7 +100,7 @@ func TestPause_TTLEmitsExpiresAt(t *testing.T) {
 		t.Fatalf("runPause: %v", err)
 	}
 
-	marker := readPauseMarkerFile(t, filepath.Join(repo, ".git", "acd", "paused"))
+	marker := readPauseMarkerFile(t, pauseMarkerPath(mustResolveGitDir(t, ctx, repo)))
 	if marker.ExpiresAt == nil {
 		t.Fatalf("expires_at is nil")
 	}
@@ -120,7 +120,7 @@ func TestPause_TTLEmitsExpiresAt(t *testing.T) {
 func TestResume_RemovesMarkerAndReportsPriorReason(t *testing.T) {
 	ctx := context.Background()
 	repo := makeStartRepo(t)
-	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	markerPath := pauseMarkerPath(mustResolveGitDir(t, ctx, repo))
 
 	var out bytes.Buffer
 	if err := runPause(ctx, &out, repo, "deploy window", "", false, true); err != nil {
@@ -146,7 +146,7 @@ func TestResume_RemovesMarkerAndReportsPriorReason(t *testing.T) {
 func TestResume_RefusesWithoutYes(t *testing.T) {
 	ctx := context.Background()
 	repo := makeStartRepo(t)
-	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	markerPath := pauseMarkerPath(mustResolveGitDir(t, ctx, repo))
 
 	var out bytes.Buffer
 	if err := runPause(ctx, &out, repo, "manual", "", false, true); err != nil {
@@ -189,4 +189,13 @@ func readPauseMarkerFile(t *testing.T, markerPath string) PauseMarker {
 		t.Fatalf("unmarshal marker: %v\n%s", err, body)
 	}
 	return marker
+}
+
+func mustResolveGitDir(t *testing.T, ctx context.Context, repo string) string {
+	t.Helper()
+	gitDir, err := resolveGitDir(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolveGitDir: %v", err)
+	}
+	return gitDir
 }
