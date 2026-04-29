@@ -159,7 +159,7 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		Path:     cc.Path,
 		Op:       cc.Op,
 		OldPath:  cc.OldPath,
-		Diff:     cc.DiffText,
+		Diff:     Truncate(RedactDiffSecrets(cc.DiffText), DiffCap),
 		RepoRoot: cc.RepoRoot,
 		Branch:   cc.Branch,
 	}
