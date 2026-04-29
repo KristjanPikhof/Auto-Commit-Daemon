@@ -350,6 +350,7 @@ func Run(ctx context.Context, opts Options) error {
 		logger.Warn("seed branch token", "err", terr.Error())
 		currentToken = ""
 	}
+	branchTransitionBlocked := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -359,11 +360,11 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, prevToken, currentToken)
 		if cErr != nil {
-			logger.Warn("classify startup branch transition; treating as diverged",
+			logger.Warn("classify startup branch transition; will retry",
 				"err", cErr.Error())
-			transition = TokenTransitionDiverged
-		}
-		if transition == TokenTransitionDiverged {
+			currentToken = prevToken
+			branchTransitionBlocked = true
+		} else if transition == TokenTransitionDiverged {
 			persistedGen++
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
@@ -383,7 +384,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err := SaveBranchGeneration(ctx, opts.DB, cctx.BranchGeneration, headOID); err != nil {
 		logger.Warn("seed branch generation", "err", err.Error())
 	}
-	if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
+	if !branchTransitionBlocked {
+		if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
+			logger.Warn("seed branch token", "err", err.Error())
+		}
+	} else {
 		logger.Warn("seed branch token", "err", err.Error())
 	}
 
