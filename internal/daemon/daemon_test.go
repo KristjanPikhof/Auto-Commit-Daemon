@@ -1195,6 +1195,64 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	}
 }
 
+func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse head: %v", err)
+	}
+	if err := SaveBranchGeneration(ctx, f.db, 4, head); err != nil {
+		t.Fatalf("SaveBranchGeneration: %v", err)
+	}
+	bogusToken := branchTokenRev("not-a-real-commit", "refs/heads/main")
+	if err := state.MetaSet(ctx, f.db, MetaKeyBranchToken, bogusToken); err != nil {
+		t.Fatalf("MetaSet branch token: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			MessageFn:   DeterministicMessage,
+		})
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+
+	got, ok, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+	if err != nil {
+		t.Fatalf("MetaGet branch generation: %v", err)
+	}
+	if !ok {
+		t.Fatalf("branch.generation missing")
+	}
+	if got != "4" {
+		t.Fatalf("branch.generation=%q after classify error; want 4", got)
+	}
+}
+
 // TestRun_BranchGenerationStableOnAcdFastForward: the daemon's own
 // commit-driven HEAD advance is a fast-forward (newHead descends from
 // prevHead), so the generation must NOT bump even though the token
