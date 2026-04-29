@@ -17,8 +17,10 @@
 //
 // The legacy snapshot daemon never shipped a subprocess provider, so the
 // canonical wire shape lives in this file (and in the docstring above) as
-// the contract every harness must speak. The `version` field exists so
-// future shapes can be negotiated without breaking older plugins.
+// the contract every harness must speak. Diff text is empty unless the daemon
+// opted in to sending diffs, then redacted and truncated before it reaches the
+// plugin. The `version` field exists so future shapes can be negotiated without
+// breaking older plugins.
 //
 // Lifecycle:
 //   - Spawn on first Generate after construction (or after a crash/timeout).
