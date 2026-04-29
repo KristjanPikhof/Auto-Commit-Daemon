@@ -61,13 +61,13 @@ type doctorRepoReport struct {
 }
 
 type doctorHarnessReport struct {
-	Name          string   `json:"name"`
-	ConfigPath    string   `json:"config_path"`
-	ConfigPresent bool     `json:"config_present"`
-	ConfigReadable bool    `json:"config_readable"`
-	MarkerFound   bool     `json:"marker_found"`
-	Installed     bool     `json:"installed"`
-	Notes         []string `json:"notes,omitempty"`
+	Name           string   `json:"name"`
+	ConfigPath     string   `json:"config_path"`
+	ConfigPresent  bool     `json:"config_present"`
+	ConfigReadable bool     `json:"config_readable"`
+	MarkerFound    bool     `json:"marker_found"`
+	Installed      bool     `json:"installed"`
+	Notes          []string `json:"notes,omitempty"`
 }
 
 type doctorAIReport struct {
@@ -82,23 +82,23 @@ type doctorAIReport struct {
 // doctorReport is the full report rendered by `acd doctor` and embedded in
 // `manifest.json` of the doctor bundle.
 type doctorReport struct {
-	GeneratedAt          string             `json:"generated_at"`
-	ACDVersion           string             `json:"acd_version"`
-	GitVersion           string             `json:"git_version,omitempty"`
-	GitPath              string             `json:"git_path,omitempty"`
-	Uname                string             `json:"uname,omitempty"`
-	GoVersion            string             `json:"go_version"`
-	GoOS                 string             `json:"go_os"`
-	GoArch               string             `json:"go_arch"`
-	UlimitNoFile         int64              `json:"ulimit_nofile,omitempty"`
-	InotifyMaxUserWatch  int64              `json:"inotify_max_user_watches,omitempty"`
-	RegistryPath         string             `json:"registry_path"`
-	RegistryRepoCount    int                `json:"registry_repo_count"`
-	SensitiveGlobsEnv    string             `json:"sensitive_globs_env"`
-	SensitiveGlobsActive []string           `json:"sensitive_globs_active"`
+	GeneratedAt          string                `json:"generated_at"`
+	ACDVersion           string                `json:"acd_version"`
+	GitVersion           string                `json:"git_version,omitempty"`
+	GitPath              string                `json:"git_path,omitempty"`
+	Uname                string                `json:"uname,omitempty"`
+	GoVersion            string                `json:"go_version"`
+	GoOS                 string                `json:"go_os"`
+	GoArch               string                `json:"go_arch"`
+	UlimitNoFile         int64                 `json:"ulimit_nofile,omitempty"`
+	InotifyMaxUserWatch  int64                 `json:"inotify_max_user_watches,omitempty"`
+	RegistryPath         string                `json:"registry_path"`
+	RegistryRepoCount    int                   `json:"registry_repo_count"`
+	SensitiveGlobsEnv    string                `json:"sensitive_globs_env"`
+	SensitiveGlobsActive []string              `json:"sensitive_globs_active"`
 	Harnesses            []doctorHarnessReport `json:"harnesses"`
-	AI                   doctorAIReport     `json:"ai"`
-	Repos                []doctorRepoReport `json:"repos"`
+	AI                   doctorAIReport        `json:"ai"`
+	Repos                []doctorRepoReport    `json:"repos"`
 }
 
 func newDoctorCmd() *cobra.Command {
