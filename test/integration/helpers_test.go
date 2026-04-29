@@ -220,7 +220,8 @@ func withIsolatedHome(t *testing.T) []string {
 	env := os.Environ()
 	for i, kv := range env {
 		if strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
-			strings.HasPrefix(kv, "XDG_DATA_HOME=") || strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			strings.HasPrefix(kv, "XDG_DATA_HOME=") || strings.HasPrefix(kv, "XDG_CONFIG_HOME=") ||
+			strings.HasPrefix(kv, "ACD_AI_") {
 			env[i] = ""
 		}
 	}

@@ -298,15 +298,89 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	defer func() { stopWaitTimeout = prevTO }()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, "", "", false, true, true); err != nil {
+	// `force=true` so the per-repo stopper enters the force path. The
+	// fixture's PIDs (99000/99001) are not alive, so stopOneRepo
+	// short-circuits to res.Stopped=true / Reason="daemon not running"
+	// without invoking signalProcess. Result: both repos land in the
+	// Stopped bucket and runStopAll returns nil. The point of this
+	// test is registry iteration breadth, not the kill path.
+	if err := runStop(ctx, &out, "", "", true, true, true); err != nil {
 		t.Fatalf("runStop --all: %v", err)
+	}
+	// signalProcess is legitimately not called for dead PIDs (the
+	// stopOneRepo force path short-circuits before reaching it), so
+	// sigCount stays at zero. Read it for the side effect of pinning
+	// that — using `_ = sigCount` would copy the atomic.Int32 value
+	// (vet flags this as a lock copy).
+	if sigCount.Load() != 0 {
+		t.Fatalf("expected signalProcess not called for dead PIDs, got count=%d", sigCount.Load())
 	}
 	var got stopAllResult
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
-	if len(got.Stopped)+len(got.Deferred) != 2 {
-		t.Fatalf("expected 2 repo entries, got %d stopped + %d deferred",
-			len(got.Stopped), len(got.Deferred))
+	if len(got.Stopped)+len(got.Deferred)+len(got.Failed) != 2 {
+		t.Fatalf("expected 2 repo entries, got %d stopped + %d deferred + %d failed",
+			len(got.Stopped), len(got.Deferred), len(got.Failed))
+	}
+	if len(got.Failed) != 0 {
+		t.Fatalf("expected 0 failed when daemons report not running, got %d (%+v)",
+			len(got.Failed), got.Failed)
+	}
+}
+
+// TestStopAll_RoutesFailuresToFailedBucket pins the regression that
+// previously buried fingerprint-mismatch / "daemon survived SIGKILL"
+// outcomes under `stopped`. The repo stopper here returns
+// res.Stopped=false (no Deferred), simulating a force-stop where the
+// kill could not be delivered. The classifier MUST surface it under
+// Failed and runStopAll MUST return a non-nil error so callers (and
+// `acd list`) don't treat the daemon as gone.
+func TestStopAll_RoutesFailuresToFailedBucket(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repoDir, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repoDir, stateDB, "claude-code")
+
+	prev := stopOneRepoForAll
+	t.Cleanup(func() { stopOneRepoForAll = prev })
+
+	stopOneRepoForAll = func(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
+		return stopRepoResult{
+			Repo:      repo,
+			Force:     force,
+			Escalated: true,
+			DaemonPID: 12345,
+			Reason:    "SIGKILL failed: verify process identity for pid 12345: fingerprint mismatch",
+			// Stopped=false, Deferred=false ⇒ must land in Failed.
+		}, nil
+	}
+
+	var out bytes.Buffer
+	err := runStopAll(ctx, &out, true, true)
+	if err == nil {
+		t.Fatalf("runStopAll: expected non-nil error when a repo failed, got nil; output=%s", out.String())
+	}
+
+	var got stopAllResult
+	if jerr := json.Unmarshal(out.Bytes(), &got); jerr != nil {
+		t.Fatalf("unmarshal: %v\n%s", jerr, out.String())
+	}
+	if len(got.Stopped) != 0 {
+		t.Fatalf("expected 0 stopped, got %d (%+v)", len(got.Stopped), got.Stopped)
+	}
+	if len(got.Deferred) != 0 {
+		t.Fatalf("expected 0 deferred, got %d (%+v)", len(got.Deferred), got.Deferred)
+	}
+	if len(got.Failed) != 1 {
+		t.Fatalf("expected 1 failed entry, got %d (%+v)", len(got.Failed), got.Failed)
+	}
+	if got.Failed[0].Repo != repoDir {
+		t.Fatalf("failed[0].Repo = %q, want %q", got.Failed[0].Repo, repoDir)
+	}
+	if got.Failed[0].DaemonPID != 12345 {
+		t.Fatalf("failed[0].DaemonPID = %d, want 12345", got.Failed[0].DaemonPID)
 	}
 }

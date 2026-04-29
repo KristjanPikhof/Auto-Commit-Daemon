@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // MessageFn produces a commit message for one event + its ops. Phase 1
@@ -56,6 +58,8 @@ type ReplayOpts struct {
 
 	// Limit caps the number of events drained per call. 0 = no limit.
 	Limit int
+	// Trace receives best-effort decision records. Nil disables tracing.
+	Trace acdtrace.Logger
 }
 
 // ReplaySummary describes one drain.
@@ -149,6 +153,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
+		if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
+			activeCtx.BranchRef = branchRef
+			if headOID != "" && headOID == parent {
+				activeCtx.BaseHead = headOID
+			}
+		}
 
 		// Branch-generation / ancestry guard. An event whose generation
 		// no longer matches the active context was captured under a
@@ -159,10 +169,20 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// silently replay — the resulting commit would chain off a stale
 		// parent and diverge from the operator's intent. Block
 		// terminally so operators can spot the mismatch and reconcile.
-		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
-			recordConflict(ctx, db, ev, reason, activeCtx)
+			errorClass := replayErrorValidation
+			if strings.Contains(reason, "branch ref mismatch") {
+				errorClass = replayErrorRefMissing
+			}
+			recordConflict(ctx, db, ev, replayIssue{
+				ErrorClass: errorClass,
+				Message:    reason,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			return sum, nil
 		}
@@ -173,14 +193,26 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		if len(ops) == 0 {
 			// No ops to apply — mark failed, do not block the queue.
-			markFailed(ctx, db, ev, "no ops attached")
+			markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorValidation,
+				Message:    "no ops attached",
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, "no ops attached", nil)
 			sum.Failed++
 			continue
 		}
 
 		// Validate before touching the index.
 		if msg := validateOps(ops); msg != "" {
-			markFailed(ctx, db, ev, msg)
+			markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorValidation,
+				Message:    msg,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, msg, nil)
 			sum.Failed++
 			continue
 		}
@@ -198,7 +230,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
-			recordConflict(ctx, db, ev, reason, activeCtx)
+			recordConflict(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorBeforeStateMismatch,
+				Message:    reason,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			// Halt the batch: subsequent events were captured assuming
 			// this one would land first. Running them now would replay on
@@ -209,7 +247,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
 		commitOID, err := commitOneEvent(ctx, repoRoot, indexFile, parent, ev, ops, msgFn)
 		if err != nil {
-			markFailed(ctx, db, ev, err.Error())
+			markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorCommitBuildFailure,
+				Message:    err.Error(),
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			// Halt the batch: a commit-build failure leaves `parent`
 			// pointing at the prior commit, but later events will still
@@ -225,11 +269,27 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := git.UpdateRef(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID); err != nil {
+		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
-			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), activeCtx)
+			reason := "update-ref CAS failed: " + err.Error()
+			actual, expected := parseUpdateRefCASReason(reason)
+			if expected == "" {
+				expected = oldOID
+			}
+			recordConflict(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorCASFail,
+				Expected:   expected,
+				Actual:     actual,
+				Message:    reason,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, map[string]any{
+				"expected_sha": expected,
+				"actual_sha":   actual,
+			})
 			sum.Conflicts++
 			return sum, nil
 		}
@@ -246,8 +306,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		_ = state.SavePublishState(ctx, db, state.Publish{
 			EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-			BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
-			BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+			BranchRef:        sql.NullString{String: activeCtx.BranchRef, Valid: true},
+			BranchGeneration: sql.NullInt64{Int64: activeCtx.BranchGeneration, Valid: true},
 			SourceHead:       sql.NullString{String: parent, Valid: true},
 			TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
 			Status:           "published",
@@ -257,9 +317,112 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.Published++
+		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
+			"commit": commitOID,
+			"parent": oldOID,
+		})
 	}
 
 	return sum, nil
+}
+
+var (
+	replayUpdateRef      = git.UpdateRef
+	replayUpdateRefSleep = sleepWithContext
+)
+
+var replayUpdateRefBackoffs = []time.Duration{
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+}
+
+func updateReplayRefWithRetry(
+	ctx context.Context,
+	repoRoot, ref, commitOID, oldOID string,
+	logger acdtrace.Logger,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= len(replayUpdateRefBackoffs); attempt++ {
+		err := replayUpdateRef(ctx, repoRoot, ref, commitOID, oldOID)
+		if err == nil {
+			traceReplayUpdateRef(logger, repoRoot, cctx, ev, state.EventStatePublished, "update-ref CAS succeeded", attempt, false, ref, commitOID, oldOID, nil)
+			return nil
+		}
+		lastErr = err
+
+		retryable := isTransientUpdateRefLockError(err)
+		finalAttempt := attempt == len(replayUpdateRefBackoffs)
+		decision := state.EventStateBlockedConflict
+		if retryable && !finalAttempt {
+			decision = "retry"
+		}
+		traceReplayUpdateRef(logger, repoRoot, cctx, ev, decision, err.Error(), attempt, retryable && !finalAttempt, ref, commitOID, oldOID, err)
+
+		if !retryable {
+			return err
+		}
+		if finalAttempt {
+			return err
+		}
+		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
+			return sleepErr
+		}
+	}
+	return lastErr
+}
+
+func isTransientUpdateRefLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return !strings.Contains(msg, " is at ") &&
+		(strings.Contains(msg, "cannot lock") || strings.Contains(msg, "unable to lock"))
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func traceReplayUpdateRef(
+	logger acdtrace.Logger,
+	repoRoot string,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+	decision, reason string,
+	attempt int,
+	retry bool,
+	ref, commitOID, oldOID string,
+	err error,
+) {
+	output := map[string]any{
+		"attempt":      attempt,
+		"max_attempts": len(replayUpdateRefBackoffs),
+		"retry":        retry,
+		"ref":          ref,
+		"commit":       commitOID,
+		"expected_sha": oldOID,
+	}
+	if err != nil {
+		actual, expected := parseUpdateRefCASReason("update-ref CAS failed: " + err.Error())
+		if actual != "" {
+			output["actual_sha"] = actual
+		}
+		if expected != "" {
+			output["expected_sha"] = expected
+		}
+	}
+	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
 }
 
 // validateOps mirrors snapshot-replay._validate_op: every op kind must
@@ -439,12 +602,16 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
 // will not re-attempt it. Best-effort: persistence failures here do not
 // propagate.
-func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string) {
+func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue) {
+	if issue.Message == "" {
+		issue.Message = "replay failed"
+	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	_ = state.MarkEventPublished(ctx, db,
 		ev.Seq, state.EventStateFailed,
-		sql.NullString{}, sql.NullString{String: reason, Valid: true},
+		sql.NullString{}, sql.NullString{String: issue.Message, Valid: true},
 		ev.Message, nowSec)
+	recordReplayIssue(ctx, db, ev, issue, nowSec)
 }
 
 // recordConflict terminally settles the event in
@@ -457,15 +624,134 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason
 // every subsequent poll, so a stuck event no longer blocks the queue with
 // retry churn. Operators see the row via `acd status` (blocked_conflicts
 // count) and via daemon_meta.last_replay_conflict for the human message.
-func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, reason string, cctx CaptureContext) {
+func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, cctx CaptureContext) {
+	if issue.Message == "" {
+		issue.Message = "replay conflict"
+	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	_ = state.MarkEventBlocked(ctx, db, ev.Seq, reason, nowSec,
+	_ = state.MarkEventBlocked(ctx, db, ev.Seq, issue.Message, nowSec,
 		sql.NullString{String: cctx.BranchRef, Valid: true},
 		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		sql.NullString{String: cctx.BaseHead, Valid: true},
 	)
-	_ = state.MetaSet(ctx, db, "last_replay_conflict",
-		fmt.Sprintf("seq=%d: %s", ev.Seq, reason))
+	recordReplayIssue(ctx, db, ev, issue, nowSec)
+}
+
+const (
+	metaKeyLastReplayConflict       = "last_replay_conflict"
+	metaKeyLastReplayConflictLegacy = "last_replay_conflict_legacy"
+
+	replayErrorCASFail             = "cas_fail"
+	replayErrorBeforeStateMismatch = "before_state_mismatch"
+	replayErrorCommitBuildFailure  = "commit_build_failure"
+	replayErrorRefMissing          = "ref_missing"
+	replayErrorValidation          = "validation"
+)
+
+type replayIssue struct {
+	ErrorClass string
+	Expected   string
+	Actual     string
+	Ref        string
+	Path       string
+	Message    string
+}
+
+type replayConflictMetadata struct {
+	TS         string `json:"ts"`
+	Seq        int64  `json:"seq"`
+	ErrorClass string `json:"error_class"`
+	Expected   string `json:"expected_sha,omitempty"`
+	Actual     string `json:"actual_sha,omitempty"`
+	Ref        string `json:"ref,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Message    string `json:"message"`
+}
+
+func recordReplayIssue(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, nowSec float64) {
+	if issue.ErrorClass == "" {
+		issue.ErrorClass = classifyReplayIssue(issue.Message)
+	}
+	meta := replayConflictMetadata{
+		TS:         time.Unix(0, int64(nowSec*1e9)).UTC().Format(time.RFC3339Nano),
+		Seq:        ev.Seq,
+		ErrorClass: issue.ErrorClass,
+		Expected:   issue.Expected,
+		Actual:     issue.Actual,
+		Ref:        issue.Ref,
+		Path:       issue.Path,
+		Message:    issue.Message,
+	}
+	_ = state.MetaSetJSON(ctx, db, metaKeyLastReplayConflict, meta)
+	_ = state.MetaSet(ctx, db, metaKeyLastReplayConflictLegacy,
+		fmt.Sprintf("seq=%d: %s", ev.Seq, issue.Message))
+}
+
+func classifyReplayIssue(message string) string {
+	switch {
+	case strings.Contains(message, "update-ref CAS failed"):
+		return replayErrorCASFail
+	case strings.Contains(message, "before-state mismatch"),
+		strings.Contains(message, "missing-in-index"),
+		strings.Contains(message, "create conflict"),
+		strings.Contains(message, "rename source"),
+		strings.Contains(message, "rename target"):
+		return replayErrorBeforeStateMismatch
+	case strings.Contains(message, "commit-tree"),
+		strings.Contains(message, "write-tree"),
+		strings.Contains(message, "update-index"):
+		return replayErrorCommitBuildFailure
+	case strings.Contains(message, "branch ref mismatch"):
+		return replayErrorRefMissing
+	default:
+		return replayErrorValidation
+	}
+}
+
+func parseUpdateRefCASReason(reason string) (actual, expected string) {
+	const actualMarker = " is at "
+	const expectedMarker = " but expected "
+	actualStart := strings.Index(reason, actualMarker)
+	expectedStart := strings.Index(reason, expectedMarker)
+	if actualStart == -1 || expectedStart == -1 || expectedStart <= actualStart {
+		return "", ""
+	}
+	actualFields := strings.Fields(reason[actualStart+len(actualMarker) : expectedStart])
+	if len(actualFields) > 0 {
+		actual = actualFields[0]
+	}
+	expectedFields := strings.Fields(reason[expectedStart+len(expectedMarker):])
+	if len(expectedFields) > 0 {
+		expected = expectedFields[0]
+	}
+	return actual, expected
+}
+
+func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, ev state.CaptureEvent, class, decision, reason string, output map[string]any) {
+	input := map[string]any{
+		"operation": ev.Operation,
+		"path":      ev.Path,
+	}
+	recordTrace(logger, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: class,
+		Decision:   decision,
+		Reason:     reason,
+		Input:      input,
+		Output:     output,
+		Error:      traceError(decision, reason),
+		Seq:        ev.Seq,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceError(decision, reason string) string {
+	if decision == state.EventStatePublished || reason == "" {
+		return ""
+	}
+	return reason
 }
 
 // checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty

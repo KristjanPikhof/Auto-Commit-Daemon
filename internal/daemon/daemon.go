@@ -27,6 +27,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // Default knobs the run loop uses when Options leaves them zero.
@@ -171,6 +172,10 @@ type Options struct {
 	// FsnotifyMaxWatches caps the OS watch budget. Zero asks the watcher
 	// to derive a sensible default from the platform.
 	FsnotifyMaxWatches int
+
+	// Trace receives best-effort decision records. Nil uses ACD_TRACE env
+	// wiring; disabled env returns a no-op logger.
+	Trace acdtrace.Logger
 }
 
 // resolveClientTTL honors EnvClientTTLSeconds + opt.
@@ -211,6 +216,15 @@ func Run(ctx context.Context, opts Options) error {
 	if now == nil {
 		now = time.Now
 	}
+	tracer := opts.Trace
+	if tracer == nil {
+		tracer = acdtrace.FromEnv(opts.RepoPath, opts.GitDir)
+	}
+	defer func() {
+		if err := tracer.Close(); err != nil {
+			logger.Warn("close trace writer", "err", err.Error())
+		}
+	}()
 	// MessageFn precedence: explicit MessageFn > injected MessageProvider
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
@@ -288,7 +302,15 @@ func Run(ctx context.Context, opts Options) error {
 	bootTime := now()
 
 	// 2. Stamp daemon_state.mode = "running" + identity.
-	fp, fpErr := identity.CaptureSelf()
+	//
+	// Use identity.Capture(pid) — the ps-form hash — so the persisted
+	// fingerprint is byte-symmetric with what `acd stop` / `acd wake`
+	// recompute when verifying the pid before delivering a signal.
+	// identity.CaptureSelf() hashes the unjoined os.Args, which is more
+	// precise but cannot be reproduced by an external observer reading
+	// `ps`, so a CaptureSelf-stamped fingerprint always mismatches at
+	// verify time and signalProcess silently swallows SIGTERM/SIGKILL.
+	fp, fpErr := identity.Capture(pid)
 	var fpToken string
 	if fpErr == nil {
 		fpToken = FingerprintToken(fp)
@@ -365,13 +387,35 @@ func Run(ctx context.Context, opts Options) error {
 			currentToken = prevToken
 			branchTransitionBlocked = true
 		} else if transition == TokenTransitionDiverged {
+			prevGeneration := persistedGen
 			persistedGen++
+			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
+			if dropErr != nil {
+				logger.Warn("drop pending events for previous branch generation at startup",
+					"generation", prevGeneration, "err", dropErr.Error())
+			}
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
 			logger.Info("branch generation bumped at startup",
 				"old", prevToken, "new", currentToken,
 				"generation", persistedGen,
 				"transition", transition.String())
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  branchRef,
+				HeadSHA:    headOID,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "startup token transition classified",
+				Input:      map[string]any{"previous": prevToken, "current": currentToken},
+				Output: map[string]any{
+					"prev_generation": prevGeneration,
+					"new_generation":  persistedGen,
+					"dropped_pending": droppedPending,
+				},
+				Error:      traceErrString(dropErr),
+				Generation: persistedGen,
+			})
 		}
 	}
 	cctx := CaptureContext{
@@ -400,7 +444,9 @@ func Run(ctx context.Context, opts Options) error {
 	if cctx.BranchRef != "" && cctx.BaseHead != "" {
 		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 			logger.Warn("bootstrap shadow", "err", err.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 		} else {
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "startup shadow bootstrap", seeded)
 			if seeded > 0 {
 				logger.Info("shadow bootstrapped", "rows", seeded)
 			}
@@ -558,11 +604,33 @@ func Run(ctx context.Context, opts Options) error {
 		oldToken := currentToken
 		currentToken = newToken
 		if transition == TokenTransitionDiverged {
+			prevGeneration := cctx.BranchGeneration
 			cctx.BranchGeneration++
 			logger.Info("branch generation bumped",
 				"old", oldToken, "new", newToken,
 				"generation", cctx.BranchGeneration,
 				"transition", transition.String())
+			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
+			if dropErr != nil {
+				logger.Warn("drop pending events for previous branch generation",
+					"generation", prevGeneration, "err", dropErr.Error())
+			}
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "run-loop token transition classified",
+				Input:      map[string]any{"previous": oldToken, "current": newToken},
+				Output: map[string]any{
+					"prev_generation": prevGeneration,
+					"new_generation":  cctx.BranchGeneration,
+					"dropped_pending": droppedPending,
+				},
+				Error:      traceErrString(dropErr),
+				Generation: cctx.BranchGeneration,
+			})
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
@@ -578,7 +646,9 @@ func Run(ctx context.Context, opts Options) error {
 			} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 				logger.Warn("reseed shadow after generation bump",
 					"err", err.Error())
+				traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 			} else {
+				traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
 				if seeded > 0 {
 					logger.Info("shadow reseeded",
 						"rows", seeded,
@@ -597,6 +667,17 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Debug("branch fast-forwarded",
 				"old", oldToken, "new", newToken,
 				"generation", cctx.BranchGeneration)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "run-loop token transition classified",
+				Input:      map[string]any{"previous": oldToken, "current": newToken},
+				Output:     map[string]any{"generation": cctx.BranchGeneration},
+				Generation: cctx.BranchGeneration,
+			})
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist branch head", "err", err.Error())
@@ -649,39 +730,71 @@ func Run(ctx context.Context, opts Options) error {
 		// restart picks up the same value, and the next replay pass
 		// terminally blocks any queued events captured under the prior
 		// generation (their BaseHead is no longer reachable).
-		if cctx.BranchRef == "" {
-			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
-			if branchRef != "" {
-				cctx.BranchRef = branchRef
-				cctx.BaseHead = headOID
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, headOID); err != nil {
-					logger.Warn("persist reattached branch head",
-						"err", err.Error())
-				}
-				if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-				}
-				if headOID != "" {
-					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-						logger.Warn("bootstrap shadow after reattach",
+		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
+		if operationPaused {
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
+			logger.Warn("git operation in progress; capture/replay paused",
+				"operation", operationName)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "daemon.pause",
+				Decision:   "paused",
+				Reason:     "git operation marker present",
+				Input:      map[string]any{"operation": operationName},
+				Generation: cctx.BranchGeneration,
+			})
+		} else if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyOperationInProgress); ok {
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgress)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "daemon.pause",
+				Decision:   "resumed",
+				Reason:     "git operation marker cleared",
+				Generation: cctx.BranchGeneration,
+			})
+		}
+
+		if !operationPaused {
+			if cctx.BranchRef == "" {
+				branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
+				if branchRef != "" {
+					cctx.BranchRef = branchRef
+					cctx.BaseHead = headOID
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist reattached branch head",
 							"err", err.Error())
-					} else {
-						if seeded > 0 {
-							logger.Info("shadow bootstrapped after reattach",
-								"rows", seeded)
-						}
-						if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
-							logger.Warn("prune old shadow generations", "err", pErr.Error())
-						} else if pruned > 0 {
-							logger.Info("pruned old shadow generations", "rows", pruned)
+					}
+					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+					}
+					if headOID != "" {
+						if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+							logger.Warn("bootstrap shadow after reattach",
+								"err", err.Error())
+							traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+						} else {
+							traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "reattach shadow bootstrap", seeded)
+							if seeded > 0 {
+								logger.Info("shadow bootstrapped after reattach",
+									"rows", seeded)
+							}
+							if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+								logger.Warn("prune old shadow generations", "err", pErr.Error())
+							} else if pruned > 0 {
+								logger.Info("pruned old shadow generations", "rows", pruned)
+							}
 						}
 					}
 				}
 			}
-		}
-		if processBranchTokenChange("branch token") {
-			branchTransitionBlocked = true
+			if processBranchTokenChange("branch token") {
+				branchTransitionBlocked = true
+			}
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
@@ -708,7 +821,7 @@ func Run(ctx context.Context, opts Options) error {
 				break
 			}
 		}
-		if processBranchTokenChange("pre-capture branch token") {
+		if !operationPaused && processBranchTokenChange("pre-capture branch token") {
 			branchTransitionBlocked = true
 		}
 
@@ -720,6 +833,9 @@ func Run(ctx context.Context, opts Options) error {
 		detachedHeadPaused := cctx.BranchRef == ""
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
+		} else if operationPaused {
+			logger.Warn("git operation in progress; capture/replay paused",
+				"operation", operationName)
 		} else if detachedHeadPaused {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
@@ -728,6 +844,7 @@ func Run(ctx context.Context, opts Options) error {
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
 				SensitiveMatcher: matcher,
+				Trace:            tracer,
 			})
 		}
 
@@ -735,11 +852,12 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && !branchTransitionBlocked && !detachedHeadPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
 				GitDir:    opts.GitDir,
+				Trace:     tracer,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
@@ -902,6 +1020,26 @@ func resolveBranch(ctx context.Context, repoDir string, logger *slog.Logger) (st
 		return branch, ""
 	}
 	return branch, head
+}
+
+func gitOperationInProgress(gitDir string) (string, bool) {
+	for _, marker := range []struct {
+		path string
+		name string
+	}{
+		{path: "rebase-merge", name: "rebase-merge"},
+		{path: "rebase-apply", name: "rebase-apply"},
+		{path: "MERGE_HEAD", name: "merge"},
+		{path: "CHERRY_PICK_HEAD", name: "cherry-pick"},
+		{path: "BISECT_LOG", name: "bisect"},
+	} {
+		if _, err := os.Stat(filepath.Join(gitDir, marker.path)); err == nil {
+			return marker.name, true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return marker.name, true
+		}
+	}
+	return "", false
 }
 
 // gitDirEnsureSubdir is a tiny helper to ensure a subdir exists under
