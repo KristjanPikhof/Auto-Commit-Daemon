@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -68,6 +69,7 @@ type ReplaySummary struct {
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
+	Skipped   bool // replay drain was intentionally skipped before reading events
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -100,6 +102,15 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	msgFn := opts.MessageFn
 	if msgFn == nil {
 		msgFn = DeterministicMessage
+	}
+
+	if paused, err := replayPauseState(ctx, opts.GitDir, db); err != nil {
+		return sum, err
+	} else if paused.Active {
+		sum.BaseHead = cctx.BaseHead
+		sum.Skipped = true
+		traceReplayPaused(opts.Trace, repoRoot, cctx, paused)
+		return sum, nil
 	}
 
 	indexFile := opts.IndexFile
