@@ -839,6 +839,13 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 func sanitizeReport(r doctorReport) doctorReport {
 	out := r
 	out.RegistryPath = homeShort(r.RegistryPath)
+	harnesses := make([]doctorHarnessReport, 0, len(r.Harnesses))
+	for _, h := range r.Harnesses {
+		c := h
+		c.ConfigPath = homeShort(h.ConfigPath)
+		harnesses = append(harnesses, c)
+	}
+	out.Harnesses = harnesses
 	repos := make([]doctorRepoReport, 0, len(r.Repos))
 	for _, rr := range r.Repos {
 		c := rr
