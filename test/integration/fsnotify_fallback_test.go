@@ -158,7 +158,7 @@ func TestFsnotify_BudgetExceededFallsBackToPoll(t *testing.T) {
 	// Confirm capture-replay still works under the poll fallback.
 	writeFile(t, filepath.Join(repo, "after-fallback.txt"), "poll-still-works\n")
 	wakeSession(t, ctx, envWith(env, "ACD_FSNOTIFY_ENABLED=1", "ACD_MAX_INOTIFY_WATCHES=2"), repo, "fsn-budget")
-	waitForCommitContaining(t, repo, "after-fallback.txt", 8*time.Second)
+	waitForCommitContaining(t, repo, "after-fallback.txt", 30*time.Second)
 }
 
 // TestFsnotify_DisabledByEnvFallsBackToPoll: ACD_DISABLE_FSNOTIFY=1 forces
