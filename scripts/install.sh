@@ -57,8 +57,11 @@ if command -v sha256sum >/dev/null 2>&1; then
   ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | sha256sum -c - )
 elif command -v shasum >/dev/null 2>&1; then
   ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | shasum -a 256 -c - )
+elif [ "${ACD_ALLOW_NO_CHECKSUM:-}" = "1" ]; then
+  echo "warning: ACD_ALLOW_NO_CHECKSUM=1 set; skipping checksum check" >&2
 else
-  echo "warning: no sha256 verifier found; skipping checksum check" >&2
+  echo "no sha256 verifier found; install sha256sum/shasum or set ACD_ALLOW_NO_CHECKSUM=1 to skip checksum verification" >&2
+  exit 1
 fi
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
