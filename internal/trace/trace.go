@@ -31,18 +31,18 @@ type Logger interface {
 
 // Event is one decision record before JSON encoding.
 type Event struct {
-	TS          time.Time
-	Repo        string
-	BranchRef   string
-	HeadSHA     string
-	EventClass  string
-	Decision    string
-	Reason      string
-	Input       any
-	Output      any
-	Error       string
-	Seq         int64
-	Generation  int64
+	TS         time.Time
+	Repo       string
+	BranchRef  string
+	HeadSHA    string
+	EventClass string
+	Decision   string
+	Reason     string
+	Input      any
+	Output     any
+	Error      string
+	Seq        int64
+	Generation int64
 }
 
 // Options configures an enabled writer. Dir may be left empty when GitDir is
@@ -61,8 +61,8 @@ type Options struct {
 // minimum possible work on hot paths.
 type Noop struct{}
 
-func (Noop) Record(Event)   {}
-func (Noop) Close() error   { return nil }
+func (Noop) Record(Event)    {}
+func (Noop) Close() error    { return nil }
 func (Noop) Dropped() uint64 { return 0 }
 
 // EnabledFromEnv reports whether ACD_TRACE is truthy.
