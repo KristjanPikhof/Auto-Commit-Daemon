@@ -65,20 +65,27 @@ single pass works as follows:
       halts — later events are NOT replayed because they were captured assuming
       this one would land first.
 
-   c. **Apply ops.** The ops are fed to `git update-index --index-info` against
+   c. **Idempotent publish check.** Before recording that before-state mismatch,
+      replay checks the current `HEAD` tree. If every op's desired final state is
+      already present, including absent paths for deletes and rename cleanup, the
+      event is marked `published` with `commit_oid = HEAD`. No new commit is
+      created. This handles parallel committers that already landed the same
+      change.
+
+   d. **Apply ops.** The ops are fed to `git update-index --index-info` against
       the scratch index (via `GIT_INDEX_FILE`), advancing it atomically.
 
-   d. **Build tree and commit.** `git write-tree` produces a tree OID from the
+   e. **Build tree and commit.** `git write-tree` produces a tree OID from the
       updated scratch index. A commit is created via `git commit-tree` with the
       AI or deterministic message. The new commit becomes the parent for the
       next event in the pass.
 
-   e. **Advance the branch ref.** `git update-ref` atomically advances the
+   f. **Advance the branch ref.** `git update-ref` atomically advances the
       branch ref from `parent` to the new commit OID (compare-and-swap).
       If the CAS fails (someone else moved the ref), the event is
       `blocked_conflict` and the pass halts.
 
-   f. **Record the outcome.** The event row is updated to `published` with the
+   g. **Record the outcome.** The event row is updated to `published` with the
       commit OID, and `publish_state` is upserted with `status = "published"`.
 
 The scratch index is deleted when the pass returns. Every new pass creates a
@@ -105,7 +112,10 @@ shape is `rev:<sha> <branch-ref>` while attached, `rev:<sha>` while detached,
 and `missing <branch-ref>` for an attached unborn branch.
 
 ACD's own commits always fast-forward, so normal operation never bumps the
-generation. Only external branch surgery does.
+generation. Only external branch surgery does. If the branch moves backward on
+the same branch ref, the daemon writes `daemon_meta.replay.paused_until` and
+pauses replay for `ACD_REWIND_GRACE_SECONDS` seconds. The default is 60 seconds;
+set it to `0` to disable the grace.
 
 At startup the daemon classifies the persisted `branch.head` against the
 current HEAD before overwriting metadata. If the branch was reset or rebased
@@ -113,6 +123,19 @@ while the daemon was offline, generation bumps and `shadow_paths` is reseeded
 before capture resumes. Detached HEAD is treated as a pause: `acd start`
 refuses to register, the daemon stamps `detached_head_paused`, and capture plus
 replay stay disabled until HEAD is attached to a branch again.
+
+### Replay pauses
+
+Replay can be paused from two sources:
+
+| Source | Storage | Behavior |
+|---|---|---|
+| Manual operator pause | `<gitDir>/acd/paused` JSON marker | `acd pause` writes it, `acd resume --yes` removes it. The daemon reads it but never deletes it. |
+| Rewind grace | `daemon_meta.replay.paused_until` | Set when the daemon detects a same-branch rewind. Expired values are cleared by replay. |
+
+Manual pause wins when both sources exist. Malformed manual markers and
+unparseable rewind-grace timestamps fail open with a warning so a bad marker
+does not lock the daemon permanently.
 
 ### Shadow generation retention
 
@@ -215,6 +238,22 @@ This refreshes the session's `last_seen_ts` heartbeat (keeping the client row
 alive) and sends `SIGUSR1` to the daemon process, which triggers an immediate
 capture + replay pass. Harnesses that call `acd wake` on `PostToolUse` events
 reduce commit latency to near-zero.
+
+### Pause and resume replay
+
+Use a manual pause before branch surgery that should not be immediately
+replayed:
+
+~~~bash
+acd pause --repo . --reason "manual reset" --yes
+# reset, rebase, inspect, or stage changes
+acd resume --repo . --yes
+acd wake --repo . --session-id "$ACD_SESSION_ID"
+~~~
+
+`acd pause --ttl 10m --yes` creates a marker that expires automatically for
+replay purposes. Expired markers remain on disk until `acd resume --yes`
+removes them.
 
 ### Restart the daemon with updated env
 
