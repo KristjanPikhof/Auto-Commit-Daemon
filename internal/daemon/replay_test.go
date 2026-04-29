@@ -241,8 +241,29 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 	if sum.Published < 1 {
 		t.Fatalf("Published=%d want >=1 (event 1 should land before the blocker)", sum.Published)
 	}
+	var publishedHead sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT commit_oid FROM capture_events WHERE path = 'ok.txt' AND state = ?`,
+		state.EventStatePublished).Scan(&publishedHead); err != nil {
+		t.Fatalf("query ok.txt commit: %v", err)
+	}
+	if !publishedHead.Valid || publishedHead.String == "" {
+		t.Fatalf("ok.txt published without commit oid")
+	}
+	pub, ok, err := state.LoadPublishState(ctx, f.db)
+	if err != nil {
+		t.Fatalf("LoadPublishState: %v", err)
+	}
+	if !ok {
+		t.Fatalf("publish_state row not written")
+	}
+	if !pub.SourceHead.Valid || pub.SourceHead.String != publishedHead.String {
+		t.Fatalf("publish_state.source_head=%v want first published head %s",
+			pub.SourceHead, publishedHead.String)
+	}
 
-	// `after.txt`'s event must still be pending; the blocker must be terminal.
+	// `after.txt`'s event must be held behind the terminal blocker; the blocker
+	// itself must not re-enter the pending queue.
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
 		t.Fatalf("PendingEvents: %v", err)
@@ -259,23 +280,20 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 	if sawBlocker {
 		t.Fatalf("blocker seq=%d should NOT be pending after settle", blockerSeq)
 	}
-	if !sawAfter {
-		t.Fatalf("after.txt should remain pending; pending=%+v", pending)
+	if sawAfter {
+		t.Fatalf("after.txt should be held behind blocked predecessor; pending=%+v", pending)
 	}
 
 	// A second pass with the blocker still in place must NOT drain `after.txt`.
-	// (The batch sees it sitting behind the blocked predecessor — but with the
-	// blocker already terminal, there is nothing left to halt on. So this
-	// assertion is the "operator must reconcile first" property: until the
-	// blocker is gone OR another mechanism advances BaseHead, retries do not
-	// magically chain on top of a stale parent. We verify by re-running
-	// Replay; `after.txt` may publish or stay pending depending on whether
-	// the scratch index reconciles, but the blocker MUST stay terminal.)
-	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Replay second pass: %v", err)
+	}
+	if sum2.Published != 0 || sum2.Conflicts != 0 || sum2.Failed != 0 {
+		t.Fatalf("second pass should be held by seq barrier; sum=%+v", sum2)
 	}
 	pending2, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
@@ -284,6 +302,9 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 	for _, p := range pending2 {
 		if p.Seq == blockerSeq {
 			t.Fatalf("blocker re-entered pending on second pass: %+v", p)
+		}
+		if p.Path == "after.txt" {
+			t.Fatalf("after.txt re-entered pending while blocker remains: %+v", p)
 		}
 	}
 }
@@ -417,6 +438,42 @@ func TestReplay_ModifyChain_OrderedReplay(t *testing.T) {
 		if entries[0].OID != wantBlobs[i] {
 			t.Fatalf("commit %d (%s) chain.txt blob=%s want %s", i, h, entries[0].OID, wantBlobs[i])
 		}
+	}
+}
+
+func TestReplay_DefaultIndexIsPerPassTempfile(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "temp-index.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write temp-index.txt: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published == 0 {
+		t.Fatalf("Published=0 want >0")
+	}
+	if _, err := os.Stat(filepath.Join(f.gitDir, "acd", "replay.index")); !os.IsNotExist(err) {
+		t.Fatalf("fixed replay.index exists or stat failed unexpectedly: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(f.gitDir, "acd", "replay-*.index"))
+	if err != nil {
+		t.Fatalf("glob temp indexes: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp replay indexes were not cleaned up: %v", matches)
 	}
 }
 

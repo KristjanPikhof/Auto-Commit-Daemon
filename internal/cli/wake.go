@@ -29,11 +29,20 @@ type wakeResult struct {
 
 // signalProcess is the injection point used by tests to verify that wake
 // would have sent SIGUSR1 without involving real OS signals.
-var signalProcess = func(pid int, sig syscall.Signal) error {
+var captureProcessFingerprint = identity.Capture
+var killProcess = syscall.Kill
+
+var signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 	if pid <= 0 {
 		return errors.New("invalid pid")
 	}
-	return syscall.Kill(pid, sig)
+	if expectedFingerprint != "" {
+		fp, err := captureProcessFingerprint(pid)
+		if err == nil && daemon.FingerprintToken(fp) != expectedFingerprint {
+			return fmt.Errorf("verify process identity for pid %d: fingerprint mismatch", pid)
+		}
+	}
+	return killProcess(pid, sig)
 }
 
 func newWakeCmd() *cobra.Command {
@@ -117,7 +126,7 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 	pid := 0
 	if st.PID > 0 && identity.Alive(st.PID) {
 		pid = st.PID
-		if err := signalProcess(st.PID, syscall.SIGUSR1); err == nil {
+		if err := signalProcess(st.PID, syscall.SIGUSR1, daemonFingerprintToken(st)); err == nil {
 			sent = true
 		}
 	}
@@ -140,6 +149,13 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 		fmt.Fprintf(out, "acd wake: refreshed session %s (daemon not running)\n", sessionID)
 	}
 	return nil
+}
+
+func daemonFingerprintToken(st state.DaemonState) string {
+	if !st.DaemonFingerprint.Valid {
+		return ""
+	}
+	return st.DaemonFingerprint.String
 }
 
 func nowSecondsFloat() float64 {

@@ -68,7 +68,7 @@ SELECT branch_ref, branch_generation, path, operation, mode, oid,
 FROM shadow_paths
 WHERE branch_ref = ? AND branch_generation = ? AND path = ?`
 	var sp ShadowPath
-	err := d.conn.QueryRowContext(ctx, q, branchRef, gen, path).Scan(
+	err := d.readSQL().QueryRowContext(ctx, q, branchRef, gen, path).Scan(
 		&sp.BranchRef, &sp.BranchGeneration, &sp.Path, &sp.Operation, &sp.Mode, &sp.OID,
 		&sp.OldPath, &sp.BaseHead, &sp.Fidelity, &sp.UpdatedTS,
 	)
@@ -94,6 +94,33 @@ func DeleteShadowGeneration(ctx context.Context, d *DB, branchRef string, gen in
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("state: delete shadow generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// PruneShadowGenerations deletes shadow rows for branch generations older than
+// the configured retention window behind currentGeneration. retainBehind is the
+// number of prior generations to keep in addition to the current generation.
+func PruneShadowGenerations(ctx context.Context, d *DB, branchRef string, currentGeneration, retainBehind int64) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: PruneShadowGenerations: empty branch_ref")
+	}
+	if currentGeneration <= 0 {
+		return 0, fmt.Errorf("state: PruneShadowGenerations: invalid current generation %d", currentGeneration)
+	}
+	if retainBehind < 0 {
+		retainBehind = 0
+	}
+	minGeneration := currentGeneration - retainBehind
+	res, err := d.conn.ExecContext(ctx,
+		`DELETE FROM shadow_paths WHERE branch_ref = ? AND branch_generation < ?`,
+		branchRef, minGeneration)
+	if err != nil {
+		return 0, fmt.Errorf("state: prune shadow generations: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: prune shadow generation rows: %w", err)
 	}
 	return int(n), nil
 }

@@ -17,8 +17,10 @@
 //
 // The legacy snapshot daemon never shipped a subprocess provider, so the
 // canonical wire shape lives in this file (and in the docstring above) as
-// the contract every harness must speak. The `version` field exists so
-// future shapes can be negotiated without breaking older plugins.
+// the contract every harness must speak. Diff text is empty unless the daemon
+// opted in to sending diffs, then redacted and truncated before it reaches the
+// plugin. The `version` field exists so future shapes can be negotiated without
+// breaking older plugins.
 //
 // Lifecycle:
 //   - Spawn on first Generate after construction (or after a crash/timeout).
@@ -44,9 +46,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -67,12 +72,13 @@ type LookPathFunc func(string) (string, error)
 
 // SubprocessOptions tunes a SubprocessProvider. Zero-valued fields fall
 // back to safe defaults (Timeout=30s, LookPath=exec.LookPath, Logger=
-// slog.Default).
+// slog.Default, Stderr=~/.local/state/acd/plugin-<name>.log).
 type SubprocessOptions struct {
 	Timeout  time.Duration // per-request hard timeout; 0 -> DefaultSubprocessTimeout
 	Logger   *slog.Logger  // optional; nil -> slog.Default
 	Env      []string      // additional env entries appended to os.Environ
 	LookPath LookPathFunc  // resolves binary path; nil -> exec.LookPath
+	Stderr   io.Writer     // plugin stderr sink; nil -> per-plugin log file
 }
 
 // SubprocessProvider implements Provider by talking JSONL to a long-lived
@@ -85,6 +91,7 @@ type SubprocessProvider struct {
 
 	timeout time.Duration
 	env     []string
+	stderr  io.Writer
 	logger  *slog.Logger
 
 	mu     sync.Mutex // guards plugin/closed
@@ -116,6 +123,7 @@ func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvi
 		name:    name,
 		timeout: timeout,
 		env:     append([]string(nil), opts.Env...),
+		stderr:  opts.Stderr,
 		logger:  logger,
 	}
 
@@ -159,7 +167,7 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		Path:     cc.Path,
 		Op:       cc.Op,
 		OldPath:  cc.OldPath,
-		Diff:     cc.DiffText,
+		Diff:     Truncate(RedactDiffSecrets(cc.DiffText), DiffCap),
 		RepoRoot: cc.RepoRoot,
 		Branch:   cc.Branch,
 	}
@@ -268,7 +276,7 @@ func (p *SubprocessProvider) acquire() (*pluginSession, error) {
 		_ = p.plugin.shutdown(0)
 		p.plugin = nil
 	}
-	session, err := startPlugin(p.binary, p.env, p.logger.With(slog.String("plugin", p.name)))
+	session, err := startPlugin(p.name, p.binary, p.env, p.stderr, p.logger.With(slog.String("plugin", p.name)))
 	if err != nil {
 		return nil, fmt.Errorf("subprocess:%s: start: %w", p.name, err)
 	}
@@ -339,6 +347,7 @@ type pluginSession struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	stderr io.Closer
 	logger *slog.Logger
 
 	work     chan pluginRequest
@@ -350,11 +359,10 @@ type pluginSession struct {
 	deadFl bool
 }
 
-// startPlugin spawns the binary and launches the owner goroutine. The
-// plugin process owns its own stderr; we inherit it so plugin diagnostics
-// land in the daemon's log stream by default.
-func startPlugin(binary string, extraEnv []string, logger *slog.Logger) (*pluginSession, error) {
+// startPlugin spawns the binary and launches the owner goroutine.
+func startPlugin(name, binary string, extraEnv []string, stderr io.Writer, logger *slog.Logger) (*pluginSession, error) {
 	cmd := exec.Command(binary)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if len(extraEnv) > 0 {
 		// Compose: parent env + extras. We intentionally do not
 		// strip parent env — plugin authors may rely on standard
@@ -370,19 +378,29 @@ func startPlugin(binary string, extraEnv []string, logger *slog.Logger) (*plugin
 		_ = stdin.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	// stderr inherits to the parent for diagnostic visibility.
-	cmd.Stderr = nil // os.Stderr by default? No — exec.Cmd default is no inheritance; use nil to discard.
-	// Discard plugin stderr by default; loud plugins shouldn't pollute
-	// the daemon log unless wired through Logger explicitly.
+	var stderrClose io.Closer
+	if stderr == nil {
+		stderr, stderrClose, err = openDefaultPluginStderr(name)
+		if err != nil {
+			_ = stdin.Close()
+			_ = stdout.Close()
+			return nil, fmt.Errorf("stderr log: %w", err)
+		}
+	}
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
+		if stderrClose != nil {
+			_ = stderrClose.Close()
+		}
 		return nil, fmt.Errorf("start: %w", err)
 	}
 	s := &pluginSession{
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
+		stderr: stderrClose,
 		logger: logger,
 		work:   make(chan pluginRequest),
 		done:   make(chan struct{}),
@@ -390,6 +408,45 @@ func startPlugin(binary string, extraEnv []string, logger *slog.Logger) (*plugin
 	}
 	go s.run()
 	return s, nil
+}
+
+func openDefaultPluginStderr(name string) (io.Writer, io.Closer, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	dir := filepath.Join(home, ".local", "state", "acd")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, err
+	}
+	path := filepath.Join(dir, "plugin-"+safePluginLogName(name)+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, f, nil
+}
+
+func safePluginLogName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 // run is the owner goroutine. One request in flight at a time; reads
@@ -523,7 +580,9 @@ func bytesContainNewline(b []byte) bool {
 // multiple times; subsequent calls are no-ops once the process has exited.
 func (s *pluginSession) kill() {
 	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
+		if err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			_ = s.cmd.Process.Kill()
+		}
 	}
 	_ = s.stdin.Close()
 	_ = s.stdout.Close()
@@ -547,6 +606,9 @@ func (s *pluginSession) shutdown(grace time.Duration) error {
 		select {
 		case err := <-exited:
 			_ = s.stdout.Close()
+			if s.stderr != nil {
+				_ = s.stderr.Close()
+			}
 			<-s.done
 			return err
 		case <-time.After(grace):
@@ -558,6 +620,9 @@ func (s *pluginSession) shutdown(grace time.Duration) error {
 	}
 	_ = s.stdout.Close()
 	_ = s.cmd.Wait()
+	if s.stderr != nil {
+		_ = s.stderr.Close()
+	}
 	<-s.done
 	return nil
 }

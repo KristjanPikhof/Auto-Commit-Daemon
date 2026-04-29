@@ -23,9 +23,13 @@
 package ai
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +44,7 @@ const (
 	EnvAPIKey   = "ACD_AI_API_KEY"
 	EnvModel    = "ACD_AI_MODEL"
 	EnvTimeout  = "ACD_AI_TIMEOUT"
+	EnvCAFile   = "ACD_AI_CA_FILE"
 )
 
 // DefaultProviderTimeout is the per-request timeout applied to the
@@ -73,6 +78,10 @@ type ProviderConfig struct {
 	// resolves to DefaultProviderTimeout.
 	Timeout time.Duration
 
+	// CAFile is an optional PEM bundle used to trust a private
+	// OpenAI-compatible HTTPS gateway.
+	CAFile string
+
 	// Logger receives warning logs from BuildProvider's degraded paths.
 	// Nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -89,6 +98,7 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		BaseURL: strings.TrimSpace(os.Getenv(EnvBaseURL)),
 		APIKey:  strings.TrimSpace(os.Getenv(EnvAPIKey)),
 		Model:   strings.TrimSpace(os.Getenv(EnvModel)),
+		CAFile:  strings.TrimSpace(os.Getenv(EnvCAFile)),
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultOpenAIBaseURL
@@ -146,16 +156,24 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return det, nil, nil
 
 	case mode == "openai-compat":
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		if err != nil {
+			return nil, nil, err
+		}
 		if cfg.APIKey == "" {
 			logger.Warn("ai: ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY empty; falling back to deterministic",
 				slog.String("provider", "openai-compat"))
 			return det, nil, nil
 		}
+		httpClient, err := openAIHTTPClient(cfg.Timeout, cfg.CAFile)
+		if err != nil {
+			return nil, nil, err
+		}
 		primary := &OpenAIProvider{
-			BaseURL: cfg.BaseURL,
+			BaseURL: baseURL,
 			APIKey:  cfg.APIKey,
 			Model:   cfg.Model,
-			HTTP:    nil, // provider lazy-builds a redirect-refusing client
+			HTTP:    httpClient,
 		}
 		return Compose(primary, det), nil, nil
 
@@ -183,3 +201,36 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 // hard-fail mode) can surface a typed error without changing the
 // signature. Currently unused.
 var errProviderUnused = errors.New("ai: provider configuration error") //nolint:unused
+
+func openAIHTTPClient(timeout time.Duration, caFile string) (*http.Client, error) {
+	client := defaultOpenAIClient()
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	caFile = strings.TrimSpace(caFile)
+	if caFile == "" {
+		return client, nil
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	pemBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("openai-compat: read ACD_AI_CA_FILE: %w", err)
+	}
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, errors.New("openai-compat: ACD_AI_CA_FILE contained no PEM certificates")
+	}
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("openai-compat: default HTTP transport has unexpected type")
+	}
+	cloned := transport.Clone()
+	cloned.TLSClientConfig = &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	}
+	client.Transport = cloned
+	return client, nil
+}

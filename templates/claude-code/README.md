@@ -3,10 +3,9 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Install jq (required): `brew install jq` or `apt install jq`
-3. Generate snippet: `acd init claude-code`
-4. Merge the printed JSON into `~/.claude/settings.json` under the `hooks` key
-5. Restart Claude Code
+2. Generate snippet: `acd init claude-code`
+3. Merge the printed JSON into `~/.claude/settings.json` under the `hooks` key
+4. Restart Claude Code
 
 ## Verify
 

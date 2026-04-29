@@ -32,8 +32,12 @@ pending  →  published     (normal: commit was written and ref advanced)
 ```
 
 `pending` is the only non-terminal state. The replay loop processes only
-`pending` rows. `blocked_conflict` and `failed` rows are permanent — they are
-counted but never retried automatically.
+`pending` rows. `blocked_conflict` and `failed` rows are terminal — they are
+counted but never retried automatically. A terminal `blocked_conflict` or
+`failed` row also acts as a sequence barrier for the same branch ref and
+generation: later pending rows stay held until the operator deletes or otherwise
+resolves the terminal predecessor. The retention pruner can delete old terminal
+rows only after they no longer act as the active barrier.
 
 ---
 
@@ -42,10 +46,10 @@ counted but never retried automatically.
 The daemon drains `pending` events on every poll tick by calling `Replay`. A
 single pass works as follows:
 
-1. **Seed a scratch index.** The daemon creates an isolated index file at
-   `<gitDir>/acd/replay.index` and seeds it from the current `BaseHead` via
-   `git read-tree`. This index is private to the replay pass; the repo's live
-   working-tree index is never touched.
+1. **Seed a scratch index.** The daemon creates an isolated per-pass tempfile
+   under `<gitDir>/acd/replay-*.index` and seeds it from the current `BaseHead`
+   via `git read-tree`. This index is private to the replay pass; the repo's
+   live working-tree index is never touched.
 
 2. **For each pending event in sequence:**
 
@@ -77,8 +81,8 @@ single pass works as follows:
    f. **Record the outcome.** The event row is updated to `published` with the
       commit OID, and `publish_state` is upserted with `status = "published"`.
 
-The scratch index is deleted at the start of every pass so a crash mid-pass
-never poisons the next one.
+The scratch index is deleted when the pass returns. Every new pass creates a
+fresh tempfile, so a crash mid-pass never poisons the next one.
 
 ---
 
@@ -89,16 +93,34 @@ moment of capture. The daemon classifies each HEAD movement as:
 
 | Transition | Classification | Effect on queue |
 |---|---|---|
-| New HEAD descends from previous HEAD | Fast-forward | Generation unchanged; queue remains valid |
-| New HEAD does NOT descend from previous HEAD | Diverged (rebase / reset / branch-switch) | Generation bumped; old-generation events become `blocked_conflict` at replay time |
+| New HEAD descends from previous HEAD on the same branch ref | Fast-forward | Generation unchanged; queue remains valid |
+| New HEAD does NOT descend from previous HEAD, or branch ref changes even at the same SHA | Diverged (rebase / reset / branch-switch) | Generation bumped; old-generation events become `blocked_conflict` at replay time |
 | HEAD transitions to or from `missing` (orphan) | Diverged | Same as above |
 
 The generation counter is persisted in `daemon_meta` under `branch.generation`
 so a daemon restart picks up the last-known value rather than resetting to 1
-(which would cause stale events to appear fresh).
+(which would cause stale events to appear fresh). The last observed HEAD is
+stored as `branch.head`, and the raw token is stored as `branch_token`. Token
+shape is `rev:<sha> <branch-ref>` while attached, `rev:<sha>` while detached,
+and `missing <branch-ref>` for an attached unborn branch.
 
 ACD's own commits always fast-forward, so normal operation never bumps the
 generation. Only external branch surgery does.
+
+At startup the daemon classifies the persisted `branch.head` against the
+current HEAD before overwriting metadata. If the branch was reset or rebased
+while the daemon was offline, generation bumps and `shadow_paths` is reseeded
+before capture resumes. Detached HEAD is treated as a pause: `acd start`
+refuses to register, the daemon stamps `detached_head_paused`, and capture plus
+replay stay disabled until HEAD is attached to a branch again.
+
+### Shadow generation retention
+
+`shadow_paths` is keyed by `(branch_ref, branch_generation, path)`. A successful
+reseed calls `PruneShadowGenerations`, keeping the current generation plus
+`ACD_SHADOW_RETENTION_GENERATIONS` prior generations. The default is `1`, which
+keeps one prior generation for inspection while bounding SQLite growth across
+repeated rebases.
 
 ---
 
@@ -111,14 +133,15 @@ This means:
 
 - The diff reflects exactly what was captured, even if the file has changed
   many times since.
-- The diff is capped at `DiffCap` (4000 bytes) before transmission. Long diffs
-  are truncated at a line boundary while preserving the diff header(s) so the
-  model still sees which file is being described.
+- The diff is capped at `DiffCap` (4000 bytes) while it is rendered. Long diffs
+  stop at a line boundary while preserving the diff header(s) so the model
+  still sees which file is being described.
 - `create` and `delete` ops use git's well-known empty-blob OID
   (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
 
-The deterministic provider does not consult `DiffText` at all, so the fallback
-path is identical regardless of diff reconstruction success or failure.
+Diff reconstruction is opt-in via `ACD_AI_SEND_DIFF=1`. The deterministic
+provider declares that it does not need diffs, so default replay skips
+reconstruction entirely and only builds diff text for providers that can use it.
 
 ---
 
@@ -141,11 +164,20 @@ the branch. Common causes:
 
 ### Batch-halt behavior
 
-The pass halts on the first `blocked_conflict`. Events that came after the
-blocker in the capture sequence are left `pending`. They will be re-examined on
-the next poll tick, but they will also block because their `BaseHead` was
-captured against the now-broken predecessor. The entire backlog clears only
-after the operator resolves the root conflict.
+The pass halts on the first `blocked_conflict` or failed replay-build row.
+Events that came after the blocker in the capture sequence are left `pending`,
+but `PendingEvents` hides them behind the terminal predecessor on later passes.
+They do not leapfrog the broken event even when their paths are disjoint. The
+entire backlog clears only after the operator resolves or deletes the root
+conflict row.
+
+### Retention pruning
+
+The daemon prunes old `published` rows after `ACD_EVENT_RETENTION_DAYS`
+(default 7 days). It also prunes stale terminal `blocked_conflict` and `failed`
+rows past the same cutoff, but only when deleting them would not expose a later
+pending row that still depends on the terminal barrier. Active barriers remain
+until the operator resolves the conflict or deletes the row intentionally.
 
 ---
 
@@ -243,7 +275,8 @@ Use this checklist when commits stop appearing:
    acd doctor      # last conflict: <path> <age> "<error>"
    ~~~
 
-   `blocked_conflict` events are terminal. Resolution options:
+   `blocked_conflict` events are terminal and may hold later pending rows behind
+   a sequence barrier. Resolution options:
 
    - If the error is a **generation mismatch** (after a rebase or reset): the
      captured events are stale. Remove them manually from `capture_events` (set

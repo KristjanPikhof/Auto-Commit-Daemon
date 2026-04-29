@@ -43,6 +43,14 @@ type startResult struct {
 // Returns the spawned PID (or 0 if the spawn was a no-op stub).
 var spawnDaemon = defaultSpawnDaemon
 
+const defaultDaemonSpawnPollTimeout = 3 * time.Second
+
+var daemonSpawnPollTimeout = defaultDaemonSpawnPollTimeout
+var daemonSpawnPollInterval = 50 * time.Millisecond
+var afterDaemonSpawnPollDeadline func(context.Context, *state.DB)
+var startControlLockTimeout = 5 * time.Second
+var startControlLockRetryInterval = 10 * time.Millisecond
+
 // defaultSpawnDaemon fork-execs a detached `acd daemon run --repo <abs>`
 // process. Stdin/stdout/stderr point to /dev/null so the parent can exit
 // cleanly without holding the child's pipes; the daemon configures its own
@@ -115,12 +123,15 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if err != nil {
 		return fmt.Errorf("acd start: resolve git dir: %w", err)
 	}
+	if err := ensureAttachedHEAD(ctx, repo); err != nil {
+		return err
+	}
 
 	// Brief control.lock for the daemon_clients read-modify-write window.
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		return fmt.Errorf("acd start: mkdir state dir: %w", err)
 	}
-	clock, err := daemon.AcquireControlLock(gitDir)
+	clock, err := acquireStartControlLock(ctx, gitDir)
 	if err != nil {
 		return fmt.Errorf("acd start: acquire control.lock: %w", err)
 	}
@@ -133,17 +144,14 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	defer func() { _ = db.Close() }()
 
-	// watch_pid defaults to PPID when running from a shell hook; pass 0
-	// to opt out (per §7.2 flag semantics).
-	if watchPID == 0 {
-		watchPID = os.Getppid()
-	}
 	var watchPIDNull sql.NullInt64
 	var watchFPNull sql.NullString
 	if watchPID > 0 {
-		watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
-		if fp, ferr := identity.Capture(watchPID); ferr == nil && !fp.Empty() {
-			watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
+		if identity.AliveContext(ctx, watchPID) {
+			watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
+			if fp, ferr := identity.CaptureContext(ctx, watchPID); ferr == nil && !fp.Empty() {
+				watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
+			}
 		}
 	}
 
@@ -167,6 +175,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}); err != nil {
 		return fmt.Errorf("acd start: register client: %w", err)
 	}
+	registeredClients, _ := state.CountClients(ctx, db)
 
 	// Detect daemon liveness: PID alive AND heartbeat fresh.
 	st, _, err := state.LoadDaemonState(ctx, db)
@@ -175,7 +184,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	daemonPID := 0
 	daemonAlive := false
-	if st.PID > 0 && identity.Alive(st.PID) {
+	if st.PID > 0 && identity.AliveContext(ctx, st.PID) {
 		hbAge := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
 		if hbAge < clientTTL() && st.Mode != "stopped" {
 			daemonAlive = true
@@ -199,17 +208,33 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		// Poll daemon_state.pid for up to ~3s. Tests inject a stub
 		// spawnDaemon that stamps the row synchronously, so the loop
 		// usually exits on the first iteration.
-		deadline := time.Now().Add(3 * time.Second)
+		pollTimeout := daemonSpawnPollTimeout
+		if registeredClients > 1 && pollTimeout == defaultDaemonSpawnPollTimeout {
+			pollTimeout = 5 * time.Second
+		}
+		deadline := time.Now().Add(pollTimeout)
 		for time.Now().Before(deadline) {
 			st, _, _ = state.LoadDaemonState(ctx, db)
 			if st.PID > 0 && st.Mode != "stopped" {
 				daemonPID = st.PID
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(daemonSpawnPollInterval)
+		}
+		if daemonPID == 0 {
+			if afterDaemonSpawnPollDeadline != nil {
+				afterDaemonSpawnPollDeadline(ctx, db)
+			}
+			st, _, _ = state.LoadDaemonState(ctx, db)
+			if st.PID > 0 && st.Mode != "stopped" {
+				daemonPID = st.PID
+			}
 		}
 		if daemonPID == 0 {
 			daemonPID = pid // fall back to the spawned PID
+		}
+		if pid > 0 && daemonPID > 0 && daemonPID != pid {
+			started = false
 		}
 	}
 
@@ -259,6 +284,26 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	return nil
 }
 
+func acquireStartControlLock(ctx context.Context, gitDir string) (*daemon.ControlLock, error) {
+	deadline := time.Now().Add(startControlLockTimeout)
+	for {
+		clock, err := daemon.AcquireControlLock(gitDir)
+		if err == nil {
+			return clock, nil
+		}
+		if !errors.Is(err, daemon.ErrControlLockHeld) || time.Now().After(deadline) {
+			return nil, err
+		}
+		timer := time.NewTimer(startControlLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // resolveGitDir resolves the .git directory for a repo. Falls back to
 // <repo>/.git when the git binary fails (common in synthetic test repos).
 func resolveGitDir(ctx context.Context, repo string) (string, error) {
@@ -271,6 +316,17 @@ func resolveGitDir(ctx context.Context, repo string) (string, error) {
 		return fallback, nil
 	}
 	return "", err
+}
+
+func ensureAttachedHEAD(ctx context.Context, repo string) error {
+	branchRef, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("acd start: resolve HEAD branch: %w", err)
+	}
+	if branchRef == "" {
+		return errors.New("acd start: detached HEAD is not supported; checkout a branch before starting")
+	}
+	return nil
 }
 
 // fingerprintToken renders a Fingerprint into the canonical persisted form

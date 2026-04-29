@@ -50,9 +50,10 @@ func AbsoluteGitDir(ctx context.Context, dir string) (string, error) {
 // a new ref or an unconditional update.
 //
 // Mirrors the legacy replay's compare-and-swap update-ref invocation in
-// snapshot-replay.py.
+// snapshot-replay.py. --no-deref makes the target ref explicit instead of
+// following a symbolic ref.
 func UpdateRef(ctx context.Context, repoDir, ref, newOID, oldOID string) error {
-	args := []string{"update-ref", ref, newOID}
+	args := []string{"update-ref", "--no-deref", ref, newOID}
 	if oldOID != "" {
 		args = append(args, oldOID)
 	}

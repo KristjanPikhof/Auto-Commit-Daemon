@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -220,6 +221,44 @@ func TestBuildOpsDiff_MultiOpConcatenates(t *testing.T) {
 	}
 }
 
+// TestBuildOpsDiff_CapsAtDiffCapAndStopsAppending verifies the hot-loop
+// behavior for large replay events: once the budget is consumed, later ops are
+// not appended to the rendered diff.
+func TestBuildOpsDiff_CapsAtDiffCapAndStopsAppending(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	largeOID := hashContent(t, f.dir, strings.Repeat("large line\n", 1200))
+	secondOID := hashContent(t, f.dir, "second\n")
+
+	ops := []state.CaptureOp{
+		{
+			Op:        "create",
+			Path:      "large.txt",
+			AfterOID:  sql.NullString{String: largeOID, Valid: true},
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:  "rescan",
+		},
+		{
+			Op:        "create",
+			Path:      "second.txt",
+			AfterOID:  sql.NullString{String: secondOID, Valid: true},
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:  "rescan",
+		},
+	}
+
+	diff, err := BuildOpsDiff(ctx, f.dir, ops)
+	if err != nil {
+		t.Fatalf("BuildOpsDiff: %v", err)
+	}
+	if len(diff) > ai.DiffCap {
+		t.Fatalf("diff len=%d, want <= %d", len(diff), ai.DiffCap)
+	}
+	if strings.Contains(diff, "second.txt") {
+		t.Fatalf("diff appended section after cap was consumed:\n%s", diff)
+	}
+}
+
 // TestBuildOpsDiff_SurvivesLiveWorktreeChange — the canonical
 // regression. The blobs are persisted at capture time; the live file
 // then changes again. The reconstructed diff still describes the
@@ -258,9 +297,9 @@ func TestBuildOpsDiff_SurvivesLiveWorktreeChange(t *testing.T) {
 	}
 }
 
-// TestCommitContextFromEvent_PopulatesAIFields asserts the wiring:
-// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText.
-func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
+// TestCommitContextFromEvent_DefaultOmitsDiffText asserts the secure default:
+// captured diffs are not sent to AI providers unless ACD_AI_SEND_DIFF opts in.
+func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -285,14 +324,61 @@ func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
 			Fidelity:   "rescan",
 		},
+	}
+
+	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, f.dir)
+
+	if cc.Branch != "refs/heads/main" {
+		t.Fatalf("Branch=%q", cc.Branch)
+	}
+	if cc.RepoRoot != f.dir {
+		t.Fatalf("RepoRoot=%q want %q", cc.RepoRoot, f.dir)
+	}
+	if cc.Now.IsZero() {
+		t.Fatalf("Now is zero")
+	}
+	if cc.DiffText != "" {
+		t.Fatalf("DiffText=%q, want empty by default", cc.DiffText)
+	}
+}
+
+// TestCommitContextFromEvent_OptInPopulatesRedactedDiff asserts the wiring:
+// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText. The
+// opted-in diff must be redacted before it reaches a provider.
+func TestCommitContextFromEvent_OptInPopulatesRedactedDiff(t *testing.T) {
+	t.Setenv(envAISendDiff, "1")
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	beforeOID := hashContent(t, f.dir, "old\n")
+	afterA := hashContent(t, f.dir, "aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n")
+	afterB := hashContent(t, f.dir, "fresh B\n")
+
+	ev := state.CaptureEvent{
+		Seq:              1,
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "a.txt",
+		Fidelity:         "rescan",
+	}
+	ops := []state.CaptureOp{
 		{
 			Op:         "modify",
-			Path:       "b.txt",
+			Path:       "a.txt",
 			BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
 			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-			AfterOID:   sql.NullString{String: afterOID, Valid: true},
+			AfterOID:   sql.NullString{String: afterA, Valid: true},
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
 			Fidelity:   "rescan",
+		},
+		{
+			Op:        "create",
+			Path:      "b.txt",
+			AfterOID:  sql.NullString{String: afterB, Valid: true},
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:  "rescan",
 		},
 	}
 
@@ -318,6 +404,71 @@ func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
 	}
 	if !strings.Contains(cc.DiffText, "diff --git a/b.txt b/b.txt") {
 		t.Fatalf("DiffText missing second op:\n%s", cc.DiffText)
+	}
+	if strings.Contains(cc.DiffText, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("DiffText leaked AWS key:\n%s", cc.DiffText)
+	}
+	if !strings.Contains(cc.DiffText, "[REDACTED_SECRET]") {
+		t.Fatalf("DiffText missing redaction marker:\n%s", cc.DiffText)
+	}
+}
+
+type captureProvider struct {
+	needsDiff bool
+	cc        ai.CommitContext
+}
+
+func (p *captureProvider) Name() string { return "capture" }
+
+func (p *captureProvider) NeedsDiff() bool { return p.needsDiff }
+
+func (p *captureProvider) Generate(_ context.Context, cc ai.CommitContext) (ai.Result, error) {
+	p.cc = cc
+	return ai.Result{Subject: "Update file", Source: p.Name()}, nil
+}
+
+func TestProviderMessageFn_SkipsDiffWhenProviderDoesNotNeedDiff(t *testing.T) {
+	t.Setenv(envAISendDiff, "1")
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	beforeOID := hashContent(t, f.dir, "old\n")
+	afterOID := hashContent(t, f.dir, "new\n")
+	provider := &captureProvider{needsDiff: false}
+
+	ev := state.CaptureEvent{
+		Seq:              1,
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "a.txt",
+		Fidelity:         "rescan",
+	}
+	ops := []state.CaptureOp{
+		{
+			Op:         "modify",
+			Path:       "a.txt",
+			BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:   sql.NullString{String: afterOID, Valid: true},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:   "rescan",
+		},
+	}
+
+	msg, err := providerMessageFn(provider, f.dir)(ctx, EventContext{Event: ev, Ops: ops})
+	if err != nil {
+		t.Fatalf("providerMessageFn: %v", err)
+	}
+	if msg != "Update file" {
+		t.Fatalf("message=%q", msg)
+	}
+	if provider.cc.RepoRoot != "" {
+		t.Fatalf("RepoRoot=%q, want empty for no-diff provider", provider.cc.RepoRoot)
+	}
+	if provider.cc.DiffText != "" {
+		t.Fatalf("DiffText=%q, want empty for no-diff provider", provider.cc.DiffText)
 	}
 }
 

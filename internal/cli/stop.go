@@ -96,9 +96,9 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	out_all := stopAllResult{Stopped: []stopRepoResult{}, Deferred: []stopRepoResult{}}
 	for _, rec := range reg.Repos {
-		// `acd stop --all` is the operator escape hatch — force-stop
-		// every daemon regardless of remaining refcount peers.
-		res, err := stopOneRepo(ctx, rec.Path, "", force || true)
+		// Use the caller's force mode for each repo; without --force,
+		// the per-repo refcount-aware shutdown path applies.
+		res, err := stopOneRepoForAll(ctx, rec.Path, "", force)
 		if err != nil {
 			res = stopRepoResult{Repo: rec.Path, Reason: err.Error()}
 		}
@@ -123,6 +123,8 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	return nil
 }
+
+var stopOneRepoForAll = stopOneRepo
 
 // stopOneRepo handles the per-repo logic shared by single-repo and --all.
 func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
@@ -179,7 +181,7 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		// stopWaitTimeout, report deferred (run-loop's own GC will
 		// catch up).
 		if st.PID > 0 && identity.Alive(st.PID) {
-			_ = signalProcess(st.PID, syscall.SIGTERM)
+			_ = signalProcess(st.PID, syscall.SIGTERM, daemonFingerprintToken(st))
 			if waitForStopped(ctx, db, stopWaitTimeout) {
 				res.Stopped = true
 				return res, nil
@@ -203,7 +205,8 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		res.Reason = "daemon not running"
 		return res, nil
 	}
-	if err := signalProcess(st.PID, syscall.SIGTERM); err != nil {
+	expectedFingerprint := daemonFingerprintToken(st)
+	if err := signalProcess(st.PID, syscall.SIGTERM, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGTERM failed: %v", err)
 	}
 	if waitForStopped(ctx, db, stopWaitTimeout) {
@@ -217,7 +220,7 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		res.Stopped = true
 		return res, nil
 	}
-	if err := signalProcess(st.PID, syscall.SIGKILL); err != nil {
+	if err := signalProcess(st.PID, syscall.SIGKILL, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGKILL failed: %v", err)
 		return res, nil
 	}

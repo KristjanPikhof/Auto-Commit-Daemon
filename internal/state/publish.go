@@ -29,7 +29,7 @@ SELECT event_seq, branch_ref, branch_generation, source_head, target_commit_oid,
        status, error, updated_ts
 FROM publish_state WHERE id = 1`
 	var p Publish
-	err := d.conn.QueryRowContext(ctx, q).Scan(
+	err := d.readSQL().QueryRowContext(ctx, q).Scan(
 		&p.EventSeq, &p.BranchRef, &p.BranchGeneration, &p.SourceHead, &p.TargetCommitOID,
 		&p.Status, &p.Error, &p.UpdatedTS,
 	)

@@ -19,10 +19,22 @@ esac
 
 VERSION="${ACD_VERSION:-}"
 if [ -z "$VERSION" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+  RELEASE_JSON="$(curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/$REPO/releases/latest")"
+  if command -v jq >/dev/null 2>&1; then
+    VERSION="$(printf '%s\n' "$RELEASE_JSON" | jq -r '.tag_name // empty')"
+  else
+    VERSION="$(printf '%s\n' "$RELEASE_JSON" \
+      | sed -nE 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/p' \
+      | head -1)"
+  fi
 fi
-[ -n "$VERSION" ] || { echo "could not resolve latest acd version" >&2; exit 1; }
+[ -n "$VERSION" ] || {
+  echo "could not resolve latest acd version; set ACD_VERSION=vYYYY-MM-DD to install a specific release" >&2
+  exit 1
+}
 
 # Tag carries leading "v" (e.g. v2026-04-28); goreleaser archive names omit it.
 VERSION_NUM="${VERSION#v}"
@@ -45,8 +57,11 @@ if command -v sha256sum >/dev/null 2>&1; then
   ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | sha256sum -c - )
 elif command -v shasum >/dev/null 2>&1; then
   ( cd "$TMP" && grep "$ARCHIVE" checksums.txt | shasum -a 256 -c - )
+elif [ "${ACD_ALLOW_NO_CHECKSUM:-}" = "1" ]; then
+  echo "warning: ACD_ALLOW_NO_CHECKSUM=1 set; skipping checksum check" >&2
 else
-  echo "warning: no sha256 verifier found; skipping checksum check" >&2
+  echo "no sha256 verifier found; install sha256sum/shasum or set ACD_ALLOW_NO_CHECKSUM=1 to skip checksum verification" >&2
+  exit 1
 fi
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
@@ -59,3 +74,5 @@ echo "Next:"
 echo "  1) Make sure $INSTALL_DIR is on your PATH"
 echo "  2) Run: acd init <claude-code|codex|opencode|pi|shell>"
 echo "  3) Follow the printed snippet to wire up your harness"
+echo
+echo "Tip: set ACD_VERSION=vYYYY-MM-DD to install a specific release."

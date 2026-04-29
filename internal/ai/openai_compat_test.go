@@ -227,6 +227,54 @@ func TestOpenAI_TruncatesDiff(t *testing.T) {
 	}
 }
 
+func TestOpenAI_RedactsDiffBeforeSend(t *testing.T) {
+	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedToolCall("Update secrets", "")
+	})
+	diff := "diff --git a/config/prod.yaml b/config/prod.yaml\n@@\n" +
+		"+aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n" +
+		"+authorization: Bearer abcdefghij.klmnopqrst.uvwxyz123456\n"
+	_, err := p.Generate(context.Background(), CommitContext{
+		Op: "modify", Path: "config/prod.yaml", DiffText: diff,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(last.rawBody, &sent); err != nil {
+		t.Fatalf("decode sent: %v", err)
+	}
+	var userContent string
+	for _, m := range sent.Messages {
+		if m.Role == "user" {
+			userContent = m.Content
+		}
+	}
+	jsonStart := strings.Index(userContent, "{")
+	if jsonStart < 0 {
+		t.Fatalf("user content missing JSON: %q", userContent)
+	}
+	var inner struct {
+		Diff string `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(userContent[jsonStart:]), &inner); err != nil {
+		t.Fatalf("decode user payload: %v", err)
+	}
+	if strings.Contains(inner.Diff, "AKIAIOSFODNN7EXAMPLE") ||
+		strings.Contains(inner.Diff, "Bearer abcdefghij.klmnopqrst.uvwxyz123456") {
+		t.Fatalf("diff leaked secret:\n%s", inner.Diff)
+	}
+	if !strings.Contains(inner.Diff, redactedSecret) {
+		t.Fatalf("diff missing redaction marker:\n%s", inner.Diff)
+	}
+}
+
 // Sanitization: tool-call subject with control chars / trailing period /
 // long length is cleaned and capped.
 func TestOpenAI_SanitizesResponse(t *testing.T) {

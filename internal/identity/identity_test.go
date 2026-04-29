@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,6 +23,15 @@ func TestAlive_ZeroAndNegative(t *testing.T) {
 	}
 	if Alive(-1) {
 		t.Errorf("Alive(-1) = true; want false")
+	}
+}
+
+func TestAliveContext_Canceled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if AliveContext(ctx, os.Getpid()) {
+		t.Fatalf("AliveContext canceled context = true, want false")
 	}
 }
 
@@ -152,6 +162,15 @@ func TestCapture_RejectsBadPid(t *testing.T) {
 	}
 	if _, err := Capture(-1); err == nil {
 		t.Errorf("Capture(-1) returned nil error")
+	}
+}
+
+func TestCaptureContext_Canceled(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := CaptureContext(ctx, os.Getpid()); err == nil {
+		t.Fatalf("CaptureContext canceled context returned nil error")
 	}
 }
 

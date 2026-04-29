@@ -6,14 +6,12 @@ package integration_test
 // adapter_e2e_test.go — §7.9 / §9 end-to-end coverage. Each subtest renders a
 // harness's snippet via `acd init <harness>`, executes the start-equivalent
 // command(s) under a fake harness env (mock CLAUDE_PROJECT_DIR /
-// OPENCODE_SESSION_ID / PI_SESSION_ID / etc., piping JSON through jq where
-// the snippet expects it), and asserts the daemon's per-repo state.db has
-// the expected daemon_clients row (session_id + harness). Then runs the
-// stop-equivalent command (or `acd stop --force` fallback) so the daemon
-// shuts down cleanly between subtests.
+// OPENCODE_SESSION_ID / PI_SESSION_ID / etc.), and asserts the daemon's
+// per-repo state.db has the expected daemon_clients row (session_id + harness).
+// Then runs the stop-equivalent command (or `acd stop --force` fallback) so
+// the daemon shuts down cleanly between subtests.
 //
-// Skip rules: bash missing → skip the file; jq missing → skip the subtests
-// that pipe through jq (claude-code, codex); Windows → skip the file.
+// Skip rules: bash missing → skip the file; Windows → skip the file.
 
 import (
 	"context"
@@ -25,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -60,16 +59,11 @@ func TestAdapterE2E(t *testing.T) {
 	}
 
 	t.Run("claude-code", func(t *testing.T) {
-		if _, err := exec.LookPath("jq"); err != nil {
-			t.Skip("claude-code snippet requires jq; not on PATH")
-		}
 		runClaudeCodeE2E(t, bin)
 	})
 	t.Run("codex", func(t *testing.T) {
-		if _, err := exec.LookPath("jq"); err != nil {
-			t.Skip("codex snippet requires jq; not on PATH")
-		}
 		runCodexE2E(t, bin)
+		runCodexMissingAcdWritesHookLog(t)
 	})
 	t.Run("opencode", func(t *testing.T) {
 		runOpencodeE2E(t, bin)
@@ -105,6 +99,64 @@ func adapterEnv(t *testing.T, binDir string, extras ...string) []string {
 		base = append(base, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
 	return envWith(base, extras...)
+}
+
+func prependPath(env []string, dir string) []string {
+	out := append([]string{}, env...)
+	for i, kv := range out {
+		if strings.HasPrefix(kv, "PATH=") {
+			out[i] = "PATH=" + dir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+			return out
+		}
+	}
+	return append(out, "PATH="+dir)
+}
+
+func addFailingJQ(t *testing.T, env []string) []string {
+	t.Helper()
+	fakeBin := t.TempDir()
+	jq := filepath.Join(fakeBin, "jq")
+	writeFile(t, jq, "#!/usr/bin/env bash\necho jq should not be used >&2\nexit 127\n")
+	if err := os.Chmod(jq, 0o755); err != nil {
+		t.Fatalf("chmod fake jq: %v", err)
+	}
+	return prependPath(env, fakeBin)
+}
+
+func daemonStopped(repo string) bool {
+	if readDaemonStateMode(repo) == "stopped" {
+		return true
+	}
+	pid := readDaemonStatePID(repo)
+	return pid > 0 && syscall.Kill(pid, 0) != nil
+}
+
+func waitDaemonStoppedOrKill(t *testing.T, label, repo string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if daemonStopped(repo) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	pid := readDaemonStatePID(repo)
+	if pid <= 0 {
+		return
+	}
+	t.Logf("%s: daemon pid %d still alive after stop command; killing test daemon", label, pid)
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if daemonStopped(repo) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	waitFor(t, label, 5*time.Second, func() bool {
+		return daemonStopped(repo)
+	})
 }
 
 // runBash runs `bash -c command` with the given env and stdin. Returns
@@ -367,9 +419,7 @@ func shutdownDaemon(t *testing.T, env []string, repo, sessionID string) {
 		t.Logf("cleanup acd stop --force exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
 	}
-	waitFor(t, "post-cleanup mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
+	waitDaemonStoppedOrKill(t, "post-cleanup daemon stopped", repo)
 }
 
 // -----------------------------------------------------------------------------
@@ -388,6 +438,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	// Fake claude-code env: CLAUDE_PROJECT_DIR points at the repo so the
 	// snippet's ${CLAUDE_PROJECT_DIR:-$PWD} expansion picks it up.
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -404,7 +455,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
 
 	// Exercise PreToolUse so we know `acd wake` works through the same
-	// JSON-piped, jq-filtered path the snippet expects in production.
+	// JSON-piped path the snippet expects in production.
 	wakeHook := pickHookByEvent(t, hooks, "PreToolUse")
 	wakeRes := runBash(t, ctx, env, stdin, wakeHook.Command)
 	if wakeRes.ExitCode != 0 {
@@ -420,9 +471,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 		t.Fatalf("claude-code SessionEnd exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "claude-code daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
+	waitDaemonStoppedOrKill(t, "claude-code daemon stopped", repo)
 }
 
 func runCodexE2E(t *testing.T, bin string) {
@@ -434,14 +483,15 @@ func runCodexE2E(t *testing.T, bin string) {
 	sessionID := "e2e-codex"
 	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
 
-	// Codex snippet uses $PWD; force the bash subprocess into the repo.
-	env := adapterEnv(t, binDir)
+	// Codex provides the project directory separately from the hook process
+	// cwd; keep the bash subprocess outside repo to prove the snippet honors it.
+	env := adapterEnv(t, binDir, "CODEX_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := "cd " + shellQuote(repo) + " && " + startHook.Command
-	res := runBash(t, ctx, env, stdin, cmd)
+	res := runBash(t, ctx, env, stdin, startHook.Command)
 	if res.ExitCode != 0 {
 		t.Fatalf("codex SessionStart exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
@@ -455,15 +505,57 @@ func runCodexE2E(t *testing.T, bin string) {
 	// Production cleanup relies on watch_pid death + refcount sweep; in the
 	// test we drive shutdown explicitly with `acd stop --force`.
 	stopRes := runBash(t, ctx, env, "",
-		"cd "+shellQuote(repo)+" && acd stop --session-id "+shellQuote(sessionID)+
+		"acd stop --session-id "+shellQuote(sessionID)+
 			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
 	if stopRes.ExitCode != 0 {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "codex daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
+	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
+}
+
+func runCodexMissingAcdWritesHookLog(t *testing.T) {
+	body := readSnippet(t, "codex/config.snippet.toml")
+	hooks := parseCodexSnippet(t, body)
+	startHook := pickHookByEvent(t, hooks, "SessionStart")
+
+	fakeBin := t.TempDir()
+
+	base := withIsolatedHome(t)
+	home := ""
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		t.Fatal("isolated HOME missing from env")
+	}
+
+	env := envWith(base,
+		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
+		"CODEX_PROJECT_DIR="+t.TempDir(),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stdin := `{"session_id":"e2e-codex-missing-acd"}`
+	res := runBash(t, ctx, env, stdin, startHook.Command)
+	if res.ExitCode == 0 {
+		t.Fatalf("codex SessionStart without acd should fail\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
+	}
+	if strings.TrimSpace(res.Stdout) != "{}" {
+		t.Fatalf("codex failure path should still emit JSON stdout, got %q", res.Stdout)
+	}
+
+	logPath := filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read codex hook log %s: %v", logPath, err)
+	}
+	if !strings.Contains(string(logBody), "acd") {
+		t.Fatalf("codex hook log missing acd failure, got:\n%s", logBody)
+	}
 }
 
 func runOpencodeE2E(t *testing.T, bin string) {
@@ -497,9 +589,7 @@ func runOpencodeE2E(t *testing.T, bin string) {
 		t.Fatalf("opencode acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "opencode daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
+	waitDaemonStoppedOrKill(t, "opencode daemon stopped", repo)
 }
 
 func runPiE2E(t *testing.T, bin string) {
@@ -533,9 +623,7 @@ func runPiE2E(t *testing.T, bin string) {
 		t.Fatalf("pi acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "pi daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
+	waitDaemonStoppedOrKill(t, "pi daemon stopped", repo)
 }
 
 func runShellE2E(t *testing.T, bin string) {

@@ -21,8 +21,16 @@ package integration_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -97,7 +105,72 @@ func TestAI_DeterministicDefault(t *testing.T) {
 	}
 }
 
-// TestAI_OpenAICompatMockSuccess: the daemon points at an httptest server
+// newOpenAITestServer returns an HTTPS httptest server plus the ACD_AI_CA_FILE
+// override that lets the integration binary trust its private test CA.
+func newOpenAITestServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate test CA key: %v", err)
+	}
+	now := time.Now()
+	caTemplate := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ACD integration test CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create test CA cert: %v", err)
+	}
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate test server key: %v", err)
+	}
+	leafTemplate := x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses: []net.IP{
+			net.ParseIP("127.0.0.1"),
+			net.ParseIP("::1"),
+		},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTemplate, &caTemplate, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create test server cert: %v", err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{leafDER, caDER},
+			PrivateKey:  leafKey,
+		}},
+		MinVersion: tls.VersionTLS12,
+	}
+	server.StartTLS()
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caDER,
+	})
+	certPath := filepath.Join(t.TempDir(), "openai-test-ca.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		server.Close()
+		t.Fatalf("write OpenAI test CA: %v", err)
+	}
+	return server, "ACD_AI_CA_FILE=" + certPath
+}
+
+// TestAI_OpenAICompatMockSuccess: the daemon points at an HTTPS test server
 // whose chat/completions endpoint returns a canned tool_call. The commit
 // subject must be the value the mock returned.
 func TestAI_OpenAICompatMockSuccess(t *testing.T) {
@@ -132,7 +205,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 }`
 
 	var hits atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
@@ -151,6 +224,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-mock", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
@@ -181,7 +255,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	var hits atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		http.Error(w, `{"error":{"message":"upstream boom"}}`, http.StatusInternalServerError)
 	}))
@@ -195,6 +269,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		trustEnv,
 	}
 	p := startSessionJSON(t, ctx, env, repo, "ai-5xx", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
@@ -267,7 +342,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 }`
 
 	var capturedBody atomic.Pointer[string]
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
@@ -288,6 +363,8 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_SEND_DIFF=1",
+		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-diff", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)

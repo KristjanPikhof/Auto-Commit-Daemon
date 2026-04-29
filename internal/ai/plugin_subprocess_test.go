@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,6 +71,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -85,6 +87,44 @@ done
 	}
 	if !strings.Contains(r.Body, "modify src/main.go") {
 		t.Errorf("body: got %q", r.Body)
+	}
+}
+
+func TestSubprocess_RedactsDiffBeforeSend(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *AKIAIOSFODNN7EXAMPLE*)
+      printf '{"version":1,"subject":"","body":"","error":"secret leaked"}\n'
+      ;;
+    *REDACTED_SECRET*)
+      printf '{"version":1,"subject":"Redacted diff","body":"","error":""}\n'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing redaction"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	r, err := p.Generate(context.Background(), CommitContext{
+		Path:     "config/prod.yaml",
+		Op:       "modify",
+		DiffText: "+aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n",
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if r.Subject != "Redacted diff" {
+		t.Fatalf("subject=%q", r.Subject)
 	}
 }
 
@@ -104,6 +144,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -160,6 +201,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -183,6 +225,7 @@ done
 	composed := Compose(NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	}), det)
 	r, err = composed.Generate(context.Background(), CommitContext{Path: "z.go", Op: "modify"})
 	if err != nil {
@@ -215,6 +258,7 @@ done
 	p := NewSubprocessProvider("slow", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-slow", slowBin),
 		Timeout:  200 * time.Millisecond,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -275,6 +319,7 @@ fi
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -301,6 +346,39 @@ fi
 	}
 	if r.Subject != "second" {
 		t.Errorf("third subject: got %q want second", r.Subject)
+	}
+}
+
+func TestSubprocess_DefaultStderrLogFile(t *testing.T) {
+	skipIfWindows(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+printf 'plugin diagnostic\n' >&2
+while IFS= read -r line; do
+  printf '{"version":1,"subject":"OK","body":"","error":""}\n'
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+	})
+
+	if _, err := p.Generate(context.Background(), CommitContext{Path: "a", Op: "modify"}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	logPath := filepath.Join(home, ".local", "state", "acd", "plugin-test.log")
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stderr log: %v", err)
+	}
+	if !strings.Contains(string(body), "plugin diagnostic") {
+		t.Fatalf("stderr log missing diagnostic: %q", string(body))
 	}
 }
 
@@ -349,6 +427,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 
 	// Spawn the plugin by issuing one request.

@@ -11,6 +11,7 @@
 package identity
 
 import (
+	"context"
 	"errors"
 	"syscall"
 )
@@ -37,4 +38,18 @@ func Alive(pid int) bool {
 	}
 	// EPERM → process exists, owned by someone else. ESRCH → no such pid.
 	return errors.Is(err, syscall.EPERM)
+}
+
+// AliveContext is Alive with an early context-cancellation check for callers
+// that are already operating under a request/run-loop context.
+func AliveContext(ctx context.Context, pid int) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+		return Alive(pid)
+	}
 }

@@ -53,6 +53,7 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvAPIKey, "  sk-abc123  ")
 	t.Setenv(EnvModel, "  gpt-4.1-mini  ")
 	t.Setenv(EnvTimeout, "45s")
+	t.Setenv(EnvCAFile, "  /tmp/acd-test-ca.pem  ")
 
 	cfg := LoadProviderConfigFromEnv()
 
@@ -70,6 +71,9 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	}
 	if cfg.Timeout != 45*time.Second {
 		t.Fatalf("Timeout=%v want 45s", cfg.Timeout)
+	}
+	if cfg.CAFile != "/tmp/acd-test-ca.pem" {
+		t.Fatalf("CAFile=%q", cfg.CAFile)
 	}
 }
 
@@ -154,6 +158,44 @@ func TestBuildProvider_OpenAICompatComposed(t *testing.T) {
 	want := "openai-compat+deterministic"
 	if p.Name() != want {
 		t.Fatalf("Name=%q want %q", p.Name(), want)
+	}
+}
+
+func TestBuildProvider_OpenAICompatRejectsInvalidBaseURL(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		baseURL   string
+		wantError string
+	}{
+		{
+			name:      "http rejected",
+			baseURL:   "http://gateway.example/v1",
+			wantError: "must use https",
+		},
+		{
+			name:      "relative rejected",
+			baseURL:   "/v1",
+			wantError: "must be an absolute URL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ProviderConfig{
+				Mode:    "openai-compat",
+				BaseURL: tc.baseURL,
+				APIKey:  "sk-test",
+				Logger:  quietLogger(),
+			}
+			p, closer, err := BuildProvider(cfg)
+			if err == nil {
+				t.Fatalf("BuildProvider returned nil error")
+			}
+			if p != nil || closer != nil {
+				t.Fatalf("provider=%v closer=%v, want nils on invalid URL", p, closer)
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error=%q want substring %q", err, tc.wantError)
+			}
+		})
 	}
 }
 

@@ -20,6 +20,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -35,6 +37,8 @@ type doctorRepoReport struct {
 	StateDBReadable        bool     `json:"state_db_readable"`
 	DaemonPID              int      `json:"daemon_pid"`
 	DaemonAlive            bool     `json:"daemon_alive"`
+	DaemonProcessCount     int      `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs      []int    `json:"daemon_process_pids,omitempty"`
 	DaemonMode             string   `json:"daemon_mode"`
 	HeartbeatTS            int64    `json:"heartbeat_ts,omitempty"`
 	HeartbeatAgeS          int64    `json:"heartbeat_age_seconds,omitempty"`
@@ -56,24 +60,45 @@ type doctorRepoReport struct {
 	Notes                  []string `json:"notes,omitempty"`
 }
 
+type doctorHarnessReport struct {
+	Name           string   `json:"name"`
+	ConfigPath     string   `json:"config_path"`
+	ConfigPresent  bool     `json:"config_present"`
+	ConfigReadable bool     `json:"config_readable"`
+	MarkerFound    bool     `json:"marker_found"`
+	Installed      bool     `json:"installed"`
+	Notes          []string `json:"notes,omitempty"`
+}
+
+type doctorAIReport struct {
+	Provider             string   `json:"provider"`
+	APIKeySet            bool     `json:"api_key_set,omitempty"`
+	ProviderCommand      string   `json:"provider_command,omitempty"`
+	ProviderCommandFound bool     `json:"provider_command_found,omitempty"`
+	ProviderCommandPath  string   `json:"provider_command_path,omitempty"`
+	Notes                []string `json:"notes,omitempty"`
+}
+
 // doctorReport is the full report rendered by `acd doctor` and embedded in
 // `manifest.json` of the doctor bundle.
 type doctorReport struct {
-	GeneratedAt          string             `json:"generated_at"`
-	ACDVersion           string             `json:"acd_version"`
-	GitVersion           string             `json:"git_version,omitempty"`
-	GitPath              string             `json:"git_path,omitempty"`
-	Uname                string             `json:"uname,omitempty"`
-	GoVersion            string             `json:"go_version"`
-	GoOS                 string             `json:"go_os"`
-	GoArch               string             `json:"go_arch"`
-	UlimitNoFile         int64              `json:"ulimit_nofile,omitempty"`
-	InotifyMaxUserWatch  int64              `json:"inotify_max_user_watches,omitempty"`
-	RegistryPath         string             `json:"registry_path"`
-	RegistryRepoCount    int                `json:"registry_repo_count"`
-	SensitiveGlobsEnv    string             `json:"sensitive_globs_env"`
-	SensitiveGlobsActive []string           `json:"sensitive_globs_active"`
-	Repos                []doctorRepoReport `json:"repos"`
+	GeneratedAt          string                `json:"generated_at"`
+	ACDVersion           string                `json:"acd_version"`
+	GitVersion           string                `json:"git_version,omitempty"`
+	GitPath              string                `json:"git_path,omitempty"`
+	Uname                string                `json:"uname,omitempty"`
+	GoVersion            string                `json:"go_version"`
+	GoOS                 string                `json:"go_os"`
+	GoArch               string                `json:"go_arch"`
+	UlimitNoFile         int64                 `json:"ulimit_nofile,omitempty"`
+	InotifyMaxUserWatch  int64                 `json:"inotify_max_user_watches,omitempty"`
+	RegistryPath         string                `json:"registry_path"`
+	RegistryRepoCount    int                   `json:"registry_repo_count"`
+	SensitiveGlobsEnv    string                `json:"sensitive_globs_env"`
+	SensitiveGlobsActive []string              `json:"sensitive_globs_active"`
+	Harnesses            []doctorHarnessReport `json:"harnesses"`
+	AI                   doctorAIReport        `json:"ai"`
+	Repos                []doctorRepoReport    `json:"repos"`
 }
 
 func newDoctorCmd() *cobra.Command {
@@ -160,6 +185,8 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 
 	rep.SensitiveGlobsEnv = os.Getenv(state.EnvSensitiveGlobs)
 	rep.SensitiveGlobsActive = state.SensitivePatterns()
+	rep.Harnesses = collectDoctorHarnesses()
+	rep.AI = collectDoctorAI()
 
 	roots, err := paths.Resolve()
 	if err != nil {
@@ -180,6 +207,11 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 			Harnesses: append([]string{}, rec.Harnesses...),
 			LogPath:   roots.RepoLogPath(rec.RepoHash),
 		}
+		rr.DaemonProcessPIDs = findDaemonProcesses(ctx, rec.Path)
+		rr.DaemonProcessCount = len(rr.DaemonProcessPIDs)
+		if rr.DaemonProcessCount > 1 {
+			rr.Notes = append(rr.Notes, fmt.Sprintf("multiple acd daemon processes for repo: %v", rr.DaemonProcessPIDs))
+		}
 		// Read state.db (best-effort).
 		if fileExists(rec.StateDB) {
 			rr.StateDBReadable = readRepoState(ctx, &rr, rec.StateDB)
@@ -194,6 +226,143 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 	}
 
 	return rep, nil
+}
+
+func collectDoctorHarnesses() []doctorHarnessReport {
+	detected := map[string]bool{}
+	for _, h := range adapter.DetectInstalled() {
+		detected[h.Name()] = true
+	}
+
+	reports := make([]doctorHarnessReport, 0, len(supportedHarnesses))
+	for _, name := range supportedHarnesses {
+		h, ok := adapter.Lookup(name)
+		if !ok {
+			continue
+		}
+		path := h.ConfigPath()
+		hr := doctorHarnessReport{
+			Name:       name,
+			ConfigPath: path,
+		}
+		body, err := os.ReadFile(path)
+		switch {
+		case err == nil:
+			hr.ConfigPresent = true
+			hr.ConfigReadable = true
+			hr.MarkerFound = configHasACDMarker(body)
+			hr.Installed = hr.MarkerFound
+		case errors.Is(err, os.ErrNotExist):
+			if detected[name] {
+				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
+				hr.Installed = true
+			}
+		default:
+			hr.ConfigPresent = true
+			hr.Notes = append(hr.Notes, "config read failed: "+err.Error())
+		}
+
+		if name == "codex" {
+			home, _ := os.UserHomeDir()
+			legacyPath := filepath.Join(home, ".codex", "hooks.json")
+			if fileExists(legacyPath) {
+				hr.Notes = append(hr.Notes, "legacy ~/.codex/hooks.json exists; Codex also loads ~/.codex/config.toml, remove stale hooks.json after installing the toml snippet")
+			}
+		}
+		reports = append(reports, hr)
+	}
+	return reports
+}
+
+func configHasACDMarker(body []byte) bool {
+	text := string(body)
+	return strings.Contains(text, `"_acd_managed": true`) ||
+		strings.Contains(text, `"_acd_managed":true`) ||
+		strings.Contains(text, "acd-managed: true")
+}
+
+func collectDoctorAI() doctorAIReport {
+	cfg := ai.LoadProviderConfigFromEnv()
+	provider := cfg.Mode
+	if provider == "" {
+		provider = "deterministic"
+	}
+	rep := doctorAIReport{
+		Provider: provider,
+	}
+	switch {
+	case provider == "openai-compat":
+		rep.APIKeySet = strings.TrimSpace(os.Getenv(ai.EnvAPIKey)) != ""
+		if !rep.APIKeySet {
+			rep.Notes = append(rep.Notes, "ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY is not set")
+		}
+	case strings.HasPrefix(provider, "subprocess:"):
+		name := strings.TrimSpace(strings.TrimPrefix(provider, "subprocess:"))
+		if name == "" {
+			rep.Notes = append(rep.Notes, "ACD_AI_PROVIDER=subprocess: is missing a provider name")
+			break
+		}
+		rep.ProviderCommand = "acd-provider-" + name
+		if path, err := exec.LookPath(rep.ProviderCommand); err == nil {
+			rep.ProviderCommandFound = true
+			rep.ProviderCommandPath = path
+		} else {
+			rep.Notes = append(rep.Notes, rep.ProviderCommand+" not found on PATH")
+		}
+	}
+	return rep
+}
+
+var doctorProcessList = defaultDoctorProcessList
+
+type doctorProcess struct {
+	PID     int
+	Command string
+}
+
+func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var processes []doctorProcess
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		processes = append(processes, doctorProcess{
+			PID:     pid,
+			Command: strings.TrimSpace(strings.TrimPrefix(line, fields[0])),
+		})
+	}
+	return processes, scanner.Err()
+}
+
+func findDaemonProcesses(ctx context.Context, repo string) []int {
+	processes, err := doctorProcessList(ctx)
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, proc := range processes {
+		cmd := proc.Command
+		if strings.Contains(cmd, "acd daemon run") &&
+			strings.Contains(cmd, "--repo") &&
+			strings.Contains(cmd, repo) {
+			pids = append(pids, proc.PID)
+		}
+	}
+	return pids
 }
 
 // readRepoState opens the per-repo DB read-only and fills the report fields
@@ -334,6 +503,33 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 	fmt.Fprintf(out, "\nSensitive globs (env=%q, %d active)\n",
 		r.SensitiveGlobsEnv, len(r.SensitiveGlobsActive))
 
+	fmt.Fprintf(out, "\nInstall\n")
+	fmt.Fprintf(out, "  hooks:\n")
+	for _, h := range r.Harnesses {
+		installed := "no"
+		if h.Installed {
+			installed = "yes"
+		}
+		fmt.Fprintf(out, "    %-11s : %s (%s)\n", h.Name, installed, homeShort(h.ConfigPath))
+		if len(h.Notes) > 0 {
+			fmt.Fprintf(out, "                  notes: %s\n", strings.Join(h.Notes, "; "))
+		}
+	}
+	fmt.Fprintf(out, "  ai provider : %s\n", r.AI.Provider)
+	if r.AI.Provider == "openai-compat" {
+		fmt.Fprintf(out, "                api key set=%v\n", r.AI.APIKeySet)
+	}
+	if r.AI.ProviderCommand != "" {
+		fmt.Fprintf(out, "                command=%s found=%v", r.AI.ProviderCommand, r.AI.ProviderCommandFound)
+		if r.AI.ProviderCommandPath != "" {
+			fmt.Fprintf(out, " path=%s", r.AI.ProviderCommandPath)
+		}
+		fmt.Fprintln(out)
+	}
+	if len(r.AI.Notes) > 0 {
+		fmt.Fprintf(out, "                notes: %s\n", strings.Join(r.AI.Notes, "; "))
+	}
+
 	fmt.Fprintf(out, "\nRepos (%d):\n", len(r.Repos))
 	for _, rr := range r.Repos {
 		mode := rr.DaemonMode
@@ -346,6 +542,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		fmt.Fprintf(out, "  - %s\n", homeShort(rr.Path))
 		fmt.Fprintf(out, "      hash       : %s\n", rr.RepoHash)
 		fmt.Fprintf(out, "      daemon     : %s (pid %d, alive=%v)\n", mode, rr.DaemonPID, rr.DaemonAlive)
+		if rr.DaemonProcessCount > 0 {
+			fmt.Fprintf(out, "      processes  : %d %v\n", rr.DaemonProcessCount, rr.DaemonProcessPIDs)
+		}
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
 		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
 		if rr.BlockedConflicts > 0 {
@@ -640,6 +839,13 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 func sanitizeReport(r doctorReport) doctorReport {
 	out := r
 	out.RegistryPath = homeShort(r.RegistryPath)
+	harnesses := make([]doctorHarnessReport, 0, len(r.Harnesses))
+	for _, h := range r.Harnesses {
+		c := h
+		c.ConfigPath = homeShort(h.ConfigPath)
+		harnesses = append(harnesses, c)
+	}
+	out.Harnesses = harnesses
 	repos := make([]doctorRepoReport, 0, len(r.Repos))
 	for _, rr := range r.Repos {
 		c := rr

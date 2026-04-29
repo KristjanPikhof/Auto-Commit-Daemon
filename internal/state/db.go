@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -23,17 +24,20 @@ const driverName = "sqlite"
 // DBFileName is the per-repo SQLite filename inside .git/acd/.
 const DBFileName = "state.db"
 
-// DB wraps the per-repo *sql.DB plus a small amount of derived metadata.
+// DB wraps the per-repo SQLite handles plus a small amount of derived metadata.
 //
 // All exported helpers in this package take *DB and a context.Context, so the
 // daemon can cancel long writes when the worktree is shutting down.
 //
-// The underlying *sql.DB is safe for concurrent use from multiple goroutines;
-// SQLite serialises writers internally and WAL + busy_timeout=5000 guarantees
-// readers and writers do not deadlock under the daemon's expected load.
+// SQLite WAL permits many readers but still serializes writes. Keeping writes
+// on a single-connection handle avoids a local pool of writer-capable
+// connections queueing behind busy_timeout under multi-client load, while a
+// separate small read pool lets status/list-style queries proceed alongside
+// the daemon's hot write paths.
 type DB struct {
-	conn *sql.DB
-	path string
+	conn     *sql.DB // single-connection write handle; kept for package compatibility.
+	readConn *sql.DB
+	path     string
 
 	// initOnce guards the schema-bootstrap path so callers can safely call
 	// Open repeatedly with the same file (e.g. tests reopening to verify
@@ -45,18 +49,27 @@ type DB struct {
 // Path returns the absolute path to the underlying state.db file.
 func (d *DB) Path() string { return d.path }
 
-// SQL returns the underlying *sql.DB. Exposed so other state-package files
-// (events.go, shadow.go, ...) can compose queries without re-piping every
-// helper through DB. External callers should not rely on this directly.
+// SQL returns the write handle. Exposed so state-adjacent packages can compose
+// fixture and daemon queries without re-piping every helper through DB.
+// External callers should prefer package helpers for normal reads/writes.
 func (d *DB) SQL() *sql.DB { return d.conn }
+
+func (d *DB) readSQL() *sql.DB { return d.readConn }
 
 // Close releases the underlying database handle. Safe to call multiple times;
 // the second call returns the original close error.
 func (d *DB) Close() error {
-	if d == nil || d.conn == nil {
+	if d == nil {
 		return nil
 	}
-	return d.conn.Close()
+	var err error
+	if d.conn != nil {
+		err = errors.Join(err, d.conn.Close())
+	}
+	if d.readConn != nil {
+		err = errors.Join(err, d.readConn.Close())
+	}
+	return err
 }
 
 // AcdDirFromGitDir returns the canonical ACD state directory for a given .git
@@ -99,25 +112,37 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 	// state is per-connection (not per-database) for journal_mode/sync.
 	dsn := buildDSN(dbPath)
 
-	conn, err := sql.Open(driverName, dsn)
+	writeConn, err := sql.Open(driverName, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("state: sql.Open: %w", err)
+		return nil, fmt.Errorf("state: sql.Open write: %w", err)
 	}
 
-	// SQLite in WAL mode supports concurrent readers + a single writer. We
-	// keep the pool small to avoid file-handle storms but allow > 1 reader.
-	conn.SetMaxOpenConns(8)
-	conn.SetMaxIdleConns(4)
+	writeConn.SetMaxOpenConns(1)
+	writeConn.SetMaxIdleConns(1)
 
-	if err := conn.PingContext(ctx); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("state: ping: %w", err)
+	if err := writeConn.PingContext(ctx); err != nil {
+		_ = writeConn.Close()
+		return nil, fmt.Errorf("state: ping write: %w", err)
 	}
 
-	d := &DB{conn: conn, path: dbPath}
+	readConn, err := sql.Open(driverName, dsn)
+	if err != nil {
+		_ = writeConn.Close()
+		return nil, fmt.Errorf("state: sql.Open read: %w", err)
+	}
+	readConn.SetMaxOpenConns(4)
+	readConn.SetMaxIdleConns(4)
+
+	if err := readConn.PingContext(ctx); err != nil {
+		_ = readConn.Close()
+		_ = writeConn.Close()
+		return nil, fmt.Errorf("state: ping read: %w", err)
+	}
+
+	d := &DB{conn: writeConn, readConn: readConn, path: dbPath}
 
 	if err := d.bootstrapWithRetry(ctx); err != nil {
-		_ = conn.Close()
+		_ = d.Close()
 		return nil, err
 	}
 
@@ -216,7 +241,7 @@ func isSQLiteLocked(err error) bool {
 // Useful for tests + migration logic in migrate.go.
 func (d *DB) UserVersion(ctx context.Context) (int, error) {
 	var v int
-	if err := d.conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+	if err := d.readSQL().QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return 0, fmt.Errorf("state: read user_version: %w", err)
 	}
 	return v, nil
@@ -227,7 +252,7 @@ func (d *DB) UserVersion(ctx context.Context) (int, error) {
 func (d *DB) PragmaString(ctx context.Context, name string) (string, error) {
 	var v string
 	q := "PRAGMA " + name
-	if err := d.conn.QueryRowContext(ctx, q).Scan(&v); err != nil {
+	if err := d.readSQL().QueryRowContext(ctx, q).Scan(&v); err != nil {
 		return "", fmt.Errorf("state: read pragma %s: %w", name, err)
 	}
 	return v, nil
@@ -237,7 +262,7 @@ func (d *DB) PragmaString(ctx context.Context, name string) (string, error) {
 func (d *DB) PragmaInt(ctx context.Context, name string) (int64, error) {
 	var v int64
 	q := "PRAGMA " + name
-	if err := d.conn.QueryRowContext(ctx, q).Scan(&v); err != nil {
+	if err := d.readSQL().QueryRowContext(ctx, q).Scan(&v); err != nil {
 		return 0, fmt.Errorf("state: read pragma %s: %w", name, err)
 	}
 	return v, nil

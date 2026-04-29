@@ -53,6 +53,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -75,6 +76,22 @@ const openAISystemPrompt = "You are a git commit message generator. " +
 	"Always call the commit_message function. " +
 	"Subject is imperative, concise, no trailing period. " +
 	"Body (optional) is a bullet list describing what changed and why."
+
+var openAICommitMessageParameters = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"subject": map[string]any{
+			"type":        "string",
+			"description": "Imperative subject line; <= 72 chars; no trailing period.",
+		},
+		"body": map[string]any{
+			"type":        "string",
+			"description": "Optional bullet body explaining what/why; may be empty.",
+		},
+	},
+	"required":             []string{"subject"},
+	"additionalProperties": false,
+}
 
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
 // usable: Generate fills in the BaseURL/Model/HTTP/Now defaults on first
@@ -105,9 +122,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		return Result{}, errors.New("openai-compat: missing API key")
 	}
 
-	baseURL := strings.TrimRight(p.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = DefaultOpenAIBaseURL
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return Result{}, err
 	}
 	model := p.Model
 	if model == "" {
@@ -127,7 +144,10 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
 	}
 
-	endpoint := baseURL + "/chat/completions"
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: new request: %w", err)
@@ -174,6 +194,27 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 	}, nil
 }
 
+func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		base = DefaultOpenAIBaseURL
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("openai-compat: invalid ACD_AI_BASE_URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return "", errors.New("openai-compat: ACD_AI_BASE_URL must be an absolute URL")
+	}
+	if requireHTTPS && u.Scheme != "https" {
+		return "", fmt.Errorf("openai-compat: ACD_AI_BASE_URL must use https, got %q", u.Scheme)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return "", fmt.Errorf("openai-compat: unsupported ACD_AI_BASE_URL scheme %q", u.Scheme)
+	}
+	return u.String(), nil
+}
+
 // defaultOpenAIClient is a redirect-refusing http.Client with a sane
 // default timeout. The 3xx-refusal is the v1 minimum hardening that
 // keeps a hostile network from steering the bearer token to a logging
@@ -202,9 +243,11 @@ func truncateForError(s string) string {
 
 // buildOpenAIRequest serializes the chat-completion payload. Keeping
 // this in its own function makes the test-mode "capture the JSON the
-// provider sent" assertion straightforward.
+// provider sent" assertion straightforward. DiffText is redacted before
+// truncation so secrets near either end of a large diff cannot survive
+// provider serialization.
 func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, error) {
-	diff := Truncate(cc.DiffText, diffCap)
+	diff := Truncate(RedactDiffSecrets(cc.DiffText), diffCap)
 
 	type op struct {
 		Path    string `json:"path"`
@@ -279,21 +322,7 @@ func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, er
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit a single commit message for the change described.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"subject": map[string]any{
-							"type":        "string",
-							"description": "Imperative subject line; <= 72 chars; no trailing period.",
-						},
-						"body": map[string]any{
-							"type":        "string",
-							"description": "Optional bullet body explaining what/why; may be empty.",
-						},
-					},
-					"required":             []string{"subject"},
-					"additionalProperties": false,
-				},
+				Parameters:  openAICommitMessageParameters,
 			},
 		}},
 		ToolChoice: toolChoice{

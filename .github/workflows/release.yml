@@ -20,7 +20,14 @@ jobs:
           go-version: '1.22'
       - uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          version: '~> v2'
           args: release --clean --skip=homebrew
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Smoke test published install script
+        env:
+          ACD_INSTALL_DIR: ${{ runner.temp }}/acd-smoke-bin
+          ACD_VERSION: ${{ github.ref_name }}
+        run: |
+          bash scripts/install.sh
+          "$ACD_INSTALL_DIR/acd" version
