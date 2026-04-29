@@ -195,6 +195,57 @@ func TestStop_ForceEscalates(t *testing.T) {
 	}
 }
 
+func TestStopAll_PassesCallerForceToRepoStopper(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repoDir, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repoDir, stateDB, "codex")
+
+	prev := stopOneRepoForAll
+	t.Cleanup(func() { stopOneRepoForAll = prev })
+
+	type call struct {
+		repo      string
+		sessionID string
+		force     bool
+	}
+	var calls []call
+	stopOneRepoForAll = func(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
+		calls = append(calls, call{repo: repo, sessionID: sessionID, force: force})
+		return stopRepoResult{Repo: repo, Stopped: true, Force: force}, nil
+	}
+
+	for _, tc := range []struct {
+		name  string
+		force bool
+	}{
+		{name: "default", force: false},
+		{name: "force", force: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls = nil
+			var out bytes.Buffer
+			if err := runStopAll(ctx, &out, tc.force, true); err != nil {
+				t.Fatalf("runStopAll: %v", err)
+			}
+			if len(calls) != 1 {
+				t.Fatalf("expected 1 stopOneRepo call, got %d", len(calls))
+			}
+			if calls[0].repo != repoDir {
+				t.Fatalf("repo = %q, want %q", calls[0].repo, repoDir)
+			}
+			if calls[0].sessionID != "" {
+				t.Fatalf("sessionID = %q, want empty", calls[0].sessionID)
+			}
+			if calls[0].force != tc.force {
+				t.Fatalf("force = %v, want %v", calls[0].force, tc.force)
+			}
+		})
+	}
+}
+
 func TestStop_All_IteratesRegistry(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
