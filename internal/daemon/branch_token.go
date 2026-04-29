@@ -61,6 +61,9 @@ const (
 	// the token last changed. Operator breadcrumb only — the loop never
 	// reads it back.
 	MetaKeyBranchTokenChangedAt = "branch_token_changed_at"
+	// MetaKeyDetachedHeadPaused is stamped when the daemon sees a detached
+	// HEAD and pauses capture/replay instead of inventing a branch ref.
+	MetaKeyDetachedHeadPaused = "detached_head_paused"
 )
 
 // TokenTransition classifies how the active branch ref moved between two
