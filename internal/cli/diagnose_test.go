@@ -138,6 +138,41 @@ func TestDiagnose_BlockedHistogram(t *testing.T) {
 	}
 }
 
+func TestDiagnose_LegacyReplayConflictMetadataFallsBackToRowError(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running", BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+	seq := blockDiagnoseEvent(t, ctx, d, "legacy.go", "before-state mismatch: expected abc actual def")
+	if err := state.MetaSet(ctx, d, "last_replay_conflict", "seq="+itoa64(seq)+": update-ref CAS failed"); err != nil {
+		t.Fatalf("set legacy last_replay_conflict: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if len(rep.RecentBlocked) != 1 {
+		t.Fatalf("recent blocked len=%d, want 1", len(rep.RecentBlocked))
+	}
+	if got := rep.RecentBlocked[0].ErrorClass; got != "before_state_mismatch" {
+		t.Fatalf("recent blocked error_class=%q, want before_state_mismatch", got)
+	}
+}
+
 func TestDiagnose_JSONOutput(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
