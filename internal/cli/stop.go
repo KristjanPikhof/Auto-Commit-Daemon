@@ -181,7 +181,7 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		// stopWaitTimeout, report deferred (run-loop's own GC will
 		// catch up).
 		if st.PID > 0 && identity.Alive(st.PID) {
-			_ = signalProcess(st.PID, syscall.SIGTERM)
+			_ = signalProcess(st.PID, syscall.SIGTERM, daemonFingerprintToken(st))
 			if waitForStopped(ctx, db, stopWaitTimeout) {
 				res.Stopped = true
 				return res, nil
@@ -205,7 +205,8 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		res.Reason = "daemon not running"
 		return res, nil
 	}
-	if err := signalProcess(st.PID, syscall.SIGTERM); err != nil {
+	expectedFingerprint := daemonFingerprintToken(st)
+	if err := signalProcess(st.PID, syscall.SIGTERM, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGTERM failed: %v", err)
 	}
 	if waitForStopped(ctx, db, stopWaitTimeout) {
@@ -219,7 +220,7 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		res.Stopped = true
 		return res, nil
 	}
-	if err := signalProcess(st.PID, syscall.SIGKILL); err != nil {
+	if err := signalProcess(st.PID, syscall.SIGKILL, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGKILL failed: %v", err)
 		return res, nil
 	}
