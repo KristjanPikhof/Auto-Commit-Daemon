@@ -292,7 +292,7 @@ func loadLastReplayConflictMeta(ctx context.Context, conn *sql.DB) (replayConfli
 		return meta, nil
 	}
 	if err := json.Unmarshal([]byte(trimmed), &meta); err != nil {
-		return replayConflictMeta{}, nil
+		return replayConflictMeta{}, fmt.Errorf("last_replay_conflict metadata: %w", err)
 	}
 	return meta, nil
 }
