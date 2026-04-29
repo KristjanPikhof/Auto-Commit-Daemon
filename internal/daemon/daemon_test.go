@@ -21,6 +21,11 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func TestMain(m *testing.M) {
+	_ = os.Setenv(ai.EnvProvider, "deterministic")
+	os.Exit(m.Run())
+}
+
 // daemonFixture wires up a temp git repo + open per-repo state DB so the
 // run-loop tests don't have to repeat the boilerplate. Mirrors the
 // captureFixture pattern but exposes the absolute git dir + database.
