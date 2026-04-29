@@ -103,6 +103,37 @@ func TestMktreeAndLsTreeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLsTreeBlobOID(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	blob, err := HashObjectStdin(ctx, dir, []byte("hello\n"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	tree, err := Mktree(ctx, dir, []MktreeEntry{
+		{Mode: RegularFileMode, Type: "blob", OID: blob, Path: "hello.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+
+	got, err := LsTreeBlobOID(ctx, dir, tree, "hello.txt")
+	if err != nil {
+		t.Fatalf("LsTreeBlobOID existing: %v", err)
+	}
+	if got != blob {
+		t.Fatalf("LsTreeBlobOID existing=%s want %s", got, blob)
+	}
+
+	missing, err := LsTreeBlobOID(ctx, dir, tree, "missing.txt")
+	if err != nil {
+		t.Fatalf("LsTreeBlobOID missing: %v", err)
+	}
+	if missing != "" {
+		t.Fatalf("LsTreeBlobOID missing=%q want empty", missing)
+	}
+}
+
 func TestCommitTreeAndUpdateRefProduceValidCommit(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()
