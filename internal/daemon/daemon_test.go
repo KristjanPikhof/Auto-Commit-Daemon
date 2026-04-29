@@ -136,6 +136,18 @@ func daemonMode(t *testing.T, db *state.DB) string {
 	return st.Mode
 }
 
+func waitForDaemonMode(t *testing.T, db *state.DB, mode string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if daemonMode(t, db) == mode {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("daemon_state.mode did not become %q within %v", mode, timeout)
+}
+
 // TestRun_LifecycleHappyPath: a full capture+replay cycle drives a commit
 // onto HEAD when the test triggers a wake; ctx cancel exits with mode=stopped.
 func TestRun_LifecycleHappyPath(t *testing.T) {
@@ -160,14 +172,17 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 		runErr = Run(ctx, Options{
 			RepoPath:    f.dir,
 			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second, // never trigger self-terminate
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-		})
-	}()
+				DB:          f.db,
+				Scheduler:   fastScheduler(),
+				BootGrace:   30 * time.Second, // never trigger self-terminate
+				MessageFn:    DeterministicMessage,
+				WakeCh:      wakeCh,
+				ShutdownCh:  shutdownCh,
+				SkipSignals: true,
+			})
+		}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
 	// Write a file and signal a wake.
 	if err := os.WriteFile(filepath.Join(f.dir, "hello.txt"), []byte("hi\n"), 0o644); err != nil {
@@ -321,14 +336,17 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 		_ = Run(ctx, Options{
 			RepoPath:    f.dir,
 			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-		})
-	}()
+				DB:          f.db,
+				Scheduler:   fastScheduler(),
+				BootGrace:   30 * time.Second,
+				MessageFn:    DeterministicMessage,
+				WakeCh:      wakeCh,
+				ShutdownCh:  shutdownCh,
+				SkipSignals: true,
+			})
+		}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
 	// Write a single file and burst-signal 100 wakes.
 	if err := os.WriteFile(filepath.Join(f.dir, "burst.txt"), []byte("once\n"), 0o644); err != nil {
