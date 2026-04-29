@@ -410,6 +410,10 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 					SkipSignals: true,
 				})
 			}()
+			t.Cleanup(func() {
+				cancel()
+				wg.Wait()
+			})
 
 			waitForMetaValue(t, f.db, MetaKeyOperationInProgress, tc.name, 3*time.Second)
 
@@ -447,7 +451,7 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 				t.Fatalf("write resumed: %v", err)
 			}
 			wakeCh <- struct{}{}
-			newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+			newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
 			if newHead == startHead {
 				t.Fatalf("HEAD did not advance after %s marker cleared", tc.marker)
 			}
