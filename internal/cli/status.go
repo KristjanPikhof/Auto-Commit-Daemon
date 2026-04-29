@@ -51,6 +51,8 @@ type statusReport struct {
 	LastCommitTS        int64          `json:"last_commit_ts,omitempty"`
 	LastCommitMessage   string         `json:"last_commit_message,omitempty"`
 	CaptureErrors       int            `json:"capture_errors"`
+	Paused              bool           `json:"paused,omitempty"`
+	Pause               *pauseInfo     `json:"pause,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -248,6 +250,12 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		`SELECT COUNT(*) FROM daemon_meta WHERE key LIKE 'capture_error.%'`).Scan(&report.CaptureErrors); err != nil {
 		return report, fmt.Errorf("capture errors: %w", err)
 	}
+	if info, err := pauseInfoForRepo(ctx, conn, rec.StateDB, now); err != nil {
+		return report, fmt.Errorf("pause state: %w", err)
+	} else if info != nil {
+		report.Paused = true
+		report.Pause = info
+	}
 
 	return report, nil
 }
@@ -331,6 +339,22 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		fmt.Fprintln(out, "Capture errors: none")
 	} else {
 		fmt.Fprintf(out, "Capture errors: %d\n", r.CaptureErrors)
+	}
+
+	if r.Pause != nil {
+		fmt.Fprintln(out, "Pause:")
+		fmt.Fprintf(out, "  Source: %s\n", strings.ReplaceAll(r.Pause.Source, "_", " "))
+		if r.Pause.Reason != "" {
+			fmt.Fprintf(out, "  Reason: %s\n", r.Pause.Reason)
+		}
+		if r.Pause.SetAt != "" {
+			fmt.Fprintf(out, "  Set at: %s\n", r.Pause.SetAt)
+		}
+		if r.Pause.ExpiresAt != "" {
+			fmt.Fprintf(out, "  Expires at: %s (%s remaining)\n",
+				r.Pause.ExpiresAt,
+				formatDurationCompact(time.Duration(r.Pause.RemainingSeconds)*time.Second))
+		}
 	}
 
 	if r.BranchGenToken != "" {
