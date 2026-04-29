@@ -53,6 +53,7 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvAPIKey, "  sk-abc123  ")
 	t.Setenv(EnvModel, "  gpt-4.1-mini  ")
 	t.Setenv(EnvTimeout, "45s")
+	t.Setenv(EnvCAFile, "  /tmp/acd-test-ca.pem  ")
 
 	cfg := LoadProviderConfigFromEnv()
 
@@ -70,6 +71,9 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	}
 	if cfg.Timeout != 45*time.Second {
 		t.Fatalf("Timeout=%v want 45s", cfg.Timeout)
+	}
+	if cfg.CAFile != "/tmp/acd-test-ca.pem" {
+		t.Fatalf("CAFile=%q", cfg.CAFile)
 	}
 }
 
