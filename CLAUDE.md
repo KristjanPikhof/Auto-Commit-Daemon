@@ -63,7 +63,9 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 - **Detached HEAD pauses capture/replay.** `acd start` refuses to register on detached HEAD; the daemon stores `detached_head_paused` and leaves `CaptureContext.BranchRef` empty until reattached. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - **Git operations pause capture/replay.** `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, and `BISECT_LOG` in the git dir set `operation_in_progress`; the daemon skips branch-token, capture, and replay work until the marker clears.
 - **Replay uses an isolated per-pass scratch index** (`<gitDir>/acd/replay-*.index`) seeded from `cctx.BaseHead`. Helper: `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)`. Never inspect the live repo index for queued history.
+- **Idempotent publish handles parallel committers before blocking.** When the scratch-index before-state probe would otherwise produce `blocked_conflict`, replay checks the current `HEAD` tree for every op's desired final state. If `HEAD` already has the captured blob/mode, or the path is already absent for delete/rename cleanup, the event is marked `published` with `commit_oid=HEAD` and no new commit is created. This only narrows the before-state mismatch path; real mismatches still become terminal `blocked_conflict` rows.
 - **Replay CAS targets literal `HEAD`.** The replay path calls `git update-ref HEAD <new> <old>` through `git.UpdateRef`; literal `HEAD` must dereference to the worktree's active branch, while named refs continue to use `--no-deref`. This keeps linked worktrees and same-SHA branch switches anchored to the current worktree.
+- **Replay pause gate checks manual marker before rewind grace.** `gitDir/acd/paused` is a durable JSON marker owned by `acd pause` and `acd resume`; the daemon reads it once per replay pass and never deletes it. Malformed markers fail open with a warning. If no active manual marker exists, replay checks `daemon_meta.replay.paused_until`; a future timestamp skips the drain, and an expired timestamp is cleared. Rewind grace defaults to 60 seconds and is controlled by `ACD_REWIND_GRACE_SECONDS` (`0` disables it).
 - **`blocked_conflict` is terminal and forms a seq barrier.** Set via `state.MarkEventBlocked` (atomic update of `capture_events` + `publish_state`). Daemon never retries. `PendingEvents` hides later pending rows for the same `(branch_ref, branch_generation)` behind any earlier `blocked_conflict` or `failed` row, so downstream events do NOT leapfrog a broken predecessor across replay passes. Terminal rows older than retention are pruned only when they are no longer the active barrier.
 - **Diverged drops stale pending rows only.** On Diverged, delete `pending` capture events for the previous branch generation. Do not delete `blocked_conflict`, `failed`, or `published` rows; those remain operator-visible.
 - **Replay conflict metadata is structured.** `daemon_meta.last_replay_conflict` stores JSON with `ts`, `seq`, `error_class`, `expected_sha`, `actual_sha`, `ref`, `path`, and `message`. `last_replay_conflict_legacy` mirrors the old single-line string for backward-compatible tooling.
@@ -103,6 +105,10 @@ sqlite3 .git/acd/state.db "SELECT state, COUNT(*) FROM capture_events GROUP BY s
 # Inspect blocked events with reasons
 sqlite3 .git/acd/state.db "SELECT seq, operation, path, substr(error,1,100) FROM capture_events WHERE state='blocked_conflict' ORDER BY seq DESC LIMIT 20;"
 
+# Pause replay while doing manual branch surgery, then resume explicitly
+acd pause --repo . --reason "manual reset" --yes
+acd resume --repo . --yes
+
 # Drop blocked rows (terminal, safe to delete)
 sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"
 ```
@@ -138,6 +144,7 @@ The original 145-event incident pattern is: `daemon_state.branch_ref` and queued
 | `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
+| `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after same-branch rewind detection. `0` disables the grace. |
 
 ### Trace log format
 
