@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -38,6 +39,28 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 		return fmt.Errorf("state: meta set %q: %w", key, err)
 	}
 	return nil
+}
+
+// MetaSetJSON marshals value as JSON and stores it under key in daemon_meta.
+func MetaSetJSON(ctx context.Context, d *DB, key string, value any) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("state: meta json marshal %q: %w", key, err)
+	}
+	return MetaSet(ctx, d, key, string(b))
+}
+
+// MetaGetJSON reads key from daemon_meta and unmarshals it into dst. It
+// returns false when the key is absent.
+func MetaGetJSON(ctx context.Context, d *DB, key string, dst any) (bool, error) {
+	v, ok, err := MetaGet(ctx, d, key)
+	if err != nil || !ok {
+		return ok, err
+	}
+	if err := json.Unmarshal([]byte(v), dst); err != nil {
+		return true, fmt.Errorf("state: meta json unmarshal %q: %w", key, err)
+	}
+	return true, nil
 }
 
 // MetaDelete removes a key. Returns whether the key was present.
