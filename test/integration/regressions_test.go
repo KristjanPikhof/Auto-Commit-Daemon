@@ -620,7 +620,15 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 	if stop.ExitCode != 0 {
 		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stop.ExitCode, stop.Stdout, stop.Stderr)
 	}
-	waitMode(t, repo, "stopped", 10*time.Second)
+	var stopJSON struct {
+		Stopped bool `json:"stopped"`
+	}
+	if err := json.Unmarshal([]byte(stop.Stdout), &stopJSON); err != nil {
+		t.Fatalf("decode stop json: %v\nstdout=%s", err, stop.Stdout)
+	}
+	if !stopJSON.Stopped {
+		t.Fatalf("force stop did not report stopped\nstdout=%s\nstderr=%s", stop.Stdout, stop.Stderr)
+	}
 
 	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
 	runGitOK(t, repo, "reset", "--hard", seedHead)
