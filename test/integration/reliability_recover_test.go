@@ -25,11 +25,7 @@ func TestRecoverReplaysIncidentFixture(t *testing.T) {
 
 	startSession(t, ctx, env, repo, "recover-1", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
-	stop := runAcd(t, ctx, env, "stop", "--session-id", "recover-1", "--repo", repo, "--json")
-	if stop.ExitCode != 0 {
-		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stop.ExitCode, stop.Stdout, stop.Stderr)
-	}
-	waitMode(t, repo, "stopped", 10*time.Second)
+	stopSessionForce(t, env, repo)
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
