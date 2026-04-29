@@ -322,6 +322,73 @@ func TestEventsAppendAndPending(t *testing.T) {
 	}
 }
 
+func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, path string) int64 {
+		t.Helper()
+		ev := CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+		}
+		seq, err := AppendCaptureEvent(ctx, d, ev, []CaptureOp{
+			{Op: "modify", Path: path, Fidelity: "exact"},
+		})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	blockedSeq := appendEvent("refs/heads/main", 1, "blocked-root.txt")
+	blockedChildSeq := appendEvent("refs/heads/main", 1, "blocked-child.txt")
+	otherBranchSeq := appendEvent("refs/heads/feature", 1, "feature.txt")
+	otherGenerationSeq := appendEvent("refs/heads/main", 2, "main-gen2.txt")
+	failedSeq := appendEvent("refs/heads/failed", 1, "failed-root.txt")
+	failedChildSeq := appendEvent("refs/heads/failed", 1, "failed-child.txt")
+
+	if err := MarkEventBlocked(ctx, d, blockedSeq, "before-state mismatch", nowSeconds(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("MarkEventBlocked: %v", err)
+	}
+	if err := MarkEventPublished(ctx, d, failedSeq, EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowSeconds(),
+	); err != nil {
+		t.Fatalf("MarkEventPublished failed: %v", err)
+	}
+
+	pending, err := PendingEvents(ctx, d, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	seen := map[int64]bool{}
+	for _, ev := range pending {
+		seen[ev.Seq] = true
+	}
+	if seen[blockedChildSeq] {
+		t.Fatalf("seq %d behind blocked_conflict predecessor should be held; pending=%+v", blockedChildSeq, pending)
+	}
+	if seen[failedChildSeq] {
+		t.Fatalf("seq %d behind failed predecessor should be held; pending=%+v", failedChildSeq, pending)
+	}
+	if !seen[otherBranchSeq] {
+		t.Fatalf("different branch seq %d should remain pending; pending=%+v", otherBranchSeq, pending)
+	}
+	if !seen[otherGenerationSeq] {
+		t.Fatalf("different generation seq %d should remain pending; pending=%+v", otherGenerationSeq, pending)
+	}
+}
+
 func TestRollupsAppendOnly(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
