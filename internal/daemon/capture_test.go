@@ -259,6 +259,38 @@ func TestCapture_OversizeMetaOnly(t *testing.T) {
 	}
 }
 
+func TestCapture_SkipsPathWithControlCharacters(t *testing.T) {
+	f := newCaptureFixture(t)
+	name := "bad\tname.txt"
+	if err := os.WriteFile(filepath.Join(f.dir, name), []byte("secret-ish"), 0o644); err != nil {
+		t.Fatalf("write control-char path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "fine.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write fine: %v", err)
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.Errors == 0 {
+		t.Fatalf("expected control-char path to be counted as a soft error")
+	}
+	for _, op := range pendingOps(t, f.db) {
+		if op.Path == name {
+			t.Fatalf("control-char path should not have produced a capture event: %+v", op)
+		}
+	}
+	if _, ok, err := state.MetaGet(context.Background(), f.db, "capture-skip-invalid-path:bad\\tname.txt"); err != nil {
+		t.Fatalf("MetaGet invalid path: %v", err)
+	} else if !ok {
+		t.Fatalf("expected capture-skip-invalid-path daemon_meta row")
+	}
+}
+
 // TestCapture_RoundTrip: walk twice, the second walk emits the right diff.
 //
 //	pass 1 (first walk):  create foo.txt, modify .gitignore? no — fresh capture
