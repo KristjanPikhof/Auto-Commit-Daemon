@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -465,6 +466,163 @@ func TestDoctor_BlockedConflictSurfaced(t *testing.T) {
 			t.Errorf("doctor human output missing %q in:\n%s", want, body)
 		}
 	}
+}
+
+func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+		t.Fatalf("write claude settings: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"hooks":[]}`), 0o600); err != nil {
+		t.Fatalf("write legacy codex hooks: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	claude := findDoctorHarness(t, rep, "claude-code")
+	if !claude.Installed || !claude.MarkerFound || !claude.ConfigReadable {
+		t.Fatalf("claude-code install report wrong: %+v", claude)
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if codex.Installed || codex.MarkerFound {
+		t.Fatalf("codex should be absent when only hooks.json exists: %+v", codex)
+	}
+	if !strings.Contains(strings.Join(codex.Notes, "\n"), "legacy ~/.codex/hooks.json exists") {
+		t.Fatalf("codex legacy hooks warning missing: %+v", codex)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
+		t.Fatalf("runDoctor human: %v", err)
+	}
+	body := humanOut.String()
+	for _, want := range []string{"Install", "claude-code : yes", "codex      : no", "legacy ~/.codex/hooks.json exists"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("human doctor missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestDoctor_AIProviderOpenAICompatRequiresAPIKey(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "openai-compat")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if rep.AI.Provider != "openai-compat" {
+		t.Fatalf("provider=%q want openai-compat", rep.AI.Provider)
+	}
+	if rep.AI.APIKeySet {
+		t.Fatalf("APIKeySet=true, want false")
+	}
+	if !strings.Contains(strings.Join(rep.AI.Notes, "\n"), ai.EnvAPIKey) {
+		t.Fatalf("AI notes missing API key warning: %+v", rep.AI)
+	}
+}
+
+func TestDoctor_AISubprocessProviderChecksPATH(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "subprocess:missing")
+	t.Setenv("PATH", t.TempDir())
+
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if rep.AI.ProviderCommand != "acd-provider-missing" {
+		t.Fatalf("ProviderCommand=%q want acd-provider-missing", rep.AI.ProviderCommand)
+	}
+	if rep.AI.ProviderCommandFound {
+		t.Fatalf("ProviderCommandFound=true, want false")
+	}
+	if !strings.Contains(strings.Join(rep.AI.Notes, "\n"), "not found on PATH") {
+		t.Fatalf("AI notes missing PATH warning: %+v", rep.AI)
+	}
+}
+
+func TestDoctor_RepoWarnsOnMultipleDaemonProcesses(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+
+	repo, db, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 1001, Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	registerRepo(t, roots, repo, db, "claude-code")
+	_ = d.Close()
+
+	old := doctorProcessList
+	doctorProcessList = func(context.Context) ([]doctorProcess, error) {
+		return []doctorProcess{
+			{PID: 1001, Command: "acd daemon run --repo " + repo},
+			{PID: 1002, Command: "/usr/local/bin/acd daemon run --repo " + repo},
+			{PID: 1003, Command: "/usr/local/bin/acd daemon run --repo " + filepath.Dir(repo)},
+		}, nil
+	}
+	t.Cleanup(func() { doctorProcessList = old })
+
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", out.String())
+	}
+	if len(rep.Repos) != 1 {
+		t.Fatalf("repos=%d want 1", len(rep.Repos))
+	}
+	rr := rep.Repos[0]
+	if rr.DaemonProcessCount != 2 {
+		t.Fatalf("DaemonProcessCount=%d want 2: %+v", rr.DaemonProcessCount, rr)
+	}
+	if !strings.Contains(strings.Join(rr.Notes, "\n"), "multiple acd daemon processes") {
+		t.Fatalf("repo notes missing multiple process warning: %+v", rr.Notes)
+	}
+}
+
+func findDoctorHarness(t *testing.T, rep doctorReport, name string) doctorHarnessReport {
+	t.Helper()
+	for _, h := range rep.Harnesses {
+		if h.Name == name {
+			return h
+		}
+	}
+	t.Fatalf("harness %q not found in %+v", name, rep.Harnesses)
+	return doctorHarnessReport{}
 }
 
 func sortedKeys(m map[string]bool) []string {
