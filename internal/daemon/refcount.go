@@ -104,7 +104,11 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 		// (2) PID liveness — fast-path eviction.
 		if c.WatchPID.Valid && c.WatchPID.Int64 > 0 {
 			pid := int(c.WatchPID.Int64)
-			if !aliveFn(ctx, pid) {
+			pidAlive := aliveFn(ctx, pid)
+			if err := ctx.Err(); err != nil {
+				return alive, err
+			}
+			if !pidAlive {
 				if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
 					return alive, fmt.Errorf("daemon: drop dead-pid client %q: %w", c.SessionID, derr)
 				}
@@ -114,6 +118,9 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 			// when a stored fingerprint is present.
 			if c.WatchFP.Valid && c.WatchFP.String != "" {
 				live, ferr := captureFn(ctx, pid)
+				if err := ctx.Err(); err != nil {
+					return alive, err
+				}
 				if ferr != nil || live.Empty() {
 					logFingerprintUnresolved(c.SessionID, pid, ferr)
 					alive++
