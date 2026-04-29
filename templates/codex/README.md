@@ -3,10 +3,9 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Install jq (required): `brew install jq` or `apt install jq`
-3. Generate snippet: `acd init codex`
-4. Append the printed TOML block to your Codex config (e.g. `~/.codex/config.toml`)
-5. Restart Codex
+2. Generate snippet: `acd init codex`
+3. Append the printed TOML block to your Codex config (e.g. `~/.codex/config.toml`)
+4. Restart Codex
 
 ## Verify
 
