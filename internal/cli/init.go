@@ -52,6 +52,7 @@ func newInitCmd() *cobra.Command {
 		Short:     "Print install snippet for a harness adapter",
 		Args:      cobra.RangeArgs(0, 1),
 		ValidArgs: supportedHarnesses,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if applyFlag {
 				fmt.Fprintln(cmd.ErrOrStderr(), "acd init: --apply is not implemented")
