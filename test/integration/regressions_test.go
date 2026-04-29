@@ -627,6 +627,9 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 	if err := json.Unmarshal([]byte(stop.Stdout), &stopJSON); err != nil {
 		t.Fatalf("decode stop json: %v\nstdout=%s", err, stop.Stdout)
 	}
+	if stopJSON.DaemonPID > 0 && processAlive(stopJSON.DaemonPID) {
+		_ = syscall.Kill(stopJSON.DaemonPID, syscall.SIGKILL)
+	}
 	waitFor(t, "offline daemon pid exited", 15*time.Second, func() bool {
 		return stopJSON.DaemonPID <= 0 || !processAlive(stopJSON.DaemonPID)
 	})
@@ -1033,6 +1036,9 @@ func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil
+	out, err := exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "stat=").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
