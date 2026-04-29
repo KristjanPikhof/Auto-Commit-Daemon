@@ -41,9 +41,13 @@ func TestRegressions(t *testing.T) {
 	t.Run("LockContentionLoserExitsTempFail", regLockContentionLoserExitsTempFail)
 	t.Run("PIDReuseRejectedByFingerprint", regPIDReuseRejectedByFingerprint)
 	t.Run("StopWithPeerDefersKill", regStopWithPeerDefersKill)
+	t.Run("DetachedHeadStartRefused", regDetachedHeadStartRefused)
+	t.Run("OfflineResetRestartNoPhantomEvents", regOfflineResetRestartNoPhantomEvents)
+	t.Run("ConcurrentSessionStartsRegisterAllClients", regConcurrentSessionStartsRegisterAllClients)
 	t.Run("DaemonSelfTerminatesOnEmptySweeps", regDaemonSelfTerminatesOnEmptySweeps)
 	t.Run("RepeatedEditsPublishOrderedCommits", regRepeatedEditsPublishOrderedCommits)
 	t.Run("BlockedConflictTerminalAcrossPolls", regBlockedConflictTerminalAcrossPolls)
+	t.Run("BlockedConflictPreventsLeapfrogPublish", regBlockedConflictPreventsLeapfrogPublish)
 }
 
 // startDaemon is shared scaffolding: `acd start` + wait for mode=running.
@@ -557,6 +561,145 @@ func regStopWithPeerDefersKill(t *testing.T) {
 	waitMode(t, repo, "stopped", 5*time.Second)
 }
 
+// regDetachedHeadStartRefused verifies the CLI refuses to spawn a daemon
+// while HEAD is detached. This is the operator-facing counterpart to the
+// daemon-package pause guard: start must fail before any capture/replay loop
+// can publish commits onto a nameless ref.
+func regDetachedHeadStartRefused(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	runGitOK(t, repo, "checkout", "--detach", startHead)
+
+	res := runAcd(t, ctx, env,
+		"start", "--session-id", "detached-1", "--repo", repo, "--harness", "shell", "--json")
+	if res.ExitCode == 0 {
+		t.Fatalf("acd start succeeded on detached HEAD\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
+	}
+	if !strings.Contains(res.Stderr+res.Stdout, "detached HEAD") {
+		t.Fatalf("start failure did not mention detached HEAD\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
+	}
+
+	writeFile(t, filepath.Join(repo, "detached.txt"), "must-not-commit\n")
+	time.Sleep(300 * time.Millisecond)
+	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != startHead {
+		t.Fatalf("detached HEAD advanced to %s; want %s", head, startHead)
+	}
+	if mode := readDaemonStateMode(repo); mode == "running" {
+		t.Fatalf("daemon_state.mode=%q after refused detached start", mode)
+	}
+}
+
+// regOfflineResetRestartNoPhantomEvents starts and stops the daemon, rewinds
+// the branch while it is offline, then restarts. The restart must bump the
+// generation and reseed shadow_paths without inserting phantom create events
+// for files already tracked at the new HEAD.
+func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "offline-1", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	writeFile(t, filepath.Join(repo, "before-reset.txt"), "before reset\n")
+	wakeSession(t, ctx, env, repo, "offline-1")
+	waitForCommitContaining(t, repo, "before-reset.txt", 8*time.Second)
+
+	headBeforeReset := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	seedHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD^"))
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+
+	stop := runAcd(t, ctx, env, "stop", "--session-id", "offline-1", "--repo", repo, "--json")
+	if stop.ExitCode != 0 {
+		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stop.ExitCode, stop.Stdout, stop.Stderr)
+	}
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
+	runGitOK(t, repo, "reset", "--hard", seedHead)
+	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head == headBeforeReset {
+		t.Fatalf("reset did not move HEAD away from %s", headBeforeReset)
+	}
+
+	startSession(t, ctx, env, repo, "offline-2", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	waitFor(t, "branch.generation bumped after offline reset", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'") == "2"
+	})
+	waitFor(t, "generation 2 shadow seeded", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = 'refs/heads/main' AND branch_generation = 2") != "0"
+	})
+	time.Sleep(250 * time.Millisecond)
+	if postEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events"); postEvents != preEvents {
+		dump, _ := exec.Command("sqlite3", dbPath,
+			"SELECT seq,operation,path,state FROM capture_events ORDER BY seq").CombinedOutput()
+		t.Fatalf("offline restart inserted phantom events: pre=%s post=%s\nrows:\n%s", preEvents, postEvents, dump)
+	}
+	if pending := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state = 'pending'"); pending != "0" {
+		t.Fatalf("offline restart left pending events=%s", pending)
+	}
+}
+
+// regConcurrentSessionStartsRegisterAllClients fans out ten first-time
+// `acd start` calls. They should converge on one daemon and all session rows
+// should survive the start/control-lock race.
+func regConcurrentSessionStartsRegisterAllClients(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+
+	const clients = 10
+	type startAttempt struct {
+		session string
+		res     ExecResult
+	}
+	results := make(chan startAttempt, clients)
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		sessionID := fmt.Sprintf("client-%02d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- startAttempt{
+				session: sessionID,
+				res: runAcd(t, ctx, env,
+					"start", "--session-id", sessionID, "--repo", repo, "--harness", "shell", "--json"),
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	for attempt := range results {
+		if attempt.res.ExitCode != 0 {
+			t.Fatalf("start %s exit=%d\nstdout=%s\nstderr=%s",
+				attempt.session, attempt.res.ExitCode, attempt.res.Stdout, attempt.res.Stderr)
+		}
+	}
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM daemon_clients"); got != fmt.Sprintf("%d", clients) {
+		dump, _ := exec.Command("sqlite3", dbPath,
+			"SELECT session_id,harness FROM daemon_clients ORDER BY session_id").CombinedOutput()
+		t.Fatalf("daemon_clients count=%s want %d\nrows:\n%s", got, clients, dump)
+	}
+	if pid := readDaemonStatePID(repo); pid == 0 {
+		t.Fatalf("daemon_state.pid missing after concurrent starts")
+	}
+}
+
 // regDaemonSelfTerminatesOnEmptySweeps — start the daemon, deregister all
 // clients out-of-band, wait for self-termination after BootGrace + 2 sweeps.
 //
@@ -795,4 +938,84 @@ VALUES (last_insert_rowid(), 0, 'modify', 'ghost-conflict.txt', '%s', '100644', 
 	if mode := readDaemonStateMode(repo); mode != "running" {
 		t.Fatalf("daemon mode=%q after conflict; want running", mode)
 	}
+}
+
+// regBlockedConflictPreventsLeapfrogPublish verifies the queue barrier after
+// a recorded conflict: a later pending event for the same branch generation
+// must not publish on a second replay pass.
+func regBlockedConflictPreventsLeapfrogPublish(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "leapfrog-1", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	baseHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
+	if gen == "" {
+		gen = "1"
+	}
+
+	now := nowFloatSeconds()
+	blockerSQL := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'modify', 'blocked-first.txt', 'rescan', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'modify', 'blocked-first.txt', '1111111111111111111111111111111111111111', '100644', '2222222222222222222222222222222222222222', '100644', 'rescan');
+`, gen, baseHead, now)
+	if out, err := exec.Command("sqlite3", dbPath, blockerSQL).CombinedOutput(); err != nil {
+		t.Fatalf("inject blocker event: %v\n%s", err, out)
+	}
+	blockerSeq := sqliteScalar(t, dbPath,
+		"SELECT seq FROM capture_events WHERE path = 'blocked-first.txt' ORDER BY seq DESC LIMIT 1")
+
+	wakeSession(t, ctx, env, repo, "leapfrog-1")
+	waitFor(t, "blocker enters blocked_conflict", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath,
+			fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", blockerSeq)) == "blocked_conflict"
+	})
+
+	afterOID := gitHashObjectStdin(t, repo, "must not leapfrog\n")
+	laterSQL := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'create', 'leapfrog.txt', 'exact', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', 'leapfrog.txt', '%s', '100644', 'exact');
+`, gen, baseHead, nowFloatSeconds(), afterOID)
+	if out, err := exec.Command("sqlite3", dbPath, laterSQL).CombinedOutput(); err != nil {
+		t.Fatalf("inject later event: %v\n%s", err, out)
+	}
+	laterSeq := sqliteScalar(t, dbPath,
+		"SELECT seq FROM capture_events WHERE path = 'leapfrog.txt' ORDER BY seq DESC LIMIT 1")
+
+	for i := 0; i < 3; i++ {
+		wakeSession(t, ctx, env, repo, "leapfrog-1")
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	if state := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", laterSeq)); state != "pending" {
+		t.Fatalf("later event state=%q want pending behind blocked_conflict barrier", state)
+	}
+	showOut := runGitOK(t, repo, "log", "--all", "--name-only", "--pretty=format:")
+	for _, line := range strings.Split(showOut, "\n") {
+		if strings.TrimSpace(line) == "leapfrog.txt" {
+			t.Fatalf("later event leapfrogged blocked predecessor into git history:\n%s", showOut)
+		}
+	}
+}
+
+func gitHashObjectStdin(t *testing.T, repo, body string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repo, "hash-object", "-w", "--stdin")
+	cmd.Stdin = strings.NewReader(body)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git hash-object -w --stdin: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
