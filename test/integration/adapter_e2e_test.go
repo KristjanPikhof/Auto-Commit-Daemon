@@ -495,7 +495,7 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 	}
 
 	env := envWith(base,
-		"PATH="+fakeBin,
+		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
 		"CODEX_PROJECT_DIR="+t.TempDir(),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
