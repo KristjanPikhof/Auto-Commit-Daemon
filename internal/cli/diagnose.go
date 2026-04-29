@@ -50,16 +50,16 @@ type diagnoseBlockedEntry struct {
 }
 
 type diagnoseReport struct {
-	Repo                         string                   `json:"repo"`
-	RepoHash                     string                   `json:"repo_hash"`
-	StateDB                      string                   `json:"state_db"`
-	Anchor                       diagnoseAnchorReport     `json:"anchor"`
-	BlockedHistogram             []diagnoseBlockedClass   `json:"blocked_histogram"`
-	RecentBlocked                []diagnoseBlockedEntry   `json:"recent_blocked"`
-	Remediation                  []string                 `json:"remediation"`
-	StateDBChecksumBefore         string                   `json:"state_db_checksum_before"`
-	StateDBChecksumAfter          string                   `json:"state_db_checksum_after"`
-	StateDBChecksumVerified       bool                     `json:"state_db_checksum_verified"`
+	Repo                    string                 `json:"repo"`
+	RepoHash                string                 `json:"repo_hash"`
+	StateDB                 string                 `json:"state_db"`
+	Anchor                  diagnoseAnchorReport   `json:"anchor"`
+	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
+	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
+	Remediation             []string               `json:"remediation"`
+	StateDBChecksumBefore   string                 `json:"state_db_checksum_before"`
+	StateDBChecksumAfter    string                 `json:"state_db_checksum_after"`
+	StateDBChecksumVerified bool                   `json:"state_db_checksum_verified"`
 }
 
 type replayConflictMeta struct {
