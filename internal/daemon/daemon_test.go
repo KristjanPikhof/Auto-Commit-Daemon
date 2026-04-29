@@ -201,6 +201,103 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	}
 }
 
+func TestResolveBranch_DetachedHeadHasNoBranchRef(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "--detach", head); err != nil {
+		t.Fatalf("checkout --detach: %v", err)
+	}
+
+	branchRef, headOID := resolveBranch(ctx, f.dir, slog.Default())
+	if branchRef != "" {
+		t.Fatalf("branchRef=%q want empty for detached HEAD", branchRef)
+	}
+	if headOID != head {
+		t.Fatalf("headOID=%q want %q", headOID, head)
+	}
+}
+
+func TestRun_DetachedHeadPausesCaptureReplay(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "--detach", startHead); err != nil {
+		t.Fatalf("checkout --detach: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "detached.txt"), []byte("paused\n"), 0o644); err != nil {
+		t.Fatalf("write detached: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); !ok {
+		t.Fatalf("%s not stamped", MetaKeyDetachedHeadPaused)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse after pause: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("detached HEAD advanced to %s; want %s", head, startHead)
+	}
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("capture_events=%d want 0 while detached", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 // TestRun_WakeBurstCoalesced: many rapid wakes don't crash and only produce
 // one capture+replay cycle (idempotent — the second pass sees no changes).
 func TestRun_WakeBurstCoalesced(t *testing.T) {
