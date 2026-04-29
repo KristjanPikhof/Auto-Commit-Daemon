@@ -298,13 +298,16 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	defer func() { stopWaitTimeout = prevTO }()
 
 	var out bytes.Buffer
-	// `force=true` so per-repo stopper actually delivers SIGTERM
-	// (sessionID is empty in --all). Stub stamps mode=stopped, so
-	// each repo's result lands in the Stopped bucket and runStopAll
-	// returns nil.
+	// `force=true` so the per-repo stopper enters the force path. The
+	// fixture's PIDs (99000/99001) are not alive, so stopOneRepo
+	// short-circuits to res.Stopped=true / Reason="daemon not running"
+	// without invoking signalProcess. Result: both repos land in the
+	// Stopped bucket and runStopAll returns nil. The point of this
+	// test is registry iteration breadth, not the kill path.
 	if err := runStop(ctx, &out, "", "", true, true, true); err != nil {
 		t.Fatalf("runStop --all: %v", err)
 	}
+	_ = sigCount // signalProcess legitimately not called for dead PIDs
 	var got stopAllResult
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
@@ -314,11 +317,8 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 			len(got.Stopped), len(got.Deferred), len(got.Failed))
 	}
 	if len(got.Failed) != 0 {
-		t.Fatalf("expected 0 failed when SIGTERM stamps mode=stopped, got %d (%+v)",
+		t.Fatalf("expected 0 failed when daemons report not running, got %d (%+v)",
 			len(got.Failed), got.Failed)
-	}
-	if sigCount.Load() < 2 {
-		t.Fatalf("expected SIGTERM delivered to both daemons, got count=%d", sigCount.Load())
 	}
 }
 
