@@ -102,7 +102,7 @@ func stopSessionForce(t *testing.T, env []string, repo string) {
 	}
 	_ = json.Unmarshal([]byte(res.Stdout), &stopJSON)
 	// Best-effort wait for stopped state — don't fail cleanup.
-	if waitStopped(repo, 5*time.Second) {
+	if waitStopped(repo, 1*time.Second) {
 		return
 	}
 	pid := stopJSON.DaemonPID
@@ -113,11 +113,11 @@ func stopSessionForce(t *testing.T, env []string, repo string) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
-	if waitStopped(repo, 2*time.Second) || !processAlive(pid) {
+	if waitStopped(repo, 1*time.Second) || !processAlive(pid) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
-	_ = waitStopped(repo, 2*time.Second)
+	_ = waitStopped(repo, 1*time.Second)
 }
 
 func waitStopped(repo string, timeout time.Duration) bool {
