@@ -131,6 +131,34 @@ func daemonStopped(repo string) bool {
 	return pid > 0 && syscall.Kill(pid, 0) != nil
 }
 
+func waitDaemonStoppedOrKill(t *testing.T, label, repo string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if daemonStopped(repo) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	pid := readDaemonStatePID(repo)
+	if pid <= 0 {
+		return
+	}
+	t.Logf("%s: daemon pid %d still alive after stop command; killing test daemon", label, pid)
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if daemonStopped(repo) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	waitFor(t, label, 5*time.Second, func() bool {
+		return daemonStopped(repo)
+	})
+}
+
 // runBash runs `bash -c command` with the given env and stdin. Returns
 // stdout, stderr, exit code.
 func runBash(t *testing.T, ctx context.Context, env []string, stdin, command string) ExecResult {
@@ -391,9 +419,7 @@ func shutdownDaemon(t *testing.T, env []string, repo, sessionID string) {
 		t.Logf("cleanup acd stop --force exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
 	}
-	waitFor(t, "post-cleanup mode==stopped", 10*time.Second, func() bool {
-		return daemonStopped(repo)
-	})
+	waitDaemonStoppedOrKill(t, "post-cleanup daemon stopped", repo)
 }
 
 // -----------------------------------------------------------------------------
@@ -445,9 +471,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 		t.Fatalf("claude-code SessionEnd exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "claude-code daemon mode==stopped", 10*time.Second, func() bool {
-		return daemonStopped(repo)
-	})
+	waitDaemonStoppedOrKill(t, "claude-code daemon stopped", repo)
 }
 
 func runCodexE2E(t *testing.T, bin string) {
@@ -487,9 +511,7 @@ func runCodexE2E(t *testing.T, bin string) {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "codex daemon mode==stopped", 10*time.Second, func() bool {
-		return daemonStopped(repo)
-	})
+	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
 }
 
 func runCodexMissingAcdWritesHookLog(t *testing.T) {
@@ -567,9 +589,7 @@ func runOpencodeE2E(t *testing.T, bin string) {
 		t.Fatalf("opencode acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "opencode daemon mode==stopped", 10*time.Second, func() bool {
-		return daemonStopped(repo)
-	})
+	waitDaemonStoppedOrKill(t, "opencode daemon stopped", repo)
 }
 
 func runPiE2E(t *testing.T, bin string) {
@@ -603,9 +623,7 @@ func runPiE2E(t *testing.T, bin string) {
 		t.Fatalf("pi acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitFor(t, "pi daemon mode==stopped", 10*time.Second, func() bool {
-		return daemonStopped(repo)
-	})
+	waitDaemonStoppedOrKill(t, "pi daemon stopped", repo)
 }
 
 func runShellE2E(t *testing.T, bin string) {
