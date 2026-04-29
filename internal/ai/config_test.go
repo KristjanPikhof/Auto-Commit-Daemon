@@ -157,6 +157,44 @@ func TestBuildProvider_OpenAICompatComposed(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_OpenAICompatRejectsInvalidBaseURL(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		baseURL   string
+		wantError string
+	}{
+		{
+			name:      "http rejected",
+			baseURL:   "http://gateway.example/v1",
+			wantError: "must use https",
+		},
+		{
+			name:      "relative rejected",
+			baseURL:   "/v1",
+			wantError: "must be an absolute URL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ProviderConfig{
+				Mode:    "openai-compat",
+				BaseURL: tc.baseURL,
+				APIKey:  "sk-test",
+				Logger:  quietLogger(),
+			}
+			p, closer, err := BuildProvider(cfg)
+			if err == nil {
+				t.Fatalf("BuildProvider returned nil error")
+			}
+			if p != nil || closer != nil {
+				t.Fatalf("provider=%v closer=%v, want nils on invalid URL", p, closer)
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error=%q want substring %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
 // TestBuildProvider_OpenAICompatNoKeyDegrades: an empty APIKey logs a
 // warning and falls back to DeterministicProvider so misconfiguration
 // can never silently disable commit messages.
