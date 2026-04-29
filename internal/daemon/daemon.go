@@ -649,39 +649,50 @@ func Run(ctx context.Context, opts Options) error {
 		// restart picks up the same value, and the next replay pass
 		// terminally blocks any queued events captured under the prior
 		// generation (their BaseHead is no longer reachable).
-		if cctx.BranchRef == "" {
-			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
-			if branchRef != "" {
-				cctx.BranchRef = branchRef
-				cctx.BaseHead = headOID
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, headOID); err != nil {
-					logger.Warn("persist reattached branch head",
-						"err", err.Error())
-				}
-				if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-				}
-				if headOID != "" {
-					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-						logger.Warn("bootstrap shadow after reattach",
+		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
+		if operationPaused {
+			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
+			logger.Warn("git operation in progress; capture/replay paused",
+				"operation", operationName)
+		} else if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyOperationInProgress); ok {
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgress)
+		}
+
+		if !operationPaused {
+			if cctx.BranchRef == "" {
+				branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
+				if branchRef != "" {
+					cctx.BranchRef = branchRef
+					cctx.BaseHead = headOID
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist reattached branch head",
 							"err", err.Error())
-					} else {
-						if seeded > 0 {
-							logger.Info("shadow bootstrapped after reattach",
-								"rows", seeded)
-						}
-						if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
-							logger.Warn("prune old shadow generations", "err", pErr.Error())
-						} else if pruned > 0 {
-							logger.Info("pruned old shadow generations", "rows", pruned)
+					}
+					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+					}
+					if headOID != "" {
+						if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+							logger.Warn("bootstrap shadow after reattach",
+								"err", err.Error())
+						} else {
+							if seeded > 0 {
+								logger.Info("shadow bootstrapped after reattach",
+									"rows", seeded)
+							}
+							if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+								logger.Warn("prune old shadow generations", "err", pErr.Error())
+							} else if pruned > 0 {
+								logger.Info("pruned old shadow generations", "rows", pruned)
+							}
 						}
 					}
 				}
 			}
-		}
-		if processBranchTokenChange("branch token") {
-			branchTransitionBlocked = true
+			if processBranchTokenChange("branch token") {
+				branchTransitionBlocked = true
+			}
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
@@ -708,7 +719,7 @@ func Run(ctx context.Context, opts Options) error {
 				break
 			}
 		}
-		if processBranchTokenChange("pre-capture branch token") {
+		if !operationPaused && processBranchTokenChange("pre-capture branch token") {
 			branchTransitionBlocked = true
 		}
 
@@ -720,6 +731,9 @@ func Run(ctx context.Context, opts Options) error {
 		detachedHeadPaused := cctx.BranchRef == ""
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
+		} else if operationPaused {
+			logger.Warn("git operation in progress; capture/replay paused",
+				"operation", operationName)
 		} else if detachedHeadPaused {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
@@ -735,7 +749,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && !branchTransitionBlocked && !detachedHeadPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
@@ -902,6 +916,26 @@ func resolveBranch(ctx context.Context, repoDir string, logger *slog.Logger) (st
 		return branch, ""
 	}
 	return branch, head
+}
+
+func gitOperationInProgress(gitDir string) (string, bool) {
+	for _, marker := range []struct {
+		path string
+		name string
+	}{
+		{path: "rebase-merge", name: "rebase-merge"},
+		{path: "rebase-apply", name: "rebase-apply"},
+		{path: "MERGE_HEAD", name: "merge"},
+		{path: "CHERRY_PICK_HEAD", name: "cherry-pick"},
+		{path: "BISECT_LOG", name: "bisect"},
+	} {
+		if _, err := os.Stat(filepath.Join(gitDir, marker.path)); err == nil {
+			return marker.name, true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return marker.name, true
+		}
+	}
+	return "", false
 }
 
 // gitDirEnsureSubdir is a tiny helper to ensure a subdir exists under
