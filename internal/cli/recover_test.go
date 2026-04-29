@@ -73,6 +73,38 @@ func TestRecover_DryRunNoMutation(t *testing.T) {
 	_ = before
 }
 
+func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	if _, err := db.SQL().ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
+		t.Fatalf("lower user_version: %v", err)
+	}
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+		t.Fatalf("runRecover dry-run: %v", err)
+	}
+	after, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("dry-run bootstrapped schema: before=%s after=%s", before, after)
+	}
+	var version int
+	if err := db.SQL().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("query user_version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("user_version=%d want 1", version)
+	}
+}
+
 func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
