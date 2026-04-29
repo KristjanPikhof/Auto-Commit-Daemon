@@ -67,8 +67,8 @@ const SubjectCap = 72
 // BodyWrap is the line width used when re-wrapping bullet bodies.
 const BodyWrap = 72
 
-// DiffCap is the byte cap callers should apply via Truncate before handing
-// a unified diff to a network-bound provider.
+// DiffCap is the byte cap callers should apply after RedactDiffSecrets before
+// handing a unified diff to a network-bound provider.
 const DiffCap = 4000
 
 var (
