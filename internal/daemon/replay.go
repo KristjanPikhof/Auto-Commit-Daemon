@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -152,7 +153,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
-		if branchRef, headOID := resolveBranch(ctx, repoRoot, nil); branchRef != "" {
+		if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
 			activeCtx.BranchRef = branchRef
 			if headOID != "" && headOID == parent {
 				activeCtx.BaseHead = headOID
