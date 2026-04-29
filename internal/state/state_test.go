@@ -122,6 +122,44 @@ func TestOpenIdempotent(t *testing.T) {
 	}
 }
 
+func TestOpenExistingCurrentDBDoesNotNeedWriteLock(t *testing.T) {
+	t.Parallel()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	ctx := context.Background()
+
+	d1, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	defer d1.Close()
+
+	tx, err := d1.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin writer: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('held-writer', '1', 1)`); err != nil {
+		t.Fatalf("hold writer lock: %v", err)
+	}
+
+	d2, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("second Open while writer active: %v", err)
+	}
+	defer d2.Close()
+
+	uv, err := d2.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("second user_version: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("second user_version = %d, want %d", uv, SchemaVersion)
+	}
+}
+
 func TestDaemonStateRoundTrip(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)

@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	// modernc.org/sqlite is the pure-Go driver mandated by D16 (zero cgo).
 	// Do not switch to mattn/go-sqlite3 — that pulls cgo and breaks the
@@ -76,10 +78,11 @@ func DBPathFromGitDir(gitDir string) string {
 //  2. Open the SQLite database with WAL, NORMAL sync, foreign keys, and a
 //     5-second busy timeout (§6.1 + §8.1 concurrency expectations).
 //  3. Apply DDL from schema.go inside a transaction, idempotent.
-//  4. Stamp PRAGMA user_version = SchemaVersion.
+//  4. Stamp PRAGMA user_version = SchemaVersion on first initialization.
 //
-// Re-opening an existing database is a no-op for schema purposes (CREATE TABLE
-// IF NOT EXISTS + INSERT OR IGNORE for the singleton rows).
+// Re-opening an existing current-version database is read-only for schema
+// purposes so status/daemon contenders do not take an avoidable SQLite write
+// lock.
 func Open(ctx context.Context, dbPath string) (*DB, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("state: empty dbPath")
@@ -113,7 +116,7 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 
 	d := &DB{conn: conn, path: dbPath}
 
-	if err := d.bootstrap(ctx); err != nil {
+	if err := d.bootstrapWithRetry(ctx); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -134,7 +137,8 @@ func buildDSN(dbPath string) string {
 }
 
 // bootstrap applies the DDL and stamps user_version on first open. Subsequent
-// calls are cheap because every CREATE uses IF NOT EXISTS.
+// calls first check user_version and return without taking a write lock when
+// the database is already current.
 func (d *DB) bootstrap(ctx context.Context) error {
 	d.initOnce.Do(func() {
 		d.initErr = d.runBootstrap(ctx)
@@ -142,7 +146,41 @@ func (d *DB) bootstrap(ctx context.Context) error {
 	return d.initErr
 }
 
+func (d *DB) bootstrapWithRetry(ctx context.Context) error {
+	const attempts = 8
+	for attempt := 0; attempt < attempts; attempt++ {
+		err := d.bootstrap(ctx)
+		if err == nil || !isSQLiteLocked(err) {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		// Allow another try after a transient lock. runBootstrap itself is
+		// idempotent, and current-version databases return before writing.
+		d.initOnce = sync.Once{}
+		d.initErr = nil
+	}
+	return d.bootstrap(ctx)
+}
+
 func (d *DB) runBootstrap(ctx context.Context) error {
+	cur, err := d.UserVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if cur > SchemaVersion {
+		return fmt.Errorf("state: db user_version=%d is newer than this binary's SchemaVersion=%d", cur, SchemaVersion)
+	}
+	if cur == SchemaVersion {
+		return nil
+	}
+
 	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("state: begin bootstrap: %w", err)
@@ -164,6 +202,14 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 		return fmt.Errorf("state: commit bootstrap: %w", err)
 	}
 	return nil
+}
+
+func isSQLiteLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
 }
 
 // UserVersion reads the SQLite PRAGMA user_version from the open database.
