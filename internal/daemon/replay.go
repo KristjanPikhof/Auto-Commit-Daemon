@@ -526,12 +526,18 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.Ca
 		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
 	}
 	for _, op := range ops {
-		if !op.AfterOID.Valid || op.AfterOID.String == "" {
-			return headOID, false, nil
-		}
 		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
 		if err != nil {
 			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+		}
+		if op.Op == "delete" {
+			if blobOID != "" {
+				return headOID, false, nil
+			}
+			continue
+		}
+		if !op.AfterOID.Valid || op.AfterOID.String == "" {
+			return headOID, false, nil
 		}
 		if blobOID != op.AfterOID.String {
 			return headOID, false, nil
@@ -542,6 +548,15 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.Ca
 				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
 			}
 			if !treeEntryModeMatches(entries, op.Path, op.AfterMode.String) {
+				return headOID, false, nil
+			}
+		}
+		if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
+			oldBlobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.OldPath.String)
+			if err != nil {
+				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.OldPath.String, err)
+			}
+			if oldBlobOID != "" {
 				return headOID, false, nil
 			}
 		}
