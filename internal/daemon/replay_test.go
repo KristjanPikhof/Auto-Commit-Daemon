@@ -395,6 +395,79 @@ func TestReplay_IdempotentPublishWhenParallelCommitterAlreadyLanded(t *testing.T
 	}
 }
 
+func TestReplay_IdempotentPublishWhenParallelDeleteAlreadyLanded(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "gone.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "delete",
+		Path:             "gone.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "delete",
+		Path:       "gone.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	emptyTree, err := git.Mktree(ctx, f.dir, nil)
+	if err != nil {
+		t.Fatalf("mktree empty: %v", err)
+	}
+	external, err := git.CommitTree(ctx, f.dir, emptyTree, "external delete", base)
+	if err != nil {
+		t.Fatalf("commit external delete: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; idempotent publish should not create a commit", beforeCount, got)
+	}
+	var stateName string
+	var commitOID sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &commitOID); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStatePublished {
+		t.Fatalf("state=%q want published", stateName)
+	}
+	if !commitOID.Valid || commitOID.String != external {
+		t.Fatalf("commit_oid=%v want %s", commitOID, external)
+	}
+}
+
 func TestReplay_RealConflictStillBlocks(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
