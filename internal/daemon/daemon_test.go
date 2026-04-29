@@ -896,6 +896,15 @@ func TestClassifyTokenTransition(t *testing.T) {
 	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, "rev:"+seed); err != nil || got != TokenTransitionUnchanged {
 		t.Fatalf("Unchanged: got=%v err=%v", got, err)
 	}
+	// Same SHA but different symbolic branch refs -> Diverged. Without the
+	// ref in the token, the daemon can keep a stale cctx.BranchRef and
+	// publish onto the branch it started on.
+	if got, err := ClassifyTokenTransition(ctx, f.dir,
+		branchTokenRev(seed, "refs/heads/main"),
+		branchTokenRev(seed, "refs/heads/feature/same-sha"),
+	); err != nil || got != TokenTransitionDiverged {
+		t.Fatalf("same-sha branch switch: got=%v err=%v", got, err)
+	}
 	// seed -> child (ancestor): FastForward.
 	if got, err := ClassifyTokenTransition(ctx, f.dir, "rev:"+seed, "rev:"+child); err != nil || got != TokenTransitionFastForward {
 		t.Fatalf("FastForward: got=%v err=%v", got, err)
@@ -1272,12 +1281,17 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
 
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
 	tok, err := BranchGenerationToken(ctx, f.dir)
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
-	if !strings.HasPrefix(tok, "rev:") {
-		t.Fatalf("token=%q want rev:* prefix", tok)
+	want := branchTokenRev(head, "refs/heads/main")
+	if tok != want {
+		t.Fatalf("token=%q want %q", tok, want)
 	}
 	if !SameGeneration(tok, tok) {
 		t.Fatalf("SameGeneration(t,t) false")
@@ -1291,12 +1305,83 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 	if err := git.Init(ctx, empty); err != nil {
 		t.Fatalf("init empty: %v", err)
 	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: empty}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref empty HEAD: %v", err)
+	}
 	tok2, err := BranchGenerationToken(ctx, empty)
 	if err != nil {
 		t.Fatalf("token empty: %v", err)
 	}
-	if tok2 != BranchTokenMissing {
-		t.Fatalf("empty token=%q want %q", tok2, BranchTokenMissing)
+	if tok2 != branchTokenMissing("refs/heads/main") {
+		t.Fatalf("empty token=%q want %q", tok2, branchTokenMissing("refs/heads/main"))
+	}
+}
+
+func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse start: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:     f.dir,
+			GitDir:       f.gitDir,
+			DB:           f.db,
+			Scheduler:    fastScheduler(),
+			BootGrace:    30 * time.Second,
+			WakeCh:       wakeCh,
+			ShutdownCh:   shutdownCh,
+			SkipSignals:  true,
+			MessageFn:    DeterministicMessage,
+			PruneInterval: time.Hour,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	featureRef := "refs/heads/feature/same-sha"
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "-q", "-b", "feature/same-sha"); err != nil {
+		t.Fatalf("checkout feature: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatalf("write feature.txt: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	mainHead, err := git.RevParse(ctx, f.dir, "refs/heads/main")
+	if err != nil {
+		t.Fatalf("rev-parse main: %v", err)
+	}
+	if mainHead != startHead {
+		t.Fatalf("main advanced to %s; want unchanged %s", mainHead, startHead)
+	}
+	featureHead, err := git.RevParse(ctx, f.dir, featureRef)
+	if err != nil {
+		t.Fatalf("rev-parse feature: %v", err)
+	}
+	if featureHead != newHead {
+		t.Fatalf("feature head=%s want new HEAD %s", featureHead, newHead)
+	}
+	if featureHead == startHead {
+		t.Fatalf("feature branch did not advance from start")
 	}
 }
 
