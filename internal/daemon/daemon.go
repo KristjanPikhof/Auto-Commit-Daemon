@@ -585,11 +585,17 @@ func Run(ctx context.Context, opts Options) error {
 		oldToken := currentToken
 		currentToken = newToken
 		if transition == TokenTransitionDiverged {
+			prevGeneration := cctx.BranchGeneration
 			cctx.BranchGeneration++
 			logger.Info("branch generation bumped",
 				"old", oldToken, "new", newToken,
 				"generation", cctx.BranchGeneration,
 				"transition", transition.String())
+			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
+			if dropErr != nil {
+				logger.Warn("drop pending events for previous branch generation",
+					"generation", prevGeneration, "err", dropErr.Error())
+			}
 			recordTrace(tracer, acdtrace.Event{
 				Repo:       opts.RepoPath,
 				BranchRef:  cctx.BranchRef,
@@ -598,7 +604,12 @@ func Run(ctx context.Context, opts Options) error {
 				Decision:   transition.String(),
 				Reason:     "run-loop token transition classified",
 				Input:      map[string]any{"previous": oldToken, "current": newToken},
-				Output:     map[string]any{"generation": cctx.BranchGeneration},
+				Output: map[string]any{
+					"prev_generation": prevGeneration,
+					"new_generation":  cctx.BranchGeneration,
+					"dropped_pending": droppedPending,
+				},
+				Error:      traceErrString(dropErr),
 				Generation: cctx.BranchGeneration,
 			})
 			if err := SaveBranchGeneration(ctx, opts.DB,
