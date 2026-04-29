@@ -602,6 +602,9 @@ func (s *pluginSession) shutdown(grace time.Duration) error {
 		select {
 		case err := <-exited:
 			_ = s.stdout.Close()
+			if s.stderr != nil {
+				_ = s.stderr.Close()
+			}
 			<-s.done
 			return err
 		case <-time.After(grace):
