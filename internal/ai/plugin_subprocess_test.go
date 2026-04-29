@@ -88,6 +88,43 @@ done
 	}
 }
 
+func TestSubprocess_RedactsDiffBeforeSend(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *AKIAIOSFODNN7EXAMPLE*)
+      printf '{"version":1,"subject":"","body":"","error":"secret leaked"}\n'
+      ;;
+    *REDACTED_SECRET*)
+      printf '{"version":1,"subject":"Redacted diff","body":"","error":""}\n'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing redaction"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	r, err := p.Generate(context.Background(), CommitContext{
+		Path:     "config/prod.yaml",
+		Op:       "modify",
+		DiffText: "+aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n",
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if r.Subject != "Redacted diff" {
+		t.Fatalf("subject=%q", r.Subject)
+	}
+}
+
 // TestSubprocess_Concurrency hammers Generate from many goroutines. The
 // owner-goroutine serialisation contract guarantees no garbled stdout
 // reads; this test would deadlock or panic under -race if the runner ever
