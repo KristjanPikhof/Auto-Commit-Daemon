@@ -388,8 +388,6 @@ func Run(ctx context.Context, opts Options) error {
 		if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
 			logger.Warn("seed branch token", "err", err.Error())
 		}
-	} else {
-		logger.Warn("seed branch token", "err", err.Error())
 	}
 
 	// Seed shadow_paths from HEAD before the first capture so files
