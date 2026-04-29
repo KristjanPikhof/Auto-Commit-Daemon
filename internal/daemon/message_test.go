@@ -258,9 +258,9 @@ func TestBuildOpsDiff_SurvivesLiveWorktreeChange(t *testing.T) {
 	}
 }
 
-// TestCommitContextFromEvent_PopulatesAIFields asserts the wiring:
-// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText.
-func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
+// TestCommitContextFromEvent_DefaultOmitsDiffText asserts the secure default:
+// captured diffs are not sent to AI providers unless ACD_AI_SEND_DIFF opts in.
+func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -285,14 +285,61 @@ func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
 			Fidelity:   "rescan",
 		},
+	}
+
+	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, f.dir)
+
+	if cc.Branch != "refs/heads/main" {
+		t.Fatalf("Branch=%q", cc.Branch)
+	}
+	if cc.RepoRoot != f.dir {
+		t.Fatalf("RepoRoot=%q want %q", cc.RepoRoot, f.dir)
+	}
+	if cc.Now.IsZero() {
+		t.Fatalf("Now is zero")
+	}
+	if cc.DiffText != "" {
+		t.Fatalf("DiffText=%q, want empty by default", cc.DiffText)
+	}
+}
+
+// TestCommitContextFromEvent_OptInPopulatesRedactedDiff asserts the wiring:
+// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText. The
+// opted-in diff must be redacted before it reaches a provider.
+func TestCommitContextFromEvent_OptInPopulatesRedactedDiff(t *testing.T) {
+	t.Setenv(envAISendDiff, "1")
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	beforeOID := hashContent(t, f.dir, "old\n")
+	afterA := hashContent(t, f.dir, "aws_access_key_id: AKIAIOSFODNN7EXAMPLE\n")
+	afterB := hashContent(t, f.dir, "fresh B\n")
+
+	ev := state.CaptureEvent{
+		Seq:              1,
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "a.txt",
+		Fidelity:         "rescan",
+	}
+	ops := []state.CaptureOp{
 		{
 			Op:         "modify",
-			Path:       "b.txt",
+			Path:       "a.txt",
 			BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
 			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-			AfterOID:   sql.NullString{String: afterOID, Valid: true},
+			AfterOID:   sql.NullString{String: afterA, Valid: true},
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
 			Fidelity:   "rescan",
+		},
+		{
+			Op:        "create",
+			Path:      "b.txt",
+			AfterOID:  sql.NullString{String: afterB, Valid: true},
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:  "rescan",
 		},
 	}
 
@@ -318,6 +365,12 @@ func TestCommitContextFromEvent_PopulatesAIFields(t *testing.T) {
 	}
 	if !strings.Contains(cc.DiffText, "diff --git a/b.txt b/b.txt") {
 		t.Fatalf("DiffText missing second op:\n%s", cc.DiffText)
+	}
+	if strings.Contains(cc.DiffText, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("DiffText leaked AWS key:\n%s", cc.DiffText)
+	}
+	if !strings.Contains(cc.DiffText, "[REDACTED_SECRET]") {
+		t.Fatalf("DiffText missing redaction marker:\n%s", cc.DiffText)
 	}
 }
 
