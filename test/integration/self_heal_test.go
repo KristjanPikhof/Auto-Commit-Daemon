@@ -6,7 +6,7 @@ package integration_test
 import (
 	"context"
 	"fmt"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -191,25 +191,9 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 
 func requireSQLite(t *testing.T) {
 	t.Helper()
-	if _, err := os.Stat("/usr/bin/sqlite3"); err == nil {
-		return
-	}
-	if _, err := runGit("", "--version"); err != nil {
-		t.Fatalf("git required: %v", err)
-	}
-	if _, err := os.Stat("/opt/homebrew/bin/sqlite3"); err == nil {
-		return
-	}
-	if _, err := os.Stat("/usr/local/bin/sqlite3"); err == nil {
-		return
-	}
-	if _, err := execLookPath("sqlite3"); err != nil {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required for self-heal integration assertions")
 	}
-}
-
-func execLookPath(file string) (string, error) {
-	return exec.LookPath(file)
 }
 
 func selfHealStateDB(repo string) string {
