@@ -287,7 +287,11 @@ func loadLastReplayConflictMeta(ctx context.Context, conn *sql.DB) (replayConfli
 	if err != nil || !ok || strings.TrimSpace(v) == "" {
 		return meta, err
 	}
-	if err := json.Unmarshal([]byte(v), &meta); err != nil {
+	trimmed := strings.TrimSpace(v)
+	if !strings.HasPrefix(trimmed, "{") {
+		return meta, nil
+	}
+	if err := json.Unmarshal([]byte(trimmed), &meta); err != nil {
 		return replayConflictMeta{}, nil
 	}
 	return meta, nil
