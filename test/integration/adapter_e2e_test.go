@@ -488,15 +488,7 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 	hooks := parseCodexSnippet(t, body)
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 
-	jq, err := exec.LookPath("jq")
-	if err != nil {
-		t.Skip("codex missing-acd stderr test requires jq; not on PATH")
-	}
-
 	fakeBin := t.TempDir()
-	if err := os.Symlink(jq, filepath.Join(fakeBin, "jq")); err != nil {
-		t.Fatalf("symlink jq: %v", err)
-	}
 
 	base := withIsolatedHome(t)
 	home := ""
