@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -91,4 +92,93 @@ func TestShowToplevelAndAbsoluteGitDir(t *testing.T) {
 	if gd == "" {
 		t.Fatal("expected non-empty git dir")
 	}
+}
+
+func TestIsAncestor_True(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	base := commitFile(t, ctx, dir, "base.txt", "base", "base")
+	descendant := commitFile(t, ctx, dir, "descendant.txt", "descendant", "descendant", base)
+
+	ok, err := IsAncestor(ctx, dir, base, descendant)
+	if err != nil {
+		t.Fatalf("is ancestor: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected base commit to be ancestor of descendant")
+	}
+}
+
+func TestIsAncestor_False(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	base := commitFile(t, ctx, dir, "base.txt", "base", "base")
+	main := commitFile(t, ctx, dir, "main.txt", "main", "main", base)
+	divergent := commitFile(t, ctx, dir, "branch.txt", "branch", "branch", base)
+
+	ok, err := IsAncestor(ctx, dir, divergent, main)
+	if err != nil {
+		t.Fatalf("is ancestor: %v", err)
+	}
+	if ok {
+		t.Fatal("expected divergent commit not to be ancestor of main commit")
+	}
+}
+
+func TestIsAncestor_BadOID(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	base := commitFile(t, ctx, dir, "base.txt", "base", "base")
+
+	ok, err := IsAncestor(ctx, dir, "not-an-oid", base)
+	if err == nil {
+		t.Fatal("expected malformed oid to return an error")
+	}
+	if ok {
+		t.Fatal("expected malformed oid not to be reported as ancestor")
+	}
+	var gerr *Error
+	if !errors.As(err, &gerr) {
+		t.Fatalf("expected *git.Error, got %T: %v", err, err)
+	}
+	if gerr.ExitCode == 1 {
+		t.Fatalf("expected bad oid to be treated as git failure, got exit %d", gerr.ExitCode)
+	}
+}
+
+func TestIsAncestor_RepoMissing(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	missingRepo := filepath.Join(t.TempDir(), "missing")
+
+	ok, err := IsAncestor(ctx, missingRepo, "HEAD", "HEAD")
+	if err == nil {
+		t.Fatal("expected missing repo to return an error")
+	}
+	if ok {
+		t.Fatal("expected missing repo not to be reported as ancestor")
+	}
+	var gerr *Error
+	if !errors.As(err, &gerr) {
+		t.Fatalf("expected *git.Error, got %T: %v", err, err)
+	}
+}
+
+func commitFile(t *testing.T, ctx context.Context, dir, path, content, message string, parents ...string) string {
+	t.Helper()
+	blob, err := HashObjectStdin(ctx, dir, []byte(content))
+	if err != nil {
+		t.Fatalf("hash %s: %v", path, err)
+	}
+	tree, err := Mktree(ctx, dir, []MktreeEntry{
+		{Mode: RegularFileMode, Type: "blob", OID: blob, Path: path},
+	})
+	if err != nil {
+		t.Fatalf("mktree %s: %v", path, err)
+	}
+	commit, err := CommitTree(ctx, dir, tree, message, parents...)
+	if err != nil {
+		t.Fatalf("commit-tree %s: %v", path, err)
+	}
+	return commit
 }
