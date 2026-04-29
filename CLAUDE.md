@@ -59,10 +59,16 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 
 - **`shadow_paths` is keyed by `(branch_ref, branch_generation)`.** Whenever the generation bumps (Diverged transition) or branch ref changes, you MUST reseed via `BootstrapShadow(ctx, repoDir, db, cctx)` or the next capture pass classifies every tracked file as a phantom `create`. Idempotent — guarded by COUNT(*) check. Successful reseeds prune old generations via `ACD_SHADOW_RETENTION_GENERATIONS` (default `1` prior generation).
 - **Branch-generation token**: format `rev:<sha> <branch-ref>` for an attached HEAD, `rev:<sha>` for detached HEAD, and `missing <branch-ref>` when an attached ref has no commit. Fast-forward (newHead descends from prevHead on the same branch ref) keeps generation; Diverged (reset/rebase/branch-switch/same-SHA ref switch) bumps it. Persisted in `daemon_meta` as `branch.generation` + `branch.head` + `branch_token`.
+- **Legacy branch tokens without a ref name force Diverged on upgrade.** A persisted `rev:<sha>` or bare `missing` token followed by an attached `rev:<sha> <branch-ref>` or `missing <branch-ref>` is treated as Diverged even when the SHA is unchanged. This intentionally reseeds shadow state and avoids replaying stale queued rows onto a newly identified branch.
 - **Detached HEAD pauses capture/replay.** `acd start` refuses to register on detached HEAD; the daemon stores `detached_head_paused` and leaves `CaptureContext.BranchRef` empty until reattached. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
+- **Git operations pause capture/replay.** `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, and `BISECT_LOG` in the git dir set `operation_in_progress`; the daemon skips branch-token, capture, and replay work until the marker clears.
 - **Replay uses an isolated per-pass scratch index** (`<gitDir>/acd/replay-*.index`) seeded from `cctx.BaseHead`. Helper: `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)`. Never inspect the live repo index for queued history.
+- **Replay CAS targets literal `HEAD`.** The replay path calls `git update-ref HEAD <new> <old>` through `git.UpdateRef`; literal `HEAD` must dereference to the worktree's active branch, while named refs continue to use `--no-deref`. This keeps linked worktrees and same-SHA branch switches anchored to the current worktree.
 - **`blocked_conflict` is terminal and forms a seq barrier.** Set via `state.MarkEventBlocked` (atomic update of `capture_events` + `publish_state`). Daemon never retries. `PendingEvents` hides later pending rows for the same `(branch_ref, branch_generation)` behind any earlier `blocked_conflict` or `failed` row, so downstream events do NOT leapfrog a broken predecessor across replay passes. Terminal rows older than retention are pruned only when they are no longer the active barrier.
+- **Diverged drops stale pending rows only.** On Diverged, delete `pending` capture events for the previous branch generation. Do not delete `blocked_conflict`, `failed`, or `published` rows; those remain operator-visible.
+- **Replay conflict metadata is structured.** `daemon_meta.last_replay_conflict` stores JSON with `ts`, `seq`, `error_class`, `expected_sha`, `actual_sha`, `ref`, `path`, and `message`. `last_replay_conflict_legacy` mirrors the old single-line string for backward-compatible tooling.
 - **AI diff text is opt-in.** By default providers receive empty `DiffText`; `ACD_AI_SEND_DIFF=1` enables redacted captured diffs built from `before_oid`/`after_oid` blobs (`internal/daemon/message.go::BuildOpsDiff`). Deterministic provider declares `NeedsDiff=false` and skips reconstruction. Diff rendering is capped during construction at `DiffCap` and survives live worktree changes after capture.
+- **Trace logging is opt-in and best-effort.** `ACD_TRACE=1` writes JSONL decision records to `<gitDir>/acd/trace/` or `ACD_TRACE_DIR`. Trace writes never block or abort capture/replay.
 
 ## Known issues / flaky tests
 
@@ -87,6 +93,10 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 ## Recovery / cleanup
 
 ```bash
+# Inspect the current anchor, blocked histogram, and recent blockers
+acd diagnose --repo .
+acd diagnose --repo . --json
+
 # Inspect event states
 sqlite3 .git/acd/state.db "SELECT state, COUNT(*) FROM capture_events GROUP BY state;"
 
@@ -95,6 +105,46 @@ sqlite3 .git/acd/state.db "SELECT seq, operation, path, substr(error,1,100) FROM
 
 # Drop blocked rows (terminal, safe to delete)
 sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"
+```
+
+### Incident recovery cookbook
+
+Use the built-in recovery flow before editing SQLite by hand:
+
+```bash
+# 1. Confirm the current anchor and blocker shape
+acd diagnose --repo . --json
+
+# 2. Preview the recovery plan; this must not mutate state.db
+acd recover --repo . --auto --dry-run --json
+
+# 3. Apply only after reading the plan. A byte-for-byte backup is created as
+#    .git/acd/state.db.recover-<timestamp>.
+acd recover --repo . --auto --yes
+
+# 4. Wake the daemon and inspect the queue
+acd wake --repo . --session-id <session>
+acd status --repo .
+```
+
+The original 145-event incident pattern is: `daemon_state.branch_ref` and queued `capture_events.branch_ref` point at a stale branch, while `git symbolic-ref HEAD` points at the active branch. `acd recover` retargets pending/blocked rows to the current attached branch and generation, resets `blocked_conflict` rows to `pending`, clears stale replay/pause metadata, and refuses to run while the daemon PID is alive.
+
+## Environment knobs
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable JSONL trace logging. |
+| `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides the trace output directory. |
+| `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
+| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
+| `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
+
+### Trace log format
+
+Trace files rotate daily as `YYYY-MM-DD.jsonl`. Every line is JSON:
+
+```json
+{"ts":"2026-04-29T12:34:56.000000789Z","repo":"/repo/acd","branch_ref":"refs/heads/main","head_sha":"dddddddddddddddddddddddddddddddddddddddd","event_class":"replay.commit","decision":"published","reason":"event published","input":{"operation":"create","path":"file.txt"},"output":{"commit":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","parent":"dddddddddddddddddddddddddddddddddddddddd"},"error":"","seq":4,"generation":7}
 ```
 
 ## Release one-liners
