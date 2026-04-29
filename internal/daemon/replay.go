@@ -24,6 +24,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // MessageFn produces a commit message for one event + its ops. Phase 1
@@ -56,6 +57,8 @@ type ReplayOpts struct {
 
 	// Limit caps the number of events drained per call. 0 = no limit.
 	Limit int
+	// Trace receives best-effort decision records. Nil disables tracing.
+	Trace acdtrace.Logger
 }
 
 // ReplaySummary describes one drain.
@@ -172,6 +175,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			return sum, nil
 		}
@@ -188,6 +192,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, "no ops attached", nil)
 			sum.Failed++
 			continue
 		}
@@ -200,6 +205,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, msg, nil)
 			sum.Failed++
 			continue
 		}
@@ -223,6 +229,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			// Halt the batch: subsequent events were captured assuming
 			// this one would land first. Running them now would replay on
@@ -239,6 +246,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			// Halt the batch: a commit-build failure leaves `parent`
 			// pointing at the prior commit, but later events will still
@@ -271,6 +279,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
 			}, activeCtx)
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, map[string]any{
+				"expected_sha": expected,
+				"actual_sha":   actual,
+			})
 			sum.Conflicts++
 			return sum, nil
 		}
@@ -298,6 +310,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.Published++
+		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
+			"commit": commitOID,
+			"parent": oldOID,
+		})
 	}
 
 	return sum, nil
@@ -603,6 +619,33 @@ func parseUpdateRefCASReason(reason string) (actual, expected string) {
 		expected = expectedFields[0]
 	}
 	return actual, expected
+}
+
+func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, ev state.CaptureEvent, class, decision, reason string, output map[string]any) {
+	input := map[string]any{
+		"operation": ev.Operation,
+		"path":      ev.Path,
+	}
+	recordTrace(logger, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: class,
+		Decision:   decision,
+		Reason:     reason,
+		Input:      input,
+		Output:     output,
+		Error:      traceError(decision, reason),
+		Seq:        ev.Seq,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceError(decision, reason string) string {
+	if decision == state.EventStatePublished || reason == "" {
+		return ""
+	}
+	return reason
 }
 
 // checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty
