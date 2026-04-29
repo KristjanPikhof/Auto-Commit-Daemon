@@ -6,14 +6,12 @@ package integration_test
 // adapter_e2e_test.go — §7.9 / §9 end-to-end coverage. Each subtest renders a
 // harness's snippet via `acd init <harness>`, executes the start-equivalent
 // command(s) under a fake harness env (mock CLAUDE_PROJECT_DIR /
-// OPENCODE_SESSION_ID / PI_SESSION_ID / etc., piping JSON through jq where
-// the snippet expects it), and asserts the daemon's per-repo state.db has
-// the expected daemon_clients row (session_id + harness). Then runs the
-// stop-equivalent command (or `acd stop --force` fallback) so the daemon
-// shuts down cleanly between subtests.
+// OPENCODE_SESSION_ID / PI_SESSION_ID / etc.), and asserts the daemon's
+// per-repo state.db has the expected daemon_clients row (session_id + harness).
+// Then runs the stop-equivalent command (or `acd stop --force` fallback) so
+// the daemon shuts down cleanly between subtests.
 //
-// Skip rules: bash missing → skip the file; jq missing → skip the subtests
-// that pipe through jq (claude-code, codex); Windows → skip the file.
+// Skip rules: bash missing → skip the file; Windows → skip the file.
 
 import (
 	"context"
