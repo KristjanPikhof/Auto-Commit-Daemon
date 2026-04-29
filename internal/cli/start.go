@@ -43,7 +43,9 @@ type startResult struct {
 // Returns the spawned PID (or 0 if the spawn was a no-op stub).
 var spawnDaemon = defaultSpawnDaemon
 
-var daemonSpawnPollTimeout = 3 * time.Second
+const defaultDaemonSpawnPollTimeout = 3 * time.Second
+
+var daemonSpawnPollTimeout = defaultDaemonSpawnPollTimeout
 var daemonSpawnPollInterval = 50 * time.Millisecond
 var afterDaemonSpawnPollDeadline func(context.Context, *state.DB)
 
@@ -171,6 +173,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}); err != nil {
 		return fmt.Errorf("acd start: register client: %w", err)
 	}
+	registeredClients, _ := state.CountClients(ctx, db)
 
 	// Detect daemon liveness: PID alive AND heartbeat fresh.
 	st, _, err := state.LoadDaemonState(ctx, db)
@@ -203,7 +206,11 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		// Poll daemon_state.pid for up to ~3s. Tests inject a stub
 		// spawnDaemon that stamps the row synchronously, so the loop
 		// usually exits on the first iteration.
-		deadline := time.Now().Add(daemonSpawnPollTimeout)
+		pollTimeout := daemonSpawnPollTimeout
+		if registeredClients > 1 && pollTimeout == defaultDaemonSpawnPollTimeout {
+			pollTimeout = 5 * time.Second
+		}
+		deadline := time.Now().Add(pollTimeout)
 		for time.Now().Before(deadline) {
 			st, _, _ = state.LoadDaemonState(ctx, db)
 			if st.PID > 0 && st.Mode != "stopped" {
@@ -223,6 +230,9 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		}
 		if daemonPID == 0 {
 			daemonPID = pid // fall back to the spawned PID
+		}
+		if pid > 0 && daemonPID > 0 && daemonPID != pid {
+			started = false
 		}
 	}
 
