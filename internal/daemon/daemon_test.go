@@ -630,6 +630,72 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	}
 }
 
+func TestPruneCaptureEvents_DropsOldTerminalRowsWhenNotBarriers(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	appendEvent := func(path, branch, stateName string, capturedTS float64) int64 {
+		t.Helper()
+		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: 1,
+			BaseHead:         "deadbeef",
+			Operation:        "create",
+			Path:             path,
+			Fidelity:         "full",
+			CapturedTS:       capturedTS,
+			State:            stateName,
+		}, []state.CaptureOp{{
+			Op: "create", Path: path, Fidelity: "full",
+			AfterMode: sql.NullString{String: "100644", Valid: true},
+			AfterOID:  sql.NullString{String: "abcd", Valid: true},
+		}})
+		if err != nil {
+			t.Fatalf("insert %s: %v", path, err)
+		}
+		return seq
+	}
+
+	oldBlocked := appendEvent("old-blocked.txt", "refs/heads/main", state.EventStateBlockedConflict, 1)
+	oldFailed := appendEvent("old-failed.txt", "refs/heads/failed", state.EventStateFailed, 1)
+	barrier := appendEvent("barrier.txt", "refs/heads/barrier", state.EventStateBlockedConflict, 1)
+	pendingBehindBarrier := appendEvent("pending.txt", "refs/heads/barrier", state.EventStatePending, 1)
+	freshFailed := appendEvent("fresh-failed.txt", "refs/heads/fresh", state.EventStateFailed, float64(time.Now().Unix()))
+
+	n, err := PruneCaptureEvents(ctx, f.db, time.Now(), 1*time.Second)
+	if err != nil {
+		t.Fatalf("PruneCaptureEvents: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("pruned=%d want 2", n)
+	}
+
+	rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query remaining: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan remaining: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate remaining: %v", err)
+	}
+	if remaining[oldBlocked] || remaining[oldFailed] {
+		t.Fatalf("old terminal rows survived: remaining=%v", remaining)
+	}
+	for _, seq := range []int64{barrier, pendingBehindBarrier, freshFailed} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
+		}
+	}
+}
+
 // TestRun_RollupHookAdvancesLastDay: the daemon loop's daily rollup hook
 // (§8.10) fires once per RollupInterval, attributes a synthetic event to a
 // completed UTC day, and advances rollup.last_day. This test confirms the
