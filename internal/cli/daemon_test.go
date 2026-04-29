@@ -74,28 +74,6 @@ func TestBuildDaemonRunOptions_FsnotifyEnvToggle(t *testing.T) {
 	}
 }
 
-// TestBuildDaemonRunOptions_BadRepoLogsAndDegrades verifies that a
-// non-existent repo path causes RepoHash to be empty (since
-// paths.RepoHash hashes a real path) but the helper does NOT panic and
-// records a diagnostic on errOut so the daemon can still boot. Stats
-// will be silently disabled — the run loop tolerates this.
-func TestBuildDaemonRunOptions_BadRepoLogsAndDegrades(t *testing.T) {
-	withIsolatedHome(t)
-	_, _, db := makeRepoStateDB(t)
-
-	var errBuf bytes.Buffer
-	// /nonexistent guarantees repo-hash failure on every supported
-	// platform; resolve-paths still succeeds because it depends only
-	// on $HOME (which withIsolatedHome stamps).
-	opts := buildDaemonRunOptions("/nonexistent/path/for/test", "/nonexistent/path/for/test/.git", db, &errBuf)
-
-	if opts.CentralStatsDBPath == "" {
-		t.Fatalf("CentralStatsDBPath should still resolve from isolated home, got empty (errOut=%q)", errBuf.String())
-	}
-	if opts.RepoHash != "" {
-		t.Fatalf("RepoHash should be empty when repo path resolution fails, got %q", opts.RepoHash)
-	}
-	if !strings.Contains(errBuf.String(), "repo hash") {
-		t.Fatalf("expected errOut to mention repo hash failure, got %q", errBuf.String())
-	}
-}
+// (paths.RepoHash is a pure path hash and does not stat the filesystem,
+// so a "bad repo path" degrade test isn't meaningful here. RepoHash
+// failure paths are exercised in internal/paths.)
