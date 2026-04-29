@@ -100,6 +100,28 @@ func adapterEnv(t *testing.T, binDir string, extras ...string) []string {
 	return envWith(base, extras...)
 }
 
+func prependPath(env []string, dir string) []string {
+	out := append([]string{}, env...)
+	for i, kv := range out {
+		if strings.HasPrefix(kv, "PATH=") {
+			out[i] = "PATH=" + dir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+			return out
+		}
+	}
+	return append(out, "PATH="+dir)
+}
+
+func addFailingJQ(t *testing.T, env []string) []string {
+	t.Helper()
+	fakeBin := t.TempDir()
+	jq := filepath.Join(fakeBin, "jq")
+	writeFile(t, jq, "#!/usr/bin/env bash\necho jq should not be used >&2\nexit 127\n")
+	if err := os.Chmod(jq, 0o755); err != nil {
+		t.Fatalf("chmod fake jq: %v", err)
+	}
+	return prependPath(env, fakeBin)
+}
+
 // runBash runs `bash -c command` with the given env and stdin. Returns
 // stdout, stderr, exit code.
 func runBash(t *testing.T, ctx context.Context, env []string, stdin, command string) ExecResult {
