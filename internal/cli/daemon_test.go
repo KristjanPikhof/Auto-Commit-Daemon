@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"os"
-	"strings"
 	"testing"
 )
 
