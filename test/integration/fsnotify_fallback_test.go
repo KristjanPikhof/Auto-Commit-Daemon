@@ -196,6 +196,53 @@ func TestFsnotify_DisabledByEnvFallsBackToPoll(t *testing.T) {
 	waitForCommitContaining(t, repo, "poll-only.txt", 8*time.Second)
 }
 
+// TestFsnotify_RuntimeBudgetExceededFallsBackToPoll starts below the watch
+// budget, then creates a nested directory tree while the daemon is running.
+// The dynamic re-watch path must detect the budget overshoot and degrade to
+// poll mode without losing later capture/replay work.
+func TestFsnotify_RuntimeBudgetExceededFallsBackToPoll(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not supported on windows in v1")
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required for daemon_meta probes")
+	}
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	extra := []string{
+		"ACD_FSNOTIFY_ENABLED=1",
+		"ACD_MAX_INOTIFY_WATCHES=3",
+	}
+	startSessionJSON(t, ctx, env, repo, "fsn-runtime-budget", "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+	waitMetaValue(t, repo, "fsnotify.mode", "fsnotify", 5*time.Second)
+
+	if err := os.Mkdir(filepath.Join(repo, "runtime-tree"), 0o755); err != nil {
+		t.Fatalf("mkdir runtime-tree: %v", err)
+	}
+	waitFor(t, "runtime-tree watch registered", 5*time.Second, func() bool {
+		return readDaemonMetaKey(repo, "fsnotify.watch_count") == "2"
+	})
+
+	if err := os.MkdirAll(filepath.Join(repo, "runtime-tree", "a", "b", "c"), 0o755); err != nil {
+		t.Fatalf("mkdir runtime nested tree: %v", err)
+	}
+	waitMetaValue(t, repo, "fsnotify.mode", "poll", 5*time.Second)
+	if got := readDaemonMetaKey(repo, "fsnotify.fallback_reason"); got != "watch_budget_exceeded" {
+		t.Fatalf("fsnotify.fallback_reason=%q want watch_budget_exceeded", got)
+	}
+
+	writeFile(t, filepath.Join(repo, "after-runtime-fallback.txt"), "poll after runtime fallback\n")
+	wakeSession(t, ctx, envWith(env, extra...), repo, "fsn-runtime-budget")
+	waitForCommitContaining(t, repo, "after-runtime-fallback.txt", 8*time.Second)
+}
+
 // TestFsnotify_LatencyOnSmallRepo: with fsnotify enabled (no overrides) on
 // a small repo, a single file write should land as a commit quickly. We
 // gate the strict 1500ms bound under ACD_PERF_TEST=1; otherwise allow up
