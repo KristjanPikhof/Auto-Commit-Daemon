@@ -503,6 +503,33 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 	fmt.Fprintf(out, "\nSensitive globs (env=%q, %d active)\n",
 		r.SensitiveGlobsEnv, len(r.SensitiveGlobsActive))
 
+	fmt.Fprintf(out, "\nInstall\n")
+	fmt.Fprintf(out, "  hooks:\n")
+	for _, h := range r.Harnesses {
+		installed := "no"
+		if h.Installed {
+			installed = "yes"
+		}
+		fmt.Fprintf(out, "    %-11s : %s (%s)\n", h.Name, installed, homeShort(h.ConfigPath))
+		if len(h.Notes) > 0 {
+			fmt.Fprintf(out, "                  notes: %s\n", strings.Join(h.Notes, "; "))
+		}
+	}
+	fmt.Fprintf(out, "  ai provider : %s\n", r.AI.Provider)
+	if r.AI.Provider == "openai-compat" {
+		fmt.Fprintf(out, "                api key set=%v\n", r.AI.APIKeySet)
+	}
+	if r.AI.ProviderCommand != "" {
+		fmt.Fprintf(out, "                command=%s found=%v", r.AI.ProviderCommand, r.AI.ProviderCommandFound)
+		if r.AI.ProviderCommandPath != "" {
+			fmt.Fprintf(out, " path=%s", r.AI.ProviderCommandPath)
+		}
+		fmt.Fprintln(out)
+	}
+	if len(r.AI.Notes) > 0 {
+		fmt.Fprintf(out, "                notes: %s\n", strings.Join(r.AI.Notes, "; "))
+	}
+
 	fmt.Fprintf(out, "\nRepos (%d):\n", len(r.Repos))
 	for _, rr := range r.Repos {
 		mode := rr.DaemonMode
@@ -515,6 +542,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		fmt.Fprintf(out, "  - %s\n", homeShort(rr.Path))
 		fmt.Fprintf(out, "      hash       : %s\n", rr.RepoHash)
 		fmt.Fprintf(out, "      daemon     : %s (pid %d, alive=%v)\n", mode, rr.DaemonPID, rr.DaemonAlive)
+		if rr.DaemonProcessCount > 0 {
+			fmt.Fprintf(out, "      processes  : %d %v\n", rr.DaemonProcessCount, rr.DaemonProcessPIDs)
+		}
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
 		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
 		if rr.BlockedConflicts > 0 {
