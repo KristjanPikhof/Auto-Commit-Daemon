@@ -115,6 +115,9 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if err != nil {
 		return fmt.Errorf("acd start: resolve git dir: %w", err)
 	}
+	if err := ensureAttachedHEAD(ctx, repo); err != nil {
+		return err
+	}
 
 	// Brief control.lock for the daemon_clients read-modify-write window.
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
@@ -271,6 +274,17 @@ func resolveGitDir(ctx context.Context, repo string) (string, error) {
 		return fallback, nil
 	}
 	return "", err
+}
+
+func ensureAttachedHEAD(ctx context.Context, repo string) error {
+	branchRef, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("acd start: resolve HEAD branch: %w", err)
+	}
+	if branchRef == "" {
+		return errors.New("acd start: detached HEAD is not supported; checkout a branch before starting")
+	}
+	return nil
 }
 
 // fingerprintToken renders a Fingerprint into the canonical persisted form
