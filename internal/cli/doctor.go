@@ -263,7 +263,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		}
 
 		if name == "codex" {
-			legacyPath := expandHomeCLI("~/.codex/hooks.json")
+			home, _ := os.UserHomeDir()
+			legacyPath := filepath.Join(home, ".codex", "hooks.json")
 			if fileExists(legacyPath) {
 				hr.Notes = append(hr.Notes, "legacy ~/.codex/hooks.json exists; Codex also loads ~/.codex/config.toml, remove stale hooks.json after installing the toml snippet")
 			}
