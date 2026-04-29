@@ -21,6 +21,8 @@ import (
 )
 
 func TestRecoverReplaysIncidentFixture(t *testing.T) {
+	buildAcdBinary(t)
+
 	repo := tempRepo(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
