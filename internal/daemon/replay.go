@@ -162,8 +162,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
 			return sum, err
 		} else if reason != "" {
+			errorClass := replayErrorValidation
+			if strings.Contains(reason, "branch ref mismatch") {
+				errorClass = replayErrorRefMissing
+			}
 			recordConflict(ctx, db, ev, replayIssue{
-				ErrorClass: replayErrorValidation,
+				ErrorClass: errorClass,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
@@ -590,7 +594,10 @@ func parseUpdateRefCASReason(reason string) (actual, expected string) {
 	if actualStart == -1 || expectedStart == -1 || expectedStart <= actualStart {
 		return "", ""
 	}
-	actual = strings.Fields(reason[actualStart+len(actualMarker) : expectedStart])[0]
+	actualFields := strings.Fields(reason[actualStart+len(actualMarker) : expectedStart])
+	if len(actualFields) > 0 {
+		actual = actualFields[0]
+	}
 	expectedFields := strings.Fields(reason[expectedStart+len(expectedMarker):])
 	if len(expectedFields) > 0 {
 		expected = expectedFields[0]
