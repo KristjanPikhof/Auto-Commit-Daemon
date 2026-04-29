@@ -140,7 +140,8 @@ func waitForDaemonMode(t *testing.T, db *state.DB, mode string, timeout time.Dur
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if daemonMode(t, db) == mode {
+		st, _, err := state.LoadDaemonState(context.Background(), db)
+		if err == nil && st.Mode == mode {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -172,15 +173,15 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 		runErr = Run(ctx, Options{
 			RepoPath:    f.dir,
 			GitDir:      f.gitDir,
-				DB:          f.db,
-				Scheduler:   fastScheduler(),
-				BootGrace:   30 * time.Second, // never trigger self-terminate
-				MessageFn:    DeterministicMessage,
-				WakeCh:      wakeCh,
-				ShutdownCh:  shutdownCh,
-				SkipSignals: true,
-			})
-		}()
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second, // never trigger self-terminate
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
@@ -313,6 +314,108 @@ func TestRun_DetachedHeadPausesCaptureReplay(t *testing.T) {
 	}
 }
 
+func TestRun_PauseDuringGitOperation(t *testing.T) {
+	tests := []struct {
+		marker string
+		name   string
+		dir    bool
+	}{
+		{marker: "rebase-merge", name: "rebase-merge", dir: true},
+		{marker: "rebase-apply", name: "rebase-apply", dir: true},
+		{marker: "MERGE_HEAD", name: "merge"},
+		{marker: "CHERRY_PICK_HEAD", name: "cherry-pick"},
+		{marker: "BISECT_LOG", name: "bisect"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.marker, func(t *testing.T) {
+			f := newDaemonFixture(t)
+			registerLiveClient(t, f.db)
+			ctx := context.Background()
+
+			startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse: %v", err)
+			}
+
+			markerPath := filepath.Join(f.gitDir, tc.marker)
+			if tc.dir {
+				if err := os.Mkdir(markerPath, 0o755); err != nil {
+					t.Fatalf("create marker dir: %v", err)
+				}
+			} else if err := os.WriteFile(markerPath, []byte(startHead+"\n"), 0o644); err != nil {
+				t.Fatalf("create marker file: %v", err)
+			}
+
+			wakeCh := make(chan struct{}, 4)
+			shutdownCh := make(chan struct{}, 1)
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			var runErr error
+			go func() {
+				defer wg.Done()
+				runErr = Run(runCtx, Options{
+					RepoPath:    f.dir,
+					GitDir:      f.gitDir,
+					DB:          f.db,
+					Scheduler:   fastScheduler(),
+					BootGrace:   30 * time.Second,
+					WakeCh:      wakeCh,
+					ShutdownCh:  shutdownCh,
+					SkipSignals: true,
+				})
+			}()
+
+			waitForMetaValue(t, f.db, MetaKeyOperationInProgress, tc.name, 3*time.Second)
+
+			if err := os.WriteFile(filepath.Join(f.dir, "paused.txt"), []byte(tc.name+"\n"), 0o644); err != nil {
+				t.Fatalf("write paused: %v", err)
+			}
+			for i := 0; i < 4; i++ {
+				select {
+				case wakeCh <- struct{}{}:
+				default:
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			head, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse while paused: %v", err)
+			}
+			if head != startHead {
+				t.Fatalf("HEAD advanced while paused to %s; want %s", head, startHead)
+			}
+			var events int
+			if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+				t.Fatalf("count capture_events: %v", err)
+			}
+			if events != 0 {
+				t.Fatalf("capture_events=%d want 0 while %s marker exists", events, tc.marker)
+			}
+
+			if err := os.RemoveAll(markerPath); err != nil {
+				t.Fatalf("remove marker: %v", err)
+			}
+			wakeCh <- struct{}{}
+			newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+			if newHead == startHead {
+				t.Fatalf("HEAD did not advance after %s marker cleared", tc.marker)
+			}
+			waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+
+			cancel()
+			wg.Wait()
+			if runErr != nil {
+				t.Fatalf("Run returned %v", runErr)
+			}
+		})
+	}
+}
+
 // TestRun_WakeBurstCoalesced: many rapid wakes don't crash and only produce
 // one capture+replay cycle (idempotent — the second pass sees no changes).
 func TestRun_WakeBurstCoalesced(t *testing.T) {
@@ -336,15 +439,15 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 		_ = Run(ctx, Options{
 			RepoPath:    f.dir,
 			GitDir:      f.gitDir,
-				DB:          f.db,
-				Scheduler:   fastScheduler(),
-				BootGrace:   30 * time.Second,
-				MessageFn:    DeterministicMessage,
-				WakeCh:      wakeCh,
-				ShutdownCh:  shutdownCh,
-				SkipSignals: true,
-			})
-		}()
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
