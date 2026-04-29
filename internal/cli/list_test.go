@@ -381,3 +381,11 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 		t.Fatalf("expected slog/log warn for missing state.db, got stderr:\n%s", stderr.String())
 	}
 }
+
+func writePauseMarkerForStateDB(t *testing.T, stateDBPath string, marker pausepkg.Marker) {
+	t.Helper()
+	gitDir := filepath.Dir(filepath.Dir(stateDBPath))
+	if err := pausepkg.Write(pausepkg.Path(gitDir), marker, true); err != nil {
+		t.Fatalf("write pause marker: %v", err)
+	}
+}
