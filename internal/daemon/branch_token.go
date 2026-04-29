@@ -153,6 +153,9 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 	newMissing := tokenMissing(newToken)
 	prevBranchRef := tokenBranchRef(prevToken)
 	newBranchRef := tokenBranchRef(newToken)
+	if prevToken != "" && prevBranchRef == "" && newBranchRef != "" {
+		return TokenTransitionDiverged, nil
+	}
 	if prevBranchRef != "" && newBranchRef != "" && prevBranchRef != newBranchRef {
 		return TokenTransitionDiverged, nil
 	}
