@@ -16,7 +16,7 @@ var (
 	reJWT              = regexp.MustCompile(`\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	rePrivateKeyMarker = regexp.MustCompile(`-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----`)
 	reAssignedSecret   = regexp.MustCompile(`(?i)\b([A-Z0-9_.-]*(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|private[_-]?key)[A-Z0-9_.-]*\s*[:=]\s*["']?)([^"'\s#]{8,})(["']?)`)
-	reHighEntropy      = regexp.MustCompile(`\b[A-Za-z0-9_+/=.-]{32,}\b`)
+	reHighEntropy      = regexp.MustCompile(`[A-Za-z0-9_+/=.-]{32,}`)
 )
 
 // RedactDiffSecrets scrubs obvious credential shapes from unified diff text
