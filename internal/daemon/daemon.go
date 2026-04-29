@@ -360,7 +360,7 @@ func Run(ctx context.Context, opts Options) error {
 	// already at HEAD don't generate spurious creates.
 		if cctx.BranchRef != "" {
 			if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-				_ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+				_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 			}
 		}
 		if cctx.BranchRef != "" && cctx.BaseHead != "" {
@@ -546,7 +546,7 @@ func Run(ctx context.Context, opts Options) error {
 						"err", err.Error())
 				}
 				if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-					_ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 				}
 				if headOID != "" {
 					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
