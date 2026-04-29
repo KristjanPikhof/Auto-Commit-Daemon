@@ -51,6 +51,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -361,6 +362,7 @@ type pluginSession struct {
 // startPlugin spawns the binary and launches the owner goroutine.
 func startPlugin(name, binary string, extraEnv []string, stderr io.Writer, logger *slog.Logger) (*pluginSession, error) {
 	cmd := exec.Command(binary)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if len(extraEnv) > 0 {
 		// Compose: parent env + extras. We intentionally do not
 		// strip parent env — plugin authors may rely on standard
@@ -578,7 +580,9 @@ func bytesContainNewline(b []byte) bool {
 // multiple times; subsequent calls are no-ops once the process has exited.
 func (s *pluginSession) kill() {
 	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
+		if err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			_ = s.cmd.Process.Kill()
+		}
 	}
 	_ = s.stdin.Close()
 	_ = s.stdout.Close()
