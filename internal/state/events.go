@@ -305,13 +305,6 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 // PrunePublishedEventsBefore deletes capture_events rows whose state is
 // 'published' (terminal success) AND whose captured_ts is strictly older
 // than cutoff. Returns the number of rows removed.
-//
-// 'failed' rows are intentionally retained so operators can inspect why a
-// replay failed. 'pending' rows are retained so an unrecoverable backlog
-// is not silently swept under the rug.
-//
-// CASCADE on the capture_ops foreign key drops the matching ops rows in
-// the same transaction.
 func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
 	res, err := d.conn.ExecContext(ctx,
 		`DELETE FROM capture_events WHERE state = 'published' AND captured_ts < ?`,
@@ -323,6 +316,36 @@ func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("state: prune events rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// PruneTerminalEventsBefore deletes stale terminal failure rows whose state is
+// 'blocked_conflict' or 'failed'. Rows that still form a replay barrier are
+// preserved: if a later pending event exists for the same branch ref and
+// generation, deleting the terminal predecessor would let that pending event
+// leapfrog a broken replay history.
+//
+// CASCADE on capture_ops drops matching op rows in the same transaction.
+func PruneTerminalEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
+	res, err := d.conn.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE state IN ('blocked_conflict', 'failed')
+  AND captured_ts < ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events pending
+      WHERE pending.branch_ref = capture_events.branch_ref
+        AND pending.branch_generation = capture_events.branch_generation
+        AND pending.seq > capture_events.seq
+        AND pending.state = 'pending'
+  )`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("state: prune terminal events: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: prune terminal events rows: %w", err)
 	}
 	return int(n), nil
 }
