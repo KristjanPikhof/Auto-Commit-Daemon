@@ -70,6 +70,7 @@ func TestAdapterE2E(t *testing.T) {
 			t.Skip("codex snippet requires jq; not on PATH")
 		}
 		runCodexE2E(t, bin)
+		runCodexMissingAcdWritesHookLog(t)
 	})
 	t.Run("opencode", func(t *testing.T) {
 		runOpencodeE2E(t, bin)
@@ -434,14 +435,14 @@ func runCodexE2E(t *testing.T, bin string) {
 	sessionID := "e2e-codex"
 	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
 
-	// Codex snippet uses $PWD; force the bash subprocess into the repo.
-	env := adapterEnv(t, binDir)
+	// Codex provides the project directory separately from the hook process
+	// cwd; keep the bash subprocess outside repo to prove the snippet honors it.
+	env := adapterEnv(t, binDir, "CODEX_PROJECT_DIR="+repo)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := "cd " + shellQuote(repo) + " && " + startHook.Command
-	res := runBash(t, ctx, env, stdin, cmd)
+	res := runBash(t, ctx, env, stdin, startHook.Command)
 	if res.ExitCode != 0 {
 		t.Fatalf("codex SessionStart exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
@@ -455,7 +456,7 @@ func runCodexE2E(t *testing.T, bin string) {
 	// Production cleanup relies on watch_pid death + refcount sweep; in the
 	// test we drive shutdown explicitly with `acd stop --force`.
 	stopRes := runBash(t, ctx, env, "",
-		"cd "+shellQuote(repo)+" && acd stop --session-id "+shellQuote(sessionID)+
+		"acd stop --session-id "+shellQuote(sessionID)+
 			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
 	if stopRes.ExitCode != 0 {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
@@ -464,6 +465,58 @@ func runCodexE2E(t *testing.T, bin string) {
 	waitFor(t, "codex daemon mode==stopped", 10*time.Second, func() bool {
 		return readDaemonStateMode(repo) == "stopped"
 	})
+}
+
+func runCodexMissingAcdWritesHookLog(t *testing.T) {
+	body := readSnippet(t, "codex/config.snippet.toml")
+	hooks := parseCodexSnippet(t, body)
+	startHook := pickHookByEvent(t, hooks, "SessionStart")
+
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("codex missing-acd stderr test requires jq; not on PATH")
+	}
+
+	fakeBin := t.TempDir()
+	if err := os.Symlink(jq, filepath.Join(fakeBin, "jq")); err != nil {
+		t.Fatalf("symlink jq: %v", err)
+	}
+
+	base := withIsolatedHome(t)
+	home := ""
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		t.Fatal("isolated HOME missing from env")
+	}
+
+	env := envWith(base,
+		"PATH="+fakeBin,
+		"CODEX_PROJECT_DIR="+t.TempDir(),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stdin := `{"session_id":"e2e-codex-missing-acd"}`
+	res := runBash(t, ctx, env, stdin, startHook.Command)
+	if res.ExitCode == 0 {
+		t.Fatalf("codex SessionStart without acd should fail\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
+	}
+	if strings.TrimSpace(res.Stdout) != "{}" {
+		t.Fatalf("codex failure path should still emit JSON stdout, got %q", res.Stdout)
+	}
+
+	logPath := filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
+	logBody, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read codex hook log %s: %v", logPath, err)
+	}
+	if !strings.Contains(string(logBody), "acd") {
+		t.Fatalf("codex hook log missing acd failure, got:\n%s", logBody)
+	}
 }
 
 func runOpencodeE2E(t *testing.T, bin string) {
