@@ -468,6 +468,89 @@ func TestReplay_IdempotentPublishWhenParallelDeleteAlreadyLanded(t *testing.T) {
 	}
 }
 
+func TestReplay_IdempotentPublishReseedsIndexForChainedEvents(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	blobA, err := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	if err != nil {
+		t.Fatalf("hash A: %v", err)
+	}
+	blobB, err := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	if err != nil {
+		t.Fatalf("hash B: %v", err)
+	}
+	blobC, err := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	if err != nil {
+		t.Fatalf("hash C: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "chain.txt", blobA, "seed A")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	first := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "chain.txt",
+		Fidelity:         "rescan",
+	}
+	firstOp := state.CaptureOp{
+		Op:         "modify",
+		Path:       "chain.txt",
+		BeforeOID:  sql.NullString{String: blobA, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blobB, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, first, []state.CaptureOp{firstOp}); err != nil {
+		t.Fatalf("AppendCaptureEvent first: %v", err)
+	}
+
+	second := first
+	second.BaseHead = base
+	second.Path = "chain.txt"
+	secondOp := state.CaptureOp{
+		Op:         "modify",
+		Path:       "chain.txt",
+		BeforeOID:  sql.NullString{String: blobB, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blobC, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, second, []state.CaptureOp{secondOp}); err != nil {
+		t.Fatalf("AppendCaptureEvent second: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "chain.txt", blobB, "external B", base)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	headBlob, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "chain.txt")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD: %v", err)
+	}
+	if headBlob != blobC {
+		t.Fatalf("HEAD blob=%s want C blob %s", headBlob, blobC)
+	}
+}
+
 func TestReplay_RealConflictStillBlocks(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
