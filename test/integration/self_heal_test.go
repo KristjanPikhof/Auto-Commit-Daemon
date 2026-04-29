@@ -23,14 +23,20 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	target := filepath.Join(repo, "parallel.txt")
+	writeFile(t, target, "before\n")
+	baselineHead := gitCommitAll(t, repo, "baseline parallel file", "parallel.txt")
+
 	startSession(t, ctx, env, repo, "selfheal-parallel", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
 
 	dbPath := selfHealStateDB(repo)
 	initialHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	if initialHead != baselineHead {
+		t.Fatalf("initial HEAD=%s want baseline %s", initialHead, baselineHead)
+	}
 
 	pauseReplay(t, ctx, env, repo, "parallel committer test")
-	target := filepath.Join(repo, "parallel.txt")
 	writeFile(t, target, "same change\n")
 	wakeSession(t, ctx, env, repo, "selfheal-parallel")
 	waitForEventState(t, dbPath, "parallel.txt", "pending", 8*time.Second)
@@ -55,9 +61,9 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	if head != externalHead {
 		t.Fatalf("HEAD=%s want unchanged external commit %s", head, externalHead)
 	}
-	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "2" {
+	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "3" {
 		log := runGitOK(t, repo, "log", "--oneline", "--decorate")
-		t.Fatalf("commit count=%s want 2 (seed + external only)\nlog:\n%s", count, log)
+		t.Fatalf("commit count=%s want 3 (seed + baseline + external only)\nlog:\n%s", count, log)
 	}
 }
 
