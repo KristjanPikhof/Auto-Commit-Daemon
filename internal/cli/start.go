@@ -43,6 +43,10 @@ type startResult struct {
 // Returns the spawned PID (or 0 if the spawn was a no-op stub).
 var spawnDaemon = defaultSpawnDaemon
 
+var daemonSpawnPollTimeout = 3 * time.Second
+var daemonSpawnPollInterval = 50 * time.Millisecond
+var afterDaemonSpawnPollDeadline func(context.Context, *state.DB)
+
 // defaultSpawnDaemon fork-execs a detached `acd daemon run --repo <abs>`
 // process. Stdin/stdout/stderr point to /dev/null so the parent can exit
 // cleanly without holding the child's pipes; the daemon configures its own
@@ -136,17 +140,14 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	defer func() { _ = db.Close() }()
 
-	// watch_pid defaults to PPID when running from a shell hook; pass 0
-	// to opt out (per §7.2 flag semantics).
-	if watchPID == 0 {
-		watchPID = os.Getppid()
-	}
 	var watchPIDNull sql.NullInt64
 	var watchFPNull sql.NullString
 	if watchPID > 0 {
-		watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
-		if fp, ferr := identity.Capture(watchPID); ferr == nil && !fp.Empty() {
-			watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
+		if identity.AliveContext(ctx, watchPID) {
+			watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
+			if fp, ferr := identity.CaptureContext(ctx, watchPID); ferr == nil && !fp.Empty() {
+				watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
+			}
 		}
 	}
 
@@ -178,7 +179,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	daemonPID := 0
 	daemonAlive := false
-	if st.PID > 0 && identity.Alive(st.PID) {
+	if st.PID > 0 && identity.AliveContext(ctx, st.PID) {
 		hbAge := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
 		if hbAge < clientTTL() && st.Mode != "stopped" {
 			daemonAlive = true
@@ -202,14 +203,23 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		// Poll daemon_state.pid for up to ~3s. Tests inject a stub
 		// spawnDaemon that stamps the row synchronously, so the loop
 		// usually exits on the first iteration.
-		deadline := time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(daemonSpawnPollTimeout)
 		for time.Now().Before(deadline) {
 			st, _, _ = state.LoadDaemonState(ctx, db)
 			if st.PID > 0 && st.Mode != "stopped" {
 				daemonPID = st.PID
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(daemonSpawnPollInterval)
+		}
+		if daemonPID == 0 {
+			if afterDaemonSpawnPollDeadline != nil {
+				afterDaemonSpawnPollDeadline(ctx, db)
+			}
+			st, _, _ = state.LoadDaemonState(ctx, db)
+			if st.PID > 0 && st.Mode != "stopped" {
+				daemonPID = st.PID
+			}
 		}
 		if daemonPID == 0 {
 			daemonPID = pid // fall back to the spawned PID
