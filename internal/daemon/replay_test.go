@@ -172,6 +172,117 @@ func TestReplay_Conflict(t *testing.T) {
 	}
 }
 
+func TestRecordConflict_StructuredMetadata(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "nonexistent.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "nonexistent.txt",
+		BeforeOID:  sql.NullString{String: "1111111111111111111111111111111111111111", Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: "2222222222222222222222222222222222222222", Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d want 1", sum.Conflicts)
+	}
+
+	var meta replayConflictMetadata
+	ok, err := state.MetaGetJSON(ctx, f.db, metaKeyLastReplayConflict, &meta)
+	if err != nil {
+		t.Fatalf("MetaGetJSON: %v", err)
+	}
+	if !ok {
+		t.Fatalf("%s not written", metaKeyLastReplayConflict)
+	}
+	if meta.Seq != seq {
+		t.Fatalf("meta.Seq=%d want %d", meta.Seq, seq)
+	}
+	if meta.ErrorClass != replayErrorBeforeStateMismatch {
+		t.Fatalf("meta.ErrorClass=%q want %q", meta.ErrorClass, replayErrorBeforeStateMismatch)
+	}
+	if meta.Ref != f.cctx.BranchRef {
+		t.Fatalf("meta.Ref=%q want %q", meta.Ref, f.cctx.BranchRef)
+	}
+	if meta.Path != "nonexistent.txt" {
+		t.Fatalf("meta.Path=%q want nonexistent.txt", meta.Path)
+	}
+	if meta.Message == "" || !strings.Contains(meta.Message, "missing-in-index") {
+		t.Fatalf("meta.Message=%q want missing-in-index", meta.Message)
+	}
+	if meta.TS == "" {
+		t.Fatalf("meta.TS empty")
+	}
+
+	legacy, ok, err := state.MetaGet(ctx, f.db, metaKeyLastReplayConflictLegacy)
+	if err != nil {
+		t.Fatalf("MetaGet legacy: %v", err)
+	}
+	if !ok || !strings.Contains(legacy, "seq=") || !strings.Contains(legacy, meta.Message) {
+		t.Fatalf("legacy mirror=%q", legacy)
+	}
+}
+
+func TestClassifyReplayIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{
+			name: "cas",
+			msg:  "update-ref CAS failed: cannot lock ref",
+			want: replayErrorCASFail,
+		},
+		{
+			name: "before-state",
+			msg:  "modify before-state mismatch for file.txt",
+			want: replayErrorBeforeStateMismatch,
+		},
+		{
+			name: "commit build",
+			msg:  "commit-tree: missing tree",
+			want: replayErrorCommitBuildFailure,
+		},
+		{
+			name: "ref missing",
+			msg:  "branch ref mismatch: event captured on refs/heads/a but daemon is on refs/heads/b",
+			want: replayErrorRefMissing,
+		},
+		{
+			name: "validation",
+			msg:  "missing after_oid for create file.txt",
+			want: replayErrorValidation,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyReplayIssue(tt.msg); got != tt.want {
+				t.Fatalf("classifyReplayIssue(%q)=%q want %q", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReplay_BatchHaltsOnBlockedConflict: a blocker in the middle of the
 // queue must terminally settle that event and stop the batch — every event
 // behind it stays pending so the next poll tick can re-attempt them once
