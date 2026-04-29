@@ -77,6 +77,22 @@ const openAISystemPrompt = "You are a git commit message generator. " +
 	"Subject is imperative, concise, no trailing period. " +
 	"Body (optional) is a bullet list describing what changed and why."
 
+var openAICommitMessageParameters = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"subject": map[string]any{
+			"type":        "string",
+			"description": "Imperative subject line; <= 72 chars; no trailing period.",
+		},
+		"body": map[string]any{
+			"type":        "string",
+			"description": "Optional bullet body explaining what/why; may be empty.",
+		},
+	},
+	"required":             []string{"subject"},
+	"additionalProperties": false,
+}
+
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
 // usable: Generate fills in the BaseURL/Model/HTTP/Now defaults on first
 // call. Once initialized the provider is concurrency-safe (the http
@@ -306,21 +322,7 @@ func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, er
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit a single commit message for the change described.",
-				Parameters: map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"subject": map[string]any{
-							"type":        "string",
-							"description": "Imperative subject line; <= 72 chars; no trailing period.",
-						},
-						"body": map[string]any{
-							"type":        "string",
-							"description": "Optional bullet body explaining what/why; may be empty.",
-						},
-					},
-					"required":             []string{"subject"},
-					"additionalProperties": false,
-				},
+				Parameters:  openAICommitMessageParameters,
 			},
 		}},
 		ToolChoice: toolChoice{
