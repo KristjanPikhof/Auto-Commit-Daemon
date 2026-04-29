@@ -68,6 +68,9 @@ const (
 	// MetaKeyDetachedHeadPaused is stamped when the daemon sees a detached
 	// HEAD and pauses capture/replay instead of inventing a branch ref.
 	MetaKeyDetachedHeadPaused = "detached_head_paused"
+	// MetaKeyOperationInProgress stores the active git operation name when
+	// capture/replay are paused for rebase, merge, cherry-pick, or bisect.
+	MetaKeyOperationInProgress = "operation_in_progress"
 )
 
 // TokenTransition classifies how the active branch ref moved between two
