@@ -388,6 +388,12 @@ func Run(ctx context.Context, opts Options) error {
 			branchTransitionBlocked = true
 		} else if transition == TokenTransitionDiverged {
 			prevGeneration := persistedGen
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, prevToken, currentToken, now())
+			if rewindErr != nil {
+				logger.Warn("detect startup rewind grace", "err", rewindErr.Error())
+			} else if rewindPaused {
+				logger.Info("replay paused after startup branch rewind", "until", rewindUntil)
+			}
 			persistedGen++
 			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
 			if dropErr != nil {
@@ -605,6 +611,12 @@ func Run(ctx context.Context, opts Options) error {
 		currentToken = newToken
 		if transition == TokenTransitionDiverged {
 			prevGeneration := cctx.BranchGeneration
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, oldToken, newToken, now())
+			if rewindErr != nil {
+				logger.Warn(logPrefix+" detect rewind grace failed", "err", rewindErr.Error())
+			} else if rewindPaused {
+				logger.Info("replay paused after branch rewind", "until", rewindUntil)
+			}
 			cctx.BranchGeneration++
 			logger.Info("branch generation bumped",
 				"old", oldToken, "new", newToken,
