@@ -262,7 +262,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := git.UpdateRef(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID); err != nil {
+		if err := updateReplayRefWithRetry(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
@@ -317,6 +317,105 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	return sum, nil
+}
+
+var (
+	replayUpdateRef      = git.UpdateRef
+	replayUpdateRefSleep = sleepWithContext
+)
+
+var replayUpdateRefBackoffs = []time.Duration{
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+}
+
+func updateReplayRefWithRetry(
+	ctx context.Context,
+	repoRoot, ref, commitOID, oldOID string,
+	logger acdtrace.Logger,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+) error {
+	var lastErr error
+	for attempt := 1; attempt <= len(replayUpdateRefBackoffs); attempt++ {
+		err := replayUpdateRef(ctx, repoRoot, ref, commitOID, oldOID)
+		if err == nil {
+			traceReplayUpdateRef(logger, repoRoot, cctx, ev, state.EventStatePublished, "update-ref CAS succeeded", attempt, false, ref, commitOID, oldOID, nil)
+			return nil
+		}
+		lastErr = err
+
+		retryable := isTransientUpdateRefLockError(err)
+		finalAttempt := attempt == len(replayUpdateRefBackoffs)
+		decision := state.EventStateBlockedConflict
+		if retryable && !finalAttempt {
+			decision = "retry"
+		}
+		traceReplayUpdateRef(logger, repoRoot, cctx, ev, decision, err.Error(), attempt, retryable && !finalAttempt, ref, commitOID, oldOID, err)
+
+		if !retryable {
+			return err
+		}
+		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
+			return sleepErr
+		}
+		if finalAttempt {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func isTransientUpdateRefLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return !strings.Contains(msg, " is at ") &&
+		(strings.Contains(msg, "cannot lock") || strings.Contains(msg, "unable to lock"))
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func traceReplayUpdateRef(
+	logger acdtrace.Logger,
+	repoRoot string,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+	decision, reason string,
+	attempt int,
+	retry bool,
+	ref, commitOID, oldOID string,
+	err error,
+) {
+	output := map[string]any{
+		"attempt":      attempt,
+		"max_attempts": len(replayUpdateRefBackoffs),
+		"retry":        retry,
+		"ref":          ref,
+		"commit":       commitOID,
+		"expected_sha": oldOID,
+	}
+	if err != nil {
+		actual, expected := parseUpdateRefCASReason("update-ref CAS failed: " + err.Error())
+		if actual != "" {
+			output["actual_sha"] = actual
+		}
+		if expected != "" {
+			output["expected_sha"] = expected
+		}
+	}
+	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
 }
 
 // validateOps mirrors snapshot-replay._validate_op: every op kind must
