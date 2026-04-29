@@ -15,10 +15,39 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"strconv"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// EnvShadowRetentionGenerations controls how many prior shadow generations are
+// retained after a successful reseed.
+const EnvShadowRetentionGenerations = "ACD_SHADOW_RETENTION_GENERATIONS"
+
+// DefaultShadowRetentionGenerations keeps one previous generation for local
+// inspection while bounding shadow_paths growth across repeated rebases.
+const DefaultShadowRetentionGenerations int64 = 1
+
+func resolveShadowRetentionGenerations() int64 {
+	if env := os.Getenv(EnvShadowRetentionGenerations); env != "" {
+		if n, err := strconv.ParseInt(env, 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return DefaultShadowRetentionGenerations
+}
+
+func pruneShadowGenerations(ctx context.Context, db *state.DB, cctx CaptureContext) (int, error) {
+	if db == nil {
+		return 0, fmt.Errorf("daemon: pruneShadowGenerations: nil db")
+	}
+	if cctx.BranchRef == "" || cctx.BranchGeneration <= 0 {
+		return 0, nil
+	}
+	return state.PruneShadowGenerations(ctx, db, cctx.BranchRef, cctx.BranchGeneration, resolveShadowRetentionGenerations())
+}
 
 // BootstrapShadow seeds shadow_paths for (cctx.BranchRef,
 // cctx.BranchGeneration) from HEAD's tree at cctx.BaseHead. Returns the
