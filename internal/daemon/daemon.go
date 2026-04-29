@@ -302,7 +302,15 @@ func Run(ctx context.Context, opts Options) error {
 	bootTime := now()
 
 	// 2. Stamp daemon_state.mode = "running" + identity.
-	fp, fpErr := identity.CaptureSelf()
+	//
+	// Use identity.Capture(pid) — the ps-form hash — so the persisted
+	// fingerprint is byte-symmetric with what `acd stop` / `acd wake`
+	// recompute when verifying the pid before delivering a signal.
+	// identity.CaptureSelf() hashes the unjoined os.Args, which is more
+	// precise but cannot be reproduced by an external observer reading
+	// `ps`, so a CaptureSelf-stamped fingerprint always mismatches at
+	// verify time and signalProcess silently swallows SIGTERM/SIGKILL.
+	fp, fpErr := identity.Capture(pid)
 	var fpToken string
 	if fpErr == nil {
 		fpToken = FingerprintToken(fp)
