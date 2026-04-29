@@ -37,8 +37,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -71,7 +73,17 @@ const (
 	// MetaKeyOperationInProgress stores the active git operation name when
 	// capture/replay are paused for rebase, merge, cherry-pick, or bisect.
 	MetaKeyOperationInProgress = "operation_in_progress"
+	// MetaKeyReplayPausedUntil stores an RFC3339 UTC timestamp until which
+	// replay should skip drain passes after a detected branch rewind.
+	MetaKeyReplayPausedUntil = "replay.paused_until"
 )
+
+// EnvRewindGraceSeconds controls the post-rewind replay pause window. The
+// default is intentionally short: enough for an operator's reset/revert flow
+// to settle, but not long enough to surprise a normal daemon session.
+const EnvRewindGraceSeconds = "ACD_REWIND_GRACE_SECONDS"
+
+const defaultRewindGrace = 60 * time.Second
 
 // TokenTransition classifies how the active branch ref moved between two
 // observations of HEAD.
@@ -287,4 +299,42 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 		return "", nil
 	}
 	return v, nil
+}
+
+func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time) (bool, string, error) {
+	prevHead := tokenSHA(prevToken)
+	newHead := tokenSHA(newToken)
+	prevBranchRef := tokenBranchRef(prevToken)
+	newBranchRef := tokenBranchRef(newToken)
+	if prevHead == "" || newHead == "" || prevBranchRef == "" || newBranchRef == "" || prevBranchRef != newBranchRef {
+		return false, "", nil
+	}
+	grace := resolveRewindGrace()
+	if grace <= 0 {
+		return false, "", nil
+	}
+	ok, err := git.IsAncestor(ctx, repoDir, newHead, prevHead)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, "", nil
+	}
+	until := time.Unix(now.Add(grace).Unix(), 0).UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, MetaKeyReplayPausedUntil, until); err != nil {
+		return false, "", err
+	}
+	return true, until, nil
+}
+
+func resolveRewindGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(EnvRewindGraceSeconds))
+	if raw == "" {
+		return defaultRewindGrace
+	}
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || secs < 0 {
+		return defaultRewindGrace
+	}
+	return time.Duration(secs) * time.Second
 }
