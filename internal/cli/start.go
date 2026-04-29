@@ -48,6 +48,8 @@ const defaultDaemonSpawnPollTimeout = 3 * time.Second
 var daemonSpawnPollTimeout = defaultDaemonSpawnPollTimeout
 var daemonSpawnPollInterval = 50 * time.Millisecond
 var afterDaemonSpawnPollDeadline func(context.Context, *state.DB)
+var startControlLockTimeout = 5 * time.Second
+var startControlLockRetryInterval = 10 * time.Millisecond
 
 // defaultSpawnDaemon fork-execs a detached `acd daemon run --repo <abs>`
 // process. Stdin/stdout/stderr point to /dev/null so the parent can exit
@@ -129,7 +131,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		return fmt.Errorf("acd start: mkdir state dir: %w", err)
 	}
-	clock, err := daemon.AcquireControlLock(gitDir)
+	clock, err := acquireStartControlLock(ctx, gitDir)
 	if err != nil {
 		return fmt.Errorf("acd start: acquire control.lock: %w", err)
 	}
@@ -280,6 +282,26 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			sessionID, daemonPID)
 	}
 	return nil
+}
+
+func acquireStartControlLock(ctx context.Context, gitDir string) (*daemon.ControlLock, error) {
+	deadline := time.Now().Add(startControlLockTimeout)
+	for {
+		clock, err := daemon.AcquireControlLock(gitDir)
+		if err == nil {
+			return clock, nil
+		}
+		if !errors.Is(err, daemon.ErrControlLockHeld) || time.Now().After(deadline) {
+			return nil, err
+		}
+		timer := time.NewTimer(startControlLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // resolveGitDir resolves the .git directory for a repo. Falls back to
