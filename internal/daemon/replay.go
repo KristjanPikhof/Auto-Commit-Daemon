@@ -263,26 +263,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ops)
-		if err != nil {
-			return sum, err
-		}
-		if alreadyPublished {
-			sourceHead := parent
-			if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
-				return sum, err
-			}
-			parent = headOID
-			activeCtx.BaseHead = headOID
-			sum.BaseHead = headOID
-			sum.Published++
-			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
-				"commit": headOID,
-				"parent": sourceHead,
-			})
-			continue
-		}
-
 		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
 		commitOID, err := commitOneEvent(ctx, repoRoot, indexFile, parent, ev, ops, msgFn)
 		if err != nil {
