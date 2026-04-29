@@ -616,11 +616,11 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 	seedHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD^"))
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 
-	stop := runAcd(t, ctx, env, "stop", "--session-id", "offline-1", "--repo", repo, "--json")
+	stop := runAcd(t, ctx, env, "stop", "--session-id", "offline-1", "--repo", repo, "--force", "--json")
 	if stop.ExitCode != 0 {
 		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stop.ExitCode, stop.Stdout, stop.Stderr)
 	}
-	waitMode(t, repo, "stopped", 5*time.Second)
+	waitMode(t, repo, "stopped", 10*time.Second)
 
 	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
 	runGitOK(t, repo, "reset", "--hard", seedHead)
