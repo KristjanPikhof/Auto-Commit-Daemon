@@ -21,7 +21,7 @@ func installStopSignal(t *testing.T, repoDir string) (*atomic.Int32, func()) {
 	prev := signalProcess
 	var count atomic.Int32
 	gitDir := filepath.Join(repoDir, ".git")
-	signalProcess = func(pid int, sig syscall.Signal) error {
+	signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 		count.Add(1)
 		if sig == syscall.SIGTERM {
 			d, err := state.Open(context.Background(), state.DBPathFromGitDir(gitDir))
@@ -141,7 +141,7 @@ func TestStop_ForceEscalates(t *testing.T) {
 	prev := signalProcess
 	var count atomic.Int32
 	var sawKill atomic.Bool
-	signalProcess = func(pid int, sig syscall.Signal) error {
+	signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 		count.Add(1)
 		if sig == syscall.SIGKILL {
 			sawKill.Store(true)
@@ -272,7 +272,7 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	// Signal stub stamps mode=stopped on each SIGTERM, per-repo.
 	prev := signalProcess
 	var sigCount atomic.Int32
-	signalProcess = func(pid int, sig syscall.Signal) error {
+	signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 		sigCount.Add(1)
 		// Find which repo's DB to stamp by PID — both repos have
 		// distinct PIDs above. The stub is generic, so stamp both.
