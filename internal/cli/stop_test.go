@@ -307,7 +307,14 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	if err := runStop(ctx, &out, "", "", true, true, true); err != nil {
 		t.Fatalf("runStop --all: %v", err)
 	}
-	_ = sigCount // signalProcess legitimately not called for dead PIDs
+	// signalProcess is legitimately not called for dead PIDs (the
+	// stopOneRepo force path short-circuits before reaching it), so
+	// sigCount stays at zero. Read it for the side effect of pinning
+	// that — using `_ = sigCount` would copy the atomic.Int32 value
+	// (vet flags this as a lock copy).
+	if sigCount.Load() != 0 {
+		t.Fatalf("expected signalProcess not called for dead PIDs, got count=%d", sigCount.Load())
+	}
 	var got stopAllResult
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
