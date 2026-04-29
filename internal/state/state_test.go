@@ -389,6 +389,79 @@ func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
 	}
 }
 
+func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, path string, capturedTS float64, state string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			CapturedTS:       capturedTS,
+			State:            state,
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	prunedBlocked := appendEvent("refs/heads/main", 1, "old-blocked.txt", 10, EventStateBlockedConflict)
+	prunedFailed := appendEvent("refs/heads/failed", 1, "old-failed.txt", 11, EventStateFailed)
+	barrier := appendEvent("refs/heads/barrier", 1, "barrier.txt", 12, EventStateBlockedConflict)
+	pendingBehindBarrier := appendEvent("refs/heads/barrier", 1, "pending.txt", 13, EventStatePending)
+	freshFailed := appendEvent("refs/heads/fresh", 1, "fresh-failed.txt", 200, EventStateFailed)
+
+	n, err := PruneTerminalEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PruneTerminalEventsBefore: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("pruned=%d want 2", n)
+	}
+
+	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query remaining: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan remaining: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate remaining: %v", err)
+	}
+	if remaining[prunedBlocked] || remaining[prunedFailed] {
+		t.Fatalf("stale terminal rows survived: remaining=%v", remaining)
+	}
+	for _, seq := range []int64{barrier, pendingBehindBarrier, freshFailed} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
+		}
+	}
+
+	var opCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_ops WHERE event_seq IN (?, ?)`,
+		prunedBlocked, prunedFailed).Scan(&opCount); err != nil {
+		t.Fatalf("count pruned ops: %v", err)
+	}
+	if opCount != 0 {
+		t.Fatalf("capture_ops for pruned rows=%d want 0", opCount)
+	}
+}
+
 func TestRollupsAppendOnly(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
