@@ -235,7 +235,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				return sum, err
 			}
 			if alreadyPublished {
-				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+				sourceHead := parent
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
 					return sum, err
 				}
 				parent = headOID
@@ -244,7 +245,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				sum.Published++
 				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
 					"commit": headOID,
-					"parent": parent,
+					"parent": sourceHead,
 				})
 				continue
 			}
@@ -267,7 +268,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, err
 		}
 		if alreadyPublished {
-			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+			sourceHead := parent
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
 				return sum, err
 			}
 			parent = headOID
@@ -276,7 +278,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			sum.Published++
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
 				"commit": headOID,
-				"parent": parent,
+				"parent": sourceHead,
 			})
 			continue
 		}
