@@ -724,6 +724,14 @@ func Run(ctx context.Context, opts Options) error {
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
 				cctx.BaseHead = repSum.BaseHead
+				currentToken = branchTokenRev(cctx.BaseHead, cctx.BranchRef)
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, cctx.BaseHead); err != nil {
+					logger.Warn("persist replay head", "err", err.Error())
+				}
+				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
+					logger.Warn("persist replay branch token", "err", err.Error())
+				}
 			}
 		}
 
