@@ -352,6 +352,11 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
+		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
+			logger.Warn("load persisted branch token", "err", err.Error())
+		} else if ok && persistedToken != "" {
+			prevToken = persistedToken
+		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, prevToken, currentToken)
 		if cErr != nil {
 			logger.Warn("classify startup branch transition; treating as diverged",
