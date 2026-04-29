@@ -123,7 +123,11 @@ func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("replay.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
 	}
-	if events[0].Reason != "replay_paused" || events[0].Output["source"] != "manual" {
+	output, ok := events[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("trace output type=%T want map[string]any", events[0].Output)
+	}
+	if events[0].Reason != "replay_paused" || output["source"] != "manual" {
 		t.Fatalf("unexpected trace event: %+v", events[0])
 	}
 }
