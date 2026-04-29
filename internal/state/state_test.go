@@ -558,6 +558,60 @@ func TestShadowPathRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPruneShadowGenerationsRetainsConfiguredPriorGenerations(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	upsert := func(branch string, generation int64, path string) {
+		t.Helper()
+		if err := UpsertShadowPath(ctx, d, ShadowPath{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			Path:             path,
+			Operation:        "bootstrap",
+			BaseHead:         "abc123",
+			Fidelity:         "full",
+		}); err != nil {
+			t.Fatalf("upsert %s gen %d: %v", branch, generation, err)
+		}
+	}
+
+	upsert("refs/heads/main", 1, "gen1.txt")
+	upsert("refs/heads/main", 2, "gen2.txt")
+	upsert("refs/heads/main", 3, "gen3.txt")
+	upsert("refs/heads/other", 1, "other-gen1.txt")
+
+	n, err := PruneShadowGenerations(ctx, d, "refs/heads/main", 3, 1)
+	if err != nil {
+		t.Fatalf("PruneShadowGenerations: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned=%d want 1", n)
+	}
+
+	cases := []struct {
+		branch     string
+		generation int64
+		path       string
+		want       bool
+	}{
+		{"refs/heads/main", 1, "gen1.txt", false},
+		{"refs/heads/main", 2, "gen2.txt", true},
+		{"refs/heads/main", 3, "gen3.txt", true},
+		{"refs/heads/other", 1, "other-gen1.txt", true},
+	}
+	for _, tc := range cases {
+		_, ok, err := GetShadowPath(ctx, d, tc.branch, tc.generation, tc.path)
+		if err != nil {
+			t.Fatalf("GetShadowPath %s gen %d: %v", tc.branch, tc.generation, err)
+		}
+		if ok != tc.want {
+			t.Fatalf("shadow row %s gen %d ok=%v want %v", tc.branch, tc.generation, ok, tc.want)
+		}
+	}
+}
+
 func TestPublishStateRoundTrip(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
