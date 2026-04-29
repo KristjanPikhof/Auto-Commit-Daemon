@@ -290,3 +290,13 @@ func writeFile(t *testing.T, path, body string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+func gitCommitAll(t *testing.T, repo, message string, paths ...string) string {
+	t.Helper()
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
+	runGitOK(t, repo, append([]string{"add"}, paths...)...)
+	runGitOK(t, repo, "commit", "-q", "-m", message)
+	return strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+}
