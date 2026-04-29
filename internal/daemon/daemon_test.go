@@ -1386,6 +1386,72 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRun_BranchSwitchDropsPending(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	appendEvent := func(path string, generation int64, stateName string) int64 {
+		t.Helper()
+		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: generation,
+			BaseHead:         f.cctx.BaseHead,
+			Operation:        "create",
+			Path:             path,
+			Fidelity:         "full",
+			State:            stateName,
+		}, []state.CaptureOp{{
+			Op:        "create",
+			Path:      path,
+			Fidelity:  "full",
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+		}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	prevPending := appendEvent("prev-pending.txt", 1, state.EventStatePending)
+	prevBlocked := appendEvent("prev-blocked.txt", 1, state.EventStateBlockedConflict)
+	prevPublished := appendEvent("prev-published.txt", 1, state.EventStatePublished)
+	nextPending := appendEvent("next-pending.txt", 2, state.EventStatePending)
+
+	dropped, err := state.DeletePendingForGeneration(ctx, f.db, 1)
+	if err != nil {
+		t.Fatalf("DeletePendingForGeneration: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped=%d want 1", dropped)
+	}
+
+	rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if remaining[prevPending] {
+		t.Fatalf("previous generation pending seq %d was not deleted", prevPending)
+	}
+	for _, seq := range []int64{prevBlocked, prevPublished, nextPending} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d should be retained; remaining=%v", seq, remaining)
+		}
+	}
+}
+
 func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	t.Setenv(EnvShadowRetentionGenerations, "0")
 
