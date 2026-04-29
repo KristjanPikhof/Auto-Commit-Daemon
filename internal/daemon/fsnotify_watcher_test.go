@@ -2,10 +2,10 @@ package daemon
 
 import (
 	"context"
-	"strconv"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -402,11 +402,11 @@ func TestRun_FsnotifyDrivesWake(t *testing.T) {
 				IdleCeiling:  2 * time.Second,
 				ErrorCeiling: 2 * time.Second,
 			},
-				BootGrace:        30 * time.Second,
-				MessageFn:         DeterministicMessage,
-				ShutdownCh:       shutdownCh,
-				SkipSignals:      true,
-				FsnotifyEnabled:  true,
+			BootGrace:        30 * time.Second,
+			MessageFn:        DeterministicMessage,
+			ShutdownCh:       shutdownCh,
+			SkipSignals:      true,
+			FsnotifyEnabled:  true,
 			FsnotifyDebounce: 30 * time.Millisecond,
 		})
 	}()
