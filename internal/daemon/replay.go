@@ -216,7 +216,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// chain from a broken predecessor as soon as the operator
 			// fixes the root cause. Stop here and let the next poll tick
 			// re-attempt from a fresh seed.
-			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
 			return sum, nil
 		}
 
@@ -232,7 +231,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// stale ref and must wait for branch reconciliation.
 			recordConflict(ctx, db, ev, "update-ref CAS failed: "+err.Error(), activeCtx)
 			sum.Conflicts++
-			_ = git.ReadTree(ctx, repoRoot, indexFile, parent)
 			return sum, nil
 		}
 
