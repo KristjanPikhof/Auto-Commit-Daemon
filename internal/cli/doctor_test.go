@@ -600,7 +600,7 @@ func TestDoctor_RepoWarnsOnMultipleDaemonProcesses(t *testing.T) {
 	}
 	var rep doctorReport
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", out.String())
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
 	if len(rep.Repos) != 1 {
 		t.Fatalf("repos=%d want 1", len(rep.Repos))
