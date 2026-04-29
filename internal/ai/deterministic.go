@@ -41,6 +41,9 @@ type DeterministicProvider struct{}
 // Name returns the canonical provider identifier used in Result.Source.
 func (DeterministicProvider) Name() string { return "deterministic" }
 
+// NeedsDiff reports that deterministic generation only needs event metadata.
+func (DeterministicProvider) NeedsDiff() bool { return false }
+
 // Generate composes a Result from CommitContext alone. ctx is honoured for
 // cancellation but the function is otherwise pure.
 func (p DeterministicProvider) Generate(ctx context.Context, cc CommitContext) (Result, error) {

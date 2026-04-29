@@ -117,13 +117,20 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		return nil, err
 	}
 
-	// Honor ctx cancellation: kill the subprocess, surface the error.
+	// Honor ctx cancellation: cancel the subprocess context so any
+	// in-flight Write/Read returns an error. We deliberately do NOT touch
+	// shared state (c.stdin/c.cmd/etc) from this goroutine — killLocked
+	// runs in the error path below under c.mu. Capture cancel locally so
+	// the goroutine never reads c.cancel concurrently with killLocked.
+	cancelLocal := c.cancel
 	doneCh := make(chan struct{})
 	defer close(doneCh)
 	go func() {
 		select {
 		case <-ctx.Done():
-			c.killLocked()
+			if cancelLocal != nil {
+				cancelLocal()
+			}
 		case <-doneCh:
 		}
 	}()

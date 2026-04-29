@@ -8,9 +8,9 @@ import (
 // Migrate brings the database forward from whatever PRAGMA user_version it
 // currently reports up to SchemaVersion.
 //
-// v1 is the first acd release; there is no v0 to migrate from. Future
-// migrations are append-only for daily_rollups (D9) — only ALTER TABLE ADD
-// COLUMN. Schema-changing helpers belong here, not in db.go.
+// v1 was the first acd release. v2 adds idempotent indexes through schemaDDL.
+// Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
+// ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
 // Open calls bootstrap which is itself idempotent for v1, so the daemon does
 // not need to call Migrate explicitly today. Migrate is wired now so future
@@ -26,6 +26,7 @@ func (d *DB) Migrate(ctx context.Context) error {
 	if cur == SchemaVersion {
 		return nil
 	}
-	// No < 1 path exists yet; bootstrap stamped the version in Open.
+	// Open applies the idempotent schemaDDL for older databases before it stamps
+	// SchemaVersion, so no explicit post-open migration step exists yet.
 	return nil
 }

@@ -1,9 +1,12 @@
 // branch_token.go implements the branch-generation token per §8.9.
 //
 // Token shape:
-//   - "rev:<sha>" when HEAD resolves to a commit. Same generation between
-//     iterations means the branch fast-forwarded (no rebase, no force-push).
-//   - "missing"   when HEAD does not resolve (orphan repo, just-init'd).
+//   - "rev:<sha> <branch-ref>" when HEAD resolves to a commit on a branch.
+//     Same generation between iterations means the branch fast-forwarded
+//     (no rebase, no force-push, no branch switch).
+//   - "rev:<sha>" when HEAD resolves while detached.
+//   - "missing <branch-ref>" when HEAD does not resolve (orphan repo,
+//     just-init'd).
 //
 // A bumped token signals a force-push or reset; the daemon records the
 // transition in daemon_meta so operators can spot the divergence.
@@ -35,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -61,6 +65,9 @@ const (
 	// the token last changed. Operator breadcrumb only — the loop never
 	// reads it back.
 	MetaKeyBranchTokenChangedAt = "branch_token_changed_at"
+	// MetaKeyDetachedHeadPaused is stamped when the daemon sees a detached
+	// HEAD and pauses capture/replay instead of inventing a branch ref.
+	MetaKeyDetachedHeadPaused = "detached_head_paused"
 )
 
 // TokenTransition classifies how the active branch ref moved between two
@@ -100,20 +107,24 @@ func (t TokenTransition) String() string {
 }
 
 // BranchGenerationToken returns the current generation token by resolving
-// HEAD. ErrRefNotFound from git is mapped to BranchTokenMissing; any other
-// error is surfaced verbatim.
+// HEAD and the symbolic branch ref. ErrRefNotFound from git is mapped to a
+// missing token; any other error is surfaced verbatim.
 func BranchGenerationToken(ctx context.Context, repoDir string) (string, error) {
 	if repoDir == "" {
 		return "", fmt.Errorf("daemon: BranchGenerationToken: empty repoDir")
 	}
+	branchRef, err := git.RunBranchRef(ctx, repoDir)
+	if err != nil {
+		return "", err
+	}
 	sha, err := git.RevParse(ctx, repoDir, "HEAD")
 	if err != nil {
 		if errors.Is(err, git.ErrRefNotFound) {
-			return BranchTokenMissing, nil
+			return branchTokenMissing(branchRef), nil
 		}
 		return "", err
 	}
-	return "rev:" + sha, nil
+	return branchTokenRev(sha, branchRef), nil
 }
 
 // SameGeneration reports whether two tokens describe the same generation.
@@ -138,10 +149,25 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 	if SameGeneration(prevToken, newToken) {
 		return TokenTransitionUnchanged, nil
 	}
+	prevMissing := tokenMissing(prevToken)
+	newMissing := tokenMissing(newToken)
+	prevBranchRef := tokenBranchRef(prevToken)
+	newBranchRef := tokenBranchRef(newToken)
+	if prevBranchRef != "" && newBranchRef != "" && prevBranchRef != newBranchRef {
+		return TokenTransitionDiverged, nil
+	}
 	// Token shape transition: missing<->rev. Always a divergence. The
 	// queue's BaseHead is either the empty string (orphan) or a SHA that
 	// is no longer reachable from HEAD.
-	if prevToken == BranchTokenMissing || newToken == BranchTokenMissing {
+	if prevMissing || newMissing {
+		if prevMissing && newMissing {
+			// Compatibility with old persisted "missing" tokens that did
+			// not carry the branch ref. With no commits there is no
+			// ancestry to prove or disprove, so the first observation is
+			// treated like boot-time initialization unless both refs above
+			// proved a concrete branch switch.
+			return TokenTransitionFastForward, nil
+		}
 		return TokenTransitionDiverged, nil
 	}
 	prevHead := tokenSHA(prevToken)
@@ -168,10 +194,44 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 // shape we don't recognize.
 func tokenSHA(token string) string {
 	const prefix = "rev:"
-	if len(token) > len(prefix) && token[:len(prefix)] == prefix {
-		return token[len(prefix):]
+	rest, ok := strings.CutPrefix(token, prefix)
+	if !ok || rest == "" {
+		return ""
+	}
+	sha, _, _ := strings.Cut(rest, " ")
+	return sha
+}
+
+func tokenBranchRef(token string) string {
+	if rest, ok := strings.CutPrefix(token, "rev:"); ok {
+		_, branchRef, ok := strings.Cut(rest, " ")
+		if ok {
+			return branchRef
+		}
+		return ""
+	}
+	if rest, ok := strings.CutPrefix(token, BranchTokenMissing+" "); ok {
+		return rest
 	}
 	return ""
+}
+
+func tokenMissing(token string) bool {
+	return token == BranchTokenMissing || strings.HasPrefix(token, BranchTokenMissing+" ")
+}
+
+func branchTokenRev(sha, branchRef string) string {
+	if branchRef == "" {
+		return "rev:" + sha
+	}
+	return "rev:" + sha + " " + branchRef
+}
+
+func branchTokenMissing(branchRef string) string {
+	if branchRef == "" {
+		return BranchTokenMissing
+	}
+	return BranchTokenMissing + " " + branchRef
 }
 
 // LoadBranchGeneration reads the persisted branch_generation from

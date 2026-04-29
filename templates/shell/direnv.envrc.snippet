@@ -4,7 +4,7 @@ if command -v acd >/dev/null 2>&1; then
     SID=$(uuidgen)
     export ACD_SESSION_ID="$SID"
     acd start --session-id "$SID" --harness shell --watch-pid "$$" --repo "$PWD"
-    # Stop hook fires when you `cd` away from the repo (direnv handles unload).
+    # EXIT runs when direnv's shell hook reloads/unloads this .envrc.
     function _acd_stop_on_unload() {
         acd stop --session-id "$ACD_SESSION_ID" --repo "$PWD" 2>/dev/null || true
     }

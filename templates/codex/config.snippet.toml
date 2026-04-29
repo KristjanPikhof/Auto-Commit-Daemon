@@ -12,14 +12,14 @@ codex_hooks = true
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
+command = "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; SID=$(acd hook-stdin-extract session_id <&0 2>>\"$LOG\"); rc=$?; if [ $rc -ne 0 ]; then printf \"{}\\n\"; exit \"$rc\"; fi; REPO=\"${CODEX_PROJECT_DIR:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; rc=$?; printf \"{}\\n\"; exit \"$rc\"'"
 
 [[hooks.PreToolUse]]
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
+command = "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; SID=$(acd hook-stdin-extract session_id <&0 2>>\"$LOG\"); rc=$?; if [ $rc -ne 0 ]; then printf \"{}\\n\"; exit \"$rc\"; fi; REPO=\"${CODEX_PROJECT_DIR:-$PWD}\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; rc=$?; printf \"{}\\n\"; exit \"$rc\"'"
 
 [[hooks.PostToolUse]]
 [[hooks.PostToolUse.hooks]]
 type = "command"
-command = "bash -c 'SID=$(jq -r .session_id <&0); acd wake --session-id \"$SID\" --repo \"$PWD\" >/dev/null 2>&1; printf \"{}\\n\"'"
+command = "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; SID=$(acd hook-stdin-extract session_id <&0 2>>\"$LOG\"); rc=$?; if [ $rc -ne 0 ]; then printf \"{}\\n\"; exit \"$rc\"; fi; REPO=\"${CODEX_PROJECT_DIR:-$PWD}\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; rc=$?; printf \"{}\\n\"; exit \"$rc\"'"

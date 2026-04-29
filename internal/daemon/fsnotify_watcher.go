@@ -292,7 +292,7 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 
 		// Sensitive directories: skip whole subtrees that look like
 		// secrets dirs (best-effort; capture also rejects them).
-		if w.opts.Sensitive != nil && w.opts.Sensitive.Match(rel) {
+		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rel) {
 			return fs.SkipDir
 		}
 

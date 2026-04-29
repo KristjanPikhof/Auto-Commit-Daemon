@@ -160,6 +160,24 @@ func (m *SensitiveMatcher) Match(rel string) bool {
 	return false
 }
 
+// MatchDirectory reports whether rel is a directory that should be pruned
+// before walking descendants. Directory pruning is intentionally narrower than
+// file matching: wildcard file-shaped patterns such as "credentials*" must not
+// hide ordinary directories like "credentials_repo".
+func (m *SensitiveMatcher) MatchDirectory(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	base := path.Base(rel)
+	for _, pattern := range m.patterns {
+		if strings.ContainsAny(pattern, "*?[") || strings.Contains(pattern, "/") {
+			continue
+		}
+		if pattern == base {
+			return true
+		}
+	}
+	return false
+}
+
 // Patterns returns a copy of the precomputed pattern list (for diagnostics).
 func (m *SensitiveMatcher) Patterns() []string {
 	out := make([]string, len(m.patterns))

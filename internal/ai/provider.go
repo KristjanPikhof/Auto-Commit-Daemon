@@ -23,6 +23,26 @@ type Provider interface {
 	Generate(ctx context.Context, cc CommitContext) (Result, error)
 }
 
+// DiffProvider is an optional capability for providers that can declare
+// whether they need CommitContext.DiffText populated.
+type DiffProvider interface {
+	NeedsDiff() bool
+}
+
+// ProviderNeedsDiff reports whether the daemon should reconstruct captured
+// diffs before calling p. Providers that do not implement the optional
+// capability default to true because network/plugin providers are the paths
+// that benefit from diff context.
+func ProviderNeedsDiff(p Provider) bool {
+	if p == nil {
+		return false
+	}
+	if dp, ok := p.(DiffProvider); ok {
+		return dp.NeedsDiff()
+	}
+	return true
+}
+
 // Compose returns a Provider that calls `primary`, and on error or zero
 // result, falls back to `fallback`. The Result.Source field reports which
 // provider actually satisfied the request — useful for telemetry and for
@@ -48,6 +68,13 @@ type composed struct {
 
 func (c *composed) Name() string {
 	return c.primary.Name() + "+" + c.fallback.Name()
+}
+
+// NeedsDiff is true when either side of the fallback chain can consume diff
+// text. A primary AI provider still needs the diff even when the fallback is
+// deterministic.
+func (c *composed) NeedsDiff() bool {
+	return ProviderNeedsDiff(c.primary) || ProviderNeedsDiff(c.fallback)
 }
 
 // Generate tries the primary provider; on error or empty subject we fall

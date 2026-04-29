@@ -7,9 +7,10 @@
 package state
 
 // SchemaVersion is the current PRAGMA user_version value for the per-repo
-// state DB. Bumping this triggers a migration step in migrate.go. v1 is the
-// first acd release and is fully greenfield (no v0 to migrate from).
-const SchemaVersion = 1
+// state DB. Bumping this triggers a migration step in migrate.go. v1 was the
+// first acd release; v2 adds capture_events indexes used by replay barriers
+// and pruning.
+const SchemaVersion = 2
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -73,6 +74,12 @@ CREATE TABLE IF NOT EXISTS capture_events(
     error            TEXT,
     message          TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_capture_events_state_captured
+    ON capture_events(state, captured_ts);
+
+CREATE INDEX IF NOT EXISTS idx_capture_events_branch_generation_seq_state
+    ON capture_events(branch_ref, branch_generation, seq, state);
 
 CREATE TABLE IF NOT EXISTS capture_ops(
     event_seq    INTEGER NOT NULL,

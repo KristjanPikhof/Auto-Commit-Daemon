@@ -2,16 +2,22 @@
 
 `acd` generates commit messages through a `Provider` interface (§10.1). Three implementations ship in v1: `deterministic` (rule-based, always available), `openai-compat` (HTTP to any OpenAI-compatible endpoint), and `subprocess` (JSONL protocol to an external binary). The default is `deterministic`; opt into the others via environment variables. Providers are composed so that any error in the primary falls back to `deterministic` automatically.
 
-The diff handed to AI providers is reconstructed from the `before_oid` and
-`after_oid` blobs captured in SQLite at write time — **not from the live
-worktree**. This means the model sees exactly what changed at the moment of
-capture, even if the file has been edited many times since. The diff is capped
-at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`) before transmission; long
-diffs are truncated at a line boundary while preserving the diff header so the
-model still sees the file path. The deterministic provider does not consult the
-diff at all, so its output is identical regardless of diff reconstruction
-success or failure. See [capture-replay.md](capture-replay.md) for the full
-storage model.
+By default, AI providers receive metadata only: path, operation, branch, repo
+root, multi-op entries, and timestamp. `diff` is empty unless you explicitly set
+`ACD_AI_SEND_DIFF=1`.
+
+When diff sending is enabled, the diff handed to AI providers is reconstructed
+from the `before_oid` and `after_oid` blobs captured in SQLite at write time —
+**not from the live worktree**. This means the model sees exactly what changed
+at the moment of capture, even if the file has been edited many times since.
+Before transmission, the diff is scrubbed for obvious secret shapes (AWS access
+keys, Slack/GitHub tokens, bearer tokens, JWTs, private-key markers, assigned
+password/secret/token values, and high-entropy token-like strings), then capped
+at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`). Long diffs are truncated
+at a line boundary while preserving the diff header so the model still sees the
+file path. The deterministic provider does not consult the diff at all, so its
+output is identical regardless of diff reconstruction success or failure. See
+[capture-replay.md](capture-replay.md) for the full storage model.
 
 ---
 
@@ -31,6 +37,7 @@ export ACD_AI_API_KEY=sk-...
 # Optional overrides:
 # export ACD_AI_BASE_URL=https://api.openai.com/v1
 # export ACD_AI_MODEL=gpt-4o-mini
+# export ACD_AI_SEND_DIFF=1
 ```
 
 **Subprocess plugin:**
@@ -39,21 +46,24 @@ export ACD_AI_API_KEY=sk-...
 export ACD_AI_PROVIDER=subprocess:my-provider
 export PATH=$PATH:/path/to/plugin/dir
 # acd will exec acd-provider-my-provider from $PATH
+# export ACD_AI_SEND_DIFF=1
 ```
 
 ---
 
 ## Environment variables
 
-Source of truth: `internal/ai/config.go`.
+Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic` \| `openai-compat` \| `subprocess:<name>` |
-| `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | openai-compat only |
+| `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | openai-compat only; must be an absolute `https://` URL |
 | `ACD_AI_API_KEY` | (none) | openai-compat only; missing key degrades to deterministic with a warning |
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
+| `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
+| `ACD_AI_SEND_DIFF` | `0` | `1`, `true`, `yes`, or `on` opt in to sending redacted captured diffs; unset/empty/other values send an empty `diff` |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
 
@@ -89,7 +99,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 `op` values: `create` | `modify` | `delete` | `rename` | `mode` | `symlink`.  
 `multi_op` is present when one daemon event covers more than one file.  
-`diff` is a unified diff capped at 4000 bytes before transmission (`DiffCap` in `internal/ai/prompt.go`). The diff is built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since.
+`diff` is empty by default. With `ACD_AI_SEND_DIFF=1`, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
 
 **Response (plugin → daemon, one line per request):**
 
@@ -111,6 +121,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 - **Soft errors**: a response with a non-empty `error` field keeps the plugin process alive. Only the current request fails, allowing `Compose` to fall back to `deterministic`.
 - **Hard errors** (timeout, unexpected EOF, I/O failure, exit): the plugin is killed and marked crashed. The next `Generate` call respawns the binary transparently.
 - **Shutdown**: `Close()` sends EOF on stdin and waits up to 5 seconds for a clean exit before escalating to SIGKILL. The daemon calls `Close()` at shutdown so plugins are always reaped.
+- **Stderr**: plugin stderr is captured for diagnostics. By default it is appended to `~/.local/state/acd/plugin-<name>.log`; tests or embedders can override this with `SubprocessOptions.Stderr`.
 
 ---
 
@@ -185,14 +196,18 @@ The `deterministic` provider never fails. It always produces a message and is th
 
 ### Subprocess plugins
 
-- Plugins run as **subprocesses of the daemon** and inherit its full process privileges: file-system access, network access, environment variables (including secrets), and the ability to invoke `git` commands.
+- Plugins run as **subprocesses of the daemon** and inherit its full process privileges: file-system access, network access, environment variables (including secrets), the operator's Git credentials, and the ability to invoke `git` commands, including `git push`.
 - The daemon reads from your repository and writes commits. A malicious or compromised plugin can read and exfiltrate your source code or push tampered commits.
 - **Vetting plugins is entirely the operator's responsibility.** Treat every third-party `acd-provider-*` binary exactly as you would any unsandboxed binary on your `$PATH`: pin versions, review source, audit network calls, and prefer running the daemon under a restricted system user.
 
-### openai-compat diffs leave your machine
+### Diffs can leave your machine
 
-- The openai-compat provider sends file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
-- **Do not enable `ACD_AI_PROVIDER=openai-compat` on private or sensitive repositories without explicit consent and a fully verified `ACD_AI_BASE_URL`.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
+- The daemon sends an empty `diff` unless `ACD_AI_SEND_DIFF=1` is set.
+- With diff sending enabled, the openai-compat provider sends redacted file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
+- With diff sending enabled, subprocess plugins receive the same redacted, truncated diff over stdin.
+- Redaction is best-effort and pattern-based. It is a backstop, not a guarantee that arbitrary secrets or proprietary code cannot be transmitted.
+- **Do not enable `ACD_AI_SEND_DIFF=1` on private or sensitive repositories without explicit consent and a fully verified provider endpoint/plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
+- `ACD_AI_BASE_URL` must be an absolute `https://` URL. Plain HTTP and relative URLs are rejected before the OpenAI-compatible provider is built.
 - The default HTTP client refuses 3xx redirects to prevent the bearer token from being steered to a different host by a hostile network.
 
 ---

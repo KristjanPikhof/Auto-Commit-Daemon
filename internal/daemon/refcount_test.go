@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,8 +58,8 @@ func TestRefcount_PeerAlive(t *testing.T) {
 	})
 
 	alive, err := SweepClients(context.Background(), db, now, SweepOpts{
-		AliveFn:            func(pid int) bool { return pid == 1234 },
-		CaptureFingerprint: func(pid int) (identity.Fingerprint, error) { return live, nil },
+		AliveFn:            func(context.Context, int) bool { return true },
+		CaptureFingerprint: func(context.Context, int) (identity.Fingerprint, error) { return live, nil },
 	})
 	if err != nil {
 		t.Fatalf("SweepClients: %v", err)
@@ -90,8 +91,8 @@ func TestRefcount_DeadPID(t *testing.T) {
 		LastSeenTS:   float64(now.Unix() - 5),
 	})
 	alive, err := SweepClients(context.Background(), db, now, SweepOpts{
-		AliveFn: func(pid int) bool { return false },
-		CaptureFingerprint: func(pid int) (identity.Fingerprint, error) {
+		AliveFn: func(context.Context, int) bool { return false },
+		CaptureFingerprint: func(context.Context, int) (identity.Fingerprint, error) {
 			t.Fatalf("CaptureFingerprint should not be called when AliveFn=false")
 			return identity.Fingerprint{}, nil
 		},
@@ -122,8 +123,8 @@ func TestRefcount_FingerprintMismatch(t *testing.T) {
 	})
 	live := identity.Fingerprint{StartTime: "Tue May 01 09:00:00 2026", ArgvHash: "NEW"}
 	alive, err := SweepClients(context.Background(), db, now, SweepOpts{
-		AliveFn:            func(pid int) bool { return true },
-		CaptureFingerprint: func(pid int) (identity.Fingerprint, error) { return live, nil },
+		AliveFn:            func(context.Context, int) bool { return true },
+		CaptureFingerprint: func(context.Context, int) (identity.Fingerprint, error) { return live, nil },
 	})
 	if err != nil {
 		t.Fatalf("SweepClients: %v", err)
@@ -133,6 +134,73 @@ func TestRefcount_FingerprintMismatch(t *testing.T) {
 	}
 	if got := countClients(t, db); got != 0 {
 		t.Fatalf("post-sweep rows=%d, want 0", got)
+	}
+}
+
+// TestRefcount_FingerprintUnresolvableKeepsClient: an alive pid whose
+// fingerprint cannot be resolved (for example ps cannot see into another PID
+// namespace) must stay registered until the universal TTL gate expires.
+func TestRefcount_FingerprintUnresolvableKeepsClient(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Unix(2_000_000, 0)
+	stored := identity.Fingerprint{StartTime: "Mon Apr 28 14:22:13 2026", ArgvHash: "OLD"}
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-ps-unresolvable",
+		Harness:      "codex",
+		WatchPID:     sql.NullInt64{Int64: 2468, Valid: true},
+		WatchFP:      sql.NullString{String: FingerprintToken(stored), Valid: true},
+		RegisteredTS: float64(now.Unix() - 10),
+		LastSeenTS:   float64(now.Unix() - 5),
+	})
+
+	for i := 0; i < 5; i++ {
+		alive, err := SweepClients(context.Background(), db, now.Add(time.Duration(i)*time.Minute), SweepOpts{
+			AliveFn: func(context.Context, int) bool { return true },
+			CaptureFingerprint: func(context.Context, int) (identity.Fingerprint, error) {
+				return identity.Fingerprint{}, errors.New("ps unavailable")
+			},
+		})
+		if err != nil {
+			t.Fatalf("SweepClients pass %d: %v", i, err)
+		}
+		if alive != 1 {
+			t.Fatalf("pass %d alive=%d, want 1", i, alive)
+		}
+		if got := countClients(t, db); got != 1 {
+			t.Fatalf("pass %d post-sweep rows=%d, want 1", i, got)
+		}
+	}
+}
+
+func TestRefcount_FingerprintProbeHonorsCancellation(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Unix(2_000_000, 0)
+	stored := identity.Fingerprint{StartTime: "Mon Apr 28 14:22:13 2026", ArgvHash: "OLD"}
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-cancel",
+		Harness:      "codex",
+		WatchPID:     sql.NullInt64{Int64: 2468, Valid: true},
+		WatchFP:      sql.NullString{String: FingerprintToken(stored), Valid: true},
+		RegisteredTS: float64(now.Unix() - 10),
+		LastSeenTS:   float64(now.Unix() - 5),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	alive, err := SweepClients(ctx, db, now, SweepOpts{
+		AliveFn: func(context.Context, int) bool { return true },
+		CaptureFingerprint: func(ctx context.Context, _ int) (identity.Fingerprint, error) {
+			cancel()
+			return identity.Fingerprint{}, ctx.Err()
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SweepClients err=%v, want context.Canceled", err)
+	}
+	if alive != 0 {
+		t.Fatalf("alive=%d, want 0 before canceled probe is counted", alive)
+	}
+	if got := countClients(t, db); got != 1 {
+		t.Fatalf("post-sweep rows=%d, want 1", got)
 	}
 }
 

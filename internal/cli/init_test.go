@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -261,14 +263,68 @@ func TestInit_UnknownHarness_NonZeroExit(t *testing.T) {
 	}
 }
 
-func TestInit_ApplyFlag_ExitsZeroAndMentionsDeferred(t *testing.T) {
-	out, _, err := runInitCmd(t, "claude-code", "--apply")
-	if err != nil {
-		t.Fatalf("--apply should exit 0, got: %v\nstdout:\n%s", err, out)
+func TestInit_ApplyFlag_NonZero(t *testing.T) {
+	out, stderr, err := runInitCmd(t, "claude-code", "--apply")
+	if err == nil {
+		t.Fatalf("--apply should fail, got nil\nstdout:\n%s", out)
 	}
-	// Must mention that --apply is deferred / not implemented in v0.1.
-	lower := strings.ToLower(out)
-	if !strings.Contains(lower, "not implemented") && !strings.Contains(lower, "deferred") {
-		t.Errorf("--apply output should mention not-implemented/deferred, got:\n%s", out)
+	if out != "" {
+		t.Errorf("--apply should not render snippet stdout, got:\n%s", out)
+	}
+	if !strings.Contains(stderr, "--apply is not implemented") {
+		t.Errorf("--apply stderr should explain rejection, got: %q", stderr)
+	}
+}
+
+func TestInit_NoArg_AutoDetectsSingleHarness(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatalf("mkdir settings dir: %v", err)
+	}
+	if err := os.WriteFile(settings, []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	out, stderr, err := runInitCmd(t)
+	if err != nil {
+		t.Fatalf("expected auto-detected init to exit 0, got: %v\nstderr:\n%s", err, stderr)
+	}
+	want := snippetBody(t, "claude-code/settings.snippet.json")
+	if !strings.Contains(out, strings.TrimSpace(want)) {
+		t.Errorf("auto-detected init did not render claude-code snippet.\nwant:\n%s\ngot:\n%s", want, out)
+	}
+}
+
+func TestInit_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	files := map[string]string{
+		filepath.Join(home, ".claude", "settings.json"): `{"_acd_managed": true}`,
+		filepath.Join(home, ".codex", "config.toml"):    "# acd-managed: true\n",
+	}
+	for path, body := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	out, stderr, err := runInitCmd(t)
+	if err == nil {
+		t.Fatalf("expected multiple detected harnesses to fail, got nil\nstdout:\n%s", out)
+	}
+	if out != "" {
+		t.Errorf("multi-detect should not render snippet stdout, got:\n%s", out)
+	}
+	for _, want := range []string{"claude-code", "codex"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("multi-detect stderr missing %q: %q", want, stderr)
+		}
 	}
 }

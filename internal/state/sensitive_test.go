@@ -109,6 +109,21 @@ func TestSensitiveMatcherSnapshot(t *testing.T) {
 	}
 }
 
+func TestSensitiveMatcherDirectoryPruningOnlyUsesLiteralDirNames(t *testing.T) {
+	t.Setenv(EnvSensitiveGlobs, "credentials*,private")
+	m := NewSensitiveMatcher()
+
+	if m.MatchDirectory("credentials_repo") {
+		t.Fatalf("wildcard file pattern should not prune credentials_repo directory")
+	}
+	if !m.Match("credentials_repo") {
+		t.Fatalf("file matcher should still match credentials_repo")
+	}
+	if !m.MatchDirectory("nested/private") {
+		t.Fatalf("literal directory pattern should prune nested/private")
+	}
+}
+
 // TestExpandGlobs ports the legacy snapshot_state._expand_globs invariants:
 // every "**/X" yields a paired bare "X", with no duplicates.
 func TestExpandGlobs(t *testing.T) {
