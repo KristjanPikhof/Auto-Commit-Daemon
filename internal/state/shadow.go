@@ -68,7 +68,7 @@ SELECT branch_ref, branch_generation, path, operation, mode, oid,
 FROM shadow_paths
 WHERE branch_ref = ? AND branch_generation = ? AND path = ?`
 	var sp ShadowPath
-	err := d.conn.QueryRowContext(ctx, q, branchRef, gen, path).Scan(
+	err := d.readSQL().QueryRowContext(ctx, q, branchRef, gen, path).Scan(
 		&sp.BranchRef, &sp.BranchGeneration, &sp.Path, &sp.Operation, &sp.Mode, &sp.OID,
 		&sp.OldPath, &sp.BaseHead, &sp.Fidelity, &sp.UpdatedTS,
 	)
