@@ -664,6 +664,27 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 	return commitOID, nil
 }
 
+func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID string) error {
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	if err := state.MarkEventPublished(ctx, db,
+		ev.Seq, state.EventStatePublished,
+		sql.NullString{String: commitOID, Valid: true},
+		sql.NullString{},
+		ev.Message, nowSec,
+	); err != nil {
+		return fmt.Errorf("daemon: mark published: %w", err)
+	}
+	_ = state.SavePublishState(ctx, db, state.Publish{
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		SourceHead:       sql.NullString{String: sourceHead, Valid: true},
+		TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
+		Status:           "published",
+	})
+	return nil
+}
+
 // markFailed flags an event as terminally failed and records the reason.
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
 // will not re-attempt it. Best-effort: persistence failures here do not
