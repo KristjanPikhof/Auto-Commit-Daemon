@@ -250,6 +250,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
 					return sum, err
 				}
+				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after idempotent publish: %w", err)
+				}
 				parent = headOID
 				activeCtx.BaseHead = headOID
 				sum.BaseHead = headOID
