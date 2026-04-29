@@ -584,7 +584,8 @@ func regStopWithPeerDefersKill(t *testing.T) {
 		if !stop2.Deferred {
 			t.Fatalf("expected stopped or deferred after final session out, got %+v", stop2)
 		}
-		waitMode(t, repo, "stopped", 15*time.Second)
+		stopSessionForce(t, env, repo)
+		waitMode(t, repo, "stopped", 5*time.Second)
 		return
 	}
 	waitMode(t, repo, "stopped", 5*time.Second)
