@@ -58,15 +58,9 @@ func TestAdapterE2E(t *testing.T) {
 	}
 
 	t.Run("claude-code", func(t *testing.T) {
-		if _, err := exec.LookPath("jq"); err != nil {
-			t.Skip("claude-code snippet requires jq; not on PATH")
-		}
 		runClaudeCodeE2E(t, bin)
 	})
 	t.Run("codex", func(t *testing.T) {
-		if _, err := exec.LookPath("jq"); err != nil {
-			t.Skip("codex snippet requires jq; not on PATH")
-		}
 		runCodexE2E(t, bin)
 		runCodexMissingAcdWritesHookLog(t)
 	})
