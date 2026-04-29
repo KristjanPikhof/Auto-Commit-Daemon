@@ -442,12 +442,15 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 			if err := os.RemoveAll(markerPath); err != nil {
 				t.Fatalf("remove marker: %v", err)
 			}
+			waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+			if err := os.WriteFile(filepath.Join(f.dir, "resumed.txt"), []byte(tc.name+"\n"), 0o644); err != nil {
+				t.Fatalf("write resumed: %v", err)
+			}
 			wakeCh <- struct{}{}
 			newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
 			if newHead == startHead {
 				t.Fatalf("HEAD did not advance after %s marker cleared", tc.marker)
 			}
-			waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
 
 			cancel()
 			wg.Wait()
