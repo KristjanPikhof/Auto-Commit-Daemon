@@ -33,7 +33,10 @@ pending  →  published     (normal: commit was written and ref advanced)
 
 `pending` is the only non-terminal state. The replay loop processes only
 `pending` rows. `blocked_conflict` and `failed` rows are permanent — they are
-counted but never retried automatically.
+counted but never retried automatically. A terminal `blocked_conflict` or
+`failed` row also acts as a sequence barrier for the same branch ref and
+generation: later pending rows stay held until the operator deletes or otherwise
+resolves the terminal predecessor.
 
 ---
 
@@ -142,10 +145,10 @@ the branch. Common causes:
 ### Batch-halt behavior
 
 The pass halts on the first `blocked_conflict`. Events that came after the
-blocker in the capture sequence are left `pending`. They will be re-examined on
-the next poll tick, but they will also block because their `BaseHead` was
-captured against the now-broken predecessor. The entire backlog clears only
-after the operator resolves the root conflict.
+blocker in the capture sequence are left `pending`, but `PendingEvents` hides
+them behind the terminal predecessor on later passes. They do not leapfrog the
+broken event even when their paths are disjoint. The entire backlog clears only
+after the operator resolves or deletes the root conflict row.
 
 ---
 
