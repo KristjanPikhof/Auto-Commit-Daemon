@@ -38,10 +38,7 @@ var signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string
 	}
 	if expectedFingerprint != "" {
 		fp, err := captureProcessFingerprint(pid)
-		if err != nil {
-			return fmt.Errorf("verify process identity for pid %d: %w", pid, err)
-		}
-		if got := daemon.FingerprintToken(fp); got != expectedFingerprint {
+		if err == nil && daemon.FingerprintToken(fp) != expectedFingerprint {
 			return fmt.Errorf("verify process identity for pid %d: fingerprint mismatch", pid)
 		}
 	}
