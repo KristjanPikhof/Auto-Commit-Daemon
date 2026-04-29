@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -41,11 +43,51 @@ func installFakeSpawn(t *testing.T, fakePID int) (*atomic.Int32, func()) {
 	return &count, func() { spawnDaemon = prev }
 }
 
+func makeStartRepo(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	if err := git.Init(ctx, repoDir); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	return repoDir
+}
+
+func commitStartRepoSeed(t *testing.T, repoDir string) string {
+	t.Helper()
+	ctx := context.Background()
+	for _, kv := range [][]string{
+		{"user.email", "acd-test@example.com"},
+		{"user.name", "ACD Test"},
+		{"commit.gpgsign", "false"},
+	} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "config", kv[0], kv[1]); err != nil {
+			t.Fatalf("git config %s: %v", kv[0], err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "add", "seed.txt"); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "commit", "-q", "-m", "seed"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	head, err := git.RevParse(ctx, repoDir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return head
+}
+
 func TestStart_FirstCall_StartsDaemon(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close() // start.go reopens the DB itself
+	repoDir := makeStartRepo(t)
 	t.Logf("roots=%+v", roots)
 
 	count, restore := installFakeSpawn(t, os.Getpid())
@@ -76,8 +118,7 @@ func TestStart_FirstCall_StartsDaemon(t *testing.T) {
 func TestStart_DuplicateSession_NoRespawn(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close()
+	repoDir := makeStartRepo(t)
 
 	count, restore := installFakeSpawn(t, os.Getpid())
 	defer restore()
@@ -108,8 +149,7 @@ func TestStart_DuplicateSession_NoRespawn(t *testing.T) {
 func TestStart_RegistryUpdated(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close()
+	repoDir := makeStartRepo(t)
 	_, restore := installFakeSpawn(t, os.Getpid())
 	defer restore()
 
@@ -124,5 +164,30 @@ func TestStart_RegistryUpdated(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte(repoDir)) || !bytes.Contains(body, []byte("codex")) {
 		t.Fatalf("registry missing repo or harness:\n%s", body)
+	}
+}
+
+func TestStart_DetachedHEADRefused(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	head := commitStartRepoSeed(t, repoDir)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "checkout", "--detach", head); err != nil {
+		t.Fatalf("git checkout --detach: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+
+	var stdout bytes.Buffer
+	err := runStart(ctx, &stdout, repoDir, "session-detached", "codex", 0, true)
+	if err == nil {
+		t.Fatalf("runStart succeeded on detached HEAD")
+	}
+	if !strings.Contains(err.Error(), "detached HEAD") {
+		t.Fatalf("error %q does not mention detached HEAD", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count=%d want 0", count.Load())
 	}
 }
