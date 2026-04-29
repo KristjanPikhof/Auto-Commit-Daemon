@@ -60,7 +60,7 @@ func ListDailyRollupsSince(ctx context.Context, d *DB, sinceDay string) ([]Daily
 SELECT day, repo_root, events_total, commits_total, files_changed,
        bytes_changed, errors_total, sessions_seen, daemon_uptime_seconds
 FROM daily_rollups WHERE day >= ? ORDER BY day ASC, repo_root ASC`
-	rows, err := d.conn.QueryContext(ctx, q, sinceDay)
+	rows, err := d.readSQL().QueryContext(ctx, q, sinceDay)
 	if err != nil {
 		return nil, fmt.Errorf("state: list daily rollups: %w", err)
 	}
