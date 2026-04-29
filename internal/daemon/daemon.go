@@ -593,6 +593,8 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	for {
+		branchTransitionBlocked = false
+
 		// 4a/b. Honor ctx + shutdown signal.
 		if err := ctx.Err(); err != nil {
 			graceful("context canceled")
