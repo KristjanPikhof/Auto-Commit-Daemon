@@ -450,6 +450,47 @@ func traceReplayUpdateRef(
 	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
 }
 
+func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, bool, error) {
+	headOID, err := git.RevParse(ctx, repoRoot, "HEAD")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	for _, op := range ops {
+		if !op.AfterOID.Valid || op.AfterOID.String == "" {
+			return headOID, false, nil
+		}
+		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
+		if err != nil {
+			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+		}
+		if blobOID != op.AfterOID.String {
+			return headOID, false, nil
+		}
+		if op.AfterMode.Valid && op.AfterMode.String != "" {
+			entries, err := git.LsTree(ctx, repoRoot, headOID, false, op.Path)
+			if err != nil {
+				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+			}
+			if !treeEntryModeMatches(entries, op.Path, op.AfterMode.String) {
+				return headOID, false, nil
+			}
+		}
+	}
+	return headOID, true, nil
+}
+
+func treeEntryModeMatches(entries []git.TreeEntry, path, mode string) bool {
+	for _, entry := range entries {
+		if entry.Path == path && entry.Type == "blob" {
+			return entry.Mode == mode
+		}
+	}
+	return false
+}
+
 // validateOps mirrors snapshot-replay._validate_op: every op kind must
 // supply the right combination of after_oid/after_mode/before_*/old_path.
 // Returns the empty string on success.
