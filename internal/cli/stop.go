@@ -34,9 +34,16 @@ type stopRepoResult struct {
 }
 
 // stopAllResult is the JSON payload for `acd stop --all`.
+//
+// `Failed` holds repos where stop attempted to terminate the daemon but the
+// daemon survived — typically a fingerprint mismatch swallowing SIGTERM /
+// SIGKILL, or "daemon survived SIGKILL" after escalation. These rows MUST
+// NOT be reported under `Stopped`: the previous classifier branched on
+// `Deferred` alone and silently buried failures.
 type stopAllResult struct {
 	Stopped  []stopRepoResult `json:"stopped"`
 	Deferred []stopRepoResult `json:"deferred"`
+	Failed   []stopRepoResult `json:"failed,omitempty"`
 }
 
 // stopWaitTimeout is how long the controller waits for the daemon to
