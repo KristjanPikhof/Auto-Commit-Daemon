@@ -5,6 +5,7 @@ package integration_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,26 +14,57 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestRecoverReplaysIncidentFixture(t *testing.T) {
 	repo := tempRepo(t)
-	env := withIsolatedHome(t)
-	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	env := envWith(os.Environ(), "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	startSession(t, ctx, env, repo, "recover-1", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("paths.Resolve: %v", err)
+	}
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.UpsertRepo(repo, repoHash, dbPath, "test", time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatalf("register repo: %v", err)
+	}
+
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:              999999,
+		Mode:             "stopped",
+		BranchRef:        sql.NullString{String: "refs/heads/stale", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 3, Valid: true},
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
 	afterOID := gitHashObjectStdin(t, repo, "recovered\n")
 	now := nowFloatSeconds()
 	inject := fmt.Sprintf(`
-UPDATE daemon_state SET branch_ref = 'refs/heads/stale', branch_generation = 3, mode = 'stopped' WHERE id = 1;
 INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.generation', '3', %f)
   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts;
 INSERT INTO daemon_meta(key, value, updated_ts) VALUES('last_replay_conflict', '{"seq":1,"error_class":"cas_fail"}', %f)
