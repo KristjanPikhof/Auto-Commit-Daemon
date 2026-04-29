@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -120,6 +121,14 @@ func addFailingJQ(t *testing.T, env []string) []string {
 		t.Fatalf("chmod fake jq: %v", err)
 	}
 	return prependPath(env, fakeBin)
+}
+
+func daemonStopped(repo string) bool {
+	if readDaemonStateMode(repo) == "stopped" {
+		return true
+	}
+	pid := readDaemonStatePID(repo)
+	return pid > 0 && syscall.Kill(pid, 0) != nil
 }
 
 // runBash runs `bash -c command` with the given env and stdin. Returns
@@ -383,7 +392,7 @@ func shutdownDaemon(t *testing.T, env []string, repo, sessionID string) {
 			res.ExitCode, res.Stdout, res.Stderr)
 	}
 	waitFor(t, "post-cleanup mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+		return daemonStopped(repo)
 	})
 }
 
@@ -437,7 +446,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitFor(t, "claude-code daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+		return daemonStopped(repo)
 	})
 }
 
@@ -479,7 +488,7 @@ func runCodexE2E(t *testing.T, bin string) {
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitFor(t, "codex daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+		return daemonStopped(repo)
 	})
 }
 
@@ -559,7 +568,7 @@ func runOpencodeE2E(t *testing.T, bin string) {
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitFor(t, "opencode daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+		return daemonStopped(repo)
 	})
 }
 
@@ -595,7 +604,7 @@ func runPiE2E(t *testing.T, bin string) {
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitFor(t, "pi daemon mode==stopped", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+		return daemonStopped(repo)
 	})
 }
 
