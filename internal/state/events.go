@@ -158,16 +158,26 @@ WHERE seq = ?`
 // PendingEvents returns up to limit pending events ordered by seq ascending
 // (FIFO replay). limit <= 0 means "no limit".
 //
-// Only rows with state = EventStatePending are returned. Terminal states
-// (published, failed, blocked_conflict) are intentionally excluded so a
-// stuck event does not re-run on every poll tick — see EventStateBlockedConflict.
+// Only rows with state = EventStatePending are returned. A terminal failed or
+// blocked_conflict predecessor for the same branch generation forms a replay
+// barrier: later pending rows stay out of the queue until the operator removes
+// the terminal predecessor. Published predecessors do not block because they
+// already advanced the branch history.
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
 	q := `
-SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
-       fidelity, captured_ts, published_ts, state, commit_oid, error, message
-FROM capture_events
-WHERE state = 'pending'
-ORDER BY seq ASC`
+SELECT e.seq, e.branch_ref, e.branch_generation, e.base_head, e.operation, e.path, e.old_path,
+       e.fidelity, e.captured_ts, e.published_ts, e.state, e.commit_oid, e.error, e.message
+FROM capture_events e
+WHERE e.state = 'pending'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events barrier
+      WHERE barrier.branch_ref = e.branch_ref
+        AND barrier.branch_generation = e.branch_generation
+        AND barrier.seq < e.seq
+        AND barrier.state IN ('blocked_conflict', 'failed')
+  )
+ORDER BY e.seq ASC`
 	args := []any{}
 	if limit > 0 {
 		q += " LIMIT ?"
