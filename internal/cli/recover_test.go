@@ -126,6 +126,24 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	if err := state.MetaSet(ctx, db, "last_replay_conflict", `{"seq":1,"error_class":"cas_fail"}`); err != nil {
 		t.Fatalf("MetaSet conflict: %v", err)
 	}
+	for _, sp := range []state.ShadowPath{
+		{
+			BranchRef: "refs/heads/stale", BranchGeneration: 2,
+			Path: "dup.txt", Operation: "modify", BaseHead: head, Fidelity: "exact",
+			Mode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			OID:  sql.NullString{String: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Valid: true},
+		},
+		{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			Path: "dup.txt", Operation: "modify", BaseHead: head, Fidelity: "exact",
+			Mode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			OID:  sql.NullString{String: "cccccccccccccccccccccccccccccccccccccccc", Valid: true},
+		},
+	} {
+		if err := state.UpsertShadowPath(ctx, db, sp); err != nil {
+			t.Fatalf("UpsertShadowPath: %v", err)
+		}
+	}
 	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/stale",
 		BranchGeneration: 2,
@@ -187,6 +205,15 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	}
 	if tok, _, _ := state.MetaGet(ctx, db, "branch_token"); !strings.Contains(tok, "refs/heads/main") {
 		t.Fatalf("branch_token=%q want current branch", tok)
+	}
+	var shadowRows int
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = 'refs/heads/main' AND branch_generation = 2 AND path = 'dup.txt'`,
+	).Scan(&shadowRows); err != nil {
+		t.Fatalf("count retargeted shadow rows: %v", err)
+	}
+	if shadowRows != 1 {
+		t.Fatalf("retargeted shadow rows=%d want 1", shadowRows)
 	}
 }
 
