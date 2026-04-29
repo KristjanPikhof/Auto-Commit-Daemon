@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,6 +71,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -109,6 +111,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -141,6 +144,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -197,6 +201,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -220,6 +225,7 @@ done
 	composed := Compose(NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	}), det)
 	r, err = composed.Generate(context.Background(), CommitContext{Path: "z.go", Op: "modify"})
 	if err != nil {
@@ -252,6 +258,7 @@ done
 	p := NewSubprocessProvider("slow", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-slow", slowBin),
 		Timeout:  200 * time.Millisecond,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -312,6 +319,7 @@ fi
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -386,6 +394,7 @@ done
 	p := NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
 		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
 	})
 
 	// Spawn the plugin by issuing one request.
