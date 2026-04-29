@@ -99,6 +99,41 @@ func TestIgnoreCheckerConcurrentCallsAreSerialized(t *testing.T) {
 	}
 }
 
+func TestIgnoreCheckerConcurrentCanceledChecksDoNotRace(t *testing.T) {
+	dir := initRepo(t)
+	writeGitignore(t, dir, "*.tmp\n")
+	checker := NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := checker.Check(ctx, []string{"trash.tmp", "keep.go"}); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("canceled Check returned non-context error: %v", err)
+	}
+
+	got, err := checker.Check(context.Background(), []string{"trash.tmp", "keep.go"})
+	if err != nil {
+		t.Fatalf("Check after canceled calls: %v", err)
+	}
+	if len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("Check after canceled calls = %v, want [true false]", got)
+	}
+}
+
 func TestIgnoreCheckerCloseIsIdempotent(t *testing.T) {
 	dir := initRepo(t)
 	checker := NewIgnoreChecker(dir)
