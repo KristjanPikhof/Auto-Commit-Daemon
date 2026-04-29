@@ -42,6 +42,8 @@ acd status              # current repo's daemon (shows pending_events + blocked_
 acd stats --since 7d    # last week's commits
 acd doctor              # pending : N, blocked : N, last conflict path + age + error
 acd doctor --bundle     # diagnostics zip for issue reports
+acd diagnose            # read-only branch anchor + blocked_conflict report
+acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
 acd gc                  # prune stale central-registry entries
 acd stop --repo X       # graceful stop, refcount-aware
@@ -50,6 +52,52 @@ acd stop --all          # stop every daemon
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
+
+## Trace and recovery
+
+Use `acd diagnose` first when replay stalls:
+
+~~~bash
+acd diagnose --repo .
+acd diagnose --repo . --json
+~~~
+
+It reports the current git `HEAD` branch, the daemon's persisted branch anchor,
+blocked-conflict counts by `error_class`, and the five most recent blocked
+events. If the daemon is stopped and the plan looks right, recover a stale
+anchor with an automatic backup:
+
+~~~bash
+acd recover --repo . --auto --dry-run
+acd recover --repo . --auto --yes
+~~~
+
+`recover` refuses to run while the daemon PID is alive. Applying a plan copies
+`.git/acd/state.db` to `.git/acd/state.db.recover-<timestamp>`, retargets stale
+pending/blocked rows to the current attached branch, resets `blocked_conflict`
+rows to `pending`, and clears stale replay metadata.
+
+Enable local decision tracing when you need a replay/capture audit trail:
+
+~~~bash
+ACD_TRACE=1 acd start --repo . --session-id debug --harness shell
+ACD_TRACE=1 ACD_TRACE_DIR=/tmp/acd-trace acd daemon run --repo .
+~~~
+
+Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
+`ACD_TRACE_DIR` is set. Each record includes `ts`, `repo`, `branch_ref`,
+`head_sha`, `event_class`, `decision`, `reason`, `input`, `output`, `error`,
+`seq`, and `generation`.
+
+## Environment
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
+| `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
+| `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
+| `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
+| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 
 ## Docs
 
