@@ -152,6 +152,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
+		if branchRef, headOID := resolveBranch(ctx, repoRoot, nil); branchRef != "" {
+			activeCtx.BranchRef = branchRef
+			if headOID != "" && headOID == parent {
+				activeCtx.BaseHead = headOID
+			}
+		}
 
 		// Branch-generation / ancestry guard. An event whose generation
 		// no longer matches the active context was captured under a
@@ -162,7 +168,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// silently replay — the resulting commit would chain off a stale
 		// parent and diverge from the operator's intent. Block
 		// terminally so operators can spot the mismatch and reconcile.
-		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, cctx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
 			errorClass := replayErrorValidation
@@ -262,7 +268,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := updateReplayRefWithRetry(ctx, repoRoot, cctx.BranchRef, commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
@@ -299,8 +305,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		_ = state.SavePublishState(ctx, db, state.Publish{
 			EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-			BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
-			BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+			BranchRef:        sql.NullString{String: activeCtx.BranchRef, Valid: true},
+			BranchGeneration: sql.NullInt64{Int64: activeCtx.BranchGeneration, Valid: true},
 			SourceHead:       sql.NullString{String: parent, Valid: true},
 			TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
 			Status:           "published",
