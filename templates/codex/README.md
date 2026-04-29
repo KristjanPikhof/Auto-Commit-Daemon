@@ -13,6 +13,10 @@
 - Open Codex in any git repo
 - From another shell, run `acd status`
 - One client with `harness=codex` should appear
+- If a hook fails, inspect `~/.local/state/acd/codex-hook.log`
+
+The snippet uses `CODEX_PROJECT_DIR` for the repo path and falls back to the
+hook process working directory when the environment variable is unavailable.
 
 ## Uninstall
 
