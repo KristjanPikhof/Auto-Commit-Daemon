@@ -264,6 +264,83 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	}
 }
 
+// TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
+// where Run used identity.CaptureSelf() to stamp daemon_fingerprint.
+// The persisted token must equal what `acd stop` / `acd wake`
+// reconstruct via identity.Capture(pid) when verifying the daemon's
+// PID before delivering a signal — otherwise signalProcess silently
+// returns "fingerprint mismatch" and SIGTERM/SIGKILL never reach the
+// daemon. Asserts the stored token is identical to
+// FingerprintToken(identity.Capture(daemon_pid)).
+func TestRun_StampedFingerprintIsSymmetricWithVerifier(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("ps fingerprint only validated on darwin/linux; running on %s", runtime.GOOS)
+	}
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wakeCh := make(chan struct{}, 1)
+	shutdownCh := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	st, _, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil {
+		t.Fatalf("LoadDaemonState: %v", err)
+	}
+	if !st.DaemonFingerprint.Valid || st.DaemonFingerprint.String == "" {
+		t.Fatalf("daemon_fingerprint not stamped: %+v", st)
+	}
+	if st.PID != os.Getpid() {
+		t.Fatalf("daemon_state.pid=%d want test pid %d", st.PID, os.Getpid())
+	}
+
+	// Reconstruct what `acd stop` would compute when verifying the
+	// stamped PID. Must equal byte-for-byte; otherwise signalProcess
+	// returns mismatch.
+	verified, err := identity.Capture(st.PID)
+	if err != nil {
+		t.Fatalf("identity.Capture(daemon pid): %v", err)
+	}
+	want := FingerprintToken(verified)
+	if want == "" {
+		t.Fatalf("verifier token empty; cannot assert symmetry")
+	}
+	if st.DaemonFingerprint.String != want {
+		t.Fatalf("stamped daemon_fingerprint=%q, verifier would compute %q "+
+			"(asymmetric — daemon stamping must use identity.Capture, not CaptureSelf)",
+			st.DaemonFingerprint.String, want)
+	}
+
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 func TestResolveBranch_DetachedHeadHasNoBranchRef(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
