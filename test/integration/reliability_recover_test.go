@@ -27,7 +27,17 @@ func TestRecoverReplaysIncidentFixture(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("XDG_DATA_HOME", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
-	env := envWith(os.Environ(), "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
+	env := make([]string, 0, len(os.Environ())+4)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "HOME=") ||
+			strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
+			strings.HasPrefix(kv, "XDG_DATA_HOME=") ||
+			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
