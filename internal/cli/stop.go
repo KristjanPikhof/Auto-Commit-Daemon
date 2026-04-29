@@ -101,7 +101,11 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	if err != nil {
 		return fmt.Errorf("acd stop: load registry: %w", err)
 	}
-	out_all := stopAllResult{Stopped: []stopRepoResult{}, Deferred: []stopRepoResult{}}
+	out_all := stopAllResult{
+		Stopped:  []stopRepoResult{},
+		Deferred: []stopRepoResult{},
+		Failed:   []stopRepoResult{},
+	}
 	for _, rec := range reg.Repos {
 		// Use the caller's force mode for each repo; without --force,
 		// the per-repo refcount-aware shutdown path applies.
@@ -109,10 +113,15 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 		if err != nil {
 			res = stopRepoResult{Repo: rec.Path, Reason: err.Error()}
 		}
-		if res.Deferred {
+		switch {
+		case res.Deferred:
 			out_all.Deferred = append(out_all.Deferred, res)
-		} else {
+		case res.Stopped:
 			out_all.Stopped = append(out_all.Stopped, res)
+		default:
+			// SIGTERM swallowed, SIGKILL failed, or daemon survived
+			// escalation. Surface it; do not pretend success.
+			out_all.Failed = append(out_all.Failed, res)
 		}
 	}
 	if jsonOut {
@@ -120,13 +129,23 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(out_all)
 	}
-	fmt.Fprintf(out, "acd stop --all: stopped=%d deferred=%d\n",
-		len(out_all.Stopped), len(out_all.Deferred))
+	fmt.Fprintf(out, "acd stop --all: stopped=%d deferred=%d failed=%d\n",
+		len(out_all.Stopped), len(out_all.Deferred), len(out_all.Failed))
 	for _, r := range out_all.Stopped {
 		fmt.Fprintf(out, "  stopped: %s (pid %d)\n", r.Repo, r.DaemonPID)
 	}
 	for _, r := range out_all.Deferred {
 		fmt.Fprintf(out, "  deferred: %s (%s)\n", r.Repo, r.Reason)
+	}
+	for _, r := range out_all.Failed {
+		reason := r.Reason
+		if reason == "" {
+			reason = "daemon still running"
+		}
+		fmt.Fprintf(out, "  failed: %s (pid %d) — %s\n", r.Repo, r.DaemonPID, reason)
+	}
+	if len(out_all.Failed) > 0 {
+		return fmt.Errorf("acd stop --all: %d repo(s) failed to stop", len(out_all.Failed))
 	}
 	return nil
 }
