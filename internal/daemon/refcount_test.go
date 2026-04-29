@@ -172,6 +172,38 @@ func TestRefcount_FingerprintUnresolvableKeepsClient(t *testing.T) {
 	}
 }
 
+func TestRefcount_FingerprintProbeHonorsCancellation(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Unix(2_000_000, 0)
+	stored := identity.Fingerprint{StartTime: "Mon Apr 28 14:22:13 2026", ArgvHash: "OLD"}
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-cancel",
+		Harness:      "codex",
+		WatchPID:     sql.NullInt64{Int64: 2468, Valid: true},
+		WatchFP:      sql.NullString{String: FingerprintToken(stored), Valid: true},
+		RegisteredTS: float64(now.Unix() - 10),
+		LastSeenTS:   float64(now.Unix() - 5),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	alive, err := SweepClients(ctx, db, now, SweepOpts{
+		AliveFn: func(context.Context, int) bool { return true },
+		CaptureFingerprint: func(ctx context.Context, _ int) (identity.Fingerprint, error) {
+			cancel()
+			return identity.Fingerprint{}, ctx.Err()
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SweepClients err=%v, want context.Canceled", err)
+	}
+	if alive != 0 {
+		t.Fatalf("alive=%d, want 0 before canceled probe is counted", alive)
+	}
+	if got := countClients(t, db); got != 1 {
+		t.Fatalf("post-sweep rows=%d, want 1", got)
+	}
+}
+
 // TestRefcount_TTLExpiry: no pid, last_seen older than TTL -> drop.
 func TestRefcount_TTLExpiry(t *testing.T) {
 	db := openTestDB(t)
