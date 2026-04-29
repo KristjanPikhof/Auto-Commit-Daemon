@@ -1,6 +1,6 @@
-// prune.go drops stale capture_events rows so the per-repo state DB does not
-// grow without bound. Pruned rows are restricted to terminal-success
-// ('published') so operators can still inspect failures.
+// prune.go drops stale terminal capture_events rows so the per-repo state DB
+// does not grow without bound. Terminal failure rows are retained while they
+// still form an active replay barrier for later pending events.
 //
 // Default retention is 7 days; override via env ACD_EVENT_RETENTION_DAYS.
 package daemon
@@ -36,7 +36,7 @@ func resolveEventRetention(opt time.Duration) time.Duration {
 	return DefaultEventRetention
 }
 
-// PruneCaptureEvents drops 'published' capture_events older than retention.
+// PruneCaptureEvents drops terminal capture_events older than retention.
 // Returns the number of rows removed.
 func PruneCaptureEvents(ctx context.Context, db *state.DB, now time.Time, retention time.Duration) (int, error) {
 	if db == nil {
@@ -44,5 +44,13 @@ func PruneCaptureEvents(ctx context.Context, db *state.DB, now time.Time, retent
 	}
 	r := resolveEventRetention(retention)
 	cutoff := float64(now.Add(-r).UnixNano()) / 1e9
-	return state.PrunePublishedEventsBefore(ctx, db, cutoff)
+	published, err := state.PrunePublishedEventsBefore(ctx, db, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	terminal, err := state.PruneTerminalEventsBefore(ctx, db, cutoff)
+	if err != nil {
+		return published, err
+	}
+	return published + terminal, nil
 }
