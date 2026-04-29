@@ -149,6 +149,48 @@ func waitForDaemonMode(t *testing.T, db *state.DB, mode string, timeout time.Dur
 	t.Fatalf("daemon_state.mode did not become %q within %v", mode, timeout)
 }
 
+func waitForMetaValue(t *testing.T, db *state.DB, key, want string, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		got, ok, err := state.MetaGet(ctx, db, key)
+		if err != nil {
+			t.Fatalf("MetaGet %s: %v", key, err)
+		}
+		if ok && got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, ok, err := state.MetaGet(ctx, db, key)
+	if err != nil {
+		t.Fatalf("MetaGet %s after timeout: %v", key, err)
+	}
+	t.Fatalf("%s=%q ok=%v want %q", key, got, ok, want)
+}
+
+func waitForMetaDeleted(t *testing.T, db *state.DB, key string, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, ok, err := state.MetaGet(ctx, db, key)
+		if err != nil {
+			t.Fatalf("MetaGet %s: %v", key, err)
+		}
+		if !ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, ok, err := state.MetaGet(ctx, db, key)
+	if err != nil {
+		t.Fatalf("MetaGet %s after timeout: %v", key, err)
+	}
+	t.Fatalf("%s still set to %q ok=%v", key, got, ok)
+}
+
 // TestRun_LifecycleHappyPath: a full capture+replay cycle drives a commit
 // onto HEAD when the test triggers a wake; ctx cancel exits with mode=stopped.
 func TestRun_LifecycleHappyPath(t *testing.T) {
