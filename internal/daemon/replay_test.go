@@ -1381,6 +1381,38 @@ func traceHasDecision(events []acdtrace.Event, decision string) bool {
 	return false
 }
 
+func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture, path, body string) int {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("expected at least one pending event")
+	}
+	return len(pending)
+}
+
+func assertPendingCount(t *testing.T, ctx context.Context, db *state.DB, want int) {
+	t.Helper()
+	pending, err := state.PendingEvents(ctx, db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != want {
+		t.Fatalf("pending count=%d want %d; pending=%+v", len(pending), want, pending)
+	}
+}
+
 func commitSingleFileTree(t *testing.T, ctx context.Context, repoDir, path, blobOID, message string, parents ...string) string {
 	t.Helper()
 	tree, err := git.Mktree(ctx, repoDir, []git.MktreeEntry{
