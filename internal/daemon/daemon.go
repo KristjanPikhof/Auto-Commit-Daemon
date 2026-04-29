@@ -488,15 +488,14 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Loop state.
 	var (
-		consecutiveErrors    int
-		consecutiveIdleTicks int
-		emptyCount           int
-		currentDelay         = opts.Scheduler.Reset()
-		lastSweep            = time.Time{}
-		lastPrune            = time.Time{}
-		lastRollup           = time.Time{}
-		lastRollupUTCDay     = ""
-		stopped              bool
+		consecutiveErrors int
+		emptyCount        int
+		currentDelay      = opts.Scheduler.Reset()
+		lastSweep         = time.Time{}
+		lastPrune         = time.Time{}
+		lastRollup        = time.Time{}
+		lastRollupUTCDay  = ""
+		stopped           bool
 	)
 
 	graceful := func(reason string) {
@@ -750,11 +749,6 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0
-		if hadWork {
-			consecutiveIdleTicks = 0
-		} else {
-			consecutiveIdleTicks++
-		}
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
@@ -858,16 +852,13 @@ func Run(ctx context.Context, opts Options) error {
 			return nil
 		case <-wakeCh:
 			timer.Stop()
-			// Reset the idle counter so the next tick starts fresh.
 			currentDelay = opts.Scheduler.Reset()
-			consecutiveIdleTicks = 0
 		case <-fsWakeReader:
 			// fsWakeReader is nil when fsnotify is disabled; a nil
 			// receive blocks forever, so this arm is effectively
 			// inactive when there's no watcher.
 			timer.Stop()
 			currentDelay = opts.Scheduler.Reset()
-			consecutiveIdleTicks = 0
 		case <-timer.C:
 		}
 	}
