@@ -14,6 +14,8 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
@@ -39,9 +41,9 @@ type SweepOpts struct {
 	// CaptureFingerprint resolves a live fingerprint for a pid. Defaulted to
 	// identity.Capture; tests inject a deterministic stub so they don't need
 	// a real `ps`. A nil function defaults to identity.Capture.
-	CaptureFingerprint func(pid int) (identity.Fingerprint, error)
+	CaptureFingerprint func(context.Context, int) (identity.Fingerprint, error)
 	// AliveFn checks pid liveness. Defaulted to identity.Alive; tests inject.
-	AliveFn func(pid int) bool
+	AliveFn func(context.Context, int) bool
 }
 
 // SelfTerminateOpts configures ShouldSelfTerminate.
@@ -70,11 +72,11 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 	}
 	aliveFn := opts.AliveFn
 	if aliveFn == nil {
-		aliveFn = identity.Alive
+		aliveFn = identity.AliveContext
 	}
 	captureFn := opts.CaptureFingerprint
 	if captureFn == nil {
-		captureFn = identity.Capture
+		captureFn = identity.CaptureContext
 	}
 
 	clients, err := state.ListClients(ctx, db)
@@ -102,7 +104,7 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 		// (2) PID liveness — fast-path eviction.
 		if c.WatchPID.Valid && c.WatchPID.Int64 > 0 {
 			pid := int(c.WatchPID.Int64)
-			if !aliveFn(pid) {
+			if !aliveFn(ctx, pid) {
 				if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
 					return alive, fmt.Errorf("daemon: drop dead-pid client %q: %w", c.SessionID, derr)
 				}
@@ -111,14 +113,10 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 			// (3) Fingerprint mismatch — PID reuse defense. Only checked
 			// when a stored fingerprint is present.
 			if c.WatchFP.Valid && c.WatchFP.String != "" {
-				live, ferr := captureFn(pid)
+				live, ferr := captureFn(ctx, pid)
 				if ferr != nil || live.Empty() {
-					// Cannot resolve fingerprint -> treat as dead (legacy
-					// verify_process_identity returns False on lookup
-					// failure, which the GC consumes as "drop").
-					if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
-						return alive, fmt.Errorf("daemon: drop unresolved-fp client %q: %w", c.SessionID, derr)
-					}
+					logFingerprintUnresolved(c.SessionID, pid, ferr)
+					alive++
 					continue
 				}
 				if storedHashOf(live) != c.WatchFP.String {
@@ -169,4 +167,18 @@ func FingerprintToken(fp identity.Fingerprint) string {
 		return ""
 	}
 	return storedHashOf(fp)
+}
+
+var unresolvedFingerprintWarnings sync.Map
+
+func logFingerprintUnresolved(sessionID string, pid int, err error) {
+	key := fmt.Sprintf("%s:%d", sessionID, pid)
+	if _, loaded := unresolvedFingerprintWarnings.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	attrs := []any{"session_id", sessionID, "pid", pid}
+	if err != nil {
+		attrs = append(attrs, "err", err.Error())
+	}
+	slog.Default().Warn("client fingerprint unresolved; keeping row until ttl", attrs...)
 }
