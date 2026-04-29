@@ -1171,10 +1171,17 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	}
 
 	var shadowRows int
-	if err := f.db.SQL().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
-		"refs/heads/main", int64(2)).Scan(&shadowRows); err != nil {
-		t.Fatalf("count shadow rows: %v", err)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := f.db.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+			"refs/heads/main", int64(2)).Scan(&shadowRows); err != nil {
+			t.Fatalf("count shadow rows: %v", err)
+		}
+		if shadowRows > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if shadowRows == 0 {
 		t.Fatalf("shadow_paths not reseeded for startup generation 2")
