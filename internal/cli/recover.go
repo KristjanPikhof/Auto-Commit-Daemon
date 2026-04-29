@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -116,17 +117,17 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) 
 		return recoverPlan{}, fmt.Errorf("acd recover: resolve HEAD: %w", err)
 	}
 
-	db, err := state.Open(ctx, rec.StateDB)
+	conn, err := openStateDBReadOnly(ctx, rec.StateDB)
 	if err != nil {
-		return recoverPlan{}, fmt.Errorf("acd recover: open state.db: %w", err)
+		return recoverPlan{}, fmt.Errorf("acd recover: open state.db read-only: %w", err)
 	}
-	defer func() { _ = db.Close() }()
+	defer conn.Close()
 
-	if err := refuseRecoverWhenDaemonAlive(ctx, db); err != nil {
+	if err := refuseRecoverWhenDaemonAliveSQL(ctx, conn); err != nil {
 		return recoverPlan{}, err
 	}
 	gen := int64(1)
-	if raw, ok, err := state.MetaGet(ctx, db, "branch.generation"); err != nil {
+	if raw, ok, err := metaLookup(ctx, conn, "branch.generation"); err != nil {
 		return recoverPlan{}, fmt.Errorf("acd recover: load branch generation: %w", err)
 	} else if ok {
 		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
@@ -152,6 +153,19 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) 
 	return plan, nil
 }
 
+func refuseRecoverWhenDaemonAliveSQL(ctx context.Context, conn *sql.DB) error {
+	var pid int
+	var mode string
+	err := conn.QueryRowContext(ctx, `SELECT pid, mode FROM daemon_state WHERE id = 1`).Scan(&pid, &mode)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("acd recover: load daemon state: %w", err)
+	}
+	return refuseRecoverWhenDaemonPIDAlive(ctx, pid, mode)
+}
+
 func refuseRecoverWhenDaemonAlive(ctx context.Context, db *state.DB) error {
 	st, ok, err := state.LoadDaemonState(ctx, db)
 	if err != nil {
@@ -160,10 +174,17 @@ func refuseRecoverWhenDaemonAlive(ctx context.Context, db *state.DB) error {
 	if !ok || st.PID <= 0 {
 		return nil
 	}
-	switch st.Mode {
+	return refuseRecoverWhenDaemonPIDAlive(ctx, st.PID, st.Mode)
+}
+
+func refuseRecoverWhenDaemonPIDAlive(ctx context.Context, pid int, mode string) error {
+	if pid <= 0 {
+		return nil
+	}
+	switch mode {
 	case "running", "starting", "draining":
-		if identity.AliveContext(ctx, st.PID) {
-			return fmt.Errorf("acd recover: refusing while daemon pid %d is alive in mode %s", st.PID, st.Mode)
+		if identity.AliveContext(ctx, pid) {
+			return fmt.Errorf("acd recover: refusing while daemon pid %d is alive in mode %s", pid, mode)
 		}
 	}
 	return nil
@@ -181,6 +202,10 @@ func applyRecoverPlan(ctx context.Context, stateDB string, plan *recoverPlan) er
 		return fmt.Errorf("acd recover: open state.db: %w", err)
 	}
 	defer func() { _ = db.Close() }()
+
+	if err := refuseRecoverWhenDaemonAlive(ctx, db); err != nil {
+		return err
+	}
 
 	tx, err := db.SQL().BeginTx(ctx, nil)
 	if err != nil {
