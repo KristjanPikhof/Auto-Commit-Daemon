@@ -54,6 +54,8 @@ func newRootCmd() *cobra.Command {
 		newStatsCmd(),
 		newDiagnoseCmd(),
 		newRecoverCmd(),
+		newPauseCmd(),
+		newResumeCmd(),
 		newPurgeEventsCmd(),
 		newInitCmd(),
 		newHookStdinExtractCmd(),
