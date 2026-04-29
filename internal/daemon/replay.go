@@ -230,6 +230,24 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
+			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ops)
+			if err != nil {
+				return sum, err
+			}
+			if alreadyPublished {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+					return sum, err
+				}
+				parent = headOID
+				activeCtx.BaseHead = headOID
+				sum.BaseHead = headOID
+				sum.Published++
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
+					"commit": headOID,
+					"parent": parent,
+				})
+				continue
+			}
 			recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorBeforeStateMismatch,
 				Message:    reason,
@@ -242,6 +260,25 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// this one would land first. Running them now would replay on
 			// top of a broken predecessor.
 			return sum, nil
+		}
+
+		headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ops)
+		if err != nil {
+			return sum, err
+		}
+		if alreadyPublished {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+				return sum, err
+			}
+			parent = headOID
+			activeCtx.BaseHead = headOID
+			sum.BaseHead = headOID
+			sum.Published++
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
+				"commit": headOID,
+				"parent": parent,
+			})
+			continue
 		}
 
 		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
@@ -295,23 +332,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Settle the event row + publish_state.
-		nowSec := float64(time.Now().UnixNano()) / 1e9
-		if err := state.MarkEventPublished(ctx, db,
-			ev.Seq, state.EventStatePublished,
-			sql.NullString{String: commitOID, Valid: true},
-			sql.NullString{},
-			ev.Message, nowSec,
-		); err != nil {
-			return sum, fmt.Errorf("daemon: mark published: %w", err)
+		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
+			return sum, err
 		}
-		_ = state.SavePublishState(ctx, db, state.Publish{
-			EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-			BranchRef:        sql.NullString{String: activeCtx.BranchRef, Valid: true},
-			BranchGeneration: sql.NullInt64{Int64: activeCtx.BranchGeneration, Valid: true},
-			SourceHead:       sql.NullString{String: parent, Valid: true},
-			TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
-			Status:           "published",
-		})
 
 		parent = commitOID
 		activeCtx.BaseHead = commitOID
