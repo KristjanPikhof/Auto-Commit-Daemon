@@ -24,7 +24,7 @@ func installFakeSignal(t *testing.T) (*atomic.Int32, *[]fakeSignalCall, func()) 
 	prev := signalProcess
 	var count atomic.Int32
 	calls := []fakeSignalCall{}
-	signalProcess = func(pid int, sig syscall.Signal) error {
+	signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 		count.Add(1)
 		calls = append(calls, fakeSignalCall{pid: pid, sig: sig})
 		return nil
