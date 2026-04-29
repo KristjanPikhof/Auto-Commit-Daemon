@@ -2,12 +2,12 @@ package cli
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -125,12 +125,13 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) 
 	if err := refuseRecoverWhenDaemonAlive(ctx, db); err != nil {
 		return recoverPlan{}, err
 	}
-	gen, err := state.LoadBranchGeneration(ctx, db)
-	if err != nil {
+	gen := int64(1)
+	if raw, ok, err := state.MetaGet(ctx, db, "branch.generation"); err != nil {
 		return recoverPlan{}, fmt.Errorf("acd recover: load branch generation: %w", err)
-	}
-	if gen <= 0 {
-		gen = 1
+	} else if ok {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			gen = parsed
+		}
 	}
 
 	plan := recoverPlan{
