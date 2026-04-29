@@ -35,7 +35,7 @@ SELECT pid, mode, heartbeat_ts, branch_ref, branch_generation,
 FROM daemon_state WHERE id = 1`
 
 	var s DaemonState
-	row := d.conn.QueryRowContext(ctx, q)
+	row := d.readSQL().QueryRowContext(ctx, q)
 	err := row.Scan(&s.PID, &s.Mode, &s.HeartbeatTS, &s.BranchRef, &s.BranchGeneration,
 		&s.Note, &s.DaemonToken, &s.DaemonFingerprint, &s.UpdatedTS)
 	if errors.Is(err, sql.ErrNoRows) {
