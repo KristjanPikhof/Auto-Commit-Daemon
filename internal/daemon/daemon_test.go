@@ -447,14 +447,6 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 				t.Fatalf("remove marker: %v", err)
 			}
 			waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
-			if err := os.WriteFile(filepath.Join(f.dir, "resumed.txt"), []byte(tc.name+"\n"), 0o644); err != nil {
-				t.Fatalf("write resumed: %v", err)
-			}
-			wakeCh <- struct{}{}
-			newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
-			if newHead == startHead {
-				t.Fatalf("HEAD did not advance after %s marker cleared", tc.marker)
-			}
 
 			cancel()
 			wg.Wait()
@@ -462,6 +454,75 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 				t.Fatalf("Run returned %v", runErr)
 			}
 		})
+	}
+}
+
+func TestRun_PauseDuringGitOperation_ReplaysAfterClear(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	markerPath := filepath.Join(f.gitDir, "MERGE_HEAD")
+	if err := os.WriteFile(markerPath, []byte(startHead+"\n"), 0o644); err != nil {
+		t.Fatalf("create marker file: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForMetaValue(t, f.db, MetaKeyOperationInProgress, "merge", 3*time.Second)
+	if err := os.WriteFile(filepath.Join(f.dir, "paused.txt"), []byte("paused\n"), 0o644); err != nil {
+		t.Fatalf("write paused: %v", err)
+	}
+	wakeCh <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+	if head, err := git.RevParse(ctx, f.dir, "HEAD"); err != nil {
+		t.Fatalf("rev-parse while paused: %v", err)
+	} else if head != startHead {
+		t.Fatalf("HEAD advanced while paused to %s; want %s", head, startHead)
+	}
+
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("remove marker: %v", err)
+	}
+	waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+	if err := os.WriteFile(filepath.Join(f.dir, "resumed.txt"), []byte("resumed\n"), 0o644); err != nil {
+		t.Fatalf("write resumed: %v", err)
+	}
+	wakeCh <- struct{}{}
+	waitForCommit(t, f.dir, startHead, 5*time.Second)
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
 	}
 }
 
