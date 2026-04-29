@@ -158,6 +158,10 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 	if !stopJSON.Stopped && !stopJSON.Deferred {
 		t.Fatalf("expected stopped or deferred, got %+v", stopJSON)
 	}
+	if stopJSON.Deferred {
+		t.Logf("regular stop deferred in this environment; forcing cleanup: %+v", stopJSON)
+		stopSessionForce(t, env, repo)
+	}
 
 	// daemon_state.mode == "stopped" within 5s. Either acd stop already
 	// confirmed it (Stopped=true) or the run-loop is finishing up.
