@@ -97,7 +97,9 @@ func CaptureContext(ctx context.Context, pid int) (Fingerprint, error) {
 
 // CaptureSelf is a convenience for fingerprinting the running process. It
 // uses os.Args directly (preserving the original NUL-joined hash) rather
-// than parsing ps output for the current pid.
+// than parsing ps output for the current pid. That makes its ArgvHash more
+// precise than Capture's ps-rendered hash, but asymmetric with fingerprints
+// captured from another process via ps.
 func CaptureSelf() (Fingerprint, error) {
 	fp, err := CaptureContext(context.Background(), os.Getpid())
 	if err != nil {
