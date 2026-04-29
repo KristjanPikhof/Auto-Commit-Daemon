@@ -16,7 +16,7 @@ func MetaGet(ctx context.Context, d *DB, key string) (string, bool, error) {
 		return "", false, fmt.Errorf("state: MetaGet: empty key")
 	}
 	var v string
-	err := d.conn.QueryRowContext(ctx, `SELECT value FROM daemon_meta WHERE key = ?`, key).Scan(&v)
+	err := d.readSQL().QueryRowContext(ctx, `SELECT value FROM daemon_meta WHERE key = ?`, key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
