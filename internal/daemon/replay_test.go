@@ -209,6 +209,7 @@ func TestReplay_CASRetryRecoversFromLock(t *testing.T) {
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
+		Limit:     1,
 		Trace:     trace,
 	})
 	if err != nil {
@@ -275,6 +276,7 @@ func TestReplay_CASMismatchNoRetry(t *testing.T) {
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
+		Limit:     1,
 		Trace:     trace,
 	})
 	if err != nil {
