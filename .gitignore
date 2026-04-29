@@ -8,3 +8,4 @@
 *.zip
 .idea/
 .vscode/
+.claude/scheduled_tasks.lock
