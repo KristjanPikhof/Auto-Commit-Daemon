@@ -991,3 +991,64 @@ func TestDeterministicMessage_Format(t *testing.T) {
 		})
 	}
 }
+
+func restoreReplayRefSeams(t *testing.T) {
+	t.Helper()
+	origUpdateRef := replayUpdateRef
+	origSleep := replayUpdateRefSleep
+	t.Cleanup(func() {
+		replayUpdateRef = origUpdateRef
+		replayUpdateRefSleep = origSleep
+	})
+}
+
+type memoryTraceLogger struct {
+	mu     sync.Mutex
+	events []acdtrace.Event
+}
+
+func (l *memoryTraceLogger) Record(ev acdtrace.Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, ev)
+}
+
+func (l *memoryTraceLogger) Close() error { return nil }
+
+func (l *memoryTraceLogger) Dropped() uint64 { return 0 }
+
+func (l *memoryTraceLogger) Events() []acdtrace.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]acdtrace.Event, len(l.events))
+	copy(out, l.events)
+	return out
+}
+
+func traceEventsByClass(events []acdtrace.Event, class string) []acdtrace.Event {
+	var matches []acdtrace.Event
+	for _, ev := range events {
+		if ev.EventClass == class {
+			matches = append(matches, ev)
+		}
+	}
+	return matches
+}
+
+func traceHasClass(events []acdtrace.Event, class string) bool {
+	for _, ev := range events {
+		if ev.EventClass == class {
+			return true
+		}
+	}
+	return false
+}
+
+func traceHasDecision(events []acdtrace.Event, decision string) bool {
+	for _, ev := range events {
+		if ev.Decision == decision {
+			return true
+		}
+	}
+	return false
+}
