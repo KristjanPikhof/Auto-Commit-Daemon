@@ -53,6 +53,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -105,9 +106,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		return Result{}, errors.New("openai-compat: missing API key")
 	}
 
-	baseURL := strings.TrimRight(p.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = DefaultOpenAIBaseURL
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return Result{}, err
 	}
 	model := p.Model
 	if model == "" {
@@ -127,7 +128,10 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
 	}
 
-	endpoint := baseURL + "/chat/completions"
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: new request: %w", err)
@@ -172,6 +176,27 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		Body:    bodyOut,
 		Source:  "openai-compat",
 	}, nil
+}
+
+func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		base = DefaultOpenAIBaseURL
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("openai-compat: invalid ACD_AI_BASE_URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return "", errors.New("openai-compat: ACD_AI_BASE_URL must be an absolute URL")
+	}
+	if requireHTTPS && u.Scheme != "https" {
+		return "", fmt.Errorf("openai-compat: ACD_AI_BASE_URL must use https, got %q", u.Scheme)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return "", fmt.Errorf("openai-compat: unsupported ACD_AI_BASE_URL scheme %q", u.Scheme)
+	}
+	return u.String(), nil
 }
 
 // defaultOpenAIClient is a redirect-refusing http.Client with a sane
