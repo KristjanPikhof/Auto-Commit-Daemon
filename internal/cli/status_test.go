@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -183,6 +184,49 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 	// Pending must be 0 — blocked rows leave the FIFO.
 	if rep.PendingEvents != 0 {
 		t.Fatalf("PendingEvents = %d, want 0 (blocker is terminal)", rep.PendingEvents)
+	}
+}
+
+func TestStatus_BodyRendersPauseSection(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason:    "deploy window",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "test",
+		ExpiresAt: &expiresAt,
+	})
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	human := humanOut.String()
+	for _, want := range []string{"Pause:", "Source: manual", "Reason: deploy window", "Expires at:"} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("status output missing %q in:\n%s", want, human)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if !rep.Paused || rep.Pause == nil || rep.Pause.Source != "manual" || rep.Pause.Reason != "deploy window" {
+		t.Fatalf("unexpected pause JSON: %+v", rep.Pause)
 	}
 }
 
