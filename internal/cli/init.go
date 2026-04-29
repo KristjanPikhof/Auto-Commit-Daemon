@@ -48,10 +48,10 @@ func newInitCmd() *cobra.Command {
 	var applyFlag bool
 
 	cmd := &cobra.Command{
-		Use:       "init [harness]",
-		Short:     "Print install snippet for a harness adapter",
-		Args:      cobra.RangeArgs(0, 1),
-		ValidArgs: supportedHarnesses,
+		Use:          "init [harness]",
+		Short:        "Print install snippet for a harness adapter",
+		Args:         cobra.RangeArgs(0, 1),
+		ValidArgs:    supportedHarnesses,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if applyFlag {
