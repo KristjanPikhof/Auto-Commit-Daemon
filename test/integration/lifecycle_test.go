@@ -115,8 +115,9 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 		t.Logf("wake queued without direct signal; daemon PID/fingerprint was not signalable in this environment: %+v", wakeJSON)
 	}
 
-	// 4. HEAD advances within 3s.
-	waitFor(t, "HEAD advanced past seed", 3*time.Second, func() bool {
+	// 4. HEAD advances. In restricted PID environments wake may only queue
+	// the flush request, so allow the poll loop to pick it up.
+	waitFor(t, "HEAD advanced past seed", 10*time.Second, func() bool {
 		head, err := runGit(repo, "rev-parse", "HEAD")
 		if err != nil {
 			return false
