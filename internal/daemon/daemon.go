@@ -379,7 +379,13 @@ func Run(ctx context.Context, opts Options) error {
 			currentToken = prevToken
 			branchTransitionBlocked = true
 		} else if transition == TokenTransitionDiverged {
+			prevGeneration := persistedGen
 			persistedGen++
+			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
+			if dropErr != nil {
+				logger.Warn("drop pending events for previous branch generation at startup",
+					"generation", prevGeneration, "err", dropErr.Error())
+			}
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
 			logger.Info("branch generation bumped at startup",
@@ -394,7 +400,12 @@ func Run(ctx context.Context, opts Options) error {
 				Decision:   transition.String(),
 				Reason:     "startup token transition classified",
 				Input:      map[string]any{"previous": prevToken, "current": currentToken},
-				Output:     map[string]any{"generation": persistedGen},
+				Output: map[string]any{
+					"prev_generation": prevGeneration,
+					"new_generation":  persistedGen,
+					"dropped_pending": droppedPending,
+				},
+				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
 		}
