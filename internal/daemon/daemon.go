@@ -27,6 +27,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // Default knobs the run loop uses when Options leaves them zero.
@@ -171,6 +172,10 @@ type Options struct {
 	// FsnotifyMaxWatches caps the OS watch budget. Zero asks the watcher
 	// to derive a sensible default from the platform.
 	FsnotifyMaxWatches int
+
+	// Trace receives best-effort decision records. Nil uses ACD_TRACE env
+	// wiring; disabled env returns a no-op logger.
+	Trace acdtrace.Logger
 }
 
 // resolveClientTTL honors EnvClientTTLSeconds + opt.
@@ -211,6 +216,15 @@ func Run(ctx context.Context, opts Options) error {
 	if now == nil {
 		now = time.Now
 	}
+	tracer := opts.Trace
+	if tracer == nil {
+		tracer = acdtrace.FromEnv(opts.RepoPath, opts.GitDir)
+	}
+	defer func() {
+		if err := tracer.Close(); err != nil {
+			logger.Warn("close trace writer", "err", err.Error())
+		}
+	}()
 	// MessageFn precedence: explicit MessageFn > injected MessageProvider
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
@@ -372,6 +386,17 @@ func Run(ctx context.Context, opts Options) error {
 				"old", prevToken, "new", currentToken,
 				"generation", persistedGen,
 				"transition", transition.String())
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  branchRef,
+				HeadSHA:    headOID,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "startup token transition classified",
+				Input:      map[string]any{"previous": prevToken, "current": currentToken},
+				Output:     map[string]any{"generation": persistedGen},
+				Generation: persistedGen,
+			})
 		}
 	}
 	cctx := CaptureContext{
@@ -400,7 +425,9 @@ func Run(ctx context.Context, opts Options) error {
 	if cctx.BranchRef != "" && cctx.BaseHead != "" {
 		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 			logger.Warn("bootstrap shadow", "err", err.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 		} else {
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "startup shadow bootstrap", seeded)
 			if seeded > 0 {
 				logger.Info("shadow bootstrapped", "rows", seeded)
 			}
@@ -563,6 +590,17 @@ func Run(ctx context.Context, opts Options) error {
 				"old", oldToken, "new", newToken,
 				"generation", cctx.BranchGeneration,
 				"transition", transition.String())
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "run-loop token transition classified",
+				Input:      map[string]any{"previous": oldToken, "current": newToken},
+				Output:     map[string]any{"generation": cctx.BranchGeneration},
+				Generation: cctx.BranchGeneration,
+			})
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
@@ -578,7 +616,9 @@ func Run(ctx context.Context, opts Options) error {
 			} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 				logger.Warn("reseed shadow after generation bump",
 					"err", err.Error())
+				traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 			} else {
+				traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
 				if seeded > 0 {
 					logger.Info("shadow reseeded",
 						"rows", seeded,
@@ -597,6 +637,17 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Debug("branch fast-forwarded",
 				"old", oldToken, "new", newToken,
 				"generation", cctx.BranchGeneration)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "branch_token.transition",
+				Decision:   transition.String(),
+				Reason:     "run-loop token transition classified",
+				Input:      map[string]any{"previous": oldToken, "current": newToken},
+				Output:     map[string]any{"generation": cctx.BranchGeneration},
+				Generation: cctx.BranchGeneration,
+			})
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist branch head", "err", err.Error())
@@ -654,8 +705,27 @@ func Run(ctx context.Context, opts Options) error {
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "daemon.pause",
+				Decision:   "paused",
+				Reason:     "git operation marker present",
+				Input:      map[string]any{"operation": operationName},
+				Generation: cctx.BranchGeneration,
+			})
 		} else if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyOperationInProgress); ok {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgress)
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "daemon.pause",
+				Decision:   "resumed",
+				Reason:     "git operation marker cleared",
+				Generation: cctx.BranchGeneration,
+			})
 		}
 
 		if !operationPaused {
@@ -676,7 +746,9 @@ func Run(ctx context.Context, opts Options) error {
 						if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 							logger.Warn("bootstrap shadow after reattach",
 								"err", err.Error())
+							traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 						} else {
+							traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "reattach shadow bootstrap", seeded)
 							if seeded > 0 {
 								logger.Info("shadow bootstrapped after reattach",
 									"rows", seeded)
@@ -742,6 +814,7 @@ func Run(ctx context.Context, opts Options) error {
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
 				SensitiveMatcher: matcher,
+				Trace:            tracer,
 			})
 		}
 
@@ -754,6 +827,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
 				GitDir:    opts.GitDir,
+				Trace:     tracer,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
