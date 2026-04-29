@@ -715,7 +715,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && !detachedHeadPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !detachedHeadPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
