@@ -1320,13 +1320,17 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 func TestRun_BranchSwitchDropsPending(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
+	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
 
 	appendEvent := func(path string, generation int64, stateName string) int64 {
 		t.Helper()
 		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: generation,
-			BaseHead:         f.cctx.BaseHead,
+			BaseHead:         baseHead,
 			Operation:        "create",
 			Path:             path,
 			Fidelity:         "full",
