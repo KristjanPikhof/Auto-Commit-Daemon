@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strconv"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +34,21 @@ func newWatcherForTest(t *testing.T, opts FsnotifyOptions) (*FsnotifyWatcher, *a
 	}
 	t.Cleanup(func() { _ = w.Stop() })
 	return w, &wakeCount
+}
+
+func waitForFsnotifyReady(t *testing.T, db *state.DB, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		mode, modeOK, modeErr := state.MetaGet(context.Background(), db, "fsnotify.mode")
+		watchCountRaw, countOK, countErr := state.MetaGet(context.Background(), db, "fsnotify.watch_count")
+		watchCount, _ := strconv.Atoi(watchCountRaw)
+		if modeErr == nil && countErr == nil && modeOK && countOK && mode == "fsnotify" && watchCount > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("fsnotify watcher was not ready within %v", timeout)
 }
 
 // TestFsnotifyWatcher_HappyPath: enabling the watcher on a real tempdir
@@ -386,16 +402,17 @@ func TestRun_FsnotifyDrivesWake(t *testing.T) {
 				IdleCeiling:  2 * time.Second,
 				ErrorCeiling: 2 * time.Second,
 			},
-			BootGrace:        30 * time.Second,
-			ShutdownCh:       shutdownCh,
-			SkipSignals:      true,
-			FsnotifyEnabled:  true,
+				BootGrace:        30 * time.Second,
+				MessageFn:         DeterministicMessage,
+				ShutdownCh:       shutdownCh,
+				SkipSignals:      true,
+				FsnotifyEnabled:  true,
 			FsnotifyDebounce: 30 * time.Millisecond,
 		})
 	}()
 
-	// Give Run a moment to install state + start the watcher.
-	time.Sleep(150 * time.Millisecond)
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForFsnotifyReady(t, f.db, 2*time.Second)
 
 	if err := os.WriteFile(filepath.Join(f.dir, "fast.txt"), []byte("fs\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
