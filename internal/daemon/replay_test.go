@@ -423,6 +423,43 @@ func TestClassifyReplayIssue(t *testing.T) {
 	}
 }
 
+func TestReplay_HEADCASUsesLiteralHead(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "head-cas.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write head-cas.txt: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	restoreReplayRefSeams(t)
+	var refs []string
+	replayUpdateRef = func(ctx context.Context, repoRoot, ref, newOID, oldOID string) error {
+		refs = append(refs, ref)
+		return git.UpdateRef(ctx, repoRoot, ref, newOID, oldOID)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if len(refs) != 1 || refs[0] != "HEAD" {
+		t.Fatalf("update-ref refs=%v want [HEAD]", refs)
+	}
+}
+
 // TestReplay_BatchHaltsOnBlockedConflict: a blocker in the middle of the
 // queue must terminally settle that event and stop the batch — every event
 // behind it stays pending so the next poll tick can re-attempt them once
