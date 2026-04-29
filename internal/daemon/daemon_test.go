@@ -1416,6 +1416,22 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	} else if seeded == 0 {
 		t.Fatalf("BootstrapShadow old generation seeded 0 rows")
 	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef:        oldCtx.BranchRef,
+		BranchGeneration: oldCtx.BranchGeneration,
+		BaseHead:         oldCtx.BaseHead,
+		Operation:        "create",
+		Path:             "stale-pending.txt",
+		Fidelity:         "full",
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "stale-pending.txt",
+		Fidelity:  "full",
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}}); err != nil {
+		t.Fatalf("AppendCaptureEvent stale pending: %v", err)
+	}
 
 	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("rebased\n"))
 	if err != nil {
