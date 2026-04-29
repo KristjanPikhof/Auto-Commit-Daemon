@@ -102,7 +102,7 @@ func stopSessionForce(t *testing.T, env []string, repo string) {
 	}
 	_ = json.Unmarshal([]byte(res.Stdout), &stopJSON)
 	// Best-effort wait for stopped state — don't fail cleanup.
-	if waitStopped(repo, 5*time.Second) {
+	if waitStopped(repo, 1*time.Second) {
 		return
 	}
 	pid := stopJSON.DaemonPID
@@ -113,11 +113,11 @@ func stopSessionForce(t *testing.T, env []string, repo string) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
-	if waitStopped(repo, 2*time.Second) || !processAlive(pid) {
+	if waitStopped(repo, 1*time.Second) || !processAlive(pid) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
-	_ = waitStopped(repo, 2*time.Second)
+	_ = waitStopped(repo, 1*time.Second)
 }
 
 func waitStopped(repo string, timeout time.Duration) bool {
@@ -319,12 +319,9 @@ func regBootstrapFailurePreservesShadow(t *testing.T) {
 		t.Fatalf("expected daemon_state row before disruption")
 	}
 
-	// Stop the daemon cleanly.
-	res := runAcd(t, ctx, env, "stop", "--session-id", "boot-1", "--repo", repo, "--json")
-	if res.ExitCode != 0 {
-		t.Fatalf("acd stop exit=%d\n%s\n%s", res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitMode(t, repo, "stopped", 5*time.Second)
+	// Stop the daemon deterministically; this scenario is about preserving
+	// shadow rows across restart, not refcount-drain timing.
+	stopSessionForce(t, env, repo)
 
 	// Disrupt: wipe rows from a non-critical operational table while
 	// leaving shadow_paths + daemon_state intact. The bootstrap is

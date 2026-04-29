@@ -187,6 +187,39 @@ func TestCaptureSelf_UsesInProcessArgv(t *testing.T) {
 	}
 }
 
+// TestCaptureSelf_AsymmetricWithCapture pins the underlying reason
+// daemon-side fingerprint stamping must NOT use CaptureSelf when the
+// stamped value will later be verified via Capture(pid). CaptureSelf
+// hashes the unjoined os.Args (NUL-separated, sha256), Capture hashes
+// the space-joined `ps` rendering. The two ArgvHashes therefore differ
+// for any non-trivial argv, which silently turns every signalProcess
+// fingerprint check into "mismatch" and swallows SIGTERM/SIGKILL.
+//
+// If you find yourself updating this test because the two now match,
+// re-evaluate whether daemon.go can go back to CaptureSelf — but check
+// every signalProcess caller and refcount GC site first.
+func TestCaptureSelf_AsymmetricWithCapture(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("ps fingerprint only validated on darwin/linux")
+	}
+	if len(os.Args) < 2 {
+		t.Skip("test binary invoked with empty argv tail; nothing to differ on")
+	}
+	self, err := CaptureSelf()
+	if err != nil {
+		t.Fatalf("CaptureSelf: %v", err)
+	}
+	other, err := Capture(os.Getpid())
+	if err != nil {
+		t.Fatalf("Capture(self): %v", err)
+	}
+	if self.ArgvHash == other.ArgvHash {
+		t.Fatalf("expected CaptureSelf and Capture argv hashes to differ "+
+			"(NUL-joined vs ps space-joined); both = %s. "+
+			"If this is now legitimate, audit daemon.go fingerprint stamping.", self.ArgvHash)
+	}
+}
+
 // trueBinary returns the path to a no-op executable. We prefer /bin/true
 // over /usr/bin/true for darwin compatibility but fall back if missing.
 func trueBinary() string {

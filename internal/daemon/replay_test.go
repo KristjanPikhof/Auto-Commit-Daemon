@@ -3,13 +3,17 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // TestReplay_Lifecycle: capture creates events for a new file; replay
@@ -169,6 +173,290 @@ func TestReplay_Conflict(t *testing.T) {
 	}
 	if !pub.EventSeq.Valid || pub.EventSeq.Int64 != seq {
 		t.Fatalf("publish_state.event_seq=%v want %d", pub.EventSeq, seq)
+	}
+}
+
+func TestReplay_CASRetryRecoversFromLock(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "cas-retry.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write cas-retry.txt: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	restoreReplayRefSeams(t)
+	var attempts int
+	replayUpdateRef = func(ctx context.Context, repoRoot, ref, newOID, oldOID string) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("cannot lock ref 'refs/heads/main': File exists")
+		}
+		return git.UpdateRef(ctx, repoRoot, ref, newOID, oldOID)
+	}
+	var sleeps []time.Duration
+	replayUpdateRefSleep = func(ctx context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+	trace := &memoryTraceLogger{}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+		Trace:     trace,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("UpdateRef attempts=%d want 3", attempts)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	wantSleeps := []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
+	if len(sleeps) != len(wantSleeps) {
+		t.Fatalf("sleeps=%v want %v", sleeps, wantSleeps)
+	}
+	for i := range wantSleeps {
+		if sleeps[i] != wantSleeps[i] {
+			t.Fatalf("sleeps=%v want %v", sleeps, wantSleeps)
+		}
+	}
+
+	events := trace.Events()
+	updateRefEvents := traceEventsByClass(events, "replay.update_ref")
+	if len(updateRefEvents) != 3 {
+		t.Fatalf("update_ref trace events=%d want 3; events=%+v", len(updateRefEvents), events)
+	}
+	if updateRefEvents[0].Decision != "retry" || updateRefEvents[1].Decision != "retry" {
+		t.Fatalf("first two update_ref decisions=%q,%q want retry,retry", updateRefEvents[0].Decision, updateRefEvents[1].Decision)
+	}
+	if updateRefEvents[2].Decision != state.EventStatePublished {
+		t.Fatalf("final update_ref decision=%q want %q", updateRefEvents[2].Decision, state.EventStatePublished)
+	}
+	if !traceHasClass(events, "replay.commit") {
+		t.Fatalf("missing final replay.commit trace; events=%+v", events)
+	}
+}
+
+func TestReplay_CASMismatchNoRetry(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "cas-mismatch.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write cas-mismatch.txt: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	restoreReplayRefSeams(t)
+	var attempts int
+	replayUpdateRef = func(ctx context.Context, repoRoot, ref, newOID, oldOID string) error {
+		attempts++
+		return errors.New("cannot lock ref 'refs/heads/main': is at 1111111111111111111111111111111111111111 but expected " + oldOID)
+	}
+	replayUpdateRefSleep = func(ctx context.Context, d time.Duration) error {
+		t.Fatalf("sleep called for true CAS mismatch: %s", d)
+		return nil
+	}
+	trace := &memoryTraceLogger{}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+		Trace:     trace,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("UpdateRef attempts=%d want 1", attempts)
+	}
+	if sum.Published != 0 || sum.Conflicts != 1 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	blocked, err := state.CountEventsByState(ctx, f.db, state.EventStateBlockedConflict)
+	if err != nil {
+		t.Fatalf("CountEventsByState: %v", err)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked_conflict count=%d want 1", blocked)
+	}
+	events := trace.Events()
+	updateRefEvents := traceEventsByClass(events, "replay.update_ref")
+	if len(updateRefEvents) != 1 {
+		t.Fatalf("update_ref trace events=%d want 1; events=%+v", len(updateRefEvents), events)
+	}
+	if updateRefEvents[0].Decision != state.EventStateBlockedConflict {
+		t.Fatalf("update_ref decision=%q want %q", updateRefEvents[0].Decision, state.EventStateBlockedConflict)
+	}
+	if traceHasDecision(events, "retry") {
+		t.Fatalf("unexpected retry trace for true CAS mismatch; events=%+v", events)
+	}
+	if !traceHasClass(events, "replay.conflict") {
+		t.Fatalf("missing final replay.conflict trace; events=%+v", events)
+	}
+}
+
+func TestRecordConflict_StructuredMetadata(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "nonexistent.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "nonexistent.txt",
+		BeforeOID:  sql.NullString{String: "1111111111111111111111111111111111111111", Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: "2222222222222222222222222222222222222222", Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d want 1", sum.Conflicts)
+	}
+
+	var meta replayConflictMetadata
+	ok, err := state.MetaGetJSON(ctx, f.db, metaKeyLastReplayConflict, &meta)
+	if err != nil {
+		t.Fatalf("MetaGetJSON: %v", err)
+	}
+	if !ok {
+		t.Fatalf("%s not written", metaKeyLastReplayConflict)
+	}
+	if meta.Seq != seq {
+		t.Fatalf("meta.Seq=%d want %d", meta.Seq, seq)
+	}
+	if meta.ErrorClass != replayErrorBeforeStateMismatch {
+		t.Fatalf("meta.ErrorClass=%q want %q", meta.ErrorClass, replayErrorBeforeStateMismatch)
+	}
+	if meta.Ref != f.cctx.BranchRef {
+		t.Fatalf("meta.Ref=%q want %q", meta.Ref, f.cctx.BranchRef)
+	}
+	if meta.Path != "nonexistent.txt" {
+		t.Fatalf("meta.Path=%q want nonexistent.txt", meta.Path)
+	}
+	if meta.Message == "" || !strings.Contains(meta.Message, "missing-in-index") {
+		t.Fatalf("meta.Message=%q want missing-in-index", meta.Message)
+	}
+	if meta.TS == "" {
+		t.Fatalf("meta.TS empty")
+	}
+
+	legacy, ok, err := state.MetaGet(ctx, f.db, metaKeyLastReplayConflictLegacy)
+	if err != nil {
+		t.Fatalf("MetaGet legacy: %v", err)
+	}
+	if !ok || !strings.Contains(legacy, "seq=") || !strings.Contains(legacy, meta.Message) {
+		t.Fatalf("legacy mirror=%q", legacy)
+	}
+}
+
+func TestClassifyReplayIssue(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{
+			name: "cas",
+			msg:  "update-ref CAS failed: cannot lock ref",
+			want: replayErrorCASFail,
+		},
+		{
+			name: "before-state",
+			msg:  "modify before-state mismatch for file.txt",
+			want: replayErrorBeforeStateMismatch,
+		},
+		{
+			name: "commit build",
+			msg:  "commit-tree: missing tree",
+			want: replayErrorCommitBuildFailure,
+		},
+		{
+			name: "ref missing",
+			msg:  "branch ref mismatch: event captured on refs/heads/a but daemon is on refs/heads/b",
+			want: replayErrorRefMissing,
+		},
+		{
+			name: "validation",
+			msg:  "missing after_oid for create file.txt",
+			want: replayErrorValidation,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyReplayIssue(tt.msg); got != tt.want {
+				t.Fatalf("classifyReplayIssue(%q)=%q want %q", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplay_HEADCASUsesLiteralHead(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "head-cas.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write head-cas.txt: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	restoreReplayRefSeams(t)
+	var refs []string
+	replayUpdateRef = func(ctx context.Context, repoRoot, ref, newOID, oldOID string) error {
+		refs = append(refs, ref)
+		return git.UpdateRef(ctx, repoRoot, ref, newOID, oldOID)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if len(refs) != 1 || refs[0] != "HEAD" {
+		t.Fatalf("update-ref refs=%v want [HEAD]", refs)
 	}
 }
 
@@ -741,4 +1029,65 @@ func TestDeterministicMessage_Format(t *testing.T) {
 			}
 		})
 	}
+}
+
+func restoreReplayRefSeams(t *testing.T) {
+	t.Helper()
+	origUpdateRef := replayUpdateRef
+	origSleep := replayUpdateRefSleep
+	t.Cleanup(func() {
+		replayUpdateRef = origUpdateRef
+		replayUpdateRefSleep = origSleep
+	})
+}
+
+type memoryTraceLogger struct {
+	mu     sync.Mutex
+	events []acdtrace.Event
+}
+
+func (l *memoryTraceLogger) Record(ev acdtrace.Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, ev)
+}
+
+func (l *memoryTraceLogger) Close() error { return nil }
+
+func (l *memoryTraceLogger) Dropped() uint64 { return 0 }
+
+func (l *memoryTraceLogger) Events() []acdtrace.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]acdtrace.Event, len(l.events))
+	copy(out, l.events)
+	return out
+}
+
+func traceEventsByClass(events []acdtrace.Event, class string) []acdtrace.Event {
+	var matches []acdtrace.Event
+	for _, ev := range events {
+		if ev.EventClass == class {
+			matches = append(matches, ev)
+		}
+	}
+	return matches
+}
+
+func traceHasClass(events []acdtrace.Event, class string) bool {
+	for _, ev := range events {
+		if ev.EventClass == class {
+			return true
+		}
+	}
+	return false
+}
+
+func traceHasDecision(events []acdtrace.Event, decision string) bool {
+	for _, ev := range events {
+		if ev.Decision == decision {
+			return true
+		}
+	}
+	return false
 }

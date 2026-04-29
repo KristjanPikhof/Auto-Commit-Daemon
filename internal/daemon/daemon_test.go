@@ -21,6 +21,11 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func TestMain(m *testing.M) {
+	_ = os.Setenv(ai.EnvProvider, "deterministic")
+	os.Exit(m.Run())
+}
+
 // daemonFixture wires up a temp git repo + open per-repo state DB so the
 // run-loop tests don't have to repeat the boilerplate. Mirrors the
 // captureFixture pattern but exposes the absolute git dir + database.
@@ -136,6 +141,61 @@ func daemonMode(t *testing.T, db *state.DB) string {
 	return st.Mode
 }
 
+func waitForDaemonMode(t *testing.T, db *state.DB, mode string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		st, _, err := state.LoadDaemonState(context.Background(), db)
+		if err == nil && st.Mode == mode {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("daemon_state.mode did not become %q within %v", mode, timeout)
+}
+
+func waitForMetaValue(t *testing.T, db *state.DB, key, want string, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		got, ok, err := state.MetaGet(ctx, db, key)
+		if err != nil {
+			t.Fatalf("MetaGet %s: %v", key, err)
+		}
+		if ok && got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, ok, err := state.MetaGet(ctx, db, key)
+	if err != nil {
+		t.Fatalf("MetaGet %s after timeout: %v", key, err)
+	}
+	t.Fatalf("%s=%q ok=%v want %q", key, got, ok, want)
+}
+
+func waitForMetaDeleted(t *testing.T, db *state.DB, key string, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, ok, err := state.MetaGet(ctx, db, key)
+		if err != nil {
+			t.Fatalf("MetaGet %s: %v", key, err)
+		}
+		if !ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, ok, err := state.MetaGet(ctx, db, key)
+	if err != nil {
+		t.Fatalf("MetaGet %s after timeout: %v", key, err)
+	}
+	t.Fatalf("%s still set to %q ok=%v", key, got, ok)
+}
+
 // TestRun_LifecycleHappyPath: a full capture+replay cycle drives a commit
 // onto HEAD when the test triggers a wake; ctx cancel exits with mode=stopped.
 func TestRun_LifecycleHappyPath(t *testing.T) {
@@ -163,11 +223,14 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 			DB:          f.db,
 			Scheduler:   fastScheduler(),
 			BootGrace:   30 * time.Second, // never trigger self-terminate
+			MessageFn:   DeterministicMessage,
 			WakeCh:      wakeCh,
 			ShutdownCh:  shutdownCh,
 			SkipSignals: true,
 		})
 	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
 	// Write a file and signal a wake.
 	if err := os.WriteFile(filepath.Join(f.dir, "hello.txt"), []byte("hi\n"), 0o644); err != nil {
@@ -198,6 +261,83 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	}
 	if mode := daemonMode(t, f.db); mode != "stopped" {
 		t.Fatalf("daemon_state.mode=%q want stopped", mode)
+	}
+}
+
+// TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
+// where Run used identity.CaptureSelf() to stamp daemon_fingerprint.
+// The persisted token must equal what `acd stop` / `acd wake`
+// reconstruct via identity.Capture(pid) when verifying the daemon's
+// PID before delivering a signal — otherwise signalProcess silently
+// returns "fingerprint mismatch" and SIGTERM/SIGKILL never reach the
+// daemon. Asserts the stored token is identical to
+// FingerprintToken(identity.Capture(daemon_pid)).
+func TestRun_StampedFingerprintIsSymmetricWithVerifier(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("ps fingerprint only validated on darwin/linux; running on %s", runtime.GOOS)
+	}
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wakeCh := make(chan struct{}, 1)
+	shutdownCh := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	st, _, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil {
+		t.Fatalf("LoadDaemonState: %v", err)
+	}
+	if !st.DaemonFingerprint.Valid || st.DaemonFingerprint.String == "" {
+		t.Fatalf("daemon_fingerprint not stamped: %+v", st)
+	}
+	if st.PID != os.Getpid() {
+		t.Fatalf("daemon_state.pid=%d want test pid %d", st.PID, os.Getpid())
+	}
+
+	// Reconstruct what `acd stop` would compute when verifying the
+	// stamped PID. Must equal byte-for-byte; otherwise signalProcess
+	// returns mismatch.
+	verified, err := identity.Capture(st.PID)
+	if err != nil {
+		t.Fatalf("identity.Capture(daemon pid): %v", err)
+	}
+	want := FingerprintToken(verified)
+	if want == "" {
+		t.Fatalf("verifier token empty; cannot assert symmetry")
+	}
+	if st.DaemonFingerprint.String != want {
+		t.Fatalf("stamped daemon_fingerprint=%q, verifier would compute %q "+
+			"(asymmetric — daemon stamping must use identity.Capture, not CaptureSelf)",
+			st.DaemonFingerprint.String, want)
+	}
+
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
 	}
 }
 
@@ -298,6 +438,107 @@ func TestRun_DetachedHeadPausesCaptureReplay(t *testing.T) {
 	}
 }
 
+func TestRun_PauseDuringGitOperation(t *testing.T) {
+	tests := []struct {
+		marker string
+		name   string
+		dir    bool
+	}{
+		{marker: "rebase-merge", name: "rebase-merge", dir: true},
+		{marker: "rebase-apply", name: "rebase-apply", dir: true},
+		{marker: "MERGE_HEAD", name: "merge"},
+		{marker: "CHERRY_PICK_HEAD", name: "cherry-pick"},
+		{marker: "BISECT_LOG", name: "bisect"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.marker, func(t *testing.T) {
+			f := newDaemonFixture(t)
+			registerLiveClient(t, f.db)
+			ctx := context.Background()
+
+			startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse: %v", err)
+			}
+
+			markerPath := filepath.Join(f.gitDir, tc.marker)
+			if tc.dir {
+				if err := os.Mkdir(markerPath, 0o755); err != nil {
+					t.Fatalf("create marker dir: %v", err)
+				}
+			} else if err := os.WriteFile(markerPath, []byte(startHead+"\n"), 0o644); err != nil {
+				t.Fatalf("create marker file: %v", err)
+			}
+
+			wakeCh := make(chan struct{}, 4)
+			shutdownCh := make(chan struct{}, 1)
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			var runErr error
+			go func() {
+				defer wg.Done()
+				runErr = Run(runCtx, Options{
+					RepoPath:    f.dir,
+					GitDir:      f.gitDir,
+					DB:          f.db,
+					Scheduler:   fastScheduler(),
+					BootGrace:   30 * time.Second,
+					WakeCh:      wakeCh,
+					ShutdownCh:  shutdownCh,
+					SkipSignals: true,
+				})
+			}()
+			t.Cleanup(func() {
+				cancel()
+				wg.Wait()
+			})
+
+			waitForMetaValue(t, f.db, MetaKeyOperationInProgress, tc.name, 3*time.Second)
+
+			if err := os.WriteFile(filepath.Join(f.dir, "paused.txt"), []byte(tc.name+"\n"), 0o644); err != nil {
+				t.Fatalf("write paused: %v", err)
+			}
+			for i := 0; i < 4; i++ {
+				select {
+				case wakeCh <- struct{}{}:
+				default:
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			head, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse while paused: %v", err)
+			}
+			if head != startHead {
+				t.Fatalf("HEAD advanced while paused to %s; want %s", head, startHead)
+			}
+			var events int
+			if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+				t.Fatalf("count capture_events: %v", err)
+			}
+			if events != 0 {
+				t.Fatalf("capture_events=%d want 0 while %s marker exists", events, tc.marker)
+			}
+
+			if err := os.RemoveAll(markerPath); err != nil {
+				t.Fatalf("remove marker: %v", err)
+			}
+			waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+
+			cancel()
+			wg.Wait()
+			if runErr != nil {
+				t.Fatalf("Run returned %v", runErr)
+			}
+		})
+	}
+}
+
 // TestRun_WakeBurstCoalesced: many rapid wakes don't crash and only produce
 // one capture+replay cycle (idempotent — the second pass sees no changes).
 func TestRun_WakeBurstCoalesced(t *testing.T) {
@@ -324,11 +565,14 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 			DB:          f.db,
 			Scheduler:   fastScheduler(),
 			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
 			WakeCh:      wakeCh,
 			ShutdownCh:  shutdownCh,
 			SkipSignals: true,
 		})
 	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
 	// Write a single file and burst-signal 100 wakes.
 	if err := os.WriteFile(filepath.Join(f.dir, "burst.txt"), []byte("once\n"), 0o644); err != nil {
@@ -1155,6 +1399,76 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRun_BranchSwitchDropsPending(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	appendEvent := func(path string, generation int64, stateName string) int64 {
+		t.Helper()
+		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: generation,
+			BaseHead:         baseHead,
+			Operation:        "create",
+			Path:             path,
+			Fidelity:         "full",
+			State:            stateName,
+		}, []state.CaptureOp{{
+			Op:        "create",
+			Path:      path,
+			Fidelity:  "full",
+			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+		}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	prevPending := appendEvent("prev-pending.txt", 1, state.EventStatePending)
+	prevBlocked := appendEvent("prev-blocked.txt", 1, state.EventStateBlockedConflict)
+	prevPublished := appendEvent("prev-published.txt", 1, state.EventStatePublished)
+	nextPending := appendEvent("next-pending.txt", 2, state.EventStatePending)
+
+	dropped, err := state.DeletePendingForGeneration(ctx, f.db, 1)
+	if err != nil {
+		t.Fatalf("DeletePendingForGeneration: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped=%d want 1", dropped)
+	}
+
+	rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if remaining[prevPending] {
+		t.Fatalf("previous generation pending seq %d was not deleted", prevPending)
+	}
+	for _, seq := range []int64{prevBlocked, prevPublished, nextPending} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d should be retained; remaining=%v", seq, remaining)
+		}
+	}
+}
+
 func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	t.Setenv(EnvShadowRetentionGenerations, "0")
 
@@ -1178,6 +1492,22 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 		t.Fatalf("BootstrapShadow old generation: %v", err)
 	} else if seeded == 0 {
 		t.Fatalf("BootstrapShadow old generation seeded 0 rows")
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef:        oldCtx.BranchRef,
+		BranchGeneration: oldCtx.BranchGeneration,
+		BaseHead:         oldCtx.BaseHead,
+		Operation:        "create",
+		Path:             "stale-pending.txt",
+		Fidelity:         "full",
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "stale-pending.txt",
+		Fidelity:  "full",
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}}); err != nil {
+		t.Fatalf("AppendCaptureEvent stale pending: %v", err)
 	}
 
 	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("rebased\n"))
