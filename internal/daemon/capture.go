@@ -255,6 +255,14 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
+		if hasControlPathChar(rel) {
+			recordInvalidPath(ctx, opts.db, rel, "control_chars")
+			summary.Errors++
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 
 		// Always step around our own state subdir + .git.
 		topComponent := rel
@@ -485,4 +493,26 @@ func recordOversize(ctx context.Context, db *state.DB, rel string, size, cap int
 	key := "capture-skip-large:" + rel
 	val := fmt.Sprintf("size=%d>cap=%d", size, cap)
 	_ = state.MetaSet(ctx, db, key, val)
+}
+
+func hasControlPathChar(rel string) bool {
+	return strings.ContainsAny(rel, "\x00\t\n\r")
+}
+
+func recordInvalidPath(ctx context.Context, db *state.DB, rel, reason string) {
+	if db == nil {
+		return
+	}
+	key := "capture-skip-invalid-path:" + metaPathKey(rel)
+	_ = state.MetaSet(ctx, db, key, "reason="+reason)
+}
+
+func metaPathKey(rel string) string {
+	replacer := strings.NewReplacer(
+		"\x00", "\\0",
+		"\t", "\\t",
+		"\n", "\\n",
+		"\r", "\\r",
+	)
+	return replacer.Replace(rel)
 }
