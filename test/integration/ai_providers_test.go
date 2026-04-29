@@ -21,6 +21,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,7 +98,24 @@ func TestAI_DeterministicDefault(t *testing.T) {
 	}
 }
 
-// TestAI_OpenAICompatMockSuccess: the daemon points at an httptest server
+// newOpenAITestServer returns an HTTPS httptest server plus the environment
+// override that lets the CGO-disabled integration binary trust its certificate.
+func newOpenAITestServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	server := httptest.NewTLSServer(handler)
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: server.Certificate().Raw,
+	})
+	certPath := filepath.Join(t.TempDir(), "openai-test-ca.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		server.Close()
+		t.Fatalf("write OpenAI test CA: %v", err)
+	}
+	return server, "SSL_CERT_FILE=" + certPath
+}
+
+// TestAI_OpenAICompatMockSuccess: the daemon points at an HTTPS test server
 // whose chat/completions endpoint returns a canned tool_call. The commit
 // subject must be the value the mock returned.
 func TestAI_OpenAICompatMockSuccess(t *testing.T) {
@@ -132,7 +150,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 }`
 
 	var hits atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
@@ -151,6 +169,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-mock", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
@@ -181,7 +200,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	var hits atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		http.Error(w, `{"error":{"message":"upstream boom"}}`, http.StatusInternalServerError)
 	}))
@@ -195,6 +214,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		trustEnv,
 	}
 	p := startSessionJSON(t, ctx, env, repo, "ai-5xx", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
@@ -267,7 +287,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 }`
 
 	var capturedBody atomic.Pointer[string]
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
@@ -288,6 +308,8 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_SEND_DIFF=1",
+		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-diff", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
