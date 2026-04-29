@@ -1028,3 +1028,11 @@ func gitHashObjectStdin(t *testing.T, repo, body string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil
+}
