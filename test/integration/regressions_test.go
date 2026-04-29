@@ -636,6 +636,9 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 
 	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
 	runGitOK(t, repo, "reset", "--hard", seedHead)
+	if err := os.Remove(filepath.Join(repo, "before-reset.txt")); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove untracked before-reset.txt after reset: %v", err)
+	}
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head == headBeforeReset {
 		t.Fatalf("reset did not move HEAD away from %s", headBeforeReset)
 	}
