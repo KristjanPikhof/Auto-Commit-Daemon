@@ -319,12 +319,9 @@ func regBootstrapFailurePreservesShadow(t *testing.T) {
 		t.Fatalf("expected daemon_state row before disruption")
 	}
 
-	// Stop the daemon cleanly.
-	res := runAcd(t, ctx, env, "stop", "--session-id", "boot-1", "--repo", repo, "--json")
-	if res.ExitCode != 0 {
-		t.Fatalf("acd stop exit=%d\n%s\n%s", res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitMode(t, repo, "stopped", 5*time.Second)
+	// Stop the daemon deterministically; this scenario is about preserving
+	// shadow rows across restart, not refcount-drain timing.
+	stopSessionForce(t, env, repo)
 
 	// Disrupt: wipe rows from a non-critical operational table while
 	// leaving shadow_paths + daemon_state intact. The bootstrap is
