@@ -53,7 +53,7 @@ export PATH=$PATH:/path/to/plugin/dir
 
 ## Environment variables
 
-Source of truth: `internal/ai/config.go`.
+Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 
 | Variable | Default | Notes |
 |---|---|---|
