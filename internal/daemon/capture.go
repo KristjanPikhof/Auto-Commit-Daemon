@@ -31,6 +31,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
 // EnvMaxFileBytes is the per-file size cap. Mirrors the legacy
@@ -79,6 +80,8 @@ type CaptureOpts struct {
 	// SubmodulePaths is the set of repo-relative paths that are submodules
 	// (mode 160000 in HEAD's tree). Capture must not descend into them.
 	SubmodulePaths map[string]bool
+	// Trace receives best-effort decision records. Nil disables tracing.
+	Trace acdtrace.Logger
 }
 
 // resolveMaxFileBytes consults EnvMaxFileBytes, falls back to default.
@@ -141,6 +144,21 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	}
 
 	ops := Classify(shadow, live)
+	recordTrace(opts.Trace, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "capture.classify",
+		Decision:   "classified",
+		Reason:     "compared live worktree to shadow state",
+		Output: map[string]any{
+			"ops":          len(ops),
+			"walked_files": summary.WalkedFiles,
+			"oversize":     summary.Oversize,
+			"errors":       summary.Errors,
+		},
+		Generation: cctx.BranchGeneration,
+	})
 
 	// Persist each classified op as its own capture_events row + capture_ops
 	// child. Atomic-per-file commits (§8.3) means one event = one op. We do
@@ -160,10 +178,28 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			OldPath:          nullString(op.OldPath),
 		}
 		stateOps := []state.CaptureOp{toStateOp(op)}
-		if _, err := state.AppendCaptureEvent(ctx, db, ev, stateOps); err != nil {
+		seq, err := state.AppendCaptureEvent(ctx, db, ev, stateOps)
+		if err != nil {
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
 		summary.EventsAppended++
+		recordTrace(opts.Trace, acdtrace.Event{
+			Repo:       repoRoot,
+			BranchRef:  cctx.BranchRef,
+			HeadSHA:    cctx.BaseHead,
+			EventClass: "capture.event",
+			Decision:   "appended",
+			Reason:     "classified op persisted to capture_events",
+			Input: map[string]any{
+				"op":       op.Op,
+				"path":     op.Path,
+				"old_path": op.OldPath,
+				"fidelity": op.Fidelity,
+			},
+			Output:     map[string]any{"seq": seq},
+			Seq:        seq,
+			Generation: cctx.BranchGeneration,
+		})
 
 		// Update shadow_paths to reflect the new live state. Renames erase
 		// the old path; deletes erase the path; everything else upserts.
