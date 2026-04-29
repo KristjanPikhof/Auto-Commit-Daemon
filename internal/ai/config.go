@@ -146,13 +146,17 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return det, nil, nil
 
 	case mode == "openai-compat":
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		if err != nil {
+			return nil, nil, err
+		}
 		if cfg.APIKey == "" {
 			logger.Warn("ai: ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY empty; falling back to deterministic",
 				slog.String("provider", "openai-compat"))
 			return det, nil, nil
 		}
 		primary := &OpenAIProvider{
-			BaseURL: cfg.BaseURL,
+			BaseURL: baseURL,
 			APIKey:  cfg.APIKey,
 			Model:   cfg.Model,
 			HTTP:    nil, // provider lazy-builds a redirect-refusing client
