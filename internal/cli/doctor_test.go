@@ -513,7 +513,7 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
 		t.Fatalf("runDoctor human: %v", err)
 	}
 	body := humanOut.String()
-	for _, want := range []string{"Install", "claude-code : yes", "codex      : no", "legacy ~/.codex/hooks.json exists"} {
+	for _, want := range []string{"Install", "claude-code : yes", "codex       : no", "legacy ~/.codex/hooks.json exists"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("human doctor missing %q:\n%s", want, body)
 		}
