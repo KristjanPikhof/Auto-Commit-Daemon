@@ -105,8 +105,8 @@ func TestAI_DeterministicDefault(t *testing.T) {
 	}
 }
 
-// newOpenAITestServer returns an HTTPS httptest server plus the environment
-// override that lets the CGO-disabled integration binary trust its certificate.
+// newOpenAITestServer returns an HTTPS httptest server plus the ACD_AI_CA_FILE
+// override that lets the integration binary trust its private test CA.
 func newOpenAITestServer(t *testing.T, handler http.Handler) (*httptest.Server, string) {
 	t.Helper()
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -167,7 +167,7 @@ func newOpenAITestServer(t *testing.T, handler http.Handler) (*httptest.Server, 
 		server.Close()
 		t.Fatalf("write OpenAI test CA: %v", err)
 	}
-	return server, "SSL_CERT_FILE=" + certPath
+	return server, "ACD_AI_CA_FILE=" + certPath
 }
 
 // TestAI_OpenAICompatMockSuccess: the daemon points at an HTTPS test server
