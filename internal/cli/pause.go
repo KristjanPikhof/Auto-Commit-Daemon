@@ -9,19 +9,15 @@ import (
 	"log"
 	"os"
 	"os/user"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 )
 
 // PauseMarker is the durable gitDir/acd/paused file format.
-type PauseMarker struct {
-	Reason    string  `json:"reason"`
-	SetAt     string  `json:"set_at"`
-	SetBy     string  `json:"set_by"`
-	ExpiresAt *string `json:"expires_at"`
-}
+type PauseMarker = pausepkg.Marker
 
 type pauseResult struct {
 	OK         bool        `json:"ok"`
@@ -176,52 +172,23 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 // ReadMarker reads gitDir/acd/paused. It returns ok=false when the marker is
 // absent or malformed, matching the daemon's best-effort pause-marker handling.
 func ReadMarker(gitDir string) (PauseMarker, bool, error) {
-	path := pauseMarkerPath(gitDir)
-	body, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	marker, ok, err := pausepkg.Read(gitDir)
+	if errors.Is(err, pausepkg.ErrMalformed) {
+		log.Printf("acd pause: ignoring malformed pause marker %s: %v", pauseMarkerPath(gitDir), err)
 		return PauseMarker{}, false, nil
 	}
 	if err != nil {
 		return PauseMarker{}, false, err
 	}
-	var marker PauseMarker
-	if err := json.Unmarshal(body, &marker); err != nil {
-		log.Printf("acd pause: ignoring malformed pause marker %s: %v", path, err)
-		return PauseMarker{}, false, nil
-	}
-	return marker, true, nil
+	return marker, ok, nil
 }
 
 func pauseMarkerPath(gitDir string) string {
-	return filepath.Join(gitDir, "acd", "paused")
+	return pausepkg.Path(gitDir)
 }
 
 func writePauseMarker(path string, marker PauseMarker, overwrite bool) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	body, err := json.MarshalIndent(marker, "", "  ")
-	if err != nil {
-		return err
-	}
-	body = append(body, '\n')
-
-	flags := os.O_WRONLY | os.O_CREATE
-	if overwrite {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	f, err := os.OpenFile(path, flags, 0o600)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	if err := f.Chmod(0o600); err != nil {
-		return err
-	}
-	_, err = f.Write(body)
-	return err
+	return pausepkg.Write(path, marker, overwrite)
 }
 
 func renderPause(out io.Writer, res pauseResult, jsonOut bool) error {
