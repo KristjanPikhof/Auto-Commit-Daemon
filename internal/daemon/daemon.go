@@ -358,17 +358,17 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
-		if cctx.BranchRef != "" {
-			if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-				_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-			}
+	if cctx.BranchRef != "" {
+		if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 		}
-		if cctx.BranchRef != "" && cctx.BaseHead != "" {
-			if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-				logger.Warn("bootstrap shadow", "err", err.Error())
-			} else if seeded > 0 {
-				logger.Info("shadow bootstrapped", "rows", seeded)
-			}
+	}
+	if cctx.BranchRef != "" && cctx.BaseHead != "" {
+		if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+			logger.Warn("bootstrap shadow", "err", err.Error())
+		} else if seeded > 0 {
+			logger.Info("shadow bootstrapped", "rows", seeded)
+		}
 	}
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
