@@ -59,10 +59,19 @@ func (fp Fingerprint) Empty() bool {
 // where the caller already has the unjoined argv vector (e.g. fingerprinting
 // the current process).
 func Capture(pid int) (Fingerprint, error) {
+	return CaptureContext(context.Background(), pid)
+}
+
+// CaptureContext builds a Fingerprint for pid using the caller's context plus
+// the package timeout ceiling.
+func CaptureContext(ctx context.Context, pid int) (Fingerprint, error) {
 	if pid <= 0 {
 		return Fingerprint{}, errors.New("identity: pid must be positive")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), fingerprintTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, fingerprintTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=,command=").Output()
 	if err != nil {
@@ -90,7 +99,7 @@ func Capture(pid int) (Fingerprint, error) {
 // uses os.Args directly (preserving the original NUL-joined hash) rather
 // than parsing ps output for the current pid.
 func CaptureSelf() (Fingerprint, error) {
-	fp, err := Capture(os.Getpid())
+	fp, err := CaptureContext(context.Background(), os.Getpid())
 	if err != nil {
 		return Fingerprint{}, err
 	}
