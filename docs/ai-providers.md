@@ -2,6 +2,17 @@
 
 `acd` generates commit messages through a `Provider` interface (§10.1). Three implementations ship in v1: `deterministic` (rule-based, always available), `openai-compat` (HTTP to any OpenAI-compatible endpoint), and `subprocess` (JSONL protocol to an external binary). The default is `deterministic`; opt into the others via environment variables. Providers are composed so that any error in the primary falls back to `deterministic` automatically.
 
+The diff handed to AI providers is reconstructed from the `before_oid` and
+`after_oid` blobs captured in SQLite at write time — **not from the live
+worktree**. This means the model sees exactly what changed at the moment of
+capture, even if the file has been edited many times since. The diff is capped
+at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`) before transmission; long
+diffs are truncated at a line boundary while preserving the diff header so the
+model still sees the file path. The deterministic provider does not consult the
+diff at all, so its output is identical regardless of diff reconstruction
+success or failure. See [capture-replay.md](capture-replay.md) for the full
+storage model.
+
 ---
 
 ## Quick start
@@ -78,7 +89,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 `op` values: `create` | `modify` | `delete` | `rename` | `mode` | `symlink`.  
 `multi_op` is present when one daemon event covers more than one file.  
-`diff` is a unified diff capped at 4000 bytes before transmission (see `DiffCap` in `internal/ai/prompt.go`).
+`diff` is a unified diff capped at 4000 bytes before transmission (`DiffCap` in `internal/ai/prompt.go`). The diff is built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since.
 
 **Response (plugin → daemon, one line per request):**
 

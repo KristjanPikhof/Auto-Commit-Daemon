@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"os"
@@ -379,6 +380,89 @@ func TestDoctor_Bundle_TwoRunsDistinctZips(t *testing.T) {
 		}
 		if st.Size() == 0 {
 			t.Fatalf("zero-byte zip %s", p)
+		}
+	}
+}
+
+// TestDoctor_BlockedConflictSurfaced verifies that doctor exposes pending
+// + blocked_conflict counts and the most recent blocked event's path /
+// timestamp / error in both JSON and human output. Mirrors what `acd list`
+// and `acd status` report so all three commands agree on the same repo.
+func TestDoctor_BlockedConflictSurfaced(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, db, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 77, Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	// One pending event.
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "live.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "live.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending: %v", err)
+	}
+	// One blocked-conflict event.
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "stuck.go",
+		Fidelity: "rescan",
+	}, []state.CaptureOp{{Op: "modify", Path: "stuck.go", Fidelity: "rescan"}})
+	if err != nil {
+		t.Fatalf("append blocker: %v", err)
+	}
+	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("MarkEventBlocked: %v", err)
+	}
+	registerRepo(t, roots, repo, db, "claude-code")
+	_ = d.Close()
+
+	// JSON shape: counts + last replay conflict info populated.
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(rep.Repos) != 1 {
+		t.Fatalf("expected 1 repo, got %d", len(rep.Repos))
+	}
+	rr := rep.Repos[0]
+	if rr.PendingEvents != 1 {
+		t.Errorf("PendingEvents=%d want 1", rr.PendingEvents)
+	}
+	if rr.BlockedConflicts != 1 {
+		t.Errorf("BlockedConflicts=%d want 1", rr.BlockedConflicts)
+	}
+	if rr.LastReplayConflictPath != "stuck.go" {
+		t.Errorf("LastReplayConflictPath=%q want stuck.go", rr.LastReplayConflictPath)
+	}
+	if rr.LastReplayConflictErr == "" {
+		t.Errorf("LastReplayConflictErr empty, want non-empty error message")
+	}
+	if rr.LastReplayConflictTS == 0 {
+		t.Errorf("LastReplayConflictTS=0, want non-zero")
+	}
+
+	// Human output renders pending and blocked lines, plus last conflict.
+	var humanOut bytes.Buffer
+	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
+		t.Fatalf("runDoctor human: %v", err)
+	}
+	body := humanOut.String()
+	for _, want := range []string{"pending    : 1", "blocked    : 1", "stuck.go", "last conflict"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("doctor human output missing %q in:\n%s", want, body)
 		}
 	}
 }

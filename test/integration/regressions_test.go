@@ -42,6 +42,8 @@ func TestRegressions(t *testing.T) {
 	t.Run("PIDReuseRejectedByFingerprint", regPIDReuseRejectedByFingerprint)
 	t.Run("StopWithPeerDefersKill", regStopWithPeerDefersKill)
 	t.Run("DaemonSelfTerminatesOnEmptySweeps", regDaemonSelfTerminatesOnEmptySweeps)
+	t.Run("RepeatedEditsPublishOrderedCommits", regRepeatedEditsPublishOrderedCommits)
+	t.Run("BlockedConflictTerminalAcrossPolls", regBlockedConflictTerminalAcrossPolls)
 }
 
 // startDaemon is shared scaffolding: `acd start` + wait for mode=running.
@@ -602,4 +604,195 @@ func sqliteScalar(t *testing.T, dbPath, query string) string {
 
 func nowFloatSeconds() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
+}
+
+// regRepeatedEditsPublishOrderedCommits — drive three sequential edits to
+// the same path through the real `acd` binary. After each edit + wake the
+// daemon must produce one commit on top of the previous tip; the final log
+// must show the chain v1 → v2 → v3 in order, with each commit a fast-forward
+// of the seed. Counterpart to TestRun_RepeatedEditsToSameFile_OrderedCommits
+// at the daemon-package level: this wires the same scenario through the real
+// CLI/daemon binary so the regression survives the boot/IPC path too.
+func regRepeatedEditsPublishOrderedCommits(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "edits-1", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	target := filepath.Join(repo, "chain.txt")
+	versions := []string{"v1\n", "v2\n", "v3\n"}
+	prev := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	heads := make([]string, 0, len(versions))
+	for i, body := range versions {
+		writeFile(t, target, body)
+		wakeSession(t, ctx, env, repo, "edits-1")
+
+		// Wait up to 8s for HEAD to advance past prev. We cannot reuse
+		// waitForCommitContaining here because chain.txt appears in every
+		// commit; we want each individual advance.
+		deadline := time.Now().Add(8 * time.Second)
+		var cur string
+		for time.Now().Before(deadline) {
+			out, err := runGit(repo, "rev-parse", "HEAD")
+			if err == nil {
+				cur = strings.TrimSpace(out)
+				if cur != prev {
+					break
+				}
+			}
+			time.Sleep(75 * time.Millisecond)
+		}
+		if cur == "" || cur == prev {
+			full, _ := runGit(repo, "log", "--all", "--oneline")
+			t.Fatalf("edit %d: HEAD did not advance past %s within 8s\nlog:\n%s", i+1, prev, full)
+		}
+		heads = append(heads, cur)
+		prev = cur
+	}
+
+	// Walk the resulting log: each commit must show chain.txt with the
+	// expected blob content. We use ls-tree per commit and compare the
+	// blob's content via cat-file.
+	for i, h := range heads {
+		out := runGitOK(t, repo, "show", h+":chain.txt")
+		if out != versions[i] {
+			t.Fatalf("commit %d (%s): chain.txt=%q want %q", i, h, out, versions[i])
+		}
+	}
+
+	// Final tip must be a fast-forward descendant of the seed (no rewrites
+	// happened mid-way).
+	seed := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--max-parents=0", "HEAD"))
+	if _, err := runGit(repo, "merge-base", "--is-ancestor", seed, heads[len(heads)-1]); err != nil {
+		full, _ := runGit(repo, "log", "--all", "--oneline")
+		t.Fatalf("seed %s is not an ancestor of final tip %s\nlog:\n%s", seed, heads[len(heads)-1], full)
+	}
+
+	// Disk content must match the last edit (the worktree may diverge from
+	// the user-facing git index because acd commits via lower-level plumbing,
+	// but the file on disk should still hold the last write).
+	if disk, err := os.ReadFile(target); err != nil {
+		t.Fatalf("read chain.txt: %v", err)
+	} else if string(disk) != versions[len(versions)-1] {
+		t.Fatalf("disk content=%q want %q", disk, versions[len(versions)-1])
+	}
+}
+
+// regBlockedConflictTerminalAcrossPolls — inject a hand-crafted capture
+// event whose `before` blob does not match what's on disk, forcing the
+// replay path to settle the event as `blocked_conflict`. We then drive
+// several wake cycles and verify the row stays terminal (does NOT re-enter
+// pending) and that publish_state.status reflects the conflict. Without
+// the §8 terminal-settle behavior the row would loop forever in `pending`.
+func regBlockedConflictTerminalAcrossPolls(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Land one real commit so BaseHead resolves to a non-seed tip.
+	startSession(t, ctx, env, repo, "blk-1", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	writeFile(t, filepath.Join(repo, "real.txt"), "real\n")
+	wakeSession(t, ctx, env, repo, "blk-1")
+	waitForCommitContaining(t, repo, "real.txt", 8*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	baseHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
+	if gen == "" {
+		gen = "1"
+	}
+
+	// Hand-inject a capture event: a `modify` op against a path whose
+	// before_oid is bogus and whose path does not exist in the live tree.
+	// This is a true conflict scenario — the scratch index probe will see
+	// before_oid mismatch (or path missing), block the event terminally,
+	// and upsert publish_state.status = blocked_conflict.
+	bogusBefore := "1111111111111111111111111111111111111111"
+	bogusAfter := "2222222222222222222222222222222222222222"
+	now := nowFloatSeconds()
+	insertEvent := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'modify', 'ghost-conflict.txt', 'rescan', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'modify', 'ghost-conflict.txt', '%s', '100644', '%s', '100644', 'rescan');
+`, gen, baseHead, now, bogusBefore, bogusAfter)
+	if out, err := exec.Command("sqlite3", dbPath, insertEvent).CombinedOutput(); err != nil {
+		t.Fatalf("inject blocker event: %v\n%s", err, out)
+	}
+
+	// Capture the injected seq for later assertions.
+	blockerSeq := sqliteScalar(t, dbPath,
+		"SELECT seq FROM capture_events WHERE path = 'ghost-conflict.txt' ORDER BY seq DESC LIMIT 1")
+	if blockerSeq == "" {
+		t.Fatalf("blocker seq missing after insert")
+	}
+
+	// Wake several times — daemon's replay must settle the event terminally
+	// on the first pass and then leave it alone on every subsequent tick.
+	for i := 0; i < 5; i++ {
+		wakeSession(t, ctx, env, repo, "blk-1")
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	// Wait for the event to land in blocked_conflict (allow up to 5s for
+	// the replay path to drain).
+	deadline := time.Now().Add(5 * time.Second)
+	var st string
+	for time.Now().Before(deadline) {
+		st = sqliteScalar(t, dbPath,
+			fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", blockerSeq))
+		if st == "blocked_conflict" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if st != "blocked_conflict" {
+		dump, _ := exec.Command("sqlite3", dbPath,
+			"SELECT seq,operation,path,state,error FROM capture_events ORDER BY seq").CombinedOutput()
+		t.Fatalf("blocker event seq=%s state=%q want blocked_conflict\nrows:\n%s", blockerSeq, st, dump)
+	}
+
+	// Drive several more poll cycles. Terminal state must not regress to
+	// pending (this is the §6.1 invariant — terminal events drop out of
+	// PendingEvents and never re-run).
+	for i := 0; i < 4; i++ {
+		wakeSession(t, ctx, env, repo, "blk-1")
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	finalState := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", blockerSeq))
+	if finalState != "blocked_conflict" {
+		t.Fatalf("blocker event regressed: state=%q after extra polls", finalState)
+	}
+
+	pendingCount := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT COUNT(*) FROM capture_events WHERE state = 'pending' AND seq = %s", blockerSeq))
+	if pendingCount != "0" {
+		t.Fatalf("blocker re-entered pending: count=%s", pendingCount)
+	}
+
+	// publish_state.status must mirror the terminal state so list/status/
+	// doctor surfaces it without scanning capture_events.
+	pubStatus := sqliteScalar(t, dbPath,
+		"SELECT status FROM publish_state WHERE id = 1")
+	if pubStatus != "blocked_conflict" {
+		dump, _ := exec.Command("sqlite3", dbPath,
+			"SELECT id,status,event_seq,error FROM publish_state").CombinedOutput()
+		t.Fatalf("publish_state.status=%q want blocked_conflict\nrows:\n%s", pubStatus, dump)
+	}
+
+	// Daemon must still be running — a single conflict cannot wedge it.
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("daemon mode=%q after conflict; want running", mode)
+	}
 }

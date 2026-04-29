@@ -169,6 +169,116 @@ func TestUpdateIndexInfoWithIsolatedIndex(t *testing.T) {
 	}
 }
 
+// TestLsFilesIndex_IsolatedIndex stages entries on a per-call scratch index
+// via UpdateIndexInfo + GIT_INDEX_FILE, then reads them back through
+// LsFilesIndex. The repo's default index must remain empty — replay relies
+// on this isolation so a busy worktree never poisons a queued event's
+// before-state check.
+func TestLsFilesIndex_IsolatedIndex(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	a, err := HashObjectStdin(ctx, dir, []byte("alpha"))
+	if err != nil {
+		t.Fatalf("hash a: %v", err)
+	}
+	b, err := HashObjectStdin(ctx, dir, []byte("beta"))
+	if err != nil {
+		t.Fatalf("hash b: %v", err)
+	}
+
+	idx := filepath.Join(t.TempDir(), "scratch.index")
+	lines := []string{
+		"100644 " + a + "\tdir/a.txt",
+		"100755 " + b + "\tdir/b.sh",
+	}
+	if err := UpdateIndexInfo(ctx, dir, idx, lines); err != nil {
+		t.Fatalf("UpdateIndexInfo: %v", err)
+	}
+
+	got, err := LsFilesIndex(ctx, dir, idx)
+	if err != nil {
+		t.Fatalf("LsFilesIndex: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d (%+v)", len(got), got)
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i].Path < got[j].Path })
+	if got[0].Path != "dir/a.txt" || got[0].OID != a || got[0].Mode != "100644" || got[0].Stage != 0 {
+		t.Fatalf("entry 0 mismatch: %+v", got[0])
+	}
+	if got[1].Path != "dir/b.sh" || got[1].OID != b || got[1].Mode != "100755" || got[1].Stage != 0 {
+		t.Fatalf("entry 1 mismatch: %+v", got[1])
+	}
+
+	// Default (live) index must stay empty.
+	live, err := LsFilesStaged(ctx, dir)
+	if err != nil {
+		t.Fatalf("LsFilesStaged: %v", err)
+	}
+	if len(live) != 0 {
+		t.Fatalf("expected live index empty, got %+v", live)
+	}
+}
+
+// TestLsFilesIndex_PathFiltering scopes the read with a `paths` filter and
+// ensures (a) only matching entries come back and (b) paths with embedded
+// whitespace round-trip via the NUL delimiter.
+func TestLsFilesIndex_PathFiltering(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	a, err := HashObjectStdin(ctx, dir, []byte("a"))
+	if err != nil {
+		t.Fatalf("hash a: %v", err)
+	}
+	b, err := HashObjectStdin(ctx, dir, []byte("b"))
+	if err != nil {
+		t.Fatalf("hash b: %v", err)
+	}
+	c, err := HashObjectStdin(ctx, dir, []byte("c"))
+	if err != nil {
+		t.Fatalf("hash c: %v", err)
+	}
+
+	idx := filepath.Join(t.TempDir(), "scratch.index")
+	// Path "weird name.txt" exercises the NUL-delimited parse — a tab- or
+	// newline-split parser would mis-segment the record.
+	lines := []string{
+		"100644 " + a + "\tweird name.txt",
+		"100644 " + b + "\tsrc/keep.go",
+		"100644 " + c + "\tsrc/skip.go",
+	}
+	if err := UpdateIndexInfo(ctx, dir, idx, lines); err != nil {
+		t.Fatalf("UpdateIndexInfo: %v", err)
+	}
+
+	// Filter to a single explicit path including the whitespace one.
+	got, err := LsFilesIndex(ctx, dir, idx, "weird name.txt", "src/keep.go")
+	if err != nil {
+		t.Fatalf("LsFilesIndex (filter): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 filtered entries, got %d (%+v)", len(got), got)
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i].Path < got[j].Path })
+	if got[0].Path != "src/keep.go" {
+		t.Fatalf("filter entry 0 mismatch: %+v", got[0])
+	}
+	if got[1].Path != "weird name.txt" {
+		t.Fatalf("filter entry 1 mismatch (NUL parse?): %+v", got[1])
+	}
+
+	// Filter that matches nothing returns an empty slice without error.
+	none, err := LsFilesIndex(ctx, dir, idx, "does/not/exist.txt")
+	if err != nil {
+		t.Fatalf("LsFilesIndex (empty filter): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("expected no entries, got %+v", none)
+	}
+}
+
 func TestLsFilesStagedReturnsIndexedEntries(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()
