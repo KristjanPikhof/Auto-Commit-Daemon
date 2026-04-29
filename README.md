@@ -44,6 +44,8 @@ acd doctor              # pending : N, blocked : N, last conflict path + age + e
 acd doctor --bundle     # diagnostics zip for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
 acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
+acd pause --reason "resetting branch" --yes   # durable manual replay pause
+acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
 acd gc                  # prune stale central-registry entries
 acd stop --repo X       # graceful stop, refcount-aware
@@ -52,6 +54,11 @@ acd stop --all          # stop every daemon
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
+
+Parallel committers are usually self-healed now. If another process lands the
+same captured edits before `acd` replays them, the daemon marks the queued event
+as `published` with the external `HEAD` commit instead of creating an empty
+commit or raising `blocked_conflict`. Real content mismatches still block.
 
 ## Trace and recovery
 
@@ -76,6 +83,20 @@ acd recover --repo . --auto --yes
 `.git/acd/state.db` to `.git/acd/state.db.recover-<timestamp>`, retargets stale
 pending/blocked rows to the current attached branch, resets `blocked_conflict`
 rows to `pending`, and clears stale replay metadata.
+
+Use a manual pause when you want to reset, rebase, inspect, or stage branch
+changes without replay racing you:
+
+~~~bash
+acd pause --repo . --reason "manual reset" --yes
+# ...do the branch work...
+acd resume --repo . --yes
+acd wake --repo . --session-id "$ACD_SESSION_ID"
+~~~
+
+The marker is stored at `<gitDir>/acd/paused` and survives daemon restarts.
+`acd status` and `acd list` show the pause source and remaining TTL when one is
+active.
 
 If a parallel committer already landed the captured edits, do not requeue those
 rows with `recover`: they will usually hit the same before-state mismatch. Use
@@ -111,6 +132,7 @@ Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 | `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
+| `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
 
 ## Docs
 
