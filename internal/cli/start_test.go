@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,5 +317,86 @@ func TestStart_RereadsDaemonStateAfterSpawnPollDeadline(t *testing.T) {
 	}
 	if got.DaemonPID != finalPID {
 		t.Fatalf("daemon_pid=%d, want final daemon_state pid %d instead of spawned pid %d", got.DaemonPID, finalPID, spawnedPID)
+	}
+}
+
+func TestStart_TenConcurrentReportsSurvivingDaemonPID(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	withSpawnPollSettings(t, 5*time.Second, 5*time.Millisecond)
+
+	const clients = 10
+	survivorPID := os.Getpid()
+	var spawnCount atomic.Int32
+	var survivorSaved atomic.Bool
+	prevSpawn := spawnDaemon
+	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
+		n := spawnCount.Add(1)
+		if n == clients && survivorSaved.CompareAndSwap(false, true) {
+			db, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repoAbs, ".git")))
+			if err != nil {
+				return 0, err
+			}
+			defer db.Close()
+			if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+				PID:         survivorPID,
+				Mode:        "running",
+				HeartbeatTS: nowFloat(),
+				UpdatedTS:   nowFloat(),
+			}); err != nil {
+				return 0, err
+			}
+		}
+		if n == 1 {
+			return survivorPID, nil
+		}
+		return 900000 + int(n), nil
+	}
+	t.Cleanup(func() { spawnDaemon = prevSpawn })
+
+	var wg sync.WaitGroup
+	results := make(chan startResult, clients)
+	errs := make(chan error, clients)
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var stdout bytes.Buffer
+			if err := runStart(ctx, &stdout, repoDir, "session-concurrent-"+string(rune('a'+i)), "codex", 0, true); err != nil {
+				errs <- err
+				return
+			}
+			var got startResult
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				errs <- err
+				return
+			}
+			results <- got
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("runStart concurrent: %v", err)
+	}
+	var seen int
+	var started int
+	for got := range results {
+		seen++
+		if got.DaemonPID != survivorPID {
+			t.Fatalf("session %s daemon_pid=%d, want survivor %d", got.SessionID, got.DaemonPID, survivorPID)
+		}
+		if got.Started {
+			started++
+		}
+	}
+	if seen != clients {
+		t.Fatalf("results=%d, want %d", seen, clients)
+	}
+	if started != 1 {
+		t.Fatalf("started results=%d, want 1 winner", started)
 	}
 }
