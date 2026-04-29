@@ -242,7 +242,8 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 		t.Fatalf("Published=%d want >=1 (event 1 should land before the blocker)", sum.Published)
 	}
 
-	// `after.txt`'s event must still be pending; the blocker must be terminal.
+	// `after.txt`'s event must be held behind the terminal blocker; the blocker
+	// itself must not re-enter the pending queue.
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
 		t.Fatalf("PendingEvents: %v", err)
@@ -259,23 +260,20 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 	if sawBlocker {
 		t.Fatalf("blocker seq=%d should NOT be pending after settle", blockerSeq)
 	}
-	if !sawAfter {
-		t.Fatalf("after.txt should remain pending; pending=%+v", pending)
+	if sawAfter {
+		t.Fatalf("after.txt should be held behind blocked predecessor; pending=%+v", pending)
 	}
 
 	// A second pass with the blocker still in place must NOT drain `after.txt`.
-	// (The batch sees it sitting behind the blocked predecessor — but with the
-	// blocker already terminal, there is nothing left to halt on. So this
-	// assertion is the "operator must reconcile first" property: until the
-	// blocker is gone OR another mechanism advances BaseHead, retries do not
-	// magically chain on top of a stale parent. We verify by re-running
-	// Replay; `after.txt` may publish or stay pending depending on whether
-	// the scratch index reconciles, but the blocker MUST stay terminal.)
-	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Replay second pass: %v", err)
+	}
+	if sum2.Published != 0 || sum2.Conflicts != 0 || sum2.Failed != 0 {
+		t.Fatalf("second pass should be held by seq barrier; sum=%+v", sum2)
 	}
 	pending2, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
@@ -284,6 +282,9 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 	for _, p := range pending2 {
 		if p.Seq == blockerSeq {
 			t.Fatalf("blocker re-entered pending on second pass: %+v", p)
+		}
+		if p.Path == "after.txt" {
+			t.Fatalf("after.txt re-entered pending while blocker remains: %+v", p)
 		}
 	}
 }
