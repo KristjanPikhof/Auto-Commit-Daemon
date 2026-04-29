@@ -37,6 +37,8 @@ type listEntry struct {
 	BlockedConflicts int     `json:"blocked_conflicts"`
 	Status           string  `json:"status"`
 	StatusNote       string  `json:"status_note,omitempty"`
+	Paused           bool    `json:"paused,omitempty"`
+	Pause            *pauseInfo `json:"pause,omitempty"`
 }
 
 func newListCmd() *cobra.Command {
@@ -111,12 +113,20 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
 		e.PendingEvents = summary.pendingEvents
 		e.BlockedConflicts = summary.blockedConflicts
+		if summary.pause != nil {
+			e.Status = "paused"
+			e.StatusNote = pauseStatusNote(summary.pause)
+			e.Paused = true
+			e.Pause = summary.pause
+		}
 		if summary.daemon == "stale" {
 			if summary.clients == 0 {
 				continue
 			}
-			e.Status = "stale"
-			e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
+			if e.Status != "paused" {
+				e.Status = "stale"
+				e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
+			}
 		}
 		entries = append(entries, e)
 	}
@@ -177,6 +187,7 @@ type repoSummary struct {
 	heartbeatTS      float64
 	pendingEvents    int
 	blockedConflicts int
+	pause            *pauseInfo
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
@@ -268,6 +279,11 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateBlockedConflict).Scan(&s.blockedConflicts); err != nil {
 		return repoSummary{}, fmt.Errorf("blocked conflicts: %w", err)
+	}
+	if info, err := pauseInfoForRepo(ctx, conn, dbPath, now); err != nil {
+		return repoSummary{}, fmt.Errorf("pause state: %w", err)
+	} else {
+		s.pause = info
 	}
 
 	return s, nil
