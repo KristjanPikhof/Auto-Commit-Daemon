@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -173,6 +174,179 @@ func TestReplay_Conflict(t *testing.T) {
 	}
 	if !pub.EventSeq.Valid || pub.EventSeq.Int64 != seq {
 		t.Fatalf("publish_state.event_seq=%v want %d", pub.EventSeq, seq)
+	}
+}
+
+func TestReplay_IdempotentPublishWhenParallelCommitterAlreadyLanded(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "idempotent.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "idempotent.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "idempotent.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "idempotent.txt", afterBlob, "external after", base)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	trace := &memoryTraceLogger{}
+	messageCalled := false
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+		MessageFn: func(context.Context, EventContext) (string, error) {
+			messageCalled = true
+			return "should not be used", nil
+		},
+		GitDir: f.gitDir,
+		Trace:  trace,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if messageCalled {
+		t.Fatalf("message function called; idempotent publish should skip commit build")
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if sum.BaseHead != external {
+		t.Fatalf("summary BaseHead=%s want external HEAD %s", sum.BaseHead, external)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; idempotent publish should not create a commit", beforeCount, got)
+	}
+
+	var stateName string
+	var commitOID sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &commitOID); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStatePublished {
+		t.Fatalf("state=%q want published", stateName)
+	}
+	if !commitOID.Valid || commitOID.String != external {
+		t.Fatalf("commit_oid=%v want %s", commitOID, external)
+	}
+
+	var reasons int
+	for _, ev := range trace.Events() {
+		if ev.EventClass == "replay.commit" && ev.Reason == "already_published_by_external_committer" {
+			reasons++
+		}
+	}
+	if reasons != 1 {
+		t.Fatalf("already-published trace count=%d want 1; events=%+v", reasons, trace.Events())
+	}
+}
+
+func TestReplay_RealConflictStillBlocks(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	conflictBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("conflict\n"))
+	if err != nil {
+		t.Fatalf("hash conflict: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "conflict.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "conflict.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "conflict.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "conflict.txt", conflictBlob, "external conflict", base)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 0 || sum.Conflicts != 1 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	var stateName string
+	var errorText sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, error FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &errorText); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStateBlockedConflict {
+		t.Fatalf("state=%q want blocked_conflict", stateName)
+	}
+	if !errorText.Valid || !strings.Contains(errorText.String, "before-state mismatch") {
+		t.Fatalf("error=%q want before-state mismatch", errorText.String)
 	}
 }
 
