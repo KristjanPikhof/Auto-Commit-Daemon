@@ -58,7 +58,7 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | Variable | Default | Notes |
 |---|---|---|
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic` \| `openai-compat` \| `subprocess:<name>` |
-| `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | openai-compat only |
+| `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | openai-compat only; must be an absolute `https://` URL |
 | `ACD_AI_API_KEY` | (none) | openai-compat only; missing key degrades to deterministic with a warning |
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
@@ -205,6 +205,7 @@ The `deterministic` provider never fails. It always produces a message and is th
 - With diff sending enabled, subprocess plugins receive the same redacted, truncated diff over stdin.
 - Redaction is best-effort and pattern-based. It is a backstop, not a guarantee that arbitrary secrets or proprietary code cannot be transmitted.
 - **Do not enable `ACD_AI_SEND_DIFF=1` on private or sensitive repositories without explicit consent and a fully verified provider endpoint/plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
+- `ACD_AI_BASE_URL` must be an absolute `https://` URL. Plain HTTP and relative URLs are rejected before the OpenAI-compatible provider is built.
 - The default HTTP client refuses 3xx redirects to prevent the bearer token from being steered to a different host by a hostile network.
 
 ---
