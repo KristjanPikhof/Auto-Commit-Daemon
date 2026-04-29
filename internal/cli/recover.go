@@ -238,6 +238,16 @@ WHERE state = ?`,
 		state.EventStatePending, state.EventStateBlockedConflict); err != nil {
 		return fmt.Errorf("acd recover: reset blocked events: %w", err)
 	}
+	if err := exec(`DELETE FROM shadow_paths
+WHERE rowid NOT IN (
+    SELECT keep_rowid FROM (
+        SELECT MAX(rowid) AS keep_rowid
+        FROM shadow_paths
+        GROUP BY path
+    )
+)`); err != nil {
+		return fmt.Errorf("acd recover: dedupe shadow_paths: %w", err)
+	}
 	if err := exec(`UPDATE shadow_paths
 SET branch_ref = ?, branch_generation = ?, base_head = ?`,
 		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead); err != nil {
