@@ -535,6 +535,30 @@ func Run(ctx context.Context, opts Options) error {
 		// restart picks up the same value, and the next replay pass
 		// terminally blocks any queued events captured under the prior
 		// generation (their BaseHead is no longer reachable).
+		if cctx.BranchRef == "" {
+			branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
+			if branchRef != "" {
+				cctx.BranchRef = branchRef
+				cctx.BaseHead = headOID
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist reattached branch head",
+						"err", err.Error())
+				}
+				if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+					_ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+				}
+				if headOID != "" {
+					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+						logger.Warn("bootstrap shadow after reattach",
+							"err", err.Error())
+					} else if seeded > 0 {
+						logger.Info("shadow bootstrapped after reattach",
+							"rows", seeded)
+					}
+				}
+			}
+		}
 		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
 			logger.Warn("branch token resolve failed", "err", terr.Error())
