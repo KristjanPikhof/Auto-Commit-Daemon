@@ -1265,3 +1265,31 @@ func traceHasDecision(events []acdtrace.Event, decision string) bool {
 	}
 	return false
 }
+
+func commitSingleFileTree(t *testing.T, ctx context.Context, repoDir, path, blobOID, message string, parents ...string) string {
+	t.Helper()
+	tree, err := git.Mktree(ctx, repoDir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: blobOID, Path: path},
+	})
+	if err != nil {
+		t.Fatalf("mktree %s: %v", path, err)
+	}
+	commit, err := git.CommitTree(ctx, repoDir, tree, message, parents...)
+	if err != nil {
+		t.Fatalf("commit-tree %s: %v", path, err)
+	}
+	return commit
+}
+
+func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "rev-list", "--count", rev)
+	if err != nil {
+		t.Fatalf("rev-list --count %s: %v", rev, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("parse rev-list count %q: %v", out, err)
+	}
+	return n
+}
