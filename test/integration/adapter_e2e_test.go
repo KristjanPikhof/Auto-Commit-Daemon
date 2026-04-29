@@ -403,6 +403,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	// Fake claude-code env: CLAUDE_PROJECT_DIR points at the repo so the
 	// snippet's ${CLAUDE_PROJECT_DIR:-$PWD} expansion picks it up.
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -419,7 +420,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
 
 	// Exercise PreToolUse so we know `acd wake` works through the same
-	// JSON-piped, jq-filtered path the snippet expects in production.
+	// JSON-piped path the snippet expects in production.
 	wakeHook := pickHookByEvent(t, hooks, "PreToolUse")
 	wakeRes := runBash(t, ctx, env, stdin, wakeHook.Command)
 	if wakeRes.ExitCode != 0 {
@@ -452,6 +453,7 @@ func runCodexE2E(t *testing.T, bin string) {
 	// Codex provides the project directory separately from the hook process
 	// cwd; keep the bash subprocess outside repo to prove the snippet honors it.
 	env := adapterEnv(t, binDir, "CODEX_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
