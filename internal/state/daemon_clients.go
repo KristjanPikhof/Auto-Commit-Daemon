@@ -98,7 +98,7 @@ func ListClients(ctx context.Context, d *DB) ([]Client, error) {
 	const q = `
 SELECT session_id, harness, watch_pid, watch_fp, registered_ts, last_seen_ts
 FROM daemon_clients ORDER BY last_seen_ts ASC`
-	rows, err := d.conn.QueryContext(ctx, q)
+	rows, err := d.readSQL().QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("state: list clients: %w", err)
 	}
@@ -122,7 +122,7 @@ FROM daemon_clients ORDER BY last_seen_ts ASC`
 // shutdown gate ("exit when refcount hits zero").
 func CountClients(ctx context.Context, d *DB) (int, error) {
 	var n int
-	err := d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&n)
+	err := d.readSQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("state: count clients: %w", err)
 	}
