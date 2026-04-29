@@ -120,6 +120,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 - **Soft errors**: a response with a non-empty `error` field keeps the plugin process alive. Only the current request fails, allowing `Compose` to fall back to `deterministic`.
 - **Hard errors** (timeout, unexpected EOF, I/O failure, exit): the plugin is killed and marked crashed. The next `Generate` call respawns the binary transparently.
 - **Shutdown**: `Close()` sends EOF on stdin and waits up to 5 seconds for a clean exit before escalating to SIGKILL. The daemon calls `Close()` at shutdown so plugins are always reaped.
+- **Stderr**: plugin stderr is captured for diagnostics. By default it is appended to `~/.local/state/acd/plugin-<name>.log`; tests or embedders can override this with `SubprocessOptions.Stderr`.
 
 ---
 
