@@ -320,6 +320,25 @@ func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int
 	return int(n), nil
 }
 
+// DeletePendingForGeneration deletes queued, unpublished events for a stale
+// branch generation after the daemon has classified a branch transition as
+// Diverged. Terminal rows are intentionally retained for operator review, and
+// published rows are never touched.
+func DeletePendingForGeneration(ctx context.Context, d *DB, branchGeneration int64) (int, error) {
+	res, err := d.conn.ExecContext(ctx,
+		`DELETE FROM capture_events WHERE state = ? AND branch_generation = ?`,
+		EventStatePending, branchGeneration,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete pending generation %d: %w", branchGeneration, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: delete pending generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // PruneTerminalEventsBefore deletes stale terminal failure rows whose state is
 // 'blocked_conflict' or 'failed'. Rows that still form a replay barrier are
 // preserved: if a later pending event exists for the same branch ref and
