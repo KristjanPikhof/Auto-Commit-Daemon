@@ -127,22 +127,25 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
-		return enc.Encode(out_all)
-	}
-	fmt.Fprintf(out, "acd stop --all: stopped=%d deferred=%d failed=%d\n",
-		len(out_all.Stopped), len(out_all.Deferred), len(out_all.Failed))
-	for _, r := range out_all.Stopped {
-		fmt.Fprintf(out, "  stopped: %s (pid %d)\n", r.Repo, r.DaemonPID)
-	}
-	for _, r := range out_all.Deferred {
-		fmt.Fprintf(out, "  deferred: %s (%s)\n", r.Repo, r.Reason)
-	}
-	for _, r := range out_all.Failed {
-		reason := r.Reason
-		if reason == "" {
-			reason = "daemon still running"
+		if err := enc.Encode(out_all); err != nil {
+			return err
 		}
-		fmt.Fprintf(out, "  failed: %s (pid %d) — %s\n", r.Repo, r.DaemonPID, reason)
+	} else {
+		fmt.Fprintf(out, "acd stop --all: stopped=%d deferred=%d failed=%d\n",
+			len(out_all.Stopped), len(out_all.Deferred), len(out_all.Failed))
+		for _, r := range out_all.Stopped {
+			fmt.Fprintf(out, "  stopped: %s (pid %d)\n", r.Repo, r.DaemonPID)
+		}
+		for _, r := range out_all.Deferred {
+			fmt.Fprintf(out, "  deferred: %s (%s)\n", r.Repo, r.Reason)
+		}
+		for _, r := range out_all.Failed {
+			reason := r.Reason
+			if reason == "" {
+				reason = "daemon still running"
+			}
+			fmt.Fprintf(out, "  failed: %s (pid %d) — %s\n", r.Repo, r.DaemonPID, reason)
+		}
 	}
 	if len(out_all.Failed) > 0 {
 		return fmt.Errorf("acd stop --all: %d repo(s) failed to stop", len(out_all.Failed))
