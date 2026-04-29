@@ -353,6 +353,82 @@ var replayUpdateRefBackoffs = []time.Duration{
 	200 * time.Millisecond,
 }
 
+type replayPause struct {
+	Active    bool
+	Source    string
+	Reason    string
+	SetAt     string
+	ExpiresAt string
+	Remaining int64
+}
+
+func replayPauseState(ctx context.Context, gitDir string, db *state.DB) (replayPause, error) {
+	now := time.Now().UTC()
+	if gitDir != "" {
+		marker, ok, err := pausepkg.Read(gitDir)
+		if errors.Is(err, pausepkg.ErrMalformed) {
+			slog.Default().Warn("ignoring malformed pause marker", "err", err.Error())
+		} else if err != nil {
+			return replayPause{}, fmt.Errorf("daemon: read pause marker: %w", err)
+		} else if ok {
+			paused, err := markerPauseState(marker, now)
+			if err != nil {
+				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+			} else if paused.Active {
+				return paused, nil
+			}
+		}
+	}
+
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		return replayPause{}, fmt.Errorf("daemon: read replay pause meta: %w", err)
+	}
+	if !ok || strings.TrimSpace(raw) == "" {
+		return replayPause{}, nil
+	}
+	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		return replayPause{}, nil
+	}
+	if !until.After(now) {
+		if _, err := state.MetaDelete(ctx, db, MetaKeyReplayPausedUntil); err != nil {
+			return replayPause{}, fmt.Errorf("daemon: clear expired replay pause meta: %w", err)
+		}
+		return replayPause{}, nil
+	}
+	return replayPause{
+		Active:    true,
+		Source:    "rewind_grace",
+		Reason:    "rewind grace",
+		ExpiresAt: until.UTC().Format(time.RFC3339),
+		Remaining: int64(until.Sub(now).Seconds()),
+	}, nil
+}
+
+func markerPauseState(marker pausepkg.Marker, now time.Time) (replayPause, error) {
+	paused := replayPause{
+		Active: true,
+		Source: "manual",
+		Reason: marker.Reason,
+		SetAt:  marker.SetAt,
+	}
+	if marker.ExpiresAt == nil || strings.TrimSpace(*marker.ExpiresAt) == "" {
+		return paused, nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*marker.ExpiresAt))
+	if err != nil {
+		return replayPause{}, fmt.Errorf("parse expires_at: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return replayPause{}, nil
+	}
+	paused.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+	paused.Remaining = int64(expiresAt.Sub(now).Seconds())
+	return paused, nil
+}
+
 func updateReplayRefWithRetry(
 	ctx context.Context,
 	repoRoot, ref, commitOID, oldOID string,
