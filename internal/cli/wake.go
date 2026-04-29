@@ -30,6 +30,7 @@ type wakeResult struct {
 // signalProcess is the injection point used by tests to verify that wake
 // would have sent SIGUSR1 without involving real OS signals.
 var captureProcessFingerprint = identity.Capture
+var killProcess = syscall.Kill
 
 var signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
 	if pid <= 0 {
@@ -44,7 +45,7 @@ var signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string
 			return fmt.Errorf("verify process identity for pid %d: fingerprint mismatch", pid)
 		}
 	}
-	return syscall.Kill(pid, sig)
+	return killProcess(pid, sig)
 }
 
 func newWakeCmd() *cobra.Command {
