@@ -25,19 +25,19 @@ import (
 // listEntry is one row in the `acd list` output. JSON marshal tags match
 // the §7.7 example shape.
 type listEntry struct {
-	Path             string  `json:"path"`
-	RepoHash         string  `json:"repo_hash"`
-	Daemon           string  `json:"daemon"`
-	PID              int     `json:"pid,omitempty"`
-	Clients          int     `json:"clients"`
-	LastSeq          int64   `json:"last_seq"`
-	LastCommitOID    string  `json:"last_commit_oid,omitempty"`
-	HeartbeatAgeSecs float64 `json:"heartbeat_age_seconds,omitempty"`
-	PendingEvents    int     `json:"pending_events"`
-	BlockedConflicts int     `json:"blocked_conflicts"`
-	Status           string  `json:"status"`
-	StatusNote       string  `json:"status_note,omitempty"`
-	Paused           bool    `json:"paused,omitempty"`
+	Path             string     `json:"path"`
+	RepoHash         string     `json:"repo_hash"`
+	Daemon           string     `json:"daemon"`
+	PID              int        `json:"pid,omitempty"`
+	Clients          int        `json:"clients"`
+	LastSeq          int64      `json:"last_seq"`
+	LastCommitOID    string     `json:"last_commit_oid,omitempty"`
+	HeartbeatAgeSecs float64    `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents    int        `json:"pending_events"`
+	BlockedConflicts int        `json:"blocked_conflicts"`
+	Status           string     `json:"status"`
+	StatusNote       string     `json:"status_note,omitempty"`
+	Paused           bool       `json:"paused,omitempty"`
 	Pause            *pauseInfo `json:"pause,omitempty"`
 }
 
