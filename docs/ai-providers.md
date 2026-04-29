@@ -195,7 +195,7 @@ The `deterministic` provider never fails. It always produces a message and is th
 
 ### Subprocess plugins
 
-- Plugins run as **subprocesses of the daemon** and inherit its full process privileges: file-system access, network access, environment variables (including secrets), and the ability to invoke `git` commands.
+- Plugins run as **subprocesses of the daemon** and inherit its full process privileges: file-system access, network access, environment variables (including secrets), the operator's Git credentials, and the ability to invoke `git` commands, including `git push`.
 - The daemon reads from your repository and writes commits. A malicious or compromised plugin can read and exfiltrate your source code or push tampered commits.
 - **Vetting plugins is entirely the operator's responsibility.** Treat every third-party `acd-provider-*` binary exactly as you would any unsandboxed binary on your `$PATH`: pin versions, review source, audit network calls, and prefer running the daemon under a restricted system user.
 
