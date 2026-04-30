@@ -308,6 +308,22 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("acd recover: commit transaction: %w", err)
 	}
+
+	// Remove the durable manual pause marker. It is owned by `acd pause` /
+	// `acd resume` and is not stored in state.db, so it survives the SQL
+	// transaction; do this last so a Commit failure cannot leave us with a
+	// retargeted DB but an orphaned marker.
+	if plan.ManualMarkerPath != "" {
+		if err := os.Remove(plan.ManualMarkerPath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("acd recover: remove manual pause marker %s: %w", plan.ManualMarkerPath, err)
+			}
+			log.Printf("acd recover: no manual pause marker present at %s", plan.ManualMarkerPath)
+		} else {
+			plan.ManualMarkerRemoved = true
+			log.Printf("acd recover: removed manual pause marker at %s", plan.ManualMarkerPath)
+		}
+	}
 	return nil
 }
 
