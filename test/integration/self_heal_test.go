@@ -214,6 +214,35 @@ func requireSQLite(t *testing.T) {
 	}
 }
 
+// assertStatusPaused calls `acd status --json --repo <repo>` and asserts that
+// the reply has Paused=true and Pause.Source==wantSource. This is a direct
+// observable-state assertion that does not depend on timing.
+func assertStatusPaused(t *testing.T, ctx context.Context, env []string, repo, wantSource string) {
+	t.Helper()
+	res := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	var rep struct {
+		Paused bool `json:"paused"`
+		Pause  *struct {
+			Source string `json:"source"`
+		} `json:"pause"`
+	}
+	if err := json.Unmarshal([]byte(res.Stdout), &rep); err != nil {
+		t.Fatalf("decode status json: %v\nstdout=%s", err, res.Stdout)
+	}
+	if !rep.Paused {
+		t.Fatalf("acd status paused=false, want true\nstdout=%s", res.Stdout)
+	}
+	if rep.Pause == nil {
+		t.Fatalf("acd status pause object nil, want source=%q\nstdout=%s", wantSource, res.Stdout)
+	}
+	if rep.Pause.Source != wantSource {
+		t.Fatalf("acd status pause.source=%q want %q\nstdout=%s", rep.Pause.Source, wantSource, res.Stdout)
+	}
+}
+
 func selfHealStateDB(repo string) string {
 	return filepath.Join(repo, ".git", "acd", "state.db")
 }
