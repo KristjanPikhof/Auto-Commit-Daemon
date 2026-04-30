@@ -197,7 +197,8 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 		t.Fatalf("HEAD advanced during rewind grace: got %s want %s", head, seedHead)
 	}
 
-	time.Sleep(2500 * time.Millisecond)
+	// Poll until the daemon clears replay.paused_until (rewind grace expired).
+	waitForMetaCleared(t, dbPath, "replay.paused_until", 5*time.Second)
 	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-rewind")
 	waitForEventState(t, dbPath, "rewind.txt", "published", 8*time.Second)
 	assertNoSelfHealTerminalRows(t, dbPath)
