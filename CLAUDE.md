@@ -154,6 +154,22 @@ Trace files rotate daily as `YYYY-MM-DD.jsonl`. Every line is JSON:
 {"ts":"2026-04-29T12:34:56.000000789Z","repo":"/repo/acd","branch_ref":"refs/heads/main","head_sha":"dddddddddddddddddddddddddddddddddddddddd","event_class":"replay.commit","decision":"published","reason":"event published","input":{"operation":"create","path":"file.txt"},"output":{"commit":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","parent":"dddddddddddddddddddddddddddddddddddddddd"},"error":"","seq":4,"generation":7}
 ```
 
+Known `event_class` values (verify with `grep -rn "EventClass:" internal/`):
+
+| `event_class` | When emitted | Notable `input`/`output` fields |
+|---|---|---|
+| `bootstrap_shadow.reseed` | Shadow state reseeded after Diverged or at startup | out: `rows` |
+| `capture.classify` | Worktree vs. shadow diff computed | out: `ops`, `walked_files`, `oversize`, `errors` |
+| `capture.event` | Op written to `capture_events` (`appended`) or dropped at cap (`dropped`) | in: `op`, `path`, `fidelity`; out: `seq` or `pending_depth`/`cap` |
+| `capture.pause` | Capture skipped because replay is paused | out: `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
+| `replay.commit` | Event published as a commit or idempotent HEAD match | in: `operation`, `path`; out: `commit`, `parent` |
+| `replay.conflict` | Event becomes `blocked_conflict` | in: `operation`, `path`; out: `expected_sha`, `actual_sha`, `ref` |
+| `replay.failed` | Event becomes `failed` (bad ops, ancestry, write-tree) | in: `operation`, `path` |
+| `replay.update_ref` | Each `git update-ref` attempt (one record per retry) | out: `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha` |
+| `replay.pause` | Replay drain skipped because paused | out: `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
+| `branch_token.transition` | HEAD movement classified (startup or per-tick) | in: `previous`, `current`; out: `prev_generation`, `new_generation`, `dropped_pending` |
+| `daemon.pause` | Git operation marker detected (`paused`) or cleared (`resumed`) | in: `operation` |
+
 ## Release one-liners
 
 ```bash
