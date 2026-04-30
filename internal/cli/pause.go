@@ -21,12 +21,16 @@ type PauseMarker = pausepkg.Marker
 
 type pauseResult struct {
 	OK         bool        `json:"ok"`
+	Status     string      `json:"status"`
 	Repo       string      `json:"repo"`
 	MarkerPath string      `json:"marker_path"`
-	Overwrote  bool        `json:"overwrote,omitempty"`
+	Overwrote  bool        `json:"overwrote"`
 	Marker     PauseMarker `json:"marker"`
 }
 
+// resumeResult is the JSON envelope returned by `acd resume`. Status takes
+// the values "resumed", "not-paused", or "requires-yes" so machine readers
+// can switch on a single field across all outcomes.
 type resumeResult struct {
 	OK                bool        `json:"ok"`
 	Status            string      `json:"status"`
