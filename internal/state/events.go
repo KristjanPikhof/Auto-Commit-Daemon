@@ -163,20 +163,31 @@ WHERE seq = ?`
 // barrier: later pending rows stay out of the queue until the operator removes
 // the terminal predecessor. Published predecessors do not block because they
 // already advanced the branch history.
+//
+// Implementation: a CTE collapses every (branch_ref, branch_generation) into
+// its lowest barrier seq, then a left-join filters pending rows whose seq is
+// at or beyond that barrier. This is an order-of-magnitude faster than the
+// previous correlated NOT EXISTS subquery once the queue grows past a few
+// thousand pending rows (the case during a long pause). The leading-state
+// covering index idx_capture_events_barrier (schema v3) keeps both the CTE
+// aggregation and the outer pending-row scan off the unindexed full-table
+// path.
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
 	q := `
+WITH barriers AS (
+    SELECT branch_ref, branch_generation, MIN(seq) AS first_seq
+    FROM capture_events
+    WHERE state IN ('blocked_conflict', 'failed')
+    GROUP BY branch_ref, branch_generation
+)
 SELECT e.seq, e.branch_ref, e.branch_generation, e.base_head, e.operation, e.path, e.old_path,
        e.fidelity, e.captured_ts, e.published_ts, e.state, e.commit_oid, e.error, e.message
 FROM capture_events e
+LEFT JOIN barriers b
+       ON b.branch_ref = e.branch_ref
+      AND b.branch_generation = e.branch_generation
 WHERE e.state = 'pending'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM capture_events barrier
-      WHERE barrier.branch_ref = e.branch_ref
-        AND barrier.branch_generation = e.branch_generation
-        AND barrier.seq < e.seq
-        AND barrier.state IN ('blocked_conflict', 'failed')
-  )
+  AND (b.first_seq IS NULL OR e.seq < b.first_seq)
 ORDER BY e.seq ASC`
 	args := []any{}
 	if limit > 0 {
