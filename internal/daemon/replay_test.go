@@ -1188,6 +1188,76 @@ func TestClassifyReplayIssue(t *testing.T) {
 	}
 }
 
+// TestIsTransientUpdateRefLockError_PinsRealGitMessage exercises real
+// git contention so isTransientUpdateRefLockError stays in lockstep with
+// the verbatim stderr git emits when ref locks collide. The classifier
+// reads err.Error() — a regression that drops "cannot lock" or
+// "unable to lock" from the lowercased message would make legitimate
+// transient lock failures look terminal.
+func TestIsTransientUpdateRefLockError_PinsRealGitMessage(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Build two distinct commits whose only difference is a single byte —
+	// either is a valid HEAD descendant of the seed commit. Both
+	// concurrent update-ref calls aim them at HEAD without a CAS, so at
+	// least one of them races with the other on the ref lock file.
+	mkCommit := func(payload string) string {
+		t.Helper()
+		blob, err := git.HashObjectStdin(ctx, f.dir, []byte(payload))
+		if err != nil {
+			t.Fatalf("hash-object: %v", err)
+		}
+		tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+			{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "lock-test.txt"},
+		})
+		if err != nil {
+			t.Fatalf("mktree: %v", err)
+		}
+		commit, err := git.CommitTree(ctx, f.dir, tree, "lock-test "+payload, f.cctx.BaseHead)
+		if err != nil {
+			t.Fatalf("commit-tree: %v", err)
+		}
+		return commit
+	}
+
+	commitA := mkCommit("a\n")
+	commitB := mkCommit("b\n")
+
+	const trials = 20
+	var observed error
+	for i := 0; i < trials && observed == nil; i++ {
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			errs[0] = git.UpdateRef(ctx, f.dir, "refs/heads/main", commitA, "")
+		}()
+		go func() {
+			defer wg.Done()
+			errs[1] = git.UpdateRef(ctx, f.dir, "refs/heads/main", commitB, "")
+		}()
+		wg.Wait()
+		for _, err := range errs {
+			if err == nil {
+				continue
+			}
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "cannot lock") || strings.Contains(msg, "unable to lock") {
+				observed = err
+				break
+			}
+		}
+	}
+	if observed == nil {
+		t.Skipf("could not provoke real git ref-lock contention after %d trials", trials)
+	}
+	if !isTransientUpdateRefLockError(observed) {
+		t.Fatalf("isTransientUpdateRefLockError(%v) = false; real git lock message must classify as transient", observed)
+	}
+}
+
 func TestReplay_HEADCASUsesLiteralHead(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
