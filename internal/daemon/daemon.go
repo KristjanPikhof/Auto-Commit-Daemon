@@ -555,6 +555,23 @@ func Run(ctx context.Context, opts Options) error {
 		lastRollup        = time.Time{}
 		lastRollupUTCDay  = ""
 		stopped           bool
+
+		// operation_in_progress staleness tracking. opMarkerSetAt is the
+		// monotonic-ish wall-clock observation of when the current marker
+		// first appeared (in this process). opMarkerHead is the HEAD SHA at
+		// that point. Both reset to zero/empty when the marker disappears.
+		// opMarkerWarnedAt rate-limits the "marker may be stale" warning.
+		opMarkerSetAt    time.Time
+		opMarkerHead     string
+		opMarkerWarnedAt time.Time
+	)
+	const (
+		// staleOpMarkerThreshold: how long an operation_in_progress marker
+		// must stay present (with HEAD motionless) before we surface a
+		// "marker may be stale" warning.
+		staleOpMarkerThreshold = 15 * time.Minute
+		// staleOpMarkerWarnInterval: throttle for the periodic warning.
+		staleOpMarkerWarnInterval = 5 * time.Minute
 	)
 
 	graceful := func(reason string) {
