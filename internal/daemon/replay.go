@@ -920,14 +920,21 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 	); err != nil {
 		return fmt.Errorf("daemon: mark published: %w", err)
 	}
-	_ = state.SavePublishState(ctx, db, state.Publish{
+	if err := state.SavePublishState(ctx, db, state.Publish{
 		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
 		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		SourceHead:       sql.NullString{String: sourceHead, Valid: true},
 		TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
 		Status:           "published",
-	})
+	}); err != nil {
+		// Best-effort: the event row is already marked published via
+		// MarkEventPublished above. publish_state is the operator-visible
+		// breadcrumb singleton — surfacing the failure as a slog warn is
+		// enough so the event row itself stays authoritative.
+		slog.Default().Warn("save publish_state after MarkEventPublished",
+			"seq", ev.Seq, "commit", commitOID, "err", err.Error())
+	}
 	return nil
 }
 
