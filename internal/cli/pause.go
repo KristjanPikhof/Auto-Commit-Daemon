@@ -106,7 +106,8 @@ func runPause(ctx context.Context, out io.Writer, repoFlag, reason, ttlFlag stri
 	}
 
 	markerPath := pauseMarkerPath(gitDir)
-	if err := writePauseMarker(markerPath, marker, yes); err != nil {
+	overwrote, err := writePauseMarker(markerPath, marker, yes)
+	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("acd pause: pause marker already exists at %s; pass --yes to overwrite", markerPath)
 		}
@@ -117,7 +118,7 @@ func runPause(ctx context.Context, out io.Writer, repoFlag, reason, ttlFlag stri
 		OK:         true,
 		Repo:       repo,
 		MarkerPath: markerPath,
-		Overwrote:  yes,
+		Overwrote:  overwrote,
 		Marker:     marker,
 	}
 	return renderPause(out, res, jsonOut)
