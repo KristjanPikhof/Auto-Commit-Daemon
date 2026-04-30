@@ -539,6 +539,134 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 	}
 }
 
+// TestDaemon_StaleOpMarker_Warns verifies that when an operation_in_progress
+// marker (e.g. MERGE_HEAD) sits in the git dir for >15 minutes WITHOUT HEAD
+// advancing, the daemon emits a "marker may be stale" warning AND surfaces
+// the stale_operation_marker bit in the persisted operation_in_progress.set_at
+// metadata so `acd diagnose` can flag it. The daemon never auto-clears the
+// marker — that is the operator's job.
+func TestDaemon_StaleOpMarker_Warns(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Inject MERGE_HEAD so gitOperationInProgress reports "merge".
+	mergeHead := filepath.Join(f.gitDir, "MERGE_HEAD")
+	if err := os.WriteFile(mergeHead, []byte(startHead+"\n"), 0o644); err != nil {
+		t.Fatalf("create MERGE_HEAD: %v", err)
+	}
+
+	// Controllable clock: first call returns t0, every subsequent call
+	// returns t0 + 16m so the daemon's stale-marker threshold (15m) trips
+	// on the next pass after seeding set_at.
+	t0 := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	advanced := atomic.Bool{}
+	nowFn := func() time.Time {
+		if advanced.Load() {
+			return t0.Add(16 * time.Minute)
+		}
+		return t0
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			Now:         nowFn,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// First, wait for the marker to be seeded with operation_in_progress.set_at.
+	waitForMetaValue(t, f.db, MetaKeyOperationInProgress, "merge", 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt); ok && v != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	setAtRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt)
+	if err != nil {
+		t.Fatalf("MetaGet set_at: %v", err)
+	}
+	if !ok || setAtRaw == "" {
+		t.Fatalf("operation_in_progress.set_at not stamped")
+	}
+
+	// Now advance the clock past the threshold and force another tick.
+	advanced.Store(true)
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// HEAD must not have advanced.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced while marker present: %s; want %s", head, startHead)
+	}
+
+	// set_at remains stable across ticks (the stamp is captured once on
+	// transition to "marker present", not refreshed each pass).
+	setAtRaw2, _, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt)
+	if setAtRaw2 != setAtRaw {
+		t.Fatalf("operation_in_progress.set_at refreshed across ticks: %q -> %q",
+			setAtRaw, setAtRaw2)
+	}
+
+	// HEAD-at stamp must match the SHA observed at marker time.
+	headAtRaw, ok, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressHead)
+	if !ok || headAtRaw != startHead {
+		t.Fatalf("operation_in_progress.head_at=%q want %s", headAtRaw, startHead)
+	}
+
+	// Cleanup: remove marker so the daemon resumes on shutdown.
+	if err := os.Remove(mergeHead); err != nil {
+		t.Fatalf("remove MERGE_HEAD: %v", err)
+	}
+	waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+	// Stale-marker metadata must be cleared on resume.
+	if _, ok, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt); ok {
+		t.Fatalf("operation_in_progress.set_at not cleared on resume")
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 // TestRewindGrace_DoesNotResurrectRewoundWork verifies that when the daemon
 // detects a same-branch rewind (newHead is an ancestor of prevHead, e.g.
 // `git reset --soft HEAD~1`) and writes daemon_meta.replay.paused_until, the
