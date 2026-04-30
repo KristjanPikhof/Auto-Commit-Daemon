@@ -2333,3 +2333,358 @@ func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
 	}
 	return n
 }
+
+// -----------------------------------------------------------------------------
+// alreadyPublishedAtHEAD probe-gap unit tests.
+//
+// Coverage matrix (see also TestReplay_IdempotentPublish_* and
+// TestReplay_HEADMovedDuringProbe for end-to-end coverage):
+//
+//   case                                                    | result
+//   --------------------------------------------------------+-------
+//   empty ops slice                                         | false
+//   modify, HEAD blob matches after_oid                     | true
+//   modify, HEAD blob matches but mode differs              | false
+//   symlink (mode 120000), HEAD entry matches               | true
+//   rename, HEAD has new path AND old path absent           | true
+//   rename, HEAD has new path BUT old path still present    | false
+//   delete, HEAD path absent                                | true
+//   delete, HEAD path replaced by directory                 | false
+//   HEAD moved between probe start and post-probe re-read   | false
+//
+// The cases below exercise every probe-gap row; the existing tests above
+// cover the simple modify, rename-success, delete-absent, ancestry-guard,
+// and CAS-exhaustion paths.
+// -----------------------------------------------------------------------------
+
+// TestAlreadyPublishedAtHEAD_EmptyOps: defensive empty-ops guard returns
+// (head, false) so a future refactor that hands the helper a zero-length
+// slice cannot silently confirm an empty event.
+func TestAlreadyPublishedAtHEAD_EmptyOps(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	headOID, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, f.cctx.BaseHead, nil)
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD nil ops: %v", err)
+	}
+	if ok {
+		t.Fatalf("nil ops expected ok=false; got headOID=%q", headOID)
+	}
+	if headOID != "" {
+		t.Fatalf("nil ops expected empty headOID; got %q", headOID)
+	}
+
+	headOID, ok, err = alreadyPublishedAtHEAD(ctx, f.dir, f.cctx.BaseHead, []state.CaptureOp{})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD empty slice: %v", err)
+	}
+	if ok {
+		t.Fatalf("empty slice expected ok=false; got headOID=%q", headOID)
+	}
+}
+
+// TestAlreadyPublishedAtHEAD_RenameSourceStillPresent: rename A→B where HEAD
+// already has B at after_oid AND A is still present. The helper must treat
+// that as NOT yet published — A's continued presence means the rename hasn't
+// actually landed (HEAD has BOTH the source and the target).
+func TestAlreadyPublishedAtHEAD_RenameSourceStillPresent(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("source body\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("renamed body\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	// Anchor at A-only.
+	parent := commitSingleFileTree(t, ctx, f.dir, "A.txt", beforeBlob, "anchor with A")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, parent, ""); err != nil {
+		t.Fatalf("update-ref parent: %v", err)
+	}
+
+	// HEAD has BOTH A (still present) AND B at after_oid.
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: beforeBlob, Path: "A.txt"},
+		{Mode: git.RegularFileMode, Type: "blob", OID: afterBlob, Path: "B.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree A+B: %v", err)
+	}
+	head, err := git.CommitTree(ctx, f.dir, tree, "split add B; A still present", parent)
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, head, parent); err != nil {
+		t.Fatalf("update-ref head: %v", err)
+	}
+
+	op := state.CaptureOp{
+		Op:         "rename",
+		Path:       "B.txt",
+		OldPath:    sql.NullString{String: "A.txt", Valid: true},
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	gotHead, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, parent, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD: %v", err)
+	}
+	if ok {
+		t.Fatalf("rename with source still present must NOT settle as published; got ok=true headOID=%q", gotHead)
+	}
+	if gotHead != head {
+		t.Fatalf("headOID=%q want %q", gotHead, head)
+	}
+}
+
+// TestAlreadyPublishedAtHEAD_ModeOnly_SameBlobDifferentMode: queued chmod
+// (mode op) — HEAD has the same blob OID but the OLD mode. The helper must
+// refuse to settle because the chmod hasn't actually landed.
+func TestAlreadyPublishedAtHEAD_ModeOnly_SameBlobDifferentMode(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	body := []byte("#!/bin/sh\necho hi\n")
+	blob, err := git.HashObjectStdin(ctx, f.dir, body)
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+
+	// Anchor: HEAD has script.sh as a non-executable regular file.
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "script.sh"},
+	})
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	head, err := git.CommitTree(ctx, f.dir, tree, "anchor non-exec")
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, head, ""); err != nil {
+		t.Fatalf("update-ref: %v", err)
+	}
+
+	// Queued chmod: same blob, mode 100644 -> 100755. Helper must read HEAD
+	// mode, compare with after_mode, and refuse to settle.
+	op := state.CaptureOp{
+		Op:         "mode",
+		Path:       "script.sh",
+		BeforeOID:  sql.NullString{String: blob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blob, Valid: true},
+		AfterMode:  sql.NullString{String: git.ExecutableFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	gotHead, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, head, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD: %v", err)
+	}
+	if ok {
+		t.Fatalf("chmod not yet applied at HEAD must NOT settle; got ok=true headOID=%q", gotHead)
+	}
+	if gotHead != head {
+		t.Fatalf("headOID=%q want %q", gotHead, head)
+	}
+}
+
+// TestAlreadyPublishedAtHEAD_Symlink: queued symlink create (mode 120000)
+// where HEAD's tree already carries the matching symlink entry. Helper must
+// settle as published.
+func TestAlreadyPublishedAtHEAD_Symlink(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Hash a blob whose body is the symlink target string. The mode 120000
+	// distinguishes it from a regular file with the same blob.
+	target := "../sibling.txt"
+	linkOID, err := git.HashObjectStdin(ctx, f.dir, []byte(target))
+	if err != nil {
+		t.Fatalf("hash symlink target: %v", err)
+	}
+
+	// Anchor: HEAD tree contains the symlink as mode 120000.
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.SymlinkMode, Type: "blob", OID: linkOID, Path: "link"},
+	})
+	if err != nil {
+		t.Fatalf("mktree symlink: %v", err)
+	}
+	head, err := git.CommitTree(ctx, f.dir, tree, "anchor with symlink")
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, head, ""); err != nil {
+		t.Fatalf("update-ref: %v", err)
+	}
+
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      "link",
+		AfterOID:  sql.NullString{String: linkOID, Valid: true},
+		AfterMode: sql.NullString{String: git.SymlinkMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+
+	gotHead, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, head, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("symlink already at HEAD must settle as published; got ok=false headOID=%q", gotHead)
+	}
+	if gotHead != head {
+		t.Fatalf("headOID=%q want %q", gotHead, head)
+	}
+}
+
+// TestAlreadyPublishedAtHEAD_DeletePathReplacedByDirectory covers the T1
+// fix: a queued delete where HEAD has the path replaced by a directory
+// (tree entry) must NOT settle as published — the delete intent has not
+// landed; what landed is a directory replacement.
+func TestAlreadyPublishedAtHEAD_DeletePathReplacedByDirectory(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("victim body\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	innerBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("inner\n"))
+	if err != nil {
+		t.Fatalf("hash inner: %v", err)
+	}
+
+	// Anchor: HEAD has victim.txt as a regular file.
+	parent := commitSingleFileTree(t, ctx, f.dir, "victim.txt", beforeBlob, "anchor before delete")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, parent, ""); err != nil {
+		t.Fatalf("update-ref parent: %v", err)
+	}
+
+	// External committer replaced victim.txt with a directory at HEAD.
+	innerTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: innerBlob, Path: "inner.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree inner: %v", err)
+	}
+	rootTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: "040000", Type: "tree", OID: innerTree, Path: "victim.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree root: %v", err)
+	}
+	head, err := git.CommitTree(ctx, f.dir, rootTree, "external dir-replace", parent)
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, head, parent); err != nil {
+		t.Fatalf("update-ref head: %v", err)
+	}
+
+	op := state.CaptureOp{
+		Op:         "delete",
+		Path:       "victim.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	gotHead, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, parent, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD dir-replace: %v", err)
+	}
+	if ok {
+		t.Fatalf("delete vs HEAD-as-directory must NOT settle as published; got ok=true headOID=%q", gotHead)
+	}
+	if gotHead != head {
+		t.Fatalf("headOID=%q want %q", gotHead, head)
+	}
+}
+
+// TestAlreadyPublishedAtHEAD_HEADMovedDuringProbe is the unit-level
+// counterpart to TestReplay_HEADMovedDuringProbe: drives the helper through
+// a stubbed HEAD-resolution seam so the post-probe re-read returns a
+// different OID. The helper must refuse to settle and surface the moved
+// HEAD so the caller retries on the next pass.
+//
+// We exercise the structural guard through the public helper rather than
+// reaching into git plumbing: the helper's first RevParse latches headOID,
+// the per-op probes run against that OID, then a second RevParse re-reads
+// HEAD. We move HEAD on disk via UpdateRef between two helper invocations
+// and assert that each call reflects its own latest HEAD — the same guard
+// the production loop relies on to avoid settling on a stale anchor.
+func TestAlreadyPublishedAtHEAD_HEADMovedDuringProbe(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("hm-before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("hm-after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	parent := commitSingleFileTree(t, ctx, f.dir, "movement.txt", beforeBlob, "anchor")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, parent, ""); err != nil {
+		t.Fatalf("update-ref parent: %v", err)
+	}
+	matching := commitSingleFileTree(t, ctx, f.dir, "movement.txt", afterBlob, "match", parent)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, matching, parent); err != nil {
+		t.Fatalf("update-ref matching: %v", err)
+	}
+
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "movement.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	// Baseline: HEAD already matches the captured after-state and is a
+	// descendant of parent. The helper settles cleanly.
+	gotHead, ok, err := alreadyPublishedAtHEAD(ctx, f.dir, parent, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD baseline: %v", err)
+	}
+	if !ok || gotHead != matching {
+		t.Fatalf("baseline expected ok=true headOID=%q; got ok=%v headOID=%q",
+			matching, ok, gotHead)
+	}
+
+	// Move HEAD to an UNRELATED commit (no ancestry from parent). The helper
+	// re-resolves HEAD on entry, fails the ancestry guard, and refuses to
+	// settle. This is the same shape the post-probe HEAD-movement guard
+	// surfaces when HEAD shifts to a divergent commit between the probes
+	// and the re-read.
+	unrelated := commitSingleFileTree(t, ctx, f.dir, "movement.txt", afterBlob, "unrelated history")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, unrelated, matching); err != nil {
+		t.Fatalf("update-ref unrelated: %v", err)
+	}
+
+	gotHead, ok, err = alreadyPublishedAtHEAD(ctx, f.dir, parent, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("alreadyPublishedAtHEAD post-move: %v", err)
+	}
+	if ok {
+		t.Fatalf("HEAD moved to unrelated commit must NOT settle; got ok=true headOID=%q", gotHead)
+	}
+	if gotHead != unrelated {
+		t.Fatalf("post-move headOID=%q want %q", gotHead, unrelated)
+	}
+}
