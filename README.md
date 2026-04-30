@@ -94,7 +94,7 @@ acd resume --repo . --yes
 acd wake --repo . --session-id "$ACD_SESSION_ID"
 ~~~
 
-The marker is stored at `<gitDir>/acd/paused` and survives daemon restarts.
+`--reason` defaults to `manual` when omitted. The marker is stored at `<gitDir>/acd/paused` and survives daemon restarts.
 `acd status` and `acd list` show the pause source and remaining TTL when one is
 active.
 
