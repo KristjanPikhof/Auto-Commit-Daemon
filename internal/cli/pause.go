@@ -120,6 +120,7 @@ func runPause(ctx context.Context, out io.Writer, repoFlag, reason, ttlFlag stri
 
 	res := pauseResult{
 		OK:         true,
+		Status:     "paused",
 		Repo:       repo,
 		MarkerPath: markerPath,
 		Overwrote:  overwrote,
