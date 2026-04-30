@@ -284,6 +284,22 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		Generation: cctx.BranchGeneration,
 	})
 
+	// Pending-depth soft cap. The cap is a per-(branch_ref, branch_generation)
+	// FIFO bound: under a long pause the queue would otherwise grow without
+	// bound and starve replay/memory. We DROP NEW EVENTS (preserve history)
+	// rather than evict the oldest pending row — operators rely on the
+	// existing FIFO + barrier invariants for replay correctness, and the
+	// dropped-tail policy keeps `acd recover --auto` deterministic.
+	pendingCap := resolveMaxPendingEvents()
+	pending := -1
+	if pendingCap > 0 {
+		n, err := state.CountPendingEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+		if err != nil {
+			return summary, fmt.Errorf("daemon: count pending events: %w", err)
+		}
+		pending = n
+	}
+
 	// Persist each classified op as its own capture_events row + capture_ops
 	// child. Atomic-per-file commits (§8.3) means one event = one op. We do
 	// NOT batch multiple ops into a single event in v1 — keeping the schema
@@ -292,6 +308,46 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		if err := ctx.Err(); err != nil {
 			return summary, err
 		}
+
+		if pendingCap > 0 && int64(pending) >= pendingCap {
+			summary.EventsDropped++
+			updatePendingHighWater(ctx, db, pending)
+			if shouldEmitPendingCapWarn() {
+				slog.Default().Warn(
+					"capture pending depth at cap; dropping new events. Consider acd resume or acd recover.",
+					slog.String("branch_ref", cctx.BranchRef),
+					slog.Int64("branch_generation", cctx.BranchGeneration),
+					slog.Int64("cap", pendingCap),
+					slog.Int("pending_depth", pending),
+					slog.String("env", EnvMaxPendingEvents),
+				)
+			}
+			recordTrace(opts.Trace, acdtrace.Event{
+				Repo:       repoRoot,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "capture.event",
+				Decision:   "dropped",
+				Reason:     CapDropReasonAtCap,
+				Input: map[string]any{
+					"op":       op.Op,
+					"path":     op.Path,
+					"old_path": op.OldPath,
+					"fidelity": op.Fidelity,
+				},
+				Output: map[string]any{
+					"pending_depth": pending,
+					"cap":           pendingCap,
+				},
+				Generation: cctx.BranchGeneration,
+			})
+			// Skip both AppendCaptureEvent and updateShadow: dropping the
+			// shadow update would let the next pass re-classify this op,
+			// which is the desired self-healing behavior — once the queue
+			// drains below the cap the op is captured fresh.
+			continue
+		}
+
 		ev := state.CaptureEvent{
 			BranchRef:        cctx.BranchRef,
 			BranchGeneration: cctx.BranchGeneration,
@@ -307,6 +363,9 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
 		summary.EventsAppended++
+		if pendingCap > 0 {
+			pending++
+		}
 		recordTrace(opts.Trace, acdtrace.Event{
 			Repo:       repoRoot,
 			BranchRef:  cctx.BranchRef,
@@ -329,6 +388,21 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		// the old path; deletes erase the path; everything else upserts.
 		if err := updateShadow(ctx, db, cctx, op); err != nil {
 			return summary, fmt.Errorf("daemon: update shadow %s: %w", op.Path, err)
+		}
+	}
+
+	if pendingCap > 0 {
+		if pending >= 0 {
+			summary.PendingDepth = pending
+			updatePendingHighWater(ctx, db, pending)
+		}
+		// Reflect the post-update high water in the summary regardless of
+		// whether we just bumped it; readers want the current persisted
+		// value, not a delta.
+		if v, ok, _ := state.MetaGet(ctx, db, MetaKeyPendingHighWater); ok && v != "" {
+			if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+				summary.PendingHighWater = hw
+			}
 		}
 	}
 
