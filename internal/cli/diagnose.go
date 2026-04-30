@@ -142,6 +142,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err != nil {
 		return report, err
 	}
+	if err := diagnoseCapacity(ctx, conn, &report); err != nil {
+		return report, err
+	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
 	}
