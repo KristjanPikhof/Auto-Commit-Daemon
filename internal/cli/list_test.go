@@ -389,3 +389,143 @@ func writePauseMarkerForStateDB(t *testing.T, stateDBPath string, marker pausepk
 		t.Fatalf("write pause marker: %v", err)
 	}
 }
+
+func TestList_PausedAndStale_RendersBoth(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 1, Mode: "running", HeartbeatTS: stale,
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason: "deploy",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	})
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "paused") || !strings.Contains(got, "manual") {
+		t.Fatalf("missing combined paused status: %s", got)
+	}
+	if !strings.Contains(got, "daemon stale") {
+		t.Fatalf("missing stale heartbeat in note: %s", got)
+	}
+}
+
+func TestList_JSON_PausedAndStale(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 1, Mode: "running", HeartbeatTS: stale,
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason: "deploy",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	})
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d want 1: %+v", len(got.Repos), got.Repos)
+	}
+	e := got.Repos[0]
+	if e.Status != "paused" {
+		t.Fatalf("status=%q want paused", e.Status)
+	}
+	if !e.Paused || !e.StaleHeartbeat {
+		t.Fatalf("Paused=%v StaleHeartbeat=%v want both true", e.Paused, e.StaleHeartbeat)
+	}
+	if e.Pause == nil {
+		t.Fatalf("Pause object missing")
+	}
+}
+
+func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
+	// Pre-existing TestList_HidesStaleDaemonWithoutLiveClients hides a stale
+	// repo with zero live clients. With a pause marker present, operator
+	// intent must keep the row visible so a paused-but-dead daemon is not
+	// silently dropped from `acd list`.
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 1, Mode: "running", HeartbeatTS: stale,
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason: "manual",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	})
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("paused-stale repo with no clients was hidden: %+v", got.Repos)
+	}
+}
+
+func TestPauseState_GitDirDerivation_Pinned(t *testing.T) {
+	cases := []struct {
+		name    string
+		stateDB string
+		want    string
+	}{
+		{
+			name:    "unix",
+			stateDB: "/repo/.git/acd/state.db",
+			want:    "/repo/.git",
+		},
+		{
+			name:    "deeper-path",
+			stateDB: "/srv/repos/foo/.git/acd/state.db",
+			want:    "/srv/repos/foo/.git",
+		},
+		{
+			name:    "linked-worktree",
+			stateDB: "/repo/.git/worktrees/wt/acd/state.db",
+			want:    "/repo/.git/worktrees/wt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gitDirFromStateDB(tc.stateDB)
+			if got != tc.want {
+				t.Fatalf("gitDirFromStateDB(%q)=%q want %q", tc.stateDB, got, tc.want)
+			}
+		})
+	}
+}
