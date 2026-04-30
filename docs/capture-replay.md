@@ -462,3 +462,30 @@ the primary provider is skipped:
 | AI sees empty diff | Op has no `before_oid`/`after_oid` (e.g. oversize file) | Expected; deterministic fallback is correct |
 
 See [docs/ai-providers.md](ai-providers.md) for the full provider reference.
+
+---
+
+## Trace event classes
+
+Enable `ACD_TRACE=1` to write JSONL decision records to `<gitDir>/acd/trace/`
+(see `CLAUDE.md` Trace log format for the full record schema). Every record
+has an `event_class` field that identifies the decision point. The complete
+enumeration:
+
+| `event_class` | When emitted | Key `input` fields | Key `output` fields |
+|---|---|---|---|
+| `bootstrap_shadow.reseed` | Shadow state reseeded after Diverged or at startup | — | `rows` |
+| `capture.classify` | After comparing live worktree to shadow state | — | `ops`, `walked_files`, `oversize`, `errors` |
+| `capture.event` | Each op persisted to `capture_events` (decision `appended`) or dropped at queue cap (decision `dropped`) | `op`, `path`, `old_path`, `fidelity` | `seq` (appended) or `pending_depth`, `cap` (dropped) |
+| `capture.pause` | Capture pass skipped because replay is paused | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
+| `replay.commit` | Capture event published as a git commit, or idempotent-publish at HEAD | `operation`, `path` | `commit`, `parent` |
+| `replay.conflict` | Event becomes `blocked_conflict` (before-state mismatch, CAS failure, or generation mismatch) | `operation`, `path` | `expected_sha`, `actual_sha`, `ref` |
+| `replay.failed` | Event becomes `failed` (bad op data, ancestry error, write-tree failure) | `operation`, `path` | — |
+| `replay.update_ref` | Each `git update-ref` attempt during commit publish (per-retry) | — | `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha`, `actual_sha` |
+| `replay.pause` | Replay drain skipped because paused (manual or rewind grace) | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
+| `branch_token.transition` | HEAD movement classified at startup or per poll tick | `previous`, `current` | `prev_generation`, `new_generation`, `dropped_pending` |
+| `daemon.pause` | Git operation in progress (rebase, merge, cherry-pick, bisect) detected (decision `paused`) or cleared (decision `resumed`) | `operation` | — |
+
+`capture.pause` and `replay.pause` are emitted once per daemon poll cycle while
+the pause is active; they share the same output shape as the `pause` object in
+`acd status --json` and `acd list --json`.
