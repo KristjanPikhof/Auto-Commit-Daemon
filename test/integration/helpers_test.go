@@ -300,3 +300,24 @@ func gitCommitAll(t *testing.T, repo, message string, paths ...string) string {
 	runGitOK(t, repo, "commit", "-q", "-m", message)
 	return strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 }
+
+// waitForMetaCleared polls daemon_meta until the given key is absent or empty,
+// with a 50ms tick and the supplied timeout. Fails the test if the key is still
+// set when the deadline expires.
+func waitForMetaCleared(t *testing.T, dbPath, key string, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("daemon_meta[%s] cleared", key), timeout, func() bool {
+		out, err := exec.Command("sqlite3", dbPath,
+			fmt.Sprintf("SELECT value FROM daemon_meta WHERE key = %s", sqliteLiteral(key))).
+			CombinedOutput()
+		if err != nil {
+			return false
+		}
+		return strings.TrimSpace(string(out)) == ""
+	})
+}
+
+// sqliteLiteral returns a single-quoted SQLite string literal for key.
+func sqliteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
