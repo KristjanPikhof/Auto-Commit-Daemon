@@ -224,6 +224,107 @@ acd doctor --bundle     # write a zip to ~/Downloads for issue reports
       last conflict : path/to/file.go  47s ago  "before-state mismatch for path/to/file.go"
 ```
 
+#### `acd status --json` shape
+
+```json
+{
+  "repo": "/path/to/repo",
+  "repo_hash": "abc123",
+  "daemon": "running",
+  "stale": false,
+  "pid": 12345,
+  "started_ts": 1746000000,
+  "uptime_seconds": 300,
+  "heartbeat_ts": 1746000300,
+  "heartbeat_age_seconds": 2,
+  "branch_ref": "refs/heads/main",
+  "branch_generation_token": "rev:abc123def456 refs/heads/main",
+  "clients": [
+    {
+      "session_id": "abc1...",
+      "harness": "claude-code",
+      "watch_pid": 9876,
+      "last_seen_ts": 1746000295,
+      "last_seen_age_seconds": 5,
+      "ttl_remaining_seconds": 55
+    }
+  ],
+  "pending_events": 2,
+  "blocked_conflicts": 0,
+  "last_commit_oid": "deadbeef...",
+  "last_commit_ts": 1746000250,
+  "last_commit_message": "modify auth.go",
+  "capture_errors": 0,
+  "paused": true,
+  "pause": {
+    "source": "manual",
+    "reason": "manual reset in progress",
+    "set_at": "2026-04-30T10:00:00Z",
+    "expires_at": "2026-04-30T10:10:00Z",
+    "remaining_seconds": 42
+  }
+}
+```
+
+`paused` and `pause` are omitted when replay is not paused. The `pause` object fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `source` | string | `"manual"` — active operator pause; `"manual_expired"` — TTL elapsed but marker still on disk (run `acd resume --yes`); `"rewind_grace"` — daemon detected a same-branch rewind |
+| `reason` | string | Human note from `acd pause --reason`. Omitted for `rewind_grace`. |
+| `set_at` | string | RFC3339 timestamp when the marker was written. Omitted for `rewind_grace`. |
+| `expires_at` | string | RFC3339 expiry. Omitted when no TTL was set. |
+| `remaining_seconds` | int | Seconds until `expires_at`. `0` when `source` is `manual_expired`. Omitted when no `expires_at`. |
+
+#### `acd list --json` shape
+
+`acd list --json` wraps all known repos in a `repos` array. Each entry adds
+`status`, `status_note`, and `stale_heartbeat` on top of the pause fields:
+
+```json
+{
+  "repos": [
+    {
+      "path": "/path/to/repo",
+      "repo_hash": "abc123",
+      "daemon": "running",
+      "pid": 12345,
+      "clients": 1,
+      "last_seq": 7,
+      "last_commit_oid": "deadbeef...",
+      "heartbeat_age_seconds": 2.1,
+      "pending_events": 0,
+      "blocked_conflicts": 0,
+      "status": "paused",
+      "status_note": "manual; daemon stale 3h",
+      "paused": true,
+      "stale_heartbeat": true,
+      "pause": {
+        "source": "manual",
+        "reason": "branch surgery",
+        "set_at": "2026-04-30T10:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+`status` string values:
+
+| Value | Meaning |
+|---|---|
+| `"OK"` | Daemon running, no pause, no stale heartbeat |
+| `"paused"` | Replay paused (operator or rewind grace). Takes priority over `stale`. |
+| `"stale"` | Daemon heartbeat expired or PID dead, at least one live client present |
+| `"missing"` | Repo directory or `state.db` not found on disk |
+| `"unreadable"` | `state.db` exists but could not be opened |
+
+`status_note` combines the pause source and stale information into a human-readable
+string when both apply (e.g. `"manual; daemon stale 3h"`). `stale_heartbeat` is
+`true` whenever the daemon heartbeat is expired regardless of whether the row is
+also paused. `paused`, `stale_heartbeat`, and `pause` are omitted from JSON when
+`false` / `nil`.
+
 ### Wake the daemon (reduce latency)
 
 `acd` uses `fsnotify` for low-latency file-system events. When `fsnotify` is
