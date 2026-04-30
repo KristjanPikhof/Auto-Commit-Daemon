@@ -412,6 +412,8 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		fmt.Fprintf(out, "Persisted branch: generation=%s head=%s\n", valueOrUnset(r.Anchor.BranchGeneration), valueOrUnset(r.Anchor.BranchHead))
 	}
 
+	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d\n", r.PendingDepth, r.PendingHighWater)
+
 	fmt.Fprintln(out, "Blocked conflict histogram:")
 	if len(r.BlockedHistogram) == 0 {
 		fmt.Fprintln(out, "  none")
