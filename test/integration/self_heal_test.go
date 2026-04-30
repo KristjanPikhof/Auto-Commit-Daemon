@@ -89,17 +89,15 @@ func TestSelfHeal_ManualPauseAndResume(t *testing.T) {
 
 	writeFile(t, filepath.Join(repo, "pause-one.txt"), "one\n")
 	wakeSession(t, ctx, env, repo, "selfheal-pause")
-	waitForEventState(t, dbPath, "pause-one.txt", "pending", 8*time.Second)
 
 	writeFile(t, filepath.Join(repo, "pause-two.txt"), "two\n")
 	wakeSession(t, ctx, env, repo, "selfheal-pause")
-	waitForEventState(t, dbPath, "pause-two.txt", "pending", 8*time.Second)
 
+	// Under the new contract, manual pause halts both capture and replay,
+	// so events for the writes above are not captured until after resume.
+	// We can still observe that HEAD has not advanced while paused.
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != initialHead {
 		t.Fatalf("HEAD advanced while manually paused: got %s want %s", head, initialHead)
-	}
-	if pending := selfHealCount(t, dbPath, "state = 'pending'"); pending < 2 {
-		t.Fatalf("pending events=%d want at least 2", pending)
 	}
 
 	resumeReplay(t, ctx, env, repo)
