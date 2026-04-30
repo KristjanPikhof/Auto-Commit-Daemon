@@ -301,6 +301,18 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 	return v, nil
 }
 
+// maybeSetRewindGrace inspects a same-branch HEAD movement: when newHead is an
+// ancestor of prevHead (operator ran `git reset --soft HEAD~1` or similar
+// rewinding op), the daemon writes daemon_meta.replay.paused_until = now+grace
+// so the next capture/replay tick observes a paused gate via daemonPauseState.
+//
+// Scope: when the grace fires BOTH capture and replay are paused. We must not
+// capture worktree state observed during the rewind window — fsnotify will
+// fire as untracked files reappear, and a post-grace replay drain would
+// resurrect work the operator just rewound. The Run loop honors this gate via
+// daemonPauseState; the Replay drain skips via the same helper.
+//
+// Returns (active, expiresRFC3339, error).
 func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time) (bool, string, error) {
 	prevHead := tokenSHA(prevToken)
 	newHead := tokenSHA(newToken)
