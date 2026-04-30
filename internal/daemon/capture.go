@@ -122,6 +122,102 @@ func resolveMaxFileBytes(opt int64) int64 {
 	return DefaultMaxFileBytes
 }
 
+// resolveMaxPendingEvents consults EnvMaxPendingEvents and returns the
+// effective cap. Negative values are clamped to 0 (disabled).
+//
+// Behavior:
+//   - empty / unset -> DefaultMaxPendingEvents.
+//   - parses to a non-negative int64 -> that value (0 disables).
+//   - parse error -> DefaultMaxPendingEvents (fail safe to bounded).
+func resolveMaxPendingEvents() int64 {
+	env := os.Getenv(EnvMaxPendingEvents)
+	if env == "" {
+		return DefaultMaxPendingEvents
+	}
+	n, err := strconv.ParseInt(env, 10, 64)
+	if err != nil {
+		return DefaultMaxPendingEvents
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// pendingCapWarnLimiter coalesces "capture pending depth at cap" warnings to
+// at most one per minute per process. Tests can override the wall clock and
+// minimum interval via the unexported helpers below.
+var (
+	pendingCapWarnMu       sync.Mutex
+	pendingCapWarnLastUnix atomic.Int64
+	pendingCapWarnInterval atomic.Int64 // seconds between warns; 0 = use default
+	pendingCapNowFn        atomic.Pointer[func() time.Time]
+)
+
+const pendingCapWarnDefaultInterval = 60 // seconds
+
+func pendingCapWarnNow() time.Time {
+	if fn := pendingCapNowFn.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return time.Now()
+}
+
+func pendingCapWarnIntervalSeconds() int64 {
+	if v := pendingCapWarnInterval.Load(); v > 0 {
+		return v
+	}
+	return pendingCapWarnDefaultInterval
+}
+
+// shouldEmitPendingCapWarn returns true when the rate-limited token says it
+// is time to emit a fresh slog.Warn. Concurrent capture passes serialize
+// under pendingCapWarnMu so we never race two warns through the gate.
+func shouldEmitPendingCapWarn() bool {
+	pendingCapWarnMu.Lock()
+	defer pendingCapWarnMu.Unlock()
+	now := pendingCapWarnNow().Unix()
+	last := pendingCapWarnLastUnix.Load()
+	if now-last < pendingCapWarnIntervalSeconds() {
+		return false
+	}
+	pendingCapWarnLastUnix.Store(now)
+	return true
+}
+
+// resetPendingCapWarnForTest clears the limiter so individual tests can
+// observe a fresh warn without waiting a full minute. Test-only.
+func resetPendingCapWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
+	t.Helper()
+	pendingCapWarnMu.Lock()
+	pendingCapWarnLastUnix.Store(0)
+	pendingCapWarnInterval.Store(intervalSeconds)
+	pendingCapWarnMu.Unlock()
+}
+
+// updatePendingHighWater bumps daemon_meta.capture.pending_high_water when
+// depth strictly exceeds the persisted value. Best-effort: errors are
+// swallowed because the capture pipeline must keep running.
+func updatePendingHighWater(ctx context.Context, db *state.DB, depth int) {
+	if db == nil || depth <= 0 {
+		return
+	}
+	cur, _, err := state.MetaGet(ctx, db, MetaKeyPendingHighWater)
+	if err != nil {
+		return
+	}
+	prev := int64(0)
+	if cur != "" {
+		if v, perr := strconv.ParseInt(cur, 10, 64); perr == nil {
+			prev = v
+		}
+	}
+	if int64(depth) <= prev {
+		return
+	}
+	_ = state.MetaSet(ctx, db, MetaKeyPendingHighWater, strconv.FormatInt(int64(depth), 10))
+}
+
 // Capture walks the repo, builds the live map, classifies vs the persisted
 // shadow_paths for this (branch, generation), persists capture events +
 // updates shadow rows, and returns a summary. The caller is expected to
