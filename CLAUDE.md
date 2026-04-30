@@ -134,7 +134,7 @@ acd wake --repo . --session-id <session>
 acd status --repo .
 ```
 
-The original 145-event incident pattern is: `daemon_state.branch_ref` and queued `capture_events.branch_ref` point at a stale branch, while `git symbolic-ref HEAD` points at the active branch. `acd recover` retargets pending/blocked rows to the current attached branch and generation, resets `blocked_conflict` rows to `pending`, clears stale replay/pause metadata, and refuses to run while the daemon PID is alive.
+The original 145-event incident pattern is: `daemon_state.branch_ref` and queued `capture_events.branch_ref` point at a stale branch, while `git symbolic-ref HEAD` points at the active branch. `acd recover` retargets pending/blocked rows to the current attached branch and generation, resets `blocked_conflict` rows to `pending`, clears stale replay/pause metadata, and refuses to run while the daemon PID is alive. `acd recover --auto` now also clears `daemon_meta.replay.paused_until` and removes the on-disk manual pause marker. Run `acd resume --yes` instead when you only need to lift a manual pause without triggering the full recover flow.
 
 ## Environment knobs
 
