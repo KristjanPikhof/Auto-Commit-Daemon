@@ -588,7 +588,27 @@ func traceReplayUpdateRef(
 	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
 }
 
-func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, bool, error) {
+// alreadyPublishedAtHEAD reports whether HEAD's tree already reflects the
+// captured ops, signalling that an external committer landed our intent
+// before we got there. Returning (headOID, true, nil) tells the caller to
+// settle the event as published against `headOID` without minting a new
+// commit.
+//
+// Two guards keep idempotent settle from masking real divergence:
+//
+//  1. Ancestry guard: `sourceHead` (the replay parent the event was about
+//     to chain off) MUST be an ancestor of the current HEAD. If HEAD has
+//     diverged from our parent (operator hard-reset to an unrelated
+//     branch, force-push, etc.) the matching tree state is coincidence,
+//     not a successful parallel publish — return false and let the caller
+//     block terminally. An empty `sourceHead` skips the probe (initial
+//     commit / orphan repo).
+//  2. HEAD-movement guard: HEAD is re-resolved AFTER the per-op tree
+//     probes. If the resolved OID has shifted between the first read and
+//     the post-probe re-read, the captured tree state is no longer
+//     guaranteed to correspond to the live HEAD — return false so the
+//     caller retries on the next replay pass with a fresh anchor.
+func alreadyPublishedAtHEAD(ctx context.Context, repoRoot, sourceHead string, ops []state.CaptureOp) (string, bool, error) {
 	// Defensive empty-ops guard. The replay loop only reaches this helper
 	// after validateOps + LoadCaptureOps, but a future refactor could
 	// hand us a zero-length slice — settle to "not published" rather than
@@ -602,6 +622,20 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.Ca
 			return "", false, nil
 		}
 		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	// Ancestry guard: an external HEAD that doesn't descend from our
+	// replay parent means the matching tree state is coincidence, not a
+	// successful parallel publish. Return (headOID, false) so the caller
+	// can record a real conflict instead of silently chaining off a
+	// stranger.
+	if sourceHead != "" && sourceHead != headOID {
+		descends, err := git.IsAncestor(ctx, repoRoot, sourceHead, headOID)
+		if err != nil {
+			return "", false, fmt.Errorf("ancestry probe %s..%s: %w", sourceHead, headOID, err)
+		}
+		if !descends {
+			return headOID, false, nil
+		}
 	}
 	for _, op := range ops {
 		if op.Op == "delete" {
