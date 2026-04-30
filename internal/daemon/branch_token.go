@@ -73,6 +73,17 @@ const (
 	// MetaKeyOperationInProgress stores the active git operation name when
 	// capture/replay are paused for rebase, merge, cherry-pick, or bisect.
 	MetaKeyOperationInProgress = "operation_in_progress"
+	// MetaKeyOperationInProgressSetAt stamps the wall-clock seconds at which
+	// MetaKeyOperationInProgress was first observed. Used to detect stale
+	// markers (rebase aborted but the marker file lingered) and warn the
+	// operator without auto-clearing.
+	MetaKeyOperationInProgressSetAt = "operation_in_progress.set_at"
+	// MetaKeyOperationInProgressHead stamps the HEAD SHA observed when the
+	// marker first appeared. Used together with MetaKeyOperationInProgressSetAt
+	// to decide whether HEAD has moved since the marker showed up — the
+	// "stale" heuristic only fires when both the marker AND HEAD have been
+	// motionless for the threshold.
+	MetaKeyOperationInProgressHead = "operation_in_progress.head_at"
 	// MetaKeyReplayPausedUntil stores an RFC3339 UTC timestamp until which
 	// replay should skip drain passes after a detected branch rewind.
 	MetaKeyReplayPausedUntil = "replay.paused_until"
