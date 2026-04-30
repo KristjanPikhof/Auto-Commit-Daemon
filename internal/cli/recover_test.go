@@ -248,7 +248,7 @@ func TestRecover_RemovesManualPauseMarker(t *testing.T) {
 	gitDir := filepath.Join(repo, ".git")
 	markerPath := pausepkg.Path(gitDir)
 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-	if err := pausepkg.Write(markerPath, pausepkg.Marker{
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
 		Reason:    "manual",
 		SetAt:     time.Now().UTC().Format(time.RFC3339),
 		SetBy:     "test",
