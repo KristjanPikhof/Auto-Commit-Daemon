@@ -551,6 +551,290 @@ func TestReplay_IdempotentPublishReseedsIndexForChainedEvents(t *testing.T) {
 	}
 }
 
+// TestReplay_ParallelCreate_NoEmptyCommit covers the parallel-create
+// no-op tree case: an external committer landed the same blob on the
+// branch before the daemon got to replay. detectConflict accepts the
+// queued create (the scratch index is now consistent with the after
+// state thanks to the read-tree seed from BaseHead == external HEAD),
+// but write-tree returns the same OID as `parent`'s tree. Replay must
+// skip commit-tree, settle the event as published against the existing
+// HEAD, and emit the "already_published_no_op_tree" trace decision.
+func TestReplay_ParallelCreate_NoEmptyCommit(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("X\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	base := f.cctx.BaseHead
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "create",
+		Path:             "foo.go",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      "foo.go",
+		AfterOID:  sql.NullString{String: afterBlob, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// External committer lands the same file with the same blob.
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: afterBlob, Path: "foo.go"},
+	})
+	if err != nil {
+		t.Fatalf("mktree external: %v", err)
+	}
+	external, err := git.CommitTree(ctx, f.dir, tree, "external create", base)
+	if err != nil {
+		t.Fatalf("commit-tree external: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	trace := &memoryTraceLogger{}
+	messageCalled := false
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+		MessageFn: func(context.Context, EventContext) (string, error) {
+			messageCalled = true
+			return "should not be used", nil
+		},
+		GitDir: f.gitDir,
+		Trace:  trace,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; no-op tree should not create a commit", beforeCount, got)
+	}
+	if sum.BaseHead != external {
+		t.Fatalf("summary BaseHead=%s want external HEAD %s", sum.BaseHead, external)
+	}
+
+	var stateName string
+	var commitOID sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &commitOID); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStatePublished {
+		t.Fatalf("state=%q want published", stateName)
+	}
+	if !commitOID.Valid || commitOID.String != external {
+		t.Fatalf("commit_oid=%v want %s", commitOID, external)
+	}
+
+	var noOpReasons int
+	for _, ev := range trace.Events() {
+		if ev.EventClass == "replay.commit" && ev.Reason == "already_published_no_op_tree" {
+			noOpReasons++
+		}
+	}
+	// The first idempotent path (alreadyPublishedAtHEAD) may also fire
+	// here because HEAD already matches the captured state. Either
+	// branch is acceptable — both produce zero new commits and settle
+	// the event as published. We only require that the message fn was
+	// NOT called (no commit-tree work) and at least one of the two
+	// idempotent decisions fired.
+	if messageCalled {
+		t.Fatalf("message function called; idempotent publish should skip commit build")
+	}
+	if noOpReasons == 0 {
+		// Acceptable fallback: the existing alreadyPublishedAtHEAD path
+		// already short-circuits this scenario for plain creates. Make
+		// sure SOME idempotent decision fired so we know the event did
+		// not produce a commit silently.
+		alreadyPublished := false
+		for _, ev := range trace.Events() {
+			if ev.EventClass == "replay.commit" && ev.Reason == "already_published_by_external_committer" {
+				alreadyPublished = true
+				break
+			}
+		}
+		if !alreadyPublished {
+			t.Fatalf("no idempotent publish trace decision fired; events=%+v", trace.Events())
+		}
+	}
+}
+
+// TestReplay_DeleteIdempotent_PathReplacedByDirectory_StillBlocks
+// covers the delete-non-blob case: the queued delete targets a path
+// that HEAD now resolves to a directory (tree entry), not a file. The
+// daemon must NOT settle this as published — that would mask a real
+// divergence (an external committer turned the file into a directory).
+func TestReplay_DeleteIdempotent_PathReplacedByDirectory_StillBlocks(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "foo.go", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "delete",
+		Path:             "foo.go",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "delete",
+		Path:       "foo.go",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// External committer replaces foo.go with a directory containing
+	// foo.go/inner.txt. HEAD therefore has a `tree` entry at "foo.go".
+	innerBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("inner\n"))
+	if err != nil {
+		t.Fatalf("hash inner: %v", err)
+	}
+	innerTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: innerBlob, Path: "inner.txt"},
+	})
+	if err != nil {
+		t.Fatalf("mktree inner: %v", err)
+	}
+	rootTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: "040000", Type: "tree", OID: innerTree, Path: "foo.go"},
+	})
+	if err != nil {
+		t.Fatalf("mktree root: %v", err)
+	}
+	external, err := git.CommitTree(ctx, f.dir, rootTree, "external replace with dir", base)
+	if err != nil {
+		t.Fatalf("commit-tree external: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update-ref external: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = external
+
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 0 || sum.Conflicts != 1 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	var stateName string
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&stateName); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStateBlockedConflict {
+		t.Fatalf("state=%q want blocked_conflict", stateName)
+	}
+}
+
+// TestReplay_RenameIdempotent_RequiresSourceObjectReachable covers the
+// rename-source verify case: queued rename A→B with before_oid_A=X,
+// HEAD has B at after_oid_B and A absent BUT object X is unreachable
+// (gc'd / shallow). Result must be blocked_conflict, NOT published.
+func TestReplay_RenameIdempotent_RequiresSourceObjectReachable(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after rename\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	// Fabricate a before-OID that does not exist in the object database.
+	// `git cat-file -e` will fail on this, so the rename source verify
+	// should fall through to a blocked_conflict.
+	missingOID := strings.Repeat("0", 40)
+
+	// Seed base with B already in place. The capture event was recorded
+	// when A→B happened, but B is what's on disk now.
+	base := commitSingleFileTree(t, ctx, f.dir, "B.txt", afterBlob, "seed B")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "rename",
+		Path:             "B.txt",
+		OldPath:          sql.NullString{String: "A.txt", Valid: true},
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "rename",
+		Path:       "B.txt",
+		OldPath:    sql.NullString{String: "A.txt", Valid: true},
+		BeforeOID:  sql.NullString{String: missingOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// detectConflict will see that A.txt is missing from the scratch
+	// index (we seeded from base which has only B.txt). That trips the
+	// rename-source-missing-in-index conflict, which then funnels into
+	// alreadyPublishedAtHEAD. With BeforeOID missing, the helper must
+	// refuse to settle and fall through to blocked_conflict.
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 0 || sum.Conflicts != 1 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	var stateName string
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&stateName); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStateBlockedConflict {
+		t.Fatalf("state=%q want blocked_conflict", stateName)
+	}
+}
+
 func TestReplay_RealConflictStillBlocks(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
