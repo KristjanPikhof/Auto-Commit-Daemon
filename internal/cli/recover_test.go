@@ -220,6 +220,99 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	}
 }
 
+func TestRecover_ClearsReplayPausedUntil(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	until := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet replay.paused_until: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, false); err != nil {
+		t.Fatalf("runRecover apply: %v", err)
+	}
+
+	if v, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("replay.paused_until still set: %q", v)
+	}
+}
+
+func TestRecover_RemovesManualPauseMarker(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "manual",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "test",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, true); err != nil {
+		t.Fatalf("runRecover apply: %v", err)
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("manual pause marker still on disk: stat err=%v", err)
+	}
+
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal recover plan: %v\n%s", err, out.String())
+	}
+	if !plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=false want true: %+v", plan)
+	}
+	if plan.ManualMarkerPath != markerPath {
+		t.Fatalf("plan.ManualMarkerPath=%q want %q", plan.ManualMarkerPath, markerPath)
+	}
+}
+
+func TestRecover_DryRun_ListsPauseStateActions(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+		t.Fatalf("runRecover dry-run: %v", err)
+	}
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	wantSubstrs := []string{
+		"clear daemon_meta " + daemon.MetaKeyReplayPausedUntil,
+		"remove manual pause marker",
+	}
+	for _, want := range wantSubstrs {
+		found := false
+		for _, action := range plan.Actions {
+			if strings.Contains(action, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("dry-run plan.Actions missing %q: %v", want, plan.Actions)
+		}
+	}
+	if plan.ManualMarkerPath == "" {
+		t.Fatalf("plan.ManualMarkerPath empty in dry-run output")
+	}
+	if plan.GitDir == "" {
+		t.Fatalf("plan.GitDir empty in dry-run output")
+	}
+}
+
 func TestRecover_RefusesWithDaemonAlive(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
