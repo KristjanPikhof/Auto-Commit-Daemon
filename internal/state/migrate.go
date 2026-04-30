@@ -9,12 +9,16 @@ import (
 // currently reports up to SchemaVersion.
 //
 // v1 was the first acd release. v2 adds idempotent indexes through schemaDDL.
+// v3 adds idx_capture_events_barrier (a covering index that keeps the
+// PendingEvents barrier subquery off a full-table scan during long pauses).
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
-// Open calls bootstrap which is itself idempotent for v1, so the daemon does
-// not need to call Migrate explicitly today. Migrate is wired now so future
-// phases have a single entry point to extend.
+// Open's runBootstrap re-applies the idempotent schemaDDL whenever the
+// stored user_version is below SchemaVersion, so simply bumping SchemaVersion
+// and adding `CREATE INDEX IF NOT EXISTS` to schemaDDL is sufficient for
+// pure-DDL migrations (such as v2→v3). Migrate is wired now so future phases
+// requiring data backfill have a single entry point to extend.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
 	if err != nil {
