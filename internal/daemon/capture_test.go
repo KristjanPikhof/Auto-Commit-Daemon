@@ -563,5 +563,3 @@ VALUES (?, ?, 'seed.txt', 'create', '100644', '000000000000000000000000000000000
 	}
 }
 
-// silence unused-import false positives if a future test removes a helper.
-var _ = sql.NullString{}
