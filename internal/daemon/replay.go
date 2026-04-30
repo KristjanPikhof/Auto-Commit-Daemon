@@ -241,7 +241,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
-			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ops)
+			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
 			if err != nil {
 				return sum, err
 			}
