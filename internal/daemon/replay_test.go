@@ -1013,6 +1013,9 @@ func TestReplay_CASMismatchNoRetry(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(f.dir, "cas-mismatch.txt"), []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write cas-mismatch.txt: %v", err)
 	}
