@@ -163,12 +163,12 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		// surfaces the non-zero exit code while stdout carries valid JSON.
 		res := resumeResult{
 			OK:                false,
-			Status:             "requires-yes",
-			Repo:               repo,
-			MarkerPath:         markerPath,
-			Removed:            false,
-			ExistedForSeconds:  markerAgeSeconds(marker, time.Now().UTC()),
-			Marker:             marker,
+			Status:            "requires-yes",
+			Repo:              repo,
+			MarkerPath:        markerPath,
+			Removed:           false,
+			ExistedForSeconds: markerAgeSeconds(marker, time.Now().UTC()),
+			Marker:            marker,
 		}
 		if renderErr := renderResume(out, res, jsonOut); renderErr != nil {
 			return renderErr
@@ -251,22 +251,47 @@ func renderResume(out io.Writer, res resumeResult, jsonOut bool) error {
 	return nil
 }
 
+// defaultPauseSetBy composes the host:user identifier stamped into the
+// pause marker. user.Current is most reliable across shells (sudo, login
+// shells, sandboxed CI runners), so we prefer it over $USER / $USERNAME.
+// Both host and user are sanitized so a hostile or accidentally-malformed
+// env var cannot inject control characters into the on-disk marker JSON.
 func defaultPauseSetBy() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown-host"
 	}
-	name := os.Getenv("USER")
-	if name == "" {
-		name = os.Getenv("USERNAME")
-	}
+	var name string
 	if current, err := user.Current(); err == nil && current.Username != "" {
 		name = current.Username
 	}
 	if name == "" {
+		name = os.Getenv("USER")
+	}
+	if name == "" {
+		name = os.Getenv("USERNAME")
+	}
+	if name == "" {
 		name = "unknown-user"
 	}
-	return host + ":" + name
+	return sanitizePauseField(host) + ":" + sanitizePauseField(name)
+}
+
+// sanitizePauseField replaces ASCII control characters (bytes < 0x20 and
+// 0x7F DEL) with '_' so the host:user identifier in the marker JSON never
+// contains literal newlines, tabs, or escapes that would break grep-friendly
+// audit logs. Non-ASCII bytes are passed through.
+func sanitizePauseField(s string) string {
+	if s == "" {
+		return s
+	}
+	b := []byte(s)
+	for i, c := range b {
+		if c < 0x20 || c == 0x7F {
+			b[i] = '_'
+		}
+	}
+	return string(b)
 }
 
 func markerAgeSeconds(marker PauseMarker, now time.Time) int64 {
