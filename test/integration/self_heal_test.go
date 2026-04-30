@@ -127,7 +127,9 @@ func TestSelfHeal_PauseSurvivesDaemonRestart(t *testing.T) {
 
 	writeFile(t, filepath.Join(repo, "restart-paused.txt"), "queued before restart\n")
 	wakeSession(t, ctx, env, repo, "selfheal-restart-a")
-	waitForEventState(t, dbPath, "restart-paused.txt", "pending", 8*time.Second)
+	// Under the new contract, manual pause halts capture too, so the write
+	// above is not captured until after resume. We only verify the pause
+	// marker durability and that HEAD has not advanced.
 
 	stopSessionForce(t, env, repo)
 	waitMode(t, repo, "stopped", 5*time.Second)
@@ -145,9 +147,12 @@ func TestSelfHeal_PauseSurvivesDaemonRestart(t *testing.T) {
 	// Positive assertion 2: acd status --json must report Paused=true, Source=manual.
 	assertStatusPaused(t, ctx, env, repo, "manual")
 
-	// The queued event must still be pending (replay is blocked by the marker).
-	if state := latestEventState(t, dbPath, "restart-paused.txt"); state != "pending" {
-		t.Fatalf("event state after restart wake=%q want pending", state)
+	// While paused, capture is also halted, so no published row should exist
+	// yet for the queued path. (Pending may or may not exist depending on
+	// whether the worktree write was observed before the pause took effect;
+	// the load-bearing invariant is that it is NOT yet published.)
+	if state := latestEventState(t, dbPath, "restart-paused.txt"); state == "published" {
+		t.Fatalf("event state after restart wake=%q want non-published while paused", state)
 	}
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != initialHead {
 		t.Fatalf("HEAD advanced while restart pause marker was active: got %s want %s", head, initialHead)
