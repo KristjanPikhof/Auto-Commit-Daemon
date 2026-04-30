@@ -238,7 +238,20 @@ func detectWatchBudget(logger *slog.Logger) int {
 // directory. Returns errBudgetExceeded if the registered count would
 // exceed maxWatches; the caller is responsible for the poll-mode
 // fallback.
+//
+// Ignore-check batching: the walk collects every directory that survives
+// the cheap filters (.git pruning, symlinks, nested repos, sensitive dirs)
+// into a candidate slice. After the walk completes, ALL candidate rels are
+// passed to IgnoreChecker.Check in one call so we hit the long-lived
+// `git check-ignore --stdin` subprocess once per pre-walk instead of once
+// per directory. Mirrors the pattern in walkLive.
 func (w *FsnotifyWatcher) preWalk(root string) error {
+	type candidate struct {
+		rel  string
+		full string
+	}
+	var candidates []candidate
+
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// soft errors during pre-walk: keep going.
@@ -267,7 +280,8 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 		}
 		rel = filepath.ToSlash(rel)
 		if rel == "." {
-			// always watch the worktree root itself.
+			// always watch the worktree root itself; the root is not subject
+			// to gitignore (gitignore can't ignore the repo itself).
 			if err := w.addWatch(path); err != nil {
 				return err
 			}
@@ -296,25 +310,50 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 			return fs.SkipDir
 		}
 
-		// Honor gitignore at directory granularity. The IgnoreChecker is
-		// optional; when absent we err on the side of watching (capture
-		// will still drop ignored files).
-		if w.opts.IgnoreChecker != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			results, err := w.opts.IgnoreChecker.Check(ctx, []string{rel})
-			if err == nil && len(results) == 1 && results[0] {
-				return fs.SkipDir
-			}
-		}
-
-		if err := w.addWatch(path); err != nil {
-			return err
-		}
+		// Defer the gitignore check: we can't safely SkipDir here because
+		// the call would run one IgnoreChecker.Check per dir (one round-trip
+		// to the long-lived check-ignore subprocess). Collect candidates
+		// and resolve in one batch after the walk; ignored entries are
+		// then filtered out before addWatch. Note: this means we briefly
+		// descend into ignored subtrees during the walk, but the cost is
+		// bounded by directory count and each subtree gets one ignore
+		// classification.
+		candidates = append(candidates, candidate{rel: rel, full: path})
 		return nil
 	})
 	if walkErr != nil {
 		return walkErr
+	}
+
+	// Batched ignore check: one round-trip per pre-walk regardless of
+	// candidate count. Best-effort — a checker error means we err on the
+	// side of watching everything (capture will still drop ignored files).
+	ignored := map[string]bool{}
+	if w.opts.IgnoreChecker != nil && len(candidates) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		paths := make([]string, len(candidates))
+		for i, c := range candidates {
+			paths[i] = c.rel
+		}
+		if results, err := w.opts.IgnoreChecker.Check(ctx, paths); err == nil && len(results) == len(candidates) {
+			for i, isIgn := range results {
+				if isIgn {
+					ignored[candidates[i].rel] = true
+				}
+			}
+		}
+	}
+
+	// Watch survivors. addWatch may return errBudgetExceeded; surface the
+	// first occurrence and let the caller fall back to poll mode.
+	for _, c := range candidates {
+		if ignored[c.rel] {
+			continue
+		}
+		if err := w.addWatch(c.full); err != nil {
+			return err
+		}
 	}
 	return nil
 }
