@@ -63,17 +63,29 @@ func TestReplay_Lifecycle(t *testing.T) {
 		t.Fatalf("unexpected conflicts/failed: %+v", sum)
 	}
 
-	// `git log --oneline` on main must show one commit per event on top of
-	// the seed commit.
+	// `git log --oneline` on main must show at most one commit per event
+	// on top of the seed commit. Idempotent publish (no-op tree, e.g.
+	// when an event's after-state already matches HEAD) settles the
+	// event without creating a new commit, so the lower bound is the
+	// number of distinct paths whose blobs differ from the seed tree.
 	out, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "--oneline", "-n", "10", f.cctx.BranchRef)
 	if err != nil {
 		t.Fatalf("git log: %v", err)
 	}
 	logLines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	// seed + N capture commits.
-	wantCommits := len(pending) + 1
-	if len(logLines) != wantCommits {
-		t.Fatalf("git log lines=%d, want %d:\n%s", len(logLines), wantCommits, out)
+	maxCommits := len(pending) + 1 // seed + one-per-event upper bound
+	if len(logLines) < 2 || len(logLines) > maxCommits {
+		t.Fatalf("git log lines=%d, want in [2,%d]:\n%s", len(logLines), maxCommits, out)
+	}
+	// foo.txt and bar.txt must both be present in the final tree.
+	for _, path := range []string{"foo.txt", "bar.txt"} {
+		oid, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", path)
+		if err != nil {
+			t.Fatalf("ls-tree HEAD %s: %v", path, err)
+		}
+		if oid == "" {
+			t.Fatalf("HEAD missing %s", path)
+		}
 	}
 
 	// Each pending event's commit_oid should now be set on the published row.
