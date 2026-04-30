@@ -365,7 +365,26 @@ type replayPause struct {
 	Remaining int64
 }
 
-func replayPauseState(ctx context.Context, gitDir string, db *state.DB) (replayPause, error) {
+// daemonPauseState reads the daemon pause gate that BOTH replay and capture
+// honor. Sources, in priority order:
+//
+//  1. Manual pause marker at <gitDir>/acd/paused (durable JSON written by
+//     `acd pause`, cleared by `acd resume`). Active when present and not
+//     expired. Malformed markers fail open with a warning.
+//  2. Rewind grace under daemon_meta.replay.paused_until — set when the
+//     daemon detects a same-branch rewind (newHead is an ancestor of the
+//     previous head, e.g. operator ran `git reset --soft HEAD~1`). The
+//     gate covers BOTH replay and capture so transient worktree state
+//     observed during the rewind window is NOT captured into the queue;
+//     otherwise the post-grace replay would resurrect work the operator
+//     just rewound.
+//
+// Detached HEAD pauses are handled by a separate gate in the Run loop.
+//
+// Callers must skip the capture pass and the replay drain when
+// `paused.Active` is true. The shared helper guarantees both lanes observe
+// the same state (alias retained for replay-internal call sites).
+func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayPause, error) {
 	now := time.Now().UTC()
 	if gitDir != "" {
 		marker, ok, err := pausepkg.Read(gitDir)
