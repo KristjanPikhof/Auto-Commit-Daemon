@@ -938,6 +938,32 @@ func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, e
 	})
 }
 
+func traceCapturePaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
+	output := map[string]any{
+		"source": paused.Source,
+	}
+	if paused.Reason != "" {
+		output["reason"] = paused.Reason
+	}
+	if paused.SetAt != "" {
+		output["set_at"] = paused.SetAt
+	}
+	if paused.ExpiresAt != "" {
+		output["expires_at"] = paused.ExpiresAt
+		output["remaining_seconds"] = paused.Remaining
+	}
+	recordTrace(logger, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "capture.pause",
+		Decision:   "skipped",
+		Reason:     "capture_paused",
+		Output:     output,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
 func traceReplayPaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
 	output := map[string]any{
 		"source": paused.Source,
