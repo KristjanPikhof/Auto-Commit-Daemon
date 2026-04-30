@@ -468,6 +468,15 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 
 	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d\n", r.PendingDepth, r.PendingHighWater)
 
+	if r.OperationInProgress != "" {
+		stale := ""
+		if r.StaleOperationMarker {
+			stale = " STALE"
+		}
+		fmt.Fprintf(out, "Git operation: %s present for %s%s\n",
+			r.OperationInProgress, r.OperationMarkerDuration, stale)
+	}
+
 	fmt.Fprintln(out, "Blocked conflict histogram:")
 	if len(r.BlockedHistogram) == 0 {
 		fmt.Fprintln(out, "  none")
