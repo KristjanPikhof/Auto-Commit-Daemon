@@ -55,10 +55,17 @@ acd stop --all          # stop every daemon
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
 
-Parallel committers are usually self-healed now. If another process lands the
-same captured edits before `acd` replays them, the daemon marks the queued event
-as `published` with the external `HEAD` commit instead of creating an empty
-commit or raising `blocked_conflict`. Real content mismatches still block.
+See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
+for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
+interactive rebase while the daemon is running, including the rewind grace window
+that pauses both capture and replay automatically.
+
+See [docs/multi-tool.md](docs/multi-tool.md) for guidance on running `acd`
+alongside another auto-committer such as the Claude Code Automatic Atomic
+Commits hook or the Codex ACD hook. The short version: if an external tool
+lands a commit before `acd`'s replay tick, the daemon detects the match and
+settles the queued event as `published` with no duplicate commit. Real content
+mismatches still produce `blocked_conflict`.
 
 ## Trace and recovery
 
