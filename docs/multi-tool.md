@@ -44,7 +44,7 @@ The Claude Code Automatic Atomic Commits (AAC) plugin commits each file
 immediately after every `Edit` or `Write` tool use. These commits land on the
 branch *before* `acd`'s next replay tick. Typical sequence:
 
-```
+```text
 [Claude Code hook] Edit tool use fires
 [Claude Code hook] git commit -m "modify auth.go"   ← branch advances
 [acd replay tick ] pending event for auth.go
