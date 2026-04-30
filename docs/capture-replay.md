@@ -598,3 +598,19 @@ enumeration:
 `capture.pause` and `replay.pause` are emitted once per daemon poll cycle while
 the pause is active; they share the same output shape as the `pause` object in
 `acd status --json` and `acd list --json`.
+
+---
+
+## Multi-tool coexistence
+
+See [docs/multi-tool.md](multi-tool.md) for a full guide on running `acd`
+alongside another auto-committer (Claude Code Automatic Atomic Commits,
+Codex ACD hook, or any process that lands commits on the active branch).
+
+Summary: `acd` uses its idempotent publish probe
+(`internal/daemon/replay.go:643`, `alreadyPublishedAtHEAD`) to detect when an
+external tool already landed a queued event. The event is settled as `published`
+against `HEAD` with no new commit, and the trace record carries
+`decision: "already_published_by_external_committer"`. Real before-state
+mismatches (mode divergence, ancestry gap, symlink target mismatch) still
+produce `blocked_conflict` and require operator resolution.
