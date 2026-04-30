@@ -100,7 +100,3 @@ func IsAncestor(ctx context.Context, repoDir, ancestor, descendant string) (bool
 	return false, err
 }
 
-// MergeBaseIsAncestor reports whether commit is an ancestor of descendant.
-func MergeBaseIsAncestor(ctx context.Context, repoDir, commit, descendant string) (bool, error) {
-	return IsAncestor(ctx, repoDir, commit, descendant)
-}
