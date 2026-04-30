@@ -449,6 +449,112 @@ Use this checklist when commits stop appearing:
 
 ---
 
+## Revert workflows
+
+This section describes what happens to the `acd` queue for each common revert
+pattern. For all of them, the safest approach is to pause `acd` first:
+
+~~~bash
+acd pause --repo . --reason "branch surgery" --yes
+# … do the revert / reset / rebase …
+acd resume --repo . --yes
+acd wake --repo . --session-id "$ACD_SESSION_ID"
+~~~
+
+If you do not pause first, the daemon handles most scenarios automatically — but
+read the sub-sections below to understand where it still blocks.
+
+### Revert via `git revert` (forward commit)
+
+`git revert <commit>` creates a *new* commit that inverts the changes of the
+target commit. From `acd`'s perspective:
+
+- The revert commit is an ordinary fast-forward; branch generation is unchanged.
+- Any pending `acd` events that captured the original changes now face a
+  before-state probe where `HEAD` already shows the inverse — the desired
+  final state matches the current `HEAD` tree.
+- `alreadyPublishedAtHEAD` (`internal/daemon/replay.go:643`) returns `true`;
+  the event is marked `published` with `commit_oid = HEAD` and no new commit is
+  created. Trace decision: `already_published_by_external_committer`.
+
+If you plan to make additional edits immediately after the revert, pause `acd`
+first to prevent the revert commit itself from being double-captured as a
+phantom change.
+
+### Revert via `git reset --soft` or `--mixed`
+
+Both variants move `HEAD` backward on the same branch ref without touching the
+working tree (`--soft`) or touching staged state but not the tree (`--mixed`).
+`acd` detects the backward HEAD movement as a **rewind** and fires rewind grace:
+
+- `maybeSetRewindGrace` (`internal/daemon/branch_token.go:327`) writes
+  `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS` (default
+  60 seconds).
+- For the duration of the grace window, **both capture and replay are paused**
+  (`internal/daemon/daemon.go:906-945`). `acd` will not enqueue the transient
+  worktree state produced by fsnotify events during the rewind, which prevents
+  the post-grace replay from resurrecting work the operator just rewound.
+- After the grace window expires the daemon resumes normally, picks up the
+  current HEAD, and reseeds shadow state if the branch generation bumped.
+
+During the grace window `acd status` shows:
+
+```json
+"paused": true,
+"pause": { "source": "rewind_grace", "remaining_seconds": 42 }
+```
+
+Operator workflow: re-stage and re-edit your files during the grace window.
+`acd` will capture the clean post-rewind state after the grace expires.
+
+### Revert via `git reset --hard`
+
+`git reset --hard` additionally overwrites the working tree. `acd` handles this
+identically to `--soft`/`--mixed`: a rewind is detected, rewind grace fires,
+and both capture and replay are paused for `ACD_REWIND_GRACE_SECONDS` seconds.
+
+Re-edit the files you want to keep during the grace window. The daemon will
+pick up a clean diff when the grace expires.
+
+### Revert + delete: rescued by idempotent publish
+
+Before this branch, a `delete` op queued while a file still existed at the
+capture time would become `blocked_conflict` if the file was already gone by
+replay time. After this branch, `alreadyPublishedAtHEAD`
+(`internal/daemon/replay.go:643`) checks each `delete` op:
+
+- If the path is **absent** in the current `HEAD` tree, the delete is already
+  accomplished; the event settles as `published` against `HEAD` without a new
+  commit.
+- If the path is present as any non-blob entry (tree, submodule), the probe
+  returns `false` and the event becomes `blocked_conflict` as before — a real
+  divergence rather than a parallel publish.
+
+This makes the classic scenario (operator deletes a file, external tool commits
+the deletion, `acd`'s queued delete event would otherwise block) self-healing in
+the common case.
+
+### Editing an old commit via `git rebase -i`
+
+An interactive rebase creates one or more git operation markers under
+`.git/rebase-merge/` or `.git/rebase-apply/`. The daemon detects these on every
+poll tick and activates `operation_in_progress`:
+
+- Both capture and replay are paused (`internal/daemon/daemon.go:794`).
+  Trace event: `daemon.pause` with `decision: "paused"`.
+- While paused, `acd status` shows `Daemon: running` but no new commits appear.
+- After the rebase completes and the markers are removed, the daemon resumes.
+  It classifies the new HEAD as **Diverged** (branch generation bumps) because
+  the rebase rewrites history.
+- Pre-rebase `pending` rows for the old generation are **dropped** on the next
+  poll tick (stale events cannot replay on top of a rewritten branch).
+  `blocked_conflict` and `failed` rows from before the rebase are **preserved**
+  for operator inspection.
+- `shadow_paths` is reseeded from the new HEAD via `BootstrapShadow`, and
+  capture resumes from the clean post-rebase state.
+
+---
+
 ## Why is AI on deterministic fallback?
 
 The daemon always falls back to the `deterministic` provider. A message
