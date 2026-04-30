@@ -362,6 +362,11 @@ func renderRecover(out io.Writer, plan recoverPlan, jsonOut bool) error {
 	}
 	if !plan.DryRun {
 		fmt.Fprintf(out, "Rows changed: %d\n", plan.RowsChanged)
+		if plan.ManualMarkerRemoved {
+			fmt.Fprintf(out, "Manual pause marker removed: %s\n", plan.ManualMarkerPath)
+		} else if plan.ManualMarkerPath != "" {
+			fmt.Fprintf(out, "Manual pause marker: not present at %s\n", plan.ManualMarkerPath)
+		}
 	}
 	return nil
 }
