@@ -136,6 +136,7 @@ func TestReplay_SkipsDrainWhenRewindGraceActive(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	pending := captureOnePendingFile(t, ctx, f, "rewind.txt", "rewind\n")
+	beforeCount := captureEventsTotal(t, ctx, f.db)
 	until := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
 		t.Fatalf("MetaSet: %v", err)
@@ -149,6 +150,10 @@ func TestReplay_SkipsDrainWhenRewindGraceActive(t *testing.T) {
 		t.Fatalf("unexpected summary: %+v", sum)
 	}
 	assertPendingCount(t, ctx, f.db, pending)
+	// Replay must not mint new capture rows while the rewind grace is active.
+	if got := captureEventsTotal(t, ctx, f.db); got != beforeCount {
+		t.Fatalf("capture_events grew during rewind grace: before=%d after=%d", beforeCount, got)
+	}
 }
 
 func TestReplay_DrainsAfterMarkerExpires(t *testing.T) {
