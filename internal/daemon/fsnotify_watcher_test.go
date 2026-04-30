@@ -219,6 +219,77 @@ func TestFsnotifyWatcher_DoesNotPruneWildcardSensitiveDirectory(t *testing.T) {
 	}
 }
 
+// TestPreWalk_BatchedIgnoreCheck verifies the post-walk batched ignore
+// check correctly filters out ignored directories and watches the rest in
+// one IgnoreChecker round-trip. The previous per-dir Check loop generated
+// O(N) round-trips through the long-lived `git check-ignore --stdin`
+// subprocess; the new code collects every candidate then calls Check once.
+//
+// Test shape: a real git repo with a .gitignore that excludes "ignored_*"
+// directories. We pre-create N=60 dirs (mix of ignored + watched) and
+// assert (a) every "watched_*" dir is in WatchedPaths and (b) every
+// "ignored_*" dir is NOT.
+func TestPreWalk_BatchedIgnoreCheck(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	if err := git.Init(context.Background(), dir); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	// .gitignore at the worktree root excludes "ignored_*" dirs.
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"),
+		[]byte("ignored_*/\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+
+	const total = 60
+	for i := 0; i < total; i++ {
+		var name string
+		if i%2 == 0 {
+			name = "watched_" + strconv.Itoa(i)
+		} else {
+			name = "ignored_" + strconv.Itoa(i)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, name, "nested"), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	checker := git.NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:      dir,
+		IgnoreChecker: checker,
+		Debounce:      30 * time.Millisecond,
+	})
+	if d := w.Diagnostics(); d.Mode != "fsnotify" {
+		t.Fatalf("mode=%q want fsnotify (reason=%q)", d.Mode, d.FallbackReason)
+	}
+
+	watchedSet := map[string]struct{}{}
+	for _, p := range w.WatchedPaths() {
+		watchedSet[filepath.Clean(p)] = struct{}{}
+	}
+	for i := 0; i < total; i++ {
+		var prefix string
+		if i%2 == 0 {
+			prefix = "watched_"
+		} else {
+			prefix = "ignored_"
+		}
+		full := filepath.Clean(filepath.Join(dir, prefix+strconv.Itoa(i)))
+		_, isWatched := watchedSet[full]
+		if prefix == "watched_" && !isWatched {
+			t.Fatalf("expected %s to be watched but was not; watched=%v", full, w.WatchedPaths())
+		}
+		if prefix == "ignored_" && isWatched {
+			t.Fatalf("ignored dir %s slipped into watched set", full)
+		}
+	}
+}
+
 // TestFsnotifyWatcher_DebounceCoalesces asserts a burst of file events
 // produces a small (<= 5) number of WakeFn calls, not one per file.
 func TestFsnotifyWatcher_DebounceCoalesces(t *testing.T) {
