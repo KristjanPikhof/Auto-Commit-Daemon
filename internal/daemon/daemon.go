@@ -838,11 +838,28 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		// 4f. Capture pass.
+		//
+		// Manual pause + rewind grace pause BOTH capture and replay. This is
+		// symmetric with the detached-HEAD pause and the git-operation pause:
+		// while the operator's repo is in a transient state (mid-rewind, mid-
+		// rebase, paused for surgery), capture must NOT enqueue events that
+		// reflect that transient state. Otherwise the post-pause replay drain
+		// would resurrect work the operator just rewound. Detached HEAD has
+		// its own dedicated gate above.
 		var (
-			capSum CaptureSummary
-			capErr error
+			capSum     CaptureSummary
+			capErr     error
+			daemonPaus replayPause
+			pauseErr   error
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
+		if !branchTransitionBlocked && !operationPaused && !detachedHeadPaused {
+			daemonPaus, pauseErr = daemonPauseState(ctx, opts.GitDir, opts.DB)
+			if pauseErr != nil {
+				logger.Warn("read daemon pause state", "err", pauseErr.Error())
+			}
+		}
+		daemonPaused := pauseErr == nil && daemonPaus.Active
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
 		} else if operationPaused {
@@ -852,6 +869,10 @@ func Run(ctx context.Context, opts Options) error {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
 			logger.Warn("detached HEAD detected; capture/replay paused")
+		} else if daemonPaused {
+			logger.Warn("daemon paused; capture skipped",
+				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
+			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
 		} else if cctx.BaseHead != "" {
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
@@ -864,7 +885,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
