@@ -144,7 +144,8 @@ for the full `event_class` enumeration.
 
 ## Docs
 
-- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, AI diff from captured blobs, operator troubleshooting, pause JSON shapes, trace event classes
+- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, revert workflows, AI diff from captured blobs, operator troubleshooting, pause JSON shapes, trace event classes
+- [docs/multi-tool.md](docs/multi-tool.md) — running `acd` alongside Claude Code auto-commit, Codex ACD hook, or any parallel committer
 - [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
 
