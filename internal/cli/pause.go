@@ -188,7 +188,7 @@ func pauseMarkerPath(gitDir string) string {
 	return pausepkg.Path(gitDir)
 }
 
-func writePauseMarker(path string, marker PauseMarker, overwrite bool) error {
+func writePauseMarker(path string, marker PauseMarker, overwrite bool) (bool, error) {
 	return pausepkg.Write(path, marker, overwrite)
 }
 
