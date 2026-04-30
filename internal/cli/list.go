@@ -121,10 +121,24 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 			e.Pause = summary.pause
 		}
 		if summary.daemon == "stale" {
-			if summary.clients == 0 {
-				continue
-			}
-			if e.Status != "paused" {
+			e.StaleHeartbeat = true
+			staleNote := "daemon stale " + formatDurationCompact(summary.heartbeatAge)
+			if e.Status == "paused" {
+				// Combined paused+stale presentation: keep Status="paused"
+				// (operator intent wins) but append the stale-heartbeat fact
+				// so a paused-but-dead daemon never silently disappears.
+				if e.StatusNote == "" {
+					e.StatusNote = staleNote
+				} else {
+					e.StatusNote = e.StatusNote + "; " + staleNote
+				}
+			} else {
+				if summary.clients == 0 {
+					// Inactive stale daemon with zero live clients is hidden
+					// from the default list (gc is responsible for it). When
+					// a pause marker is present we already kept the row above.
+					continue
+				}
 				e.Status = "stale"
 				e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
 			}
