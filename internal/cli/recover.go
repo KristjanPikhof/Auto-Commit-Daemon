@@ -121,6 +121,11 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) 
 	if err != nil {
 		return recoverPlan{}, fmt.Errorf("acd recover: resolve HEAD: %w", err)
 	}
+	gitDir, err := resolveGitDir(ctx, rec.Path)
+	if err != nil {
+		return recoverPlan{}, fmt.Errorf("acd recover: resolve git dir: %w", err)
+	}
+	markerPath := pausepkg.Path(gitDir)
 
 	conn, err := openStateDBReadOnly(ctx, rec.StateDB)
 	if err != nil {
