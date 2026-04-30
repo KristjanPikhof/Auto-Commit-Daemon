@@ -1192,7 +1192,7 @@ func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state
 	if ev.BaseHead == parent {
 		return "", nil
 	}
-	ok, err := git.MergeBaseIsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
 	if err != nil {
 		// merge-base failed — most often because ev.BaseHead is no
 		// longer in the object database (gc'd reset). Treat as a
