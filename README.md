@@ -137,7 +137,7 @@ for the full `event_class` enumeration.
 
 ## Docs
 
-- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, AI diff from captured blobs, operator troubleshooting
+- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, AI diff from captured blobs, operator troubleshooting, pause JSON shapes, trace event classes
 - [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
 
