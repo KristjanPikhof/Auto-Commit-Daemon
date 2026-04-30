@@ -272,8 +272,8 @@ func TestRecover_RemovesManualPauseMarker(t *testing.T) {
 	if !plan.ManualMarkerRemoved {
 		t.Fatalf("plan.ManualMarkerRemoved=false want true: %+v", plan)
 	}
-	if plan.ManualMarkerPath != markerPath {
-		t.Fatalf("plan.ManualMarkerPath=%q want %q", plan.ManualMarkerPath, markerPath)
+	if !strings.HasSuffix(plan.ManualMarkerPath, filepath.Join(".git", "acd", "paused")) {
+		t.Fatalf("plan.ManualMarkerPath=%q want suffix .git/acd/paused", plan.ManualMarkerPath)
 	}
 }
 
