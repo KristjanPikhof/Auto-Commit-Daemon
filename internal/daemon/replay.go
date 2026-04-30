@@ -277,8 +277,57 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
-		commitOID, err := commitOneEvent(ctx, repoRoot, indexFile, parent, ev, ops, msgFn)
+		// Apply ops to the isolated index and write a tree. We split this
+		// out from commit-tree so we can short-circuit a parallel-create
+		// no-op: when an external committer already produced the same
+		// tree on top of `parent`, the resulting tree OID matches
+		// `parent`'s tree and we settle the event as already-published
+		// without minting an empty commit.
+		treeOID, err := applyOpsAndWriteTree(ctx, repoRoot, indexFile, ops)
+		if err != nil {
+			markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorCommitBuildFailure,
+				Message:    err.Error(),
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+			sum.Failed++
+			return sum, nil
+		}
+
+		// Parallel-create no-op: if write-tree produced the same tree as
+		// the current parent, the captured ops are already reflected in
+		// HEAD's tree (an external committer landed an identical change
+		// before we got here). Settle the event as published against
+		// `parent` without committing an empty tree.
+		parentTree, err := resolveTreeOID(ctx, repoRoot, parent)
+		if err != nil {
+			return sum, err
+		}
+		if parentTree != "" && treeOID == parentTree {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
+				return sum, err
+			}
+			// Reseed the scratch index from `parent` so chained events
+			// see a clean baseline (write-tree leaves stale entries
+			// otherwise).
+			if err := git.ReadTree(ctx, repoRoot, indexFile, parent); err != nil {
+				return sum, fmt.Errorf("daemon: replay reseed index after no-op tree: %w", err)
+			}
+			activeCtx.BaseHead = parent
+			sum.BaseHead = parent
+			sum.Published++
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_no_op_tree", map[string]any{
+				"commit": parent,
+				"parent": parent,
+				"tree":   treeOID,
+			})
+			continue
+		}
+
+		// Build the commit on top of the new tree.
+		commitOID, err := buildCommitFromTree(ctx, repoRoot, treeOID, parent, ev, ops, msgFn)
 		if err != nil {
 			markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
