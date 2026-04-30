@@ -38,6 +38,7 @@ type listEntry struct {
 	Status           string     `json:"status"`
 	StatusNote       string     `json:"status_note,omitempty"`
 	Paused           bool       `json:"paused,omitempty"`
+	StaleHeartbeat   bool       `json:"stale_heartbeat,omitempty"`
 	Pause            *pauseInfo `json:"pause,omitempty"`
 }
 
