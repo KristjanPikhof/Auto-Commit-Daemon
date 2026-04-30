@@ -45,6 +45,27 @@ const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 // DefaultMaxFileBytes is the default per-file size cap (5 MiB).
 const DefaultMaxFileBytes int64 = 5 << 20
 
+// EnvMaxPendingEvents bounds capture_events FIFO depth for the active
+// (branch_ref, branch_generation). When the depth meets or exceeds the cap
+// the new event is dropped (history is preserved; only the *new* tail is
+// refused) and a rate-limited slog.Warn fires. 0 disables the cap.
+const EnvMaxPendingEvents = "ACD_MAX_PENDING_EVENTS"
+
+// DefaultMaxPendingEvents is the default per-generation pending-depth cap
+// applied when EnvMaxPendingEvents is unset. 50_000 events is well above
+// "normal capture" volume but small enough to bound memory + replay cost
+// during a multi-day pause.
+const DefaultMaxPendingEvents = 50_000
+
+// MetaKeyPendingHighWater is the daemon_meta key under which the
+// highest-observed pending depth (a.k.a. "watermark") is persisted for
+// `acd diagnose --json`. Persisted as a base-10 integer string.
+const MetaKeyPendingHighWater = "capture.pending_high_water"
+
+// CapDropReasonAtCap is the trace reason emitted when the pending-depth cap
+// drops a captured op rather than appending it to capture_events.
+const CapDropReasonAtCap = "pending depth at cap"
+
 // stateSubdir is the per-repo state directory name inside .git/. Keeping it
 // here as a local constant avoids importing internal/state just for the
 // string; the package-level helper in state/db.go is "acd" via
