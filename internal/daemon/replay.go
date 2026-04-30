@@ -765,11 +765,15 @@ func touchedPaths(ops []state.CaptureOp) []string {
 	return out
 }
 
-// commitOneEvent applies ops via update-index --index-info on the isolated
-// index, runs write-tree, composes the commit message, and runs commit-tree.
-// Returns the new commit OID; the caller is responsible for update-ref.
-func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
-	// Build update-index payload. Mirrors snapshot_state.apply_ops_to_index.
+// applyOpsAndWriteTree applies ops via update-index --index-info on the
+// isolated index and runs write-tree, returning the resulting tree OID. The
+// caller decides whether to mint a commit (and is responsible for any
+// follow-up update-ref).
+//
+// Mirrors snapshot_state.apply_ops_to_index. Split out from commitOneEvent
+// so the replay loop can compare the new tree against the parent tree and
+// skip commit-tree on a parallel-create no-op.
+func applyOpsAndWriteTree(ctx context.Context, repoRoot, indexFile string, ops []state.CaptureOp) (string, error) {
 	const zeroOID = "0000000000000000000000000000000000000000"
 	var lines []string
 	for _, op := range ops {
@@ -796,7 +800,13 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 	if err != nil {
 		return "", fmt.Errorf("write-tree: %w", err)
 	}
+	return tree, nil
+}
 
+// buildCommitFromTree composes the commit message and runs commit-tree on
+// the supplied tree OID. Returns the new commit OID; the caller is
+// responsible for update-ref.
+func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
 	msg, err := msgFn(ctx, EventContext{Event: ev, Ops: ops})
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
@@ -810,11 +820,28 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 	if parent != "" {
 		parents = []string{parent}
 	}
-	commitOID, err := git.CommitTree(ctx, repoRoot, tree, msg, parents...)
+	commitOID, err := git.CommitTree(ctx, repoRoot, treeOID, msg, parents...)
 	if err != nil {
 		return "", fmt.Errorf("commit-tree: %w", err)
 	}
 	return commitOID, nil
+}
+
+// resolveTreeOID returns the tree OID at the given commit. Empty input
+// returns ("", nil) so the caller can short-circuit. Missing refs are also
+// surfaced as ("", nil) — there is no parent tree to compare against.
+func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error) {
+	if commit == "" {
+		return "", nil
+	}
+	tree, err := git.RevParse(ctx, repoRoot, commit+"^{tree}")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("rev-parse %s^{tree}: %w", commit, err)
+	}
+	return tree, nil
 }
 
 func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID string) error {
