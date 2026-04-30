@@ -9,8 +9,10 @@ package state
 // SchemaVersion is the current PRAGMA user_version value for the per-repo
 // state DB. Bumping this triggers a migration step in migrate.go. v1 was the
 // first acd release; v2 adds capture_events indexes used by replay barriers
-// and pruning.
-const SchemaVersion = 2
+// and pruning; v3 adds idx_capture_events_barrier — a covering index that
+// keeps the PendingEvents barrier subquery off a full-table scan when
+// long-running pauses fan capture_events into tens of thousands of rows.
+const SchemaVersion = 3
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
