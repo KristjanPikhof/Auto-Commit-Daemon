@@ -157,6 +157,22 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		}, jsonOut)
 	}
 	if !yes {
+		// Marker present but --yes not passed: emit a structured envelope so
+		// JSON consumers can branch on Status="requires-yes" without parsing
+		// stderr text. Always render BEFORE returning an error so cobra still
+		// surfaces the non-zero exit code while stdout carries valid JSON.
+		res := resumeResult{
+			OK:                false,
+			Status:             "requires-yes",
+			Repo:               repo,
+			MarkerPath:         markerPath,
+			Removed:            false,
+			ExistedForSeconds:  markerAgeSeconds(marker, time.Now().UTC()),
+			Marker:             marker,
+		}
+		if renderErr := renderResume(out, res, jsonOut); renderErr != nil {
+			return renderErr
+		}
 		return fmt.Errorf("acd resume: refusing to remove pause marker without --yes")
 	}
 	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
