@@ -54,6 +54,8 @@ type diagnoseReport struct {
 	RepoHash                string                 `json:"repo_hash"`
 	StateDB                 string                 `json:"state_db"`
 	Anchor                  diagnoseAnchorReport   `json:"anchor"`
+	PendingDepth            int                    `json:"pending_depth"`
+	PendingHighWater        int64                  `json:"pending_high_water"`
 	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
 	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
 	Remediation             []string               `json:"remediation"`
