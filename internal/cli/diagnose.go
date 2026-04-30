@@ -59,6 +59,9 @@ type diagnoseReport struct {
 	PendingHighWater        int64                  `json:"pending_high_water"`
 	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
 	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
+	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
+	StaleOperationMarker    bool                   `json:"stale_operation_marker"`
+	OperationMarkerDuration string                 `json:"operation_marker_duration,omitempty"`
 	Remediation             []string               `json:"remediation"`
 	StateDBChecksumBefore   string                 `json:"state_db_checksum_before"`
 	StateDBChecksumAfter    string                 `json:"state_db_checksum_after"`
