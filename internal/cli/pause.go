@@ -234,7 +234,12 @@ func renderResume(out io.Writer, res resumeResult, jsonOut bool) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(res)
 	}
-	if !res.OK {
+	switch res.Status {
+	case "requires-yes":
+		// Human-mode: nothing on stdout (the cobra-returned error covers it).
+		// JSON-mode is handled above.
+		return nil
+	case "not-paused":
 		fmt.Fprintf(out, "Repo is not paused: %s\n", res.Repo)
 		return nil
 	}
