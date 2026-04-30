@@ -102,7 +102,7 @@ func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	pending := captureOnePendingFile(t, ctx, f, "paused.txt", "paused\n")
-	if err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
 		Reason: "operator maintenance",
 		SetAt:  time.Now().UTC().Format(time.RFC3339),
 		SetBy:  "test",
