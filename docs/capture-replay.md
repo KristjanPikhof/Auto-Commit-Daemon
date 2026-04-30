@@ -134,7 +134,7 @@ Replay can be paused from two sources:
 | Source | Storage | Behavior |
 |---|---|---|
 | Manual operator pause | `<gitDir>/acd/paused` JSON marker | `acd pause` writes it, `acd resume --yes` removes it. The daemon reads it but never deletes it. |
-| Rewind grace | `daemon_meta.replay.paused_until` | Set when the daemon detects a same-branch rewind. Expired values are cleared by replay. |
+| Rewind grace | `daemon_meta.replay.paused_until` | Set when the daemon detects a same-branch rewind. Pauses **both** capture and replay so a transient revert+re-edit cycle does not race the operator. Expired values are cleared by replay. |
 
 Manual pause wins when both sources exist. Malformed manual markers and
 unparseable rewind-grace timestamps fail open with a warning so a bad marker
