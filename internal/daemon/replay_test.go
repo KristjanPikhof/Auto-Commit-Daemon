@@ -156,7 +156,7 @@ func TestReplay_DrainsAfterMarkerExpires(t *testing.T) {
 	ctx := context.Background()
 	captureOnePendingFile(t, ctx, f, "expired-marker.txt", "drain\n")
 	expired := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
-	if err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
 		Reason:    "expired",
 		SetAt:     time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339),
 		SetBy:     "test",
