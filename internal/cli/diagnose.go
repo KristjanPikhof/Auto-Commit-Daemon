@@ -420,6 +420,11 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume / acd recover to drain replay.")
 	}
+	if report.StaleOperationMarker {
+		remediation = append(remediation,
+			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
+				report.OperationInProgress, report.OperationMarkerDuration))
+	}
 	if len(remediation) == 0 {
 		remediation = append(remediation, "No anchor mismatch or blocked replay conflicts detected.")
 	}
