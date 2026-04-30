@@ -121,7 +121,8 @@ ACD_TRACE=1 ACD_TRACE_DIR=/tmp/acd-trace acd daemon run --repo .
 Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 `ACD_TRACE_DIR` is set. Each record includes `ts`, `repo`, `branch_ref`,
 `head_sha`, `event_class`, `decision`, `reason`, `input`, `output`, `error`,
-`seq`, and `generation`.
+`seq`, and `generation`. See [docs/capture-replay.md](docs/capture-replay.md#trace-event-classes)
+for the full `event_class` enumeration.
 
 ## Environment
 
