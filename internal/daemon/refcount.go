@@ -92,13 +92,24 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 		if err := ctx.Err(); err != nil {
 			return alive, err
 		}
-		// (1) TTL gate — universal fallback. Even peers without a watch pid
-		// are GC'd here.
+		// Each per-row eviction goes through a single-statement
+		// transaction whose WHERE clause re-asserts the staleness predicate
+		// against the live row. This closes the TOCTOU window between
+		// ListClients and the DELETE: a parallel `acd start` that upserts
+		// last_seen_ts (or replaces watch_pid) wins automatically because
+		// the predicate inside the tx no longer matches.
+
+		// (1) TTL gate — universal fallback. Re-check last_seen_ts inside
+		// the delete tx so a freshly refreshed registration is preserved.
 		if c.LastSeenTS < cutoff {
-			if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
+			if dropped, derr := state.DeregisterClientIfStale(ctx, db, c.SessionID, cutoff); derr != nil {
 				return alive, fmt.Errorf("daemon: drop ttl client %q: %w", c.SessionID, derr)
+			} else if dropped {
+				continue
 			}
-			continue
+			// Predicate no longer matches — peer refreshed under us. Fall
+			// through into the liveness path with stale `c.LastSeenTS`;
+			// the row will survive the tick (and be re-evaluated next sweep).
 		}
 
 		// (2) PID liveness — fast-path eviction.
@@ -109,9 +120,19 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 				return alive, err
 			}
 			if !pidAlive {
-				if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
+				// Pin the delete to the (session_id, watch_pid) we just
+				// classified dead, AND require last_seen_ts <= the value
+				// we read. A parallel `acd start` that swapped in a fresh
+				// pid + bumped last_seen_ts will not match this predicate
+				// and the row survives.
+				if dropped, derr := state.DeregisterClientIfPID(ctx, db, c.SessionID, c.WatchPID.Int64, c.LastSeenTS); derr != nil {
 					return alive, fmt.Errorf("daemon: drop dead-pid client %q: %w", c.SessionID, derr)
+				} else if dropped {
+					continue
 				}
+				// Refreshed under us — keep alive count untouched and let
+				// the next sweep re-classify.
+				alive++
 				continue
 			}
 			// (3) Fingerprint mismatch — PID reuse defense. Only checked
@@ -127,9 +148,12 @@ func SweepClients(ctx context.Context, db *state.DB, now time.Time, opts SweepOp
 					continue
 				}
 				if storedHashOf(live) != c.WatchFP.String {
-					if _, derr := state.DeregisterClient(ctx, db, c.SessionID); derr != nil {
+					if dropped, derr := state.DeregisterClientIfPID(ctx, db, c.SessionID, c.WatchPID.Int64, c.LastSeenTS); derr != nil {
 						return alive, fmt.Errorf("daemon: drop fp-mismatch client %q: %w", c.SessionID, derr)
+					} else if dropped {
+						continue
 					}
+					alive++
 					continue
 				}
 			}
