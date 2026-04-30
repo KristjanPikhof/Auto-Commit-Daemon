@@ -23,15 +23,18 @@ import (
 )
 
 type recoverPlan struct {
-	Repo             string   `json:"repo"`
-	StateDB          string   `json:"state_db"`
-	CurrentBranchRef string   `json:"current_branch_ref"`
-	CurrentHead      string   `json:"current_head"`
-	Generation       int64    `json:"generation"`
-	DryRun           bool     `json:"dry_run"`
-	BackupPath       string   `json:"backup_path,omitempty"`
-	Actions          []string `json:"actions"`
-	RowsChanged      int64    `json:"rows_changed"`
+	Repo                string   `json:"repo"`
+	StateDB             string   `json:"state_db"`
+	GitDir              string   `json:"git_dir,omitempty"`
+	CurrentBranchRef    string   `json:"current_branch_ref"`
+	CurrentHead         string   `json:"current_head"`
+	Generation          int64    `json:"generation"`
+	DryRun              bool     `json:"dry_run"`
+	BackupPath          string   `json:"backup_path,omitempty"`
+	Actions             []string `json:"actions"`
+	RowsChanged         int64    `json:"rows_changed"`
+	ManualMarkerRemoved bool     `json:"manual_marker_removed,omitempty"`
+	ManualMarkerPath    string   `json:"manual_marker_path,omitempty"`
 }
 
 func newRecoverCmd() *cobra.Command {
