@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 )
 
 func TestPause_WritesMarkerWithReason(t *testing.T) {
