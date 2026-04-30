@@ -589,6 +589,13 @@ func traceReplayUpdateRef(
 }
 
 func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, bool, error) {
+	// Defensive empty-ops guard. The replay loop only reaches this helper
+	// after validateOps + LoadCaptureOps, but a future refactor could
+	// hand us a zero-length slice — settle to "not published" rather than
+	// silently confirming an empty event.
+	if len(ops) == 0 {
+		return "", false, nil
+	}
 	headOID, err := git.RevParse(ctx, repoRoot, "HEAD")
 	if err != nil {
 		if errors.Is(err, git.ErrRefNotFound) {
@@ -597,15 +604,23 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.Ca
 		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
 	}
 	for _, op := range ops {
-		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
-		if err != nil {
-			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
-		}
 		if op.Op == "delete" {
-			if blobOID != "" {
+			// Delete is idempotent only when HEAD has NO entry at all
+			// for this path. A path replaced by a directory (tree
+			// entry) or a submodule (commit entry) is NOT absent —
+			// settling as published would mask a real divergence.
+			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.Path)
+			if err != nil {
+				return "", false, err
+			}
+			if !absent {
 				return headOID, false, nil
 			}
 			continue
+		}
+		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
+		if err != nil {
+			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
 		}
 		if !op.AfterOID.Valid || op.AfterOID.String == "" {
 			return headOID, false, nil
@@ -623,16 +638,67 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot string, ops []state.Ca
 			}
 		}
 		if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
-			oldBlobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.OldPath.String)
+			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.OldPath.String)
 			if err != nil {
-				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.OldPath.String, err)
+				return "", false, err
 			}
-			if oldBlobOID != "" {
+			if !absent {
 				return headOID, false, nil
+			}
+			// Rename source verify: before settling as already-published
+			// we require the captured BeforeOID for the rename source to
+			// still be present in the object database. If it's missing
+			// (gc'd, partial fetch), we cannot prove the rename actually
+			// matches the captured intent, so refuse to settle and let
+			// the caller block.
+			if op.BeforeOID.Valid && op.BeforeOID.String != "" {
+				present, err := objectExists(ctx, repoRoot, op.BeforeOID.String)
+				if err != nil {
+					return "", false, err
+				}
+				if !present {
+					return headOID, false, nil
+				}
 			}
 		}
 	}
 	return headOID, true, nil
+}
+
+// isPathAbsentInTree reports whether path is absent at ref. A path resolved
+// to a non-blob entry (tree, submodule) is treated as NOT absent — the
+// caller's idempotent check must not confuse a directory-replacement with
+// a successful delete.
+func isPathAbsentInTree(ctx context.Context, repoRoot, ref, path string) (bool, error) {
+	entries, err := git.LsTree(ctx, repoRoot, ref, false, path)
+	if err != nil {
+		return false, fmt.Errorf("ls-tree %s %s: %w", ref, path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path == path {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// objectExists reports whether the given OID is present in the local
+// object database via `git cat-file -e`. Used by the rename-source verify
+// path so the daemon will not settle a rename as published when the
+// captured BeforeOID is no longer reachable (shallow clone, gc'd ref).
+func objectExists(ctx context.Context, repoRoot, oid string) (bool, error) {
+	if oid == "" {
+		return false, nil
+	}
+	_, _, err := git.RunWithStderr(ctx, git.RunOpts{Dir: repoRoot}, "cat-file", "-e", oid)
+	if err == nil {
+		return true, nil
+	}
+	var gerr *git.Error
+	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("cat-file -e %s: %w", oid, err)
 }
 
 func treeEntryModeMatches(entries []git.TreeEntry, path, mode string) bool {
