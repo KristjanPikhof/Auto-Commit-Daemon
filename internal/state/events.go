@@ -217,6 +217,39 @@ func CountEventsByState(ctx context.Context, d *DB, state string) (int, error) {
 	return n, nil
 }
 
+// CountPendingEventsForGeneration returns how many capture_events rows are
+// currently in EventStatePending for the (branch_ref, branch_generation)
+// pair. This is the daemon's depth gauge for the per-generation FIFO and
+// drives the soft-cap eviction decision in capture.AppendCaptureEvent
+// callers. The query is index-backed by idx_capture_events_barrier
+// (state-leading covering index from schema v3).
+func CountPendingEventsForGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: CountPendingEventsForGeneration: empty branch_ref")
+	}
+	var n int
+	if err := d.readSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events
+		  WHERE state = ? AND branch_ref = ? AND branch_generation = ?`,
+		EventStatePending, branchRef, branchGeneration).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count pending for generation: %w", err)
+	}
+	return n, nil
+}
+
+// CountPendingEventsAll returns the total number of capture_events rows in
+// EventStatePending across every (branch_ref, branch_generation). Used by
+// `acd diagnose --json` to surface the global pending depth.
+func CountPendingEventsAll(ctx context.Context, d *DB) (int, error) {
+	var n int
+	if err := d.readSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		EventStatePending).Scan(&n); err != nil {
+		return 0, fmt.Errorf("state: count pending events: %w", err)
+	}
+	return n, nil
+}
+
 // MarkEventBlocked atomically settles a capture_events row in
 // EventStateBlockedConflict and upserts the singleton publish_state row to
 // status="blocked_conflict" within a single transaction. This pairs the two
