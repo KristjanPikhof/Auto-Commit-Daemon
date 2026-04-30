@@ -310,11 +310,11 @@ func TestPauseStatus_ExpiredManualMarker_Visible(t *testing.T) {
 func TestDefaultPauseSetBy_PrecedenceUserCurrentFirst(t *testing.T) {
 	// user.Current() returns the actual login user under `go test`. We pin
 	// behavior by ensuring USER env doesn't overwrite the current.Username.
-	current, err := userCurrentUsername()
+	cur, err := osuser.Current()
 	if err != nil {
 		t.Skipf("user.Current unavailable: %v", err)
 	}
-	if current == "" {
+	if cur.Username == "" {
 		t.Skip("user.Current returned empty username; skipping precedence assertion")
 	}
 	t.Setenv("USER", "envuser-foo")
@@ -325,8 +325,9 @@ func TestDefaultPauseSetBy_PrecedenceUserCurrentFirst(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("defaultPauseSetBy=%q does not contain host:user", got)
 	}
-	if parts[1] != current {
-		t.Fatalf("user component=%q want user.Current=%q (USER/USERNAME must NOT win)", parts[1], current)
+	wantUser := sanitizePauseField(cur.Username)
+	if parts[1] != wantUser {
+		t.Fatalf("user component=%q want user.Current=%q (USER/USERNAME must NOT win)", parts[1], wantUser)
 	}
 }
 
@@ -346,17 +347,6 @@ func TestSanitizePauseField_StripsControlChars(t *testing.T) {
 			t.Fatalf("sanitizePauseField(%q)=%q want %q", tc.in, got, tc.want)
 		}
 	}
-}
-
-// userCurrentUsername returns the username from os/user.Current with the
-// same fallthrough rules defaultPauseSetBy uses, so the precedence test can
-// assert the exact value the implementation will see.
-func userCurrentUsername() (string, error) {
-	u, err := userCurrent()
-	if err != nil {
-		return "", err
-	}
-	return u, nil
 }
 
 func readPauseMarkerFile(t *testing.T, markerPath string) PauseMarker {
