@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	osuser "os/user"
 	"strings"
 	"testing"
 	"time"
