@@ -3,7 +3,6 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
