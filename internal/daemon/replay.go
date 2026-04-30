@@ -696,6 +696,22 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot, sourceHead string, op
 			}
 		}
 	}
+	// HEAD-movement guard: the per-op probes above all read against the
+	// `headOID` we resolved at the start. If HEAD has moved while we were
+	// probing (an external committer landed something between the first
+	// rev-parse and the last ls-tree), the matching tree state no longer
+	// describes the live ref. Refuse to settle and let the caller try
+	// again on the next pass with a fresh anchor.
+	postHead, err := git.RevParse(ctx, repoRoot, "HEAD")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("rev-parse HEAD post-probe: %w", err)
+	}
+	if postHead != headOID {
+		return postHead, false, nil
+	}
 	return headOID, true, nil
 }
 
