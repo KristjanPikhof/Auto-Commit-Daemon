@@ -317,11 +317,18 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 // rewinding op), the daemon writes daemon_meta.replay.paused_until = now+grace
 // so the next capture/replay tick observes a paused gate via daemonPauseState.
 //
-// Scope: when the grace fires BOTH capture and replay are paused. We must not
-// capture worktree state observed during the rewind window — fsnotify will
-// fire as untracked files reappear, and a post-grace replay drain would
-// resurrect work the operator just rewound. The Run loop honors this gate via
-// daemonPauseState; the Replay drain skips via the same helper.
+// Scope: same-ref rewinds only. This function is only reached after
+// ClassifyTokenTransition returns TokenTransitionFastForward on a same
+// branch-ref pair where the SHA moved backward. Other cases are handled
+// elsewhere:
+//   - Ref-switch divergences (including same-SHA branch switches): handled by
+//     TokenTransitionDiverged + DeletePendingForGeneration.
+//   - Detached-HEAD transitions: handled via MetaKeyDetachedHeadPaused.
+//
+// During the grace window BOTH capture and replay are paused. fsnotify fires
+// as untracked files reappear after a rewind, and a post-grace replay drain
+// would otherwise resurrect work the operator just rewound. The Run loop gates
+// capture via daemonPauseState; the Replay drain uses the same helper.
 //
 // Returns (active, expiresRFC3339, error).
 func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time) (bool, string, error) {
