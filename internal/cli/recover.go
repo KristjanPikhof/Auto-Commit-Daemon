@@ -148,16 +148,20 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) 
 	plan := recoverPlan{
 		Repo:             rec.Path,
 		StateDB:          rec.StateDB,
+		GitDir:           gitDir,
 		CurrentBranchRef: branchRef,
 		CurrentHead:      head,
 		Generation:       gen,
 		DryRun:           dryRun,
+		ManualMarkerPath: markerPath,
 		Actions: []string{
 			"retarget capture_events to current branch/generation/head",
 			"retarget shadow_paths to current branch/generation/head",
 			"retarget publish_state to current branch/generation/head",
 			"reset blocked_conflict rows to pending",
 			"clear stale replay/pause daemon_meta breadcrumbs",
+			"clear daemon_meta " + daemon.MetaKeyReplayPausedUntil + " (rewind grace)",
+			"remove manual pause marker at " + markerPath + " if present",
 		},
 	}
 	return plan, nil
