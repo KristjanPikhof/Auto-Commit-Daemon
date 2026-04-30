@@ -762,6 +762,18 @@ func Run(ctx context.Context, opts Options) error {
 		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
 		if operationPaused {
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
+			// Stale-marker tracking: stamp the wall-clock + HEAD the first
+			// time we see this marker, persist for diagnose, then warn
+			// periodically when both have been motionless past threshold.
+			currentHead, _ := git.RevParse(ctx, opts.RepoPath, "HEAD")
+			nowTS := now()
+			if opMarkerSetAt.IsZero() {
+				opMarkerSetAt = nowTS
+				opMarkerHead = currentHead
+				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressSetAt, stamp)
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressHead, currentHead)
+			}
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
 			recordTrace(tracer, acdtrace.Event{
@@ -774,8 +786,26 @@ func Run(ctx context.Context, opts Options) error {
 				Input:      map[string]any{"operation": operationName},
 				Generation: cctx.BranchGeneration,
 			})
+			// Stale heuristic: marker present > threshold AND HEAD has not
+			// moved since we first saw it. We never auto-clear — operator
+			// must run `git rebase --abort` (or remove the marker) by hand.
+			elapsed := nowTS.Sub(opMarkerSetAt)
+			if elapsed >= staleOpMarkerThreshold && currentHead == opMarkerHead {
+				if opMarkerWarnedAt.IsZero() || nowTS.Sub(opMarkerWarnedAt) >= staleOpMarkerWarnInterval {
+					logger.Warn("operation_in_progress marker may be stale; verify git status",
+						"operation", operationName,
+						"head", currentHead,
+						"duration", elapsed.Round(time.Second).String())
+					opMarkerWarnedAt = nowTS
+				}
+			}
 		} else if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyOperationInProgress); ok {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgress)
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgressSetAt)
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgressHead)
+			opMarkerSetAt = time.Time{}
+			opMarkerHead = ""
+			opMarkerWarnedAt = time.Time{}
 			recordTrace(tracer, acdtrace.Event{
 				Repo:       opts.RepoPath,
 				BranchRef:  cctx.BranchRef,
