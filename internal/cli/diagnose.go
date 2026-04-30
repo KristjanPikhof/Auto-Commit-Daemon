@@ -231,6 +231,31 @@ func branchRefFromToken(token string) string {
 	return ""
 }
 
+// diagnoseCapacity surfaces the per-repo pending FIFO depth and the
+// daemon-recorded high watermark. Reads are best-effort: we do not abort
+// diagnose when the table is empty or the meta key is unset (those are the
+// "fresh repo" defaults).
+func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+	var depth int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&depth); err != nil {
+		return fmt.Errorf("pending depth: %w", err)
+	}
+	report.PendingDepth = depth
+
+	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
+	if err != nil {
+		return fmt.Errorf("pending_high_water: %w", err)
+	}
+	if ok && v != "" {
+		if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.PendingHighWater = hw
+		}
+	}
+	return nil
+}
+
 func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
 	lastMeta, err := loadLastReplayConflictMeta(ctx, conn)
 	if err != nil {
