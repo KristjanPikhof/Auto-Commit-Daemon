@@ -283,6 +283,7 @@ SET branch_ref = ?, branch_generation = ?, mode = 'stopped', note = NULL`,
 		"last_replay_error",
 		"detached_head_paused",
 		"operation_in_progress",
+		daemon.MetaKeyReplayPausedUntil,
 	} {
 		if err := exec(`DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
 			return fmt.Errorf("acd recover: clear %s: %w", key, err)
