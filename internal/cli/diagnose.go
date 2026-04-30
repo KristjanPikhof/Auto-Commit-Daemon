@@ -152,6 +152,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
 	}
+	if err := diagnoseOperationMarker(ctx, conn, &report); err != nil {
+		return report, err
+	}
 	report.Remediation = diagnoseRemediation(report)
 
 	after, err := fileSHA256(rec.StateDB)
