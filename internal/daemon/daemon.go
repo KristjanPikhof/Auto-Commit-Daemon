@@ -212,6 +212,22 @@ func Run(ctx context.Context, opts Options) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Top-level panic recover. The daemon owns long-lived resources whose
+	// cleanup runs through subsequent defers (IgnoreChecker subprocess,
+	// fsnotify watcher, central stats DB, AI provider closer, trace
+	// writer). An unrecovered panic would skip those defers entirely and
+	// leak the check-ignore subprocess; recovering here lets the deferred
+	// Close calls run before we re-panic so the operator sees the original
+	// trace and the orphan process is reaped.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("daemon panic; deferred cleanup will run before re-raise",
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()))
+			// Re-raise so the harness/test runner observes the failure.
+			panic(r)
+		}
+	}()
 	now := opts.Now
 	if now == nil {
 		now = time.Now
