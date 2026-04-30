@@ -104,7 +104,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		msgFn = DeterministicMessage
 	}
 
-	if paused, err := replayPauseState(ctx, opts.GitDir, db); err != nil {
+	if paused, err := daemonPauseState(ctx, opts.GitDir, db); err != nil {
 		return sum, err
 	} else if paused.Active {
 		sum.BaseHead = cctx.BaseHead
