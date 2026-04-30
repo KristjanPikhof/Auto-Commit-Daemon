@@ -180,6 +180,133 @@ func TestResume_NoMarkerIsNoop(t *testing.T) {
 	}
 }
 
+func TestResume_RequiresYes_JSONEnvelope(t *testing.T) {
+	ctx := context.Background()
+	repo := makeStartRepo(t)
+	markerPath := pauseMarkerPath(mustResolveGitDir(t, ctx, repo))
+
+	var pauseOut bytes.Buffer
+	if err := runPause(ctx, &pauseOut, repo, "deploy", "", false, true); err != nil {
+		t.Fatalf("runPause: %v", err)
+	}
+
+	var resumeOut bytes.Buffer
+	err := runResume(ctx, &resumeOut, repo, false, true)
+	if err == nil {
+		t.Fatalf("runResume succeeded without --yes; want error to surface non-zero exit")
+	}
+	if !strings.Contains(err.Error(), "without --yes") {
+		t.Fatalf("err=%v want refuse-without-yes phrase", err)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("marker should still exist: %v", err)
+	}
+
+	var got resumeResult
+	if uerr := json.Unmarshal(resumeOut.Bytes(), &got); uerr != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", uerr, resumeOut.String())
+	}
+	if got.OK || got.Removed {
+		t.Fatalf("requires-yes envelope leaks OK/Removed: %+v", got)
+	}
+	if got.Status != "requires-yes" {
+		t.Fatalf("status=%q want requires-yes", got.Status)
+	}
+	if got.MarkerPath != markerPath {
+		t.Fatalf("marker_path=%q want %q", got.MarkerPath, markerPath)
+	}
+	if got.Marker.Reason != "deploy" {
+		t.Fatalf("envelope marker reason=%q want deploy", got.Marker.Reason)
+	}
+}
+
+func TestResume_NotPaused_JSONEnvelope(t *testing.T) {
+	ctx := context.Background()
+	repo := makeStartRepo(t)
+
+	var out bytes.Buffer
+	if err := runResume(ctx, &out, repo, false, true); err != nil {
+		t.Fatalf("runResume: %v", err)
+	}
+	var got resumeResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not valid JSON: %v\n%s", err, out.String())
+	}
+	if got.Status != "not-paused" || got.OK || got.Removed {
+		t.Fatalf("unexpected not-paused envelope: %+v", got)
+	}
+}
+
+func TestPause_OverwroteFlagFact(t *testing.T) {
+	ctx := context.Background()
+	repo := makeStartRepo(t)
+
+	// --yes against absent marker must report overwrote=false (the flag
+	// permits overwrite but no marker existed to replace).
+	var out bytes.Buffer
+	if err := runPause(ctx, &out, repo, "manual", "", true, true); err != nil {
+		t.Fatalf("runPause: %v", err)
+	}
+	var first pauseResult
+	if err := json.Unmarshal(out.Bytes(), &first); err != nil {
+		t.Fatalf("unmarshal first: %v\n%s", err, out.String())
+	}
+	if first.Overwrote {
+		t.Fatalf("first pause reports overwrote=true with no prior marker: %+v", first)
+	}
+
+	// Second pause with --yes against the now-present marker reports true.
+	out.Reset()
+	if err := runPause(ctx, &out, repo, "manual", "", true, true); err != nil {
+		t.Fatalf("second runPause: %v", err)
+	}
+	var second pauseResult
+	if err := json.Unmarshal(out.Bytes(), &second); err != nil {
+		t.Fatalf("unmarshal second: %v\n%s", err, out.String())
+	}
+	if !second.Overwrote {
+		t.Fatalf("second pause reports overwrote=false: %+v", second)
+	}
+}
+
+func TestPauseStatus_ExpiredManualMarker_Visible(t *testing.T) {
+	ctx := context.Background()
+	roots := withIsolatedHome(t)
+	repo, dbPath, _ := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	// Write a manual marker with expires_at in the past.
+	expired := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	gitDir := mustResolveGitDir(t, ctx, repo)
+	markerPath := pauseMarkerPath(gitDir)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "stuck-marker",
+		SetAt:     time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+		SetBy:     "test",
+		ExpiresAt: &expired,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !rep.Paused || rep.Pause == nil {
+		t.Fatalf("expected paused=true with pause object: %+v", rep)
+	}
+	if rep.Pause.Source != "manual_expired" {
+		t.Fatalf("pause.source=%q want manual_expired", rep.Pause.Source)
+	}
+	if rep.Pause.ExpiresAt == "" {
+		t.Fatalf("pause.expires_at empty for expired marker: %+v", rep.Pause)
+	}
+}
+
 func readPauseMarkerFile(t *testing.T, markerPath string) PauseMarker {
 	t.Helper()
 	body, err := os.ReadFile(markerPath)
