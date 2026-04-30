@@ -539,6 +539,95 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 	}
 }
 
+// TestRewindGrace_DoesNotResurrectRewoundWork verifies that when the daemon
+// detects a same-branch rewind (newHead is an ancestor of prevHead, e.g.
+// `git reset --soft HEAD~1`) and writes daemon_meta.replay.paused_until, the
+// run loop pauses BOTH capture and replay during the grace window.
+// Otherwise: an fsnotify wake during the rewound state would capture the
+// transient worktree, and the post-grace replay drain would resurrect work
+// the operator just rewound.
+func TestRewindGrace_DoesNotResurrectRewoundWork(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Pre-set the rewind grace marker to a future time. The daemon Run loop
+	// reads this via daemonPauseState and must skip both capture and replay.
+	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet paused_until: %v", err)
+	}
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// Edit a file that would normally produce a captured event; force several
+	// wakes so the run loop has clear opportunities to pass the gate.
+	if err := os.WriteFile(filepath.Join(f.dir, "rewound.txt"), []byte("transient\n"), 0o644); err != nil {
+		t.Fatalf("write rewound: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// HEAD must not advance during the grace window.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse while paused: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced while rewind grace active: %s; want %s", head, startHead)
+	}
+
+	// And capture_events must be empty: capture is paused alongside replay,
+	// so no transient worktree row was enqueued.
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("capture_events=%d want 0 during rewind grace", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 // TestRun_WakeBurstCoalesced: many rapid wakes don't crash and only produce
 // one capture+replay cycle (idempotent — the second pass sees no changes).
 func TestRun_WakeBurstCoalesced(t *testing.T) {
