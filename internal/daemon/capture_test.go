@@ -391,3 +391,169 @@ func TestCapture_ModeChange(t *testing.T) {
 		t.Fatalf("expected mode event for script.sh, got %+v", pendingOps(t, f.db))
 	}
 }
+
+// TestCapture_PendingDepthCap_DropsNewEvents verifies the
+// ACD_MAX_PENDING_EVENTS soft cap. With cap=10 and 15 candidate creates, we
+// expect exactly 10 inserts, 5 dropped events recorded in the summary, the
+// rate-limited slog.Warn fired at least once, and
+// daemon_meta.capture.pending_high_water = 10.
+func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "10")
+	resetPendingCapWarnForTest(t, 1) // 1-second interval; we only care that *one* warn lands
+
+	// Capture warn output via a buffer-backed slog handler. Restore the
+	// process default on cleanup so we don't bleed state into other tests.
+	prevDefault := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	f := newCaptureFixture(t)
+	for i := 0; i < 15; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	if sum.EventsAppended != 10 {
+		t.Fatalf("EventsAppended=%d, want 10; summary=%+v", sum.EventsAppended, sum)
+	}
+	if sum.EventsDropped != 5 {
+		t.Fatalf("EventsDropped=%d, want 5; summary=%+v", sum.EventsDropped, sum)
+	}
+	if sum.PendingDepth != 10 {
+		t.Fatalf("PendingDepth=%d, want 10; summary=%+v", sum.PendingDepth, sum)
+	}
+	if sum.PendingHighWater != 10 {
+		t.Fatalf("PendingHighWater=%d, want 10; summary=%+v", sum.PendingHighWater, sum)
+	}
+
+	var rowCount int
+	if err := f.db.SQL().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM capture_events WHERE state = 'pending'`).Scan(&rowCount); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rowCount != 10 {
+		t.Fatalf("rows=%d, want 10 (cap should hold the FIFO at the limit)", rowCount)
+	}
+
+	hw, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyPendingHighWater)
+	if err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected daemon_meta.%s to be set", MetaKeyPendingHighWater)
+	}
+	if hwInt, perr := strconv.ParseInt(hw, 10, 64); perr != nil || hwInt != 10 {
+		t.Fatalf("daemon_meta.%s=%q, want 10", MetaKeyPendingHighWater, hw)
+	}
+
+	if !strings.Contains(logBuf.String(), "capture pending depth at cap") {
+		t.Fatalf("expected slog.Warn about capture pending depth at cap, got: %s", logBuf.String())
+	}
+}
+
+// TestCapture_PendingDepthCap_Disabled verifies cap=0 short-circuits all
+// counting + bookkeeping work. With ACD_MAX_PENDING_EVENTS=0 a flood of
+// captures should land in capture_events without any drops or watermark.
+func TestCapture_PendingDepthCap_Disabled(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "0")
+	resetPendingCapWarnForTest(t, 1)
+
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsDropped != 0 {
+		t.Fatalf("disabled cap should not drop; summary=%+v", sum)
+	}
+	if sum.EventsAppended < 12 {
+		t.Fatalf("EventsAppended=%d, want >=12; summary=%+v", sum.EventsAppended, sum)
+	}
+	if sum.PendingDepth != 0 || sum.PendingHighWater != 0 {
+		t.Fatalf("disabled cap should leave depth/high_water at 0; summary=%+v", sum)
+	}
+	if _, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyPendingHighWater); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("MetaKeyPendingHighWater should be unset when cap is disabled")
+	}
+}
+
+// TestCapture_PendingDepthCap_RateLimited ensures we don't spam slog.Warn on
+// every dropped event in a single burst. With a 60-second interval and 5
+// drops, we expect exactly one warn record on the buffer.
+func TestCapture_PendingDepthCap_RateLimited(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "1")
+	resetPendingCapWarnForTest(t, 60)
+
+	prevDefault := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	f := newCaptureFixture(t)
+	// Pre-seed one pending row to put the cap immediately in effect.
+	if _, err := state.AppendCaptureEvent(context.Background(), f.db, state.CaptureEvent{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead: f.cctx.BaseHead, Operation: "create", Path: "seed.txt",
+		Fidelity: "exact", State: state.EventStatePending,
+	}, []state.CaptureOp{{Op: "create", Path: "seed.txt", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+
+	// Stub the seed into shadow_paths so it isn't reclassified as a delete.
+	if _, err := f.db.SQL().ExecContext(context.Background(), `
+INSERT INTO shadow_paths(branch_ref, branch_generation, path, operation, mode, oid, base_head, fidelity, updated_ts)
+VALUES (?, ?, 'seed.txt', 'create', '100644', '0000000000000000000000000000000000000000', ?, 'exact', 0)`,
+		f.cctx.BranchRef, f.cctx.BranchGeneration, f.cctx.BaseHead); err != nil {
+		t.Fatalf("seed shadow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "seed.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("drop-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("y"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsDropped < 5 {
+		t.Fatalf("expected at least 5 drops, got summary=%+v", sum)
+	}
+
+	count := strings.Count(logBuf.String(), "capture pending depth at cap")
+	if count != 1 {
+		t.Fatalf("expected exactly 1 warn record under rate limit, got %d:\n%s", count, logBuf.String())
+	}
+}
+
+// silence unused-import false positives if a future test removes a helper.
+var _ = sql.NullString{}
