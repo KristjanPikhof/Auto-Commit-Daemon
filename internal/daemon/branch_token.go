@@ -209,7 +209,7 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 		// Defensive — shouldn't happen given the missing checks above.
 		return TokenTransitionDiverged, nil
 	}
-	ok, err := git.MergeBaseIsAncestor(ctx, repoDir, prevHead, newHead)
+	ok, err := git.IsAncestor(ctx, repoDir, prevHead, newHead)
 	if err != nil {
 		return TokenTransitionDiverged, fmt.Errorf("daemon: classify token: %w", err)
 	}
