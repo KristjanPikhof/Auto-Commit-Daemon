@@ -343,7 +343,7 @@ func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prev
 	if !ok {
 		return false, "", nil
 	}
-	until := time.Unix(now.Add(grace).Unix(), 0).UTC().Format(time.RFC3339)
+	until := now.Add(grace).UTC().Format(time.RFC3339)
 	if err := state.MetaSet(ctx, db, MetaKeyReplayPausedUntil, until); err != nil {
 		return false, "", err
 	}
