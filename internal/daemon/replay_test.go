@@ -183,6 +183,7 @@ func TestReplay_DrainsAfterRewindGraceExpires(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	captureOnePendingFile(t, ctx, f, "expired-grace.txt", "drain\n")
+	beforeCount := captureEventsTotal(t, ctx, f.db)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)); err != nil {
 		t.Fatalf("MetaSet: %v", err)
 	}
@@ -198,6 +199,11 @@ func TestReplay_DrainsAfterRewindGraceExpires(t *testing.T) {
 		t.Fatalf("MetaGet: %v", err)
 	} else if ok {
 		t.Fatalf("expired replay pause meta not cleared: %q", got)
+	}
+	// Replay reads the queue but does not synthesize new capture rows; the
+	// total count must not grow over the drain.
+	if got := captureEventsTotal(t, ctx, f.db); got != beforeCount {
+		t.Fatalf("capture_events grew across replay drain: before=%d after=%d", beforeCount, got)
 	}
 }
 
