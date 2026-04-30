@@ -263,6 +263,44 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 	return nil
 }
 
+// diagnoseOperationMarker reports whether a git rebase / merge / cherry-pick
+// / bisect marker is currently making the daemon pause and how long it has
+// been doing so. The daemon never auto-clears these markers — operators are
+// expected to run `git rebase --abort` (or remove the marker) manually — so
+// when the elapsed time crosses 15 minutes the report flags it as stale.
+func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+	op, ok, err := metaLookup(ctx, conn, "operation_in_progress")
+	if err != nil {
+		return fmt.Errorf("operation_in_progress: %w", err)
+	}
+	if !ok || op == "" {
+		return nil
+	}
+	report.OperationInProgress = op
+	setAtRaw, ok, err := metaLookup(ctx, conn, "operation_in_progress.set_at")
+	if err != nil {
+		return fmt.Errorf("operation_in_progress.set_at: %w", err)
+	}
+	if !ok || setAtRaw == "" {
+		return nil
+	}
+	setAtSec, err := strconv.ParseFloat(setAtRaw, 64)
+	if err != nil {
+		// Best-effort: a malformed timestamp does not abort diagnose.
+		return nil
+	}
+	setAt := time.Unix(0, int64(setAtSec*float64(time.Second)))
+	elapsed := time.Since(setAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	report.OperationMarkerDuration = elapsed.Round(time.Second).String()
+	if elapsed >= 15*time.Minute {
+		report.StaleOperationMarker = true
+	}
+	return nil
+}
+
 func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
 	lastMeta, err := loadLastReplayConflictMeta(ctx, conn)
 	if err != nil {
