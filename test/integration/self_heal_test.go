@@ -136,8 +136,17 @@ func TestSelfHeal_PauseSurvivesDaemonRestart(t *testing.T) {
 	startSession(t, ctx, env, repo, "selfheal-restart-b", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
 	wakeSession(t, ctx, env, repo, "selfheal-restart-b")
-	time.Sleep(500 * time.Millisecond)
 
+	// Positive assertion 1: the manual pause marker file must survive the restart.
+	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("pause marker file missing after daemon restart: %v", err)
+	}
+
+	// Positive assertion 2: acd status --json must report Paused=true, Source=manual.
+	assertStatusPaused(t, ctx, env, repo, "manual")
+
+	// The queued event must still be pending (replay is blocked by the marker).
 	if state := latestEventState(t, dbPath, "restart-paused.txt"); state != "pending" {
 		t.Fatalf("event state after restart wake=%q want pending", state)
 	}
