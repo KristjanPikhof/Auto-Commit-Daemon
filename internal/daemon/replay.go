@@ -352,6 +352,38 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			oldOID = ""
 		}
 		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+			// CAS exhausted. Before declaring conflict, give the
+			// idempotent path one shot: an external committer may have
+			// landed identical content between our write-tree and our
+			// final update-ref attempt, leaving HEAD's tree already in
+			// the desired shape. alreadyPublishedAtHEAD enforces an
+			// ancestry guard against `parent` so we cannot mistakenly
+			// settle on top of a HEAD that diverged from our anchor.
+			//
+			// Only one probe per CAS exhaustion (the helper is
+			// itself idempotent and re-reads HEAD post-probe to defend
+			// against further movement).
+			headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
+			if probeErr != nil {
+				return sum, probeErr
+			}
+			if alreadyPublished {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+					return sum, err
+				}
+				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after cas idempotent publish: %w", err)
+				}
+				parent = headOID
+				activeCtx.BaseHead = headOID
+				sum.BaseHead = headOID
+				sum.Published++
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_after_cas_exhaustion", map[string]any{
+					"commit": headOID,
+					"parent": oldOID,
+				})
+				continue
+			}
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
