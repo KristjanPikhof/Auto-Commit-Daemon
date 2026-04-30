@@ -40,8 +40,9 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 
 	pauseReplay(t, ctx, env, repo, "parallel committer test")
 	writeFile(t, target, "same change\n")
-	wakeSession(t, ctx, env, repo, "selfheal-parallel")
-	waitForEventState(t, dbPath, "parallel.txt", "pending", 8*time.Second)
+	// Under the new contract, manual pause halts BOTH capture and replay.
+	// The worktree edit will not be captured until after resume; only then
+	// does the daemon diff worktree against shadow_paths and queue events.
 
 	externalHead := gitCommitAll(t, repo, "external parallel commit", "parallel.txt")
 	if externalHead == initialHead {
