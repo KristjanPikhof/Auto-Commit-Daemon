@@ -936,6 +936,12 @@ func TestReplay_CASRetryRecoversFromLock(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	// Seed shadow_paths so the seed's .gitignore is not re-captured as a
+	// no-op create event (which would settle idempotently and never call
+	// the update-ref seam this test pivots on).
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(f.dir, "cas-retry.txt"), []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write cas-retry.txt: %v", err)
 	}
