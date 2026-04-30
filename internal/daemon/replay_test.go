@@ -1857,6 +1857,18 @@ func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture,
 	return len(pending)
 }
 
+// captureEventsTotal returns the total row count of capture_events, regardless
+// of state. Used by the rewind-grace tests to assert capture is paused
+// alongside replay (no new pending/blocked/published rows are synthesized).
+func captureEventsTotal(t *testing.T, ctx context.Context, db *state.DB) int {
+	t.Helper()
+	var n int
+	if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&n); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	return n
+}
+
 func assertPendingCount(t *testing.T, ctx context.Context, db *state.DB, want int) {
 	t.Helper()
 	pending, err := state.PendingEvents(ctx, db, 0)
