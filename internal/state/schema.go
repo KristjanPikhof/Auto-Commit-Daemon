@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_capture_events_state_captured
 CREATE INDEX IF NOT EXISTS idx_capture_events_branch_generation_seq_state
     ON capture_events(branch_ref, branch_generation, seq, state);
 
+-- v3: barrier-friendly leading-state covering index. PendingEvents and the
+-- pending-depth cap both filter by (branch_ref, branch_generation, state)
+-- and order/aggregate on seq, so leading state lets SQLite jump straight to
+-- the matching rows without scanning unrelated branch_ref/generation pairs.
+CREATE INDEX IF NOT EXISTS idx_capture_events_barrier
+    ON capture_events(branch_ref, branch_generation, state, seq);
+
 CREATE TABLE IF NOT EXISTS capture_ops(
     event_seq    INTEGER NOT NULL,
     ord          INTEGER NOT NULL,
