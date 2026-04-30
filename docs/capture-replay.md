@@ -61,14 +61,17 @@ single pass works as follows:
    b. **Conflict probe.** The scratch index (advanced by every prior event in
       this pass) is queried via `git ls-files -s` (`LsFilesIndex`). Each op's
       `before_oid`/`before_mode` is compared against what the scratch index
-      holds. If they disagree the event is `blocked_conflict` and the pass
-      halts — later events are NOT replayed because they were captured assuming
-      this one would land first.
+      holds. If they disagree the event is a candidate for `blocked_conflict` —
+      but step 2c (Idempotent publish check) may still settle it as `published`
+      when `HEAD` already reflects the captured after-state. Real before-state
+      mismatches that survive the idempotent check terminate the pass with
+      `blocked_conflict`; later events are NOT replayed because they were
+      captured assuming this one would land first.
 
-   c. **Idempotent publish check.** Before recording that before-state mismatch,
+   c. **Idempotent publish check.** Before recording a before-state mismatch,
       replay checks the current `HEAD` tree. If every op's desired final state is
-      already present, including absent paths for deletes and rename cleanup, the
-      event is marked `published` with `commit_oid = HEAD`. No new commit is
+      already present — including absent paths for deletes and rename cleanup —
+      the event is marked `published` with `commit_oid = HEAD`. No new commit is
       created. This handles parallel committers that already landed the same
       change.
 
