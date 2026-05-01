@@ -36,10 +36,10 @@ output is identical regardless of diff reconstruction success or failure. See
 ```sh
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=sk-...
+# Selecting a network provider auto-enables diff egress.
 # Optional overrides:
 # export ACD_AI_BASE_URL=https://api.openai.com/v1
 # export ACD_AI_MODEL=gpt-4o-mini
-# export ACD_AI_SEND_DIFF=1
 ```
 
 **Subprocess plugin:**
