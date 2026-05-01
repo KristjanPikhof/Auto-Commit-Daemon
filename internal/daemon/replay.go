@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -68,6 +69,7 @@ type ReplaySummary struct {
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
+	Skipped   bool // replay drain was intentionally skipped before reading events
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -102,33 +104,57 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		msgFn = DeterministicMessage
 	}
 
+	if paused, err := daemonPauseState(ctx, opts.GitDir, db); err != nil {
+		return sum, err
+	} else if paused.Active {
+		sum.BaseHead = cctx.BaseHead
+		sum.Skipped = true
+		traceReplayPaused(opts.Trace, repoRoot, cctx, paused)
+		return sum, nil
+	}
+
 	indexFile := opts.IndexFile
-	cleanupIndex := func() {}
 	if indexFile == "" {
 		if opts.GitDir == "" {
 			return sum, fmt.Errorf("daemon: Replay: IndexFile or GitDir required")
 		}
-		indexDir := filepath.Join(opts.GitDir, "acd")
-		if err := os.MkdirAll(indexDir, 0o700); err != nil {
+		// TOCTOU defense: create a private 0o700 directory and place the
+		// scratch index inside it. Never hand a *path* to git that we have
+		// pre-created and then unlinked — the open-after-unlink window
+		// would let a same-uid attacker substitute a symlink/regular file
+		// at the path before git's read-tree opens it. The directory is
+		// owned by us for the lifetime of the pass; git creates the index
+		// file inside it (no file pre-exists at the chosen path), and we
+		// tear the whole tree down on return.
+		indexParent := filepath.Join(opts.GitDir, "acd")
+		if err := os.MkdirAll(indexParent, 0o700); err != nil {
 			return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
 		}
-		tmp, err := os.CreateTemp(indexDir, "replay-*.index")
+		tmpDir, err := os.MkdirTemp(indexParent, "replay-")
 		if err != nil {
-			return sum, fmt.Errorf("daemon: replay: create temp index: %w", err)
+			return sum, fmt.Errorf("daemon: replay: mkdir temp index dir: %w", err)
 		}
-		indexFile = tmp.Name()
-		if err := tmp.Close(); err != nil {
-			_ = os.Remove(indexFile)
-			return sum, fmt.Errorf("daemon: replay: close temp index: %w", err)
+		// 0o700 is a defense-in-depth tighten — MkdirTemp already creates
+		// at 0o700 on POSIX, but be explicit so a future umask change or
+		// platform variance cannot widen the bag.
+		if err := os.Chmod(tmpDir, 0o700); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return sum, fmt.Errorf("daemon: replay: chmod temp index dir: %w", err)
 		}
-		cleanupIndex = func() { _ = os.Remove(indexFile) }
-		defer cleanupIndex()
+		indexFile = filepath.Join(tmpDir, "idx")
+		// Do NOT pre-create the index file. Do NOT unlink it. Hand the
+		// fresh path inside our private dir to git via GIT_INDEX_FILE on
+		// the first read-tree below.
+		defer os.RemoveAll(tmpDir)
 	} else if err := os.MkdirAll(filepath.Dir(indexFile), 0o700); err != nil {
 		return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
+	} else {
+		// Caller-provided path: stale entries from a prior crashed run
+		// would otherwise poison write-tree. The TOCTOU concern only
+		// applies to default temp paths; caller-supplied paths are
+		// assumed-trusted (used by tests that need to inspect the index).
+		_ = os.Remove(indexFile)
 	}
-	// Always start from a clean index: stale entries from a prior crashed
-	// run would otherwise poison write-tree.
-	_ = os.Remove(indexFile)
 
 	pending, err := state.PendingEvents(ctx, db, opts.Limit)
 	if err != nil {
@@ -149,15 +175,30 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	activeCtx := cctx
 	sum.BaseHead = parent
 
+	// Resolve the active branch ref ONCE per pass. Per-event re-resolution
+	// would fork a `git symbolic-ref HEAD` (and `rev-parse HEAD`) for every
+	// event in the queue — O(events) subprocess invocations for a
+	// pass-stable value. A concurrent committer that moves the ref will
+	// trip the CAS retry path below, where we refresh the branch+tree
+	// state on demand.
+	if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
+		activeCtx.BranchRef = branchRef
+		if headOID != "" && headOID == parent {
+			activeCtx.BaseHead = headOID
+		}
+	}
+	// Cache the parent's tree OID. After every successful commit we carry
+	// forward `treeOID` (the tree write-tree just produced is, by
+	// construction, the next parent's tree) so we never run a fresh
+	// `rev-parse <commit>^{tree}` per event in the steady state.
+	parentTree, err := resolveTreeOID(ctx, repoRoot, parent)
+	if err != nil {
+		return sum, err
+	}
+
 	for _, ev := range pending {
 		if err := ctx.Err(); err != nil {
 			return sum, err
-		}
-		if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
-			activeCtx.BranchRef = branchRef
-			if headOID != "" && headOID == parent {
-				activeCtx.BaseHead = headOID
-			}
 		}
 
 		// Branch-generation / ancestry guard. An event whose generation
@@ -230,6 +271,38 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if reason, err := detectConflict(ctx, repoRoot, indexFile, ops); err != nil {
 			return sum, err
 		} else if reason != "" {
+			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
+			if err != nil {
+				return sum, err
+			}
+			if alreadyPublished {
+				sourceHead := parent
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
+					return sum, err
+				}
+				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after idempotent publish: %w", err)
+				}
+				parent = headOID
+				// Parent OID changed to an external HEAD — its tree must
+				// be re-resolved before the next event can use parentTree
+				// for no-op detection. This is rare (only fires on a
+				// successful idempotent-publish), so the per-incident
+				// rev-parse cost stays O(parallel-publishers) rather than
+				// O(events).
+				parentTree, err = resolveTreeOID(ctx, repoRoot, parent)
+				if err != nil {
+					return sum, err
+				}
+				activeCtx.BaseHead = headOID
+				sum.BaseHead = headOID
+				sum.Published++
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
+					"commit": headOID,
+					"parent": sourceHead,
+				})
+				continue
+			}
 			recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorBeforeStateMismatch,
 				Message:    reason,
@@ -244,8 +317,58 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Apply ops to the isolated index, write a tree, commit, advance HEAD.
-		commitOID, err := commitOneEvent(ctx, repoRoot, indexFile, parent, ev, ops, msgFn)
+		// Apply ops to the isolated index and write a tree. We split this
+		// out from commit-tree so we can short-circuit a parallel-create
+		// no-op: when an external committer already produced the same
+		// tree on top of `parent`, the resulting tree OID matches
+		// `parent`'s tree and we settle the event as already-published
+		// without minting an empty commit.
+		treeOID, err := applyOpsAndWriteTree(ctx, repoRoot, indexFile, ops)
+		if err != nil {
+			markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorCommitBuildFailure,
+				Message:    err.Error(),
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			})
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+			sum.Failed++
+			return sum, nil
+		}
+
+		// Parallel-create no-op: if write-tree produced the same tree as
+		// the current parent, the captured ops are already reflected in
+		// HEAD's tree (an external committer landed an identical change
+		// before we got here). Settle the event as published against
+		// `parent` without committing an empty tree.
+		//
+		// `parentTree` was resolved once at pass start (or refreshed on
+		// the CAS retry path) — re-resolving via `rev-parse <parent>^{tree}`
+		// per event would fork an extra git subprocess for every queued
+		// row in the steady state.
+		if parentTree != "" && treeOID == parentTree {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
+				return sum, err
+			}
+			// Reseed the scratch index from `parent` so chained events
+			// see a clean baseline (write-tree leaves stale entries
+			// otherwise).
+			if err := git.ReadTree(ctx, repoRoot, indexFile, parent); err != nil {
+				return sum, fmt.Errorf("daemon: replay reseed index after no-op tree: %w", err)
+			}
+			activeCtx.BaseHead = parent
+			sum.BaseHead = parent
+			sum.Published++
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_no_op_tree", map[string]any{
+				"commit": parent,
+				"parent": parent,
+				"tree":   treeOID,
+			})
+			continue
+		}
+
+		// Build the commit on top of the new tree.
+		commitOID, err := buildCommitFromTree(ctx, repoRoot, treeOID, parent, ev, ops, msgFn)
 		if err != nil {
 			markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
@@ -270,6 +393,52 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			oldOID = ""
 		}
 		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+			// CAS exhausted. Before declaring conflict, give the
+			// idempotent path one shot: an external committer may have
+			// landed identical content between our write-tree and our
+			// final update-ref attempt, leaving HEAD's tree already in
+			// the desired shape. alreadyPublishedAtHEAD enforces an
+			// ancestry guard against `parent` so we cannot mistakenly
+			// settle on top of a HEAD that diverged from our anchor.
+			//
+			// Only one probe per CAS exhaustion (the helper is
+			// itself idempotent and re-reads HEAD post-probe to defend
+			// against further movement).
+			headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
+			if probeErr != nil {
+				return sum, probeErr
+			}
+			if alreadyPublished {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+					return sum, err
+				}
+				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after cas idempotent publish: %w", err)
+				}
+				parent = headOID
+				// CAS lost to a concurrent committer. Re-resolve the
+				// branch ref + parent tree so subsequent events in this
+				// pass observe the post-publish anchor instead of the
+				// stale pre-CAS tree we cached at pass start.
+				if branchRef, refHead := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
+					activeCtx.BranchRef = branchRef
+					if refHead != "" && refHead == parent {
+						activeCtx.BaseHead = refHead
+					}
+				}
+				parentTree, err = resolveTreeOID(ctx, repoRoot, parent)
+				if err != nil {
+					return sum, err
+				}
+				activeCtx.BaseHead = headOID
+				sum.BaseHead = headOID
+				sum.Published++
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_after_cas_exhaustion", map[string]any{
+					"commit": headOID,
+					"parent": oldOID,
+				})
+				continue
+			}
 			// CAS failed: ref moved out from under us. Block terminally —
 			// every queued event downstream was captured against the
 			// stale ref and must wait for branch reconciliation.
@@ -295,25 +464,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Settle the event row + publish_state.
-		nowSec := float64(time.Now().UnixNano()) / 1e9
-		if err := state.MarkEventPublished(ctx, db,
-			ev.Seq, state.EventStatePublished,
-			sql.NullString{String: commitOID, Valid: true},
-			sql.NullString{},
-			ev.Message, nowSec,
-		); err != nil {
-			return sum, fmt.Errorf("daemon: mark published: %w", err)
+		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
+			return sum, err
 		}
-		_ = state.SavePublishState(ctx, db, state.Publish{
-			EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
-			BranchRef:        sql.NullString{String: activeCtx.BranchRef, Valid: true},
-			BranchGeneration: sql.NullInt64{Int64: activeCtx.BranchGeneration, Valid: true},
-			SourceHead:       sql.NullString{String: parent, Valid: true},
-			TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
-			Status:           "published",
-		})
 
 		parent = commitOID
+		// Carry forward `treeOID` as the new parent's tree. The commit we
+		// just produced (commitOID) was built from this exact tree by
+		// commit-tree, so an extra `git rev-parse <commitOID>^{tree}` would
+		// be redundant. Steady-state branch+tree probes are now O(passes),
+		// not O(events).
+		parentTree = treeOID
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.Published++
@@ -335,6 +496,101 @@ var replayUpdateRefBackoffs = []time.Duration{
 	50 * time.Millisecond,
 	100 * time.Millisecond,
 	200 * time.Millisecond,
+}
+
+type replayPause struct {
+	Active    bool
+	Source    string
+	Reason    string
+	SetAt     string
+	ExpiresAt string
+	Remaining int64
+}
+
+// daemonPauseState reads the daemon pause gate that BOTH replay and capture
+// honor. Sources, in priority order:
+//
+//  1. Manual pause marker at <gitDir>/acd/paused (durable JSON written by
+//     `acd pause`, cleared by `acd resume`). Active when present and not
+//     expired. Malformed markers fail open with a warning.
+//  2. Rewind grace under daemon_meta.replay.paused_until — set when the
+//     daemon detects a same-branch rewind (newHead is an ancestor of the
+//     previous head, e.g. operator ran `git reset --soft HEAD~1`). The
+//     gate covers BOTH replay and capture so transient worktree state
+//     observed during the rewind window is NOT captured into the queue;
+//     otherwise the post-grace replay would resurrect work the operator
+//     just rewound.
+//
+// Detached HEAD pauses are handled by a separate gate in the Run loop.
+//
+// Callers must skip the capture pass and the replay drain when
+// `paused.Active` is true. The shared helper guarantees both lanes observe
+// the same state (alias retained for replay-internal call sites).
+func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayPause, error) {
+	now := time.Now().UTC()
+	if gitDir != "" {
+		marker, ok, err := pausepkg.Read(gitDir)
+		if errors.Is(err, pausepkg.ErrMalformed) {
+			slog.Default().Warn("ignoring malformed pause marker", "err", err.Error())
+		} else if err != nil {
+			return replayPause{}, fmt.Errorf("daemon: read pause marker: %w", err)
+		} else if ok {
+			paused, err := markerPauseState(marker, now)
+			if err != nil {
+				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+			} else if paused.Active {
+				return paused, nil
+			}
+		}
+	}
+
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		return replayPause{}, fmt.Errorf("daemon: read replay pause meta: %w", err)
+	}
+	if !ok || strings.TrimSpace(raw) == "" {
+		return replayPause{}, nil
+	}
+	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		return replayPause{}, nil
+	}
+	if !until.After(now) {
+		if _, err := state.MetaDelete(ctx, db, MetaKeyReplayPausedUntil); err != nil {
+			return replayPause{}, fmt.Errorf("daemon: clear expired replay pause meta: %w", err)
+		}
+		return replayPause{}, nil
+	}
+	return replayPause{
+		Active:    true,
+		Source:    "rewind_grace",
+		Reason:    "rewind grace",
+		ExpiresAt: until.UTC().Format(time.RFC3339),
+		Remaining: int64(until.Sub(now).Seconds()),
+	}, nil
+}
+
+func markerPauseState(marker pausepkg.Marker, now time.Time) (replayPause, error) {
+	paused := replayPause{
+		Active: true,
+		Source: "manual",
+		Reason: marker.Reason,
+		SetAt:  marker.SetAt,
+	}
+	if marker.ExpiresAt == nil || strings.TrimSpace(*marker.ExpiresAt) == "" {
+		return paused, nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*marker.ExpiresAt))
+	if err != nil {
+		return replayPause{}, fmt.Errorf("parse expires_at: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return replayPause{}, nil
+	}
+	paused.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+	paused.Remaining = int64(expiresAt.Sub(now).Seconds())
+	return paused, nil
 }
 
 func updateReplayRefWithRetry(
@@ -423,6 +679,178 @@ func traceReplayUpdateRef(
 		}
 	}
 	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
+}
+
+// alreadyPublishedAtHEAD reports whether HEAD's tree already reflects the
+// captured ops, signalling that an external committer landed our intent
+// before we got there. Returning (headOID, true, nil) tells the caller to
+// settle the event as published against `headOID` without minting a new
+// commit.
+//
+// Two guards keep idempotent settle from masking real divergence:
+//
+//  1. Ancestry guard: `sourceHead` (the replay parent the event was about
+//     to chain off) MUST be an ancestor of the current HEAD. If HEAD has
+//     diverged from our parent (operator hard-reset to an unrelated
+//     branch, force-push, etc.) the matching tree state is coincidence,
+//     not a successful parallel publish — return false and let the caller
+//     block terminally. An empty `sourceHead` skips the probe (initial
+//     commit / orphan repo).
+//  2. HEAD-movement guard: HEAD is re-resolved AFTER the per-op tree
+//     probes. If the resolved OID has shifted between the first read and
+//     the post-probe re-read, the captured tree state is no longer
+//     guaranteed to correspond to the live HEAD — return false so the
+//     caller retries on the next replay pass with a fresh anchor.
+func alreadyPublishedAtHEAD(ctx context.Context, repoRoot, sourceHead string, ops []state.CaptureOp) (string, bool, error) {
+	// Defensive empty-ops guard. The replay loop only reaches this helper
+	// after validateOps + LoadCaptureOps, but a future refactor could
+	// hand us a zero-length slice — settle to "not published" rather than
+	// silently confirming an empty event.
+	if len(ops) == 0 {
+		return "", false, nil
+	}
+	headOID, err := git.RevParse(ctx, repoRoot, "HEAD")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
+	}
+	// Ancestry guard: an external HEAD that doesn't descend from our
+	// replay parent means the matching tree state is coincidence, not a
+	// successful parallel publish. Return (headOID, false) so the caller
+	// can record a real conflict instead of silently chaining off a
+	// stranger.
+	if sourceHead != "" && sourceHead != headOID {
+		descends, err := git.IsAncestor(ctx, repoRoot, sourceHead, headOID)
+		if err != nil {
+			return "", false, fmt.Errorf("ancestry probe %s..%s: %w", sourceHead, headOID, err)
+		}
+		if !descends {
+			return headOID, false, nil
+		}
+	}
+	for _, op := range ops {
+		if op.Op == "delete" {
+			// Delete is idempotent only when HEAD has NO entry at all
+			// for this path. A path replaced by a directory (tree
+			// entry) or a submodule (commit entry) is NOT absent —
+			// settling as published would mask a real divergence.
+			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.Path)
+			if err != nil {
+				return "", false, err
+			}
+			if !absent {
+				return headOID, false, nil
+			}
+			continue
+		}
+		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
+		if err != nil {
+			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+		}
+		if !op.AfterOID.Valid || op.AfterOID.String == "" {
+			return headOID, false, nil
+		}
+		if blobOID != op.AfterOID.String {
+			return headOID, false, nil
+		}
+		if op.AfterMode.Valid && op.AfterMode.String != "" {
+			entries, err := git.LsTree(ctx, repoRoot, headOID, false, op.Path)
+			if err != nil {
+				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+			}
+			if !treeEntryModeMatches(entries, op.Path, op.AfterMode.String) {
+				return headOID, false, nil
+			}
+		}
+		if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
+			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.OldPath.String)
+			if err != nil {
+				return "", false, err
+			}
+			if !absent {
+				return headOID, false, nil
+			}
+			// Rename source verify: before settling as already-published
+			// we require the captured BeforeOID for the rename source to
+			// still be present in the object database. If it's missing
+			// (gc'd, partial fetch), we cannot prove the rename actually
+			// matches the captured intent, so refuse to settle and let
+			// the caller block.
+			if op.BeforeOID.Valid && op.BeforeOID.String != "" {
+				present, err := objectExists(ctx, repoRoot, op.BeforeOID.String)
+				if err != nil {
+					return "", false, err
+				}
+				if !present {
+					return headOID, false, nil
+				}
+			}
+		}
+	}
+	// HEAD-movement guard: the per-op probes above all read against the
+	// `headOID` we resolved at the start. If HEAD has moved while we were
+	// probing (an external committer landed something between the first
+	// rev-parse and the last ls-tree), the matching tree state no longer
+	// describes the live ref. Refuse to settle and let the caller try
+	// again on the next pass with a fresh anchor.
+	postHead, err := git.RevParse(ctx, repoRoot, "HEAD")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("rev-parse HEAD post-probe: %w", err)
+	}
+	if postHead != headOID {
+		return postHead, false, nil
+	}
+	return headOID, true, nil
+}
+
+// isPathAbsentInTree reports whether path is absent at ref. A path resolved
+// to a non-blob entry (tree, submodule) is treated as NOT absent — the
+// caller's idempotent check must not confuse a directory-replacement with
+// a successful delete.
+func isPathAbsentInTree(ctx context.Context, repoRoot, ref, path string) (bool, error) {
+	entries, err := git.LsTree(ctx, repoRoot, ref, false, path)
+	if err != nil {
+		return false, fmt.Errorf("ls-tree %s %s: %w", ref, path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path == path {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// objectExists reports whether the given OID is present in the local
+// object database via `git cat-file -e`. Used by the rename-source verify
+// path so the daemon will not settle a rename as published when the
+// captured BeforeOID is no longer reachable (shallow clone, gc'd ref).
+func objectExists(ctx context.Context, repoRoot, oid string) (bool, error) {
+	if oid == "" {
+		return false, nil
+	}
+	_, _, err := git.RunWithStderr(ctx, git.RunOpts{Dir: repoRoot}, "cat-file", "-e", oid)
+	if err == nil {
+		return true, nil
+	}
+	var gerr *git.Error
+	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("cat-file -e %s: %w", oid, err)
+}
+
+func treeEntryModeMatches(entries []git.TreeEntry, path, mode string) bool {
+	for _, entry := range entries {
+		if entry.Path == path && entry.Type == "blob" {
+			return entry.Mode == mode
+		}
+	}
+	return false
 }
 
 // validateOps mirrors snapshot-replay._validate_op: every op kind must
@@ -546,11 +974,15 @@ func touchedPaths(ops []state.CaptureOp) []string {
 	return out
 }
 
-// commitOneEvent applies ops via update-index --index-info on the isolated
-// index, runs write-tree, composes the commit message, and runs commit-tree.
-// Returns the new commit OID; the caller is responsible for update-ref.
-func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
-	// Build update-index payload. Mirrors snapshot_state.apply_ops_to_index.
+// applyOpsAndWriteTree applies ops via update-index --index-info on the
+// isolated index and runs write-tree, returning the resulting tree OID. The
+// caller decides whether to mint a commit (and is responsible for any
+// follow-up update-ref).
+//
+// Mirrors snapshot_state.apply_ops_to_index. Split out from commitOneEvent
+// so the replay loop can compare the new tree against the parent tree and
+// skip commit-tree on a parallel-create no-op.
+func applyOpsAndWriteTree(ctx context.Context, repoRoot, indexFile string, ops []state.CaptureOp) (string, error) {
 	const zeroOID = "0000000000000000000000000000000000000000"
 	var lines []string
 	for _, op := range ops {
@@ -577,7 +1009,13 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 	if err != nil {
 		return "", fmt.Errorf("write-tree: %w", err)
 	}
+	return tree, nil
+}
 
+// buildCommitFromTree composes the commit message and runs commit-tree on
+// the supplied tree OID. Returns the new commit OID; the caller is
+// responsible for update-ref.
+func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
 	msg, err := msgFn(ctx, EventContext{Event: ev, Ops: ops})
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
@@ -591,11 +1029,56 @@ func commitOneEvent(ctx context.Context, repoRoot, indexFile, parent string, ev 
 	if parent != "" {
 		parents = []string{parent}
 	}
-	commitOID, err := git.CommitTree(ctx, repoRoot, tree, msg, parents...)
+	commitOID, err := git.CommitTree(ctx, repoRoot, treeOID, msg, parents...)
 	if err != nil {
 		return "", fmt.Errorf("commit-tree: %w", err)
 	}
 	return commitOID, nil
+}
+
+// resolveTreeOID returns the tree OID at the given commit. Empty input
+// returns ("", nil) so the caller can short-circuit. Missing refs are also
+// surfaced as ("", nil) — there is no parent tree to compare against.
+func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error) {
+	if commit == "" {
+		return "", nil
+	}
+	tree, err := git.RevParse(ctx, repoRoot, commit+"^{tree}")
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("rev-parse %s^{tree}: %w", commit, err)
+	}
+	return tree, nil
+}
+
+func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID string) error {
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	if err := state.MarkEventPublished(ctx, db,
+		ev.Seq, state.EventStatePublished,
+		sql.NullString{String: commitOID, Valid: true},
+		sql.NullString{},
+		ev.Message, nowSec,
+	); err != nil {
+		return fmt.Errorf("daemon: mark published: %w", err)
+	}
+	if err := state.SavePublishState(ctx, db, state.Publish{
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: true},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		SourceHead:       sql.NullString{String: sourceHead, Valid: true},
+		TargetCommitOID:  sql.NullString{String: commitOID, Valid: true},
+		Status:           "published",
+	}); err != nil {
+		// Best-effort: the event row is already marked published via
+		// MarkEventPublished above. publish_state is the operator-visible
+		// breadcrumb singleton — surfacing the failure as a slog warn is
+		// enough so the event row itself stays authoritative.
+		slog.Default().Warn("save publish_state after MarkEventPublished",
+			"seq", ev.Seq, "commit", commitOID, "err", err.Error())
+	}
+	return nil
 }
 
 // markFailed flags an event as terminally failed and records the reason.
@@ -747,6 +1230,58 @@ func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, e
 	})
 }
 
+func traceCapturePaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
+	output := map[string]any{
+		"source": paused.Source,
+	}
+	if paused.Reason != "" {
+		output["reason"] = paused.Reason
+	}
+	if paused.SetAt != "" {
+		output["set_at"] = paused.SetAt
+	}
+	if paused.ExpiresAt != "" {
+		output["expires_at"] = paused.ExpiresAt
+		output["remaining_seconds"] = paused.Remaining
+	}
+	recordTrace(logger, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "capture.pause",
+		Decision:   "skipped",
+		Reason:     "capture_paused",
+		Output:     output,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceReplayPaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
+	output := map[string]any{
+		"source": paused.Source,
+	}
+	if paused.Reason != "" {
+		output["reason"] = paused.Reason
+	}
+	if paused.SetAt != "" {
+		output["set_at"] = paused.SetAt
+	}
+	if paused.ExpiresAt != "" {
+		output["expires_at"] = paused.ExpiresAt
+		output["remaining_seconds"] = paused.Remaining
+	}
+	recordTrace(logger, acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "replay.pause",
+		Decision:   "skipped",
+		Reason:     "replay_paused",
+		Output:     output,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
 func traceError(decision, reason string) string {
 	if decision == state.EventStatePublished || reason == "" {
 		return ""
@@ -800,7 +1335,7 @@ func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state
 	if ev.BaseHead == parent {
 		return "", nil
 	}
-	ok, err := git.MergeBaseIsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
 	if err != nil {
 		// merge-base failed — most often because ev.BaseHead is no
 		// longer in the object database (gc'd reset). Treat as a

@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -212,6 +213,22 @@ func Run(ctx context.Context, opts Options) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Top-level panic recover. The daemon owns long-lived resources whose
+	// cleanup runs through subsequent defers (IgnoreChecker subprocess,
+	// fsnotify watcher, central stats DB, AI provider closer, trace
+	// writer). An unrecovered panic would skip those defers entirely and
+	// leak the check-ignore subprocess; recovering here lets the deferred
+	// Close calls run before we re-panic so the operator sees the original
+	// trace and the orphan process is reaped.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("daemon panic; deferred cleanup will run before re-raise",
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()))
+			// Re-raise so the harness/test runner observes the failure.
+			panic(r)
+		}
+	}()
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -388,6 +405,12 @@ func Run(ctx context.Context, opts Options) error {
 			branchTransitionBlocked = true
 		} else if transition == TokenTransitionDiverged {
 			prevGeneration := persistedGen
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, prevToken, currentToken, now())
+			if rewindErr != nil {
+				logger.Warn("detect startup rewind grace", "err", rewindErr.Error())
+			} else if rewindPaused {
+				logger.Info("replay paused after startup branch rewind", "until", rewindUntil)
+			}
 			persistedGen++
 			droppedPending, dropErr := state.DeletePendingForGeneration(ctx, opts.DB, prevGeneration)
 			if dropErr != nil {
@@ -549,6 +572,23 @@ func Run(ctx context.Context, opts Options) error {
 		lastRollup        = time.Time{}
 		lastRollupUTCDay  = ""
 		stopped           bool
+
+		// operation_in_progress staleness tracking. opMarkerSetAt is the
+		// monotonic-ish wall-clock observation of when the current marker
+		// first appeared (in this process). opMarkerHead is the HEAD SHA at
+		// that point. Both reset to zero/empty when the marker disappears.
+		// opMarkerWarnedAt rate-limits the "marker may be stale" warning.
+		opMarkerSetAt    time.Time
+		opMarkerHead     string
+		opMarkerWarnedAt time.Time
+	)
+	const (
+		// staleOpMarkerThreshold: how long an operation_in_progress marker
+		// must stay present (with HEAD motionless) before we surface a
+		// "marker may be stale" warning.
+		staleOpMarkerThreshold = 15 * time.Minute
+		// staleOpMarkerWarnInterval: throttle for the periodic warning.
+		staleOpMarkerWarnInterval = 5 * time.Minute
 	)
 
 	graceful := func(reason string) {
@@ -586,6 +626,81 @@ func Run(ctx context.Context, opts Options) error {
 			return false
 		}
 		if SameGeneration(currentToken, newToken) {
+			// Cross-tick same-SHA rewind probe.
+			//
+			// `git reset --hard HEAD~1` followed by `git reset --hard ORIG_HEAD`
+			// between two daemon ticks leaves the token byte-identical, so the
+			// SameGeneration short-circuit hides a real rewind from
+			// maybeSetRewindGrace and capture would otherwise enqueue any
+			// transient worktree changes the operator just rewound.
+			//
+			// We persist the live HEAD on every tick (see the unconditional
+			// stamp at the bottom of this function). If the persisted HEAD
+			// differs from BOTH the in-memory token's SHA and the freshly-read
+			// live HEAD, an out-of-band observer recorded a different HEAD
+			// between ticks. Probe ancestry: when the live HEAD is an ancestor
+			// of the persisted (i.e. backward), classify as a same-SHA rewind
+			// and set the grace gate just like the explicit divergence path.
+			liveHead := tokenSHA(newToken)
+			tokenHead := tokenSHA(currentToken)
+			liveBranchRef := tokenBranchRef(newToken)
+			if liveHead != "" && tokenHead != "" && liveBranchRef != "" {
+				persistedHead, lhErr := LoadBranchHead(ctx, opts.DB)
+				if lhErr != nil {
+					logger.Warn(logPrefix+" load persisted head for cross-tick probe",
+						"err", lhErr.Error())
+				} else if persistedHead != "" &&
+					persistedHead != tokenHead &&
+					persistedHead != liveHead {
+					ok, aErr := git.IsAncestor(ctx, opts.RepoPath, liveHead, persistedHead)
+					if aErr != nil {
+						logger.Warn(logPrefix+" cross-tick ancestry probe failed",
+							"err", aErr.Error())
+					} else if ok {
+						synthesizedPrev := branchTokenRev(persistedHead, liveBranchRef)
+						rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(
+							ctx, opts.RepoPath, opts.DB, synthesizedPrev, newToken, now())
+						if rewindErr != nil {
+							logger.Warn(logPrefix+" cross-tick rewind grace failed",
+								"err", rewindErr.Error())
+						} else if rewindPaused {
+							logger.Info("replay paused after cross-tick same-SHA rewind",
+								"persisted_head", persistedHead,
+								"live_head", liveHead,
+								"until", rewindUntil)
+							recordTrace(tracer, acdtrace.Event{
+								Repo:       opts.RepoPath,
+								BranchRef:  liveBranchRef,
+								HeadSHA:    liveHead,
+								EventClass: "branch_token.transition",
+								Decision:   "diverged",
+								Reason:     "cross-tick same-SHA rewind detected",
+								Input: map[string]any{
+									"persisted": persistedHead,
+									"current":   tokenHead,
+									"live":      liveHead,
+								},
+								Output: map[string]any{
+									"rewind_until": rewindUntil,
+								},
+								Generation: cctx.BranchGeneration,
+							})
+						}
+					}
+				}
+			}
+			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync
+			// with the freshly-observed live HEAD so the next tick's probe
+			// has a current baseline rather than a stale value written by an
+			// old transition. Cheap meta upsert; no error abort — a failure
+			// just means the next probe sees the same stale value, which is
+			// what the previous code did unconditionally.
+			if liveHead != "" {
+				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead); err != nil {
+					logger.Warn(logPrefix+" stamp branch head per-tick",
+						"err", err.Error())
+				}
+			}
 			return false
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
@@ -605,6 +720,12 @@ func Run(ctx context.Context, opts Options) error {
 		currentToken = newToken
 		if transition == TokenTransitionDiverged {
 			prevGeneration := cctx.BranchGeneration
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, oldToken, newToken, now())
+			if rewindErr != nil {
+				logger.Warn(logPrefix+" detect rewind grace failed", "err", rewindErr.Error())
+			} else if rewindPaused {
+				logger.Info("replay paused after branch rewind", "until", rewindUntil)
+			}
 			cctx.BranchGeneration++
 			logger.Info("branch generation bumped",
 				"old", oldToken, "new", newToken,
@@ -664,23 +785,92 @@ func Run(ctx context.Context, opts Options) error {
 			// Fast-forward: persist the new HEAD so the next transition
 			// compares against the latest baseline, but keep the generation
 			// counter put.
-			logger.Debug("branch fast-forwarded",
-				"old", oldToken, "new", newToken,
-				"generation", cctx.BranchGeneration)
-			recordTrace(tracer, acdtrace.Event{
-				Repo:       opts.RepoPath,
-				BranchRef:  cctx.BranchRef,
-				HeadSHA:    cctx.BaseHead,
-				EventClass: "branch_token.transition",
-				Decision:   transition.String(),
-				Reason:     "run-loop token transition classified",
-				Input:      map[string]any{"previous": oldToken, "current": newToken},
-				Output:     map[string]any{"generation": cctx.BranchGeneration},
-				Generation: cctx.BranchGeneration,
-			})
-			if err := SaveBranchGeneration(ctx, opts.DB,
-				cctx.BranchGeneration, headOID); err != nil {
-				logger.Warn("persist branch head", "err", err.Error())
+			//
+			// Exception: if a rewind-grace marker is currently active, the
+			// previous tick's same-branch rewind reseeded shadow_paths from
+			// the rewound (lower) HEAD. A fast-forward landing inside that
+			// window must NOT just bump BaseHead; the next post-grace capture
+			// pass would otherwise compare the live HEAD's tracked files
+			// against shadow rows seeded at the rewound HEAD and emit phantom
+			// `create` events for content that is already published. Treat
+			// this FF as a generation boundary: bump the generation, reseed
+			// shadow from the new HEAD, and clear the grace gate so the
+			// resumed capture/replay drain sees a clean shadow.
+			graceActive, until, gErr := rewindGraceActive(ctx, opts.DB, now())
+			if gErr != nil {
+				logger.Warn(logPrefix+" probe rewind grace failed",
+					"err", gErr.Error())
+			}
+			if graceActive {
+				prevGeneration := cctx.BranchGeneration
+				cctx.BranchGeneration++
+				logger.Info("fast-forward inside rewind grace; reseeding shadow",
+					"old", oldToken, "new", newToken,
+					"generation", cctx.BranchGeneration,
+					"grace_until", until)
+				recordTrace(tracer, acdtrace.Event{
+					Repo:       opts.RepoPath,
+					BranchRef:  cctx.BranchRef,
+					HeadSHA:    cctx.BaseHead,
+					EventClass: "branch_token.transition",
+					Decision:   transition.String(),
+					Reason:     "fast-forward inside rewind grace; reseeding shadow",
+					Input:      map[string]any{"previous": oldToken, "current": newToken},
+					Output: map[string]any{
+						"prev_generation": prevGeneration,
+						"new_generation":  cctx.BranchGeneration,
+						"grace_until":     until,
+					},
+					Generation: cctx.BranchGeneration,
+				})
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist branch generation after FF-in-grace",
+						"err", err.Error())
+				}
+				if cctx.BranchRef != "" {
+					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+						logger.Warn("reseed shadow after FF-in-grace",
+							"err", err.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+					} else {
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "FF-in-grace shadow reseed", seeded)
+						if seeded > 0 {
+							logger.Info("shadow reseeded after FF-in-grace",
+								"rows", seeded,
+								"generation", cctx.BranchGeneration)
+						}
+						if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+							logger.Warn("prune old shadow generations", "err", pErr.Error())
+						} else if pruned > 0 {
+							logger.Info("pruned old shadow generations", "rows", pruned)
+						}
+					}
+				}
+				// Clear the rewind grace gate now that shadow is consistent
+				// with the current HEAD. Capture/replay can resume on the
+				// next tick.
+				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+					"fast-forward inside rewind grace")
+			} else {
+				logger.Debug("branch fast-forwarded",
+					"old", oldToken, "new", newToken,
+					"generation", cctx.BranchGeneration)
+				recordTrace(tracer, acdtrace.Event{
+					Repo:       opts.RepoPath,
+					BranchRef:  cctx.BranchRef,
+					HeadSHA:    cctx.BaseHead,
+					EventClass: "branch_token.transition",
+					Decision:   transition.String(),
+					Reason:     "run-loop token transition classified",
+					Input:      map[string]any{"previous": oldToken, "current": newToken},
+					Output:     map[string]any{"generation": cctx.BranchGeneration},
+					Generation: cctx.BranchGeneration,
+				})
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist branch head", "err", err.Error())
+				}
 			}
 		}
 		return false
@@ -733,6 +923,18 @@ func Run(ctx context.Context, opts Options) error {
 		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
 		if operationPaused {
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
+			// Stale-marker tracking: stamp the wall-clock + HEAD the first
+			// time we see this marker, persist for diagnose, then warn
+			// periodically when both have been motionless past threshold.
+			currentHead, _ := git.RevParse(ctx, opts.RepoPath, "HEAD")
+			nowTS := now()
+			if opMarkerSetAt.IsZero() {
+				opMarkerSetAt = nowTS
+				opMarkerHead = currentHead
+				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressSetAt, stamp)
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressHead, currentHead)
+			}
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
 			recordTrace(tracer, acdtrace.Event{
@@ -745,8 +947,33 @@ func Run(ctx context.Context, opts Options) error {
 				Input:      map[string]any{"operation": operationName},
 				Generation: cctx.BranchGeneration,
 			})
+			// Stale heuristic: marker present > threshold AND HEAD has not
+			// moved since we first saw it. We never auto-clear — operator
+			// must run `git rebase --abort` (or remove the marker) by hand.
+			elapsed := nowTS.Sub(opMarkerSetAt)
+			if elapsed >= staleOpMarkerThreshold && currentHead == opMarkerHead {
+				if opMarkerWarnedAt.IsZero() || nowTS.Sub(opMarkerWarnedAt) >= staleOpMarkerWarnInterval {
+					logger.Warn("operation_in_progress marker may be stale; verify git status",
+						"operation", operationName,
+						"head", currentHead,
+						"duration", elapsed.Round(time.Second).String())
+					opMarkerWarnedAt = nowTS
+				}
+			}
 		} else if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyOperationInProgress); ok {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgress)
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgressSetAt)
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyOperationInProgressHead)
+			opMarkerSetAt = time.Time{}
+			opMarkerHead = ""
+			opMarkerWarnedAt = time.Time{}
+			// Operation cleared is an explicit operator transition. A stale
+			// rewind-grace marker from before the operation must NOT survive
+			// it — otherwise capture/replay stay muted up to
+			// ACD_REWIND_GRACE_SECONDS post-resume. Best-effort: log on
+			// failure, don't abort the resume path.
+			clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+				"git operation cleared")
 			recordTrace(tracer, acdtrace.Event{
 				Repo:       opts.RepoPath,
 				BranchRef:  cctx.BranchRef,
@@ -772,6 +999,13 @@ func Run(ctx context.Context, opts Options) error {
 					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
 						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 					}
+					// Reattach is an explicit operator transition. Like the
+					// operation-cleared path above, a stale rewind-grace marker
+					// from before the detach must NOT survive the reattach —
+					// otherwise capture/replay stay muted up to
+					// ACD_REWIND_GRACE_SECONDS post-reattach.
+					clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+						"detached HEAD reattached")
 					if headOID != "" {
 						if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 							logger.Warn("bootstrap shadow after reattach",
@@ -826,11 +1060,28 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		// 4f. Capture pass.
+		//
+		// Manual pause + rewind grace pause BOTH capture and replay. This is
+		// symmetric with the detached-HEAD pause and the git-operation pause:
+		// while the operator's repo is in a transient state (mid-rewind, mid-
+		// rebase, paused for surgery), capture must NOT enqueue events that
+		// reflect that transient state. Otherwise the post-pause replay drain
+		// would resurrect work the operator just rewound. Detached HEAD has
+		// its own dedicated gate above.
 		var (
-			capSum CaptureSummary
-			capErr error
+			capSum     CaptureSummary
+			capErr     error
+			daemonPaus replayPause
+			pauseErr   error
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
+		if !branchTransitionBlocked && !operationPaused && !detachedHeadPaused {
+			daemonPaus, pauseErr = daemonPauseState(ctx, opts.GitDir, opts.DB)
+			if pauseErr != nil {
+				logger.Warn("read daemon pause state", "err", pauseErr.Error())
+			}
+		}
+		daemonPaused := pauseErr == nil && daemonPaus.Active
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
 		} else if operationPaused {
@@ -840,11 +1091,22 @@ func Run(ctx context.Context, opts Options) error {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
 			logger.Warn("detached HEAD detected; capture/replay paused")
+		} else if daemonPaused {
+			logger.Warn("daemon paused; capture skipped",
+				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
+			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
 		} else if cctx.BaseHead != "" {
+			// The run loop has already evaluated the pause gate above and
+			// emitted the trace event when paused; SkipPauseCheck=true
+			// prevents Capture from re-tracing the same decision. GitDir
+			// is still wired through so that direct callers (tests,
+			// future CLI wrappers) honor the same gate symmetrically.
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
 				SensitiveMatcher: matcher,
 				Trace:            tracer,
+				GitDir:           opts.GitDir,
+				SkipPauseCheck:   true,
 			})
 		}
 
@@ -852,7 +1114,7 @@ func Run(ctx context.Context, opts Options) error {
 			repSum ReplaySummary
 			repErr error
 		)
-		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
 			// 4g. Replay pass.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
@@ -1058,6 +1320,48 @@ func gitDirEnsureSubdir(gitDir, sub string) (string, error) {
 // "open + log + skip" policy without re-implementing the bootstrap dance.
 func openCentralStats(ctx context.Context, dbPath string) (*central.StatsDB, error) {
 	return central.OpenAt(ctx, dbPath)
+}
+
+// clearRewindGraceMeta removes a stale daemon_meta.replay.paused_until row.
+//
+// It is a best-effort helper invoked on explicit operator transitions where
+// the rewind heuristic must NOT survive: detached-HEAD reattach and
+// operation-in-progress clear. The marker persists across restarts (it is a
+// row in daemon_meta) so a transition that lifts an unrelated pause must
+// also strip the rewind-grace gate, otherwise capture/replay stay muted for
+// up to ACD_REWIND_GRACE_SECONDS after the operator-driven resume.
+//
+// Failures are logged but do not abort the caller — `daemonPauseState` will
+// fall through to the next tick and clear an expired value naturally. When a
+// row was actually removed we emit a `replay.pause` trace with decision
+// "cleared" so operator-facing tooling can see the reason.
+func clearRewindGraceMeta(ctx context.Context, db *state.DB, repoPath string, cctx CaptureContext, tracer acdtrace.Logger, logger *slog.Logger, reason string) {
+	prev, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		logger.Warn("read rewind grace meta",
+			"err", err.Error(), "reason", reason)
+		return
+	}
+	if !ok || prev == "" {
+		return
+	}
+	if _, err := state.MetaDelete(ctx, db, MetaKeyReplayPausedUntil); err != nil {
+		logger.Warn("clear rewind grace meta",
+			"err", err.Error(), "reason", reason)
+		return
+	}
+	recordTrace(tracer, acdtrace.Event{
+		Repo:       repoPath,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "replay.pause",
+		Decision:   "cleared",
+		Reason:     reason,
+		Input:      map[string]any{"previous_until": prev},
+		Generation: cctx.BranchGeneration,
+	})
+	logger.Info("rewind grace cleared on operator transition",
+		"reason", reason, "previous_until", prev)
 }
 
 // (un)used helpers retained for future phases — keep the symbol exported so

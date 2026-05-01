@@ -9,8 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -53,7 +56,7 @@ func TestRecover_DryRunNoMutation(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, true, false, true, false); err != nil {
 		t.Fatalf("runRecover dry-run: %v", err)
 	}
 	var plan recoverPlan
@@ -86,7 +89,7 @@ func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, true, false, true, false); err != nil {
 		t.Fatalf("runRecover dry-run: %v", err)
 	}
 	after, err := fileSHA256(stateDB)
@@ -169,7 +172,7 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
 		t.Fatalf("runRecover apply: %v\n%s", err, out.String())
 	}
 	var plan recoverPlan
@@ -217,6 +220,163 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	}
 }
 
+func TestRecover_ClearsReplayPausedUntil(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	until := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet replay.paused_until: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, false, false); err != nil {
+		t.Fatalf("runRecover apply: %v", err)
+	}
+
+	if v, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("replay.paused_until still set: %q", v)
+	}
+}
+
+func TestRecover_RemovesManualPauseMarker(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "manual",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "test",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, true, true); err != nil {
+		t.Fatalf("runRecover apply: %v", err)
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("manual pause marker still on disk: stat err=%v", err)
+	}
+
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal recover plan: %v\n%s", err, out.String())
+	}
+	if !plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=false want true: %+v", plan)
+	}
+	if !strings.HasSuffix(plan.ManualMarkerPath, filepath.Join(".git", "acd", "paused")) {
+		t.Fatalf("plan.ManualMarkerPath=%q want suffix .git/acd/paused", plan.ManualMarkerPath)
+	}
+}
+
+// TestRecover_DryRunPreservesMarkerOnDisk pins that `acd recover --dry-run`
+// is purely advisory: even when a real manual pause marker is present and the
+// caller passes --clear-pause, the dry run must NOT touch the marker file.
+// This couples with TestRecover_DryRunNoMutation (state.db invariant) and
+// closes the corresponding gap on the on-disk marker side.
+func TestRecover_DryRunPreservesMarkerOnDisk(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "deploy freeze",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "operator",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	infoBefore, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatalf("stat marker before: %v", err)
+	}
+
+	// dry-run with clearPause=true. Even with the flag set, dry-run must
+	// remain non-mutating: the on-disk marker stays exactly as-is.
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, true, false, true, true); err != nil {
+		t.Fatalf("runRecover dry-run: %v", err)
+	}
+
+	infoAfter, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatalf("stat marker after dry-run (must still exist): %v", err)
+	}
+	if !os.SameFile(infoBefore, infoAfter) {
+		t.Fatalf("dry-run replaced marker inode: before=%v after=%v", infoBefore, infoAfter)
+	}
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker after: %v", err)
+	}
+	if !bytes.Equal(markerBefore, markerAfter) {
+		t.Fatalf("dry-run mutated marker bytes: before=%q after=%q", markerBefore, markerAfter)
+	}
+
+	// Plan must report DryRun=true and must NOT claim the marker was removed.
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal recover plan: %v\n%s", err, out.String())
+	}
+	if !plan.DryRun {
+		t.Fatalf("plan.DryRun=false in --dry-run output: %+v", plan)
+	}
+	if plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=true on dry-run: %+v", plan)
+	}
+}
+
+func TestRecover_DryRun_ListsPauseStateActions(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, true, false, true, true); err != nil {
+		t.Fatalf("runRecover dry-run: %v", err)
+	}
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	wantSubstrs := []string{
+		"clear daemon_meta " + daemon.MetaKeyReplayPausedUntil,
+		"remove manual pause marker",
+	}
+	for _, want := range wantSubstrs {
+		found := false
+		for _, action := range plan.Actions {
+			if strings.Contains(action, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("dry-run plan.Actions missing %q: %v", want, plan.Actions)
+		}
+	}
+	if plan.ManualMarkerPath == "" {
+		t.Fatalf("plan.ManualMarkerPath empty in dry-run output")
+	}
+	if plan.GitDir == "" {
+		t.Fatalf("plan.GitDir empty in dry-run output")
+	}
+}
+
 func TestRecover_RefusesWithDaemonAlive(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
@@ -227,8 +387,124 @@ func TestRecover_RefusesWithDaemonAlive(t *testing.T) {
 		t.Fatalf("SaveDaemonState: %v", err)
 	}
 	var out bytes.Buffer
-	err := runRecover(ctx, &out, repo, true, false, true, false)
+	err := runRecover(ctx, &out, repo, true, false, true, false, false)
 	if err == nil || !strings.Contains(err.Error(), "refusing while daemon") {
 		t.Fatalf("runRecover err=%v want daemon refusal", err)
+	}
+}
+
+func TestRecover_PreservesMarkerWithoutClearPauseFlag(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	// Stage a stale-branch incident so we can assert the DB was retargeted.
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:              999999,
+		Mode:             "stopped",
+		BranchRef:        sql.NullString{String: "refs/heads/stale", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
+	if err := state.MetaSet(ctx, db, "branch.generation", "2"); err != nil {
+		t.Fatalf("MetaSet generation: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/stale",
+		BranchGeneration: 2,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "blocked.txt",
+		Fidelity:         "full",
+		State:            state.EventStateBlockedConflict,
+		Error:            sql.NullString{String: "old conflict", Valid: true},
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "blocked.txt",
+		Fidelity:  "full",
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// Write a manual pause marker that simulates a deploy-freeze.
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "deploy freeze",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "operator",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+
+	// Apply recovery WITHOUT --clear-pause; default behavior must preserve the
+	// marker untouched while still retargeting the DB.
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+		t.Fatalf("runRecover apply: %v\n%s", err, out.String())
+	}
+
+	// Marker must still be on disk and byte-identical to what we wrote.
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker after recover: %v", err)
+	}
+	if !bytes.Equal(markerBefore, markerAfter) {
+		t.Fatalf("manual pause marker mutated: before=%q after=%q", markerBefore, markerAfter)
+	}
+
+	// Plan must reflect preservation, NOT removal.
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal plan: %v\n%s", err, out.String())
+	}
+	if plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=true want false: %+v", plan)
+	}
+	if !plan.ManualMarkerPreserved {
+		t.Fatalf("plan.ManualMarkerPreserved=false want true: %+v", plan)
+	}
+	if plan.ClearPause {
+		t.Fatalf("plan.ClearPause=true want false: %+v", plan)
+	}
+
+	// At least one Actions entry must call out preservation explicitly.
+	foundPreserveAction := false
+	for _, action := range plan.Actions {
+		if strings.Contains(action, "preserve manual pause marker") &&
+			strings.Contains(action, "--clear-pause") {
+			foundPreserveAction = true
+			break
+		}
+	}
+	if !foundPreserveAction {
+		t.Fatalf("plan.Actions missing preservation entry: %v", plan.Actions)
+	}
+
+	// DB must have been retargeted to the current branch despite skipping
+	// marker removal — this is the atomicity guarantee.
+	var branchRef, eventState string
+	var gen int64
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT branch_ref, branch_generation, state FROM capture_events WHERE seq = ?`, seq,
+	).Scan(&branchRef, &gen, &eventState); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if branchRef != "refs/heads/main" || gen != 2 || eventState != state.EventStatePending {
+		t.Fatalf("event after recover branch=%q gen=%d state=%q want main/2/pending",
+			branchRef, gen, eventState)
 	}
 }

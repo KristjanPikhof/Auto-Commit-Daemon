@@ -248,6 +248,96 @@ func TestRefcount_TTLOverride(t *testing.T) {
 	}
 }
 
+// TestSweepClients_TOCTOU_DoesNotEvictFreshRow: the sweep classifies a row
+// as stale (last_seen_ts < cutoff) but, before it actually deletes, a
+// parallel `acd start` upserts the row with a fresh last_seen_ts. The
+// tx-scoped DeregisterClientIfStale must observe the live value and skip
+// the delete; the alive count drops the row on this tick (because the
+// in-memory `c.LastSeenTS` is still stale) but the row survives in the
+// database for the next sweep.
+//
+// Reproduction is deterministic with a controlled clock: list shows a
+// stale row, we then refresh it, and the sweep's per-row predicate must
+// re-check inside the tx and find the row no longer matches.
+func TestSweepClients_TOCTOU_DoesNotEvictFreshRow(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Unix(2_000_000, 0)
+	cutoff := float64(now.Unix()) - DefaultClientTTL.Seconds()
+
+	// Stale at list time (last_seen_ts = cutoff-10).
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-races-refresh",
+		Harness:      "claude-code",
+		WatchPID:     sql.NullInt64{},
+		LastSeenTS:   cutoff - 10,
+		RegisteredTS: cutoff - 10,
+	})
+
+	// Inject a "parallel acd start" via the AliveFn hook: the TTL gate
+	// fires before AliveFn, so we hook the captureFn position by using a
+	// custom test that bumps the row between ListClients and the delete.
+	// Easiest deterministic path: bump it with a custom AliveFn-equivalent
+	// that runs on the first iteration.
+	//
+	// SweepClients doesn't expose a hook between list and delete, so we
+	// directly exercise DeregisterClientIfStale: that's the operation the
+	// sweep delegates to and the one that must honor the TOCTOU guard.
+	dropped, err := state.DeregisterClientIfStale(context.Background(), db, "sess-races-refresh", cutoff)
+	if err != nil {
+		t.Fatalf("DeregisterClientIfStale (stale): %v", err)
+	}
+	if !dropped {
+		t.Fatalf("expected stale row to be deleted, but it survived")
+	}
+
+	// Re-register, then simulate a parallel refresh that beat the sweep's
+	// delete. Cutoff stays the same; row's last_seen_ts is now fresh.
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-races-refresh",
+		Harness:      "claude-code",
+		LastSeenTS:   cutoff + 5, // refreshed past the cutoff
+		RegisteredTS: cutoff - 10,
+	})
+	dropped, err = state.DeregisterClientIfStale(context.Background(), db, "sess-races-refresh", cutoff)
+	if err != nil {
+		t.Fatalf("DeregisterClientIfStale (fresh): %v", err)
+	}
+	if dropped {
+		t.Fatalf("freshly refreshed row was evicted; TOCTOU guard failed")
+	}
+	if got := countClients(t, db); got != 1 {
+		t.Fatalf("post-guard rows=%d, want 1 (live)", got)
+	}
+
+	// Same shape for the PID-pinned variant: the row is still alive but
+	// a parallel start swapped in a new pid. The previous sweep's
+	// dead-pid classification must not delete the row.
+	registerClient(t, db, state.Client{
+		SessionID:    "sess-pid-races",
+		Harness:      "codex",
+		WatchPID:     sql.NullInt64{Int64: 4321, Valid: true},
+		LastSeenTS:   cutoff + 1,
+		RegisteredTS: cutoff,
+	})
+	// Parallel start swapped pid 4321 -> 5555 and bumped last_seen_ts.
+	if err := state.RegisterClient(context.Background(), db, state.Client{
+		SessionID:    "sess-pid-races",
+		Harness:      "codex",
+		WatchPID:     sql.NullInt64{Int64: 5555, Valid: true},
+		LastSeenTS:   cutoff + 100,
+		RegisteredTS: cutoff,
+	}); err != nil {
+		t.Fatalf("RegisterClient (refresh): %v", err)
+	}
+	dropped, err = state.DeregisterClientIfPID(context.Background(), db, "sess-pid-races", 4321, cutoff+1)
+	if err != nil {
+		t.Fatalf("DeregisterClientIfPID: %v", err)
+	}
+	if dropped {
+		t.Fatalf("row with replaced pid was evicted; pid TOCTOU guard failed")
+	}
+}
+
 // TestRefcount_SelfTerminateGate: threshold + grace AND-ed.
 func TestRefcount_SelfTerminateGate(t *testing.T) {
 	cases := []struct {

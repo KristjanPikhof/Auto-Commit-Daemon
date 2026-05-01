@@ -9,8 +9,10 @@ package state
 // SchemaVersion is the current PRAGMA user_version value for the per-repo
 // state DB. Bumping this triggers a migration step in migrate.go. v1 was the
 // first acd release; v2 adds capture_events indexes used by replay barriers
-// and pruning.
-const SchemaVersion = 2
+// and pruning; v3 adds idx_capture_events_barrier — a covering index that
+// keeps the PendingEvents barrier subquery off a full-table scan when
+// long-running pauses fan capture_events into tens of thousands of rows.
+const SchemaVersion = 3
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -80,6 +82,13 @@ CREATE INDEX IF NOT EXISTS idx_capture_events_state_captured
 
 CREATE INDEX IF NOT EXISTS idx_capture_events_branch_generation_seq_state
     ON capture_events(branch_ref, branch_generation, seq, state);
+
+-- v3: barrier-friendly leading-state covering index. PendingEvents and the
+-- pending-depth cap both filter by (branch_ref, branch_generation, state)
+-- and order/aggregate on seq, so leading state lets SQLite jump straight to
+-- the matching rows without scanning unrelated branch_ref/generation pairs.
+CREATE INDEX IF NOT EXISTS idx_capture_events_barrier
+    ON capture_events(branch_ref, branch_generation, state, seq);
 
 CREATE TABLE IF NOT EXISTS capture_ops(
     event_seq    INTEGER NOT NULL,

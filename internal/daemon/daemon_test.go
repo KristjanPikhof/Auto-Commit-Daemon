@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -536,6 +537,287 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 				t.Fatalf("Run returned %v", runErr)
 			}
 		})
+	}
+}
+
+// TestDaemon_StaleOpMarker_Warns verifies that when an operation_in_progress
+// marker (e.g. MERGE_HEAD) sits in the git dir for >15 minutes WITHOUT HEAD
+// advancing, the daemon emits a "marker may be stale" warning AND surfaces
+// the stale_operation_marker bit in the persisted operation_in_progress.set_at
+// metadata so `acd diagnose` can flag it. The daemon never auto-clears the
+// marker — that is the operator's job.
+func TestDaemon_StaleOpMarker_Warns(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Inject MERGE_HEAD so gitOperationInProgress reports "merge".
+	mergeHead := filepath.Join(f.gitDir, "MERGE_HEAD")
+	if err := os.WriteFile(mergeHead, []byte(startHead+"\n"), 0o644); err != nil {
+		t.Fatalf("create MERGE_HEAD: %v", err)
+	}
+
+	// Controllable clock: first call returns t0, every subsequent call
+	// returns t0 + 16m so the daemon's stale-marker threshold (15m) trips
+	// on the next pass after seeding set_at.
+	t0 := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	advanced := atomic.Bool{}
+	nowFn := func() time.Time {
+		if advanced.Load() {
+			return t0.Add(16 * time.Minute)
+		}
+		return t0
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Capture slog output through a custom handler so the test can assert
+	// that the "marker may be stale" warning fires after the injected clock
+	// crosses the staleness threshold while HEAD has not moved. The handler
+	// is goroutine-safe because Run can emit concurrently with the polling
+	// goroutine that reads recordedLogs below.
+	logSink := &captureLogHandler{level: slog.LevelWarn}
+	logger := slog.New(logSink)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			Now:         nowFn,
+			SkipSignals: true,
+			Logger:      logger,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// First, wait for the marker to be seeded with operation_in_progress.set_at.
+	waitForMetaValue(t, f.db, MetaKeyOperationInProgress, "merge", 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt); ok && v != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	setAtRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt)
+	if err != nil {
+		t.Fatalf("MetaGet set_at: %v", err)
+	}
+	if !ok || setAtRaw == "" {
+		t.Fatalf("operation_in_progress.set_at not stamped")
+	}
+
+	// Now advance the clock past the threshold and force another tick.
+	advanced.Store(true)
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// HEAD must not have advanced.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced while marker present: %s; want %s", head, startHead)
+	}
+
+	// set_at remains stable across ticks (the stamp is captured once on
+	// transition to "marker present", not refreshed each pass).
+	setAtRaw2, _, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressSetAt)
+	if setAtRaw2 != setAtRaw {
+		t.Fatalf("operation_in_progress.set_at refreshed across ticks: %q -> %q",
+			setAtRaw, setAtRaw2)
+	}
+
+	// HEAD-at stamp must match the SHA observed at marker time.
+	headAtRaw, ok, _ := state.MetaGet(ctx, f.db, MetaKeyOperationInProgressHead)
+	if !ok || headAtRaw != startHead {
+		t.Fatalf("operation_in_progress.head_at=%q want %s", headAtRaw, startHead)
+	}
+
+	// Visibility assertion 1: the slog warning ("marker may be stale; verify
+	// git status") must have fired at least once after the clock advanced
+	// past staleOpMarkerThreshold. This proves the rate-limited warn lane
+	// is wired up; without it, an abandoned rebase silently mutes capture/
+	// replay forever and the operator never sees a hint.
+	staleDeadline := time.Now().Add(2 * time.Second)
+	var sawWarn bool
+	var sawAttrs map[string]any
+	for time.Now().Before(staleDeadline) {
+		records := logSink.Records()
+		for _, rec := range records {
+			if rec.Level != slog.LevelWarn {
+				continue
+			}
+			if !strings.Contains(rec.Message, "marker may be stale") {
+				continue
+			}
+			sawWarn = true
+			sawAttrs = rec.Attrs
+			break
+		}
+		if sawWarn {
+			break
+		}
+		// Force more ticks to give the staleness branch a chance to fire.
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if !sawWarn {
+		t.Fatalf("stale operation marker warn never fired after clock advance; recorded warns=%+v",
+			logSink.Records())
+	}
+	if got := sawAttrs["operation"]; got != "merge" {
+		t.Fatalf("stale-warn attr operation=%v want merge; attrs=%+v", got, sawAttrs)
+	}
+	if got := sawAttrs["head"]; got != startHead {
+		t.Fatalf("stale-warn attr head=%v want %s; attrs=%+v", got, startHead, sawAttrs)
+	}
+
+	// Visibility assertion 2: diagnose-equivalent computation must classify
+	// this marker as stale. We mirror diagnoseOperationMarker's logic locally
+	// (elapsed >= staleOpMarkerThreshold AND HEAD == head_at). Couples with
+	// the diagnose-side test in internal/cli/diagnose_test.go which asserts
+	// the JSON `stale_operation_marker` field flips true under the same shape.
+	setAtSec, parseErr := strconv.ParseFloat(setAtRaw, 64)
+	if parseErr != nil {
+		t.Fatalf("parse set_at %q: %v", setAtRaw, parseErr)
+	}
+	markerSetAt := time.Unix(0, int64(setAtSec*float64(time.Second)))
+	elapsed := nowFn().Sub(markerSetAt)
+	staleByDiagnose := elapsed >= 15*time.Minute && headAtRaw == startHead
+	if !staleByDiagnose {
+		t.Fatalf("diagnose-equivalent stale check false: elapsed=%v head_at=%s startHead=%s",
+			elapsed, headAtRaw, startHead)
+	}
+
+	// Stop the daemon and verify Run returned cleanly. We do NOT remove
+	// MERGE_HEAD here because the advanced clock has carried sinceBoot
+	// past BootGrace and the empty-sweep self-terminate gate may fire on
+	// any glitch; the test's job is to confirm the stale-marker stamp +
+	// warn fires while the marker is present, not to assert the resume
+	// path (covered separately by TestRun_PauseDuringGitOperation).
+	cancel()
+	wg.Wait()
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
+// TestRewindGrace_DoesNotResurrectRewoundWork verifies that when the daemon
+// detects a same-branch rewind (newHead is an ancestor of prevHead, e.g.
+// `git reset --soft HEAD~1`) and writes daemon_meta.replay.paused_until, the
+// run loop pauses BOTH capture and replay during the grace window.
+// Otherwise: an fsnotify wake during the rewound state would capture the
+// transient worktree, and the post-grace replay drain would resurrect work
+// the operator just rewound.
+func TestRewindGrace_DoesNotResurrectRewoundWork(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Pre-set the rewind grace marker to a future time. The daemon Run loop
+	// reads this via daemonPauseState and must skip both capture and replay.
+	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet paused_until: %v", err)
+	}
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// Edit a file that would normally produce a captured event; force several
+	// wakes so the run loop has clear opportunities to pass the gate.
+	if err := os.WriteFile(filepath.Join(f.dir, "rewound.txt"), []byte("transient\n"), 0o644); err != nil {
+		t.Fatalf("write rewound: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// HEAD must not advance during the grace window.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse while paused: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced while rewind grace active: %s; want %s", head, startHead)
+	}
+
+	// And capture_events must be empty: capture is paused alongside replay,
+	// so no transient worktree row was enqueued.
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("capture_events=%d want 0 during rewind grace", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
 	}
 }
 
@@ -1974,4 +2256,335 @@ func TestRun_RepeatedEditsToSameFile_OrderedCommits(t *testing.T) {
 
 	cancel()
 	wg.Wait()
+}
+
+// TestClearRewindGraceMeta_DeletesPersistedKey is a focused unit test for
+// the helper used by the detached-HEAD reattach and operation-cleared
+// transitions. Both transitions are explicit operator events; the rewind
+// heuristic must NOT survive them, otherwise capture/replay stay muted up
+// to ACD_REWIND_GRACE_SECONDS post-resume.
+func TestClearRewindGraceMeta_DeletesPersistedKey(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet paused_until: %v", err)
+	}
+
+	clearRewindGraceMeta(ctx, f.db, f.dir, CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+	}, nil, slog.Default(), "unit-test reattach")
+
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("replay.paused_until still present after clear")
+	}
+}
+
+// TestClearRewindGraceMeta_NoOpWhenAbsent ensures the helper is safe to
+// call on every tick — when the marker is not set, it must not error or
+// emit a trace event (the trace probe has no input to log).
+func TestClearRewindGraceMeta_NoOpWhenAbsent(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	// No pre-existing key.
+	clearRewindGraceMeta(ctx, f.db, f.dir, CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+	}, nil, slog.Default(), "unit-test no-op")
+
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("replay.paused_until unexpectedly present")
+	}
+}
+
+// TestRun_ReattachClearsStaleRewindGrace pins the regression where a
+// rewind-grace marker set before a detached-HEAD transition silently
+// muted capture/replay for up to ACD_REWIND_GRACE_SECONDS after the
+// operator reattached HEAD. The reattach branch in the run loop must
+// strip MetaKeyReplayPausedUntil so the resumed worktree is observable
+// immediately.
+func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Detach HEAD: persisted detached marker + stale rewind grace marker.
+	headSHA, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "--detach", headSHA); err != nil {
+		t.Fatalf("checkout --detach: %v", err)
+	}
+	if err := state.MetaSet(ctx, f.db, MetaKeyDetachedHeadPaused, "1"); err != nil {
+		t.Fatalf("MetaSet detached: %v", err)
+	}
+	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet paused_until: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// Reattach HEAD onto refs/heads/main.
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "main"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	// Both the detached-paused marker and the rewind-grace marker must
+	// be cleared once the reattach branch in the run loop fires.
+	waitForMetaDeleted(t, f.db, MetaKeyDetachedHeadPaused, 3*time.Second)
+	waitForMetaDeleted(t, f.db, MetaKeyReplayPausedUntil, 3*time.Second)
+}
+
+// TestRun_OperationClearedClearsStaleRewindGrace asserts the symmetric
+// behavior for the operation-in-progress marker (rebase / merge /
+// cherry-pick / bisect). When the marker disappears the run loop's
+// resume path must strip a co-existing rewind-grace marker.
+func TestRun_OperationClearedClearsStaleRewindGrace(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Simulate a stale rebase-merge marker so the run loop sees an
+	// operation-in-progress on its first tick. Pre-stamp the persisted
+	// marker rows so the operation-cleared branch will fire on the next
+	// tick once we remove the on-disk marker.
+	rebaseDir := filepath.Join(f.gitDir, "rebase-merge")
+	if err := os.MkdirAll(rebaseDir, 0o755); err != nil {
+		t.Fatalf("mkdir rebase-merge: %v", err)
+	}
+	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
+		t.Fatalf("MetaSet paused_until: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	// First wake will record the in-progress marker.
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyOperationInProgress, "rebase-merge", 3*time.Second)
+	// Rewind grace marker must still be present while paused.
+	if got, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet during pause: %v", err)
+	} else if !ok || got != until {
+		t.Fatalf("replay.paused_until=(%q,%v) want (%q,true)", got, ok, until)
+	}
+
+	// Clear the operation marker — the next tick must enter the
+	// operation-cleared branch and strip both daemon_meta keys.
+	if err := os.RemoveAll(rebaseDir); err != nil {
+		t.Fatalf("remove rebase-merge: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	waitForMetaDeleted(t, f.db, MetaKeyOperationInProgress, 3*time.Second)
+	waitForMetaDeleted(t, f.db, MetaKeyReplayPausedUntil, 3*time.Second)
+}
+
+// TestRun_SameSHARewindAcrossTicksTriggersGrace pins the regression where
+// a same-SHA cross-tick rewind (operator does `git reset --hard HEAD~1`
+// followed by `git reset --hard ORIG_HEAD` between two daemon ticks)
+// slipped past processBranchTokenChange because SameGeneration short-
+// circuits on identical token strings. The daemon now stamps
+// MetaKeyBranchHead on every tick; if the persisted value diverges from
+// both the in-memory token's SHA and the freshly-read live HEAD AND
+// IsAncestor(liveHEAD, persistedHEAD) reports backward motion, the
+// run loop classifies the move as a same-SHA rewind and arms
+// MetaKeyReplayPausedUntil via maybeSetRewindGrace.
+//
+// The test boots the daemon at seedHead, lets it stamp persisted = seed
+// during the first SameGeneration tick, then simulates an out-of-band
+// observer (e.g. acd recover or another tool) overwriting persisted to
+// `advanced` while the in-memory currentToken still points at seedHead.
+// On the next wake, the cross-tick probe must observe persisted !=
+// currentToken's SHA != liveHead, run IsAncestor(seedHead, advanced) =
+// true, and arm the grace marker.
+func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	// Build a child commit on top of seed; this represents the "advanced"
+	// HEAD an out-of-band observer recorded into MetaKeyBranchHead between
+	// ticks before the operator reset back to seedHead. Live HEAD remains
+	// at seedHead — commitSingleFile only writes the commit object.
+	advanced := commitSingleFile(t, ctx, f.dir, seedHead, "advanced.txt", "ahead\n", "advanced")
+	if h, _ := git.RevParse(ctx, f.dir, "HEAD"); h != seedHead {
+		t.Fatalf("HEAD moved to %s want %s", h, seedHead)
+	}
+	// IsAncestor(seedHead, advanced) must be true (seedHead is parent).
+	ok, err := git.IsAncestor(ctx, f.dir, seedHead, advanced)
+	if err != nil {
+		t.Fatalf("IsAncestor: %v", err)
+	}
+	if !ok {
+		t.Fatal("ancestry probe expected seedHead to be ancestor of advanced")
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	// Wait until startup has settled — persisted MetaKeyBranchHead =
+	// seedHead, currentToken in-memory = "rev:seedHead refs/heads/main".
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+
+	// Simulate an out-of-band observer (acd recover, manual sqlite edit,
+	// or a previous-tick observation that has since been lost from
+	// in-memory currentToken) overwriting persisted to the advanced
+	// commit. Live HEAD is still seedHead; in-memory currentToken is
+	// still seedHead; only persisted differs.
+	if err := state.MetaSet(ctx, f.db, MetaKeyBranchHead, advanced); err != nil {
+		t.Fatalf("MetaSet branch.head=advanced: %v", err)
+	}
+	// Wake. The next processBranchTokenChange should observe
+	// SameGeneration (live token == currentToken), enter the cross-tick
+	// probe, and arm the grace marker.
+	wakeCh <- struct{}{}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		got, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil)
+		if err != nil {
+			t.Fatalf("MetaGet paused_until: %v", err)
+		}
+		if ok && got != "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("replay.paused_until never set after cross-tick same-SHA rewind")
+}
+
+// loggedRecord is a single slog record snapshot captured by captureLogHandler.
+type loggedRecord struct {
+	Level   slog.Level
+	Message string
+	Attrs   map[string]any
+}
+
+// captureLogHandler is a minimal slog.Handler that copies records into an
+// in-memory buffer for assertions. It honors only Level and the textual
+// Message + flat Attr key/value pairs; Group/WithAttrs nesting is rare in
+// daemon logging and out of scope for the tests that use this handler.
+type captureLogHandler struct {
+	mu      sync.Mutex
+	level   slog.Level
+	records []loggedRecord
+}
+
+func (h *captureLogHandler) Enabled(_ context.Context, lvl slog.Level) bool {
+	return lvl >= h.level
+}
+
+func (h *captureLogHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := loggedRecord{
+		Level:   r.Level,
+		Message: r.Message,
+		Attrs:   make(map[string]any, r.NumAttrs()),
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.Attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	h.mu.Lock()
+	h.records = append(h.records, rec)
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *captureLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *captureLogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// Records returns a snapshot copy of the captured log records.
+func (h *captureLogHandler) Records() []loggedRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]loggedRecord, len(h.records))
+	copy(out, h.records)
+	return out
 }

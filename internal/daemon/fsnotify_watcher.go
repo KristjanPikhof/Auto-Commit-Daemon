@@ -21,7 +21,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -238,83 +237,168 @@ func detectWatchBudget(logger *slog.Logger) int {
 // directory. Returns errBudgetExceeded if the registered count would
 // exceed maxWatches; the caller is responsible for the poll-mode
 // fallback.
+//
+// BFS layout with parent-prune: candidate directories are processed by
+// depth. Each layer collects every dir that survives the cheap filters
+// (.git pruning, symlinks, nested repos, sensitive dirs), batch-calls
+// IgnoreChecker.Check once for the entire layer, then only descends into
+// the non-ignored survivors. This early-prunes ignored subtrees (e.g.
+// node_modules, vendor) instead of walking every entry beneath them — the
+// previous DFS approach descended into ignored subtrees and only filtered
+// after the fact, which made first-walk on large repos pay the readdir
+// cost for every ignored child.
+//
+// Ignore-check batching is preserved: each BFS layer issues one round-trip
+// through the long-lived `git check-ignore --stdin` subprocess. With
+// per-layer batching the total round-trips equal the worktree depth, not
+// the directory count.
 func (w *FsnotifyWatcher) preWalk(root string) error {
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// soft errors during pre-walk: keep going.
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		// lstat — never descend symlinked dirs (legacy regression).
-		fi, err := os.Lstat(path)
-		if err != nil {
-			return fs.SkipDir
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return fs.SkipDir
-		}
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !rootInfo.IsDir() {
+		return nil
+	}
 
-		// Skip .git, .git/acd state, and the per-repo gitDir if it lives
-		// somewhere unusual (worktrees).
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return fs.SkipDir
-		}
-		rel = filepath.ToSlash(rel)
-		if rel == "." {
-			// always watch the worktree root itself.
-			if err := w.addWatch(path); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		topComponent := rel
-		if i := strings.IndexByte(rel, '/'); i >= 0 {
-			topComponent = rel[:i]
+	// The worktree root itself is never subject to gitignore.
+	rootRel, err := filepath.Rel(w.opts.RepoPath, root)
+	if err != nil {
+		return err
+	}
+	rootRel = filepath.ToSlash(rootRel)
+	// Filter the root itself through the cheap pre-checks unless it is
+	// the repo root (rel == "."). When called from handleEvent on a
+	// runtime mkdir, the new dir might be inside a sensitive or nested
+	// subtree.
+	if rootRel != "." {
+		topComponent := rootRel
+		if i := strings.IndexByte(rootRel, '/'); i >= 0 {
+			topComponent = rootRel[:i]
 		}
 		if topComponent == ".git" || topComponent == stateSubdir {
-			return fs.SkipDir
+			return nil
 		}
-
-		// Nested-repo / submodule pruning: any dir containing .git is a
-		// boundary we never cross.
-		if path != root {
-			if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
-				return fs.SkipDir
-			}
+		if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+			return nil
 		}
-
-		// Sensitive directories: skip whole subtrees that look like
-		// secrets dirs (best-effort; capture also rejects them).
-		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rel) {
-			return fs.SkipDir
+		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rootRel) {
+			return nil
 		}
-
-		// Honor gitignore at directory granularity. The IgnoreChecker is
-		// optional; when absent we err on the side of watching (capture
-		// will still drop ignored files).
+		// Honor gitignore on the root of a runtime re-walk too.
 		if w.opts.IgnoreChecker != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			results, err := w.opts.IgnoreChecker.Check(ctx, []string{rel})
-			if err == nil && len(results) == 1 && results[0] {
-				return fs.SkipDir
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			results, ierr := w.opts.IgnoreChecker.Check(ctx, []string{rootRel})
+			cancel()
+			if ierr == nil && len(results) == 1 && results[0] {
+				return nil
+			}
+		}
+	}
+	if err := w.addWatch(root); err != nil {
+		return err
+	}
+
+	type entry struct {
+		rel  string
+		full string
+	}
+	// frontier holds the directories whose children we still need to read.
+	// At the start of each iteration we readdir every dir in the frontier,
+	// collect all surviving children into nextLayer, batch-classify
+	// nextLayer through IgnoreChecker, then watch the survivors. Survivors
+	// become the next frontier.
+	frontier := []entry{{rel: rootRel, full: root}}
+
+	for len(frontier) > 0 {
+		var nextLayer []entry
+		for _, parent := range frontier {
+			children, err := os.ReadDir(parent.full)
+			if err != nil {
+				// soft error: skip this dir's children but keep walking.
+				continue
+			}
+			for _, d := range children {
+				if !d.IsDir() {
+					continue
+				}
+				childPath := filepath.Join(parent.full, d.Name())
+				fi, err := os.Lstat(childPath)
+				if err != nil {
+					continue
+				}
+				// Never descend symlinked dirs (legacy regression).
+				if fi.Mode()&os.ModeSymlink != 0 {
+					continue
+				}
+				if !fi.IsDir() {
+					continue
+				}
+				var childRel string
+				if parent.rel == "." {
+					childRel = d.Name()
+				} else {
+					childRel = parent.rel + "/" + d.Name()
+				}
+				topComponent := childRel
+				if i := strings.IndexByte(childRel, '/'); i >= 0 {
+					topComponent = childRel[:i]
+				}
+				if topComponent == ".git" || topComponent == stateSubdir {
+					continue
+				}
+				// Nested-repo / submodule pruning: any dir containing
+				// .git is a boundary we never cross.
+				if _, err := os.Stat(filepath.Join(childPath, ".git")); err == nil {
+					continue
+				}
+				// Sensitive directories: skip whole subtrees.
+				if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(childRel) {
+					continue
+				}
+				nextLayer = append(nextLayer, entry{rel: childRel, full: childPath})
 			}
 		}
 
-		if err := w.addWatch(path); err != nil {
-			return err
+		if len(nextLayer) == 0 {
+			break
 		}
-		return nil
-	})
-	if walkErr != nil {
-		return walkErr
+
+		// Per-layer batched ignore check: one round-trip classifies the
+		// entire layer, and ignored parents are dropped from the frontier
+		// so we never readdir into their subtrees on the next iteration.
+		ignored := map[string]bool{}
+		if w.opts.IgnoreChecker != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			paths := make([]string, len(nextLayer))
+			for i, c := range nextLayer {
+				paths[i] = c.rel
+			}
+			results, ierr := w.opts.IgnoreChecker.Check(ctx, paths)
+			cancel()
+			if ierr == nil && len(results) == len(nextLayer) {
+				for i, isIgn := range results {
+					if isIgn {
+						ignored[nextLayer[i].rel] = true
+					}
+				}
+			}
+		}
+
+		survivors := nextLayer[:0]
+		for _, c := range nextLayer {
+			if ignored[c.rel] {
+				continue
+			}
+			if err := w.addWatch(c.full); err != nil {
+				return err
+			}
+			survivors = append(survivors, c)
+		}
+		frontier = survivors
 	}
 	return nil
 }
@@ -504,11 +588,13 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 }
 
 // handleEvent dispatches one OS event. We add watches recursively on
-// directory creation; we ignore the file-level details because capture
-// will rediscover them on the next pass.
+// directory creation, and reconcile bookkeeping on directory
+// Remove/Rename so watchedDirs/watchCount don't drift upward under
+// long-running directory churn (the OS-level inotify/kqueue watch is
+// already cleaned by the kernel; only our internal counters need
+// catching up).
 func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
-	// Re-walk new directories so children become watched too. We do not
-	// remove watches on Remove/Rename — the OS already cleaned them up.
+	// Re-walk new directories so children become watched too.
 	if ev.Op&fsnotify.Create != 0 {
 		fi, err := os.Lstat(ev.Name)
 		if err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
@@ -519,6 +605,31 @@ func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
 				}
 			}
 		}
+	}
+
+	// Reconcile bookkeeping when a tracked directory disappears or is
+	// renamed away. fsnotify reports Remove/Rename for both files and
+	// directories; we only act if the path is in watchedDirs. We can't
+	// stat the path (it's gone) so the membership check is the proxy
+	// for "this was a directory we were watching".
+	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		w.releaseWatch(ev.Name)
+	}
+}
+
+// releaseWatch drops a single tracked directory from watchedDirs and
+// decrements watchCount. No-op if the path was not tracked. The OS
+// inotify/kqueue watch is already gone (the kernel cleans it up on
+// Remove/Rename) so we only reconcile our own counters.
+func (w *FsnotifyWatcher) releaseWatch(path string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.watchedDirs[path]; !ok {
+		return
+	}
+	delete(w.watchedDirs, path)
+	if w.watchCount > 0 {
+		w.watchCount--
 	}
 }
 

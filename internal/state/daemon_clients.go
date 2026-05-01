@@ -74,6 +74,77 @@ func TouchClient(ctx context.Context, d *DB, sessionID string, ts float64) (bool
 	return n > 0, nil
 }
 
+// DeregisterClientIfStale removes the client row only if it is still stale
+// at delete time, in a single transaction. The predicate is re-evaluated
+// against the live row inside the tx, so a parallel acd start that bumped
+// last_seen_ts above the cutoff wins (the row is preserved). Returns true
+// when the row was actually deleted.
+//
+// This is the TOCTOU-safe replacement for the
+// "ListClients -> classify -> DeregisterClient" sequence used by the
+// refcount sweep: between the SELECT and the DELETE another acd start may
+// have refreshed the row, and the unconditional DELETE would otherwise
+// evict a freshly-registered live session.
+func DeregisterClientIfStale(ctx context.Context, d *DB, sessionID string, cutoffTS float64) (bool, error) {
+	if sessionID == "" {
+		return false, fmt.Errorf("state: DeregisterClientIfStale: empty session_id")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-stale begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM daemon_clients WHERE session_id = ? AND last_seen_ts < ?`,
+		sessionID, cutoffTS)
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-stale exec: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-stale rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("state: dereg-if-stale commit: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeregisterClientIfPID removes the client row only if its watch_pid still
+// matches the supplied pid (and last_seen_ts is bounded above by maxLastSeen
+// so a freshly refreshed registration with the same pid is preserved).
+// Used by the SweepClients liveness/fingerprint paths to close the
+// classify-then-delete TOCTOU window. maxLastSeen=0 disables the
+// last-seen guard.
+func DeregisterClientIfPID(ctx context.Context, d *DB, sessionID string, pid int64, maxLastSeen float64) (bool, error) {
+	if sessionID == "" {
+		return false, fmt.Errorf("state: DeregisterClientIfPID: empty session_id")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-pid begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := `DELETE FROM daemon_clients WHERE session_id = ? AND watch_pid = ?`
+	args := []any{sessionID, pid}
+	if maxLastSeen > 0 {
+		q += ` AND last_seen_ts <= ?`
+		args = append(args, maxLastSeen)
+	}
+	res, err := tx.ExecContext(ctx, q, args...)
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-pid exec: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("state: dereg-if-pid rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("state: dereg-if-pid commit: %w", err)
+	}
+	return n > 0, nil
+}
+
 // DeregisterClient removes a single client by session_id. Returns whether the
 // row existed (so `acd stop` can report "unknown session" on a no-op).
 func DeregisterClient(ctx context.Context, d *DB, sessionID string) (bool, error) {
