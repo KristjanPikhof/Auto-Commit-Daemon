@@ -1096,10 +1096,17 @@ func Run(ctx context.Context, opts Options) error {
 				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
 			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
 		} else if cctx.BaseHead != "" {
+			// The run loop has already evaluated the pause gate above and
+			// emitted the trace event when paused; SkipPauseCheck=true
+			// prevents Capture from re-tracing the same decision. GitDir
+			// is still wired through so that direct callers (tests,
+			// future CLI wrappers) honor the same gate symmetrically.
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:    ignoreChecker,
 				SensitiveMatcher: matcher,
 				Trace:            tracer,
+				GitDir:           opts.GitDir,
+				SkipPauseCheck:   true,
 			})
 		}
 
