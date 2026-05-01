@@ -48,7 +48,8 @@ export ACD_AI_API_KEY=sk-...
 export ACD_AI_PROVIDER=subprocess:my-provider
 export PATH=$PATH:/path/to/plugin/dir
 # acd will exec acd-provider-my-provider from $PATH
-# export ACD_AI_SEND_DIFF=1
+# Subprocess providers declare NeedsDiff=true and receive redacted captured
+# diffs by default. There is no separate opt-in.
 ```
 
 ---
