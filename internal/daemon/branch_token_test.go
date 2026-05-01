@@ -168,6 +168,49 @@ func TestBranchToken_GraceZeroSkipsPause(t *testing.T) {
 	}
 }
 
+// TestClassifyTokenTransition_AsymmetricRefDiverged checks that transitions
+// where exactly one token carries a branch ref are always classified as
+// Diverged, regardless of direction. This covers:
+//   - prev has no ref, new has ref (legacy token upgrade)
+//   - prev has ref, new has no ref (legacy token downgrade / bare rev token)
+func TestClassifyTokenTransition_AsymmetricRefDiverged(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	t.Run("prev_no_ref_new_has_ref", func(t *testing.T) {
+		// Legacy bare rev token (no ref) → named-ref token: must be Diverged.
+		got, err := ClassifyTokenTransition(ctx, f.dir,
+			"rev:"+head,
+			branchTokenRev(head, "refs/heads/main"),
+		)
+		if err != nil {
+			t.Fatalf("ClassifyTokenTransition: %v", err)
+		}
+		if got != TokenTransitionDiverged {
+			t.Fatalf("got %v want %v", got, TokenTransitionDiverged)
+		}
+	})
+
+	t.Run("prev_has_ref_new_no_ref", func(t *testing.T) {
+		// Named-ref token → legacy bare rev token (no ref): must be Diverged.
+		got, err := ClassifyTokenTransition(ctx, f.dir,
+			branchTokenRev(head, "refs/heads/main"),
+			"rev:"+head,
+		)
+		if err != nil {
+			t.Fatalf("ClassifyTokenTransition: %v", err)
+		}
+		if got != TokenTransitionDiverged {
+			t.Fatalf("got %v want %v", got, TokenTransitionDiverged)
+		}
+	})
+}
+
 func commitSingleFile(t *testing.T, ctx context.Context, repoDir, parent, path, content, message string) string {
 	t.Helper()
 	blob, err := git.HashObjectStdin(ctx, repoDir, []byte(content))
