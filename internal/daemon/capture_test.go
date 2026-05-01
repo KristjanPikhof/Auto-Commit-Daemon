@@ -563,3 +563,143 @@ VALUES (?, ?, 'seed.txt', 'create', '100644', '000000000000000000000000000000000
 		t.Fatalf("expected exactly 1 warn record under rate limit, got %d:\n%s", count, logBuf.String())
 	}
 }
+
+// TestCapture_HonorsManualPauseDirectInvocation: Capture must consult the
+// daemon pause gate when a direct caller (test, future CLI wrapper) invokes
+// it without going through the run loop. Otherwise the live worktree state
+// during a manual pause window would still be enqueued, defeating the
+// "pause replay" guarantee — the next replay drain would resurrect work the
+// operator intentionally rewound.
+//
+// Symmetric counterpart to TestReplay_SkipsDrainWhenManualMarkerPresent.
+func TestCapture_HonorsManualPauseDirectInvocation(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Bootstrap the shadow so a fresh write is later classified as
+	// `create` rather than getting absorbed into the baseline.
+	f.firstCapture(t)
+
+	// Drop a file that would, absent the pause, become a captured event.
+	if err := os.WriteFile(filepath.Join(f.dir, "rewound.txt"),
+		[]byte("would-be-resurrected\n"), 0o644); err != nil {
+		t.Fatalf("write rewound: %v", err)
+	}
+
+	// Activate a manual pause marker — the same artifact `acd pause` writes.
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "operator surgery",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write pause marker: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pausepkg.Path(f.gitDir)) })
+
+	beforeCount := captureEventsTotalForTest(t, ctx, f.db)
+	trace := newMemoryTraceLogger()
+
+	sum, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		GitDir:           f.gitDir,
+		Trace:            trace,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if !sum.Skipped {
+		t.Fatalf("expected Skipped=true, got %+v", sum)
+	}
+	if sum.SkipReason == "" {
+		t.Fatalf("expected non-empty SkipReason, got %+v", sum)
+	}
+	if sum.EventsAppended != 0 {
+		t.Fatalf("expected EventsAppended=0 under manual pause, got %d", sum.EventsAppended)
+	}
+
+	// No new capture_events row may have been minted while the pause was
+	// active — that's the whole point of the gate.
+	if got := captureEventsTotalForTest(t, ctx, f.db); got != beforeCount {
+		t.Fatalf("capture_events grew while paused: before=%d after=%d", beforeCount, got)
+	}
+
+	// Trace symmetry: the run loop emits "capture.pause" for paused
+	// captures via the same helper. Direct callers must produce the same
+	// trace shape so operators see one consistent event class.
+	events := traceEventsByClassForTest(trace.Events(), "capture.pause")
+	if len(events) != 1 {
+		t.Fatalf("capture.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	output, ok := events[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("trace output type=%T want map[string]any", events[0].Output)
+	}
+	if events[0].Reason != "capture_paused" || output["source"] != "manual" {
+		t.Fatalf("unexpected trace event: %+v", events[0])
+	}
+}
+
+// TestCapture_RunLoopSkipPauseCheckOptOut: SkipPauseCheck=true bypasses the
+// pause gate inside Capture — the run loop relies on this to avoid a double
+// trace event (the run loop already emits capture.pause before deciding
+// whether to invoke Capture at all). With SkipPauseCheck=true the walk runs
+// even though a manual marker is present.
+func TestCapture_RunLoopSkipPauseCheckOptOut(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	f.firstCapture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "skip-opt.txt"),
+		[]byte("captured-anyway\n"), 0o644); err != nil {
+		t.Fatalf("write skip-opt: %v", err)
+	}
+
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "run loop already gated",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write pause marker: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pausepkg.Path(f.gitDir)) })
+
+	sum, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		GitDir:           f.gitDir,
+		SkipPauseCheck:   true,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.Skipped {
+		t.Fatalf("SkipPauseCheck must bypass the gate; got Skipped=true %+v", sum)
+	}
+	if sum.EventsAppended == 0 {
+		t.Fatalf("expected at least one event appended under SkipPauseCheck=true, got %+v", sum)
+	}
+}
+
+// captureEventsTotalForTest counts capture_events for assertions. Local
+// helper duplicating the equivalent in replay_test.go to avoid cross-file
+// test coupling.
+func captureEventsTotalForTest(t *testing.T, ctx context.Context, db *state.DB) int {
+	t.Helper()
+	var n int
+	if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&n); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	return n
+}
+
+// traceEventsByClassForTest filters records by EventClass.
+func traceEventsByClassForTest(records []traceRecord, class string) []traceRecord {
+	var out []traceRecord
+	for _, r := range records {
+		if r.EventClass == class {
+			out = append(out, r)
+		}
+	}
+	return out
+}
