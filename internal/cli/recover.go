@@ -78,7 +78,7 @@ func runRecover(ctx context.Context, out io.Writer, repo string, auto, dryRun, y
 	if err != nil {
 		return err
 	}
-	plan, err := buildRecoverPlan(ctx, rec, dryRun)
+	plan, err := buildRecoverPlan(ctx, rec, dryRun, clearPause)
 	if err != nil {
 		return err
 	}
