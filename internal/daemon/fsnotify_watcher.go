@@ -21,7 +21,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
