@@ -27,7 +27,7 @@ builds:
 
 archives:
   - formats: [tar.gz]
-    name_template: "{{ .ProjectName }}_{{ .Version | trimPrefix \"v\" }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "{{ .ProjectName }}_{{ trimprefix .Version \"v\" }}_{{ .Os }}_{{ .Arch }}"
     files:
       - LICENSE
       - README.md
