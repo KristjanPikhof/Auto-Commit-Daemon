@@ -52,7 +52,11 @@ func Path(gitDir string) string {
 // large/streaming file cannot exhaust memory.
 func Read(gitDir string) (Marker, bool, error) {
 	path := Path(gitDir)
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	// O_NONBLOCK prevents open() from blocking on a FIFO with no writer
+	// (the kernel would otherwise sleep forever waiting for the producer
+	// side). For regular files O_NONBLOCK is a no-op on read; we only use
+	// the open to fstat the inode and reject non-regular sources.
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Marker{}, false, nil
