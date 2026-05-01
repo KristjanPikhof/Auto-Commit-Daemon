@@ -284,6 +284,16 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 					return sum, fmt.Errorf("daemon: replay reseed index after idempotent publish: %w", err)
 				}
 				parent = headOID
+				// Parent OID changed to an external HEAD — its tree must
+				// be re-resolved before the next event can use parentTree
+				// for no-op detection. This is rare (only fires on a
+				// successful idempotent-publish), so the per-incident
+				// rev-parse cost stays O(parallel-publishers) rather than
+				// O(events).
+				parentTree, err = resolveTreeOID(ctx, repoRoot, parent)
+				if err != nil {
+					return sum, err
+				}
 				activeCtx.BaseHead = headOID
 				sum.BaseHead = headOID
 				sum.Published++
