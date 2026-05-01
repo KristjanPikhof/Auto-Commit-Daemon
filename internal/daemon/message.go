@@ -29,9 +29,12 @@
 // diff library, no bespoke text-diff implementation. For create/delete
 // we substitute the well-known empty-blob OID
 // (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
-// Captured diffs are sensitive, so CommitContext.DiffText defaults to empty;
-// set ACD_AI_SEND_DIFF=1 to opt in. Opted-in diffs are redacted before the
-// 4000-byte cap is applied.
+// Diff egress is now governed solely by the selected provider: when
+// ai.ProviderNeedsDiff(p) reports true (network-bound providers), the
+// reconstructed diff is redacted and capped, then attached to
+// CommitContext.DiffText. The deterministic provider declares
+// NeedsDiff=false and therefore never sees DiffText. The legacy
+// ACD_AI_SEND_DIFF env var is deprecated and ignored.
 package daemon
 
 import (
