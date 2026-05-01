@@ -632,11 +632,33 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		}
 
 		if pendingCap > 0 && int64(pending) >= pendingCap {
+			// Mid-pass saturation: the entry-time gate let this pass run
+			// (pending was below cap) but appending classified ops pushed
+			// the queue at or above the cap. Stamp the durable gate so the
+			// NEXT pass early-returns ahead of walk, increment the
+			// dropped-total once for this op, emit a single rate-limited
+			// warn + trace per pass, and stop processing further ops to
+			// keep walk cost bounded.
 			summary.EventsDropped++
+			summary.BackpressurePaused = true
+			summary.PendingDepth = pending
 			updatePendingHighWater(ctx, db, pending)
+			if _, _, perr := enterCaptureBackpressure(ctx, db, time.Now()); perr != nil {
+				return summary, fmt.Errorf("daemon: enter capture backpressure: %w", perr)
+			}
+			total, perr := bumpEventsDroppedTotal(ctx, db, 1)
+			if perr != nil {
+				return summary, fmt.Errorf("daemon: bump events dropped total: %w", perr)
+			}
+			summary.EventsDroppedTotal = total
+			if v, ok, _ := state.MetaGet(ctx, db, MetaKeyPendingHighWater); ok && v != "" {
+				if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+					summary.PendingHighWater = hw
+				}
+			}
 			if shouldEmitPendingCapWarn() {
 				slog.Default().Warn(
-					"capture pending depth at cap; dropping new events. Consider acd resume or acd recover.",
+					"capture pending depth at cap mid-pass; entering backpressure pause. Use acd resume --accept-overflow to clear, or wait for replay to drain.",
 					slog.String("branch_ref", cctx.BranchRef),
 					slog.Int64("branch_generation", cctx.BranchGeneration),
 					slog.Int64("cap", pendingCap),
@@ -658,16 +680,16 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 					"fidelity": op.Fidelity,
 				},
 				Output: map[string]any{
-					"pending_depth": pending,
-					"cap":           pendingCap,
+					"pending_depth":        pending,
+					"cap":                  pendingCap,
+					"events_dropped_total": total,
 				},
 				Generation: cctx.BranchGeneration,
 			})
-			// Skip both AppendCaptureEvent and updateShadow: dropping the
-			// shadow update would let the next pass re-classify this op,
-			// which is the desired self-healing behavior — once the queue
-			// drains below the cap the op is captured fresh.
-			continue
+			// Stop the pass — further ops cannot land while saturated, and
+			// re-classifying them next pass after a drain is the
+			// self-healing behavior we want.
+			return summary, nil
 		}
 
 		ev := state.CaptureEvent{
