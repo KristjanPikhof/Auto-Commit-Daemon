@@ -56,7 +56,7 @@ func TestRecover_DryRunNoMutation(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, true, false, true, false); err != nil {
 		t.Fatalf("runRecover dry-run: %v", err)
 	}
 	var plan recoverPlan
