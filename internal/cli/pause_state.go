@@ -29,7 +29,10 @@ func pauseInfoForRepo(ctx context.Context, conn *sql.DB, stateDBPath string, now
 	switch {
 	case errors.Is(err, pausepkg.ErrMalformed):
 		// Match daemon behavior: malformed manual markers fail open. Do not
-		// surface as a pause; fall through to the rewind-grace probe.
+		// surface as a pause; fall through to the rewind-grace probe. Emit
+		// a stderr warning so operators can still see the broken marker —
+		// silent fail-open hid a stuck marker for one operator already.
+		fmt.Fprintf(os.Stderr, "acd: ignoring malformed pause marker: %v\n", err)
 	case err != nil:
 		return nil, err
 	case ok:
