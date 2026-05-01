@@ -1171,6 +1171,48 @@ func openCentralStats(ctx context.Context, dbPath string) (*central.StatsDB, err
 	return central.OpenAt(ctx, dbPath)
 }
 
+// clearRewindGraceMeta removes a stale daemon_meta.replay.paused_until row.
+//
+// It is a best-effort helper invoked on explicit operator transitions where
+// the rewind heuristic must NOT survive: detached-HEAD reattach and
+// operation-in-progress clear. The marker persists across restarts (it is a
+// row in daemon_meta) so a transition that lifts an unrelated pause must
+// also strip the rewind-grace gate, otherwise capture/replay stay muted for
+// up to ACD_REWIND_GRACE_SECONDS after the operator-driven resume.
+//
+// Failures are logged but do not abort the caller — `daemonPauseState` will
+// fall through to the next tick and clear an expired value naturally. When a
+// row was actually removed we emit a `replay.pause` trace with decision
+// "cleared" so operator-facing tooling can see the reason.
+func clearRewindGraceMeta(ctx context.Context, db *state.DB, repoPath string, cctx CaptureContext, tracer acdtrace.Logger, logger *slog.Logger, reason string) {
+	prev, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		logger.Warn("read rewind grace meta",
+			"err", err.Error(), "reason", reason)
+		return
+	}
+	if !ok || prev == "" {
+		return
+	}
+	if _, err := state.MetaDelete(ctx, db, MetaKeyReplayPausedUntil); err != nil {
+		logger.Warn("clear rewind grace meta",
+			"err", err.Error(), "reason", reason)
+		return
+	}
+	recordTrace(tracer, acdtrace.Event{
+		Repo:       repoPath,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "replay.pause",
+		Decision:   "cleared",
+		Reason:     reason,
+		Input:      map[string]any{"previous_until": prev},
+		Generation: cctx.BranchGeneration,
+	})
+	logger.Info("rewind grace cleared on operator transition",
+		"reason", reason, "previous_until", prev)
+}
+
 // (un)used helpers retained for future phases — keep the symbol exported so
 // the test build doesn't drop them on compile.
 var _ = gitDirEnsureSubdir
