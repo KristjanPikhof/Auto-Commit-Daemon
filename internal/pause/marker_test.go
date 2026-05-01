@@ -7,7 +7,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func sampleMarker() Marker {
