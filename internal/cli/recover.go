@@ -52,16 +52,18 @@ func newRecoverCmd() *cobra.Command {
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			yes, _ := cmd.Flags().GetBool("yes")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runRecover(cmd.Context(), cmd.OutOrStdout(), repo, auto, dryRun, yes, jsonOut)
+			clearPause, _ := cmd.Flags().GetBool("clear-pause")
+			return runRecover(cmd.Context(), cmd.OutOrStdout(), repo, auto, dryRun, yes, jsonOut, clearPause)
 		},
 	}
 	cmd.Flags().Bool("auto", false, "Plan recovery automatically from current HEAD")
 	cmd.Flags().Bool("dry-run", false, "Show planned recovery without mutating state")
 	cmd.Flags().Bool("yes", false, "Apply recovery without an interactive prompt")
+	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker; without this flag, an existing marker is preserved")
 	return cmd
 }
 
-func runRecover(ctx context.Context, out io.Writer, repo string, auto, dryRun, yes, jsonOut bool) error {
+func runRecover(ctx context.Context, out io.Writer, repo string, auto, dryRun, yes, jsonOut, clearPause bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
