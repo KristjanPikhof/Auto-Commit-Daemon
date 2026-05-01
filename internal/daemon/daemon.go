@@ -626,6 +626,84 @@ func Run(ctx context.Context, opts Options) error {
 			return false
 		}
 		if SameGeneration(currentToken, newToken) {
+			// Cross-tick same-SHA rewind probe.
+			//
+			// `git reset --hard HEAD~1` followed by `git reset --hard ORIG_HEAD`
+			// between two daemon ticks leaves the token byte-identical, so the
+			// SameGeneration short-circuit hides a real rewind from
+			// maybeSetRewindGrace and capture would otherwise enqueue any
+			// transient worktree changes the operator just rewound.
+			//
+			// We persist the live HEAD on every tick (see the unconditional
+			// stamp at the bottom of this function). If the persisted HEAD
+			// differs from BOTH the in-memory token's SHA and the freshly-read
+			// live HEAD, an out-of-band observer recorded a different HEAD
+			// between ticks. Probe ancestry: when the live HEAD is an ancestor
+			// of the persisted (i.e. backward), classify as a same-SHA rewind
+			// and set the grace gate just like the explicit divergence path.
+			liveHead := tokenSHA(newToken)
+			tokenHead := tokenSHA(currentToken)
+			liveBranchRef := tokenBranchRef(newToken)
+			if liveHead != "" && tokenHead != "" && liveBranchRef != "" {
+				persistedHead, lhErr := LoadBranchHead(ctx, opts.DB)
+				if lhErr != nil {
+					logger.Warn(logPrefix+" load persisted head for cross-tick probe",
+						"err", lhErr.Error())
+				} else if persistedHead != "" &&
+					persistedHead != tokenHead &&
+					persistedHead != liveHead {
+					ok, aErr := git.IsAncestor(ctx, opts.RepoPath, liveHead, persistedHead)
+					if aErr != nil {
+						logger.Warn(logPrefix+" cross-tick ancestry probe failed",
+							"err", aErr.Error())
+					} else if ok {
+						synthesizedPrev := branchTokenRev(persistedHead, liveBranchRef)
+						rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(
+							ctx, opts.RepoPath, opts.DB, synthesizedPrev, newToken, now())
+						if rewindErr != nil {
+							logger.Warn(logPrefix+" cross-tick rewind grace failed",
+								"err", rewindErr.Error())
+						} else if rewindPaused {
+							logger.Info("replay paused after cross-tick same-SHA rewind",
+								"persisted_head", persistedHead,
+								"live_head", liveHead,
+								"until", rewindUntil)
+							recordTrace(tracer, acdtrace.Event{
+								Repo:       opts.RepoPath,
+								BranchRef:  liveBranchRef,
+								HeadSHA:    liveHead,
+								EventClass: "branch_token.transition",
+								Decision:   "diverged",
+								Reason:     "cross-tick same-SHA rewind detected",
+								Input: map[string]any{
+									"persisted": persistedHead,
+									"current":   tokenHead,
+									"live":      liveHead,
+								},
+								Output: map[string]any{
+									"rewind_until": rewindUntil,
+								},
+								Generation: cctx.BranchGeneration,
+							})
+						}
+					}
+				}
+			}
+			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync with
+			// the freshly-observed live HEAD so the next tick has a fresh
+			// baseline for the cross-tick probe above. Cheap meta upsert.
+			if liveHead != "" && liveHead != tokenSHA(currentToken) {
+				// Defensive — only when SameGeneration short-circuited but the
+				// extracted SHAs disagree (token shape mismatch). Should not
+				// normally fire; left as a no-op stamp via SaveBranchGeneration
+				// in the divergence/FF branches below.
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead)
+			} else if liveHead != "" {
+				// Same SHA — stamp regardless so the next tick's probe sees
+				// a current value rather than a stale one written by an old
+				// transition.
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead)
+			}
 			return false
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
