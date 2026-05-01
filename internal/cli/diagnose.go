@@ -447,6 +447,11 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume / acd recover to drain replay.")
 	}
+	if report.BackpressurePaused {
+		remediation = append(remediation,
+			fmt.Sprintf("capture is in durable backpressure (paused at %s, %d events dropped lifetime); replay must drain pending below the high-water mark, or run `acd resume --accept-overflow` to clear the gate and accept the loss.",
+				report.BackpressurePausedAt, report.EventsDroppedTotal))
+	}
 	if report.StaleOperationMarker {
 		remediation = append(remediation,
 			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
