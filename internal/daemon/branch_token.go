@@ -312,18 +312,16 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 	return v, nil
 }
 
-// maybeSetRewindGrace inspects a same-branch HEAD movement: when newHead is an
-// ancestor of prevHead (operator ran `git reset --soft HEAD~1` or similar
-// rewinding op), the daemon writes daemon_meta.replay.paused_until = now+grace
-// so the next capture/replay tick observes a paused gate via daemonPauseState.
+// maybeSetRewindGrace is called after ClassifyTokenTransition returns Diverged
+// on a same branch-ref pair; it distinguishes a backward rewind (set grace
+// marker) from any other divergence (return false).
 //
-// Scope: same-ref rewinds only. This function is only reached after
-// ClassifyTokenTransition returns TokenTransitionFastForward on a same
-// branch-ref pair where the SHA moved backward. Other cases are handled
-// elsewhere:
-//   - Ref-switch divergences (including same-SHA branch switches): handled by
-//     TokenTransitionDiverged + DeletePendingForGeneration.
-//   - Detached-HEAD transitions: handled via MetaKeyDetachedHeadPaused.
+// When newHead is an ancestor of prevHead (operator ran `git reset --soft
+// HEAD~1` or similar rewinding op), the daemon writes
+// daemon_meta.replay.paused_until = now+grace so the next capture/replay tick
+// observes a paused gate via daemonPauseState. Non-rewind divergences (e.g.
+// branch-switch, force-push, sibling commit) return (false, "", nil) without
+// touching the meta key.
 //
 // During the grace window BOTH capture and replay are paused. fsnotify fires
 // as untracked files reappear after a rewind, and a post-grace replay drain
