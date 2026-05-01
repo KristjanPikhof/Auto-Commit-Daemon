@@ -29,16 +29,20 @@ type pauseResult struct {
 }
 
 // resumeResult is the JSON envelope returned by `acd resume`. Status takes
-// the values "resumed", "not-paused", or "requires-yes" so machine readers
-// can switch on a single field across all outcomes.
+// the values "resumed", "not-paused", "requires-yes",
+// "backpressure-cleared", or "no-backpressure" so machine readers can
+// switch on a single field across all outcomes.
 type resumeResult struct {
-	OK                bool        `json:"ok"`
-	Status            string      `json:"status"`
-	Repo              string      `json:"repo"`
-	MarkerPath        string      `json:"marker_path"`
-	Removed           bool        `json:"removed"`
-	ExistedForSeconds int64       `json:"existed_for_seconds,omitempty"`
-	Marker            PauseMarker `json:"marker,omitempty"`
+	OK                  bool        `json:"ok"`
+	Status              string      `json:"status"`
+	Repo                string      `json:"repo"`
+	MarkerPath          string      `json:"marker_path"`
+	Removed             bool        `json:"removed"`
+	ExistedForSeconds   int64       `json:"existed_for_seconds,omitempty"`
+	Marker              PauseMarker `json:"marker,omitempty"`
+	BackpressureCleared bool        `json:"backpressure_cleared,omitempty"`
+	BackpressureWasSet  bool        `json:"backpressure_was_set,omitempty"`
+	BackpressureSetAt   string      `json:"backpressure_set_at,omitempty"`
 }
 
 func newPauseCmd() *cobra.Command {
