@@ -277,6 +277,70 @@ func TestRecover_RemovesManualPauseMarker(t *testing.T) {
 	}
 }
 
+// TestRecover_DryRunPreservesMarkerOnDisk pins that `acd recover --dry-run`
+// is purely advisory: even when a real manual pause marker is present and the
+// caller passes --clear-pause, the dry run must NOT touch the marker file.
+// This couples with TestRecover_DryRunNoMutation (state.db invariant) and
+// closes the corresponding gap on the on-disk marker side.
+func TestRecover_DryRunPreservesMarkerOnDisk(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "deploy freeze",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "operator",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	infoBefore, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatalf("stat marker before: %v", err)
+	}
+
+	// dry-run with clearPause=true. Even with the flag set, dry-run must
+	// remain non-mutating: the on-disk marker stays exactly as-is.
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, true, false, true, true); err != nil {
+		t.Fatalf("runRecover dry-run: %v", err)
+	}
+
+	infoAfter, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatalf("stat marker after dry-run (must still exist): %v", err)
+	}
+	if !os.SameFile(infoBefore, infoAfter) {
+		t.Fatalf("dry-run replaced marker inode: before=%v after=%v", infoBefore, infoAfter)
+	}
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker after: %v", err)
+	}
+	if !bytes.Equal(markerBefore, markerAfter) {
+		t.Fatalf("dry-run mutated marker bytes: before=%q after=%q", markerBefore, markerAfter)
+	}
+
+	// Plan must report DryRun=true and must NOT claim the marker was removed.
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal recover plan: %v\n%s", err, out.String())
+	}
+	if !plan.DryRun {
+		t.Fatalf("plan.DryRun=false in --dry-run output: %+v", plan)
+	}
+	if plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=true on dry-run: %+v", plan)
+	}
+}
+
 func TestRecover_DryRun_ListsPauseStateActions(t *testing.T) {
 	repo, _, _ := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
