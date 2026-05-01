@@ -27,3 +27,8 @@ func openExclusiveTemp(dir string) (*os.File, error) {
 	}
 	return nil, fmt.Errorf("pause: unable to create temp marker in %s after 1024 attempts", dir)
 }
+
+// fsyncDir is a no-op on non-unix platforms. ACD does not officially support
+// these platforms today, so dropping the durability guarantee here is
+// acceptable.
+func fsyncDir(path string) error { return nil }
