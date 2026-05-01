@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestPause_WritesMarkerWithReason(t *testing.T) {
