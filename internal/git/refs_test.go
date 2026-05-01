@@ -141,8 +141,8 @@ func TestIsAncestor_BadOID(t *testing.T) {
 	if !errors.As(err, &gerr) {
 		t.Fatalf("expected *git.Error, got %T: %v", err, err)
 	}
-	if gerr.ExitCode == 1 {
-		t.Fatalf("expected bad oid to be treated as git failure, got exit %d", gerr.ExitCode)
+	if gerr.ExitCode != 128 {
+		t.Fatalf("expected exit 128 for bad oid, got %d", gerr.ExitCode)
 	}
 }
 
