@@ -323,8 +323,124 @@ func TestRecover_RefusesWithDaemonAlive(t *testing.T) {
 		t.Fatalf("SaveDaemonState: %v", err)
 	}
 	var out bytes.Buffer
-	err := runRecover(ctx, &out, repo, true, false, true, false)
+	err := runRecover(ctx, &out, repo, true, false, true, false, false)
 	if err == nil || !strings.Contains(err.Error(), "refusing while daemon") {
 		t.Fatalf("runRecover err=%v want daemon refusal", err)
+	}
+}
+
+func TestRecover_PreservesMarkerWithoutClearPauseFlag(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	// Stage a stale-branch incident so we can assert the DB was retargeted.
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:              999999,
+		Mode:             "stopped",
+		BranchRef:        sql.NullString{String: "refs/heads/stale", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
+	if err := state.MetaSet(ctx, db, "branch.generation", "2"); err != nil {
+		t.Fatalf("MetaSet generation: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/stale",
+		BranchGeneration: 2,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "blocked.txt",
+		Fidelity:         "full",
+		State:            state.EventStateBlockedConflict,
+		Error:            sql.NullString{String: "old conflict", Valid: true},
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "blocked.txt",
+		Fidelity:  "full",
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// Write a manual pause marker that simulates a deploy-freeze.
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason:    "deploy freeze",
+		SetAt:     time.Now().UTC().Format(time.RFC3339),
+		SetBy:     "operator",
+		ExpiresAt: &expiresAt,
+	}, true); err != nil {
+		t.Fatalf("pausepkg.Write: %v", err)
+	}
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+
+	// Apply recovery WITHOUT --clear-pause; default behavior must preserve the
+	// marker untouched while still retargeting the DB.
+	var out bytes.Buffer
+	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+		t.Fatalf("runRecover apply: %v\n%s", err, out.String())
+	}
+
+	// Marker must still be on disk and byte-identical to what we wrote.
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read marker after recover: %v", err)
+	}
+	if !bytes.Equal(markerBefore, markerAfter) {
+		t.Fatalf("manual pause marker mutated: before=%q after=%q", markerBefore, markerAfter)
+	}
+
+	// Plan must reflect preservation, NOT removal.
+	var plan recoverPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal plan: %v\n%s", err, out.String())
+	}
+	if plan.ManualMarkerRemoved {
+		t.Fatalf("plan.ManualMarkerRemoved=true want false: %+v", plan)
+	}
+	if !plan.ManualMarkerPreserved {
+		t.Fatalf("plan.ManualMarkerPreserved=false want true: %+v", plan)
+	}
+	if plan.ClearPause {
+		t.Fatalf("plan.ClearPause=true want false: %+v", plan)
+	}
+
+	// At least one Actions entry must call out preservation explicitly.
+	foundPreserveAction := false
+	for _, action := range plan.Actions {
+		if strings.Contains(action, "preserve manual pause marker") &&
+			strings.Contains(action, "--clear-pause") {
+			foundPreserveAction = true
+			break
+		}
+	}
+	if !foundPreserveAction {
+		t.Fatalf("plan.Actions missing preservation entry: %v", plan.Actions)
+	}
+
+	// DB must have been retargeted to the current branch despite skipping
+	// marker removal — this is the atomicity guarantee.
+	var branchRef, eventState string
+	var gen int64
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT branch_ref, branch_generation, state FROM capture_events WHERE seq = ?`, seq,
+	).Scan(&branchRef, &gen, &eventState); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if branchRef != "refs/heads/main" || gen != 2 || eventState != state.EventStatePending {
+		t.Fatalf("event after recover branch=%q gen=%d state=%q want main/2/pending",
+			branchRef, gen, eventState)
 	}
 }
