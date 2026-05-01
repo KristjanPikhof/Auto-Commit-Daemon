@@ -331,10 +331,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// HEAD's tree (an external committer landed an identical change
 		// before we got here). Settle the event as published against
 		// `parent` without committing an empty tree.
-		parentTree, err := resolveTreeOID(ctx, repoRoot, parent)
-		if err != nil {
-			return sum, err
-		}
+		//
+		// `parentTree` was resolved once at pass start (or refreshed on
+		// the CAS retry path) — re-resolving via `rev-parse <parent>^{tree}`
+		// per event would fork an extra git subprocess for every queued
+		// row in the steady state.
 		if parentTree != "" && treeOID == parentTree {
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
 				return sum, err
