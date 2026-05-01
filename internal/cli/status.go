@@ -33,26 +33,29 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                string         `json:"repo"`
-	RepoHash            string         `json:"repo_hash"`
-	Daemon              string         `json:"daemon"`
-	Stale               bool           `json:"stale"`
-	PID                 int            `json:"pid"`
-	StartedTS           int64          `json:"started_ts,omitempty"`
-	UptimeSeconds       int64          `json:"uptime_seconds,omitempty"`
-	HeartbeatTS         int64          `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds int64          `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef           string         `json:"branch_ref,omitempty"`
-	BranchGenToken      string         `json:"branch_generation_token,omitempty"`
-	Clients             []statusClient `json:"clients"`
-	PendingEvents       int            `json:"pending_events"`
-	BlockedConflicts    int            `json:"blocked_conflicts"`
-	LastCommitOID       string         `json:"last_commit_oid,omitempty"`
-	LastCommitTS        int64          `json:"last_commit_ts,omitempty"`
-	LastCommitMessage   string         `json:"last_commit_message,omitempty"`
-	CaptureErrors       int            `json:"capture_errors"`
-	Paused              bool           `json:"paused,omitempty"`
-	Pause               *pauseInfo     `json:"pause,omitempty"`
+	Repo                 string         `json:"repo"`
+	RepoHash             string         `json:"repo_hash"`
+	Daemon               string         `json:"daemon"`
+	Stale                bool           `json:"stale"`
+	PID                  int            `json:"pid"`
+	StartedTS            int64          `json:"started_ts,omitempty"`
+	UptimeSeconds        int64          `json:"uptime_seconds,omitempty"`
+	HeartbeatTS          int64          `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds  int64          `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef            string         `json:"branch_ref,omitempty"`
+	BranchGenToken       string         `json:"branch_generation_token,omitempty"`
+	Clients              []statusClient `json:"clients"`
+	PendingEvents        int            `json:"pending_events"`
+	BlockedConflicts     int            `json:"blocked_conflicts"`
+	LastCommitOID        string         `json:"last_commit_oid,omitempty"`
+	LastCommitTS         int64          `json:"last_commit_ts,omitempty"`
+	LastCommitMessage    string         `json:"last_commit_message,omitempty"`
+	CaptureErrors        int            `json:"capture_errors"`
+	Paused               bool           `json:"paused,omitempty"`
+	Pause                *pauseInfo     `json:"pause,omitempty"`
+	BackpressurePaused   bool           `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt string         `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal   int64          `json:"events_dropped_total,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
