@@ -210,11 +210,11 @@ The `deterministic` provider never fails. It always produces a message and is th
 
 ### Diffs can leave your machine
 
-- The daemon sends an empty `diff` unless `ACD_AI_SEND_DIFF=1` is set.
-- With diff sending enabled, the openai-compat provider sends redacted file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
-- With diff sending enabled, subprocess plugins receive the same redacted, truncated diff over stdin.
+- The daemon sends an empty `diff` while the deterministic provider is selected. Selecting a network `ACD_AI_PROVIDER` (`openai-compat` or `subprocess:<name>`) auto-enables diff egress; there is no separate opt-in.
+- With a network provider selected, the openai-compat provider sends redacted file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
+- With a network provider selected, subprocess plugins receive the same redacted, truncated diff over stdin.
 - Redaction is best-effort and pattern-based. It is a backstop, not a guarantee that arbitrary secrets or proprietary code cannot be transmitted.
-- **Do not enable `ACD_AI_SEND_DIFF=1` on private or sensitive repositories without explicit consent and a fully verified provider endpoint/plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
+- **Do not select a network `ACD_AI_PROVIDER` on private or sensitive repositories without explicit consent and a verified endpoint or plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
 - `ACD_AI_BASE_URL` must be an absolute `https://` URL. Plain HTTP and relative URLs are rejected before the OpenAI-compatible provider is built.
 - The default HTTP client refuses 3xx redirects to prevent the bearer token from being steered to a different host by a hostile network.
 
