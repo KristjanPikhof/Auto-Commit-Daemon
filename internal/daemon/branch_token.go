@@ -179,7 +179,12 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 	newMissing := tokenMissing(newToken)
 	prevBranchRef := tokenBranchRef(prevToken)
 	newBranchRef := tokenBranchRef(newToken)
-	if prevToken != "" && prevBranchRef == "" && newBranchRef != "" {
+	// Asymmetric ref presence: exactly one of the two tokens carries a branch
+	// ref. Covers legacy-token-to-named-ref upgrades (prev has no ref, new
+	// has ref) and the inverse (new has no ref while prev did — detached-HEAD
+	// or legacy-token downgrade). Both directions indicate a generation
+	// boundary.
+	if (prevBranchRef == "") != (newBranchRef == "") && prevToken != "" {
 		return TokenTransitionDiverged, nil
 	}
 	if prevBranchRef != "" && newBranchRef != "" && prevBranchRef != newBranchRef {
