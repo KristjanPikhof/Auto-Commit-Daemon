@@ -498,7 +498,11 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		fmt.Fprintf(out, "Persisted branch: generation=%s head=%s\n", valueOrUnset(r.Anchor.BranchGeneration), valueOrUnset(r.Anchor.BranchHead))
 	}
 
-	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d\n", r.PendingDepth, r.PendingHighWater)
+	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d dropped_total=%d\n",
+		r.PendingDepth, r.PendingHighWater, r.EventsDroppedTotal)
+	if r.BackpressurePaused {
+		fmt.Fprintf(out, "Backpressure: paused at %s\n", valueOrUnset(r.BackpressurePausedAt))
+	}
 
 	if r.OperationInProgress != "" {
 		stale := ""
