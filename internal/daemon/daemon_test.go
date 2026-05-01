@@ -2538,3 +2538,52 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	}
 	t.Fatalf("replay.paused_until never set after cross-tick same-SHA rewind")
 }
+
+// loggedRecord is a single slog record snapshot captured by captureLogHandler.
+type loggedRecord struct {
+	Level   slog.Level
+	Message string
+	Attrs   map[string]any
+}
+
+// captureLogHandler is a minimal slog.Handler that copies records into an
+// in-memory buffer for assertions. It honors only Level and the textual
+// Message + flat Attr key/value pairs; Group/WithAttrs nesting is rare in
+// daemon logging and out of scope for the tests that use this handler.
+type captureLogHandler struct {
+	mu      sync.Mutex
+	level   slog.Level
+	records []loggedRecord
+}
+
+func (h *captureLogHandler) Enabled(_ context.Context, lvl slog.Level) bool {
+	return lvl >= h.level
+}
+
+func (h *captureLogHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := loggedRecord{
+		Level:   r.Level,
+		Message: r.Message,
+		Attrs:   make(map[string]any, r.NumAttrs()),
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.Attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	h.mu.Lock()
+	h.records = append(h.records, rec)
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *captureLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *captureLogHandler) WithGroup(_ string) slog.Handler      { return h }
+
+// Records returns a snapshot copy of the captured log records.
+func (h *captureLogHandler) Records() []loggedRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]loggedRecord, len(h.records))
+	copy(out, h.records)
+	return out
+}
