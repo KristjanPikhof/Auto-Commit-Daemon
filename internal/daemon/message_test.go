@@ -347,12 +347,12 @@ func TestCommitContextFromEvent_EmptyRepoRootOmitsDiffText(t *testing.T) {
 	}
 }
 
-// TestCommitContextFromEvent_OptInPopulatesRedactedDiff asserts the wiring:
-// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText. The
-// opted-in diff must be redacted before it reaches a provider.
-func TestCommitContextFromEvent_OptInPopulatesRedactedDiff(t *testing.T) {
-	t.Setenv(envAISendDiff, "1")
-
+// TestCommitContextFromEvent_NonEmptyRepoRootPopulatesRedactedDiff asserts the
+// wiring: Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText.
+// The diff must be redacted before it reaches a provider. A non-empty
+// repoRoot is what providerMessageFn passes for providers whose NeedsDiff is
+// true.
+func TestCommitContextFromEvent_NonEmptyRepoRootPopulatesRedactedDiff(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
