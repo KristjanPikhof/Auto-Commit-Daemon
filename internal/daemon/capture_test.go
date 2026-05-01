@@ -681,25 +681,3 @@ func TestCapture_RunLoopSkipPauseCheckOptOut(t *testing.T) {
 	}
 }
 
-// captureEventsTotalForTest counts capture_events for assertions. Local
-// helper duplicating the equivalent in replay_test.go to avoid cross-file
-// test coupling.
-func captureEventsTotalForTest(t *testing.T, ctx context.Context, db *state.DB) int {
-	t.Helper()
-	var n int
-	if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&n); err != nil {
-		t.Fatalf("count capture_events: %v", err)
-	}
-	return n
-}
-
-// traceEventsByClassForTest filters records by EventClass.
-func traceEventsByClassForTest(records []traceRecord, class string) []traceRecord {
-	var out []traceRecord
-	for _, r := range records {
-		if r.EventClass == class {
-			out = append(out, r)
-		}
-	}
-	return out
-}
