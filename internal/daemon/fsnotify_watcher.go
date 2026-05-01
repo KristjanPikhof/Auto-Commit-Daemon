@@ -589,11 +589,13 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 }
 
 // handleEvent dispatches one OS event. We add watches recursively on
-// directory creation; we ignore the file-level details because capture
-// will rediscover them on the next pass.
+// directory creation, and reconcile bookkeeping on directory
+// Remove/Rename so watchedDirs/watchCount don't drift upward under
+// long-running directory churn (the OS-level inotify/kqueue watch is
+// already cleaned by the kernel; only our internal counters need
+// catching up).
 func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
-	// Re-walk new directories so children become watched too. We do not
-	// remove watches on Remove/Rename — the OS already cleaned them up.
+	// Re-walk new directories so children become watched too.
 	if ev.Op&fsnotify.Create != 0 {
 		fi, err := os.Lstat(ev.Name)
 		if err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
@@ -604,6 +606,31 @@ func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
 				}
 			}
 		}
+	}
+
+	// Reconcile bookkeeping when a tracked directory disappears or is
+	// renamed away. fsnotify reports Remove/Rename for both files and
+	// directories; we only act if the path is in watchedDirs. We can't
+	// stat the path (it's gone) so the membership check is the proxy
+	// for "this was a directory we were watching".
+	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		w.releaseWatch(ev.Name)
+	}
+}
+
+// releaseWatch drops a single tracked directory from watchedDirs and
+// decrements watchCount. No-op if the path was not tracked. The OS
+// inotify/kqueue watch is already gone (the kernel cleans it up on
+// Remove/Rename) so we only reconcile our own counters.
+func (w *FsnotifyWatcher) releaseWatch(path string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.watchedDirs[path]; !ok {
+		return
+	}
+	delete(w.watchedDirs, path)
+	if w.watchCount > 0 {
+		w.watchCount--
 	}
 }
 
