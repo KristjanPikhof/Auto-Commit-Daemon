@@ -433,8 +433,6 @@ func (p *captureProvider) Generate(_ context.Context, cc ai.CommitContext) (ai.R
 }
 
 func TestProviderMessageFn_SkipsDiffWhenProviderDoesNotNeedDiff(t *testing.T) {
-	t.Setenv(envAISendDiff, "1")
-
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
