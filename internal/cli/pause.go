@@ -342,11 +342,21 @@ func renderResume(out io.Writer, res resumeResult, jsonOut bool) error {
 	case "not-paused":
 		fmt.Fprintf(out, "Repo is not paused: %s\n", res.Repo)
 		return nil
+	case "no-backpressure":
+		fmt.Fprintf(out, "No durable capture backpressure was active for %s\n", res.Repo)
+		return nil
+	case "backpressure-cleared":
+		fmt.Fprintf(out, "Cleared capture backpressure for %s (was set at %s)\n",
+			res.Repo, res.BackpressureSetAt)
+		return nil
 	}
 	fmt.Fprintf(out, "Resumed %s\n", res.Repo)
 	fmt.Fprintf(out, "Prior reason: %s\n", res.Marker.Reason)
 	if res.ExistedForSeconds > 0 {
 		fmt.Fprintf(out, "Paused for: %s\n", formatDurationCompact(time.Duration(res.ExistedForSeconds)*time.Second))
+	}
+	if res.BackpressureCleared {
+		fmt.Fprintf(out, "Cleared capture backpressure (was set at %s)\n", res.BackpressureSetAt)
 	}
 	return nil
 }
