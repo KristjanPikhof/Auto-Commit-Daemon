@@ -659,6 +659,65 @@ func TestDaemon_StaleOpMarker_Warns(t *testing.T) {
 		t.Fatalf("operation_in_progress.head_at=%q want %s", headAtRaw, startHead)
 	}
 
+	// Visibility assertion 1: the slog warning ("marker may be stale; verify
+	// git status") must have fired at least once after the clock advanced
+	// past staleOpMarkerThreshold. This proves the rate-limited warn lane
+	// is wired up; without it, an abandoned rebase silently mutes capture/
+	// replay forever and the operator never sees a hint.
+	staleDeadline := time.Now().Add(2 * time.Second)
+	var sawWarn bool
+	var sawAttrs map[string]any
+	for time.Now().Before(staleDeadline) {
+		records := logSink.Records()
+		for _, rec := range records {
+			if rec.Level != slog.LevelWarn {
+				continue
+			}
+			if !strings.Contains(rec.Message, "marker may be stale") {
+				continue
+			}
+			sawWarn = true
+			sawAttrs = rec.Attrs
+			break
+		}
+		if sawWarn {
+			break
+		}
+		// Force more ticks to give the staleness branch a chance to fire.
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if !sawWarn {
+		t.Fatalf("stale operation marker warn never fired after clock advance; recorded warns=%+v",
+			logSink.Records())
+	}
+	if got := sawAttrs["operation"]; got != "merge" {
+		t.Fatalf("stale-warn attr operation=%v want merge; attrs=%+v", got, sawAttrs)
+	}
+	if got := sawAttrs["head"]; got != startHead {
+		t.Fatalf("stale-warn attr head=%v want %s; attrs=%+v", got, startHead, sawAttrs)
+	}
+
+	// Visibility assertion 2: diagnose-equivalent computation must classify
+	// this marker as stale. We mirror diagnoseOperationMarker's logic locally
+	// (elapsed >= staleOpMarkerThreshold AND HEAD == head_at). Couples with
+	// the diagnose-side test in internal/cli/diagnose_test.go which asserts
+	// the JSON `stale_operation_marker` field flips true under the same shape.
+	setAtSec, parseErr := strconv.ParseFloat(setAtRaw, 64)
+	if parseErr != nil {
+		t.Fatalf("parse set_at %q: %v", setAtRaw, parseErr)
+	}
+	markerSetAt := time.Unix(0, int64(setAtSec*float64(time.Second)))
+	elapsed := nowFn().Sub(markerSetAt)
+	staleByDiagnose := elapsed >= 15*time.Minute && headAtRaw == startHead
+	if !staleByDiagnose {
+		t.Fatalf("diagnose-equivalent stale check false: elapsed=%v head_at=%s startHead=%s",
+			elapsed, headAtRaw, startHead)
+	}
+
 	// Stop the daemon and verify Run returned cleanly. We do NOT remove
 	// MERGE_HEAD here because the advanced clock has carried sinceBoot
 	// past BootGrace and the empty-sweep self-terminate gate may fire on
