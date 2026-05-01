@@ -72,10 +72,13 @@ func newResumeCmd() *cobra.Command {
 			repoFlag, _ := c.Flags().GetString("repo")
 			yes, _ := c.Flags().GetBool("yes")
 			jsonOut, _ := c.Flags().GetBool("json")
-			return runResume(c.Context(), c.OutOrStdout(), repoFlag, yes, jsonOut)
+			acceptOverflow, _ := c.Flags().GetBool("accept-overflow")
+			return runResume(c.Context(), c.OutOrStdout(), repoFlag, yes, jsonOut, acceptOverflow)
 		},
 	}
 	cmd.Flags().Bool("yes", false, "Remove the pause marker")
+	cmd.Flags().Bool("accept-overflow", false,
+		"Clear the durable capture-backpressure pause and accept any silent loss; independent from --yes (manual pause marker)")
 	return cmd
 }
 
