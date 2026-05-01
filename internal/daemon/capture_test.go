@@ -596,8 +596,8 @@ func TestCapture_HonorsManualPauseDirectInvocation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(pausepkg.Path(f.gitDir)) })
 
-	beforeCount := captureEventsTotalForTest(t, ctx, f.db)
-	trace := newMemoryTraceLogger()
+	beforeCount := captureEventsTotal(t, ctx, f.db)
+	trace := &memoryTraceLogger{}
 
 	sum, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
 		IgnoreChecker:    f.ig,
@@ -620,14 +620,14 @@ func TestCapture_HonorsManualPauseDirectInvocation(t *testing.T) {
 
 	// No new capture_events row may have been minted while the pause was
 	// active — that's the whole point of the gate.
-	if got := captureEventsTotalForTest(t, ctx, f.db); got != beforeCount {
+	if got := captureEventsTotal(t, ctx, f.db); got != beforeCount {
 		t.Fatalf("capture_events grew while paused: before=%d after=%d", beforeCount, got)
 	}
 
 	// Trace symmetry: the run loop emits "capture.pause" for paused
 	// captures via the same helper. Direct callers must produce the same
 	// trace shape so operators see one consistent event class.
-	events := traceEventsByClassForTest(trace.Events(), "capture.pause")
+	events := traceEventsByClass(trace.Events(), "capture.pause")
 	if len(events) != 1 {
 		t.Fatalf("capture.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
 	}
