@@ -416,6 +416,20 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 					return sum, fmt.Errorf("daemon: replay reseed index after cas idempotent publish: %w", err)
 				}
 				parent = headOID
+				// CAS lost to a concurrent committer. Re-resolve the
+				// branch ref + parent tree so subsequent events in this
+				// pass observe the post-publish anchor instead of the
+				// stale pre-CAS tree we cached at pass start.
+				if branchRef, refHead := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
+					activeCtx.BranchRef = branchRef
+					if refHead != "" && refHead == parent {
+						activeCtx.BaseHead = refHead
+					}
+				}
+				parentTree, err = resolveTreeOID(ctx, repoRoot, parent)
+				if err != nil {
+					return sum, err
+				}
 				activeCtx.BaseHead = headOID
 				sum.BaseHead = headOID
 				sum.Published++
