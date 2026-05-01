@@ -116,7 +116,7 @@ func recoverRepoRecord(repo string) (central.RepoRecord, error) {
 	return rec, nil
 }
 
-func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun bool) (recoverPlan, error) {
+func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clearPause bool) (recoverPlan, error) {
 	branchRef, err := git.RunBranchRef(ctx, rec.Path)
 	if err != nil {
 		return recoverPlan{}, fmt.Errorf("acd recover: resolve HEAD branch: %w", err)
