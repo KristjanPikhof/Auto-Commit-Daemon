@@ -266,6 +266,27 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		return CaptureSummary{}, fmt.Errorf("daemon: Capture: empty base_head")
 	}
 
+	// Daemon pause gate — symmetric with Replay. Manual pause marker and
+	// rewind grace pause BOTH lanes; otherwise a direct caller (test, CLI,
+	// future automation) could resurrect rewound work by walking the
+	// worktree while the operator is mid-surgery. The run loop sets
+	// SkipPauseCheck because it already gates on the same state and emits
+	// the trace event itself; direct callers leave it false.
+	if !opts.SkipPauseCheck && opts.GitDir != "" {
+		paused, err := daemonPauseState(ctx, opts.GitDir, db)
+		if err != nil {
+			return CaptureSummary{}, err
+		}
+		if paused.Active {
+			traceCapturePaused(opts.Trace, repoRoot, cctx, paused)
+			reason := paused.Reason
+			if reason == "" {
+				reason = paused.Source
+			}
+			return CaptureSummary{Skipped: true, SkipReason: reason}, nil
+		}
+	}
+
 	matcher := opts.SensitiveMatcher
 	if matcher == nil {
 		matcher = state.NewSensitiveMatcher()
