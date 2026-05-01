@@ -294,8 +294,11 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 // / bisect marker is currently making the daemon pause and how long it has
 // been doing so. The daemon never auto-clears these markers — operators are
 // expected to run `git rebase --abort` (or remove the marker) manually — so
-// when the elapsed time crosses 15 minutes the report flags it as stale.
-func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+// when the elapsed time crosses 15 minutes AND HEAD has not advanced since the
+// marker was first recorded, the report flags it as stale.
+// A long-running but progressing operation (e.g. an interactive rebase that is
+// still picking commits) advances HEAD across ticks; that case is NOT stale.
+func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
 	op, ok, err := metaLookup(ctx, conn, "operation_in_progress")
 	if err != nil {
 		return fmt.Errorf("operation_in_progress: %w", err)
@@ -323,7 +326,16 @@ func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, report *diagnose
 	}
 	report.OperationMarkerDuration = elapsed.Round(time.Second).String()
 	if elapsed >= 15*time.Minute {
-		report.StaleOperationMarker = true
+		// Stale only when HEAD is also motionless. A progressing rebase
+		// advances HEAD tick-by-tick; the daemon records the HEAD SHA at
+		// marker onset in operation_in_progress.head_at. Compare against the
+		// live HEAD; if they differ the operation is still active.
+		headAtRecord, _, _ := metaLookup(ctx, conn, "operation_in_progress.head_at")
+		currentHead, headErr := git.RevParse(ctx, repoDir, "HEAD")
+		headMotionless := headErr != nil || headAtRecord == "" || currentHead == headAtRecord
+		if headMotionless {
+			report.StaleOperationMarker = true
+		}
 	}
 	return nil
 }
