@@ -230,7 +230,7 @@ func TestRecover_ClearsReplayPausedUntil(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, false); err != nil {
+	if err := runRecover(ctx, &out, repo, true, false, true, false, false); err != nil {
 		t.Fatalf("runRecover apply: %v", err)
 	}
 
