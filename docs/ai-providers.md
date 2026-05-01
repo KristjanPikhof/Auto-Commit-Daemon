@@ -72,8 +72,7 @@ Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning 
 Diff egress is no longer a separate switch: it follows the selected provider's
 declared `NeedsDiff` capability. The deterministic provider always sees an
 empty `diff`; `openai-compat` and `subprocess:<name>` always receive a redacted
-captured diff. The legacy `ACD_AI_SEND_DIFF` variable was removed; setting it
-is ignored and emits a one-shot deprecation warn-log at daemon startup.
+captured diff. See `CHANGELOG.md` for the related deprecation note.
 
 ---
 
