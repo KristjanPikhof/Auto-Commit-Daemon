@@ -297,9 +297,12 @@ func TestBuildOpsDiff_SurvivesLiveWorktreeChange(t *testing.T) {
 	}
 }
 
-// TestCommitContextFromEvent_DefaultOmitsDiffText asserts the secure default:
-// captured diffs are not sent to AI providers unless ACD_AI_SEND_DIFF opts in.
-func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
+// TestCommitContextFromEvent_EmptyRepoRootOmitsDiffText asserts the
+// daemon-side gating contract: when commitContextFromEvent receives an empty
+// repoRoot (the path providerMessageFn passes for providers whose NeedsDiff
+// returns false), DiffText stays empty even if captured ops carry usable
+// before/after OIDs.
+func TestCommitContextFromEvent_EmptyRepoRootOmitsDiffText(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -326,19 +329,21 @@ func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
 		},
 	}
 
-	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, f.dir)
+	// Empty repoRoot mirrors what providerMessageFn passes when the provider
+	// declares NeedsDiff=false (e.g. DeterministicProvider).
+	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, "")
 
 	if cc.Branch != "refs/heads/main" {
 		t.Fatalf("Branch=%q", cc.Branch)
 	}
-	if cc.RepoRoot != f.dir {
-		t.Fatalf("RepoRoot=%q want %q", cc.RepoRoot, f.dir)
+	if cc.RepoRoot != "" {
+		t.Fatalf("RepoRoot=%q want empty", cc.RepoRoot)
 	}
 	if cc.Now.IsZero() {
 		t.Fatalf("Now is zero")
 	}
 	if cc.DiffText != "" {
-		t.Fatalf("DiffText=%q, want empty by default", cc.DiffText)
+		t.Fatalf("DiffText=%q, want empty when repoRoot is empty", cc.DiffText)
 	}
 }
 
