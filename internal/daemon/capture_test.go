@@ -392,11 +392,15 @@ func TestCapture_ModeChange(t *testing.T) {
 	}
 }
 
-// TestCapture_PendingDepthCap_DropsNewEvents verifies the
-// ACD_MAX_PENDING_EVENTS soft cap. With cap=10 and 15 candidate creates, we
-// expect exactly 10 inserts, 5 dropped events recorded in the summary, the
-// rate-limited slog.Warn fired at least once, and
-// daemon_meta.capture.pending_high_water = 10.
+// TestCapture_PendingDepthCap_DropsNewEvents verifies the new durable
+// backpressure contract. Pass A: drive pending up to the cap, observe
+// mid-pass entry into backpressure (the in-loop saturation guard that
+// stamps MetaKeyCaptureBackpressurePausedAt and stops the pass). Pass B:
+// while saturated, an additional capture pass MUST early-return BEFORE
+// walkLive runs — `WalkedFiles` stays 0 and `BackpressurePaused` is true.
+// Pass C: after replay drains the queue below the high-water mark, the
+// next capture pass clears the gate and emits a `capture.pause cleared`
+// trace event.
 func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 	t.Setenv(EnvMaxPendingEvents, "10")
 	resetPendingCapWarnForTest(t, 1) // 1-second interval; we only care that *one* warn lands
@@ -416,6 +420,9 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 		}
 	}
 
+	// Pass A: walk runs, fills the FIFO to cap, the in-loop saturation
+	// guard stamps the durable backpressure key, and the pass returns
+	// without processing the remaining ops.
 	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
 		IgnoreChecker:    f.ig,
 		SensitiveMatcher: f.matcher,
@@ -423,21 +430,17 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-
-	// The fixture seeds an initial commit (.gitignore) so the very first
-	// Capture pass also reclassifies that as a fresh "create" against an
-	// empty shadow. Total ops therefore = 15 user-created + 1 fixture seed
-	// = 16. With the cap at 10 we expect exactly 10 inserts and the
-	// remainder to be dropped.
 	if sum.EventsAppended != 10 {
 		t.Fatalf("EventsAppended=%d, want 10; summary=%+v", sum.EventsAppended, sum)
 	}
-	if sum.EventsDropped < 5 {
-		t.Fatalf("EventsDropped=%d, want >=5; summary=%+v", sum.EventsDropped, sum)
+	if !sum.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false; want true after mid-pass saturation; summary=%+v", sum)
 	}
-	if sum.EventsAppended+sum.EventsDropped < 15 {
-		t.Fatalf("appended+dropped=%d, want >=15; summary=%+v",
-			sum.EventsAppended+sum.EventsDropped, sum)
+	if sum.EventsDropped < 1 {
+		t.Fatalf("EventsDropped=%d, want >=1; summary=%+v", sum.EventsDropped, sum)
+	}
+	if sum.EventsDroppedTotal < 1 {
+		t.Fatalf("EventsDroppedTotal=%d, want >=1; summary=%+v", sum.EventsDroppedTotal, sum)
 	}
 	if sum.PendingDepth != 10 {
 		t.Fatalf("PendingDepth=%d, want 10; summary=%+v", sum.PendingDepth, sum)
@@ -466,8 +469,115 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 		t.Fatalf("daemon_meta.%s=%q, want 10", MetaKeyPendingHighWater, hw)
 	}
 
+	// MetaKeyCaptureBackpressurePausedAt must now be set.
+	bp, bpOK, err := state.MetaGet(context.Background(), f.db, MetaKeyCaptureBackpressurePausedAt)
+	if err != nil {
+		t.Fatalf("MetaGet backpressure: %v", err)
+	}
+	if !bpOK || bp == "" {
+		t.Fatalf("expected daemon_meta.%s set after saturation", MetaKeyCaptureBackpressurePausedAt)
+	}
+	if _, perr := time.Parse(time.RFC3339, bp); perr != nil {
+		t.Fatalf("backpressure_paused_at=%q is not RFC3339: %v", bp, perr)
+	}
+
+	// MetaKeyCaptureEventsDroppedTotal must be advanced.
+	dt, dtOK, err := state.MetaGet(context.Background(), f.db, MetaKeyCaptureEventsDroppedTotal)
+	if err != nil {
+		t.Fatalf("MetaGet dropped total: %v", err)
+	}
+	if !dtOK || dt == "" {
+		t.Fatalf("expected daemon_meta.%s set after saturation", MetaKeyCaptureEventsDroppedTotal)
+	}
+	if total, perr := strconv.ParseInt(dt, 10, 64); perr != nil || total < 1 {
+		t.Fatalf("events_dropped_total=%q, want >=1", dt)
+	}
+
 	if !strings.Contains(logBuf.String(), "capture pending depth at cap") {
 		t.Fatalf("expected slog.Warn about capture pending depth at cap, got: %s", logBuf.String())
+	}
+
+	// Pass B: a second pass while saturated MUST early-return ahead of
+	// walkLive. Drop more files into the worktree to make sure the walk
+	// would otherwise produce work.
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("extra-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("y"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	prevTotal, _, _ := state.MetaGet(context.Background(), f.db, MetaKeyCaptureEventsDroppedTotal)
+	resetPendingCapWarnForTest(t, 1)
+	logBuf.Reset()
+	sumB, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass B: %v", err)
+	}
+	if sumB.WalkedFiles != 0 {
+		t.Fatalf("WalkedFiles=%d, want 0 (walk must be skipped while saturated); summary=%+v",
+			sumB.WalkedFiles, sumB)
+	}
+	if !sumB.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false on saturated pass; summary=%+v", sumB)
+	}
+	if sumB.EventsAppended != 0 {
+		t.Fatalf("EventsAppended=%d, want 0 on saturated pass; summary=%+v", sumB.EventsAppended, sumB)
+	}
+	// Cumulative counter must advance monotonically.
+	prevN, _ := strconv.ParseInt(prevTotal, 10, 64)
+	if sumB.EventsDroppedTotal <= prevN {
+		t.Fatalf("EventsDroppedTotal did not advance: prev=%d cur=%d", prevN, sumB.EventsDroppedTotal)
+	}
+
+	// Pass C: simulate replay drain. Mark 3 of the 10 pending rows as
+	// published (depth 7), still above the high-water mark of 8 (10*0.8),
+	// so the gate stays active.
+	if _, err := f.db.SQL().ExecContext(context.Background(),
+		`UPDATE capture_events SET state = 'published' WHERE seq IN (
+			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 3
+		)`); err != nil {
+		t.Fatalf("simulate drain (3 rows): %v", err)
+	}
+	sumC, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass C: %v", err)
+	}
+	if !sumC.BackpressurePaused {
+		t.Fatalf("expected backpressure to still be active above high-water (depth=7, high_water=8); summary=%+v", sumC)
+	}
+	if sumC.WalkedFiles != 0 {
+		t.Fatalf("WalkedFiles=%d, want 0 above high-water; summary=%+v", sumC.WalkedFiles, sumC)
+	}
+
+	// Pass D: drain further so depth drops below the high-water mark.
+	// Mark one more row published (depth 6), backpressure must clear.
+	if _, err := f.db.SQL().ExecContext(context.Background(),
+		`UPDATE capture_events SET state = 'published' WHERE seq IN (
+			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 2
+		)`); err != nil {
+		t.Fatalf("simulate drain (2 rows): %v", err)
+	}
+	sumD, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass D: %v", err)
+	}
+	if !sumD.BackpressureCleared {
+		t.Fatalf("BackpressureCleared=false after drain below high-water; summary=%+v", sumD)
+	}
+	if sumD.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=true after clear transition; summary=%+v", sumD)
+	}
+	if _, ok, _ := state.MetaGet(context.Background(), f.db, MetaKeyCaptureBackpressurePausedAt); ok {
+		t.Fatalf("MetaKeyCaptureBackpressurePausedAt should be deleted after clear")
 	}
 }
 
