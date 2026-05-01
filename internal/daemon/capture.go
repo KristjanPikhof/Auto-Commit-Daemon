@@ -749,6 +749,11 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			}
 		}
 	}
+	// Surface the cumulative dropped-total regardless of whether the cap is
+	// active this pass. Readers want the running counter, not a delta.
+	if total, perr := readEventsDroppedTotal(ctx, db); perr == nil && total > 0 {
+		summary.EventsDroppedTotal = total
+	}
 
 	return summary, nil
 }
