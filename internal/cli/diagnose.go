@@ -58,6 +58,9 @@ type diagnoseReport struct {
 	Anchor                  diagnoseAnchorReport   `json:"anchor"`
 	PendingDepth            int                    `json:"pending_depth"`
 	PendingHighWater        int64                  `json:"pending_high_water"`
+	BackpressurePaused      bool                   `json:"backpressure_paused"`
+	BackpressurePausedAt    string                 `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal      int64                  `json:"events_dropped_total"`
 	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
 	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
 	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
