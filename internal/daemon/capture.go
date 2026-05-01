@@ -118,6 +118,19 @@ type CaptureOpts struct {
 	SubmodulePaths map[string]bool
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
+	// GitDir is the absolute .git directory. Required to consult the
+	// daemon pause gate (manual marker + rewind grace meta). Empty
+	// disables the in-Capture pause check entirely; callers that have
+	// already gated externally (e.g. the run loop) should set
+	// SkipPauseCheck instead so the gate is symmetric across direct and
+	// run-loop invocations.
+	GitDir string
+	// SkipPauseCheck disables the daemon pause gate inside Capture. The
+	// run loop already gates capture+replay on the same pause state and
+	// emits a single trace event before either pass runs; setting this
+	// flag avoids a double-trace. Direct callers (tests, future CLI
+	// wrappers) leave it false to honor the gate.
+	SkipPauseCheck bool
 }
 
 // resolveMaxFileBytes consults EnvMaxFileBytes, falls back to default.
