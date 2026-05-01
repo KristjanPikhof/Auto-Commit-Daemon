@@ -608,7 +608,7 @@ alongside another auto-committer (Claude Code Automatic Atomic Commits,
 Codex ACD hook, or any process that lands commits on the active branch).
 
 Summary: `acd` uses its idempotent publish probe
-(`internal/daemon/replay.go:643`, `alreadyPublishedAtHEAD`) to detect when an
+(`alreadyPublishedAtHEAD`, `internal/daemon/replay.go`) to detect when an
 external tool already landed a queued event. The event is settled as `published`
 against `HEAD` with no new commit, and the trace record carries
 `decision: "already_published_by_external_committer"`. Real before-state
