@@ -81,6 +81,14 @@ type CaptureSummary struct {
 	WalkedFiles      int64 // for diagnostics
 	PendingDepth     int   // pending depth observed for the active generation at end of pass (0 if cap disabled)
 	PendingHighWater int64 // updated daemon_meta.capture.pending_high_water value (0 if not bumped)
+	// Skipped is true when Capture intentionally skipped the walk before
+	// touching the worktree (e.g. an active manual pause marker or rewind
+	// grace). Mirrors ReplaySummary.Skipped so direct callers can short-
+	// circuit the same way the run loop does.
+	Skipped bool
+	// SkipReason is a short human-readable label populated alongside
+	// Skipped. Empty when Skipped is false.
+	SkipReason string
 }
 
 // CaptureContext carries the per-pass repository identity that the legacy
