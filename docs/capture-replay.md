@@ -521,7 +521,7 @@ pick up a clean diff when the grace expires.
 Before this branch, a `delete` op queued while a file still existed at the
 capture time would become `blocked_conflict` if the file was already gone by
 replay time. After this branch, `alreadyPublishedAtHEAD`
-(`internal/daemon/replay.go:643`) checks each `delete` op:
+(`internal/daemon/replay.go`, `alreadyPublishedAtHEAD`) checks each `delete` op:
 
 - If the path is **absent** in the current `HEAD` tree, the delete is already
   accomplished; the event settles as `published` against `HEAD` without a new
