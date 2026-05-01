@@ -187,6 +187,14 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 		t.Fatalf("daemon did not create a first rewind.txt commit")
 	}
 
+	// CLAUDE.md invariant 10: same-branch rewind pauses BOTH capture and
+	// replay during the grace window. The post-rewind capture pass must
+	// NOT mint new capture rows for rewind.txt, and HEAD must not advance.
+	// Snapshot the queue shape for rewind.txt BEFORE the reset so we can
+	// assert neither MAX(seq) nor COUNT(rows) grows during the grace.
+	rewindSeqBefore := selfHealRewindMaxSeq(t, dbPath, "rewind.txt")
+	rewindCountBefore := selfHealCount(t, dbPath, "path = 'rewind.txt'")
+
 	runGitOK(t, repo, "reset", "--soft", "HEAD~1")
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != seedHead {
 		t.Fatalf("soft reset HEAD=%s want seed %s", head, seedHead)
@@ -196,7 +204,24 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 	waitFor(t, "replay.paused_until set", 8*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'replay.paused_until'") != ""
 	})
-	waitForEventState(t, dbPath, "rewind.txt", "pending", 8*time.Second)
+
+	// Wake the daemon a few extra times during the active grace window so a
+	// regression that captures during the grace has multiple opportunities to
+	// add a phantom row. Then assert: no new rewind.txt capture rows AND HEAD
+	// has NOT advanced. This replaces the old (incorrect) `pending` poll —
+	// invariant 10 forbids capture rows during the grace window.
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-rewind")
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-rewind")
+	if got := selfHealCount(t, dbPath, "path = 'rewind.txt'"); got != rewindCountBefore {
+		rows := sqliteScalar(t, dbPath,
+			"SELECT group_concat(seq || ':' || operation || ':' || state, char(10)) FROM capture_events WHERE path = 'rewind.txt' ORDER BY seq")
+		t.Fatalf("rewind.txt rows during grace: before=%d after=%d (invariant 10 violated)\nrows:\n%s",
+			rewindCountBefore, got, rows)
+	}
+	if got := selfHealRewindMaxSeq(t, dbPath, "rewind.txt"); got != rewindSeqBefore {
+		t.Fatalf("rewind.txt MAX(seq) grew during grace: before=%d after=%d (capture queued rows during pause gate)",
+			rewindSeqBefore, got)
+	}
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != seedHead {
 		t.Fatalf("HEAD advanced during rewind grace: got %s want %s", head, seedHead)
 	}
@@ -209,6 +234,19 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head == seedHead {
 		t.Fatalf("HEAD did not advance after rewind grace expired")
 	}
+}
+
+// selfHealRewindMaxSeq returns MAX(seq) for capture_events rows on `path`,
+// or -1 when no row exists yet. Stable shape for "did the queue grow?" probes.
+func selfHealRewindMaxSeq(t *testing.T, dbPath, path string) int64 {
+	t.Helper()
+	got := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT COALESCE(MAX(seq), -1) FROM capture_events WHERE path = %s", sqliteQuote(path)))
+	var n int64
+	if _, err := fmt.Sscanf(got, "%d", &n); err != nil {
+		t.Fatalf("parse max(seq) %q: %v", got, err)
+	}
+	return n
 }
 
 // TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms pins the regression
