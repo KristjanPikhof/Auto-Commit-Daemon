@@ -70,7 +70,7 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 - **`blocked_conflict` is terminal and forms a seq barrier.** Set via `state.MarkEventBlocked` (atomic update of `capture_events` + `publish_state`). Daemon never retries. `PendingEvents` hides later pending rows for the same `(branch_ref, branch_generation)` behind any earlier `blocked_conflict` or `failed` row, so downstream events do NOT leapfrog a broken predecessor across replay passes. Terminal rows older than retention are pruned only when they are no longer the active barrier.
 - **Diverged drops stale pending rows only.** On Diverged, delete `pending` capture events for the previous branch generation. Do not delete `blocked_conflict`, `failed`, or `published` rows; those remain operator-visible.
 - **Replay conflict metadata is structured.** `daemon_meta.last_replay_conflict` stores JSON with `ts`, `seq`, `error_class`, `expected_sha`, `actual_sha`, `ref`, `path`, and `message`. `last_replay_conflict_legacy` mirrors the old single-line string for backward-compatible tooling.
-- **AI diff text is opt-in.** By default providers receive empty `DiffText`; `ACD_AI_SEND_DIFF=1` enables redacted captured diffs built from `before_oid`/`after_oid` blobs (`internal/daemon/message.go::BuildOpsDiff`). Deterministic provider declares `NeedsDiff=false` and skips reconstruction. Diff rendering is capped during construction at `DiffCap` and survives live worktree changes after capture.
+- **AI diff text follows provider capability.** Network providers declare `NeedsDiff=true` and receive a redacted unified diff built from `before_oid` and `after_oid` blobs (`internal/daemon/message.go::BuildOpsDiff`). `DeterministicProvider` declares `NeedsDiff=false` and receives an empty `DiffText`. Diff rendering is capped at `DiffCap` during construction.
 - **Trace logging is opt-in and best-effort.** `ACD_TRACE=1` writes JSONL decision records to `<gitDir>/acd/trace/` or `ACD_TRACE_DIR`. Trace writes never block or abort capture/replay.
 
 ## Known issues / flaky tests
@@ -142,10 +142,11 @@ The original 145-event incident pattern is: `daemon_state.branch_ref` and queued
 |---|---:|---|
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides the trace output directory. |
-| `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after same-branch rewind detection. `0` disables the grace. |
+
+`ACD_AI_SEND_DIFF` was removed. Diff egress now follows `ACD_AI_PROVIDER` selection. Setting `ACD_AI_SEND_DIFF` in environment is ignored and emits a one-shot deprecation warn-log at daemon startup.
 
 ### Trace log format
 

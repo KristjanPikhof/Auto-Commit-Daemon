@@ -29,16 +29,18 @@
 // diff library, no bespoke text-diff implementation. For create/delete
 // we substitute the well-known empty-blob OID
 // (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
-// Captured diffs are sensitive, so CommitContext.DiffText defaults to empty;
-// set ACD_AI_SEND_DIFF=1 to opt in. Opted-in diffs are redacted before the
-// 4000-byte cap is applied.
+// Diff egress is now governed solely by the selected provider: when
+// ai.ProviderNeedsDiff(p) reports true (network-bound providers), the
+// reconstructed diff is redacted and capped, then attached to
+// CommitContext.DiffText. The deterministic provider declares
+// NeedsDiff=false and therefore never sees DiffText. The legacy
+// ACD_AI_SEND_DIFF env var is deprecated and ignored.
 package daemon
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -51,8 +53,6 @@ import (
 // "missing side" OID when synthesising create/delete diffs so we can
 // always pass two real OIDs to `git diff`.
 const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
-
-const envAISendDiff = "ACD_AI_SEND_DIFF"
 
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
@@ -97,12 +97,14 @@ func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
 // single-op events populate the top-level Path/Op/OldPath fields so the
 // deterministic generator can take the single-op path.
 //
-// When repoRoot is non-empty and ACD_AI_SEND_DIFF is truthy, the captured
-// before/after OIDs on each op are diffed via `git diff` and the resulting
-// unified diff text is redacted, capped via ai.Truncate, and stitched into
-// CommitContext.DiffText. Diff failures are
-// swallowed: an empty DiffText still produces a working commit message
-// (the deterministic fallback is unaffected).
+// When repoRoot is non-empty, the captured before/after OIDs on each op
+// are diffed via `git diff` and the resulting unified diff text is
+// redacted, capped via ai.Truncate, and stitched into
+// CommitContext.DiffText. providerMessageFn passes an empty repoRoot for
+// providers whose ai.ProviderNeedsDiff is false (e.g. the deterministic
+// provider), so reconstruction is implicitly gated on provider need.
+// Diff failures are swallowed: an empty DiffText still produces a
+// working commit message (the deterministic fallback is unaffected).
 func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot string) ai.CommitContext {
 	cc := ai.CommitContext{
 		Branch:   ec.Event.BranchRef,
@@ -133,21 +135,12 @@ func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot strin
 			})
 		}
 	}
-	if repoRoot != "" && len(ec.Ops) > 0 && aiSendDiffEnabled() {
+	if repoRoot != "" && len(ec.Ops) > 0 {
 		if diff, err := BuildOpsDiff(ctx, repoRoot, ec.Ops); err == nil && diff != "" {
 			cc.DiffText = ai.Truncate(ai.RedactDiffSecrets(diff), ai.DiffCap)
 		}
 	}
 	return cc
-}
-
-func aiSendDiffEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(envAISendDiff))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
 
 // BuildOpsDiff reconstructs a unified diff for one event's ops by

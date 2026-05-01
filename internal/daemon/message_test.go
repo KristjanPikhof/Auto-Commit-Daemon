@@ -297,9 +297,12 @@ func TestBuildOpsDiff_SurvivesLiveWorktreeChange(t *testing.T) {
 	}
 }
 
-// TestCommitContextFromEvent_DefaultOmitsDiffText asserts the secure default:
-// captured diffs are not sent to AI providers unless ACD_AI_SEND_DIFF opts in.
-func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
+// TestCommitContextFromEvent_EmptyRepoRootOmitsDiffText asserts the
+// daemon-side gating contract: when commitContextFromEvent receives an empty
+// repoRoot (the path providerMessageFn passes for providers whose NeedsDiff
+// returns false), DiffText stays empty even if captured ops carry usable
+// before/after OIDs.
+func TestCommitContextFromEvent_EmptyRepoRootOmitsDiffText(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -326,28 +329,30 @@ func TestCommitContextFromEvent_DefaultOmitsDiffText(t *testing.T) {
 		},
 	}
 
-	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, f.dir)
+	// Empty repoRoot mirrors what providerMessageFn passes when the provider
+	// declares NeedsDiff=false (e.g. DeterministicProvider).
+	cc := commitContextFromEvent(ctx, EventContext{Event: ev, Ops: ops}, "")
 
 	if cc.Branch != "refs/heads/main" {
 		t.Fatalf("Branch=%q", cc.Branch)
 	}
-	if cc.RepoRoot != f.dir {
-		t.Fatalf("RepoRoot=%q want %q", cc.RepoRoot, f.dir)
+	if cc.RepoRoot != "" {
+		t.Fatalf("RepoRoot=%q want empty", cc.RepoRoot)
 	}
 	if cc.Now.IsZero() {
 		t.Fatalf("Now is zero")
 	}
 	if cc.DiffText != "" {
-		t.Fatalf("DiffText=%q, want empty by default", cc.DiffText)
+		t.Fatalf("DiffText=%q, want empty when repoRoot is empty", cc.DiffText)
 	}
 }
 
-// TestCommitContextFromEvent_OptInPopulatesRedactedDiff asserts the wiring:
-// Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText. The
-// opted-in diff must be redacted before it reaches a provider.
-func TestCommitContextFromEvent_OptInPopulatesRedactedDiff(t *testing.T) {
-	t.Setenv(envAISendDiff, "1")
-
+// TestCommitContextFromEvent_NonEmptyRepoRootPopulatesRedactedDiff asserts the
+// wiring: Branch, RepoRoot, MultiOp, Now, and a non-empty truncated DiffText.
+// The diff must be redacted before it reaches a provider. A non-empty
+// repoRoot is what providerMessageFn passes for providers whose NeedsDiff is
+// true.
+func TestCommitContextFromEvent_NonEmptyRepoRootPopulatesRedactedDiff(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -428,8 +433,6 @@ func (p *captureProvider) Generate(_ context.Context, cc ai.CommitContext) (ai.R
 }
 
 func TestProviderMessageFn_SkipsDiffWhenProviderDoesNotNeedDiff(t *testing.T) {
-	t.Setenv(envAISendDiff, "1")
-
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	beforeOID := hashContent(t, f.dir, "old\n")
@@ -470,6 +473,132 @@ func TestProviderMessageFn_SkipsDiffWhenProviderDoesNotNeedDiff(t *testing.T) {
 	if provider.cc.DiffText != "" {
 		t.Fatalf("DiffText=%q, want empty for no-diff provider", provider.cc.DiffText)
 	}
+}
+
+// TestProviderMessageFn_DefaultDiffOnForNetworkProvider asserts the new
+// default-on contract: when the provider's NeedsDiff() returns true,
+// providerMessageFn reconstructs the captured diff and forwards it via
+// CommitContext.DiffText with no env opt-in required. The forwarded diff
+// must respect the ai.DiffCap budget.
+func TestProviderMessageFn_DefaultDiffOnForNetworkProvider(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	beforeOID := hashContent(t, f.dir, "old\n")
+	afterOID := hashContent(t, f.dir, "new\n")
+	provider := &captureProvider{needsDiff: true}
+
+	ev := state.CaptureEvent{
+		Seq:              1,
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "a.txt",
+		Fidelity:         "rescan",
+	}
+	ops := []state.CaptureOp{
+		{
+			Op:         "modify",
+			Path:       "a.txt",
+			BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:   sql.NullString{String: afterOID, Valid: true},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:   "rescan",
+		},
+	}
+
+	msg, err := providerMessageFn(provider, f.dir)(ctx, EventContext{Event: ev, Ops: ops})
+	if err != nil {
+		t.Fatalf("providerMessageFn: %v", err)
+	}
+	if msg != "Update file" {
+		t.Fatalf("message=%q", msg)
+	}
+	if provider.cc.RepoRoot != f.dir {
+		t.Fatalf("RepoRoot=%q want %q", provider.cc.RepoRoot, f.dir)
+	}
+	if provider.cc.DiffText == "" {
+		t.Fatalf("DiffText empty; expected reconstructed diff for diff-needing provider")
+	}
+	if !strings.Contains(provider.cc.DiffText, "diff --git a/a.txt b/a.txt") {
+		t.Fatalf("DiffText missing diff header:\n%s", provider.cc.DiffText)
+	}
+	if !strings.Contains(provider.cc.DiffText, "-old") || !strings.Contains(provider.cc.DiffText, "+new") {
+		t.Fatalf("DiffText missing captured delta:\n%s", provider.cc.DiffText)
+	}
+	if len(provider.cc.DiffText) > ai.DiffCap {
+		t.Fatalf("DiffText len=%d > ai.DiffCap=%d", len(provider.cc.DiffText), ai.DiffCap)
+	}
+}
+
+// TestProviderMessageFn_DeterministicReceivesEmptyDiff asserts that the
+// real ai.DeterministicProvider never sees a populated DiffText, even when
+// the caller passes a real repo root. providerMessageFn must zero the
+// effective repo root for any provider whose NeedsDiff returns false.
+func TestProviderMessageFn_DeterministicReceivesEmptyDiff(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	beforeOID := hashContent(t, f.dir, "old\n")
+	afterOID := hashContent(t, f.dir, "new\n")
+
+	// Spy provider wrapping DeterministicProvider so we can observe the
+	// CommitContext that providerMessageFn synthesised. DeterministicProvider
+	// is a value type with NeedsDiff()==false, which is the contract this
+	// test pins.
+	det := ai.DeterministicProvider{}
+	if det.NeedsDiff() {
+		t.Fatalf("DeterministicProvider.NeedsDiff() = true, want false")
+	}
+	provider := &deterministicSpy{inner: det}
+
+	ev := state.CaptureEvent{
+		Seq:              1,
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "a.txt",
+		Fidelity:         "rescan",
+	}
+	ops := []state.CaptureOp{
+		{
+			Op:         "modify",
+			Path:       "a.txt",
+			BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:   sql.NullString{String: afterOID, Valid: true},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+			Fidelity:   "rescan",
+		},
+	}
+
+	// Even though we pass a real repo root, the provider declares it does
+	// not need a diff, so providerMessageFn must zero the effective root.
+	if _, err := providerMessageFn(provider, f.dir)(ctx, EventContext{Event: ev, Ops: ops}); err != nil {
+		t.Fatalf("providerMessageFn: %v", err)
+	}
+	if provider.cc.DiffText != "" {
+		t.Fatalf("DiffText=%q, want empty for deterministic provider", provider.cc.DiffText)
+	}
+	if provider.cc.RepoRoot != "" {
+		t.Fatalf("RepoRoot=%q, want empty for deterministic provider", provider.cc.RepoRoot)
+	}
+}
+
+// deterministicSpy wraps ai.DeterministicProvider so a test can observe the
+// CommitContext that providerMessageFn synthesised while keeping the real
+// NeedsDiff()==false behaviour.
+type deterministicSpy struct {
+	inner ai.DeterministicProvider
+	cc    ai.CommitContext
+}
+
+func (s *deterministicSpy) Name() string    { return s.inner.Name() }
+func (s *deterministicSpy) NeedsDiff() bool { return s.inner.NeedsDiff() }
+func (s *deterministicSpy) Generate(ctx context.Context, cc ai.CommitContext) (ai.Result, error) {
+	s.cc = cc
+	return s.inner.Generate(ctx, cc)
 }
 
 // writeFileForTest writes body into dir/rel, creating parent dirs.
