@@ -215,6 +215,95 @@ func TestDiagnose_JSONOutput(t *testing.T) {
 	}
 }
 
+// TestDiagnose_BackpressureSurfaced asserts the new
+// capture.backpressure_paused_at + capture.events_dropped_total meta keys
+// are surfaced via `acd diagnose --json`. Operators rely on these to
+// distinguish "saturated and refusing new events" from "all is well".
+func TestDiagnose_BackpressureSurfaced(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyCaptureBackpressurePausedAt, stamp); err != nil {
+		t.Fatalf("seed backpressure meta: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyCaptureEventsDroppedTotal, "42"); err != nil {
+		t.Fatalf("seed dropped total: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	root := newRootCmd()
+	var out, errOut bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"diagnose", "--repo", repo, "--json"})
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatalf("execute diagnose: %v\nstderr:\n%s", err, errOut.String())
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !rep.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false; want true")
+	}
+	if rep.BackpressurePausedAt != stamp {
+		t.Fatalf("BackpressurePausedAt=%q, want %q", rep.BackpressurePausedAt, stamp)
+	}
+	if rep.EventsDroppedTotal != 42 {
+		t.Fatalf("EventsDroppedTotal=%d, want 42", rep.EventsDroppedTotal)
+	}
+	// The remediation array must include a backpressure-specific hint so
+	// operators see the recovery path without grepping logs.
+	var sawHint bool
+	for _, r := range rep.Remediation {
+		if strings.Contains(r, "backpressure") {
+			sawHint = true
+			break
+		}
+	}
+	if !sawHint {
+		t.Fatalf("remediation lacks backpressure hint: %v", rep.Remediation)
+	}
+}
+
+// TestStatus_BackpressureSurfaced mirrors TestDiagnose_BackpressureSurfaced
+// for the `acd status --json` surface.
+func TestStatus_BackpressureSurfaced(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyCaptureBackpressurePausedAt, stamp); err != nil {
+		t.Fatalf("seed backpressure meta: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyCaptureEventsDroppedTotal, "9"); err != nil {
+		t.Fatalf("seed dropped total: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !rep.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false; want true")
+	}
+	if rep.BackpressurePausedAt != stamp {
+		t.Fatalf("BackpressurePausedAt=%q, want %q", rep.BackpressurePausedAt, stamp)
+	}
+	if rep.EventsDroppedTotal != 9 {
+		t.Fatalf("EventsDroppedTotal=%d, want 9", rep.EventsDroppedTotal)
+	}
+}
+
 func makeDiagnoseRepo(t *testing.T, roots paths.Roots) (repoDir, dbPath string, d *state.DB) {
 	t.Helper()
 	ctx := context.Background()
