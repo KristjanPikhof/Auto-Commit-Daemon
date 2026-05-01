@@ -16,7 +16,7 @@ conflict-resolution mechanics this document references.
 When another tool (Claude Code hook, Codex hook, or any `git commit` call) lands
 a commit *before* `acd`'s replay tick, the branch ref has already advanced. On
 the next replay pass `acd` detects this via its idempotent publish probe
-(`internal/daemon/replay.go:643`, `alreadyPublishedAtHEAD`):
+(`alreadyPublishedAtHEAD`, `internal/daemon/replay.go`):
 
 1. `acd` reads the current `HEAD` tree.
 2. For every op in the queued event, it checks whether the desired final state
