@@ -3,6 +3,7 @@
 package pause
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,4 +28,23 @@ func openExclusiveTemp(dir string) (*os.File, error) {
 		}
 	}
 	return nil, fmt.Errorf("pause: unable to create temp marker in %s after 1024 attempts", dir)
+}
+
+// fsyncDir flushes the parent directory's metadata so the most recent
+// rename/create is durable across a crash. Tmpfs and a handful of FUSE
+// filesystems return EINVAL or EROFS for fsync on a directory; treat those
+// as non-fatal so CI runs on tmpfs do not regress.
+func fsyncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EROFS) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
