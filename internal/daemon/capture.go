@@ -120,6 +120,19 @@ type CaptureSummary struct {
 	// SkipReason is a short human-readable label populated alongside
 	// Skipped. Empty when Skipped is false.
 	SkipReason string
+	// BackpressurePaused is true when the pass observed the durable
+	// capture-backpressure gate as active (either entered this pass or
+	// entered earlier and not yet cleared). The walk is skipped on entry;
+	// the field is also true for the same pass that drops the gate to
+	// describe the state across the transition.
+	BackpressurePaused bool
+	// BackpressureCleared is true when this pass observed the durable
+	// capture-backpressure gate transitioning from active to inactive
+	// (pending dropped below CaptureBackpressureClearRatio * cap).
+	BackpressureCleared bool
+	// EventsDroppedTotal mirrors daemon_meta.capture.events_dropped_total
+	// after this pass. 0 when the cumulative counter has never advanced.
+	EventsDroppedTotal int64
 }
 
 // CaptureContext carries the per-pass repository identity that the legacy
