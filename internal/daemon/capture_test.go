@@ -680,4 +680,3 @@ func TestCapture_RunLoopSkipPauseCheckOptOut(t *testing.T) {
 		t.Fatalf("expected at least one event appended under SkipPauseCheck=true, got %+v", sum)
 	}
 }
-
