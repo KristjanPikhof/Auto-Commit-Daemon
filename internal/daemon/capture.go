@@ -62,9 +62,40 @@ const DefaultMaxPendingEvents = 50_000
 // `acd diagnose --json`. Persisted as a base-10 integer string.
 const MetaKeyPendingHighWater = "capture.pending_high_water"
 
+// MetaKeyCaptureBackpressurePausedAt is the daemon_meta key whose presence
+// signals that capture has entered durable backpressure: the pending FIFO
+// for the active (branch_ref, branch_generation) reached
+// ACD_MAX_PENDING_EVENTS and the daemon refuses to walk + classify until
+// replay drains the queue below the high-water mark (or the operator
+// explicitly accepts the loss via `acd resume --accept-overflow`). The
+// value is the RFC3339 UTC timestamp of the FIRST observation; subsequent
+// passes that re-encounter the saturated cap leave the timestamp untouched
+// so operators can see how long backpressure has been active.
+const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
+
+// MetaKeyCaptureEventsDroppedTotal is a cumulative counter of capture ops
+// that the backpressure gate refused to enqueue across the lifetime of the
+// state.db. Persisted as a base-10 int64. Surfaced via `acd diagnose
+// --json` so operators can detect silent loss without scraping logs.
+const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
+
+// CaptureBackpressureClearRatio is the high-water fraction of
+// ACD_MAX_PENDING_EVENTS at which capture lifts the durable backpressure
+// pause. Pending must drop strictly below cap*ratio before
+// MetaKeyCaptureBackpressurePausedAt is cleared. 0.8 keeps capture
+// suppressed until replay has made meaningful progress, avoiding a
+// thrash where each pass alternates between paused and resumed.
+const CaptureBackpressureClearRatio = 0.8
+
 // CapDropReasonAtCap is the trace reason emitted when the pending-depth cap
 // drops a captured op rather than appending it to capture_events.
 const CapDropReasonAtCap = "pending depth at cap"
+
+// CapDropReasonBackpressureEntry is the trace reason emitted on the pass
+// that first observes saturation and skips walk+classify entirely. The
+// dropped events count for the pass is unknown (we never walked) so the
+// trace event records the cap and the cumulative dropped-total instead.
+const CapDropReasonBackpressureEntry = "capture saturated; skipped walk"
 
 // stateSubdir is the per-repo state directory name inside .git/. Keeping it
 // here as a local constant avoids importing internal/state just for the
