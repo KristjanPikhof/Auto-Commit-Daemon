@@ -258,7 +258,7 @@ func TestRecover_RemovesManualPauseMarker(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, false, true, true, true); err != nil {
 		t.Fatalf("runRecover apply: %v", err)
 	}
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
