@@ -13,7 +13,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // PauseMarker is the durable gitDir/acd/paused file format.
