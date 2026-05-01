@@ -129,7 +129,9 @@ func runPauseResumeE2E(t *testing.T, bin string) {
 		waitDaemonStoppedOrKill(t, "pause-resume daemon stopped", repo)
 	})
 
-	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	// Use pausepkg.Path so a future marker-path refactor breaks the test
+	// instead of rubber-stamping a stale hardcoded location.
+	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
 
 	// Step 1: `acd pause --reason e2e --yes` writes a 0o600 marker.
 	pauseRes := runAcd(t, ctx, env,
