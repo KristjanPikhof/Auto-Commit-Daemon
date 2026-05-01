@@ -260,8 +260,15 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'replay.paused_until'") != ""
 	})
 
-	// Fast-forward back to H2 inside the active grace window. The merge
-	// --ff-only succeeds because H2 is a descendant of seedHead.
+	// Fast-forward back to H2 inside the active grace window. The hard
+	// reset above leaves the worktree file as untracked content (the
+	// daemon committed identical content into H2's tree, so reset --hard
+	// only changed HEAD, not the file). Remove it so merge --ff-only does
+	// not refuse on "untracked files would be overwritten". H2 is a
+	// descendant of seedHead so the merge is a true fast-forward.
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove target before ff-merge: %v", err)
+	}
 	runGitOK(t, repo, "merge", "--ff-only", h2)
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
 		t.Fatalf("ff-merge HEAD=%s want H2 %s", head, h2)
