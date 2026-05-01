@@ -469,6 +469,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		parent = commitOID
+		// Carry forward `treeOID` as the new parent's tree. The commit we
+		// just produced (commitOID) was built from this exact tree by
+		// commit-tree, so an extra `git rev-parse <commitOID>^{tree}` would
+		// be redundant. Steady-state branch+tree probes are now O(passes),
+		// not O(events).
+		parentTree = treeOID
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.Published++
