@@ -144,6 +144,83 @@ func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	}
 }
 
+// TestReplay_ManualMarkerWinsOverRewindGrace pins CLAUDE.md invariant 11:
+// the manual pause marker takes precedence over a future rewind-grace
+// `replay.paused_until` value. When both are armed the replay drain must skip
+// with source=manual, and even after the rewind grace would have expired,
+// the still-present manual marker must continue to suppress the drain.
+func TestReplay_ManualMarkerWinsOverRewindGrace(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	pending := captureOnePendingFile(t, ctx, f, "manual-wins.txt", "wins\n")
+	beforeCount := captureEventsTotal(t, ctx, f.db)
+
+	// Arm BOTH gates: a manual marker without expiry AND a future
+	// rewind-grace meta key. Manual must win.
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "operator wins over rewind",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write manual marker: %v", err)
+	}
+	rewindUntil := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, rewindUntil); err != nil {
+		t.Fatalf("MetaSet rewind grace: %v", err)
+	}
+
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
+	if err != nil {
+		t.Fatalf("Replay (both gates armed): %v", err)
+	}
+	if !sum.Skipped || sum.Published != 0 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("Replay summary with both gates armed=%+v want skipped-only", sum)
+	}
+	assertPendingCount(t, ctx, f.db, pending)
+	if got := captureEventsTotal(t, ctx, f.db); got != beforeCount {
+		t.Fatalf("capture_events grew while paused: before=%d after=%d", beforeCount, got)
+	}
+	events := traceEventsByClass(trace.Events(), "replay.pause")
+	if len(events) != 1 {
+		t.Fatalf("replay.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	output, ok := events[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("trace output type=%T want map[string]any", events[0].Output)
+	}
+	if got := output["source"]; got != "manual" {
+		t.Fatalf("trace pause source=%v want manual (manual must win over rewind grace)", got)
+	}
+
+	// Advance past the rewind-grace expiry WITHOUT removing the manual marker.
+	// Replay must still skip — manual marker still wins.
+	expired := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, expired); err != nil {
+		t.Fatalf("MetaSet expired rewind grace: %v", err)
+	}
+	trace2 := &memoryTraceLogger{}
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace2})
+	if err != nil {
+		t.Fatalf("Replay (rewind expired, marker present): %v", err)
+	}
+	if !sum2.Skipped || sum2.Published != 0 {
+		t.Fatalf("Replay summary after rewind expiry but marker present=%+v want skipped-only", sum2)
+	}
+	assertPendingCount(t, ctx, f.db, pending)
+	events2 := traceEventsByClass(trace2.Events(), "replay.pause")
+	if len(events2) != 1 {
+		t.Fatalf("post-expiry replay.pause trace events=%d want 1; events=%+v", len(events2), trace2.Events())
+	}
+	output2, ok := events2[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("post-expiry trace output type=%T want map[string]any", events2[0].Output)
+	}
+	if got := output2["source"]; got != "manual" {
+		t.Fatalf("post-expiry trace pause source=%v want manual (still pausing on present marker)", got)
+	}
+}
+
 func TestReplay_SkipsDrainWhenRewindGraceActive(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
