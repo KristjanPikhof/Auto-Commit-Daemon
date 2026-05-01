@@ -360,6 +360,36 @@ func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prev
 	return true, until, nil
 }
 
+// rewindGraceActive reports whether daemon_meta.replay.paused_until carries a
+// timestamp that is still in the future relative to now. It does NOT consult
+// the manual pause marker — callers that need the full pause picture should
+// call daemonPauseState. This helper exists so the run loop can detect a
+// fast-forward landing inside an active rewind grace window: in that case the
+// FF path must reseed shadow_paths from the rewound HEAD before clearing the
+// gate, otherwise post-grace capture compares live HEAD against stale shadow
+// rows seeded at the rewound (lower) HEAD and emits phantom create events.
+//
+// Returns (active, expiresAt, error). expiresAt is the parsed RFC3339 string
+// from daemon_meta when active, "" otherwise. A malformed value is treated as
+// inactive — daemonPauseState already warns about that case.
+func rewindGraceActive(ctx context.Context, db *state.DB, now time.Time) (bool, string, error) {
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok || strings.TrimSpace(raw) == "" {
+		return false, "", nil
+	}
+	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		return false, "", nil
+	}
+	if !until.After(now.UTC()) {
+		return false, "", nil
+	}
+	return true, until.UTC().Format(time.RFC3339), nil
+}
+
 func resolveRewindGrace() time.Duration {
 	raw := strings.TrimSpace(os.Getenv(EnvRewindGraceSeconds))
 	if raw == "" {
