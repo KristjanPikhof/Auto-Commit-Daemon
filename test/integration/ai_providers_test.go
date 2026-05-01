@@ -358,12 +358,12 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Diff egress is now default-on for openai-compat; no env toggle needed.
 	extra := []string{
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
-		"ACD_AI_SEND_DIFF=1",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-diff", "shell", extra...)

@@ -257,6 +257,11 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer closeProviderOnce()
 
+	if _, ok := os.LookupEnv("ACD_AI_SEND_DIFF"); ok {
+		logger.Warn("ACD_AI_SEND_DIFF is deprecated and ignored; diff egress is now controlled by ACD_AI_PROVIDER",
+			slog.String("env", "ACD_AI_SEND_DIFF"))
+	}
+
 	msgFn := opts.MessageFn
 	if msgFn == nil {
 		provider := opts.MessageProvider

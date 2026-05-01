@@ -165,9 +165,10 @@ This means:
 - `create` and `delete` ops use git's well-known empty-blob OID
   (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
 
-Diff reconstruction is opt-in via `ACD_AI_SEND_DIFF=1`. The deterministic
-provider declares that it does not need diffs, so default replay skips
-reconstruction entirely and only builds diff text for providers that can use it.
+Diff reconstruction is gated on provider capability via `ai.ProviderNeedsDiff`.
+The deterministic provider declares that it does not need diffs, so default
+replay skips reconstruction entirely and only builds diff text for providers
+that can use it.
 
 ---
 

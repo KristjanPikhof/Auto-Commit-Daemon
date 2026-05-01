@@ -2,12 +2,14 @@
 
 `acd` generates commit messages through a `Provider` interface (§10.1). Three implementations ship in v1: `deterministic` (rule-based, always available), `openai-compat` (HTTP to any OpenAI-compatible endpoint), and `subprocess` (JSONL protocol to an external binary). The default is `deterministic`; opt into the others via environment variables. Providers are composed so that any error in the primary falls back to `deterministic` automatically.
 
-By default, AI providers receive metadata only: path, operation, branch, repo
-root, multi-op entries, and timestamp. `diff` is empty unless you explicitly set
-`ACD_AI_SEND_DIFF=1`.
+By default (the `deterministic` provider), AI providers receive metadata only:
+path, operation, branch, repo root, multi-op entries, and timestamp; `diff` is
+always empty. Selecting a network `ACD_AI_PROVIDER` (`openai-compat` or
+`subprocess:<name>`) auto-enables diff egress — those providers declare
+`NeedsDiff=true` and receive a redacted unified diff alongside the metadata.
 
-When diff sending is enabled, the diff handed to AI providers is reconstructed
-from the `before_oid` and `after_oid` blobs captured in SQLite at write time —
+When a network provider is selected, the diff handed to AI providers is
+reconstructed from the `before_oid` and `after_oid` blobs captured in SQLite at write time —
 **not from the live worktree**. This means the model sees exactly what changed
 at the moment of capture, even if the file has been edited many times since.
 Before transmission, the diff is scrubbed for obvious secret shapes (AWS access
@@ -34,10 +36,10 @@ output is identical regardless of diff reconstruction success or failure. See
 ```sh
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=sk-...
+# Selecting a network provider auto-enables diff egress.
 # Optional overrides:
 # export ACD_AI_BASE_URL=https://api.openai.com/v1
 # export ACD_AI_MODEL=gpt-4o-mini
-# export ACD_AI_SEND_DIFF=1
 ```
 
 **Subprocess plugin:**
@@ -46,7 +48,8 @@ export ACD_AI_API_KEY=sk-...
 export ACD_AI_PROVIDER=subprocess:my-provider
 export PATH=$PATH:/path/to/plugin/dir
 # acd will exec acd-provider-my-provider from $PATH
-# export ACD_AI_SEND_DIFF=1
+# Subprocess providers declare NeedsDiff=true and receive redacted captured
+# diffs by default. There is no separate opt-in.
 ```
 
 ---
@@ -63,9 +66,13 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
 | `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
-| `ACD_AI_SEND_DIFF` | `0` | `1`, `true`, `yes`, or `on` opt in to sending redacted captured diffs; unset/empty/other values send an empty `diff` |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
+
+Diff egress is no longer a separate switch: it follows the selected provider's
+declared `NeedsDiff` capability. The deterministic provider always sees an
+empty `diff`; `openai-compat` and `subprocess:<name>` always receive a redacted
+captured diff. See `CHANGELOG.md` for the related deprecation note.
 
 ---
 
@@ -99,7 +106,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 `op` values: `create` | `modify` | `delete` | `rename` | `mode` | `symlink`.  
 `multi_op` is present when one daemon event covers more than one file.  
-`diff` is empty by default. With `ACD_AI_SEND_DIFF=1`, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
+`diff` is empty when the deterministic provider is selected. When a network `ACD_AI_PROVIDER` (`openai-compat` or `subprocess:<name>`) is selected, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
 
 **Response (plugin → daemon, one line per request):**
 
@@ -202,11 +209,11 @@ The `deterministic` provider never fails. It always produces a message and is th
 
 ### Diffs can leave your machine
 
-- The daemon sends an empty `diff` unless `ACD_AI_SEND_DIFF=1` is set.
-- With diff sending enabled, the openai-compat provider sends redacted file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
-- With diff sending enabled, subprocess plugins receive the same redacted, truncated diff over stdin.
+- The daemon sends an empty `diff` while the deterministic provider is selected. Selecting a network `ACD_AI_PROVIDER` (`openai-compat` or `subprocess:<name>`) auto-enables diff egress; there is no separate opt-in.
+- With a network provider selected, the openai-compat provider sends redacted file diffs (truncated to 4000 bytes) to `ACD_AI_BASE_URL/chat/completions`. When `ACD_AI_BASE_URL` points to the public OpenAI API those diffs are transmitted to OpenAI's infrastructure.
+- With a network provider selected, subprocess plugins receive the same redacted, truncated diff over stdin.
 - Redaction is best-effort and pattern-based. It is a backstop, not a guarantee that arbitrary secrets or proprietary code cannot be transmitted.
-- **Do not enable `ACD_AI_SEND_DIFF=1` on private or sensitive repositories without explicit consent and a fully verified provider endpoint/plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
+- **Do not select a network `ACD_AI_PROVIDER` on private or sensitive repositories without explicit consent and a verified endpoint or plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
 - `ACD_AI_BASE_URL` must be an absolute `https://` URL. Plain HTTP and relative URLs are rejected before the OpenAI-compatible provider is built.
 - The default HTTP client refuses 3xx redirects to prevent the bearer token from being steered to a different host by a hostile network.
 
