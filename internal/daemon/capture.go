@@ -74,13 +74,13 @@ const stateSubdir = "acd"
 
 // CaptureSummary describes one capture pass.
 type CaptureSummary struct {
-	EventsAppended    int   // number of capture_events rows inserted
-	EventsDropped     int   // ops refused due to ACD_MAX_PENDING_EVENTS cap
-	Oversize          int   // files skipped due to size cap
-	Errors            int   // soft errors (per-file lstat/open failures)
-	WalkedFiles       int64 // for diagnostics
-	PendingDepth      int   // pending depth observed for the active generation at end of pass (0 if cap disabled)
-	PendingHighWater  int64 // updated daemon_meta.capture.pending_high_water value (0 if not bumped)
+	EventsAppended   int   // number of capture_events rows inserted
+	EventsDropped    int   // ops refused due to ACD_MAX_PENDING_EVENTS cap
+	Oversize         int   // files skipped due to size cap
+	Errors           int   // soft errors (per-file lstat/open failures)
+	WalkedFiles      int64 // for diagnostics
+	PendingDepth     int   // pending depth observed for the active generation at end of pass (0 if cap disabled)
+	PendingHighWater int64 // updated daemon_meta.capture.pending_high_water value (0 if not bumped)
 }
 
 // CaptureContext carries the per-pass repository identity that the legacy
