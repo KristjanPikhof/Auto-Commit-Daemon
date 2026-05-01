@@ -130,7 +130,7 @@ func TestResume_RemovesMarkerAndReportsPriorReason(t *testing.T) {
 		t.Fatalf("runPause: %v", err)
 	}
 	out.Reset()
-	if err := runResume(ctx, &out, repo, true, true); err != nil {
+	if err := runResume(ctx, &out, repo, true, true, false); err != nil {
 		t.Fatalf("runResume: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestResume_RefusesWithoutYes(t *testing.T) {
 		t.Fatalf("runPause: %v", err)
 	}
 	out.Reset()
-	if err := runResume(ctx, &out, repo, false, true); err == nil {
+	if err := runResume(ctx, &out, repo, false, true, false); err == nil {
 		t.Fatalf("runResume succeeded without --yes")
 	}
 	if _, err := os.Stat(markerPath); err != nil {
@@ -169,7 +169,7 @@ func TestResume_NoMarkerIsNoop(t *testing.T) {
 	repo := makeStartRepo(t)
 
 	var out bytes.Buffer
-	if err := runResume(ctx, &out, repo, false, true); err != nil {
+	if err := runResume(ctx, &out, repo, false, true, false); err != nil {
 		t.Fatalf("runResume: %v", err)
 	}
 	var got resumeResult
@@ -192,7 +192,7 @@ func TestResume_RequiresYes_JSONEnvelope(t *testing.T) {
 	}
 
 	var resumeOut bytes.Buffer
-	err := runResume(ctx, &resumeOut, repo, false, true)
+	err := runResume(ctx, &resumeOut, repo, false, true, false)
 	if err == nil {
 		t.Fatalf("runResume succeeded without --yes; want error to surface non-zero exit")
 	}
@@ -226,7 +226,7 @@ func TestResume_NotPaused_JSONEnvelope(t *testing.T) {
 	repo := makeStartRepo(t)
 
 	var out bytes.Buffer
-	if err := runResume(ctx, &out, repo, false, true); err != nil {
+	if err := runResume(ctx, &out, repo, false, true, false); err != nil {
 		t.Fatalf("runResume: %v", err)
 	}
 	var got resumeResult
@@ -267,6 +267,78 @@ func TestPause_OverwroteFlagFact(t *testing.T) {
 	}
 	if !second.Overwrote {
 		t.Fatalf("second pause reports overwrote=false: %+v", second)
+	}
+}
+
+// TestResume_AcceptOverflow_ClearsBackpressureMeta: the new
+// --accept-overflow flag must be independent from the manual pause marker.
+// When invoked alone it clears MetaKeyCaptureBackpressurePausedAt and
+// reports status="backpressure-cleared".
+func TestResume_AcceptOverflow_ClearsBackpressureMeta(t *testing.T) {
+	ctx := context.Background()
+	roots := withIsolatedHome(t)
+	repo, _, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, db.Path(), "codex")
+
+	// Stamp the durable backpressure meta key.
+	stamp := time.Now().UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt, stamp); err != nil {
+		t.Fatalf("seed backpressure meta: %v", err)
+	}
+
+	var out bytes.Buffer
+	// --yes=false, --accept-overflow=true: clears the gate independently.
+	if err := runResume(ctx, &out, repo, false, true, true); err != nil {
+		t.Fatalf("runResume --accept-overflow: %v", err)
+	}
+	var got resumeResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if got.Status != "backpressure-cleared" {
+		t.Fatalf("status=%q want backpressure-cleared; envelope=%+v", got.Status, got)
+	}
+	if !got.OK || !got.BackpressureCleared || !got.BackpressureWasSet {
+		t.Fatalf("flags wrong: %+v", got)
+	}
+	if got.BackpressureSetAt != stamp {
+		t.Fatalf("set_at=%q want %q", got.BackpressureSetAt, stamp)
+	}
+	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("backpressure meta key should be deleted after --accept-overflow")
+	}
+	// Operator-acknowledgement breadcrumb should be stamped.
+	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_overridden_at"); err != nil {
+		t.Fatalf("MetaGet override: %v", err)
+	} else if !ok {
+		t.Fatalf("expected capture.backpressure_overridden_at to be stamped")
+	}
+}
+
+// TestResume_AcceptOverflow_NoBackpressure: when no durable backpressure
+// is active, --accept-overflow must be a friendly no-op with
+// status="no-backpressure" rather than an error.
+func TestResume_AcceptOverflow_NoBackpressure(t *testing.T) {
+	ctx := context.Background()
+	roots := withIsolatedHome(t)
+	repo, _, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, db.Path(), "codex")
+
+	var out bytes.Buffer
+	if err := runResume(ctx, &out, repo, false, true, true); err != nil {
+		t.Fatalf("runResume --accept-overflow no-op: %v", err)
+	}
+	var got resumeResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if got.Status != "no-backpressure" {
+		t.Fatalf("status=%q want no-backpressure; envelope=%+v", got.Status, got)
+	}
+	if got.BackpressureCleared || got.BackpressureWasSet {
+		t.Fatalf("no-backpressure must not flag cleared/was_set: %+v", got)
 	}
 }
 
