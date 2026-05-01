@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
