@@ -823,6 +823,13 @@ func Run(ctx context.Context, opts Options) error {
 			opMarkerSetAt = time.Time{}
 			opMarkerHead = ""
 			opMarkerWarnedAt = time.Time{}
+			// Operation cleared is an explicit operator transition. A stale
+			// rewind-grace marker from before the operation must NOT survive
+			// it — otherwise capture/replay stay muted up to
+			// ACD_REWIND_GRACE_SECONDS post-resume. Best-effort: log on
+			// failure, don't abort the resume path.
+			clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+				"git operation cleared")
 			recordTrace(tracer, acdtrace.Event{
 				Repo:       opts.RepoPath,
 				BranchRef:  cctx.BranchRef,
