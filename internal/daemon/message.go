@@ -135,21 +135,12 @@ func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot strin
 			})
 		}
 	}
-	if repoRoot != "" && len(ec.Ops) > 0 && aiSendDiffEnabled() {
+	if repoRoot != "" && len(ec.Ops) > 0 {
 		if diff, err := BuildOpsDiff(ctx, repoRoot, ec.Ops); err == nil && diff != "" {
 			cc.DiffText = ai.Truncate(ai.RedactDiffSecrets(diff), ai.DiffCap)
 		}
 	}
 	return cc
-}
-
-func aiSendDiffEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(envAISendDiff))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
 
 // BuildOpsDiff reconstructs a unified diff for one event's ops by
