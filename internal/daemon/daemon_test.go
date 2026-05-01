@@ -578,6 +578,14 @@ func TestDaemon_StaleOpMarker_Warns(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Capture slog output through a custom handler so the test can assert
+	// that the "marker may be stale" warning fires after the injected clock
+	// crosses the staleness threshold while HEAD has not moved. The handler
+	// is goroutine-safe because Run can emit concurrently with the polling
+	// goroutine that reads recordedLogs below.
+	logSink := &captureLogHandler{level: slog.LevelWarn}
+	logger := slog.New(logSink)
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var runErr error
@@ -593,6 +601,7 @@ func TestDaemon_StaleOpMarker_Warns(t *testing.T) {
 			ShutdownCh:  shutdownCh,
 			Now:         nowFn,
 			SkipSignals: true,
+			Logger:      logger,
 		})
 	}()
 	t.Cleanup(func() {
