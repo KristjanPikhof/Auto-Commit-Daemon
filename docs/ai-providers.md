@@ -66,9 +66,14 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
 | `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
-| `ACD_AI_SEND_DIFF` | `0` | `1`, `true`, `yes`, or `on` opt in to sending redacted captured diffs; unset/empty/other values send an empty `diff` |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
+
+Diff egress is no longer a separate switch: it follows the selected provider's
+declared `NeedsDiff` capability. The deterministic provider always sees an
+empty `diff`; `openai-compat` and `subprocess:<name>` always receive a redacted
+captured diff. The legacy `ACD_AI_SEND_DIFF` variable was removed; setting it
+is ignored and emits a one-shot deprecation warn-log at daemon startup.
 
 ---
 
