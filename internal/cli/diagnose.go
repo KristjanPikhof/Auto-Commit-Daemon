@@ -241,10 +241,11 @@ func branchRefFromToken(token string) string {
 	return ""
 }
 
-// diagnoseCapacity surfaces the per-repo pending FIFO depth and the
-// daemon-recorded high watermark. Reads are best-effort: we do not abort
-// diagnose when the table is empty or the meta key is unset (those are the
-// "fresh repo" defaults).
+// diagnoseCapacity surfaces the per-repo pending FIFO depth, the
+// daemon-recorded high watermark, the durable backpressure state, and the
+// cumulative dropped-events counter. Reads are best-effort: we do not
+// abort diagnose when the table is empty or a meta key is unset (those are
+// the "fresh repo" defaults).
 func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
 	var depth int
 	if err := conn.QueryRowContext(ctx,
@@ -261,6 +262,29 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 	if ok && v != "" {
 		if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
 			report.PendingHighWater = hw
+		}
+	}
+
+	// Backpressure meta key presence is the signal — empty value still
+	// means "active" (we always stamp a timestamp on entry, but a third
+	// party could have written a blank value via raw SQL; treat any
+	// presence as paused for the report).
+	bv, bok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at")
+	if err != nil {
+		return fmt.Errorf("backpressure_paused_at: %w", err)
+	}
+	if bok {
+		report.BackpressurePaused = true
+		report.BackpressurePausedAt = bv
+	}
+
+	dv, dok, err := metaLookup(ctx, conn, "capture.events_dropped_total")
+	if err != nil {
+		return fmt.Errorf("events_dropped_total: %w", err)
+	}
+	if dok && dv != "" {
+		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
+			report.EventsDroppedTotal = total
 		}
 	}
 	return nil
