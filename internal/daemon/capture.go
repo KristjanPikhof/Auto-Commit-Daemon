@@ -263,6 +263,96 @@ func resetPendingCapWarnForTest(t interface{ Helper() }, intervalSeconds int64) 
 	pendingCapWarnMu.Unlock()
 }
 
+// captureBackpressureActive returns true when the durable backpressure
+// pause meta key is set. Best-effort: errors are returned to the caller so
+// Capture can fail closed (treat the pass as paused) rather than walking
+// while the gate is in an unknown state.
+func captureBackpressureActive(ctx context.Context, db *state.DB) (bool, string, error) {
+	if db == nil {
+		return false, "", nil
+	}
+	v, ok, err := state.MetaGet(ctx, db, MetaKeyCaptureBackpressurePausedAt)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, "", nil
+	}
+	return true, v, nil
+}
+
+// enterCaptureBackpressure stamps MetaKeyCaptureBackpressurePausedAt with
+// an RFC3339 UTC timestamp on the first transition into backpressure.
+// Idempotent: a second call while the key is already present leaves the
+// original timestamp untouched so operators see how long the gate has been
+// active.
+func enterCaptureBackpressure(ctx context.Context, db *state.DB, now time.Time) (string, bool, error) {
+	if db == nil {
+		return "", false, nil
+	}
+	if v, ok, err := state.MetaGet(ctx, db, MetaKeyCaptureBackpressurePausedAt); err != nil {
+		return "", false, err
+	} else if ok && v != "" {
+		return v, false, nil
+	}
+	stamp := now.UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, MetaKeyCaptureBackpressurePausedAt, stamp); err != nil {
+		return "", false, err
+	}
+	return stamp, true, nil
+}
+
+// clearCaptureBackpressure removes MetaKeyCaptureBackpressurePausedAt.
+// Returns whether a row was actually deleted so the caller can decide
+// whether to emit a "cleared" trace event.
+func clearCaptureBackpressure(ctx context.Context, db *state.DB) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	return state.MetaDelete(ctx, db, MetaKeyCaptureBackpressurePausedAt)
+}
+
+// readEventsDroppedTotal returns the cumulative dropped-events counter
+// stored in daemon_meta. Returns 0 when the key is unset or unparseable —
+// the counter is for visibility only, never a correctness anchor.
+func readEventsDroppedTotal(ctx context.Context, db *state.DB) (int64, error) {
+	if db == nil {
+		return 0, nil
+	}
+	v, ok, err := state.MetaGet(ctx, db, MetaKeyCaptureEventsDroppedTotal)
+	if err != nil {
+		return 0, err
+	}
+	if !ok || v == "" {
+		return 0, nil
+	}
+	n, perr := strconv.ParseInt(v, 10, 64)
+	if perr != nil {
+		// Corrupt counter — treat as 0 and let the next bump overwrite.
+		return 0, nil
+	}
+	return n, nil
+}
+
+// bumpEventsDroppedTotal adds delta to the cumulative dropped-events
+// counter. Best-effort but surfaces parse/write errors so the caller can
+// trace them. Negative deltas are clamped to 0 (the counter is monotonic).
+func bumpEventsDroppedTotal(ctx context.Context, db *state.DB, delta int64) (int64, error) {
+	if db == nil || delta <= 0 {
+		cur, err := readEventsDroppedTotal(ctx, db)
+		return cur, err
+	}
+	cur, err := readEventsDroppedTotal(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	next := cur + delta
+	if err := state.MetaSet(ctx, db, MetaKeyCaptureEventsDroppedTotal, strconv.FormatInt(next, 10)); err != nil {
+		return cur, err
+	}
+	return next, nil
+}
+
 // updatePendingHighWater bumps daemon_meta.capture.pending_high_water when
 // depth strictly exceeds the persisted value. Best-effort: errors are
 // swallowed because the capture pipeline must keep running.
