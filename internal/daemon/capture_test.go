@@ -532,14 +532,14 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 		t.Fatalf("EventsDroppedTotal did not advance: prev=%d cur=%d", prevN, sumB.EventsDroppedTotal)
 	}
 
-	// Pass C: simulate replay drain. Mark 3 of the 10 pending rows as
-	// published (depth 7), still above the high-water mark of 8 (10*0.8),
+	// Pass C: simulate replay drain. Mark 1 of the 10 pending rows as
+	// published (depth 9), still above the high-water mark of 8 (10*0.8),
 	// so the gate stays active.
 	if _, err := f.db.SQL().ExecContext(context.Background(),
 		`UPDATE capture_events SET state = 'published' WHERE seq IN (
-			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 3
+			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 1
 		)`); err != nil {
-		t.Fatalf("simulate drain (3 rows): %v", err)
+		t.Fatalf("simulate drain (1 row): %v", err)
 	}
 	sumC, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
 		IgnoreChecker:    f.ig,
@@ -549,14 +549,14 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 		t.Fatalf("Capture pass C: %v", err)
 	}
 	if !sumC.BackpressurePaused {
-		t.Fatalf("expected backpressure to still be active above high-water (depth=7, high_water=8); summary=%+v", sumC)
+		t.Fatalf("expected backpressure to still be active above high-water (depth=9, high_water=8); summary=%+v", sumC)
 	}
 	if sumC.WalkedFiles != 0 {
 		t.Fatalf("WalkedFiles=%d, want 0 above high-water; summary=%+v", sumC.WalkedFiles, sumC)
 	}
 
 	// Pass D: drain further so depth drops below the high-water mark.
-	// Mark one more row published (depth 6), backpressure must clear.
+	// Mark two more rows published (depth 7 < 8), backpressure must clear.
 	if _, err := f.db.SQL().ExecContext(context.Background(),
 		`UPDATE capture_events SET state = 'published' WHERE seq IN (
 			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 2
