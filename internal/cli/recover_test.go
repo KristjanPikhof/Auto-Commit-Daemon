@@ -172,7 +172,7 @@ func TestRecover_AppliesBackupAndRetargetsIncident(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
 		t.Fatalf("runRecover apply: %v\n%s", err, out.String())
 	}
 	var plan recoverPlan
