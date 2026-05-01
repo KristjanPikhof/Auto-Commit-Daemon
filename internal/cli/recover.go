@@ -152,6 +152,10 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 		}
 	}
 
+	markerAction := "preserve manual pause marker at " + markerPath + " (use --clear-pause to remove)"
+	if clearPause {
+		markerAction = "remove manual pause marker at " + markerPath + " if present"
+	}
 	plan := recoverPlan{
 		Repo:             rec.Path,
 		StateDB:          rec.StateDB,
@@ -160,6 +164,7 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 		CurrentHead:      head,
 		Generation:       gen,
 		DryRun:           dryRun,
+		ClearPause:       clearPause,
 		ManualMarkerPath: markerPath,
 		Actions: []string{
 			"retarget capture_events to current branch/generation/head",
@@ -168,7 +173,7 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			"reset blocked_conflict rows to pending",
 			"clear stale replay/pause daemon_meta breadcrumbs",
 			"clear daemon_meta " + daemon.MetaKeyReplayPausedUntil + " (rewind grace)",
-			"remove manual pause marker at " + markerPath + " if present",
+			markerAction,
 		},
 	}
 	return plan, nil
