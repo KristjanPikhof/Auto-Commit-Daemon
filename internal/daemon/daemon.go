@@ -855,6 +855,13 @@ func Run(ctx context.Context, opts Options) error {
 					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
 						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 					}
+					// Reattach is an explicit operator transition. Like the
+					// operation-cleared path above, a stale rewind-grace marker
+					// from before the detach must NOT survive the reattach —
+					// otherwise capture/replay stay muted up to
+					// ACD_REWIND_GRACE_SECONDS post-reattach.
+					clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+						"detached HEAD reattached")
 					if headOID != "" {
 						if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 							logger.Warn("bootstrap shadow after reattach",
