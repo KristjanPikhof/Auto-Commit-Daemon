@@ -421,13 +421,167 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		}
 	}
 
+	// Backpressure gate. The pending-depth cap is a per-(branch_ref,
+	// branch_generation) FIFO bound: under a long pause the queue would
+	// otherwise grow without bound and starve replay/memory. We refuse to
+	// walk + classify while the queue is saturated so the daemon stops
+	// burning fsnotify-driven walks on a state that cannot accept new
+	// events. The gate is durable in daemon_meta — once tripped it stays
+	// active until either replay drains pending below
+	// CaptureBackpressureClearRatio*cap, or the operator explicitly
+	// accepts the loss via `acd resume --accept-overflow`.
+	pendingCap := resolveMaxPendingEvents()
+	var summary CaptureSummary
+	pending := -1
+	if pendingCap > 0 {
+		n, perr := state.CountPendingEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+		if perr != nil {
+			return summary, fmt.Errorf("daemon: count pending events: %w", perr)
+		}
+		pending = n
+		bpActive, bpSetAt, perr := captureBackpressureActive(ctx, db)
+		if perr != nil {
+			return summary, fmt.Errorf("daemon: read capture backpressure: %w", perr)
+		}
+
+		// Entry: pending at or above the cap. Stamp the durable gate (no-op
+		// if already set), refresh the high-water mark, increment the
+		// cumulative dropped-total by the *current overflow* (best-effort —
+		// we have not walked, so the precise per-pass drop count is
+		// unknown; charging at least 1 keeps the counter strictly
+		// monotonic across saturated passes), and skip walk + classify.
+		if int64(pending) >= pendingCap {
+			summary.BackpressurePaused = true
+			summary.PendingDepth = pending
+			updatePendingHighWater(ctx, db, pending)
+			if !bpActive {
+				if stamp, _, perr := enterCaptureBackpressure(ctx, db, time.Now()); perr != nil {
+					return summary, fmt.Errorf("daemon: enter capture backpressure: %w", perr)
+				} else {
+					bpSetAt = stamp
+				}
+			}
+			delta := int64(1)
+			if int64(pending) > pendingCap {
+				delta = int64(pending) - pendingCap + 1
+			}
+			total, perr := bumpEventsDroppedTotal(ctx, db, delta)
+			if perr != nil {
+				return summary, fmt.Errorf("daemon: bump events dropped total: %w", perr)
+			}
+			summary.EventsDroppedTotal = total
+			summary.EventsDropped = int(delta)
+			if v, ok, _ := state.MetaGet(ctx, db, MetaKeyPendingHighWater); ok && v != "" {
+				if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+					summary.PendingHighWater = hw
+				}
+			}
+			if shouldEmitPendingCapWarn() {
+				slog.Default().Warn(
+					"capture pending depth at cap; skipping walk and entering backpressure pause. Use acd resume --accept-overflow to clear, or wait for replay to drain.",
+					slog.String("branch_ref", cctx.BranchRef),
+					slog.Int64("branch_generation", cctx.BranchGeneration),
+					slog.Int64("cap", pendingCap),
+					slog.Int("pending_depth", pending),
+					slog.String("env", EnvMaxPendingEvents),
+					slog.String("backpressure_set_at", bpSetAt),
+					slog.Int64("events_dropped_total", total),
+				)
+			}
+			recordTrace(opts.Trace, acdtrace.Event{
+				Repo:       repoRoot,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "capture.event",
+				Decision:   "dropped",
+				Reason:     CapDropReasonBackpressureEntry,
+				Output: map[string]any{
+					"pending_depth":            pending,
+					"cap":                      pendingCap,
+					"backpressure_set_at":      bpSetAt,
+					"events_dropped_total":     total,
+					"events_dropped_this_pass": delta,
+				},
+				Generation: cctx.BranchGeneration,
+			})
+			return summary, nil
+		}
+
+		// Drain crossing: backpressure was active and pending has dropped
+		// strictly below the high-water mark. Clear the gate and emit a
+		// trace event so operators can correlate "backpressure ended" with
+		// the replay drain that did the work.
+		if bpActive {
+			highWater := int64(float64(pendingCap) * CaptureBackpressureClearRatio)
+			if highWater < 1 {
+				highWater = 1
+			}
+			if int64(pending) < highWater {
+				removed, perr := clearCaptureBackpressure(ctx, db)
+				if perr != nil {
+					return summary, fmt.Errorf("daemon: clear capture backpressure: %w", perr)
+				}
+				if removed {
+					summary.BackpressureCleared = true
+					recordTrace(opts.Trace, acdtrace.Event{
+						Repo:       repoRoot,
+						BranchRef:  cctx.BranchRef,
+						HeadSHA:    cctx.BaseHead,
+						EventClass: "capture.pause",
+						Decision:   "cleared",
+						Reason:     "pending drained below high-water mark",
+						Output: map[string]any{
+							"pending_depth": pending,
+							"cap":           pendingCap,
+							"high_water":    highWater,
+							"prior_set_at":  bpSetAt,
+							"source":        "drained",
+						},
+						Generation: cctx.BranchGeneration,
+					})
+				}
+			} else {
+				// Still above the high-water mark even though we are
+				// strictly below the cap — keep the gate active and skip
+				// the walk to give replay more headroom.
+				summary.BackpressurePaused = true
+				summary.PendingDepth = pending
+				if v, ok, _ := state.MetaGet(ctx, db, MetaKeyPendingHighWater); ok && v != "" {
+					if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+						summary.PendingHighWater = hw
+					}
+				}
+				if total, perr := readEventsDroppedTotal(ctx, db); perr == nil {
+					summary.EventsDroppedTotal = total
+				}
+				recordTrace(opts.Trace, acdtrace.Event{
+					Repo:       repoRoot,
+					BranchRef:  cctx.BranchRef,
+					HeadSHA:    cctx.BaseHead,
+					EventClass: "capture.pause",
+					Decision:   "skipped",
+					Reason:     "capture saturated; awaiting drain below high-water",
+					Output: map[string]any{
+						"pending_depth": pending,
+						"cap":           pendingCap,
+						"high_water":    highWater,
+						"set_at":        bpSetAt,
+						"source":        "backpressure",
+					},
+					Generation: cctx.BranchGeneration,
+				})
+				return summary, nil
+			}
+		}
+	}
+
 	matcher := opts.SensitiveMatcher
 	if matcher == nil {
 		matcher = state.NewSensitiveMatcher()
 	}
 	maxBytes := resolveMaxFileBytes(opts.MaxFileBytes)
 
-	live, summary, err := walkLive(ctx, repoRoot, walkOpts{
+	live, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
 		matcher:       matcher,
 		ignoreChecker: opts.IgnoreChecker,
 		submodules:    opts.SubmodulePaths,
@@ -435,8 +589,16 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		db:            db,
 	})
 	if err != nil {
+		// walkLive populates Errors/Oversize/WalkedFiles in its own summary;
+		// merge those into the active summary before returning.
+		summary.Errors += walkSummary.Errors
+		summary.Oversize += walkSummary.Oversize
+		summary.WalkedFiles += walkSummary.WalkedFiles
 		return summary, err
 	}
+	summary.Errors += walkSummary.Errors
+	summary.Oversize += walkSummary.Oversize
+	summary.WalkedFiles += walkSummary.WalkedFiles
 
 	shadow, err := loadShadow(ctx, db, cctx)
 	if err != nil {
@@ -459,22 +621,6 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		},
 		Generation: cctx.BranchGeneration,
 	})
-
-	// Pending-depth soft cap. The cap is a per-(branch_ref, branch_generation)
-	// FIFO bound: under a long pause the queue would otherwise grow without
-	// bound and starve replay/memory. We DROP NEW EVENTS (preserve history)
-	// rather than evict the oldest pending row — operators rely on the
-	// existing FIFO + barrier invariants for replay correctness, and the
-	// dropped-tail policy keeps `acd recover --auto` deterministic.
-	pendingCap := resolveMaxPendingEvents()
-	pending := -1
-	if pendingCap > 0 {
-		n, err := state.CountPendingEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
-		if err != nil {
-			return summary, fmt.Errorf("daemon: count pending events: %w", err)
-		}
-		pending = n
-	}
 
 	// Persist each classified op as its own capture_events row + capture_ops
 	// child. Atomic-per-file commits (§8.3) means one event = one op. We do
