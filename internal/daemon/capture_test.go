@@ -618,9 +618,11 @@ func TestCapture_PendingDepthCap_Disabled(t *testing.T) {
 	}
 }
 
-// TestCapture_PendingDepthCap_RateLimited ensures we don't spam slog.Warn on
-// every dropped event in a single burst. With a 60-second interval and 5
-// drops, we expect exactly one warn record on the buffer.
+// TestCapture_PendingDepthCap_RateLimited ensures we don't spam slog.Warn
+// across multiple saturated passes. With a 60-second interval, two
+// saturated passes back-to-back must produce exactly one warn record.
+// Under the new contract the pre-seeded row puts capture into the
+// pre-walk gate, so neither pass walks the worktree.
 func TestCapture_PendingDepthCap_RateLimited(t *testing.T) {
 	t.Setenv(EnvMaxPendingEvents, "1")
 	resetPendingCapWarnForTest(t, 60)
@@ -650,22 +652,33 @@ VALUES (?, ?, 'seed.txt', 'create', '100644', '000000000000000000000000000000000
 	if err := os.WriteFile(filepath.Join(f.dir, "seed.txt"), []byte("seed"), 0o644); err != nil {
 		t.Fatalf("write seed: %v", err)
 	}
-
 	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("drop-%02d.txt", i)
 		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("y"), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
-	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
-		IgnoreChecker:    f.ig,
-		SensitiveMatcher: f.matcher,
-	})
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if sum.EventsDropped < 5 {
-		t.Fatalf("expected at least 5 drops, got summary=%+v", sum)
+
+	// Two saturated passes: each must early-return BEFORE walkLive (the
+	// new pre-walk gate). The rate limiter must fold their warns into one.
+	for i := 0; i < 2; i++ {
+		sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker:    f.ig,
+			SensitiveMatcher: f.matcher,
+		})
+		if err != nil {
+			t.Fatalf("Capture pass %d: %v", i, err)
+		}
+		if sum.WalkedFiles != 0 {
+			t.Fatalf("pass %d WalkedFiles=%d, want 0 (saturated pass must skip walk); summary=%+v",
+				i, sum.WalkedFiles, sum)
+		}
+		if !sum.BackpressurePaused {
+			t.Fatalf("pass %d BackpressurePaused=false; want true; summary=%+v", i, sum)
+		}
+		if sum.EventsDropped < 1 {
+			t.Fatalf("pass %d EventsDropped=%d, want >=1; summary=%+v", i, sum.EventsDropped, sum)
+		}
 	}
 
 	count := strings.Count(logBuf.String(), "capture pending depth at cap")
