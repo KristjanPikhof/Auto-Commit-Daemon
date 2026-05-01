@@ -114,32 +114,47 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	indexFile := opts.IndexFile
-	cleanupIndex := func() {}
 	if indexFile == "" {
 		if opts.GitDir == "" {
 			return sum, fmt.Errorf("daemon: Replay: IndexFile or GitDir required")
 		}
-		indexDir := filepath.Join(opts.GitDir, "acd")
-		if err := os.MkdirAll(indexDir, 0o700); err != nil {
+		// TOCTOU defense: create a private 0o700 directory and place the
+		// scratch index inside it. Never hand a *path* to git that we have
+		// pre-created and then unlinked — the open-after-unlink window
+		// would let a same-uid attacker substitute a symlink/regular file
+		// at the path before git's read-tree opens it. The directory is
+		// owned by us for the lifetime of the pass; git creates the index
+		// file inside it (no file pre-exists at the chosen path), and we
+		// tear the whole tree down on return.
+		indexParent := filepath.Join(opts.GitDir, "acd")
+		if err := os.MkdirAll(indexParent, 0o700); err != nil {
 			return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
 		}
-		tmp, err := os.CreateTemp(indexDir, "replay-*.index")
+		tmpDir, err := os.MkdirTemp(indexParent, "replay-")
 		if err != nil {
-			return sum, fmt.Errorf("daemon: replay: create temp index: %w", err)
+			return sum, fmt.Errorf("daemon: replay: mkdir temp index dir: %w", err)
 		}
-		indexFile = tmp.Name()
-		if err := tmp.Close(); err != nil {
-			_ = os.Remove(indexFile)
-			return sum, fmt.Errorf("daemon: replay: close temp index: %w", err)
+		// 0o700 is a defense-in-depth tighten — MkdirTemp already creates
+		// at 0o700 on POSIX, but be explicit so a future umask change or
+		// platform variance cannot widen the bag.
+		if err := os.Chmod(tmpDir, 0o700); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return sum, fmt.Errorf("daemon: replay: chmod temp index dir: %w", err)
 		}
-		cleanupIndex = func() { _ = os.Remove(indexFile) }
-		defer cleanupIndex()
+		indexFile = filepath.Join(tmpDir, "idx")
+		// Do NOT pre-create the index file. Do NOT unlink it. Hand the
+		// fresh path inside our private dir to git via GIT_INDEX_FILE on
+		// the first read-tree below.
+		defer os.RemoveAll(tmpDir)
 	} else if err := os.MkdirAll(filepath.Dir(indexFile), 0o700); err != nil {
 		return sum, fmt.Errorf("daemon: replay: mkdir index parent: %w", err)
+	} else {
+		// Caller-provided path: stale entries from a prior crashed run
+		// would otherwise poison write-tree. The TOCTOU concern only
+		// applies to default temp paths; caller-supplied paths are
+		// assumed-trusted (used by tests that need to inspect the index).
+		_ = os.Remove(indexFile)
 	}
-	// Always start from a clean index: stale entries from a prior crashed
-	// run would otherwise poison write-tree.
-	_ = os.Remove(indexFile)
 
 	pending, err := state.PendingEvents(ctx, db, opts.Limit)
 	if err != nil {
