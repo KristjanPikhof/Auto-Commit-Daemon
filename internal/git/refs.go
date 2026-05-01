@@ -99,4 +99,3 @@ func IsAncestor(ctx context.Context, repoDir, ancestor, descendant string) (bool
 	}
 	return false, err
 }
-
