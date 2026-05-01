@@ -97,12 +97,14 @@ func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
 // single-op events populate the top-level Path/Op/OldPath fields so the
 // deterministic generator can take the single-op path.
 //
-// When repoRoot is non-empty and ACD_AI_SEND_DIFF is truthy, the captured
-// before/after OIDs on each op are diffed via `git diff` and the resulting
-// unified diff text is redacted, capped via ai.Truncate, and stitched into
-// CommitContext.DiffText. Diff failures are
-// swallowed: an empty DiffText still produces a working commit message
-// (the deterministic fallback is unaffected).
+// When repoRoot is non-empty, the captured before/after OIDs on each op
+// are diffed via `git diff` and the resulting unified diff text is
+// redacted, capped via ai.Truncate, and stitched into
+// CommitContext.DiffText. providerMessageFn passes an empty repoRoot for
+// providers whose ai.ProviderNeedsDiff is false (e.g. the deterministic
+// provider), so reconstruction is implicitly gated on provider need.
+// Diff failures are swallowed: an empty DiffText still produces a
+// working commit message (the deterministic fallback is unaffected).
 func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot string) ai.CommitContext {
 	cc := ai.CommitContext{
 		Branch:   ec.Event.BranchRef,
