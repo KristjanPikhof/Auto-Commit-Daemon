@@ -41,7 +41,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -54,8 +53,6 @@ import (
 // "missing side" OID when synthesising create/delete diffs so we can
 // always pass two real OIDs to `git diff`.
 const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
-
-const envAISendDiff = "ACD_AI_SEND_DIFF"
 
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
