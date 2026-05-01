@@ -239,121 +239,167 @@ func detectWatchBudget(logger *slog.Logger) int {
 // exceed maxWatches; the caller is responsible for the poll-mode
 // fallback.
 //
-// Ignore-check batching: the walk collects every directory that survives
-// the cheap filters (.git pruning, symlinks, nested repos, sensitive dirs)
-// into a candidate slice. After the walk completes, ALL candidate rels are
-// passed to IgnoreChecker.Check in one call so we hit the long-lived
-// `git check-ignore --stdin` subprocess once per pre-walk instead of once
-// per directory. Mirrors the pattern in walkLive.
+// BFS layout with parent-prune: candidate directories are processed by
+// depth. Each layer collects every dir that survives the cheap filters
+// (.git pruning, symlinks, nested repos, sensitive dirs), batch-calls
+// IgnoreChecker.Check once for the entire layer, then only descends into
+// the non-ignored survivors. This early-prunes ignored subtrees (e.g.
+// node_modules, vendor) instead of walking every entry beneath them — the
+// previous DFS approach descended into ignored subtrees and only filtered
+// after the fact, which made first-walk on large repos pay the readdir
+// cost for every ignored child.
+//
+// Ignore-check batching is preserved: each BFS layer issues one round-trip
+// through the long-lived `git check-ignore --stdin` subprocess. With
+// per-layer batching the total round-trips equal the worktree depth, not
+// the directory count.
 func (w *FsnotifyWatcher) preWalk(root string) error {
-	type candidate struct {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	if !rootInfo.IsDir() {
+		return nil
+	}
+
+	// The worktree root itself is never subject to gitignore.
+	rootRel, err := filepath.Rel(w.opts.RepoPath, root)
+	if err != nil {
+		return err
+	}
+	rootRel = filepath.ToSlash(rootRel)
+	// Filter the root itself through the cheap pre-checks unless it is
+	// the repo root (rel == "."). When called from handleEvent on a
+	// runtime mkdir, the new dir might be inside a sensitive or nested
+	// subtree.
+	if rootRel != "." {
+		topComponent := rootRel
+		if i := strings.IndexByte(rootRel, '/'); i >= 0 {
+			topComponent = rootRel[:i]
+		}
+		if topComponent == ".git" || topComponent == stateSubdir {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
+			return nil
+		}
+		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rootRel) {
+			return nil
+		}
+		// Honor gitignore on the root of a runtime re-walk too.
+		if w.opts.IgnoreChecker != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			results, ierr := w.opts.IgnoreChecker.Check(ctx, []string{rootRel})
+			cancel()
+			if ierr == nil && len(results) == 1 && results[0] {
+				return nil
+			}
+		}
+	}
+	if err := w.addWatch(root); err != nil {
+		return err
+	}
+
+	type entry struct {
 		rel  string
 		full string
 	}
-	var candidates []candidate
+	// frontier holds the directories whose children we still need to read.
+	// At the start of each iteration we readdir every dir in the frontier,
+	// collect all surviving children into nextLayer, batch-classify
+	// nextLayer through IgnoreChecker, then watch the survivors. Survivors
+	// become the next frontier.
+	frontier := []entry{{rel: rootRel, full: root}}
 
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// soft errors during pre-walk: keep going.
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
+	for len(frontier) > 0 {
+		var nextLayer []entry
+		for _, parent := range frontier {
+			children, err := os.ReadDir(parent.full)
+			if err != nil {
+				// soft error: skip this dir's children but keep walking.
+				continue
 			}
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		// lstat — never descend symlinked dirs (legacy regression).
-		fi, err := os.Lstat(path)
-		if err != nil {
-			return fs.SkipDir
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return fs.SkipDir
-		}
-
-		// Skip .git, .git/acd state, and the per-repo gitDir if it lives
-		// somewhere unusual (worktrees).
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return fs.SkipDir
-		}
-		rel = filepath.ToSlash(rel)
-		if rel == "." {
-			// always watch the worktree root itself; the root is not subject
-			// to gitignore (gitignore can't ignore the repo itself).
-			if err := w.addWatch(path); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		topComponent := rel
-		if i := strings.IndexByte(rel, '/'); i >= 0 {
-			topComponent = rel[:i]
-		}
-		if topComponent == ".git" || topComponent == stateSubdir {
-			return fs.SkipDir
-		}
-
-		// Nested-repo / submodule pruning: any dir containing .git is a
-		// boundary we never cross.
-		if path != root {
-			if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
-				return fs.SkipDir
+			for _, d := range children {
+				if !d.IsDir() {
+					continue
+				}
+				childPath := filepath.Join(parent.full, d.Name())
+				fi, err := os.Lstat(childPath)
+				if err != nil {
+					continue
+				}
+				// Never descend symlinked dirs (legacy regression).
+				if fi.Mode()&os.ModeSymlink != 0 {
+					continue
+				}
+				if !fi.IsDir() {
+					continue
+				}
+				var childRel string
+				if parent.rel == "." {
+					childRel = d.Name()
+				} else {
+					childRel = parent.rel + "/" + d.Name()
+				}
+				topComponent := childRel
+				if i := strings.IndexByte(childRel, '/'); i >= 0 {
+					topComponent = childRel[:i]
+				}
+				if topComponent == ".git" || topComponent == stateSubdir {
+					continue
+				}
+				// Nested-repo / submodule pruning: any dir containing
+				// .git is a boundary we never cross.
+				if _, err := os.Stat(filepath.Join(childPath, ".git")); err == nil {
+					continue
+				}
+				// Sensitive directories: skip whole subtrees.
+				if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(childRel) {
+					continue
+				}
+				nextLayer = append(nextLayer, entry{rel: childRel, full: childPath})
 			}
 		}
 
-		// Sensitive directories: skip whole subtrees that look like
-		// secrets dirs (best-effort; capture also rejects them).
-		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rel) {
-			return fs.SkipDir
+		if len(nextLayer) == 0 {
+			break
 		}
 
-		// Defer the gitignore check: we can't safely SkipDir here because
-		// the call would run one IgnoreChecker.Check per dir (one round-trip
-		// to the long-lived check-ignore subprocess). Collect candidates
-		// and resolve in one batch after the walk; ignored entries are
-		// then filtered out before addWatch. Note: this means we briefly
-		// descend into ignored subtrees during the walk, but the cost is
-		// bounded by directory count and each subtree gets one ignore
-		// classification.
-		candidates = append(candidates, candidate{rel: rel, full: path})
-		return nil
-	})
-	if walkErr != nil {
-		return walkErr
-	}
-
-	// Batched ignore check: one round-trip per pre-walk regardless of
-	// candidate count. Best-effort — a checker error means we err on the
-	// side of watching everything (capture will still drop ignored files).
-	ignored := map[string]bool{}
-	if w.opts.IgnoreChecker != nil && len(candidates) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		paths := make([]string, len(candidates))
-		for i, c := range candidates {
-			paths[i] = c.rel
-		}
-		if results, err := w.opts.IgnoreChecker.Check(ctx, paths); err == nil && len(results) == len(candidates) {
-			for i, isIgn := range results {
-				if isIgn {
-					ignored[candidates[i].rel] = true
+		// Per-layer batched ignore check: one round-trip classifies the
+		// entire layer, and ignored parents are dropped from the frontier
+		// so we never readdir into their subtrees on the next iteration.
+		ignored := map[string]bool{}
+		if w.opts.IgnoreChecker != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			paths := make([]string, len(nextLayer))
+			for i, c := range nextLayer {
+				paths[i] = c.rel
+			}
+			results, ierr := w.opts.IgnoreChecker.Check(ctx, paths)
+			cancel()
+			if ierr == nil && len(results) == len(nextLayer) {
+				for i, isIgn := range results {
+					if isIgn {
+						ignored[nextLayer[i].rel] = true
+					}
 				}
 			}
 		}
-	}
 
-	// Watch survivors. addWatch may return errBudgetExceeded; surface the
-	// first occurrence and let the caller fall back to poll mode.
-	for _, c := range candidates {
-		if ignored[c.rel] {
-			continue
+		survivors := nextLayer[:0]
+		for _, c := range nextLayer {
+			if ignored[c.rel] {
+				continue
+			}
+			if err := w.addWatch(c.full); err != nil {
+				return err
+			}
+			survivors = append(survivors, c)
 		}
-		if err := w.addWatch(c.full); err != nil {
-			return err
-		}
+		frontier = survivors
 	}
 	return nil
 }
