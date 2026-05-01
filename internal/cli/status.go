@@ -336,6 +336,16 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	if r.BlockedConflicts > 0 {
 		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
 	}
+	if r.BackpressurePaused {
+		stamp := r.BackpressurePausedAt
+		if stamp == "" {
+			stamp = "unset"
+		}
+		fmt.Fprintf(out, "Backpressure: paused since %s (events dropped lifetime: %d)\n",
+			stamp, r.EventsDroppedTotal)
+	} else if r.EventsDroppedTotal > 0 {
+		fmt.Fprintf(out, "Capture dropped lifetime: %d\n", r.EventsDroppedTotal)
+	}
 
 	if r.LastCommitOID != "" {
 		oid := r.LastCommitOID
