@@ -282,7 +282,7 @@ func TestRecover_DryRun_ListsPauseStateActions(t *testing.T) {
 	ctx := context.Background()
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, true, false, true); err != nil {
+	if err := runRecover(ctx, &out, repo, true, true, false, true, true); err != nil {
 		t.Fatalf("runRecover dry-run: %v", err)
 	}
 	var plan recoverPlan
