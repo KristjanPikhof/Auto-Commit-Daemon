@@ -156,7 +156,7 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
 	}
-	if err := diagnoseOperationMarker(ctx, conn, &report); err != nil {
+	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
 	report.Remediation = diagnoseRemediation(report)
