@@ -455,7 +455,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"Resolve the listed paths in the worktree/index, then remove terminal blocked_conflict rows only after the predecessor is safe to discard.")
 	}
-	if report.PendingHighWater > 0 && report.PendingDepth > 0 {
+	if report.PendingDepth > 0 {
 		remediation = append(remediation,
 			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume / acd recover to drain replay.")
 	}
