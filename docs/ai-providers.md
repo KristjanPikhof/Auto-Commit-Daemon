@@ -107,7 +107,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 `op` values: `create` | `modify` | `delete` | `rename` | `mode` | `symlink`.  
 `multi_op` is present when one daemon event covers more than one file.  
-`diff` is empty by default. With `ACD_AI_SEND_DIFF=1`, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
+`diff` is empty when the deterministic provider is selected. When a network `ACD_AI_PROVIDER` (`openai-compat` or `subprocess:<name>`) is selected, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
 
 **Response (plugin → daemon, one line per request):**
 
