@@ -290,6 +290,148 @@ func TestPreWalk_BatchedIgnoreCheck(t *testing.T) {
 	}
 }
 
+// TestFsnotify_WatchCountReturnsToBaseline_AfterDirChurn asserts the
+// Remove/Rename bookkeeping fix: creating and removing 100 directories in
+// sequence leaves watchedDirs/watchCount back at the baseline, instead of
+// drifting upward toward errBudgetExceeded under long-running churn.
+func TestFsnotify_WatchCountReturnsToBaseline_AfterDirChurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath: dir,
+		Debounce: 20 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	baseline := w.Diagnostics().WatchCount
+
+	// Create + remove 100 directories. We wait for each create to land
+	// in watchedDirs before removing so the OS event-pair is delivered
+	// in the right order; otherwise the event loop can race past us.
+	const N = 100
+	for i := 0; i < N; i++ {
+		sub := filepath.Join(dir, "churn_"+strconv.Itoa(i))
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("mkdir %d: %v", i, err)
+		}
+		// Wait for fsnotify Create -> preWalk -> addWatch.
+		addedDeadline := time.Now().Add(2 * time.Second)
+		var present bool
+		for time.Now().Before(addedDeadline) {
+			for _, p := range w.WatchedPaths() {
+				if filepath.Clean(p) == filepath.Clean(sub) {
+					present = true
+					break
+				}
+			}
+			if present {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !present {
+			t.Fatalf("dir %s never landed in watched set", sub)
+		}
+		if err := os.RemoveAll(sub); err != nil {
+			t.Fatalf("remove %d: %v", i, err)
+		}
+	}
+
+	// Wait for all Remove events to be reconciled.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Diagnostics().WatchCount == baseline {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := w.Diagnostics().WatchCount
+	if got != baseline {
+		paths := w.WatchedPaths()
+		t.Fatalf("watch_count=%d want baseline=%d after churn; remaining watched=%v",
+			got, baseline, paths)
+	}
+}
+
+// TestPreWalk_EarlyPrunesIgnoredDirsBFS asserts the BFS pre-walk does not
+// descend into gitignored parents. We seed an `ignored_root` dir with a
+// thousand children and assert the watcher never observes any of them.
+// The instrumentation is implicit: WatchedPaths() never sees children of
+// an early-pruned parent because the BFS frontier never reaches that
+// layer.
+func TestPreWalk_EarlyPrunesIgnoredDirsBFS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	if err := git.Init(context.Background(), dir); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"),
+		[]byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+
+	// Create node_modules with 1000+ child directories. If pre-walk
+	// descended (the old DFS behavior), it would Lstat every child;
+	// the BFS prune drops the entire subtree without readdir.
+	nm := filepath.Join(dir, "node_modules")
+	if err := os.MkdirAll(nm, 0o755); err != nil {
+		t.Fatalf("mkdir node_modules: %v", err)
+	}
+	const childCount = 1024
+	for i := 0; i < childCount; i++ {
+		child := filepath.Join(nm, "pkg_"+strconv.Itoa(i))
+		if err := os.Mkdir(child, 0o755); err != nil {
+			t.Fatalf("mkdir child %d: %v", i, err)
+		}
+	}
+	// Also seed a watched sibling so the layer has at least one survivor.
+	if err := os.MkdirAll(filepath.Join(dir, "src", "deep", "deeper"), 0o755); err != nil {
+		t.Fatalf("mkdir src tree: %v", err)
+	}
+
+	checker := git.NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:      dir,
+		IgnoreChecker: checker,
+		Debounce:      30 * time.Millisecond,
+	})
+	if d := w.Diagnostics(); d.Mode != "fsnotify" {
+		t.Fatalf("mode=%q want fsnotify (reason=%q)", d.Mode, d.FallbackReason)
+	}
+
+	nmClean := filepath.Clean(nm)
+	for _, p := range w.WatchedPaths() {
+		clean := filepath.Clean(p)
+		if clean == nmClean {
+			t.Fatalf("ignored node_modules itself ended up watched: %s", p)
+		}
+		if strings.HasPrefix(clean, nmClean+string(filepath.Separator)) {
+			t.Fatalf("BFS descended into ignored node_modules child: %s", p)
+		}
+	}
+
+	// Sanity: the watched sibling is present so we know the walk ran.
+	srcClean := filepath.Clean(filepath.Join(dir, "src"))
+	var srcFound bool
+	for _, p := range w.WatchedPaths() {
+		if filepath.Clean(p) == srcClean {
+			srcFound = true
+			break
+		}
+	}
+	if !srcFound {
+		t.Fatalf("expected src/ to be watched; got %v", w.WatchedPaths())
+	}
+}
+
 // TestFsnotifyWatcher_DebounceCoalesces asserts a burst of file events
 // produces a small (<= 5) number of WakeFn calls, not one per file.
 func TestFsnotifyWatcher_DebounceCoalesces(t *testing.T) {
