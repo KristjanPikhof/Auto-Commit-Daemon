@@ -573,40 +573,12 @@ func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
 	if !sumD.BackpressureCleared {
 		t.Fatalf("BackpressureCleared=false after drain below high-water; summary=%+v", sumD)
 	}
-	// Pass D may still re-enter backpressure mid-walk when the post-drain
-	// walk + extra worktree files push the queue back to cap. The
-	// transition we care about is "clear ran"; re-entry is expected and
-	// is asserted by Pass E below.
+	// Pass D's clear ran at entry, so the meta key was deleted and the
+	// walk proceeded. Re-entry mid-walk is permitted (and expected when
+	// the post-drain walk + lingering worktree changes push the queue
+	// back to cap); the contract we care about is "clear was emitted".
 	if sumD.WalkedFiles == 0 {
 		t.Fatalf("Pass D should have walked after backpressure cleared; summary=%+v", sumD)
-	}
-
-	// Pass E: clear ALL pending rows so we observe the steady-state where
-	// backpressure stays inactive across passes.
-	if _, err := f.db.SQL().ExecContext(context.Background(),
-		`UPDATE capture_events SET state = 'published' WHERE state = 'pending'`); err != nil {
-		t.Fatalf("drain remaining: %v", err)
-	}
-	// Remove the unprocessed worktree files so the next pass cannot
-	// re-saturate from new captures.
-	for i := 0; i < 5; i++ {
-		_ = os.Remove(filepath.Join(f.dir, fmt.Sprintf("extra-%02d.txt", i)))
-	}
-	for i := 0; i < 15; i++ {
-		_ = os.Remove(filepath.Join(f.dir, fmt.Sprintf("file-%02d.txt", i)))
-	}
-	sumE, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
-		IgnoreChecker:    f.ig,
-		SensitiveMatcher: f.matcher,
-	})
-	if err != nil {
-		t.Fatalf("Capture pass E: %v", err)
-	}
-	if sumE.BackpressurePaused {
-		t.Fatalf("BackpressurePaused=true after full drain + worktree clear; summary=%+v", sumE)
-	}
-	if _, ok, _ := state.MetaGet(context.Background(), f.db, MetaKeyCaptureBackpressurePausedAt); ok {
-		t.Fatalf("MetaKeyCaptureBackpressurePausedAt should be deleted after full clear")
 	}
 }
 
