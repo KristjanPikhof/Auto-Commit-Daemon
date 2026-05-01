@@ -137,7 +137,6 @@ for the full `event_class` enumeration.
 |---|---:|---|
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
-| `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
