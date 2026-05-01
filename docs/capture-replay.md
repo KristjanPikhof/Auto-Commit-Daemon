@@ -473,7 +473,7 @@ target commit. From `acd`'s perspective:
 - Any pending `acd` events that captured the original changes now face a
   before-state probe where `HEAD` already shows the inverse — the desired
   final state matches the current `HEAD` tree.
-- `alreadyPublishedAtHEAD` (`internal/daemon/replay.go:643`) returns `true`;
+- `alreadyPublishedAtHEAD` (`internal/daemon/replay.go`) returns `true`;
   the event is marked `published` with `commit_oid = HEAD` and no new commit is
   created. Trace decision: `already_published_by_external_committer`.
 
