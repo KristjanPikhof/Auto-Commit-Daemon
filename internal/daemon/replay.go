@@ -175,15 +175,30 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	activeCtx := cctx
 	sum.BaseHead = parent
 
+	// Resolve the active branch ref ONCE per pass. Per-event re-resolution
+	// would fork a `git symbolic-ref HEAD` (and `rev-parse HEAD`) for every
+	// event in the queue — O(events) subprocess invocations for a
+	// pass-stable value. A concurrent committer that moves the ref will
+	// trip the CAS retry path below, where we refresh the branch+tree
+	// state on demand.
+	if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
+		activeCtx.BranchRef = branchRef
+		if headOID != "" && headOID == parent {
+			activeCtx.BaseHead = headOID
+		}
+	}
+	// Cache the parent's tree OID. After every successful commit we carry
+	// forward `treeOID` (the tree write-tree just produced is, by
+	// construction, the next parent's tree) so we never run a fresh
+	// `rev-parse <commit>^{tree}` per event in the steady state.
+	parentTree, err := resolveTreeOID(ctx, repoRoot, parent)
+	if err != nil {
+		return sum, err
+	}
+
 	for _, ev := range pending {
 		if err := ctx.Err(); err != nil {
 			return sum, err
-		}
-		if branchRef, headOID := resolveBranch(ctx, repoRoot, slog.Default()); branchRef != "" {
-			activeCtx.BranchRef = branchRef
-			if headOID != "" && headOID == parent {
-				activeCtx.BaseHead = headOID
-			}
 		}
 
 		// Branch-generation / ancestry guard. An event whose generation
