@@ -253,6 +253,22 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		`SELECT COUNT(*) FROM daemon_meta WHERE key LIKE 'capture_error.%'`).Scan(&report.CaptureErrors); err != nil {
 		return report, fmt.Errorf("capture errors: %w", err)
 	}
+
+	// Durable capture-backpressure state. Presence of the meta key signals
+	// "saturated"; readers should not block on the timestamp shape.
+	if v, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at"); err != nil {
+		return report, fmt.Errorf("backpressure state: %w", err)
+	} else if ok {
+		report.BackpressurePaused = true
+		report.BackpressurePausedAt = v
+	}
+	if v, ok, err := metaLookup(ctx, conn, "capture.events_dropped_total"); err != nil {
+		return report, fmt.Errorf("events dropped total: %w", err)
+	} else if ok && v != "" {
+		if total, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.EventsDroppedTotal = total
+		}
+	}
 	if info, err := pauseInfoForRepo(ctx, conn, rec.StateDB, now); err != nil {
 		return report, fmt.Errorf("pause state: %w", err)
 	} else if info != nil {
