@@ -710,23 +710,92 @@ func Run(ctx context.Context, opts Options) error {
 			// Fast-forward: persist the new HEAD so the next transition
 			// compares against the latest baseline, but keep the generation
 			// counter put.
-			logger.Debug("branch fast-forwarded",
-				"old", oldToken, "new", newToken,
-				"generation", cctx.BranchGeneration)
-			recordTrace(tracer, acdtrace.Event{
-				Repo:       opts.RepoPath,
-				BranchRef:  cctx.BranchRef,
-				HeadSHA:    cctx.BaseHead,
-				EventClass: "branch_token.transition",
-				Decision:   transition.String(),
-				Reason:     "run-loop token transition classified",
-				Input:      map[string]any{"previous": oldToken, "current": newToken},
-				Output:     map[string]any{"generation": cctx.BranchGeneration},
-				Generation: cctx.BranchGeneration,
-			})
-			if err := SaveBranchGeneration(ctx, opts.DB,
-				cctx.BranchGeneration, headOID); err != nil {
-				logger.Warn("persist branch head", "err", err.Error())
+			//
+			// Exception: if a rewind-grace marker is currently active, the
+			// previous tick's same-branch rewind reseeded shadow_paths from
+			// the rewound (lower) HEAD. A fast-forward landing inside that
+			// window must NOT just bump BaseHead; the next post-grace capture
+			// pass would otherwise compare the live HEAD's tracked files
+			// against shadow rows seeded at the rewound HEAD and emit phantom
+			// `create` events for content that is already published. Treat
+			// this FF as a generation boundary: bump the generation, reseed
+			// shadow from the new HEAD, and clear the grace gate so the
+			// resumed capture/replay drain sees a clean shadow.
+			graceActive, until, gErr := rewindGraceActive(ctx, opts.DB, now())
+			if gErr != nil {
+				logger.Warn(logPrefix+" probe rewind grace failed",
+					"err", gErr.Error())
+			}
+			if graceActive {
+				prevGeneration := cctx.BranchGeneration
+				cctx.BranchGeneration++
+				logger.Info("fast-forward inside rewind grace; reseeding shadow",
+					"old", oldToken, "new", newToken,
+					"generation", cctx.BranchGeneration,
+					"grace_until", until)
+				recordTrace(tracer, acdtrace.Event{
+					Repo:       opts.RepoPath,
+					BranchRef:  cctx.BranchRef,
+					HeadSHA:    cctx.BaseHead,
+					EventClass: "branch_token.transition",
+					Decision:   transition.String(),
+					Reason:     "fast-forward inside rewind grace; reseeding shadow",
+					Input:      map[string]any{"previous": oldToken, "current": newToken},
+					Output: map[string]any{
+						"prev_generation": prevGeneration,
+						"new_generation":  cctx.BranchGeneration,
+						"grace_until":     until,
+					},
+					Generation: cctx.BranchGeneration,
+				})
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist branch generation after FF-in-grace",
+						"err", err.Error())
+				}
+				if cctx.BranchRef != "" {
+					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+						logger.Warn("reseed shadow after FF-in-grace",
+							"err", err.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+					} else {
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "FF-in-grace shadow reseed", seeded)
+						if seeded > 0 {
+							logger.Info("shadow reseeded after FF-in-grace",
+								"rows", seeded,
+								"generation", cctx.BranchGeneration)
+						}
+						if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+							logger.Warn("prune old shadow generations", "err", pErr.Error())
+						} else if pruned > 0 {
+							logger.Info("pruned old shadow generations", "rows", pruned)
+						}
+					}
+				}
+				// Clear the rewind grace gate now that shadow is consistent
+				// with the current HEAD. Capture/replay can resume on the
+				// next tick.
+				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+					"fast-forward inside rewind grace")
+			} else {
+				logger.Debug("branch fast-forwarded",
+					"old", oldToken, "new", newToken,
+					"generation", cctx.BranchGeneration)
+				recordTrace(tracer, acdtrace.Event{
+					Repo:       opts.RepoPath,
+					BranchRef:  cctx.BranchRef,
+					HeadSHA:    cctx.BaseHead,
+					EventClass: "branch_token.transition",
+					Decision:   transition.String(),
+					Reason:     "run-loop token transition classified",
+					Input:      map[string]any{"previous": oldToken, "current": newToken},
+					Output:     map[string]any{"generation": cctx.BranchGeneration},
+					Generation: cctx.BranchGeneration,
+				})
+				if err := SaveBranchGeneration(ctx, opts.DB,
+					cctx.BranchGeneration, headOID); err != nil {
+					logger.Warn("persist branch head", "err", err.Error())
+				}
 			}
 		}
 		return false
