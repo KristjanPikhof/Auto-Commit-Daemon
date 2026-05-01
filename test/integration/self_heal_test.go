@@ -211,6 +211,91 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 	}
 }
 
+// TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms pins the regression
+// where a fast-forward landing inside an active rewind-grace window left
+// shadow_paths seeded from the rewound (lower) HEAD. After the grace
+// window expired, the next capture compared the live HEAD's tracked files
+// against the stale shadow rows and emitted phantom `create` events for
+// content that was already published.
+//
+// Sequence: H1 (seed) -> daemon commits H2 (worktree edit) -> operator
+// resets HEAD~1 (rewind to H1, grace marker armed) -> operator merges
+// --ff-only back to H2 inside the grace window. Once the grace window
+// expires, capture_events must NOT contain a pending row for the
+// resurrected file — the FF-in-grace path must reseed shadow from H2
+// before clearing the gate.
+func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "selfheal-ff-grace", "shell", "ACD_REWIND_GRACE_SECONDS=2")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := selfHealStateDB(repo)
+	seedHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+
+	// Drive the daemon to commit H2 with the file.
+	target := filepath.Join(repo, "ff-grace.txt")
+	writeFile(t, target, "ff content\n")
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	h2 := waitForCommitContaining(t, repo, "ff-grace.txt", 8*time.Second)
+	if h2 == seedHead {
+		t.Fatal("daemon did not commit H2")
+	}
+
+	// Rewind: hard reset to seedHead. This drops both HEAD and the worktree
+	// content, so the daemon's same-branch rewind path arms the grace gate.
+	runGitOK(t, repo, "reset", "--hard", seedHead)
+	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != seedHead {
+		t.Fatalf("hard reset HEAD=%s want seed %s", head, seedHead)
+	}
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	waitFor(t, "replay.paused_until set after rewind", 8*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'replay.paused_until'") != ""
+	})
+
+	// Fast-forward back to H2 inside the active grace window. The merge
+	// --ff-only succeeds because H2 is a descendant of seedHead.
+	runGitOK(t, repo, "merge", "--ff-only", h2)
+	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
+		t.Fatalf("ff-merge HEAD=%s want H2 %s", head, h2)
+	}
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+
+	// The FF-in-grace path must reseed shadow + clear the grace marker.
+	waitForMetaCleared(t, dbPath, "replay.paused_until", 6*time.Second)
+
+	// Wait for the natural grace expiry to elapse so any post-grace
+	// capture pass on a subsequent wake has had a chance to misbehave.
+	time.Sleep(3 * time.Second)
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	time.Sleep(500 * time.Millisecond)
+
+	// HEAD must still equal H2 — no extra commits beyond the reseeded baseline.
+	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
+		t.Fatalf("HEAD=%s want H2 %s after grace expired", head, h2)
+	}
+	// No phantom pending rows for the FF-restored file.
+	if n := selfHealCount(t, dbPath, "path = 'ff-grace.txt' AND state = 'pending'"); n != 0 {
+		rows := sqliteScalar(t, dbPath,
+			"SELECT group_concat(seq || ':' || operation || ':' || state, char(10)) FROM capture_events WHERE path = 'ff-grace.txt' ORDER BY seq")
+		t.Fatalf("phantom pending rows after FF-in-grace=%d want 0\nrows:\n%s", n, rows)
+	}
+	// And no new commits beyond H2 — the post-grace capture must not have
+	// resurrected the file as a phantom create.
+	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "2" {
+		log := runGitOK(t, repo, "log", "--oneline", "--decorate")
+		t.Fatalf("commit count=%s want 2 (seed + H2 only)\nlog:\n%s", count, log)
+	}
+}
+
 func requireSQLite(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
