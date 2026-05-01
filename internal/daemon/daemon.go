@@ -689,20 +689,17 @@ func Run(ctx context.Context, opts Options) error {
 					}
 				}
 			}
-			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync with
-			// the freshly-observed live HEAD so the next tick has a fresh
-			// baseline for the cross-tick probe above. Cheap meta upsert.
-			if liveHead != "" && liveHead != tokenSHA(currentToken) {
-				// Defensive — only when SameGeneration short-circuited but the
-				// extracted SHAs disagree (token shape mismatch). Should not
-				// normally fire; left as a no-op stamp via SaveBranchGeneration
-				// in the divergence/FF branches below.
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead)
-			} else if liveHead != "" {
-				// Same SHA — stamp regardless so the next tick's probe sees
-				// a current value rather than a stale one written by an old
-				// transition.
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead)
+			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync
+			// with the freshly-observed live HEAD so the next tick's probe
+			// has a current baseline rather than a stale value written by an
+			// old transition. Cheap meta upsert; no error abort — a failure
+			// just means the next probe sees the same stale value, which is
+			// what the previous code did unconditionally.
+			if liveHead != "" {
+				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead); err != nil {
+					logger.Warn(logPrefix+" stamp branch head per-tick",
+						"err", err.Error())
+				}
 			}
 			return false
 		}
