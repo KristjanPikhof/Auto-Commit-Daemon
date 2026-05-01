@@ -562,4 +562,3 @@ VALUES (?, ?, 'seed.txt', 'create', '100644', '000000000000000000000000000000000
 		t.Fatalf("expected exactly 1 warn record under rate limit, got %d:\n%s", count, logBuf.String())
 	}
 }
-
