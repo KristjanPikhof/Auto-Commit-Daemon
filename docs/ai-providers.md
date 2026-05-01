@@ -2,12 +2,14 @@
 
 `acd` generates commit messages through a `Provider` interface (§10.1). Three implementations ship in v1: `deterministic` (rule-based, always available), `openai-compat` (HTTP to any OpenAI-compatible endpoint), and `subprocess` (JSONL protocol to an external binary). The default is `deterministic`; opt into the others via environment variables. Providers are composed so that any error in the primary falls back to `deterministic` automatically.
 
-By default, AI providers receive metadata only: path, operation, branch, repo
-root, multi-op entries, and timestamp. `diff` is empty unless you explicitly set
-`ACD_AI_SEND_DIFF=1`.
+By default (the `deterministic` provider), AI providers receive metadata only:
+path, operation, branch, repo root, multi-op entries, and timestamp; `diff` is
+always empty. Selecting a network `ACD_AI_PROVIDER` (`openai-compat` or
+`subprocess:<name>`) auto-enables diff egress — those providers declare
+`NeedsDiff=true` and receive a redacted unified diff alongside the metadata.
 
-When diff sending is enabled, the diff handed to AI providers is reconstructed
-from the `before_oid` and `after_oid` blobs captured in SQLite at write time —
+When a network provider is selected, the diff handed to AI providers is
+reconstructed from the `before_oid` and `after_oid` blobs captured in SQLite at write time —
 **not from the live worktree**. This means the model sees exactly what changed
 at the moment of capture, even if the file has been edited many times since.
 Before transmission, the diff is scrubbed for obvious secret shapes (AWS access
