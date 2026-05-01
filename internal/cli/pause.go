@@ -136,7 +136,7 @@ func runPause(ctx context.Context, out io.Writer, repoFlag, reason, ttlFlag stri
 	return renderPause(out, res, jsonOut)
 }
 
-func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut bool) error {
+func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut, acceptOverflow bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -149,12 +149,50 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		return fmt.Errorf("acd resume: resolve git dir: %w", err)
 	}
 
+	// --accept-overflow path: independent from the manual pause marker. When
+	// supplied (alone or with --yes) it always inspects + clears the durable
+	// capture-backpressure meta key. We resolve and clear BEFORE handling the
+	// manual marker so the operator gets a clean signal even on a repo whose
+	// only "pause" is the implicit backpressure gate.
+	var bpCleared bool
+	var bpWasSet bool
+	var bpSetAt string
+	if acceptOverflow {
+		set, stamp, clearErr := clearBackpressureFromCLI(ctx, repo)
+		if clearErr != nil {
+			return fmt.Errorf("acd resume: clear backpressure: %w", clearErr)
+		}
+		bpWasSet = set
+		bpSetAt = stamp
+		bpCleared = set
+	}
+
 	marker, ok, err := ReadMarker(gitDir)
 	if err != nil {
 		return fmt.Errorf("acd resume: read marker: %w", err)
 	}
 	markerPath := pauseMarkerPath(gitDir)
+
+	// No manual marker: short-circuit. If --accept-overflow was supplied,
+	// surface the backpressure outcome under a dedicated status. Otherwise
+	// emit the existing "not-paused" envelope.
 	if !ok {
+		if acceptOverflow {
+			status := "no-backpressure"
+			if bpCleared {
+				status = "backpressure-cleared"
+			}
+			return renderResume(out, resumeResult{
+				OK:                  bpCleared || !bpWasSet,
+				Status:              status,
+				Repo:                repo,
+				MarkerPath:          markerPath,
+				Removed:             false,
+				BackpressureCleared: bpCleared,
+				BackpressureWasSet:  bpWasSet,
+				BackpressureSetAt:   bpSetAt,
+			}, jsonOut)
+		}
 		return renderResume(out, resumeResult{
 			OK:         false,
 			Status:     "not-paused",
@@ -169,13 +207,16 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		// stderr text. Always render BEFORE returning an error so cobra still
 		// surfaces the non-zero exit code while stdout carries valid JSON.
 		res := resumeResult{
-			OK:                false,
-			Status:            "requires-yes",
-			Repo:              repo,
-			MarkerPath:        markerPath,
-			Removed:           false,
-			ExistedForSeconds: markerAgeSeconds(marker, time.Now().UTC()),
-			Marker:            marker,
+			OK:                  false,
+			Status:              "requires-yes",
+			Repo:                repo,
+			MarkerPath:          markerPath,
+			Removed:             false,
+			ExistedForSeconds:   markerAgeSeconds(marker, time.Now().UTC()),
+			Marker:              marker,
+			BackpressureCleared: bpCleared,
+			BackpressureWasSet:  bpWasSet,
+			BackpressureSetAt:   bpSetAt,
 		}
 		if renderErr := renderResume(out, res, jsonOut); renderErr != nil {
 			return renderErr
@@ -187,15 +228,63 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 	}
 
 	res := resumeResult{
-		OK:                true,
-		Status:            "resumed",
-		Repo:              repo,
-		MarkerPath:        markerPath,
-		Removed:           true,
-		ExistedForSeconds: markerAgeSeconds(marker, time.Now().UTC()),
-		Marker:            marker,
+		OK:                  true,
+		Status:              "resumed",
+		Repo:                repo,
+		MarkerPath:          markerPath,
+		Removed:             true,
+		ExistedForSeconds:   markerAgeSeconds(marker, time.Now().UTC()),
+		Marker:              marker,
+		BackpressureCleared: bpCleared,
+		BackpressureWasSet:  bpWasSet,
+		BackpressureSetAt:   bpSetAt,
 	}
 	return renderResume(out, res, jsonOut)
+}
+
+// clearBackpressureFromCLI loads the per-repo state.db, inspects the
+// durable capture.backpressure_paused_at meta key, deletes it if present,
+// and emits a trace breadcrumb so operators can correlate the explicit
+// override with the daemon's later behavior. Returns (was_set, prior_set_at,
+// err). The function is independent from the manual pause marker.
+func clearBackpressureFromCLI(ctx context.Context, repo string) (bool, string, error) {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return false, "", fmt.Errorf("resolve paths: %w", err)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		return false, "", fmt.Errorf("load registry: %w", err)
+	}
+	rec, ok := findRepo(reg, repo)
+	if !ok {
+		// No registered repo means no state.db to mutate. Treat as
+		// "nothing to clear" rather than an error so the operator can
+		// still run `acd resume --accept-overflow` defensively.
+		return false, "", nil
+	}
+	if !fileExists(rec.StateDB) {
+		return false, "", nil
+	}
+	db, err := state.Open(ctx, rec.StateDB)
+	if err != nil {
+		return false, "", fmt.Errorf("open state.db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	prior, present, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt)
+	if err != nil {
+		return false, "", fmt.Errorf("read backpressure meta: %w", err)
+	}
+	if !present {
+		return false, "", nil
+	}
+	if _, err := state.MetaDelete(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil {
+		return true, prior, fmt.Errorf("delete backpressure meta: %w", err)
+	}
+	// Stamp a breadcrumb so operators can correlate the override.
+	_ = state.MetaSet(ctx, db, "capture.backpressure_overridden_at", time.Now().UTC().Format(time.RFC3339))
+	return true, prior, nil
 }
 
 // ReadMarker reads gitDir/acd/paused. It returns ok=false when the marker is
