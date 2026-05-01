@@ -34,6 +34,21 @@ func LsTree(ctx context.Context, repoDir, rev string, recursive bool, paths ...s
 	return parseLsTree(out)
 }
 
+// LsTreeBlobOID returns the blob OID for path at ref, or an empty string
+// when path is absent or resolves to a non-blob tree entry.
+func LsTreeBlobOID(ctx context.Context, repoDir, ref, path string) (string, error) {
+	entries, err := LsTree(ctx, repoDir, ref, false, path)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if entry.Path == path && entry.Type == "blob" {
+			return entry.OID, nil
+		}
+	}
+	return "", nil
+}
+
 func parseLsTree(out []byte) ([]TreeEntry, error) {
 	var entries []TreeEntry
 	for _, rec := range bytes.Split(out, []byte{0}) {

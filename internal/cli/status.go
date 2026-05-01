@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,24 +34,29 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                string         `json:"repo"`
-	RepoHash            string         `json:"repo_hash"`
-	Daemon              string         `json:"daemon"`
-	Stale               bool           `json:"stale"`
-	PID                 int            `json:"pid"`
-	StartedTS           int64          `json:"started_ts,omitempty"`
-	UptimeSeconds       int64          `json:"uptime_seconds,omitempty"`
-	HeartbeatTS         int64          `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds int64          `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef           string         `json:"branch_ref,omitempty"`
-	BranchGenToken      string         `json:"branch_generation_token,omitempty"`
-	Clients             []statusClient `json:"clients"`
-	PendingEvents       int            `json:"pending_events"`
-	BlockedConflicts    int            `json:"blocked_conflicts"`
-	LastCommitOID       string         `json:"last_commit_oid,omitempty"`
-	LastCommitTS        int64          `json:"last_commit_ts,omitempty"`
-	LastCommitMessage   string         `json:"last_commit_message,omitempty"`
-	CaptureErrors       int            `json:"capture_errors"`
+	Repo                 string         `json:"repo"`
+	RepoHash             string         `json:"repo_hash"`
+	Daemon               string         `json:"daemon"`
+	Stale                bool           `json:"stale"`
+	PID                  int            `json:"pid"`
+	StartedTS            int64          `json:"started_ts,omitempty"`
+	UptimeSeconds        int64          `json:"uptime_seconds,omitempty"`
+	HeartbeatTS          int64          `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds  int64          `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef            string         `json:"branch_ref,omitempty"`
+	BranchGenToken       string         `json:"branch_generation_token,omitempty"`
+	Clients              []statusClient `json:"clients"`
+	PendingEvents        int            `json:"pending_events"`
+	BlockedConflicts     int            `json:"blocked_conflicts"`
+	LastCommitOID        string         `json:"last_commit_oid,omitempty"`
+	LastCommitTS         int64          `json:"last_commit_ts,omitempty"`
+	LastCommitMessage    string         `json:"last_commit_message,omitempty"`
+	CaptureErrors        int            `json:"capture_errors"`
+	Paused               bool           `json:"paused,omitempty"`
+	Pause                *pauseInfo     `json:"pause,omitempty"`
+	BackpressurePaused   bool           `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt string         `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal   int64          `json:"events_dropped_total,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -249,6 +255,28 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		return report, fmt.Errorf("capture errors: %w", err)
 	}
 
+	// Durable capture-backpressure state. Presence of the meta key signals
+	// "saturated"; readers should not block on the timestamp shape.
+	if v, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at"); err != nil {
+		return report, fmt.Errorf("backpressure state: %w", err)
+	} else if ok {
+		report.BackpressurePaused = true
+		report.BackpressurePausedAt = v
+	}
+	if v, ok, err := metaLookup(ctx, conn, "capture.events_dropped_total"); err != nil {
+		return report, fmt.Errorf("events dropped total: %w", err)
+	} else if ok && v != "" {
+		if total, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.EventsDroppedTotal = total
+		}
+	}
+	if info, err := pauseInfoForRepo(ctx, conn, rec.StateDB, now); err != nil {
+		return report, fmt.Errorf("pause state: %w", err)
+	} else if info != nil {
+		report.Paused = true
+		report.Pause = info
+	}
+
 	return report, nil
 }
 
@@ -308,6 +336,16 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	if r.BlockedConflicts > 0 {
 		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
 	}
+	if r.BackpressurePaused {
+		stamp := r.BackpressurePausedAt
+		if stamp == "" {
+			stamp = "unset"
+		}
+		fmt.Fprintf(out, "Backpressure: paused since %s (events dropped lifetime: %d)\n",
+			stamp, r.EventsDroppedTotal)
+	} else if r.EventsDroppedTotal > 0 {
+		fmt.Fprintf(out, "Capture dropped lifetime: %d\n", r.EventsDroppedTotal)
+	}
 
 	if r.LastCommitOID != "" {
 		oid := r.LastCommitOID
@@ -331,6 +369,22 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		fmt.Fprintln(out, "Capture errors: none")
 	} else {
 		fmt.Fprintf(out, "Capture errors: %d\n", r.CaptureErrors)
+	}
+
+	if r.Pause != nil {
+		fmt.Fprintln(out, "Pause:")
+		fmt.Fprintf(out, "  Source: %s\n", strings.ReplaceAll(r.Pause.Source, "_", " "))
+		if r.Pause.Reason != "" {
+			fmt.Fprintf(out, "  Reason: %s\n", r.Pause.Reason)
+		}
+		if r.Pause.SetAt != "" {
+			fmt.Fprintf(out, "  Set at: %s\n", r.Pause.SetAt)
+		}
+		if r.Pause.ExpiresAt != "" {
+			fmt.Fprintf(out, "  Expires at: %s (%s remaining)\n",
+				r.Pause.ExpiresAt,
+				formatDurationCompact(time.Duration(r.Pause.RemainingSeconds)*time.Second))
+		}
 	}
 
 	if r.BranchGenToken != "" {

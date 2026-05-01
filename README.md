@@ -44,6 +44,8 @@ acd doctor              # pending : N, blocked : N, last conflict path + age + e
 acd doctor --bundle     # diagnostics zip for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
 acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
+acd pause --reason "resetting branch" --yes   # durable manual replay pause
+acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
 acd gc                  # prune stale central-registry entries
 acd stop --repo X       # graceful stop, refcount-aware
@@ -52,6 +54,18 @@ acd stop --all          # stop every daemon
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
+
+See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
+for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
+interactive rebase while the daemon is running, including the rewind grace window
+that pauses both capture and replay automatically.
+
+See [docs/multi-tool.md](docs/multi-tool.md) for guidance on running `acd`
+alongside another auto-committer such as the Claude Code Automatic Atomic
+Commits hook or the Codex ACD hook. The short version: if an external tool
+lands a commit before `acd`'s replay tick, the daemon detects the match and
+settles the queued event as `published` with no duplicate commit. Real content
+mismatches still produce `blocked_conflict`.
 
 ## Trace and recovery
 
@@ -77,6 +91,20 @@ acd recover --repo . --auto --yes
 pending/blocked rows to the current attached branch, resets `blocked_conflict`
 rows to `pending`, and clears stale replay metadata.
 
+Use a manual pause when you want to reset, rebase, inspect, or stage branch
+changes without replay racing you:
+
+~~~bash
+acd pause --repo . --reason "manual reset" --yes
+# ...do the branch work...
+acd resume --repo . --yes
+acd wake --repo . --session-id "$ACD_SESSION_ID"
+~~~
+
+`--reason` defaults to `manual` when omitted. The marker is stored at `<gitDir>/acd/paused` and survives daemon restarts.
+`acd status` and `acd list` show the pause source and remaining TTL when one is
+active.
+
 If a parallel committer already landed the captured edits, do not requeue those
 rows with `recover`: they will usually hit the same before-state mismatch. Use
 `purge-events` to delete the terminal barrier and, when that tail is obsolete,
@@ -100,7 +128,8 @@ ACD_TRACE=1 ACD_TRACE_DIR=/tmp/acd-trace acd daemon run --repo .
 Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 `ACD_TRACE_DIR` is set. Each record includes `ts`, `repo`, `branch_ref`,
 `head_sha`, `event_class`, `decision`, `reason`, `input`, `output`, `error`,
-`seq`, and `generation`.
+`seq`, and `generation`. See [docs/capture-replay.md](docs/capture-replay.md#trace-event-classes)
+for the full `event_class` enumeration.
 
 ## Environment
 
@@ -111,10 +140,12 @@ Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 | `ACD_AI_SEND_DIFF` | unset | Sends redacted captured diffs to AI providers when truthy. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
+| `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
 
 ## Docs
 
-- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, AI diff from captured blobs, operator troubleshooting
+- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, revert workflows, AI diff from captured blobs, operator troubleshooting, pause JSON shapes, trace event classes
+- [docs/multi-tool.md](docs/multi-tool.md) — running `acd` alongside Claude Code auto-commit, Codex ACD hook, or any parallel committer
 - [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
 

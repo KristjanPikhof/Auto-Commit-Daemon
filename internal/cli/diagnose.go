@@ -12,7 +12,9 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -54,8 +56,16 @@ type diagnoseReport struct {
 	RepoHash                string                 `json:"repo_hash"`
 	StateDB                 string                 `json:"state_db"`
 	Anchor                  diagnoseAnchorReport   `json:"anchor"`
+	PendingDepth            int                    `json:"pending_depth"`
+	PendingHighWater        int64                  `json:"pending_high_water"`
+	BackpressurePaused      bool                   `json:"backpressure_paused"`
+	BackpressurePausedAt    string                 `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal      int64                  `json:"events_dropped_total"`
 	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
 	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
+	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
+	StaleOperationMarker    bool                   `json:"stale_operation_marker"`
+	OperationMarkerDuration string                 `json:"operation_marker_duration,omitempty"`
 	Remediation             []string               `json:"remediation"`
 	StateDBChecksumBefore   string                 `json:"state_db_checksum_before"`
 	StateDBChecksumAfter    string                 `json:"state_db_checksum_after"`
@@ -140,7 +150,13 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err != nil {
 		return report, err
 	}
+	if err := diagnoseCapacity(ctx, conn, &report); err != nil {
+		return report, err
+	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
 	report.Remediation = diagnoseRemediation(report)
@@ -223,6 +239,105 @@ func branchRefFromToken(token string) string {
 		return parts[1]
 	}
 	return ""
+}
+
+// diagnoseCapacity surfaces the per-repo pending FIFO depth, the
+// daemon-recorded high watermark, the durable backpressure state, and the
+// cumulative dropped-events counter. Reads are best-effort: we do not
+// abort diagnose when the table is empty or a meta key is unset (those are
+// the "fresh repo" defaults).
+func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+	var depth int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStatePending).Scan(&depth); err != nil {
+		return fmt.Errorf("pending depth: %w", err)
+	}
+	report.PendingDepth = depth
+
+	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
+	if err != nil {
+		return fmt.Errorf("pending_high_water: %w", err)
+	}
+	if ok && v != "" {
+		if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.PendingHighWater = hw
+		}
+	}
+
+	// Backpressure meta key presence is the signal — empty value still
+	// means "active" (we always stamp a timestamp on entry, but a third
+	// party could have written a blank value via raw SQL; treat any
+	// presence as paused for the report).
+	bv, bok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at")
+	if err != nil {
+		return fmt.Errorf("backpressure_paused_at: %w", err)
+	}
+	if bok {
+		report.BackpressurePaused = true
+		report.BackpressurePausedAt = bv
+	}
+
+	dv, dok, err := metaLookup(ctx, conn, "capture.events_dropped_total")
+	if err != nil {
+		return fmt.Errorf("events_dropped_total: %w", err)
+	}
+	if dok && dv != "" {
+		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
+			report.EventsDroppedTotal = total
+		}
+	}
+	return nil
+}
+
+// diagnoseOperationMarker reports whether a git rebase / merge / cherry-pick
+// / bisect marker is currently making the daemon pause and how long it has
+// been doing so. The daemon never auto-clears these markers — operators are
+// expected to run `git rebase --abort` (or remove the marker) manually — so
+// when the elapsed time crosses 15 minutes AND HEAD has not advanced since the
+// marker was first recorded, the report flags it as stale.
+// A long-running but progressing operation (e.g. an interactive rebase that is
+// still picking commits) advances HEAD across ticks; that case is NOT stale.
+func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
+	op, ok, err := metaLookup(ctx, conn, "operation_in_progress")
+	if err != nil {
+		return fmt.Errorf("operation_in_progress: %w", err)
+	}
+	if !ok || op == "" {
+		return nil
+	}
+	report.OperationInProgress = op
+	setAtRaw, ok, err := metaLookup(ctx, conn, "operation_in_progress.set_at")
+	if err != nil {
+		return fmt.Errorf("operation_in_progress.set_at: %w", err)
+	}
+	if !ok || setAtRaw == "" {
+		return nil
+	}
+	setAtSec, err := strconv.ParseFloat(setAtRaw, 64)
+	if err != nil {
+		// Best-effort: a malformed timestamp does not abort diagnose.
+		return nil
+	}
+	setAt := time.Unix(0, int64(setAtSec*float64(time.Second)))
+	elapsed := time.Since(setAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	report.OperationMarkerDuration = elapsed.Round(time.Second).String()
+	if elapsed >= 15*time.Minute {
+		// Stale only when HEAD is also motionless. A progressing rebase
+		// advances HEAD tick-by-tick; the daemon records the HEAD SHA at
+		// marker onset in operation_in_progress.head_at. Compare against the
+		// live HEAD; if they differ the operation is still active.
+		headAtRecord, _, _ := metaLookup(ctx, conn, "operation_in_progress.head_at")
+		currentHead, headErr := git.RevParse(ctx, repoDir, "HEAD")
+		headMotionless := headErr != nil || headAtRecord == "" || currentHead == headAtRecord
+		if headMotionless {
+			report.StaleOperationMarker = true
+		}
+	}
+	return nil
 }
 
 func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
@@ -340,6 +455,20 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"Resolve the listed paths in the worktree/index, then remove terminal blocked_conflict rows only after the predecessor is safe to discard.")
 	}
+	if report.PendingDepth > 0 {
+		remediation = append(remediation,
+			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume / acd recover to drain replay.")
+	}
+	if report.BackpressurePaused {
+		remediation = append(remediation,
+			fmt.Sprintf("capture is in durable backpressure (paused at %s, %d events dropped lifetime); replay must drain pending below the high-water mark, or run `acd resume --accept-overflow` to clear the gate and accept the loss.",
+				report.BackpressurePausedAt, report.EventsDroppedTotal))
+	}
+	if report.StaleOperationMarker {
+		remediation = append(remediation,
+			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
+				report.OperationInProgress, report.OperationMarkerDuration))
+	}
 	if len(remediation) == 0 {
 		remediation = append(remediation, "No anchor mismatch or blocked replay conflicts detected.")
 	}
@@ -379,6 +508,21 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	}
 	if r.Anchor.BranchGeneration != "" || r.Anchor.BranchHead != "" {
 		fmt.Fprintf(out, "Persisted branch: generation=%s head=%s\n", valueOrUnset(r.Anchor.BranchGeneration), valueOrUnset(r.Anchor.BranchHead))
+	}
+
+	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d dropped_total=%d\n",
+		r.PendingDepth, r.PendingHighWater, r.EventsDroppedTotal)
+	if r.BackpressurePaused {
+		fmt.Fprintf(out, "Backpressure: paused at %s\n", valueOrUnset(r.BackpressurePausedAt))
+	}
+
+	if r.OperationInProgress != "" {
+		stale := ""
+		if r.StaleOperationMarker {
+			stale = " STALE"
+		}
+		fmt.Fprintf(out, "Git operation: %s present for %s%s\n",
+			r.OperationInProgress, r.OperationMarkerDuration, stale)
 	}
 
 	fmt.Fprintln(out, "Blocked conflict histogram:")

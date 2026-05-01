@@ -37,8 +37,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -71,7 +73,28 @@ const (
 	// MetaKeyOperationInProgress stores the active git operation name when
 	// capture/replay are paused for rebase, merge, cherry-pick, or bisect.
 	MetaKeyOperationInProgress = "operation_in_progress"
+	// MetaKeyOperationInProgressSetAt stamps the wall-clock seconds at which
+	// MetaKeyOperationInProgress was first observed. Used to detect stale
+	// markers (rebase aborted but the marker file lingered) and warn the
+	// operator without auto-clearing.
+	MetaKeyOperationInProgressSetAt = "operation_in_progress.set_at"
+	// MetaKeyOperationInProgressHead stamps the HEAD SHA observed when the
+	// marker first appeared. Used together with MetaKeyOperationInProgressSetAt
+	// to decide whether HEAD has moved since the marker showed up — the
+	// "stale" heuristic only fires when both the marker AND HEAD have been
+	// motionless for the threshold.
+	MetaKeyOperationInProgressHead = "operation_in_progress.head_at"
+	// MetaKeyReplayPausedUntil stores an RFC3339 UTC timestamp until which
+	// replay should skip drain passes after a detected branch rewind.
+	MetaKeyReplayPausedUntil = "replay.paused_until"
 )
+
+// EnvRewindGraceSeconds controls the post-rewind replay pause window. The
+// default is intentionally short: enough for an operator's reset/revert flow
+// to settle, but not long enough to surprise a normal daemon session.
+const EnvRewindGraceSeconds = "ACD_REWIND_GRACE_SECONDS"
+
+const defaultRewindGrace = 60 * time.Second
 
 // TokenTransition classifies how the active branch ref moved between two
 // observations of HEAD.
@@ -156,7 +179,12 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 	newMissing := tokenMissing(newToken)
 	prevBranchRef := tokenBranchRef(prevToken)
 	newBranchRef := tokenBranchRef(newToken)
-	if prevToken != "" && prevBranchRef == "" && newBranchRef != "" {
+	// Asymmetric ref presence: exactly one of the two tokens carries a branch
+	// ref. Covers legacy-token-to-named-ref upgrades (prev has no ref, new
+	// has ref) and the inverse (new has no ref while prev did — detached-HEAD
+	// or legacy-token downgrade). Both directions indicate a generation
+	// boundary.
+	if (prevBranchRef == "") != (newBranchRef == "") && prevToken != "" {
 		return TokenTransitionDiverged, nil
 	}
 	if prevBranchRef != "" && newBranchRef != "" && prevBranchRef != newBranchRef {
@@ -186,7 +214,7 @@ func ClassifyTokenTransition(ctx context.Context, repoDir, prevToken, newToken s
 		// Defensive — shouldn't happen given the missing checks above.
 		return TokenTransitionDiverged, nil
 	}
-	ok, err := git.MergeBaseIsAncestor(ctx, repoDir, prevHead, newHead)
+	ok, err := git.IsAncestor(ctx, repoDir, prevHead, newHead)
 	if err != nil {
 		return TokenTransitionDiverged, fmt.Errorf("daemon: classify token: %w", err)
 	}
@@ -287,4 +315,89 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 		return "", nil
 	}
 	return v, nil
+}
+
+// maybeSetRewindGrace is called after ClassifyTokenTransition returns Diverged
+// on a same branch-ref pair; it distinguishes a backward rewind (set grace
+// marker) from any other divergence (return false).
+//
+// When newHead is an ancestor of prevHead (operator ran `git reset --soft
+// HEAD~1` or similar rewinding op), the daemon writes
+// daemon_meta.replay.paused_until = now+grace so the next capture/replay tick
+// observes a paused gate via daemonPauseState. Non-rewind divergences (e.g.
+// branch-switch, force-push, sibling commit) return (false, "", nil) without
+// touching the meta key.
+//
+// During the grace window BOTH capture and replay are paused. fsnotify fires
+// as untracked files reappear after a rewind, and a post-grace replay drain
+// would otherwise resurrect work the operator just rewound. The Run loop gates
+// capture via daemonPauseState; the Replay drain uses the same helper.
+//
+// Returns (active, expiresRFC3339, error).
+func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time) (bool, string, error) {
+	prevHead := tokenSHA(prevToken)
+	newHead := tokenSHA(newToken)
+	prevBranchRef := tokenBranchRef(prevToken)
+	newBranchRef := tokenBranchRef(newToken)
+	if prevHead == "" || newHead == "" || prevBranchRef == "" || newBranchRef == "" || prevBranchRef != newBranchRef {
+		return false, "", nil
+	}
+	grace := resolveRewindGrace()
+	if grace <= 0 {
+		return false, "", nil
+	}
+	ok, err := git.IsAncestor(ctx, repoDir, newHead, prevHead)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, "", nil
+	}
+	until := now.Add(grace).UTC().Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, MetaKeyReplayPausedUntil, until); err != nil {
+		return false, "", err
+	}
+	return true, until, nil
+}
+
+// rewindGraceActive reports whether daemon_meta.replay.paused_until carries a
+// timestamp that is still in the future relative to now. It does NOT consult
+// the manual pause marker — callers that need the full pause picture should
+// call daemonPauseState. This helper exists so the run loop can detect a
+// fast-forward landing inside an active rewind grace window: in that case the
+// FF path must reseed shadow_paths from the rewound HEAD before clearing the
+// gate, otherwise post-grace capture compares live HEAD against stale shadow
+// rows seeded at the rewound (lower) HEAD and emits phantom create events.
+//
+// Returns (active, expiresAt, error). expiresAt is the parsed RFC3339 string
+// from daemon_meta when active, "" otherwise. A malformed value is treated as
+// inactive — daemonPauseState already warns about that case.
+func rewindGraceActive(ctx context.Context, db *state.DB, now time.Time) (bool, string, error) {
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok || strings.TrimSpace(raw) == "" {
+		return false, "", nil
+	}
+	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		return false, "", nil
+	}
+	if !until.After(now.UTC()) {
+		return false, "", nil
+	}
+	return true, until.UTC().Format(time.RFC3339), nil
+}
+
+func resolveRewindGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(EnvRewindGraceSeconds))
+	if raw == "" {
+		return defaultRewindGrace
+	}
+	secs, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || secs < 0 {
+		return defaultRewindGrace
+	}
+	return time.Duration(secs) * time.Second
 }

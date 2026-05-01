@@ -1,14 +1,19 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -384,5 +389,418 @@ func TestCapture_ModeChange(t *testing.T) {
 	}
 	if !sawMode {
 		t.Fatalf("expected mode event for script.sh, got %+v", pendingOps(t, f.db))
+	}
+}
+
+// TestCapture_PendingDepthCap_DropsNewEvents verifies the new durable
+// backpressure contract. Pass A: drive pending up to the cap, observe
+// mid-pass entry into backpressure (the in-loop saturation guard that
+// stamps MetaKeyCaptureBackpressurePausedAt and stops the pass). Pass B:
+// while saturated, an additional capture pass MUST early-return BEFORE
+// walkLive runs — `WalkedFiles` stays 0 and `BackpressurePaused` is true.
+// Pass C: after replay drains the queue below the high-water mark, the
+// next capture pass clears the gate and emits a `capture.pause cleared`
+// trace event.
+func TestCapture_PendingDepthCap_DropsNewEvents(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "10")
+	resetPendingCapWarnForTest(t, 1) // 1-second interval; we only care that *one* warn lands
+
+	// Capture warn output via a buffer-backed slog handler. Restore the
+	// process default on cleanup so we don't bleed state into other tests.
+	prevDefault := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	f := newCaptureFixture(t)
+	for i := 0; i < 15; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// Pass A: walk runs, fills the FIFO to cap, the in-loop saturation
+	// guard stamps the durable backpressure key, and the pass returns
+	// without processing the remaining ops.
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsAppended != 10 {
+		t.Fatalf("EventsAppended=%d, want 10; summary=%+v", sum.EventsAppended, sum)
+	}
+	if !sum.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false; want true after mid-pass saturation; summary=%+v", sum)
+	}
+	if sum.EventsDropped < 1 {
+		t.Fatalf("EventsDropped=%d, want >=1; summary=%+v", sum.EventsDropped, sum)
+	}
+	if sum.EventsDroppedTotal < 1 {
+		t.Fatalf("EventsDroppedTotal=%d, want >=1; summary=%+v", sum.EventsDroppedTotal, sum)
+	}
+	if sum.PendingDepth != 10 {
+		t.Fatalf("PendingDepth=%d, want 10; summary=%+v", sum.PendingDepth, sum)
+	}
+	if sum.PendingHighWater != 10 {
+		t.Fatalf("PendingHighWater=%d, want 10; summary=%+v", sum.PendingHighWater, sum)
+	}
+
+	var rowCount int
+	if err := f.db.SQL().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM capture_events WHERE state = 'pending'`).Scan(&rowCount); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rowCount != 10 {
+		t.Fatalf("rows=%d, want 10 (cap should hold the FIFO at the limit)", rowCount)
+	}
+
+	hw, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyPendingHighWater)
+	if err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected daemon_meta.%s to be set", MetaKeyPendingHighWater)
+	}
+	if hwInt, perr := strconv.ParseInt(hw, 10, 64); perr != nil || hwInt != 10 {
+		t.Fatalf("daemon_meta.%s=%q, want 10", MetaKeyPendingHighWater, hw)
+	}
+
+	// MetaKeyCaptureBackpressurePausedAt must now be set.
+	bp, bpOK, err := state.MetaGet(context.Background(), f.db, MetaKeyCaptureBackpressurePausedAt)
+	if err != nil {
+		t.Fatalf("MetaGet backpressure: %v", err)
+	}
+	if !bpOK || bp == "" {
+		t.Fatalf("expected daemon_meta.%s set after saturation", MetaKeyCaptureBackpressurePausedAt)
+	}
+	if _, perr := time.Parse(time.RFC3339, bp); perr != nil {
+		t.Fatalf("backpressure_paused_at=%q is not RFC3339: %v", bp, perr)
+	}
+
+	// MetaKeyCaptureEventsDroppedTotal must be advanced.
+	dt, dtOK, err := state.MetaGet(context.Background(), f.db, MetaKeyCaptureEventsDroppedTotal)
+	if err != nil {
+		t.Fatalf("MetaGet dropped total: %v", err)
+	}
+	if !dtOK || dt == "" {
+		t.Fatalf("expected daemon_meta.%s set after saturation", MetaKeyCaptureEventsDroppedTotal)
+	}
+	if total, perr := strconv.ParseInt(dt, 10, 64); perr != nil || total < 1 {
+		t.Fatalf("events_dropped_total=%q, want >=1", dt)
+	}
+
+	if !strings.Contains(logBuf.String(), "capture pending depth at cap") {
+		t.Fatalf("expected slog.Warn about capture pending depth at cap, got: %s", logBuf.String())
+	}
+
+	// Pass B: a second pass while saturated MUST early-return ahead of
+	// walkLive. Drop more files into the worktree to make sure the walk
+	// would otherwise produce work.
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("extra-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("y"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	prevTotal, _, _ := state.MetaGet(context.Background(), f.db, MetaKeyCaptureEventsDroppedTotal)
+	resetPendingCapWarnForTest(t, 1)
+	logBuf.Reset()
+	sumB, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass B: %v", err)
+	}
+	if sumB.WalkedFiles != 0 {
+		t.Fatalf("WalkedFiles=%d, want 0 (walk must be skipped while saturated); summary=%+v",
+			sumB.WalkedFiles, sumB)
+	}
+	if !sumB.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=false on saturated pass; summary=%+v", sumB)
+	}
+	if sumB.EventsAppended != 0 {
+		t.Fatalf("EventsAppended=%d, want 0 on saturated pass; summary=%+v", sumB.EventsAppended, sumB)
+	}
+	// Cumulative counter must advance monotonically.
+	prevN, _ := strconv.ParseInt(prevTotal, 10, 64)
+	if sumB.EventsDroppedTotal <= prevN {
+		t.Fatalf("EventsDroppedTotal did not advance: prev=%d cur=%d", prevN, sumB.EventsDroppedTotal)
+	}
+
+	// Pass C: simulate replay drain. Mark 1 of the 10 pending rows as
+	// published (depth 9), still above the high-water mark of 8 (10*0.8),
+	// so the gate stays active.
+	if _, err := f.db.SQL().ExecContext(context.Background(),
+		`UPDATE capture_events SET state = 'published' WHERE seq IN (
+			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 1
+		)`); err != nil {
+		t.Fatalf("simulate drain (1 row): %v", err)
+	}
+	sumC, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass C: %v", err)
+	}
+	if !sumC.BackpressurePaused {
+		t.Fatalf("expected backpressure to still be active above high-water (depth=9, high_water=8); summary=%+v", sumC)
+	}
+	if sumC.WalkedFiles != 0 {
+		t.Fatalf("WalkedFiles=%d, want 0 above high-water; summary=%+v", sumC.WalkedFiles, sumC)
+	}
+
+	// Pass D: drain further so depth drops below the high-water mark.
+	// Mark two more rows published (depth 7 < 8), backpressure must clear.
+	if _, err := f.db.SQL().ExecContext(context.Background(),
+		`UPDATE capture_events SET state = 'published' WHERE seq IN (
+			SELECT seq FROM capture_events WHERE state = 'pending' ORDER BY seq ASC LIMIT 2
+		)`); err != nil {
+		t.Fatalf("simulate drain (2 rows): %v", err)
+	}
+	sumD, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture pass D: %v", err)
+	}
+	if !sumD.BackpressureCleared {
+		t.Fatalf("BackpressureCleared=false after drain below high-water; summary=%+v", sumD)
+	}
+	// Pass D's clear ran at entry, so the meta key was deleted and the
+	// walk proceeded. Re-entry mid-walk is permitted (and expected when
+	// the post-drain walk + lingering worktree changes push the queue
+	// back to cap); the contract we care about is "clear was emitted".
+	if sumD.WalkedFiles == 0 {
+		t.Fatalf("Pass D should have walked after backpressure cleared; summary=%+v", sumD)
+	}
+}
+
+// TestCapture_PendingDepthCap_Disabled verifies cap=0 short-circuits all
+// counting + bookkeeping work. With ACD_MAX_PENDING_EVENTS=0 a flood of
+// captures should land in capture_events without any drops or watermark.
+func TestCapture_PendingDepthCap_Disabled(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "0")
+	resetPendingCapWarnForTest(t, 1)
+
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsDropped != 0 {
+		t.Fatalf("disabled cap should not drop; summary=%+v", sum)
+	}
+	if sum.EventsAppended < 12 {
+		t.Fatalf("EventsAppended=%d, want >=12; summary=%+v", sum.EventsAppended, sum)
+	}
+	if sum.PendingDepth != 0 || sum.PendingHighWater != 0 {
+		t.Fatalf("disabled cap should leave depth/high_water at 0; summary=%+v", sum)
+	}
+	if _, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyPendingHighWater); err != nil {
+		t.Fatalf("MetaGet: %v", err)
+	} else if ok {
+		t.Fatalf("MetaKeyPendingHighWater should be unset when cap is disabled")
+	}
+}
+
+// TestCapture_PendingDepthCap_RateLimited ensures we don't spam slog.Warn
+// across multiple saturated passes. With a 60-second interval, two
+// saturated passes back-to-back must produce exactly one warn record.
+// Under the new contract the pre-seeded row puts capture into the
+// pre-walk gate, so neither pass walks the worktree.
+func TestCapture_PendingDepthCap_RateLimited(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "1")
+	resetPendingCapWarnForTest(t, 60)
+
+	prevDefault := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	f := newCaptureFixture(t)
+	// Pre-seed one pending row to put the cap immediately in effect.
+	if _, err := state.AppendCaptureEvent(context.Background(), f.db, state.CaptureEvent{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead: f.cctx.BaseHead, Operation: "create", Path: "seed.txt",
+		Fidelity: "exact", State: state.EventStatePending,
+	}, []state.CaptureOp{{Op: "create", Path: "seed.txt", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+
+	// Stub the seed into shadow_paths so it isn't reclassified as a delete.
+	if _, err := f.db.SQL().ExecContext(context.Background(), `
+INSERT INTO shadow_paths(branch_ref, branch_generation, path, operation, mode, oid, base_head, fidelity, updated_ts)
+VALUES (?, ?, 'seed.txt', 'create', '100644', '0000000000000000000000000000000000000000', ?, 'exact', 0)`,
+		f.cctx.BranchRef, f.cctx.BranchGeneration, f.cctx.BaseHead); err != nil {
+		t.Fatalf("seed shadow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "seed.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("drop-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("y"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// Two saturated passes: each must early-return BEFORE walkLive (the
+	// new pre-walk gate). The rate limiter must fold their warns into one.
+	for i := 0; i < 2; i++ {
+		sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker:    f.ig,
+			SensitiveMatcher: f.matcher,
+		})
+		if err != nil {
+			t.Fatalf("Capture pass %d: %v", i, err)
+		}
+		if sum.WalkedFiles != 0 {
+			t.Fatalf("pass %d WalkedFiles=%d, want 0 (saturated pass must skip walk); summary=%+v",
+				i, sum.WalkedFiles, sum)
+		}
+		if !sum.BackpressurePaused {
+			t.Fatalf("pass %d BackpressurePaused=false; want true; summary=%+v", i, sum)
+		}
+		if sum.EventsDropped < 1 {
+			t.Fatalf("pass %d EventsDropped=%d, want >=1; summary=%+v", i, sum.EventsDropped, sum)
+		}
+	}
+
+	count := strings.Count(logBuf.String(), "capture pending depth at cap")
+	if count != 1 {
+		t.Fatalf("expected exactly 1 warn record under rate limit, got %d:\n%s", count, logBuf.String())
+	}
+}
+
+// TestCapture_HonorsManualPauseDirectInvocation: Capture must consult the
+// daemon pause gate when a direct caller (test, future CLI wrapper) invokes
+// it without going through the run loop. Otherwise the live worktree state
+// during a manual pause window would still be enqueued, defeating the
+// "pause replay" guarantee — the next replay drain would resurrect work the
+// operator intentionally rewound.
+//
+// Symmetric counterpart to TestReplay_SkipsDrainWhenManualMarkerPresent.
+func TestCapture_HonorsManualPauseDirectInvocation(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Bootstrap the shadow so a fresh write is later classified as
+	// `create` rather than getting absorbed into the baseline.
+	f.firstCapture(t)
+
+	// Drop a file that would, absent the pause, become a captured event.
+	if err := os.WriteFile(filepath.Join(f.dir, "rewound.txt"),
+		[]byte("would-be-resurrected\n"), 0o644); err != nil {
+		t.Fatalf("write rewound: %v", err)
+	}
+
+	// Activate a manual pause marker — the same artifact `acd pause` writes.
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "operator surgery",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write pause marker: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pausepkg.Path(f.gitDir)) })
+
+	beforeCount := captureEventsTotal(t, ctx, f.db)
+	trace := &memoryTraceLogger{}
+
+	sum, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		GitDir:           f.gitDir,
+		Trace:            trace,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if !sum.Skipped {
+		t.Fatalf("expected Skipped=true, got %+v", sum)
+	}
+	if sum.SkipReason == "" {
+		t.Fatalf("expected non-empty SkipReason, got %+v", sum)
+	}
+	if sum.EventsAppended != 0 {
+		t.Fatalf("expected EventsAppended=0 under manual pause, got %d", sum.EventsAppended)
+	}
+
+	// No new capture_events row may have been minted while the pause was
+	// active — that's the whole point of the gate.
+	if got := captureEventsTotal(t, ctx, f.db); got != beforeCount {
+		t.Fatalf("capture_events grew while paused: before=%d after=%d", beforeCount, got)
+	}
+
+	// Trace symmetry: the run loop emits "capture.pause" for paused
+	// captures via the same helper. Direct callers must produce the same
+	// trace shape so operators see one consistent event class.
+	events := traceEventsByClass(trace.Events(), "capture.pause")
+	if len(events) != 1 {
+		t.Fatalf("capture.pause trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	output, ok := events[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("trace output type=%T want map[string]any", events[0].Output)
+	}
+	if events[0].Reason != "capture_paused" || output["source"] != "manual" {
+		t.Fatalf("unexpected trace event: %+v", events[0])
+	}
+}
+
+// TestCapture_RunLoopSkipPauseCheckOptOut: SkipPauseCheck=true bypasses the
+// pause gate inside Capture — the run loop relies on this to avoid a double
+// trace event (the run loop already emits capture.pause before deciding
+// whether to invoke Capture at all). With SkipPauseCheck=true the walk runs
+// even though a manual marker is present.
+func TestCapture_RunLoopSkipPauseCheckOptOut(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	f.firstCapture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "skip-opt.txt"),
+		[]byte("captured-anyway\n"), 0o644); err != nil {
+		t.Fatalf("write skip-opt: %v", err)
+	}
+
+	if _, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+		Reason: "run loop already gated",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "test",
+	}, false); err != nil {
+		t.Fatalf("write pause marker: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pausepkg.Path(f.gitDir)) })
+
+	sum, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		GitDir:           f.gitDir,
+		SkipPauseCheck:   true,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.Skipped {
+		t.Fatalf("SkipPauseCheck must bypass the gate; got Skipped=true %+v", sum)
+	}
+	if sum.EventsAppended == 0 {
+		t.Fatalf("expected at least one event appended under SkipPauseCheck=true, got %+v", sum)
 	}
 }

@@ -25,18 +25,21 @@ import (
 // listEntry is one row in the `acd list` output. JSON marshal tags match
 // the §7.7 example shape.
 type listEntry struct {
-	Path             string  `json:"path"`
-	RepoHash         string  `json:"repo_hash"`
-	Daemon           string  `json:"daemon"`
-	PID              int     `json:"pid,omitempty"`
-	Clients          int     `json:"clients"`
-	LastSeq          int64   `json:"last_seq"`
-	LastCommitOID    string  `json:"last_commit_oid,omitempty"`
-	HeartbeatAgeSecs float64 `json:"heartbeat_age_seconds,omitempty"`
-	PendingEvents    int     `json:"pending_events"`
-	BlockedConflicts int     `json:"blocked_conflicts"`
-	Status           string  `json:"status"`
-	StatusNote       string  `json:"status_note,omitempty"`
+	Path             string     `json:"path"`
+	RepoHash         string     `json:"repo_hash"`
+	Daemon           string     `json:"daemon"`
+	PID              int        `json:"pid,omitempty"`
+	Clients          int        `json:"clients"`
+	LastSeq          int64      `json:"last_seq"`
+	LastCommitOID    string     `json:"last_commit_oid,omitempty"`
+	HeartbeatAgeSecs float64    `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents    int        `json:"pending_events"`
+	BlockedConflicts int        `json:"blocked_conflicts"`
+	Status           string     `json:"status"`
+	StatusNote       string     `json:"status_note,omitempty"`
+	Paused           bool       `json:"paused,omitempty"`
+	StaleHeartbeat   bool       `json:"stale_heartbeat,omitempty"`
+	Pause            *pauseInfo `json:"pause,omitempty"`
 }
 
 func newListCmd() *cobra.Command {
@@ -111,12 +114,34 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
 		e.PendingEvents = summary.pendingEvents
 		e.BlockedConflicts = summary.blockedConflicts
+		if summary.pause != nil {
+			e.Status = "paused"
+			e.StatusNote = pauseStatusNote(summary.pause)
+			e.Paused = true
+			e.Pause = summary.pause
+		}
 		if summary.daemon == "stale" {
-			if summary.clients == 0 {
-				continue
+			e.StaleHeartbeat = true
+			staleNote := "daemon stale " + formatDurationCompact(summary.heartbeatAge)
+			if e.Status == "paused" {
+				// Combined paused+stale presentation: keep Status="paused"
+				// (operator intent wins) but append the stale-heartbeat fact
+				// so a paused-but-dead daemon never silently disappears.
+				if e.StatusNote == "" {
+					e.StatusNote = staleNote
+				} else {
+					e.StatusNote = e.StatusNote + "; " + staleNote
+				}
+			} else {
+				if summary.clients == 0 {
+					// Inactive stale daemon with zero live clients is hidden
+					// from the default list (gc is responsible for it). When
+					// a pause marker is present we already kept the row above.
+					continue
+				}
+				e.Status = "stale"
+				e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
 			}
-			e.Status = "stale"
-			e.StatusNote = "stale heartbeat (" + formatDurationCompact(summary.heartbeatAge) + ")"
 		}
 		entries = append(entries, e)
 	}
@@ -177,6 +202,7 @@ type repoSummary struct {
 	heartbeatTS      float64
 	pendingEvents    int
 	blockedConflicts int
+	pause            *pauseInfo
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
@@ -268,6 +294,11 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateBlockedConflict).Scan(&s.blockedConflicts); err != nil {
 		return repoSummary{}, fmt.Errorf("blocked conflicts: %w", err)
+	}
+	if info, err := pauseInfoForRepo(ctx, conn, dbPath, now); err != nil {
+		return repoSummary{}, fmt.Errorf("pause state: %w", err)
+	} else {
+		s.pause = info
 	}
 
 	return s, nil

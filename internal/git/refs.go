@@ -85,11 +85,11 @@ func RunBranchRef(ctx context.Context, repoDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// MergeBaseIsAncestor reports whether commit is an ancestor of descendant.
+// IsAncestor reports whether ancestor is an ancestor of descendant.
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
-func MergeBaseIsAncestor(ctx context.Context, repoDir, commit, descendant string) (bool, error) {
-	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "merge-base", "--is-ancestor", commit, descendant)
+func IsAncestor(ctx context.Context, repoDir, ancestor, descendant string) (bool, error) {
+	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
 	}

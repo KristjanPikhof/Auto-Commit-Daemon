@@ -784,3 +784,124 @@ func sqlNullStr(s string) sql.NullString {
 	}
 	return sql.NullString{Valid: true, String: s}
 }
+
+// TestState_PendingEventsBarrierIndex_Exists asserts the v3 covering index
+// idx_capture_events_barrier is created on a fresh DB (and on reopen) so the
+// PendingEvents barrier subquery never falls back to a full-table scan.
+func TestState_PendingEventsBarrierIndex_Exists(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv < 3 {
+		t.Fatalf("user_version=%d, want >= 3 (v3 introduces idx_capture_events_barrier)", uv)
+	}
+
+	var name string
+	err = d.SQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master
+WHERE type = 'index' AND name = 'idx_capture_events_barrier' AND tbl_name = 'capture_events'`).Scan(&name)
+	if err != nil {
+		t.Fatalf("idx_capture_events_barrier missing: %v", err)
+	}
+	if name != "idx_capture_events_barrier" {
+		t.Fatalf("got index name=%q, want idx_capture_events_barrier", name)
+	}
+
+	// Verify SQLite chooses the new index for the depth-cap counting query.
+	rows, err := d.SQL().QueryContext(ctx,
+		`EXPLAIN QUERY PLAN
+		 SELECT COUNT(*) FROM capture_events
+		 WHERE state = 'pending' AND branch_ref = 'refs/heads/main' AND branch_generation = 1`)
+	if err != nil {
+		t.Fatalf("explain query plan: %v", err)
+	}
+	defer rows.Close()
+	var planText strings.Builder
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		planText.WriteString(detail)
+		planText.WriteByte('\n')
+	}
+	if !strings.Contains(planText.String(), "idx_capture_events_barrier") {
+		t.Fatalf("query plan did not select idx_capture_events_barrier:\n%s", planText.String())
+	}
+}
+
+// BenchmarkPendingEvents seeds 10k pending rows + a couple of terminal
+// barriers in older generations and measures PendingEvents throughput. The
+// benchmark protects against future regressions where someone drops the
+// covering index or rewrites the barrier subquery to scan the entire table.
+func BenchmarkPendingEvents(b *testing.B) {
+	d, _ := openBenchDB(b)
+	ctx := context.Background()
+
+	const rows = 10_000
+	for i := 0; i < rows; i++ {
+		ev := CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 7,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             fmt.Sprintf("bench-%05d.txt", i),
+			Fidelity:         "exact",
+		}
+		if _, err := AppendCaptureEvent(ctx, d, ev, nil); err != nil {
+			b.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+	// Two stale-generation barriers that PendingEvents must skip cleanly.
+	for _, gen := range []int64{5, 6} {
+		ev := CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: gen,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             fmt.Sprintf("stale-gen-%d.txt", gen),
+			Fidelity:         "exact",
+		}
+		seq, err := AppendCaptureEvent(ctx, d, ev, nil)
+		if err != nil {
+			b.Fatalf("seed stale: %v", err)
+		}
+		if err := MarkEventBlocked(ctx, d, seq, "stale", float64(time.Now().Unix()),
+			sql.NullString{String: "refs/heads/main", Valid: true},
+			sql.NullInt64{Int64: gen, Valid: true},
+			sql.NullString{String: "deadbeef", Valid: true},
+		); err != nil {
+			b.Fatalf("mark stale blocked: %v", err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := PendingEvents(ctx, d, 100)
+		if err != nil {
+			b.Fatalf("PendingEvents: %v", err)
+		}
+		if len(out) != 100 {
+			b.Fatalf("got %d pending, want 100", len(out))
+		}
+	}
+}
+
+func openBenchDB(b *testing.B) (*DB, string) {
+	b.Helper()
+	gitDir := filepath.Join(b.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	d, err := Open(context.Background(), dbPath)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	b.Cleanup(func() { _ = d.Close() })
+	return d, dbPath
+}

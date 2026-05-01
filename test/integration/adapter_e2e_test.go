@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
@@ -74,6 +75,139 @@ func TestAdapterE2E(t *testing.T) {
 	t.Run("shell", func(t *testing.T) {
 		runShellE2E(t, bin)
 	})
+	t.Run("pause-resume", func(t *testing.T) {
+		runPauseResumeE2E(t, bin)
+	})
+}
+
+// runPauseResumeE2E covers P2 finding 15: drives `acd pause` / `acd resume`
+// against a daemon spawned through the existing claude-code harness lifecycle
+// and asserts the on-disk marker, marker mode, and `acd status --json`
+// projection of the pause state in both directions. We reuse the claude-code
+// path (vs reimplementing daemon spawn) so this stays one of the AdapterE2E
+// subtests instead of a parallel scaffold.
+func runPauseResumeE2E(t *testing.T, bin string) {
+	body := readSnippet(t, "claude-code/settings.snippet.json")
+	hooks := parseClaudeCodeSnippet(t, body)
+
+	repo := tempRepo(t)
+	binDir := filepath.Dir(bin)
+	sessionID := "e2e-pause-resume"
+	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
+
+	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
+
+	// Drive the claude-code SessionStart hook so the daemon comes up under
+	// the same code path the harness uses in production.
+	startHook := pickHookByEvent(t, hooks, "SessionStart")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res := runBash(t, ctx, env, stdin, startHook.Command)
+	if res.ExitCode != 0 {
+		t.Fatalf("pause-resume SessionStart exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	waitFor(t, "pause-resume daemon mode==running", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
+
+	// Always tear down the daemon, even on assertion failure, so subsequent
+	// subtests start from a clean slate.
+	t.Cleanup(func() {
+		stopHook := pickHookByEvent(t, hooks, "SessionEnd")
+		stopRes := runBash(t, ctx, env, stdin, stopHook.Command)
+		if stopRes.ExitCode != 0 {
+			// Fall back to forced stop so we never leave a stray daemon
+			// behind.
+			t.Logf("pause-resume SessionEnd exit=%d (stdout=%s stderr=%s); forcing stop",
+				stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
+			shutdownDaemon(t, env, repo, sessionID)
+			return
+		}
+		waitDaemonStoppedOrKill(t, "pause-resume daemon stopped", repo)
+	})
+
+	// Use pausepkg.Path so a future marker-path refactor breaks the test
+	// instead of rubber-stamping a stale hardcoded location.
+	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
+
+	// Step 1: `acd pause --reason e2e --yes` writes a 0o600 marker.
+	pauseRes := runAcd(t, ctx, env,
+		"pause", "--repo", repo, "--reason", "e2e", "--yes", "--json")
+	if pauseRes.ExitCode != 0 {
+		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s",
+			pauseRes.ExitCode, pauseRes.Stdout, pauseRes.Stderr)
+	}
+	info, err := os.Lstat(markerPath)
+	if err != nil {
+		t.Fatalf("stat pause marker: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("pause marker is not a regular file: mode=%v", info.Mode())
+	}
+	// Permissions: 0o600. We test only the lower 9 bits because the temp file
+	// publish path may set additional bits (e.g. setgid via umask) on some
+	// platforms; the security-relevant part is "no world/group access".
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("pause marker mode=%o want 0o600", perm)
+	}
+
+	// Step 2: `acd status --json` reflects paused=true with source=manual.
+	assertStatusPause(t, ctx, env, repo, true, "manual")
+
+	// Step 3: `acd resume --yes` removes the marker.
+	resumeRes := runAcd(t, ctx, env, "resume", "--repo", repo, "--yes", "--json")
+	if resumeRes.ExitCode != 0 {
+		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s",
+			resumeRes.ExitCode, resumeRes.Stdout, resumeRes.Stderr)
+	}
+	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("pause marker still present after acd resume: err=%v", err)
+	}
+
+	// Step 4: `acd status --json` reflects paused=false (Pause field absent).
+	assertStatusPause(t, ctx, env, repo, false, "")
+}
+
+// assertStatusPause runs `acd status --json` and verifies the paused/source
+// fields. wantSource is ignored when wantPaused==false.
+func assertStatusPause(t *testing.T, ctx context.Context, env []string, repo string, wantPaused bool, wantSource string) {
+	t.Helper()
+	res := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	var rep struct {
+		Paused bool `json:"paused"`
+		Pause  *struct {
+			Source string `json:"source"`
+		} `json:"pause"`
+	}
+	if err := json.Unmarshal([]byte(res.Stdout), &rep); err != nil {
+		t.Fatalf("decode status json: %v\nstdout=%s", err, res.Stdout)
+	}
+	if rep.Paused != wantPaused {
+		t.Fatalf("acd status paused=%v want %v\nstdout=%s",
+			rep.Paused, wantPaused, res.Stdout)
+	}
+	if !wantPaused {
+		if rep.Pause != nil {
+			t.Fatalf("acd status pause object present after resume: %+v\nstdout=%s",
+				rep.Pause, res.Stdout)
+		}
+		return
+	}
+	if rep.Pause == nil {
+		t.Fatalf("acd status pause object nil, want source=%q\nstdout=%s",
+			wantSource, res.Stdout)
+	}
+	if rep.Pause.Source != wantSource {
+		t.Fatalf("acd status pause.source=%q want %q\nstdout=%s",
+			rep.Pause.Source, wantSource, res.Stdout)
+	}
 }
 
 // -----------------------------------------------------------------------------
