@@ -326,7 +326,7 @@ func LoadCaptureOps(ctx context.Context, d *DB, seq int64) ([]CaptureOp, error) 
 SELECT event_seq, ord, op, path, old_path,
        before_oid, before_mode, after_oid, after_mode, fidelity
 FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
-	rows, err := d.conn.QueryContext(ctx, q, seq)
+	rows, err := d.readSQL().QueryContext(ctx, q, seq)
 	if err != nil {
 		return nil, fmt.Errorf("state: query capture ops: %w", err)
 	}
