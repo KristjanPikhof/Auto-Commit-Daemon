@@ -1521,6 +1521,10 @@ func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, e
 	})
 }
 
+func traceLiveIndexReconcile(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, ev state.CaptureEvent, decision, reason string, output map[string]any) {
+	traceReplay(logger, repoRoot, cctx, ev, "replay.live_index", decision, reason, output)
+}
+
 func traceCapturePaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
 	output := map[string]any{
 		"source": paused.Source,
