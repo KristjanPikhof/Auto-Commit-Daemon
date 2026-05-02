@@ -1524,6 +1524,3 @@ WHERE status = 'acknowledged'
 	return n, nil
 }
 
-// (un)used helpers retained for future phases — keep the symbol exported so
-// the test build doesn't drop them on compile.
-var _ = gitDirEnsureSubdir
