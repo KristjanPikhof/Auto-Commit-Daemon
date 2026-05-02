@@ -1171,11 +1171,17 @@ func Run(ctx context.Context, opts Options) error {
 			repErr error
 		)
 		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
-			// 4g. Replay pass.
+			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
+			// pending queue cannot starve flush_request claims, heartbeat
+			// refresh, or shutdown observation. ReplaySummary.HasMore is
+			// folded into hadWork below so the scheduler resets to the base
+			// poll interval and an immediate follow-up pass drains the rest
+			// without waiting for the idle ceiling.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
 				GitDir:    opts.GitDir,
 				Trace:     tracer,
+				Limit:     DefaultReplayLimit,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
