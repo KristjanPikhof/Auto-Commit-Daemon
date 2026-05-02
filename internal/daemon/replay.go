@@ -518,9 +518,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// against further movement).
 			headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
 			if probeErr != nil {
+				cancelEvent()
 				return sum, probeErr
 			}
 			if alreadyPublished {
+				cancelEvent()
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
 					return sum, err
 				}
@@ -559,14 +561,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if expected == "" {
 				expected = oldOID
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if recErr := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCASFail,
 				Expected:   expected,
 				Actual:     actual,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); recErr != nil {
+				return sum, recErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, map[string]any{
 				"expected_sha": expected,
 				"actual_sha":   actual,
@@ -576,6 +581,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Settle the event row + publish_state.
+		cancelEvent()
 		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
 			return sum, err
 		}
