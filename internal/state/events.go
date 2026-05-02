@@ -418,7 +418,7 @@ WHERE state IN ('blocked_conflict', 'failed')
 // rollup window query.
 func LatestEventSeq(ctx context.Context, d *DB) (int64, error) {
 	var seq sql.NullInt64
-	err := d.conn.QueryRowContext(ctx, `SELECT MAX(seq) FROM capture_events`).Scan(&seq)
+	err := d.readSQL().QueryRowContext(ctx, `SELECT MAX(seq) FROM capture_events`).Scan(&seq)
 	if err != nil {
 		return 0, fmt.Errorf("state: latest event seq: %w", err)
 	}
