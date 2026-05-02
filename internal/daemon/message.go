@@ -349,11 +349,23 @@ func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error
 		return hdr.String(), nil
 	}
 
-	body, err := git.DiffBlobs(ctx, repoRoot, s.beforeOID, s.afterOID)
+	// Per-DiffBlobs deadline. A pathological blob (multi-MB binary, hostile
+	// repacked archive) can otherwise stall `git diff` long enough to
+	// starve the entire BuildOpsDiff pass. 5s per op caps the wall-clock
+	// cost; on timeout we fall back to header-only for THIS op only —
+	// other ops in the same multi-op event still render. The cap is
+	// enforced at the git layer via DiffBlobsLimited so an oversize blob
+	// truncates at ai.DiffCap rather than after we've already buffered the
+	// full payload.
+	diffCtx, cancel := context.WithTimeout(ctx, diffBlobsTimeout())
+	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, int64(ai.DiffCap))
+	cancel()
 	if err != nil {
-		// Best-effort: when git refuses (missing blob, foreign archive),
-		// fall back to header-only so the model still sees the change
-		// shape.
+		// Best-effort: when git refuses (missing blob, foreign archive,
+		// per-op deadline hit, stdout overflow), fall back to header-only
+		// so the model still sees the change shape. ErrStdoutOverflow
+		// returns the partial prefix; a header-only fallback is safer for
+		// the model than a truncated mid-hunk body.
 		return hdr.String(), nil
 	}
 	body = stripGitDiffPreamble(body)
