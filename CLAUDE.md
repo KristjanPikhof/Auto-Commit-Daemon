@@ -1,226 +1,258 @@
-# Agents Guide
+# Agent guide
 
 ## Identity
 
-- **Binary**: `acd` (single static cross-platform Go binary)
-- **Module**: `github.com/KristjanPikhof/Auto-Commit-Daemon`
-- **License**: MIT
-- **Versioning**: date-based, `vYYYY-MM-DD`
-- **Platforms**: macOS (arm64, amd64), Linux (arm64, amd64). No Windows in v1.
+- Binary: `acd`, single static Go CLI/daemon.
+- Module: `github.com/KristjanPikhof/Auto-Commit-Daemon`
+- Versioning: date tags, `vYYYY-MM-DD`; `make build` injects version and git SHA.
+- Platforms: macOS and Linux, `arm64`/`amd64`. No Windows in v1.
+- License: MIT.
 
-## Build / test / verify
+## Commands
 
 ```bash
-make build          # CGO_ENABLED=0, -tags=netgo,osusergo, ldflags-injected version
+make build          # CGO_ENABLED=0, -tags=netgo,osusergo
 make test           # go test ./... -race -count=1
-make lint           # go vet + gofmt -l (must be empty)
+make lint           # go vet ./... plus gofmt check
+make fmt            # gofmt -w .
+make tidy           # go mod tidy
 ./bin/acd version
 
-# Integration tests (build-tagged)
 go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 ```
 
-## Pre-merge verification (mandatory)
-
-Before declaring work done, before pushing the final commit on a branch, and before opening a PR for review, run the full suite locally with the race detector:
+Mandatory before claiming done, pushing final branch work, or opening PR:
 
 ```bash
 make lint
-make test                                                                                                       # ./... -race -count=1
+make test
 go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal/pause/... ./internal/cli/... -race -count=3 -timeout 10m
 ```
 
-Why: Ubuntu CI has caught real races and ordering bugs that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out. The `race-stress` lane in `.github/workflows/ci.yml` runs the broader `-count=3` set on every PR.
-
-When CI fails on a previously-green branch:
-
-1. Re-read failing test name + file:line from the log.
-2. `WARNING: DATA RACE` or `panic: ... nil pointer` → real bug; fix root cause; do not retry.
-3. Timing-sensitive `internal/daemon` failure → reproduce locally with `-count=10` (and `GOMAXPROCS=1 -count=50` to expose ordering hazards). Only retry CI if you cannot reproduce after both.
-4. Cross-check macOS-only assumptions: fsnotify event ordering, process exec timing, `/tmp` semantics differ on Linux.
-
-Common Linux-only failure modes seen on this codebase:
-
-- **Test-design race against boot iteration.** Test stages multiple HEAD transitions but the daemon's boot iteration may observe phase 1 *or* phase 2 depending on scheduler. Fix: `waitForMetaValue(MetaKeyBranchHead, <expected>, 3s)` between phases so each phase is observed deterministically before moving on. Pattern in `TestRun_PostFlushBranchTokenReCheck`.
-- **Real ordering bug masked by macOS scheduling.** Daemon iteration finishes before the test mutates state on macOS, hiding a missing meta-clear. On Linux the iteration races and exposes it. Don't relax the assertion — fix the production path. Example: Diverged-attached-from-detached must clear `MetaKeyDetachedHeadPaused` and `MetaKeyReplayPausedUntil` (`internal/daemon/daemon.go` Diverged branch); otherwise the dedicated reattach branch is bypassed forever once `cctx.BranchRef` is set.
-
-## Refresh local install
+Install current local build:
 
 ```bash
 make build && install -m 0755 ./bin/acd ~/.local/bin/acd
 ```
 
-Required after any `templates/*` edit (templates baked at build time via `templates/embed.go`).
+Required after `templates/*` edits because snippets are embedded by `templates/embed.go`.
 
-## Conventions
-
-- **Stub format**: `package <name>` + `// TODO(phase N): <intent>`. Stubs must compile.
-- **Markdown nested code**: README + adapter docs use `~~~` fences when nesting code blocks.
-- **Embed**: `templates/embed.go` is the single embed point. Extend its `//go:embed` line for new harnesses.
-- **Test fixtures must pin branch name**: after `git.Init` (or `git init`), call `git symbolic-ref HEAD refs/heads/main`. CI runners default to `master`.
-
-## Architecture invariants
-
-- **`shadow_paths` is keyed by `(branch_ref, branch_generation)`.** Whenever the generation bumps (Diverged transition) or branch ref changes, you MUST reseed via `BootstrapShadow(ctx, repoDir, db, cctx)` or the next capture pass classifies every tracked file as a phantom `create`. Idempotency is gated by a `daemon_meta` completion marker — `IsShadowBootstrapped` checks the per-(branch, generation) key formatted by `ShadowBootstrappedKey` (prefix `MetaKeyShadowBootstrappedPrefix = "shadow.bootstrapped:"`). The previous COUNT(*) gate was unsafe under partial bootstrap failure and has been removed. Successful reseeds prune old generations via `ACD_SHADOW_RETENTION_GENERATIONS` (default `1` prior generation).
-- **Shadow bootstrap is chunked, transactional, and self-cleaning.** `BootstrapShadow` walks `HEAD` and feeds rows to `state.AppendShadowBatch` in 5000-row chunks (`bootstrapShadowChunkSize` in `internal/daemon/bootstrap.go`); each chunk is its own transaction. The completion marker is written ONLY after every chunk has committed; on any failure the partially-inserted rows for `(branch_ref, generation)` are deleted before returning the error so the next pass re-walks from a clean slate.
-- **Branch-generation token**: format `rev:<sha> <branch-ref>` for an attached HEAD, `rev:<sha>` for detached HEAD, and `missing <branch-ref>` when an attached ref has no commit. Fast-forward (newHead descends from prevHead on the same branch ref) keeps generation; Diverged (reset/rebase/branch-switch/same-SHA ref switch) bumps it. Persisted in `daemon_meta` as `branch.generation` + `branch.head` + `branch_token`.
-- **Legacy branch tokens without a ref name force Diverged on upgrade.** A persisted `rev:<sha>` or bare `missing` token followed by an attached `rev:<sha> <branch-ref>` or `missing <branch-ref>` is treated as Diverged even when the SHA is unchanged. This intentionally reseeds shadow state and avoids replaying stale queued rows onto a newly identified branch.
-- **Detached HEAD pauses capture/replay.** `acd start` refuses to register on detached HEAD; the daemon stores `detached_head_paused` and leaves `CaptureContext.BranchRef` empty until reattached. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
-- **Git operations pause capture/replay.** `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, and `BISECT_LOG` in the git dir set `operation_in_progress`; the daemon skips branch-token, capture, and replay work until the marker clears.
-- **Replay uses an isolated per-pass scratch index** (`<gitDir>/acd/replay-*.index`) seeded from `cctx.BaseHead`. Helper: `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)`. Never inspect the live repo index for queued history.
-- **Idempotent publish handles parallel committers before blocking.** When the scratch-index before-state probe would otherwise produce `blocked_conflict`, replay checks the current `HEAD` tree for every op's desired final state. If `HEAD` already has the captured blob/mode, or the path is already absent for delete/rename cleanup, the event is marked `published` with `commit_oid=HEAD` and no new commit is created. This only narrows the before-state mismatch path; real mismatches still become terminal `blocked_conflict` rows.
-- **Replay CAS targets literal `HEAD`.** The replay path calls `git update-ref HEAD <new> <old>` through `git.UpdateRef`; literal `HEAD` must dereference to the worktree's active branch, while named refs continue to use `--no-deref`. This keeps linked worktrees and same-SHA branch switches anchored to the current worktree.
-- **Replay pause gate checks manual marker before rewind grace.** `gitDir/acd/paused` is a durable JSON marker owned by `acd pause` and `acd resume`; the daemon reads it once per replay pass and never deletes it. Malformed markers fail open with a warning. If no active manual marker exists, replay checks `daemon_meta.replay.paused_until`; a future timestamp skips the drain, and an expired timestamp is cleared. Rewind grace defaults to 60 seconds and is controlled by `ACD_REWIND_GRACE_SECONDS` (`0` disables it).
-- **Same-branch rewinds pause BOTH capture and replay during the grace window.** When `newHead` is an ancestor of `prevHead` on the same branch ref, the daemon writes `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`. During the grace window, BOTH capture and replay are paused so a transient revert+re-edit dance does not race the operator — fsnotify fires as untracked files reappear and a post-grace replay drain would otherwise resurrect work the operator just rewound. The marker is auto-cleared on expiry; capture rows are NOT created while the gate is active. Scope: same-ref rewinds only. Ref-switch divergences go through Diverged + `DeletePendingForGeneration`. Same-SHA branch switches also go through Diverged. Detached-HEAD transitions use `MetaKeyDetachedHeadPaused`.
-- **`blocked_conflict` is terminal and forms a seq barrier.** Set via `state.MarkEventBlocked` (atomic update of `capture_events` + `publish_state`). Daemon never retries. `PendingEvents` hides later pending rows for the same `(branch_ref, branch_generation)` behind any earlier `blocked_conflict` or `failed` row, so downstream events do NOT leapfrog a broken predecessor across replay passes. Terminal rows older than retention are pruned only when they are no longer the active barrier.
-- **Diverged drops stale pending rows only.** On Diverged, delete `pending` capture events for the previous branch generation. Do not delete `blocked_conflict`, `failed`, or `published` rows; those remain operator-visible.
-- **Replay conflict metadata is structured.** `daemon_meta.last_replay_conflict` stores JSON with `ts`, `seq`, `error_class`, `expected_sha`, `actual_sha`, `ref`, `path`, and `message`. `last_replay_conflict_legacy` mirrors the old single-line string for backward-compatible tooling.
-- **AI diff text follows provider capability.** Network providers declare `NeedsDiff=true` and receive a redacted unified diff built from `before_oid` and `after_oid` blobs (`internal/daemon/message.go::BuildOpsDiff`). `DeterministicProvider` declares `NeedsDiff=false` and receives an empty `DiffText`. The byte cap is now enforced at the git layer via `git.DefaultDiffCap` (1 MiB) routed through `git.DiffBlobsLimited` / `git.CatFileBlobLimited`; `BuildOpsDiff` no longer post-trims after-the-fact. Each per-op diff is bounded by a 5s timeout so a single hung blob render cannot stall the message builder.
-- **Git read helpers are bounded.** `internal/git` exposes `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout = 30s`, and `DefaultWriteTimeout = 60s`. Diff/blob helpers (`DiffBlobs`, `CatFileBlob`, `DiffWorkingIndex`, and their `*Limited` variants) wire `DefaultReadTimeout` and `DefaultDiffCap` through `RunWithLimit`; on overflow callers receive the partial prefix paired with `ErrStdoutOverflow` so truncation is observable, not silent.
-- **`RevParse` propagates ambiguity.** Ambiguous refs surface as `git.ErrRefAmbiguous` (detected from git's stderr); callers must classify it separately from "missing ref" before treating a ref as resolved.
-- **State read pool exposes a read-only handle.** `state.DB.ReadSQL()` is the supported accessor for read-mostly queries (pending/op/state-counts/latest-seq, plus `daemon/shadow_io.go` shadow loads). Schema is at v4 with `idx_flush_requests_status_id` to keep `ClaimNextFlushRequest` constant-time under load. `state.AppendShadowBatch` is the chunked upsert helper used by `BootstrapShadow`.
-- **Replay update-ref retries jitter.** `replayUpdateRefBackoffs` is the fixed schedule; each delay is multiplied by `±25%` jitter via `math/rand/v2` (test seam in `internal/daemon`) so concurrent committers do not align on retry boundaries.
-- **Replay budgets every event.** Each replay event runs under a 60s timeout derived from the parent ctx; the timeout fires `MarkEventBlocked` rather than letting the event stall the run loop. Errors from `MarkEventBlocked` propagate so a failed terminal-state write surfaces instead of being swallowed.
-- **fsnotify dispatch never blocks on slow helpers.** Runtime-Create rewalks are off-loaded to a buffered `rewalkCh` consumed by `rewalkWorker`; `WatcherDiagnostics` deliveries flow through `diagCh` so `DiagnosticsFn` (which writes `daemon_meta`) cannot stall the dispatch goroutine. The watcher coalesces wakes with a leading-edge fire plus a trailing-edge timer clamped at `MaxDebounceTail = 500ms`. ENOSPC during registration is normalized to `errBudgetExceeded`, which routes through the same poll-mode fallback as a budget overshoot. `Stop` now takes `context.Context` and is bounded by the caller's deadline.
-- **`IgnoreChecker.Close` is non-blocking.** The cancel func is held in `atomic.Pointer[context.CancelFunc]` so `Close` can cancel a parked `killLocked` Wait without taking `c.mu`. `killLocked`'s `cmd.Wait` is bounded at 2s; daemon shutdown does not stall behind a hung subprocess.
-- **AI provider close is bounded.** `closeProviderOnce` waits at most `providerCloseTimeout = 5s` for the provider's `Close`. On timeout it falls through to `Process.Kill` via the `processExposer` interface (implemented by subprocess-backed closers). The daemon never blocks shutdown on a hung plugin.
-- **Log rotation gzips off-thread.** `logger/rotate.go` spawns gzip goroutines tracked by `gzipWG`; rotation does not hold `w.mu` while compressing. `Close` drains in-flight gzip work bounded by `gzipCloseWait = 5s` before returning, so writes never block on compression but shutdown still waits briefly for clean output.
-- **Trace logging is opt-in and best-effort.** `ACD_TRACE=1` writes JSONL decision records to `<gitDir>/acd/trace/` or `ACD_TRACE_DIR`. Trace writes never block or abort capture/replay.
-- **`walkLive` and `fsnotify_watcher.preWalk` both use BFS-by-layer ignore-prune.** Each directory layer is batch-classified via `IgnoreChecker.Check` with `ignoreCheckBatchSize=1000` paths per call before descending; ignored directories are pruned from the next frontier so subtrees like `build/`, `node_modules/`, `DerivedData/` are never readdir'd. The two paths are deliberately symmetric — divergence between them previously hid the v2026-05-01 P0 capture deadlock. Helper: `classifyIgnoredBatched` in `internal/daemon/capture.go`. The walker no longer prunes a top-level/worktree-rooted `acd/` directory: user repos are free to track files under their own `acd/` tree without losing capture. The daemon's own state still lives under `<gitDir>/acd/`, which is outside the worktree and therefore not visible to the walker.
-- **`IgnoreChecker.Check` stream-pumps stdin via a writer goroutine** before entering the read loop. Single `stdin.Write` of every path would deadlock against the macOS 16 KiB pipe buffer when the batch is large. On read error the subprocess is `killLocked` and `errCh` is drained; on read success deferred write errors surface via `errCh`. Do not refactor back to a synchronous write.
-
-## Daemon run-loop invariants
-
-- **`processBranchTokenChange` is called twice per Run iteration: once before Capture and once after the flush drain.** The post-flush re-check is load-bearing: the flush drain can iterate up to `DefaultFlushLimit` rows, and operator git surgery (`reset`/`rebase`/`checkout`) is NOT serialized through `wakeCh`, so HEAD can move during the drain. Without the re-check, Capture/Replay would run with a stale `BranchRef`/`BaseHead`/generation. Pinned by `TestRun_PostFlushBranchTokenReCheck`. Do NOT collapse back to a single call.
-- **Diverged-attached-from-detached must clear pause markers.** When `tokenBranchRef(oldToken) == ""` and the new token is attached, the Diverged branch in the run loop must `MetaDelete(MetaKeyDetachedHeadPaused)` and `clearRewindGraceMeta`. Otherwise the dedicated reattach branch (which fires only when `cctx.BranchRef == ""`) is bypassed forever once the Diverged path sets `cctx.BranchRef`.
-- **Replay budget is bounded.** `DefaultReplayLimit = 64`; `Replay` queries `Limit+1` rows, trims the extra, and sets `ReplaySummary.HasMore` to cue the next-iteration decision (immediate re-wake vs. natural tick). The run loop wires `ReplayLimit: DefaultReplayLimit` on every call.
-- **Flush drain is bounded AND shutdown-aware.** `DefaultFlushLimit = 256`; the run loop resolves `flushLimit` from `opts.FlushLimit` falling back to the default. The inner drain loop checks BOTH `ctx.Err()` AND a non-blocking `select` on `shutdownCh` at the top of every iteration. Some callers run the daemon with a non-cancelable `context.Background` and rely on `shutdownCh` for signal delivery; without the explicit `shutdownCh` arm a worst-case drain (256 rows × ~30ms claim) would burn ~7.5s before the loop noticed the signal. SIGTERM mid-drain now exits within ~tens of ms.
-- **`gitOperationInProgress` fails open on non-ErrNotExist stat errors.** `os.Stat` returning EACCES/EIO/etc. on `MERGE_HEAD`/`rebase-merge`/`CHERRY_PICK_HEAD`/`BISECT_LOG` is logged and treated as marker absent for the current tick. The previous "stat err → paused" behavior latched the daemon into permanent pause when the git dir had transient permission issues; only the reverse "marker absent" branch could clear the gate, and it never ran.
-- **Per-tick metadata writes batch through `state.MetaSetMany`.** Branch-token transitions, fsnotify diagnostics, and operation-marker upserts all flow through a single transaction per call. Reduces SQLite write amplification and keeps `daemon_meta` reads consistent within a tick.
-- **`MetaKeyBranchHead` per-tick MetaSet is value-guarded.** A closure-scoped `lastStampedBranchHead` (seeded from `persistedHead`) skips the keep-alive write when `liveHead == lastStampedBranchHead`. Idle daemons do not churn the meta table every tick.
-- **Fingerprint-warn LRU is bounded.** The unresolved-fingerprint warn map is capped at 1024 entries; on overflow 256 oldest entries are evicted in one pass. Prevents a runaway log producer from leaking unbounded memory under sustained churn.
-- **Capture/replay/opMarker warn limiters are NTP-safe.** All time-clamp comparisons handle backward NTP steps without dropping warnings or marking markers stale; `ClampRewindGraceAtStartup` (`internal/daemon/branch_token.go`) similarly clamps a future `replay.paused_until` value at boot before it can wedge the daemon. Replay's `shouldEmitPauseWarn` throttles redundant pause warnings to one-per-key-per-interval.
-- **Startup orphan-acked sweep.** `sweepOrphanAckedFlushRequests` runs once at boot and marks `acknowledged` rows older than `OrphanFlushAckThreshold = 5 * time.Minute` as `failed`, so a crashed worker does not leave forever-stuck rows.
-- **`daemonPauseState` fails open on non-regular markers but CLOSED on SQLite read errors.** `pause.Read` returning `ErrMalformed` *or* `ErrNonRegularSource` (FIFO/socket/dir/symlink at `<gitDir>/acd/paused`) logs a warning and treats the marker as absent — stale FIFOs do not wedge replay. A `daemon_meta.replay.paused_until` SQLite read error fails CLOSED for that tick: the run loop skips capture and replay and waits for the next tick to re-read. Disk-marker malformed/non-regular still fails open.
-
-## Known issues / flaky tests
-
-- **Timing-sensitive in `internal/daemon` under broad package runs**: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` verification when diagnosing unrelated lanes, then run the full suite before merge. May be partially resolved by the v2026-05-02 hardening branch (leading-edge fsnotify wake + `MaxDebounceTail` clamp); re-evaluate post-merge before pruning entries from this list.
-- **Multi-phase HEAD-transition tests must phase deterministically.** When a test stages two HEAD movements and asserts a transition was classified, insert `waitForMetaValue(MetaKeyBranchHead, <phase1HeadSha>, 3s)` between the phases so the daemon's boot iteration cannot race past phase 1 unobserved. Stabilization pattern applied to `TestRun_PostFlushBranchTokenReCheck` (commit `ab52b32`); skipping it produces 3-of-50 Linux flakes under `GOMAXPROCS=1 -count=50`.
-
-## Gotchas
-
-- **`modernc.org/sqlite`** drives the DB without cgo. Pinned at `v1.36.0` to keep the `go 1.22` directive (newer sqlite needs go ≥ 1.23). Platform breakage = STOP and surface options to the user; do not bump go or sqlite without explicit approval.
-- **`isSQLiteLocked` matches typed errors first.** `internal/state/db.go` imports `modernc.org/sqlite` as a named package and unwraps to `*sqlite.Error`, comparing the typed code before falling back to substring matching on the message. Do not regress to substring-only matching — sqlite localizes some message strings.
-- **Symlinks**: always captured as mode `120000`. Never descend into symlinked directories. Fixture: `TestCapture_SymlinkToDirAsMode120000`.
-- **Sensitive globs**: empty `ACD_SENSITIVE_GLOBS` falls back to defaults. Never let a typo open the gate.
-- **Sensitive directory pruning**: fsnotify prunes only literal sensitive directory names. Wildcard file patterns like `credentials*` are applied at file granularity so ordinary directories such as `credentials_repo` are still watched.
-- **`ACD_AI_DIFF_EGRESS` payloads are bounded at the git layer.** `BuildOpsDiff` calls `git.DiffBlobsLimited` with `git.DefaultDiffCap` per op; oversize diffs return `ErrStdoutOverflow` and surface a truncated prefix instead of being silently dropped. There is no longer a post-render trim step in `BuildOpsDiff`.
-- **`ps` is invoked via absolute path.** `internal/identity/ps_darwin.go` pins `/bin/ps` and `internal/identity/ps_linux.go` pins `/usr/bin/ps`; do not refactor these to a `PATH` lookup. A forged `ps` on `$PATH` would otherwise spoof process fingerprints.
-
-## Harness adapter gotchas
-
-- **Codex hooks** (`templates/codex/config.snippet.toml`) need 3-level schema: `[features] codex_hooks = true`, then `[[hooks.<EventName>]]` wrapping `[[hooks.<EventName>.hooks]]` (handler with `type = "command"` + `command`). Flat `[[hooks]]` arrays do NOT work.
-- **Codex hook stdout must be valid JSON.** Snippet redirects `acd` output to `/dev/null` and emits `printf "{}\n"`.
-- **No `Stop` hook in the Codex snippet** — races the replay drain. Cleanup via `watch_pid` death + refcount sweep instead.
-- **Codex auto-loads both `~/.codex/hooks.json` and `~/.codex/config.toml`.** Delete the old hooks.json after installing the toml snippet.
-- **Hook JSON extraction**: templates use `acd hook-stdin-extract <field>` instead of `jq`; keep that helper registered in `internal/cli/root.go` and covered by AdapterE2E.
-- **Adapter package is real code.** `internal/adapter` detects installed harness config files and markers for `acd init` auto-detect and `acd doctor`; do not restore the old TODO-only stubs.
-
-## Recovery / cleanup
+Release smoke:
 
 ```bash
-# Inspect the current anchor, blocked histogram, and recent blockers
-acd diagnose --repo .
-acd diagnose --repo . --json
-
-# Inspect event states
-sqlite3 .git/acd/state.db "SELECT state, COUNT(*) FROM capture_events GROUP BY state;"
-
-# Inspect blocked events with reasons
-sqlite3 .git/acd/state.db "SELECT seq, operation, path, substr(error,1,100) FROM capture_events WHERE state='blocked_conflict' ORDER BY seq DESC LIMIT 20;"
-
-# Pause replay while doing manual branch surgery, then resume explicitly
-acd pause --repo . --reason "manual reset" --yes
-acd resume --repo . --yes
-
-# Drop blocked rows (terminal, safe to delete)
-sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"
+git tag v2026-MM-DD && git push origin v2026-MM-DD && gh run watch
+gh release edit v2026-MM-DD --prerelease=false --latest
+ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 ```
 
-### Incident recovery cookbook
+## Project map
 
-Use the built-in recovery flow before editing SQLite by hand:
+| Path | Purpose |
+|---|---|
+| `cmd/acd/main.go` | CLI entrypoint. |
+| `internal/cli` | Cobra commands: start/stop/status/diagnose/recover/init/hooks/etc. |
+| `internal/daemon` | Run loop, capture/replay, fsnotify, branch tokens, shadow bootstrap, recovery repair. |
+| `internal/git` | Bounded git helpers, refs, trees, diff/blob reads, live index reconciliation, ignore checker. |
+| `internal/state` | SQLite schema/migrations, events, shadow paths, daemon meta, clients, flush requests. |
+| `internal/ai` | Deterministic, OpenAI-compatible, and subprocess providers. |
+| `internal/adapter` | Harness detection for `acd init` and `acd doctor`. |
+| `internal/central` | Registry and rollup stats DB. |
+| `internal/pause` | Durable pause marker under `<gitDir>/acd/paused`. |
+| `internal/trace` | Best-effort JSONL trace writer. |
+| `templates/*` | Installed harness snippets. Update `templates/embed.go` for new files. |
+| `test/integration` | Build-tagged lifecycle, adapter, recovery, ignored-tree, fallback tests. |
+| `docs/*` | User-facing architecture and provider docs. |
+
+Go is pinned to `go 1.22`. `modernc.org/sqlite` is pinned at `v1.36.0`; do not bump Go or sqlite for platform issues without explicit approval.
+
+## Workflows and conventions
+
+- Keep changes scoped. This repo has many timing-sensitive daemon tests.
+- Test fixtures must pin branch names after `git.Init` or `git init`:
+  `git symbolic-ref HEAD refs/heads/main`. CI defaults can be `master`.
+- Stub format: `package <name>` plus `// TODO(phase N): <intent>`. Stubs must compile.
+- README and adapter docs use `~~~` when nesting fenced code.
+- Prefer `rg` over `grep`; some old comments say grep but repo practice is `rg`.
+- Never inspect the live repo index when replaying queued events. Replay uses scratch indexes only.
+- If CI fails with `WARNING: DATA RACE`, panic, nil pointer, or ordering failure, assume real bug until proved otherwise. Do not retry first.
+- For timing-sensitive `internal/daemon` failures, reproduce with `-count=10`; also try `GOMAXPROCS=1 -count=50` for ordering hazards.
+- Multi-phase HEAD-transition tests must wait for phase observation, usually `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
+
+Known timing-sensitive tests under broad runs: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` while diagnosing, then run the full mandatory suite.
+
+## Core data model
+
+- SQLite state lives under `<gitDir>/acd/state.db`; central registry/stats are under user state/share paths.
+- Schema is v4. `idx_flush_requests_status_id` keeps `ClaimNextFlushRequest` constant-time.
+- `shadow_paths` is keyed by `(branch_ref, branch_generation, path)`.
+- Shadow bootstrap is chunked in 5000-row transactions via `state.AppendShadowBatch`.
+- Bootstrap idempotency is `daemon_meta` marker `shadow.bootstrapped:<branch_ref>:<generation>` from `ShadowBootstrappedKey`.
+- Completion marker is written only after all chunks commit. On failure, partial rows for the branch/generation are deleted.
+- Successful reseed prunes old generations using `ACD_SHADOW_RETENTION_GENERATIONS` (default `1` prior generation).
+- If a bootstrap marker exists but `shadow_paths` is empty for the active branch/generation, delete that marker to force a clean re-bootstrap.
+- `state.DB.ReadSQL()` is the supported read-only handle for read-heavy queries and shadow loads.
+
+## Branch and pause invariants
+
+- Branch token formats:
+  - attached: `rev:<sha> <branch-ref>`
+  - detached: `rev:<sha>`
+  - missing attached ref: `missing <branch-ref>`
+- Fast-forward on same branch keeps generation. Diverged resets/rebases/branch-switches/same-SHA ref switches bump generation.
+- Legacy tokens without a branch ref force Diverged when upgraded to an attached token, even if SHA is unchanged.
+- Detached HEAD pauses capture/replay. `acd start` refuses detached HEAD. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
+- Git operation markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`.
+- `gitOperationInProgress` fails open on non-`ErrNotExist` stat errors; log and treat marker absent.
+- Same-branch rewinds write `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; both capture and replay pause during grace. `0` disables grace.
+- Manual replay pause marker is `<gitDir>/acd/paused`. Manual marker wins over rewind grace. Malformed/non-regular disk marker fails open with warning.
+- SQLite read errors in `daemonPauseState` fail closed for that tick.
+- Diverged drops stale `pending` rows for the previous generation only. Keep `published`, `failed`, and `blocked_conflict`.
+- Diverged-attached-from-detached must clear `MetaKeyDetachedHeadPaused` and rewind grace metadata.
+
+## Capture invariants
+
+- Capture compares live worktree to `shadow_paths`; stale or missing bootstrap can classify tracked files as phantom creates.
+- `walkLive` uses BFS by directory layer, batches ignore checks with `ignoreCheckBatchSize=1000`, and prunes ignored directories before readdir.
+- `fsnotify_watcher.preWalk` must mirror `walkLive` ignore-prune behavior.
+- Do not prune a worktree-rooted `acd/`; daemon state is under `.git/acd`, outside the worktree.
+- Symlinks are captured as mode `120000`. Never descend into symlinked directories.
+- Sensitive globs: empty `ACD_SENSITIVE_GLOBS` falls back to defaults. Never let typo/misconfig open the gate.
+- Sensitive directory pruning only uses literal sensitive directory names. Wildcard patterns such as `credentials*` apply at file granularity.
+- `IgnoreChecker.Check` uses long-lived `git check-ignore --stdin -z --non-matching --verbose`.
+- `IgnoreChecker.Check` must stream stdin from a writer goroutine while reading stdout. A single large `stdin.Write` deadlocks on macOS 16 KiB pipes.
+- `IgnoreChecker.Close` is non-blocking: atomic cancel, `killLocked`, bounded `cmd.Wait` at 2s.
+- `git check-ignore --stdin` does not reload `.gitignore` during a session. Keep `IgnoreChecker.Invalidate` behavior:
+  - run loop invalidates before each capture pass,
+  - fsnotify invalidates on worktree `.gitignore` events.
+  Regression: stale checker committed ignored `node_modules/` and `dist/` in a live test. Tests: `TestIgnoreCheckerInvalidateReloadsGitignore`, `TestHandleEventInvalidatesIgnoreCheckerOnGitignoreChange`.
+
+## Replay invariants
+
+- Replay uses isolated per-pass scratch index `<gitDir>/acd/replay-*.index` seeded from `cctx.BaseHead`.
+- Use `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)` for scratch-index reads.
+- Replay CAS targets literal `HEAD` via `git.UpdateRef`; named refs still use `--no-deref`.
+- `DefaultReplayLimit = 64`; query `Limit+1`, trim, set `ReplaySummary.HasMore`.
+- Every replay event has a 60s budget. Timeout marks event blocked, and `MarkEventBlocked` errors propagate.
+- `blocked_conflict` is terminal and a seq barrier. `PendingEvents` hides later pending rows behind prior `blocked_conflict` or `failed` rows for the branch/generation.
+- Idempotent publish checks current `HEAD` before blocking on before-state mismatch. If `HEAD` already has desired final blob/mode or absence, mark published with `commit_oid=HEAD`.
+- Replay conflict metadata is JSON in `daemon_meta.last_replay_conflict`; legacy string mirror is `last_replay_conflict_legacy`.
+- Live-index reconciliation after publish is guarded and path-scoped. Do not overwrite user-staged changes. Related files: `internal/git/tree.go`, `internal/daemon/replay.go`, `internal/daemon/live_index_repair.go`.
+- Startup/recover repair handles old published events whose live index stayed stale. Doctor may report repair candidates.
+- `replay.live_index` traces are success records unless decision is failed/blocked; successful `applied` must keep `error` empty.
+- `replayUpdateRefBackoffs` uses `math/rand/v2` jitter +-25% to avoid aligned concurrent retries.
+
+## Run-loop invariants
+
+- `processBranchTokenChange` runs twice per iteration: before capture and after flush drain. Do not collapse to one call.
+- Post-flush re-check is load-bearing because operator git surgery is not serialized through `wakeCh`.
+- Flush drain is bounded by `DefaultFlushLimit = 256` and must check both `ctx.Err()` and `shutdownCh` each iteration.
+- Per-tick metadata writes batch through `state.MetaSetMany`.
+- `MetaKeyBranchHead` keep-alive is value-guarded by closure-scoped `lastStampedBranchHead`.
+- Startup runs `sweepOrphanAckedFlushRequests`: `acknowledged` rows older than `OrphanFlushAckThreshold = 5m` become `failed`.
+- Fingerprint warn LRU is capped at 1024 entries, evicting 256 oldest on overflow.
+- Warn limiters and `ClampRewindGraceAtStartup` must handle backward NTP steps.
+- fsnotify dispatch must not block on slow helpers:
+  - runtime creates go through buffered `rewalkCh` and `rewalkWorker`,
+  - diagnostics go through `diagCh`,
+  - wake coalescing uses leading-edge fire plus trailing timer clamped at `MaxDebounceTail = 500ms`,
+  - ENOSPC normalizes to `errBudgetExceeded`,
+  - `Stop(context.Context)` is bounded.
+
+## Git and diff helpers
+
+- `internal/git` exposes `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`.
+- Diff/blob helpers route `DefaultReadTimeout` and `git.DefaultDiffCap` (1 MiB) through `RunWithLimit`.
+- On overflow, return partial prefix plus `ErrStdoutOverflow`; truncation must be observable.
+- `RevParse` surfaces ambiguous refs as `git.ErrRefAmbiguous`; classify separately from missing ref.
+- `ps` path is pinned: `/bin/ps` on Darwin, `/usr/bin/ps` on Linux. Do not use `$PATH`.
+- `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
+
+## AI and messages
+
+- Providers declare capability with `NeedsDiff`.
+- Network providers get redacted unified diffs when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` is truthy.
+- `DeterministicProvider` uses `NeedsDiff=false` and gets empty `DiffText`.
+- `BuildOpsDiff` uses git-layer caps through `git.DiffBlobsLimited` / `git.CatFileBlobLimited`; no post-render trim.
+- Per-op diff render has 5s timeout.
+- `ACD_AI_SEND_DIFF` was removed; setting it emits one startup deprecation warning.
+- Message quality can be weak for generic modify events, e.g. `Update PopupApp.tsx`; treat as low-priority message-quality issue unless replay/state is wrong.
+
+## Trace and diagnostics
+
+- `ACD_TRACE=1` writes JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`.
+- `ACD_TRACE_DIR` overrides trace dir. Trace writes are best-effort and must never block/abort work.
+- Known event classes include:
+  - `bootstrap_shadow.reseed`
+  - `capture.classify`
+  - `capture.event`
+  - `capture.pause`
+  - `replay.commit`
+  - `replay.conflict`
+  - `replay.failed`
+  - `replay.update_ref`
+  - `replay.live_index`
+  - `replay.pause`
+  - `branch_token.transition`
+  - `daemon.pause`
+- Use `rg -n "EventClass:" internal/` or direct trace helpers to verify additions.
+
+Useful live checks:
 
 ```bash
-# 1. Confirm the current anchor and blocker shape
+acd status --repo .
 acd diagnose --repo . --json
+sqlite3 .git/acd/state.db "SELECT state, COUNT(*) FROM capture_events GROUP BY state;"
+sqlite3 .git/acd/state.db "SELECT seq, operation, path, substr(error,1,100) FROM capture_events WHERE state='blocked_conflict' ORDER BY seq DESC LIMIT 20;"
+sqlite3 .git/acd/state.db "SELECT COUNT(*) FROM capture_events WHERE path LIKE 'node_modules/%' OR path LIKE 'dist/%' OR path LIKE '.trekoon/%';"
+git status --short --ignored
+```
 
-# 2. Preview the recovery plan; this must not mutate state.db
+## Recovery
+
+Prefer built-in recovery before hand-editing SQLite:
+
+```bash
+acd diagnose --repo . --json
 acd recover --repo . --auto --dry-run --json
-
-# 3. Apply only after reading the plan. A byte-for-byte backup is created as
-#    .git/acd/state.db.recover-<timestamp>.
 acd recover --repo . --auto --yes
-
-# 4. Wake the daemon and inspect the queue
 acd wake --repo . --session-id <session>
 acd status --repo .
 ```
 
-The original 145-event incident pattern is: `daemon_state.branch_ref` and queued `capture_events.branch_ref` point at a stale branch, while `git symbolic-ref HEAD` points at the active branch. `acd recover` retargets pending/blocked rows to the current attached branch and generation, resets `blocked_conflict` rows to `pending`, clears stale replay/pause metadata, and refuses to run while the daemon PID is alive. `acd recover --auto` now also clears `daemon_meta.replay.paused_until` and removes the on-disk manual pause marker. Run `acd resume --yes` instead when you only need to lift a manual pause without triggering the full recover flow.
+`acd recover --auto` refuses to run while daemon PID is alive, creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows to current attached branch/generation, resets blocked rows to pending, clears stale replay/pause metadata, and removes the on-disk manual pause marker. Use `acd resume --yes` when only lifting a manual pause.
 
-Schema is at v4. The v3→v4 migration adds `idx_flush_requests_status_id` so `ClaimNextFlushRequest` stays constant-time as `flush_requests` grows. Shadow-bootstrap idempotency is keyed by `daemon_meta` markers under the `shadow.bootstrapped:` prefix (`SELECT key FROM daemon_meta WHERE key LIKE 'shadow.bootstrapped:%'` to inspect). If a marker exists for the active `(branch_ref, generation)` but `shadow_paths` is empty for it, delete the marker by hand to force a re-bootstrap; the chunked bootstrap path will rewrite both atomically.
+Manual cleanup snippets:
+
+```bash
+acd pause --repo . --reason "manual reset" --yes
+acd resume --repo . --yes
+sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"
+```
+
+## Harness adapter gotchas
+
+- Codex template: `templates/codex/config.snippet.toml`.
+- Codex hooks require `[features] codex_hooks = true`, then `[[hooks.<EventName>]]`, then nested `[[hooks.<EventName>.hooks]]`.
+- Flat `[[hooks]]` arrays do not work.
+- Codex hook stdout must be valid JSON. Snippet redirects `acd` output to `/dev/null` and emits `printf "{}\n"`.
+- No `Stop` hook in Codex snippet; it races replay drain. Cleanup uses `watch_pid` death plus refcount sweep.
+- Codex can auto-load both `~/.codex/hooks.json` and `~/.codex/config.toml`; delete old `hooks.json` after installing toml snippet.
+- Templates use `acd hook-stdin-extract <field>` instead of `jq`; keep helper in `internal/cli/root.go` and AdapterE2E coverage.
+- `internal/adapter` is real code for harness config and marker detection; do not restore old TODO stubs.
 
 ## Environment knobs
 
 | Variable | Default | Effect |
 |---|---:|---|
-| `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable JSONL trace logging. |
-| `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides the trace output directory. |
-| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
+| `ACD_TRACE` | unset | `1`/`true`/`yes` enables trace JSONL. |
+| `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Trace output override. |
+| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
-| `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after same-branch rewind detection. `0` disables the grace. |
-| `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. |
+| `ACD_REWIND_GRACE_SECONDS` | `60` | Same-branch rewind pause seconds; `0` disables. |
+| `ACD_AI_DIFF_EGRESS` | unset | Opts in to sending reconstructed diffs to network AI providers. |
 
-Diff-egress migration: `ACD_AI_SEND_DIFF` was removed. Setting it now emits a one-shot deprecation warn-log at daemon startup. See `docs/ai-providers.md` for the full opt-in semantics — the canonical source of truth for AI payload behavior.
+## Release notes
 
-### Trace log format
-
-Trace files rotate daily as `YYYY-MM-DD.jsonl`. Every line is JSON:
-
-```json
-{"ts":"2026-04-29T12:34:56.000000789Z","repo":"/repo/acd","branch_ref":"refs/heads/main","head_sha":"dddddddddddddddddddddddddddddddddddddddd","event_class":"replay.commit","decision":"published","reason":"event published","input":{"operation":"create","path":"file.txt"},"output":{"commit":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","parent":"dddddddddddddddddddddddddddddddddddddddd"},"error":"","seq":4,"generation":7}
-```
-
-Known `event_class` values (verify with `grep -rn "EventClass:" internal/`):
-
-| `event_class` | When emitted | Notable `input`/`output` fields |
-|---|---|---|
-| `bootstrap_shadow.reseed` | Shadow state reseeded after Diverged or at startup | out: `rows` |
-| `capture.classify` | Worktree vs. shadow diff computed | out: `ops`, `walked_files`, `oversize`, `errors` |
-| `capture.event` | Op written to `capture_events` (`appended`) or dropped at cap (`dropped`) | in: `op`, `path`, `fidelity`; out: `seq` or `pending_depth`/`cap` |
-| `capture.pause` | Capture skipped because replay is paused | out: `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
-| `replay.commit` | Event published as a commit or idempotent HEAD match | in: `operation`, `path`; out: `commit`, `parent` |
-| `replay.conflict` | Event becomes `blocked_conflict` | in: `operation`, `path`; out: `expected_sha`, `actual_sha`, `ref` |
-| `replay.failed` | Event becomes `failed` (bad ops, ancestry, write-tree) | in: `operation`, `path` |
-| `replay.update_ref` | Each `git update-ref` attempt (one record per retry) | out: `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha` |
-| `replay.pause` | Replay drain skipped because paused | out: `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
-| `branch_token.transition` | HEAD movement classified (startup or per-tick) | in: `previous`, `current`; out: `prev_generation`, `new_generation`, `dropped_pending` |
-| `daemon.pause` | Git operation marker detected (`paused`) or cleared (`resumed`) | in: `operation` |
-
-## Release one-liners
-
-```bash
-# Cut a new release
-git tag v2026-MM-DD && git push origin v2026-MM-DD && gh run watch
-
-# Fix a release auto-marked as pre-release
-gh release edit v2026-MM-DD --prerelease=false --latest
-
-# Smoke-test install.sh
-ACD_VERSION=v2026-MM-DD sh scripts/install.sh
-```
-
-`.goreleaser.yaml` hardcodes `prerelease: false` (date tags would otherwise be auto-pre-released and `releases/latest` would return nothing). Brew step gated behind `--skip=homebrew` until `HOMEBREW_TAP_TOKEN` PAT + tap repo exist.
+- `.goreleaser.yaml` hardcodes `prerelease: false`; date tags otherwise become pre-releases and `releases/latest` breaks.
+- Brew publishing is gated behind `--skip=homebrew` until `HOMEBREW_TAP_TOKEN` and tap repo exist.
