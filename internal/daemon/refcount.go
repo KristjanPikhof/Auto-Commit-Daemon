@@ -211,8 +211,8 @@ func FingerprintToken(fp identity.Fingerprint) string {
 // ≤fingerprintWarnCap unique pairs", which is tight enough that legitimate
 // alarm clusters under investigation are not flushed mid-analysis.
 const (
-	fingerprintWarnCap         = 1024
-	fingerprintWarnEvictBatch  = 256
+	fingerprintWarnCap        = 1024
+	fingerprintWarnEvictBatch = 256
 )
 
 // fingerprintWarnEntry records when a (session_id, pid) was first warned so
@@ -243,10 +243,13 @@ func logFingerprintUnresolved(sessionID string, pid int, err error) {
 }
 
 // sweepFingerprintWarnMap caps the dedup map at fingerprintWarnCap entries.
-// When over the cap, it evicts the fingerprintWarnEvictBatch oldest entries
-// by insertion timestamp. Called once per refcount sweep tick from the run
-// loop so growth is bounded by the sweep cadence. Returns the post-eviction
-// size so callers can surface map pressure if needed.
+// When over the cap, it evicts oldest entries (by insertion timestamp) until
+// the surviving set is at most fingerprintWarnCap - fingerprintWarnEvictBatch
+// — i.e. it always frees a full batch's worth of headroom rather than
+// trimming by a single batch from whatever the current size happens to be.
+// This keeps a single sweep deterministic (target = cap - batch) regardless
+// of how badly the map overflowed between ticks. Called once per refcount
+// sweep tick from the run loop so growth is bounded by the sweep cadence.
 //
 // Eviction is intentionally batch-based (rather than 1-at-a-time on insert)
 // so the common case (under-cap) costs only the size check; the O(n) sort
@@ -254,24 +257,31 @@ func logFingerprintUnresolved(sessionID string, pid int, err error) {
 func sweepFingerprintWarnMap() int {
 	unresolvedFingerprintMu.Lock()
 	defer unresolvedFingerprintMu.Unlock()
-	if len(unresolvedFingerprintWarnings) <= fingerprintWarnCap {
-		return len(unresolvedFingerprintWarnings)
+	cur := len(unresolvedFingerprintWarnings)
+	if cur <= fingerprintWarnCap {
+		return cur
 	}
-	// Collect (key, insertedAt) and partial-sort by age. We avoid pulling in
-	// container/heap by sorting once per overflow tick — fingerprintWarnCap
-	// is small (1024) and the slice cost is bounded.
+	// Collect (key, insertedAt) and sort by age. fingerprintWarnCap is small
+	// (1024) so the worst-case overflow slice is bounded by sweep cadence.
 	type kv struct {
 		key string
 		ts  time.Time
 	}
-	entries := make([]kv, 0, len(unresolvedFingerprintWarnings))
+	entries := make([]kv, 0, cur)
 	for k, v := range unresolvedFingerprintWarnings {
 		entries = append(entries, kv{key: k, ts: v.insertedAt})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].ts.Before(entries[j].ts)
 	})
-	evict := fingerprintWarnEvictBatch
+	// Evict oldest entries until size <= (cap - evictBatch). target floors
+	// at zero in case batch exceeds cap (defensive; not the configured
+	// shape).
+	target := fingerprintWarnCap - fingerprintWarnEvictBatch
+	if target < 0 {
+		target = 0
+	}
+	evict := cur - target
 	if evict > len(entries) {
 		evict = len(entries)
 	}
