@@ -272,7 +272,7 @@ func Run(ctx context.Context, opts Options) error {
 	defer closeProviderOnce()
 
 	if _, ok := os.LookupEnv("ACD_AI_SEND_DIFF"); ok {
-		logger.Warn("ACD_AI_SEND_DIFF is deprecated and ignored; diff egress is now controlled by ACD_AI_PROVIDER",
+		logger.Warn("ACD_AI_SEND_DIFF is deprecated and ignored; diff egress is now opt-in via ACD_AI_DIFF_EGRESS=1",
 			slog.String("env", "ACD_AI_SEND_DIFF"))
 	}
 
@@ -297,7 +297,21 @@ func Run(ctx context.Context, opts Options) error {
 		} else if opts.MessageProviderCloser != nil {
 			providerCloser = opts.MessageProviderCloser
 		}
-		msgFn = providerMessageFn(provider, opts.RepoPath)
+		// Diff egress is OFF by default. Network-bound providers receive
+		// only metadata (paths + op kinds + branch + timestamp) unless the
+		// operator explicitly opts in via ACD_AI_DIFF_EGRESS. Reason: the
+		// reconstructed unified diff carries source bytes; redaction is
+		// pattern-based and best-effort; an unset default that silently
+		// transmits diffs would be a privacy regression on upgrade. When
+		// the opt-in is missing for a provider that wants diffs, surface a
+		// one-shot warn so operators see what they need to set.
+		effectiveRepoRoot := opts.RepoPath
+		if ai.ProviderNeedsDiff(provider) && !diffEgressOptIn() {
+			effectiveRepoRoot = ""
+			logger.Warn("AI provider supports diff context but ACD_AI_DIFF_EGRESS=1 is not set; sending metadata only",
+				"provider", provider.Name())
+		}
+		msgFn = providerMessageFn(provider, effectiveRepoRoot)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
