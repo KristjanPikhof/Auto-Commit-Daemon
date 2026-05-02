@@ -237,6 +237,74 @@ func TestStart_DuplicateSession_NoRespawn(t *testing.T) {
 	}
 }
 
+func TestStart_ManualEmptySessionUsesDeterministicHumanSession(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, repoDir, "", "", 0, true); err != nil {
+		t.Fatalf("first runStart: %v", err)
+	}
+	var first startResult
+	if err := json.Unmarshal(stdout.Bytes(), &first); err != nil {
+		t.Fatalf("unmarshal first: %v\n%s", err, stdout.String())
+	}
+	if first.SessionID != humanStartSessionID(first.RepoHash) {
+		t.Fatalf("session_id=%q, want deterministic human session for repo hash %q", first.SessionID, first.RepoHash)
+	}
+	if first.Harness != "other" {
+		t.Fatalf("harness=%q, want other", first.Harness)
+	}
+	if !first.Started || first.Duplicate || first.ClientCount != 1 {
+		t.Fatalf("unexpected first start result: %+v", first)
+	}
+
+	stdout.Reset()
+	if err := runStart(ctx, &stdout, repoDir, "", "", 0, true); err != nil {
+		t.Fatalf("second runStart: %v", err)
+	}
+	var second startResult
+	if err := json.Unmarshal(stdout.Bytes(), &second); err != nil {
+		t.Fatalf("unmarshal second: %v\n%s", err, stdout.String())
+	}
+	if second.SessionID != first.SessionID {
+		t.Fatalf("second session_id=%q, want %q", second.SessionID, first.SessionID)
+	}
+	if second.Started || !second.Duplicate || second.ClientCount != 1 {
+		t.Fatalf("unexpected second start result: %+v", second)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count=%d, want 1", count.Load())
+	}
+
+	db := openStartDB(t, repoDir)
+	clients, err := state.ListClients(ctx, db)
+	if err != nil {
+		t.Fatalf("ListClients: %v", err)
+	}
+	if len(clients) != 1 {
+		t.Fatalf("clients=%d, want 1", len(clients))
+	}
+	if clients[0].SessionID != first.SessionID || clients[0].Harness != "other" {
+		t.Fatalf("client row mismatch: %+v", clients[0])
+	}
+}
+
+func TestStart_EmptySessionWithHarnessRequiresExplicitSession(t *testing.T) {
+	var stdout bytes.Buffer
+	err := runStart(context.Background(), &stdout, ".", "", "codex", 0, true)
+	if err == nil {
+		t.Fatalf("runStart succeeded without session_id for harness start")
+	}
+	if !strings.Contains(err.Error(), "--session-id is required when --harness is set") {
+		t.Fatalf("error %q does not explain explicit harness session requirement", err)
+	}
+}
+
 func TestStart_RegistryUpdated(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

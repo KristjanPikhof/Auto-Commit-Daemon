@@ -4,6 +4,11 @@
 
 ### Added
 
+- `acd start` now works without `--session-id` for manual current-repo use.
+  It registers a stable human client for the repo, so repeated manual starts
+  refresh the same row instead of creating a pile of stale clients.
+- `acd stop` now works without `--session-id` for manual current-repo use.
+  It stops the resolved repo daemon directly.
 - `acd list --watch` refreshes the daemon table until Ctrl-C.
 - `acd list --watch --interval <duration>` sets the refresh rate.
 - `acd logs` tails the current repo's daemon log as raw JSONL.
@@ -12,8 +17,12 @@
 
 ### Changed
 
+- `acd stop --session-id <id>` is now documented as the harness/refcount path:
+  it deregisters one client and stops the daemon only when no peers remain.
+- Harness templates keep passing explicit `--session-id`; the new no-flag
+  start/stop defaults are for humans at a terminal.
 - Updated README and troubleshooting docs with examples for watch mode and
-  log tailing.
+  log tailing, plus the simpler current-repo start/stop flow.
 
 ### Fixed
 

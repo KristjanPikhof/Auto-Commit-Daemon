@@ -36,6 +36,7 @@ acd init shell         # universal direnv / zshrc fallback
 Open your harness. Edit files. Commits land automatically.
 
 ~~~bash
+acd start               # start or refresh the current repo daemon
 acd list                # daemons running across all your repos
                         # columns: REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS
 acd list --watch        # refresh the repo table until Ctrl-C
@@ -53,9 +54,26 @@ acd pause --reason "resetting branch" --yes   # durable manual replay pause
 acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
 acd gc                  # prune stale central-registry entries
-acd stop --repo X       # graceful stop, refcount-aware
+acd stop                # graceful stop for the current repo daemon
+acd stop --session-id X # harness/refcount stop; exits only when no peers remain
 acd stop --all          # stop every daemon
 ~~~
+
+Use the no-flag lifecycle commands when you are driving ACD from a terminal.
+Manual `acd start` registers a stable human client for the current repo, so
+running it again refreshes the same client instead of creating a new session.
+Manual `acd stop` stops the current repo daemon directly.
+
+Harness integrations should keep passing `--session-id` (and usually
+`--harness`). That path is refcount-aware: `acd stop --session-id X` removes one
+client and stops the shared daemon only after the final harness client exits.
+
+| Situation | Command |
+|---|---|
+| Start or refresh ACD while working in a repo | `acd start` |
+| Stop the daemon for the repo you are in | `acd stop` |
+| Stop one harness session and respect peer sessions | `acd stop --session-id X` |
+| Stop every registered repo daemon | `acd stop --all` |
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
@@ -139,7 +157,7 @@ pending rows for replay.
 Enable local decision tracing when you need a replay/capture audit trail:
 
 ~~~bash
-ACD_TRACE=1 acd start --repo . --session-id debug --harness shell
+ACD_TRACE=1 acd start
 ACD_TRACE=1 ACD_TRACE_DIR=/tmp/acd-trace acd daemon run --repo .
 ~~~
 

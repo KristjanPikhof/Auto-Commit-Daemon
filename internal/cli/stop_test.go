@@ -78,6 +78,60 @@ func TestStop_DefaultDeferredWhenPeerAlive(t *testing.T) {
 	}
 }
 
+func TestStop_NoSessionStopsDaemonWithoutDeregisteringClients(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	for _, sid := range []string{"s1", "s2"} {
+		if err := state.RegisterClient(ctx, db, state.Client{
+			SessionID: sid, Harness: "claude-code",
+		}); err != nil {
+			t.Fatalf("register %s: %v", sid, err)
+		}
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: 1, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = db.Close()
+
+	count, restore := installStopSignal(t, repoDir)
+	defer restore()
+
+	prev := stopWaitTimeout
+	stopWaitTimeout = 1 * time.Second
+	defer func() { stopWaitTimeout = prev }()
+
+	var out bytes.Buffer
+	if err := runStop(ctx, &out, repoDir, "", false, false, true); err != nil {
+		t.Fatalf("runStop: %v", err)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("expected 1 SIGTERM, got %d", count.Load())
+	}
+	var got stopRepoResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Stopped || got.Deferred || got.SessionID != "" || got.Peers != 0 {
+		t.Fatalf("expected human no-session stop, got %+v", got)
+	}
+
+	reopened, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repoDir, ".git")))
+	if err != nil {
+		t.Fatalf("reopen state db: %v", err)
+	}
+	defer reopened.Close()
+	clients, err := state.CountClients(ctx, reopened)
+	if err != nil {
+		t.Fatalf("count clients: %v", err)
+	}
+	if clients != 2 {
+		t.Fatalf("clients after no-session stop = %d, want 2", clients)
+	}
+}
+
 func TestStop_DefaultLastSession_SIGTERM(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()

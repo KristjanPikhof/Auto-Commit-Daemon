@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"syscall"
@@ -57,7 +56,18 @@ var stopPollInterval = 100 * time.Millisecond
 func newStopCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stop",
-		Short: "Deregister a session; daemon exits when refcount hits zero",
+		Short: "Stop the current repo daemon or deregister a harness session",
+		Long: `Stop the daemon for the current repository by default.
+
+Precedence:
+  acd stop
+    Stop the resolved repo daemon without inspecting session refcounts.
+  acd stop --session-id SESSION
+    Deregister one harness session; stop only when no peers remain.
+  acd stop --force [--session-id SESSION]
+    Best-effort deregister SESSION when provided, then terminate the daemon and escalate if needed.
+  acd stop --all [--force]
+    Apply the same stop mode to every registered repo and keep stopped/deferred/failed buckets.`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			jsonOut, _ := c.Flags().GetBool("json")
@@ -67,7 +77,7 @@ func newStopCmd() *cobra.Command {
 			return runStop(c.Context(), c.OutOrStdout(), repoFlag, sessionID, force, all, jsonOut)
 		},
 	}
-	cmd.Flags().String("session-id", "", "Session identifier to deregister")
+	cmd.Flags().String("session-id", "", "Harness session identifier to deregister instead of human stop")
 	cmd.Flags().Bool("flush", false, "Drain pending events before stopping (with --force)")
 	cmd.Flags().Bool("force", false, "Skip refcount and SIGTERM the daemon")
 	cmd.Flags().Bool("all", false, "Stop every daemon in the central registry")
@@ -108,7 +118,7 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	for _, rec := range reg.Repos {
 		// Use the caller's force mode for each repo; without --force,
-		// the per-repo refcount-aware shutdown path applies.
+		// the default graceful stop path applies.
 		res, err := stopOneRepoForAll(ctx, rec.Path, "", force)
 		if err != nil {
 			res = stopRepoResult{Repo: rec.Path, Reason: err.Error()}
@@ -181,34 +191,33 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	}
 	res.DaemonPID = st.PID
 
-	// Refcount-aware default path: drop the caller's row first, then
-	// inspect remaining peers.
+	// Refcount-aware explicit-session path: drop the caller's row first,
+	// then inspect remaining peers.
 	if !force {
-		if sessionID == "" {
-			return res, errors.New("acd stop: --session-id is required (or pass --force)")
+		if sessionID != "" {
+			existed, err := state.DeregisterClient(ctx, db, sessionID)
+			if err != nil {
+				return res, fmt.Errorf("acd stop: deregister: %w", err)
+			}
+			if !existed {
+				res.UnknownSession = true
+			}
+			// Count remaining clients.
+			remaining, err := state.CountClients(ctx, db)
+			if err != nil {
+				return res, fmt.Errorf("acd stop: count clients: %w", err)
+			}
+			if remaining > 0 {
+				res.Deferred = true
+				res.Peers = remaining
+				res.Reason = fmt.Sprintf("%d peer(s) remain", remaining)
+				return res, nil
+			}
 		}
-		existed, err := state.DeregisterClient(ctx, db, sessionID)
-		if err != nil {
-			return res, fmt.Errorf("acd stop: deregister: %w", err)
-		}
-		if !existed {
-			res.UnknownSession = true
-		}
-		// Count remaining clients.
-		remaining, err := state.CountClients(ctx, db)
-		if err != nil {
-			return res, fmt.Errorf("acd stop: count clients: %w", err)
-		}
-		if remaining > 0 {
-			res.Deferred = true
-			res.Peers = remaining
-			res.Reason = fmt.Sprintf("%d peer(s) remain", remaining)
-			return res, nil
-		}
-		// No peers remain. Fall through to default-stop: SIGTERM the
-		// daemon. If it does not transition to mode=stopped within
-		// stopWaitTimeout, report deferred (run-loop's own GC will
-		// catch up).
+		// No session was supplied, or the explicit session was the last
+		// client. SIGTERM the daemon without escalating; if it does not
+		// transition to mode=stopped within stopWaitTimeout, report
+		// deferred so the caller can see that shutdown is still pending.
 		if st.PID > 0 && identity.Alive(st.PID) {
 			_ = signalProcess(st.PID, syscall.SIGTERM, daemonFingerprintToken(st))
 			if waitForStopped(ctx, db, stopWaitTimeout) {
