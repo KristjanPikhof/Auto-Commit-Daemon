@@ -929,8 +929,8 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 		// single check-ignore round-trip bounded; larger layers are sliced
 		// into successive Check calls.
 		if opts.ignoreChecker != nil && (len(nextDirs) > 0 || len(fileCands) > 0) {
-			totalLen := len(nextDirs) + len(fileCands)
-			paths := make([]string, 0, totalLen)
+			origDirCount := len(nextDirs)
+			paths := make([]string, 0, origDirCount+len(fileCands))
 			for _, e := range nextDirs {
 				paths = append(paths, e.rel)
 			}
@@ -945,39 +945,23 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				return nil, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
 			}
 
-			survivorsDirs := nextDirs[:0]
+			survivorDirs := make([]dirEntry, 0, len(nextDirs))
 			for i, e := range nextDirs {
 				if results[i] {
 					continue
 				}
-				survivorsDirs = append(survivorsDirs, e)
+				survivorDirs = append(survivorDirs, e)
 			}
-			nextDirs = survivorsDirs
+			nextDirs = survivorDirs
 
-			survivorsFiles := fileCands[:0]
-			for j, c := range fileCands {
-				if results[len(nextDirs)+j] {
-					// Note: nextDirs has already been pruned above, but the
-					// `results` slice still indexes the ORIGINAL ordering
-					// (dirs first, then files). We can't use len(nextDirs)
-					// here — recompute the file's original index against
-					// the pre-prune dir count.
-					_ = c
-				}
-			}
-			// Recompute survivors against the pre-prune indices (the prune
-			// loop above mutated nextDirs in place via slice aliasing, so
-			// we cannot index back into the original layer). Instead, we
-			// iterate `results` from the original split point.
-			origDirCount := len(paths) - len(fileCands)
-			survivorsFiles = fileCands[:0]
+			survivorFiles := make([]candidate, 0, len(fileCands))
 			for j, c := range fileCands {
 				if results[origDirCount+j] {
 					continue
 				}
-				survivorsFiles = append(survivorsFiles, c)
+				survivorFiles = append(survivorFiles, c)
 			}
-			fileCands = survivorsFiles
+			fileCands = survivorFiles
 		}
 
 		pending = append(pending, fileCands...)
@@ -993,9 +977,6 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			return nil, summary, err
 		}
 		summary.WalkedFiles++
-		if ignored[c.rel] {
-			continue
-		}
 		entry, ok, err := hashCandidate(ctx, repoRoot, c, opts)
 		if err != nil {
 			summary.Errors++
