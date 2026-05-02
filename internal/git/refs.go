@@ -11,27 +11,46 @@ import (
 // an initial commit) from a real git failure.
 var ErrRefNotFound = errors.New("git: ref not found")
 
+// ErrRefAmbiguous is returned by RevParse when the requested name resolves
+// to multiple objects (e.g. a branch and a tag with the same short name).
+// Pre-fix RevParse used --quiet which silently coerced this case to a
+// successful resolution, hiding repo misconfiguration; we now surface it as
+// a distinct error so callers can fail loudly.
+var ErrRefAmbiguous = errors.New("git: ref is ambiguous")
+
 // RevParse resolves rev (any acceptable revision spec — HEAD, refs/...,
 // short hash, etc.) to a full SHA. Returns ErrRefNotFound when the rev does
-// not exist; other failures (ambiguous ref, wrong-type expansion, etc.)
-// surface as *Error.
+// not exist, ErrRefAmbiguous when the name maps to multiple objects, and
+// any other failure as a real *Error wrapping git's stderr.
 //
-// Disambiguation contract:
+// Disambiguation contract (git semantics with --verify but WITHOUT --quiet):
 //
-//   - Exit 1 + empty stderr  → ErrRefNotFound (the canonical "no such rev"
-//     case; --quiet was historically how we forced this shape, but git also
-//     emits ambiguity / wrong-type warnings to stderr at exit 1).
-//   - Exit 1 + non-empty stderr → real *Error wrapping the stderr; the
-//     caller can match on the message ("ambiguous", "needed a single
-//     revision", etc.). We deliberately drop --quiet so those messages
-//     reach us.
-//   - Other exit codes → *Error verbatim.
+//   - Exit 0, no warning → resolved successfully.
+//   - Exit 0, "warning: refname '...' is ambiguous." on stderr → multiple
+//     refs share the short name. The reported OID is whichever git resolved
+//     first (refs/heads order). We surface ErrRefAmbiguous wrapping a
+//     *Error so callers can either fail or downgrade by passing a fully
+//     qualified ref like refs/heads/foo.
+//   - Exit 128, "fatal: Needed a single revision" → ref does not exist.
+//     This is git's canonical missing-rev shape when --quiet is not set.
+//
+// Pre-fix the call passed --quiet which suppressed both the ambiguity
+// warning AND collapsed missing-ref to exit 1, masking misconfiguration.
 func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
 	out, err := Run(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
 	if err != nil {
 		var gerr *Error
-		if errors.As(err, &gerr) && gerr.ExitCode == 1 && strings.TrimSpace(gerr.Stderr) == "" {
-			return "", ErrRefNotFound
+		if errors.As(err, &gerr) {
+			stderr := strings.TrimSpace(gerr.Stderr)
+			// "Needed a single revision" is git's missing-ref message at
+			// exit 128 without --quiet. Treat it (and the historical
+			// --quiet form, exit 1 + empty stderr) as ErrRefNotFound.
+			if strings.Contains(stderr, "Needed a single revision") {
+				return "", ErrRefNotFound
+			}
+			if gerr.ExitCode == 1 && stderr == "" {
+				return "", ErrRefNotFound
+			}
 		}
 		return "", err
 	}
