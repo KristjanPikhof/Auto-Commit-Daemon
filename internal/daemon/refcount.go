@@ -200,16 +200,82 @@ func FingerprintToken(fp identity.Fingerprint) string {
 	return storedHashOf(fp)
 }
 
-var unresolvedFingerprintWarnings sync.Map
+// fingerprintWarnCap is the maximum number of distinct (session_id, pid)
+// pairs the deduplication map for "client fingerprint unresolved" warnings
+// retains across sweeps. A long-lived daemon attached to a churning fleet of
+// session/pids would otherwise grow this map without bound — every unique
+// pair we ever warned about stays in memory forever. When the map exceeds
+// fingerprintWarnCap, we evict the oldest fingerprintWarnEvictBatch entries
+// (by insertion timestamp). The dedup window is therefore "the most recent
+// ≤fingerprintWarnCap unique pairs", which is tight enough that legitimate
+// alarm clusters under investigation are not flushed mid-analysis.
+const (
+	fingerprintWarnCap         = 1024
+	fingerprintWarnEvictBatch  = 256
+)
+
+// fingerprintWarnEntry records when a (session_id, pid) was first warned so
+// the bounded-eviction step can drop the oldest entries first.
+type fingerprintWarnEntry struct {
+	insertedAt time.Time
+}
+
+var (
+	unresolvedFingerprintMu       sync.Mutex
+	unresolvedFingerprintWarnings = make(map[string]fingerprintWarnEntry)
+)
 
 func logFingerprintUnresolved(sessionID string, pid int, err error) {
 	key := fmt.Sprintf("%s:%d", sessionID, pid)
-	if _, loaded := unresolvedFingerprintWarnings.LoadOrStore(key, struct{}{}); loaded {
+	unresolvedFingerprintMu.Lock()
+	if _, loaded := unresolvedFingerprintWarnings[key]; loaded {
+		unresolvedFingerprintMu.Unlock()
 		return
 	}
+	unresolvedFingerprintWarnings[key] = fingerprintWarnEntry{insertedAt: time.Now()}
+	unresolvedFingerprintMu.Unlock()
 	attrs := []any{"session_id", sessionID, "pid", pid}
 	if err != nil {
 		attrs = append(attrs, "err", err.Error())
 	}
 	slog.Default().Warn("client fingerprint unresolved; keeping row until ttl", attrs...)
+}
+
+// sweepFingerprintWarnMap caps the dedup map at fingerprintWarnCap entries.
+// When over the cap, it evicts the fingerprintWarnEvictBatch oldest entries
+// by insertion timestamp. Called once per refcount sweep tick from the run
+// loop so growth is bounded by the sweep cadence. Returns the post-eviction
+// size so callers can surface map pressure if needed.
+//
+// Eviction is intentionally batch-based (rather than 1-at-a-time on insert)
+// so the common case (under-cap) costs only the size check; the O(n) sort
+// runs at most once per sweep tick when the cap is exceeded.
+func sweepFingerprintWarnMap() int {
+	unresolvedFingerprintMu.Lock()
+	defer unresolvedFingerprintMu.Unlock()
+	if len(unresolvedFingerprintWarnings) <= fingerprintWarnCap {
+		return len(unresolvedFingerprintWarnings)
+	}
+	// Collect (key, insertedAt) and partial-sort by age. We avoid pulling in
+	// container/heap by sorting once per overflow tick — fingerprintWarnCap
+	// is small (1024) and the slice cost is bounded.
+	type kv struct {
+		key string
+		ts  time.Time
+	}
+	entries := make([]kv, 0, len(unresolvedFingerprintWarnings))
+	for k, v := range unresolvedFingerprintWarnings {
+		entries = append(entries, kv{key: k, ts: v.insertedAt})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ts.Before(entries[j].ts)
+	})
+	evict := fingerprintWarnEvictBatch
+	if evict > len(entries) {
+		evict = len(entries)
+	}
+	for i := 0; i < evict; i++ {
+		delete(unresolvedFingerprintWarnings, entries[i].key)
+	}
+	return len(unresolvedFingerprintWarnings)
 }
