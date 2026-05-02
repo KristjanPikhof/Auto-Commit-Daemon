@@ -59,10 +59,21 @@ acd stop --session-id X # harness/refcount stop; exits only when no peers remain
 acd stop --all          # stop every daemon
 ~~~
 
-Manual `acd start` / `acd stop` commands default to the current repository.
-Harness integrations should continue passing `--session-id` (and usually
-`--harness`) so ACD can refresh heartbeats and keep shared daemons alive until
-the final harness client exits.
+Use the no-flag lifecycle commands when you are driving ACD from a terminal.
+Manual `acd start` registers a stable human client for the current repo, so
+running it again refreshes the same client instead of creating a new session.
+Manual `acd stop` stops the current repo daemon directly.
+
+Harness integrations should keep passing `--session-id` (and usually
+`--harness`). That path is refcount-aware: `acd stop --session-id X` removes one
+client and stops the shared daemon only after the final harness client exits.
+
+| Situation | Command |
+|---|---|
+| Start or refresh ACD while working in a repo | `acd start` |
+| Stop the daemon for the repo you are in | `acd stop` |
+| Stop one harness session and respect peer sessions | `acd stop --session-id X` |
+| Stop every registered repo daemon | `acd stop --all` |
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
