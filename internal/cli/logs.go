@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -40,7 +41,13 @@ or acd doctor --bundle.`,
 			repo, _ := cmd.Flags().GetString("repo")
 			lines, _ := cmd.Flags().GetInt("lines")
 			follow, _ := cmd.Flags().GetBool("follow")
-			return runLogs(cmd.Context(), cmd.OutOrStdout(), repo, lines, follow)
+			ctx := cmd.Context()
+			stop := func() {}
+			if follow {
+				ctx, stop = signal.NotifyContext(ctx, os.Interrupt)
+			}
+			defer stop()
+			return runLogs(ctx, cmd.OutOrStdout(), repo, lines, follow)
 		},
 	}
 	cmd.Flags().Int("lines", defaultLogLines, "Number of log lines to print before exiting or following")
@@ -68,7 +75,7 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 	}
 
 	if lines > 0 {
-		tail, err := readLastLogLines(logPath, lines)
+		tail, offset, err := readLastLogLines(logPath, lines)
 		if err != nil {
 			return fmt.Errorf("acd logs: read daemon log %s: %w", logPath, err)
 		}
@@ -77,10 +84,10 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 				return fmt.Errorf("acd logs: write output: %w", err)
 			}
 		}
-	}
-
-	if !follow {
-		return nil
+		}
+		if follow {
+			return followLog(ctx, out, logPath, offset, logFollowPollInterval)
+		}
 	}
 
 	info, err := os.Stat(logPath)
@@ -110,10 +117,10 @@ func resolveRepoLogPath(repo string) (logPath, absRepo string, err error) {
 	return roots.RepoLogPath(rec.RepoHash), abs, nil
 }
 
-func readLastLogLines(path string, n int) ([]string, error) {
+func readLastLogLines(path string, n int) ([]string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 
@@ -128,9 +135,13 @@ func readLastLogLines(path string, n int) ([]string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return lines, nil
+	offset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, 0, err
+	}
+	return lines, offset, nil
 }
 
 func followLog(ctx context.Context, out io.Writer, path string, offset int64, interval time.Duration) error {
