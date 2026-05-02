@@ -121,3 +121,91 @@ VALUES (last_insert_rowid(), 0, 'create', 'recover.txt', '%s', '100644', 'exact'
 		t.Fatalf("last_replay_conflict rows=%s want 0", got)
 	}
 }
+
+func TestRecoverRepairsPublishedStaleLiveIndex(t *testing.T) {
+	buildAcdBinary(t)
+
+	repo := tempRepo(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	env := make([]string, 0, len(os.Environ())+4)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "HOME=") ||
+			strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
+			strings.HasPrefix(kv, "XDG_DATA_HOME=") ||
+			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("paths.Resolve: %v", err)
+	}
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.UpsertRepo(repo, repoHash, dbPath, "test", time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatalf("register repo: %v", err)
+	}
+
+	baseHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repo, "legacy.txt"), "legacy published\n")
+	afterOID := gitHashObjectStdin(t, repo, "legacy published\n")
+	runGitOK(t, repo, "add", "legacy.txt")
+	runGitOK(t, repo, "commit", "-q", "-m", "legacy acd publish")
+	publishedHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	runGitOK(t, repo, "update-index", "--force-remove", "--", "legacy.txt")
+	status := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain"))
+	if !strings.Contains(status, "D  legacy.txt") || !strings.Contains(status, "?? legacy.txt") {
+		t.Fatalf("test did not create stale live-index shape:\n%s", status)
+	}
+
+	now := nowFloatSeconds()
+	inject := fmt.Sprintf(`
+INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.generation', '1', %f)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts;
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, published_ts, state, commit_oid)
+VALUES ('refs/heads/main', 1, '%s', 'create', 'legacy.txt', 'exact', %f, %f, 'published', '%s');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', 'legacy.txt', '%s', '100644', 'exact');
+`, now, baseHead, now, now, publishedHead, afterOID)
+	if out, err := exec.Command("sqlite3", dbPath, inject).CombinedOutput(); err != nil {
+		t.Fatalf("inject published fixture: %v\n%s", err, out)
+	}
+
+	applied := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--yes", "--json")
+	if applied.ExitCode != 0 {
+		t.Fatalf("acd recover apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
+	}
+	var payload struct {
+		LiveIndexApplied int `json:"live_index_applied"`
+	}
+	if err := json.Unmarshal([]byte(applied.Stdout), &payload); err != nil {
+		t.Fatalf("decode recover output: %v\n%s", err, applied.Stdout)
+	}
+	if payload.LiveIndexApplied != 1 {
+		t.Fatalf("live_index_applied=%d want 1\n%s", payload.LiveIndexApplied, applied.Stdout)
+	}
+	if status := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); status != "" {
+		t.Fatalf("status after live-index repair not clean:\n%s", status)
+	}
+}
