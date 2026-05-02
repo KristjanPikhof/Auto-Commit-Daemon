@@ -1017,7 +1017,6 @@ func Run(ctx context.Context, opts Options) error {
 		// generation (their BaseHead is no longer reachable).
 		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
 		if operationPaused {
-			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
 			// Stale-marker tracking: stamp the wall-clock + HEAD the first
 			// time we see this marker, persist for diagnose, then warn
 			// periodically when both have been motionless past threshold.
@@ -1027,8 +1026,18 @@ func Run(ctx context.Context, opts Options) error {
 				opMarkerSetAt = nowTS
 				opMarkerHead = currentHead
 				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressSetAt, stamp)
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressHead, currentHead)
+				// First-observation transition: stamp marker name +
+				// set_at + head_at atomically.
+				_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+					MetaKeyOperationInProgress:      operationName,
+					MetaKeyOperationInProgressSetAt: stamp,
+					MetaKeyOperationInProgressHead:  currentHead,
+				})
+			} else {
+				// Steady-state: only the marker name needs refreshing
+				// (no-op upsert when unchanged); set_at/head_at remain
+				// pinned to the first-observation tick.
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
 			}
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
