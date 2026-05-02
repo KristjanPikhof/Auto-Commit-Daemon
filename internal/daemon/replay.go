@@ -641,7 +641,9 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 		case ok:
 			paused, err := markerPauseState(marker, now)
 			if err != nil {
-				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+				if shouldEmitPauseWarn("invalid_pause_marker") {
+					slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+				}
 			} else if paused.Active {
 				return paused, nil
 			}
