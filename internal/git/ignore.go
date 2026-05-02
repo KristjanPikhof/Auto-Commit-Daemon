@@ -7,10 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// killWaitTimeout bounds how long killLocked waits for the underlying git
+// subprocess to exit after stdin is closed and the context is cancelled. A
+// process stuck in uninterruptible sleep (D state on NFS, paging, etc.) is
+// not killable from userspace; we leak the cmd handle in that case rather
+// than wedge the daemon shutdown path. The kernel reaps the process when it
+// eventually unblocks.
+const killWaitTimeout = 2 * time.Second
+
+// waitFn is a test seam: tests can replace it to simulate a wedged
+// subprocess that does not respond to SIGKILL. Production calls cmd.Wait
+// directly.
+var waitFn = func(cmd *exec.Cmd) error { return cmd.Wait() }
 
 // IgnoreChecker batches paths through a single long-lived
 // `git check-ignore --stdin -z` process per repo. Reusing one subprocess
