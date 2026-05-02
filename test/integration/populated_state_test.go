@@ -126,21 +126,13 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 		return traceHasNonBootstrapEvent(t, traceDir)
 	})
 
-	// Phase 5 — pending flush_requests must drain to 0 within budget.
-	deadlineFR := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadlineFR) {
-		got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM flush_requests WHERE status='pending'")
-		if got == "0" {
-			break
-		}
-		t.Logf("flush_requests pending=%s, mode=%s, hb=%f", got, readDaemonStateMode(repo), readHeartbeatTs(repo))
-		// Drive activity so the run loop has reason to iterate.
-		wakeSession(t, ctx, traceEnv, repo, "populated-1")
-		time.Sleep(1 * time.Second)
-	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM flush_requests WHERE status='pending'"); got != "0" {
-		t.Fatalf("flush_requests pending=%s after 30s, mode=%s", got, readDaemonStateMode(repo))
-	}
+	// Phase 5 — pending flush_requests must drain to 0 within budget. The
+	// daemon's bounded flush drain (DefaultFlushLimit=256) means this takes
+	// at least four iterations of the run loop on a 1000-row seed; we
+	// budget 30s which is conservative for any real machine.
+	waitFor(t, "flush_requests pending drained to 0", 30*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM flush_requests WHERE status='pending'") == "0"
+	})
 }
 
 // resetForSeed wipes residual rows from the bootstrap start/stop cycle so
