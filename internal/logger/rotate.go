@@ -94,20 +94,41 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 }
 
 // Close releases the active file. After Close the writer rejects further
-// Writes with os.ErrClosed.
+// Writes with os.ErrClosed. Close briefly waits (bounded by
+// gzipCloseWait) for any in-flight background gzip goroutines so the
+// archive on disk reflects the final rotated content; if the wait
+// expires (e.g. wedged disk I/O) Close proceeds anyway and the
+// goroutines are leaked — they finish whenever the kernel unblocks
+// them.
 func (w *rotatingWriter) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.closed {
+		w.mu.Unlock()
 		return nil
 	}
 	w.closed = true
-	if w.file == nil {
-		return nil
+	var fileErr error
+	if w.file != nil {
+		fileErr = w.file.Close()
+		w.file = nil
 	}
-	err := w.file.Close()
-	w.file = nil
-	return err
+	w.mu.Unlock()
+
+	// Wait for background gzip goroutines off-mutex so a writer that
+	// races Close cannot deadlock behind us. Bound the wait so a wedged
+	// disk does not stall daemon shutdown.
+	done := make(chan struct{})
+	go func() {
+		w.gzipWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(gzipCloseWait):
+		slog.Warn("logger: in-flight gzip did not finish; proceeding with close",
+			"timeout", gzipCloseWait.String())
+	}
+	return fileErr
 }
 
 // openFile (re)opens the active log in append mode. Append mode means
