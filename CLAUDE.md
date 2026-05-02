@@ -26,19 +26,24 @@ Before declaring work done, before pushing the final commit on a branch, and bef
 
 ```bash
 make lint
-make test                                                              # ./... -race -count=1
+make test                                                                                                       # ./... -race -count=1
 go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
-go test ./internal/git/... ./internal/daemon/... -race -count=3        # stress concurrency-prone packages
+go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal/pause/... ./internal/cli/... -race -count=3 -timeout 10m
 ```
 
-Why: Ubuntu CI has caught real races (e.g. `internal/git/ignore.go` cancellation goroutine racing with `Check` mutex) that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out.
+Why: Ubuntu CI has caught real races and ordering bugs that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out. The `race-stress` lane in `.github/workflows/ci.yml` runs the broader `-count=3` set on every PR.
 
-When CI fails on a previously-green branch, do this before retrying:
+When CI fails on a previously-green branch:
 
-1. Re-read the failing test name + file:line from the log.
-2. If the failure is a `WARNING: DATA RACE` or `panic: ... nil pointer`, treat it as a real bug and fix at root cause; do not retry.
-3. If the failure is in the timing-sensitive `internal/daemon` lane (see Known issues), reproduce locally with `-count=10` before assuming flake; only retry CI after that.
-4. Cross-check against macOS-only assumptions: fsnotify event ordering, process exec timing, and `/tmp` semantics differ on Linux.
+1. Re-read failing test name + file:line from the log.
+2. `WARNING: DATA RACE` or `panic: ... nil pointer` → real bug; fix root cause; do not retry.
+3. Timing-sensitive `internal/daemon` failure → reproduce locally with `-count=10` (and `GOMAXPROCS=1 -count=50` to expose ordering hazards). Only retry CI if you cannot reproduce after both.
+4. Cross-check macOS-only assumptions: fsnotify event ordering, process exec timing, `/tmp` semantics differ on Linux.
+
+Common Linux-only failure modes seen on this codebase:
+
+- **Test-design race against boot iteration.** Test stages multiple HEAD transitions but the daemon's boot iteration may observe phase 1 *or* phase 2 depending on scheduler. Fix: `waitForMetaValue(MetaKeyBranchHead, <expected>, 3s)` between phases so each phase is observed deterministically before moving on. Pattern in `TestRun_PostFlushBranchTokenReCheck`.
+- **Real ordering bug masked by macOS scheduling.** Daemon iteration finishes before the test mutates state on macOS, hiding a missing meta-clear. On Linux the iteration races and exposes it. Don't relax the assertion — fix the production path. Example: Diverged-attached-from-detached must clear `MetaKeyDetachedHeadPaused` and `MetaKeyReplayPausedUntil` (`internal/daemon/daemon.go` Diverged branch); otherwise the dedicated reattach branch is bypassed forever once `cctx.BranchRef` is set.
 
 ## Refresh local install
 
