@@ -26,7 +26,7 @@ func newLogsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "logs",
 		Short: "Print the current repo daemon log tail",
-		Long: `Print the raw JSONL daemon log for the selected repo.
+		Long: `Print the current repo daemon log tail as raw JSONL.
 
 By default acd logs prints the last 100 raw log lines and exits. Use --lines to
 choose the initial tail length, or --follow to keep streaming appended lines
