@@ -48,8 +48,8 @@ func newInitCmd() *cobra.Command {
 	var applyFlag bool
 
 	cmd := &cobra.Command{
-		Use:          "init [harness]",
-		Short:        "Print install snippet for a harness adapter",
+		Use:   "init [harness]",
+		Short: "Print install snippet for a harness adapter",
 		Long: `Print the install snippet for a supported harness adapter.
 
 When no harness is provided, acd tries to detect one installed acd-managed harness. Otherwise pass a harness name explicitly. This command prints snippets only; --apply is reserved for a future version and is hidden.
