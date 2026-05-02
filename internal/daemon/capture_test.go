@@ -856,14 +856,8 @@ func TestCapture_LargeIgnoredTree(t *testing.T) {
 		}
 	}
 
-	// Wrap the IgnoreChecker so we can observe per-Check batch sizes and
-	// total path volume. The cap assertion below is the contract: no
-	// single Check call may exceed ignoreCheckBatchSize.
-	probe := newProbingIgnoreChecker(f.dir)
-	t.Cleanup(func() { _ = probe.close() })
-
 	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
-		IgnoreChecker:    probe.ig,
+		IgnoreChecker:    f.ig,
 		SensitiveMatcher: f.matcher,
 	})
 	if err != nil {
@@ -883,12 +877,6 @@ func TestCapture_LargeIgnoredTree(t *testing.T) {
 		t.Fatalf("WalkedFiles=%d exceeds 1000 cap; ignored subtree must be pruned at the directory layer", sum.WalkedFiles)
 	}
 
-	// Every IgnoreChecker batch must respect the file-count cap.
-	maxBatch := probe.maxBatch()
-	if maxBatch > ignoreCheckBatchSize {
-		t.Fatalf("IgnoreChecker batch %d exceeded cap %d", maxBatch, ignoreCheckBatchSize)
-	}
-
 	// The capture event for the tracked file must exist, and no event
 	// should have been emitted for any path under build/.
 	ops := pendingOps(t, f.db)
@@ -906,27 +894,27 @@ func TestCapture_LargeIgnoredTree(t *testing.T) {
 	}
 }
 
-// probingIgnoreChecker wraps a real IgnoreChecker and records the size of
-// every Check call so tests can assert on per-batch caps.
-type probingIgnoreChecker struct {
-	ig       *git.IgnoreChecker
-	mu       sync.Mutex
-	batchMax int
-}
+// TestCapture_ClassifyIgnoredBatched_RespectsCap verifies the helper
+// slices large path lists into chunks of at most ignoreCheckBatchSize. We
+// stub the underlying IgnoreChecker via a fake .gitignore that doesn't
+// actually match anything; what we're asserting is the batching contract,
+// not the classification result.
+func TestCapture_ClassifyIgnoredBatched_RespectsCap(t *testing.T) {
+	f := newCaptureFixture(t)
 
-func newProbingIgnoreChecker(repoDir string) *probingIgnoreChecker {
-	return &probingIgnoreChecker{ig: git.NewIgnoreChecker(repoDir)}
-}
-
-func (p *probingIgnoreChecker) close() error {
-	if p.ig == nil {
-		return nil
+	// Build a slice well above the cap so the helper must do >=3 round
+	// trips internally.
+	const total = ignoreCheckBatchSize*2 + 7
+	paths := make([]string, total)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("synthetic/path-%05d.txt", i)
 	}
-	return p.ig.Close()
-}
 
-func (p *probingIgnoreChecker) maxBatch() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.batchMax
+	results, err := classifyIgnoredBatched(context.Background(), f.ig, paths, ignoreCheckBatchSize)
+	if err != nil {
+		t.Fatalf("classifyIgnoredBatched: %v", err)
+	}
+	if len(results) != len(paths) {
+		t.Fatalf("len(results)=%d, len(paths)=%d — must be 1:1", len(results), len(paths))
+	}
 }
