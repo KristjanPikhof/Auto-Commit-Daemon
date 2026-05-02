@@ -455,6 +455,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// per event would fork an extra git subprocess for every queued
 		// row in the steady state.
 		if parentTree != "" && treeOID == parentTree {
+			cancelEvent()
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
 				return sum, err
 			}
@@ -476,14 +477,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Build the commit on top of the new tree.
-		commitOID, err := buildCommitFromTree(ctx, repoRoot, treeOID, parent, ev, ops, msgFn)
+		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn)
 		if err != nil {
-			markFailed(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); markErr != nil {
+				return sum, markErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			// Halt the batch: a commit-build failure leaves `parent`
@@ -500,7 +504,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+		if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
 			// CAS exhausted. Before declaring conflict, give the
 			// idempotent path one shot: an external committer may have
 			// landed identical content between our write-tree and our
