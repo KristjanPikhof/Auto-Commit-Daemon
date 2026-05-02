@@ -112,7 +112,8 @@ func (c *IgnoreChecker) ensureLocked() error {
 	c.cmd = cmd
 	c.stdin = stdin
 	c.stdout = bufio.NewReader(stdout)
-	c.cancel = cancel
+	cancelCopy := cancel
+	c.cancelPtr.Store(&cancelCopy)
 	return nil
 }
 
