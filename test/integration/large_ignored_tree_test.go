@@ -227,7 +227,3 @@ func classifyWalkedFiles(line string) (int64, bool) {
 	return n, true
 }
 
-// traceEnv2Ctx returns ctx unchanged. It exists so the test reads as
-// "start under the trace env in this context", parallel to startSession's
-// signature without surprises.
-func traceEnv2Ctx(ctx context.Context) context.Context { return ctx }
