@@ -239,12 +239,30 @@ func pendingCapWarnIntervalSeconds() int64 {
 // shouldEmitPendingCapWarn returns true when the rate-limited token says it
 // is time to emit a fresh slog.Warn. Concurrent capture passes serialize
 // under pendingCapWarnMu so we never race two warns through the gate.
+//
+// NTP-safe: an NTP backward step would otherwise leave (now-last) negative,
+// which compares as < interval forever and silences the warn. We clamp two
+// ways:
+//
+//  1. now <= last → the clock ran backwards (or we're in the same second);
+//     reset last to now and emit so a stuck warn becomes unstuck on the next
+//     capture pass.
+//  2. last is more than `2 * interval` in the future relative to now — this
+//     can only happen when last was stamped before a bigger backward step.
+//     Reset and emit.
 func shouldEmitPendingCapWarn() bool {
 	pendingCapWarnMu.Lock()
 	defer pendingCapWarnMu.Unlock()
 	now := pendingCapWarnNow().Unix()
 	last := pendingCapWarnLastUnix.Load()
-	if now-last < pendingCapWarnIntervalSeconds() {
+	interval := pendingCapWarnIntervalSeconds()
+	// NTP backward step: clock went back so `last` is now in the future.
+	// Reset the gate and emit so a stuck warn does not stay suppressed.
+	if now <= last {
+		pendingCapWarnLastUnix.Store(now)
+		return true
+	}
+	if now-last < interval {
 		return false
 	}
 	pendingCapWarnLastUnix.Store(now)
