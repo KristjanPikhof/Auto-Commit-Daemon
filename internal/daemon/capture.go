@@ -790,13 +790,28 @@ type walkOpts struct {
 	db            *state.DB
 }
 
+// ignoreCheckBatchSize caps how many paths walkLive sends per
+// IgnoreChecker.Check call. The cap is by file count (not byte size) so
+// pathological worktrees with very long path names cannot wedge the
+// long-lived `git check-ignore --stdin` subprocess on a single huge write.
+// Layers larger than the cap are sliced into multiple round-trips; the
+// results are concatenated in order before survivors descend.
+const ignoreCheckBatchSize = 1000
+
 // walkLive walks the worktree and returns the live map.
 //
 // Implementation notes:
-//   - We use filepath.WalkDir but consult lstat ourselves for every entry so
-//     symlinks-to-directory are NEVER descended into (followlinks=false
-//     equivalent). The `fs.SkipDir` return path lets us prune ignored,
-//     submoduled, or nested-repo directories cleanly.
+//   - We BFS the worktree by directory layer instead of letting
+//     filepath.WalkDir DFS the whole tree. Each layer batches the cheap
+//     filters (symlink, .git, ACD subdir, nested repo, submodule, sensitive)
+//     locally; survivors are then run through IgnoreChecker.Check in
+//     batches of ignoreCheckBatchSize so a top-level gitignored directory
+//     like build/, node_modules/, or DerivedData is pruned before we
+//     readdir its 100k+ children. This mirrors fsnotify_watcher.preWalk
+//     (commit f647b92): per-layer batched ignore-classify + parent-prune.
+//   - Symlinks-to-directory are NEVER descended into (followlinks=false
+//     equivalent), preserving the legacy CLAUDE.md regression. They are
+//     captured as mode-120000 candidates instead.
 //   - Sensitive + ignore checks short-circuit before O_NOFOLLOW + read.
 //   - All errors except context cancellation are soft: the daemon must keep
 //     running across permission errors or file races.
@@ -804,9 +819,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	live := map[string]LiveEntry{}
 	var summary CaptureSummary
 
-	// First pass: collect candidate (rel, fullPath, FileInfo) entries while
-	// walking. Defer hashing until after the batched ignore check so we
-	// don't hash files git considers ignored.
+	// First pass: BFS the worktree, collecting (a) regular-file + symlink
+	// candidates that survived the cheap filters and (b) the directory
+	// frontier we still need to descend. Both are then batch-classified
+	// against IgnoreChecker; ignored directories are pruned before their
+	// children are read.
 	type candidate struct {
 		rel  string
 		full string
@@ -814,130 +831,161 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	}
 	var pending []candidate
 
-	walkErr := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, walkErr error) error {
+	type dirEntry struct {
+		rel  string // worktree-relative slashed path; "" for the root
+		full string
+	}
+	frontier := []dirEntry{{rel: "", full: repoRoot}}
+
+	for len(frontier) > 0 {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, summary, err
 		}
-		if walkErr != nil {
-			// A descent error (permission, vanished dir). Record and move on.
-			summary.Errors++
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
+
+		var nextDirs []dirEntry
+		var fileCands []candidate
+
+		for _, parent := range frontier {
+			children, err := os.ReadDir(parent.full)
+			if err != nil {
+				// Soft error: the directory vanished or is unreadable.
+				summary.Errors++
+				continue
 			}
-			return nil
-		}
+			for _, d := range children {
+				name := d.Name()
+				var childRel string
+				if parent.rel == "" {
+					childRel = name
+				} else {
+					childRel = parent.rel + "/" + name
+				}
+				if hasControlPathChar(childRel) {
+					recordInvalidPath(ctx, opts.db, childRel, "control_chars")
+					summary.Errors++
+					continue
+				}
 
-		// Top-level: same dir, skip the root entry itself.
-		if path == repoRoot {
-			return nil
-		}
+				// Always step around our own state subdir + .git, regardless
+				// of depth. The tokens only ever exist as top-level
+				// components, but the cheap topComponent slice keeps the
+				// check identical to the previous DFS implementation.
+				topComponent := childRel
+				if i := strings.IndexByte(childRel, '/'); i >= 0 {
+					topComponent = childRel[:i]
+				}
+				if topComponent == ".git" || topComponent == stateSubdir {
+					continue
+				}
 
-		rel, err := filepath.Rel(repoRoot, path)
-		if err != nil {
-			summary.Errors++
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if hasControlPathChar(rel) {
-			recordInvalidPath(ctx, opts.db, rel, "control_chars")
-			summary.Errors++
-			if d.IsDir() {
-				return fs.SkipDir
+				childFull := filepath.Join(parent.full, name)
+				fi, lstatErr := os.Lstat(childFull)
+				if lstatErr != nil {
+					summary.Errors++
+					continue
+				}
+				mode := fi.Mode()
+
+				// Symlinks: capture as 120000 candidate, never descend.
+				if mode&os.ModeSymlink != 0 {
+					if opts.matcher != nil && opts.matcher.Match(childRel) {
+						continue
+					}
+					fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
+					continue
+				}
+
+				if fi.IsDir() {
+					// Nested-repo / submodule: a directory containing .git
+					// is a boundary we never cross.
+					if _, err := os.Stat(filepath.Join(childFull, ".git")); err == nil {
+						continue
+					}
+					if opts.submodules != nil && opts.submodules[childRel] {
+						continue
+					}
+					if opts.matcher != nil && opts.matcher.MatchDirectory(childRel) {
+						continue
+					}
+					nextDirs = append(nextDirs, dirEntry{rel: childRel, full: childFull})
+					continue
+				}
+
+				// Regular files only — sockets/FIFOs/devices skipped quietly.
+				if !mode.IsRegular() {
+					continue
+				}
+				if opts.matcher != nil && opts.matcher.Match(childRel) {
+					continue
+				}
+				fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
 			}
-			return nil
 		}
 
-		// Always step around our own state subdir + .git.
-		topComponent := rel
-		if i := strings.IndexByte(rel, '/'); i >= 0 {
-			topComponent = rel[:i]
-		}
-		if topComponent == ".git" || topComponent == stateSubdir {
-			if d.IsDir() {
-				return fs.SkipDir
+		// Per-layer batched ignore check: classify the directory frontier
+		// AND the file candidates collected at this layer in one pass so
+		// ignored top-level subtrees never get read on the next iteration.
+		// Batches are capped at ignoreCheckBatchSize paths to keep any
+		// single check-ignore round-trip bounded; larger layers are sliced
+		// into successive Check calls.
+		if opts.ignoreChecker != nil && (len(nextDirs) > 0 || len(fileCands) > 0) {
+			totalLen := len(nextDirs) + len(fileCands)
+			paths := make([]string, 0, totalLen)
+			for _, e := range nextDirs {
+				paths = append(paths, e.rel)
 			}
-			return nil
-		}
-
-		// lstat the entry (do NOT follow symlinks).
-		fi, lstatErr := os.Lstat(path)
-		if lstatErr != nil {
-			summary.Errors++
-			if d.IsDir() {
-				return fs.SkipDir
+			for _, c := range fileCands {
+				paths = append(paths, c.rel)
 			}
-			return nil
-		}
-		mode := fi.Mode()
-
-		// Symlink handling: ALWAYS treat as symlink entry, regardless of
-		// whether the target is a file or a directory. Capture the link
-		// target as content, mode 120000. Do not descend.
-		//
-		// Note: filepath.WalkDir, when it encounters a symlink-to-dir on
-		// disk with `d` reflecting the *link*, calls us with
-		// d.IsDir()==false on most platforms (the entry's type bits are
-		// the LINK bits, not the target). We still defensively check
-		// fi.Mode() for ModeSymlink and route via the symlink path.
-		if mode&os.ModeSymlink != 0 {
-			if opts.matcher.Match(rel) {
-				return nil
+			results, ierr := classifyIgnoredBatched(ctx, opts.ignoreChecker, paths, ignoreCheckBatchSize)
+			if ierr != nil {
+				// Fail-closed: if check-ignore is busted, abort the pass
+				// rather than silently committing files git considers
+				// ignored.
+				return nil, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
 			}
-			pending = append(pending, candidate{rel: rel, full: path, fi: fi})
-			return nil
-		}
 
-		// Directory pruning: nested .git, submodules, and ACD state subdir.
-		if d.IsDir() {
-			// nested-repo/submodule detection: skip when <dir>/.git exists.
-			if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
-				return fs.SkipDir
+			survivorsDirs := nextDirs[:0]
+			for i, e := range nextDirs {
+				if results[i] {
+					continue
+				}
+				survivorsDirs = append(survivorsDirs, e)
 			}
-			if opts.submodules != nil && opts.submodules[rel] {
-				return fs.SkipDir
+			nextDirs = survivorsDirs
+
+			survivorsFiles := fileCands[:0]
+			for j, c := range fileCands {
+				if results[len(nextDirs)+j] {
+					// Note: nextDirs has already been pruned above, but the
+					// `results` slice still indexes the ORIGINAL ordering
+					// (dirs first, then files). We can't use len(nextDirs)
+					// here — recompute the file's original index against
+					// the pre-prune dir count.
+					_ = c
+				}
 			}
-			return nil
+			// Recompute survivors against the pre-prune indices (the prune
+			// loop above mutated nextDirs in place via slice aliasing, so
+			// we cannot index back into the original layer). Instead, we
+			// iterate `results` from the original split point.
+			origDirCount := len(paths) - len(fileCands)
+			survivorsFiles = fileCands[:0]
+			for j, c := range fileCands {
+				if results[origDirCount+j] {
+					continue
+				}
+				survivorsFiles = append(survivorsFiles, c)
+			}
+			fileCands = survivorsFiles
 		}
 
-		// Regular files only — sockets/FIFOs/devices skipped quietly.
-		if !mode.IsRegular() {
-			return nil
-		}
-
-		if opts.matcher.Match(rel) {
-			return nil
-		}
-		pending = append(pending, candidate{rel: rel, full: path, fi: fi})
-		return nil
-	})
-	if walkErr != nil {
-		// ctx cancellation is the only walkErr we surface as fatal.
-		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
-			return nil, summary, walkErr
-		}
-		// Non-fatal: log via summary.Errors and proceed with whatever we
-		// collected so far.
-		summary.Errors++
+		pending = append(pending, fileCands...)
+		frontier = nextDirs
 	}
 
-	// Batched ignore check (one git subprocess per pass, not per file).
-	ignored := map[string]bool{}
-	if opts.ignoreChecker != nil && len(pending) > 0 {
-		paths := make([]string, len(pending))
-		for i, c := range pending {
-			paths[i] = c.rel
-		}
-		results, ierr := opts.ignoreChecker.Check(ctx, paths)
-		if ierr != nil {
-			// Fail-closed: if check-ignore is busted, abort the pass rather
-			// than silently committing files git considers ignored.
-			return nil, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
-		}
-		for i, isIgn := range results {
-			if isIgn {
-				ignored[pending[i].rel] = true
-			}
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, summary, err
 	}
 
 	for _, c := range pending {
