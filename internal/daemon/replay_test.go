@@ -114,6 +114,9 @@ func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
 	captureOnePendingFile(t, ctx, f, "hello.md", "hello\n")
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
 	if err != nil {
