@@ -389,6 +389,71 @@ func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
 	}
 }
 
+func TestDeleteStaleUnpublishedForBranchGeneration(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, baseHead, stateName, path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         baseHead,
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			State:            stateName,
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	stalePending := appendEvent("refs/heads/main", 7, "old", EventStatePending, "stale-pending.txt")
+	staleBlocked := appendEvent("refs/heads/main", 7, "old", EventStateBlockedConflict, "stale-blocked.txt")
+	currentPending := appendEvent("refs/heads/main", 7, "new", EventStatePending, "current-pending.txt")
+	stalePublished := appendEvent("refs/heads/main", 7, "old", EventStatePublished, "stale-published.txt")
+	otherBranch := appendEvent("refs/heads/feature", 7, "old", EventStatePending, "other-branch.txt")
+	otherGeneration := appendEvent("refs/heads/main", 8, "old", EventStatePending, "other-generation.txt")
+
+	n, err := DeleteStaleUnpublishedForBranchGeneration(ctx, d, "refs/heads/main", 7, "new")
+	if err != nil {
+		t.Fatalf("DeleteStaleUnpublishedForBranchGeneration: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("deleted=%d want 2", n)
+	}
+
+	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query remaining: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan remaining: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate remaining: %v", err)
+	}
+	for _, seq := range []int64{stalePending, staleBlocked} {
+		if remaining[seq] {
+			t.Fatalf("stale unpublished seq %d survived; remaining=%v", seq, remaining)
+		}
+	}
+	for _, seq := range []int64{currentPending, stalePublished, otherBranch, otherGeneration} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
+		}
+	}
+}
+
 func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
