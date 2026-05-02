@@ -548,13 +548,15 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 		diagFn := func(d WatcherDiagnostics) {
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.mode", d.Mode)
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.watch_count",
-				strconv.Itoa(d.WatchCount))
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.dropped_events",
-				strconv.Itoa(d.DroppedEvents))
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.fallback_reason",
-				d.FallbackReason)
+			// Single-tx batch so the four diagnostics are observed
+			// atomically by readers and a contending writer cannot
+			// amplify N×busy_timeout into a tick stall.
+			_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+				"fsnotify.mode":            d.Mode,
+				"fsnotify.watch_count":     strconv.Itoa(d.WatchCount),
+				"fsnotify.dropped_events":  strconv.Itoa(d.DroppedEvents),
+				"fsnotify.fallback_reason": d.FallbackReason,
+			})
 		}
 		w, err := NewFsnotifyWatcher(FsnotifyOptions{
 			RepoPath:      opts.RepoPath,
