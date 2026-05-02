@@ -140,6 +140,7 @@ for the full `event_class` enumeration.
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
+| `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
 
 ## Docs
 
