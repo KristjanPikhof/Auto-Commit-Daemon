@@ -283,12 +283,13 @@ func TestIgnoreChecker_CloseDoesNotHangOnWedgedSubprocess(t *testing.T) {
 	releaseHang := func() { hangOnce.Do(func() { close(hang) }) }
 	t.Cleanup(releaseHang)
 
-	prevWait := waitFn
-	waitFn = func(_ *exec.Cmd) error {
+	prevWait := waitFn.Load()
+	stub := func(_ *exec.Cmd) error {
 		<-hang
 		return nil
 	}
-	t.Cleanup(func() { waitFn = prevWait })
+	waitFn.Store(&stub)
+	t.Cleanup(func() { waitFn.Store(prevWait) })
 
 	checker := NewIgnoreChecker(dir)
 	// Drive the subprocess to spawn so cmd is non-nil at Close time.
