@@ -37,24 +37,36 @@ var ErrRefAmbiguous = errors.New("git: ref is ambiguous")
 // Pre-fix the call passed --quiet which suppressed both the ambiguity
 // warning AND collapsed missing-ref to exit 1, masking misconfiguration.
 func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
+	out, stderr, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
 	if err != nil {
 		var gerr *Error
 		if errors.As(err, &gerr) {
-			stderr := strings.TrimSpace(gerr.Stderr)
+			gerrStderr := strings.TrimSpace(gerr.Stderr)
 			// "Needed a single revision" is git's missing-ref message at
 			// exit 128 without --quiet. Treat it (and the historical
 			// --quiet form, exit 1 + empty stderr) as ErrRefNotFound.
-			if strings.Contains(stderr, "Needed a single revision") {
+			if strings.Contains(gerrStderr, "Needed a single revision") {
 				return "", ErrRefNotFound
 			}
-			if gerr.ExitCode == 1 && stderr == "" {
+			if gerr.ExitCode == 1 && gerrStderr == "" {
 				return "", ErrRefNotFound
 			}
 		}
 		return "", err
 	}
+	// Exit 0 with an "ambiguous" warning on stderr means the short name
+	// resolved by accident — git picked the first match. Surface this so
+	// callers don't silently consume the wrong OID.
+	if bytesContains(stderr, "is ambiguous") {
+		return "", fmt.Errorf("%w: %s", ErrRefAmbiguous, strings.TrimSpace(string(stderr)))
+	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// bytesContains is a tiny helper to avoid pulling bytes into the imports
+// list just for one substring probe in a hot path.
+func bytesContains(b []byte, sub string) bool {
+	return strings.Contains(string(b), sub)
 }
 
 // ShowToplevel returns the absolute path of the worktree root.
