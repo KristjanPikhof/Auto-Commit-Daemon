@@ -101,10 +101,3 @@ func TestDiffBlobs_BoundedOutput(t *testing.T) {
 		t.Fatalf("expected non-empty diff body")
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
