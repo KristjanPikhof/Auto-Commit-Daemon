@@ -240,7 +240,15 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 // Close terminates the underlying git subprocess. Safe to call multiple
 // times; safe to call concurrently with Check (Check serializes through
 // the same mutex).
+//
+// Close fires the subprocess cancel atomically BEFORE acquiring c.mu so a
+// peer Check that is mid-Wait inside killLocked unblocks immediately.
+// Without this, Close would deadlock behind the mu-holding Check until
+// killWaitTimeout elapsed.
 func (c *IgnoreChecker) Close() error {
+	if p := c.cancelPtr.Swap(nil); p != nil {
+		(*p)()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
@@ -248,17 +256,36 @@ func (c *IgnoreChecker) Close() error {
 	return nil
 }
 
+// killLocked tears down the active subprocess. Caller must hold c.mu.
+//
+// The Wait is bounded by killWaitTimeout: a process stuck in
+// uninterruptible sleep (NFS D-state, paging) cannot be killed from
+// userspace, and an unbounded Wait would wedge daemon shutdown. On
+// timeout we leak the *exec.Cmd handle (the kernel reaps the process
+// when it eventually unblocks) and emit a warn log.
 func (c *IgnoreChecker) killLocked() {
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
+	if p := c.cancelPtr.Swap(nil); p != nil {
+		(*p)()
 	}
 	if c.stdin != nil {
 		_ = c.stdin.Close()
 		c.stdin = nil
 	}
 	if c.cmd != nil {
-		_ = c.cmd.Wait()
+		cmd := c.cmd
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- waitFn(cmd) }()
+		select {
+		case <-waitDone:
+		case <-time.After(killWaitTimeout):
+			pid := -1
+			if cmd.Process != nil {
+				pid = cmd.Process.Pid
+			}
+			slog.Warn("git: ignore checker subprocess did not exit; leaking",
+				"pid", pid,
+				"timeout", killWaitTimeout.String())
+		}
 		c.cmd = nil
 	}
 	c.stdout = nil
