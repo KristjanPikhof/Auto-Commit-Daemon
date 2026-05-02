@@ -172,12 +172,20 @@ func (d *DB) bootstrap(ctx context.Context) error {
 }
 
 func (d *DB) bootstrapWithRetry(ctx context.Context) error {
+	// runBootstrap is idempotent: it early-returns when user_version already
+	// equals SchemaVersion, and applies DDL inside a single transaction
+	// otherwise. Call it directly across attempts rather than resetting the
+	// initOnce sync.Once value — mutating a sync.Once after use is undefined
+	// behavior under the race detector. initOnce is reserved for the
+	// no-retry bootstrap entrypoint.
 	const attempts = 8
+	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		err := d.bootstrap(ctx)
+		err := d.runBootstrap(ctx)
 		if err == nil || !isSQLiteLocked(err) {
 			return err
 		}
+		lastErr = err
 		timer := time.NewTimer(time.Duration(attempt+1) * 25 * time.Millisecond)
 		select {
 		case <-ctx.Done():
@@ -185,13 +193,8 @@ func (d *DB) bootstrapWithRetry(ctx context.Context) error {
 			return ctx.Err()
 		case <-timer.C:
 		}
-
-		// Allow another try after a transient lock. runBootstrap itself is
-		// idempotent, and current-version databases return before writing.
-		d.initOnce = sync.Once{}
-		d.initErr = nil
 	}
-	return d.bootstrap(ctx)
+	return lastErr
 }
 
 func (d *DB) runBootstrap(ctx context.Context) error {
