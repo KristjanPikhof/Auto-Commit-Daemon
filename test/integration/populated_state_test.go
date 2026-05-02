@@ -124,6 +124,31 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 	})
 }
 
+// resetForSeed wipes residual rows from the bootstrap start/stop cycle so
+// the test's own seed counts are deterministic. We keep daemon_state intact
+// (the singleton row carries the schema marker) but clear every other table
+// the seeders touch.
+func resetForSeed(t *testing.T, dbPath string) {
+	t.Helper()
+	ddl := strings.Join([]string{
+		"DELETE FROM flush_requests;",
+		"DELETE FROM daemon_clients;",
+		"DELETE FROM shadow_paths;",
+		"DELETE FROM capture_events;",
+		"DELETE FROM capture_ops;",
+	}, " ")
+	if out, err := execSQL(dbPath, ddl); err != nil {
+		t.Fatalf("reset for seed: %v\n%s", err, out)
+	}
+}
+
+// execSQL runs sqlite3 against the database and returns combined output.
+func execSQL(dbPath, sql string) (string, error) {
+	cmd := exec.Command("sqlite3", dbPath, sql)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // traceHasNonBootstrapEvent returns true if at least one JSONL record in any
 // rotated file under traceDir reports an event_class other than
 // bootstrap_shadow.reseed. We open every *.jsonl, scan one line at a time,
