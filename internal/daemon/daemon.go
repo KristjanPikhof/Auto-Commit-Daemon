@@ -1330,11 +1330,12 @@ func Run(ctx context.Context, opts Options) error {
 			// is still wired through so that direct callers (tests,
 			// future CLI wrappers) honor the same gate symmetrically.
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
-				IgnoreChecker:    ignoreChecker,
-				SensitiveMatcher: matcher,
-				Trace:            tracer,
-				GitDir:           opts.GitDir,
-				SkipPauseCheck:   true,
+				IgnoreChecker:     ignoreChecker,
+				SensitiveMatcher:  matcher,
+				SafeIgnoreMatcher: safeIgnore,
+				Trace:             tracer,
+				GitDir:            opts.GitDir,
+				SkipPauseCheck:    true,
 			})
 		}
 
