@@ -202,7 +202,7 @@ func goroutineStacks() string {
 // runtimeStack is a thin wrapper around runtime.Stack so the function is
 // trivial to substitute under tests if needed.
 func runtimeStack(buf []byte, all bool) int {
-	return runtimeStackImpl(buf, all)
+	return runtime.Stack(buf, all)
 }
 
 func joinLines(parts []string) string {
