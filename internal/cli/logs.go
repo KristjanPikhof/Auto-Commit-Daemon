@@ -26,6 +26,16 @@ func newLogsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "logs",
 		Short: "Print the current repo daemon log tail",
+		Long: `Print the raw JSONL daemon log for the selected repo.
+
+By default acd logs prints the last 100 raw log lines and exits. Use --lines to
+choose the initial tail length, or --follow to keep streaming appended lines
+until interrupted. For bundled diagnostics and sanitized tails, use acd doctor
+or acd doctor --bundle.`,
+		Example: `  acd logs
+  acd logs --lines 200
+  acd logs --follow
+  acd logs --repo /path/to/repo --lines 50 --follow`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			lines, _ := cmd.Flags().GetInt("lines")
