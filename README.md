@@ -38,10 +38,15 @@ Open your harness. Edit files. Commits land automatically.
 ~~~bash
 acd list                # daemons running across all your repos
                         # columns: REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS
+acd list --watch        # refresh the repo table until Ctrl-C
+acd list --watch --interval 5s
 acd status              # current repo's daemon (shows pending_events + blocked_conflicts)
+acd logs                # tail the current repo daemon log as raw JSONL
+acd logs --lines 200    # choose the initial tail length
+acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
 acd stats --since 7d    # last week's commits
 acd doctor              # pending : N, blocked : N, last conflict path + age + error
-acd doctor --bundle     # diagnostics zip for issue reports
+acd doctor --bundle     # diagnostics zip with bundled/tail diagnostics for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
 acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
 acd pause --reason "resetting branch" --yes   # durable manual replay pause
@@ -54,6 +59,10 @@ acd stop --all          # stop every daemon
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
+
+`acd logs` reads the daemon's per-repo JSONL log directly. It does not pretty
+print, summarize, or sanitize the stream; use `acd doctor` when you want the
+bundled diagnostics view with tail snippets and safe metadata for reports.
 
 See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
 for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
