@@ -404,13 +404,20 @@ removes them.
 ### Restart the daemon with updated env
 
 Environment variables (`ACD_AI_PROVIDER`, `ACD_AI_API_KEY`, etc.) are read at
-daemon startup. To apply changes:
+daemon startup. To apply changes during manual use:
 
 ~~~bash
-acd stop --force            # kill the current daemon
+acd stop                    # stop the current repo daemon
 # … set new env vars in your shell or harness …
-acd start --session-id "$ACD_SESSION_ID" --harness claude-code
+acd start                   # start the current repo daemon with the new env
 ~~~
+
+If the daemon does not exit after the graceful stop window, use
+`acd stop --force`. Harness hooks should keep using `--session-id` with
+`acd start`, `acd wake`, and `acd stop`; that mode refreshes client heartbeats
+and makes `acd stop --session-id "$ACD_SESSION_ID"` refcount-aware so the daemon
+stays alive while peer harness sessions remain. Use `acd stop --all` when you
+need to stop every registered repo daemon.
 
 The queue is persisted in SQLite and survives the restart. The daemon will
 drain pending events with the new provider on its first poll tick.
@@ -452,8 +459,8 @@ Use this checklist when commits stop appearing:
    ~~~
 
    A `stale` daemon has a recent-looking heartbeat but a dead PID (crashed
-   without updating state). Run `acd stop --force` then `acd start` to
-   restart it.
+   without updating state). Run `acd stop` then `acd start` to restart it; use
+   `acd stop --force` if the graceful stop path cannot clear the stale entry.
 
    To inspect the daemon's own messages while you restart or wait for replay,
    use raw JSONL log tailing:
@@ -633,7 +640,7 @@ the primary provider is skipped:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Generic `modify file.go` messages | `ACD_AI_PROVIDER` unset | Set `ACD_AI_PROVIDER=openai-compat` and `ACD_AI_API_KEY` |
-| Generic messages after working AI | Daemon not restarted after env change | `acd stop --force` + `acd start` |
+| Generic messages after working AI | Daemon not restarted after env change | `acd stop` + `acd start` |
 | Generic messages + network provider set | Missing or expired API key | Check `ACD_AI_API_KEY`; restart daemon |
 | Generic messages on every event | Subprocess plugin crash / timeout | Check plugin binary on `$PATH`; see `acd doctor` log tail |
 | AI sees empty diff | Op has no `before_oid`/`after_oid` (e.g. oversize file) | Expected; deterministic fallback is correct |
