@@ -543,7 +543,7 @@ func TestFsnotifyWatcher_DisabledByEnv(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	// Stop should be safe even though dispatch never spawned.
-	if err := w.Stop(); err != nil {
+	if err := w.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 }
