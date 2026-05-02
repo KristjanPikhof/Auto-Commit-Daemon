@@ -29,18 +29,25 @@
 // diff library, no bespoke text-diff implementation. For create/delete
 // we substitute the well-known empty-blob OID
 // (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
-// Diff egress is now governed solely by the selected provider: when
-// ai.ProviderNeedsDiff(p) reports true (network-bound providers), the
-// reconstructed diff is redacted and capped, then attached to
-// CommitContext.DiffText. The deterministic provider declares
-// NeedsDiff=false and therefore never sees DiffText. The legacy
-// ACD_AI_SEND_DIFF env var is deprecated and ignored.
+// Diff egress is gated on TWO signals:
+//
+//  1. The selected provider declares NeedsDiff=true (network-bound
+//     providers do; the deterministic provider does not).
+//  2. The operator has opted in via ACD_AI_DIFF_EGRESS=1.
+//
+// Both must be true for the daemon to populate CommitContext.DiffText.
+// The provider-level gate prevents wasting work on providers that ignore
+// diffs; the operator-level gate prevents silently shipping reconstructed
+// source bytes off the host on upgrade. The legacy ACD_AI_SEND_DIFF env
+// var is deprecated and ignored; a one-shot warn fires at startup when
+// it is set.
 package daemon
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -48,6 +55,18 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// diffEgressOptIn reports whether the operator has explicitly enabled
+// diff transmission to AI providers via ACD_AI_DIFF_EGRESS. Truthy values
+// match the ACD_TRACE convention: "1", "true", "yes" (case-insensitive).
+func diffEgressOptIn() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ACD_AI_DIFF_EGRESS"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
 
 // emptyBlobOID is git's hard-coded SHA-1 of the empty blob. Used as the
 // "missing side" OID when synthesising create/delete diffs so we can
