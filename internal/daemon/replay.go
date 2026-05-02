@@ -659,7 +659,9 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 	}
 	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
 	if err != nil {
-		slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		if shouldEmitPauseWarn("invalid_rewind_grace") {
+			slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		}
 		return replayPause{}, nil
 	}
 	if !until.After(now) {
