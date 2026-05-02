@@ -970,7 +970,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 					if opts.matcher != nil && opts.matcher.Match(childRel) {
 						continue
 					}
-					if opts.safeIgnore != nil && opts.safeIgnore.Match(childRel) {
+					if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
 						continue
 					}
 					fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -1003,7 +1003,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				if opts.matcher != nil && opts.matcher.Match(childRel) {
 					continue
 				}
-				if opts.safeIgnore != nil && opts.safeIgnore.Match(childRel) {
+				if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
 					continue
 				}
 				fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
