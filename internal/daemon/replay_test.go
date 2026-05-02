@@ -417,6 +417,11 @@ func TestReplay_BoundedBatchYields(t *testing.T) {
 		t.Fatalf("pending after first pass=%d want %d", len(pendingAfter), len(pendingBefore)-limit)
 	}
 
+	// Refresh BaseHead — the run loop normally does this between passes by
+	// reading sum.BaseHead. Without it the second pass would seed its scratch
+	// index from a now-stale HEAD and reject the remaining events.
+	f.cctx.BaseHead = sum.BaseHead
+
 	// Second pass with the same budget drains the remainder. There is no
 	// queued event behind it, so HasMore must be false.
 	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
