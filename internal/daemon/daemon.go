@@ -772,8 +772,13 @@ func Run(ctx context.Context, opts Options) error {
 			return true
 		}
 		ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
-		_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
-		_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, newToken)
+		// Single-tx batch: changedAt + token must land together so a
+		// reader between the two writes never sees a stale token paired
+		// with the new timestamp (or vice versa).
+		_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+			MetaKeyBranchTokenChangedAt: ts,
+			MetaKeyBranchToken:          newToken,
+		})
 		// Refresh HEAD for capture/replay regardless of transition kind.
 		branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
 		cctx.BranchRef = branchRef
