@@ -638,6 +638,19 @@ func Run(ctx context.Context, opts Options) error {
 		"repo", opts.RepoPath, "pid", pid, "branch", branchRef,
 		"head", headOID, "token", currentToken)
 
+	// lastStampedBranchHead is the most recent value the run loop has
+	// written to MetaKeyBranchHead through the SameGeneration "per-tick
+	// keep-alive" path inside processBranchTokenChange. The previous
+	// implementation called state.MetaSet on every tick regardless of the
+	// value, which produced steady write churn on otherwise-idle daemons.
+	// We now skip the upsert when the live HEAD matches what we last
+	// stamped; the cross-tick rewind probe still runs because it reads
+	// persisted via LoadBranchHead, not via lastStampedBranchHead.
+	//
+	// Seed lastStampedBranchHead from the persisted value at startup so
+	// the very first idle tick does not re-stamp an unchanged value.
+	lastStampedBranchHead := persistedHead
+
 	processBranchTokenChange := func(logPrefix string) bool {
 		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
