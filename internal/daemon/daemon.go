@@ -578,6 +578,11 @@ func Run(ctx context.Context, opts Options) error {
 				logger.Info("pruned old shadow generations", "rows", pruned)
 			}
 		}
+		if repaired, err := RepairPublishedLiveIndex(ctx, opts.RepoPath, opts.DB, cctx.BaseHead, DefaultLiveIndexRepairLimit); err != nil {
+			logger.Warn("repair published live index", "err", err.Error())
+		} else if repaired.Applied > 0 || len(repaired.Skipped) > 0 {
+			logger.Info("published live index repair checked", "candidates", repaired.Candidates, "applied", repaired.Applied, "skipped", len(repaired.Skipped))
+		}
 	}
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
@@ -1312,6 +1317,11 @@ func Run(ctx context.Context, opts Options) error {
 				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
 			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
 		} else if cctx.BaseHead != "" {
+			// git check-ignore keeps ignore files loaded for the lifetime
+			// of its --stdin process. Refresh once per capture pass so
+			// newly-created or edited .gitignore files are honored even
+			// when fsnotify is disabled or misses the ignore-file event.
+			ignoreChecker.Invalidate()
 			// The run loop has already evaluated the pause gate above and
 			// emitted the trace event when paused; SkipPauseCheck=true
 			// prevents Capture from re-tracing the same decision. GitDir

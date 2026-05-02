@@ -91,8 +91,29 @@ single pass works as follows:
    g. **Record the outcome.** The event row is updated to `published` with the
       commit OID, and `publish_state` is upserted with `status = "published"`.
 
+   h. **Reconcile the live index.** After a successful publish settlement, the
+      daemon may update only the paths owned by that event in the repo's live
+      index. This is an IDE-facing cleanup step: replay correctness still comes
+      from the scratch index and the `update-ref` CAS above.
+
 The scratch index is deleted when the pass returns. Every new pass creates a
 fresh tempfile, so a crash mid-pass never poisons the next one.
+
+### Live-index reconciliation safety matrix
+
+ACD treats the live index as protected user state. Reconciliation is path-scoped
+and guarded; broad `git reset`, `git checkout`, or `git read-tree` operations
+against the user-facing index are intentionally out of bounds.
+
+| Live-index state for event path | Automatic action |
+|---|---|
+| Create: path absent before replay and `HEAD` now has the captured after blob/mode | Add the captured `HEAD` entry to the live index |
+| Modify/mode: index entry exactly matches the captured before blob/mode | Replace it with the captured after blob/mode |
+| Delete: index entry exactly matches the captured before blob/mode | Remove the path from the live index |
+| Rename: old path exactly matches captured before blob/mode and new path is absent or already matches captured after blob/mode | Remove old path and add the captured new-path entry |
+| Same-path index entry differs from the captured before state | Skip; this is user staging or an external mutation |
+| Any conflict-stage entry, intent-to-add entry, or malformed index shape | Skip and report; never flatten or overwrite it |
+| Unrelated staged paths | Leave untouched |
 
 ---
 
@@ -413,7 +434,21 @@ Use this checklist when commits stop appearing:
    without updating state). Run `acd stop --force` then `acd start` to
    restart it.
 
-3. **Resolve blocked conflicts.**
+3. **Check for stale live-index repair candidates.**
+
+   ~~~bash
+   acd doctor
+   acd recover --repo . --auto --dry-run
+   ~~~
+
+   A legacy stale-index shape looks like `D  path` plus `?? path` even though
+   `HEAD:path` and the worktree file match. Current daemon startup and
+   `acd recover --auto --yes` repair only ACD-owned published paths proved from
+   `capture_events`/`capture_ops`, current `HEAD` ancestry, and matching
+   worktree content. Ambiguous same-path staged work is skipped; use normal git
+   inspection to decide whether it is user intent.
+
+4. **Resolve blocked conflicts.**
 
    ~~~bash
    acd doctor      # last conflict: <path> <age> "<error>"

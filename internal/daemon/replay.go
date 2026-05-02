@@ -386,6 +386,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
 					return sum, err
 				}
+				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after idempotent publish: %w", err)
 				}
@@ -465,6 +466,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
 				return sum, err
 			}
+			reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 			// Reseed the scratch index from `parent` so chained events
 			// see a clean baseline (write-tree leaves stale entries
 			// otherwise).
@@ -532,6 +534,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
 					return sum, err
 				}
+				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after cas idempotent publish: %w", err)
 				}
@@ -591,6 +594,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
 			return sum, err
 		}
+		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 
 		parent = commitOID
 		// Carry forward `treeOID` as the new parent's tree. The commit we
@@ -1200,6 +1204,73 @@ func applyOpsAndWriteTree(ctx context.Context, repoRoot, indexFile string, ops [
 	return tree, nil
 }
 
+func reconcileLiveIndexAfterPublish(ctx context.Context, repoRoot string, logger acdtrace.Logger, cctx CaptureContext, ev state.CaptureEvent, ops []state.CaptureOp) {
+	liveOps := liveIndexOpsFromCaptureOps(ops)
+	if len(liveOps) == 0 {
+		return
+	}
+	res, err := git.ReconcileLiveIndex(ctx, repoRoot, liveOps)
+	if err != nil {
+		slog.Default().Warn("live index reconciliation failed", "seq", ev.Seq, "path", ev.Path, "err", err)
+		traceLiveIndexReconcile(logger, repoRoot, cctx, ev, "failed", err.Error(), nil)
+		return
+	}
+	output := map[string]any{
+		"applied": res.Applied,
+		"skipped": res.Skipped,
+	}
+	if len(res.Skipped) > 0 {
+		slog.Default().Warn("live index reconciliation skipped paths", "seq", ev.Seq, "path", ev.Path, "skipped", res.Skipped)
+		traceLiveIndexReconcile(logger, repoRoot, cctx, ev, "skipped", "live index paths skipped", output)
+		return
+	}
+	traceLiveIndexReconcile(logger, repoRoot, cctx, ev, "applied", "live index reconciled", output)
+}
+
+func liveIndexOpsFromCaptureOps(ops []state.CaptureOp) []git.LiveIndexOp {
+	out := make([]git.LiveIndexOp, 0, len(ops))
+	for _, op := range ops {
+		switch op.Op {
+		case "create":
+			out = append(out, git.LiveIndexOp{
+				Path:      op.Path,
+				AfterMode: op.AfterMode.String,
+				AfterOID:  op.AfterOID.String,
+			})
+		case "modify", "mode":
+			out = append(out, git.LiveIndexOp{
+				Path:       op.Path,
+				BeforeMode: op.BeforeMode.String,
+				BeforeOID:  op.BeforeOID.String,
+				AfterMode:  op.AfterMode.String,
+				AfterOID:   op.AfterOID.String,
+			})
+		case "delete":
+			out = append(out, git.LiveIndexOp{
+				Path:       op.Path,
+				BeforeMode: op.BeforeMode.String,
+				BeforeOID:  op.BeforeOID.String,
+				Delete:     true,
+			})
+		case "rename":
+			if op.OldPath.Valid && op.OldPath.String != "" {
+				out = append(out, git.LiveIndexOp{
+					Path:       op.OldPath.String,
+					BeforeMode: op.BeforeMode.String,
+					BeforeOID:  op.BeforeOID.String,
+					Delete:     true,
+				})
+			}
+			out = append(out, git.LiveIndexOp{
+				Path:      op.Path,
+				AfterMode: op.AfterMode.String,
+				AfterOID:  op.AfterOID.String,
+			})
+		}
+	}
+	return out
+}
+
 // buildCommitFromTree composes the commit message and runs commit-tree on
 // the supplied tree OID. Returns the new commit OID; the caller is
 // responsible for update-ref.
@@ -1450,6 +1521,10 @@ func traceReplay(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, e
 	})
 }
 
+func traceLiveIndexReconcile(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, ev state.CaptureEvent, decision, reason string, output map[string]any) {
+	traceReplay(logger, repoRoot, cctx, ev, "replay.live_index", decision, reason, output)
+}
+
 func traceCapturePaused(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, paused replayPause) {
 	output := map[string]any{
 		"source": paused.Source,
@@ -1503,10 +1578,15 @@ func traceReplayPaused(logger acdtrace.Logger, repoRoot string, cctx CaptureCont
 }
 
 func traceError(decision, reason string) string {
-	if decision == state.EventStatePublished || reason == "" {
+	if reason == "" {
 		return ""
 	}
-	return reason
+	switch decision {
+	case state.EventStateFailed, state.EventStateBlockedConflict:
+		return reason
+	default:
+		return ""
+	}
 }
 
 // checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty

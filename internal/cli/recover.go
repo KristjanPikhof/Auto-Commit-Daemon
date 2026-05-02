@@ -40,6 +40,9 @@ type recoverPlan struct {
 	ManualMarkerPreserved   bool     `json:"manual_marker_preserved,omitempty"`
 	ManualMarkerPath        string   `json:"manual_marker_path,omitempty"`
 	ManualMarkerRemoveError string   `json:"manual_marker_remove_error,omitempty"`
+	LiveIndexCandidates     int      `json:"live_index_candidates,omitempty"`
+	LiveIndexApplied        int      `json:"live_index_applied,omitempty"`
+	LiveIndexSkipped        int      `json:"live_index_skipped,omitempty"`
 }
 
 func newRecoverCmd() *cobra.Command {
@@ -151,21 +154,30 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			gen = parsed
 		}
 	}
+	var liveIndexPlan daemon.LiveIndexRepairSummary
+	if !dryRun {
+		liveIndexPlan, err = planLiveIndexRepair(ctx, rec.Path, rec.StateDB, head)
+		if err != nil {
+			return recoverPlan{}, err
+		}
+	}
 
 	markerAction := "preserve manual pause marker at " + markerPath + " (use --clear-pause to remove)"
 	if clearPause {
 		markerAction = "remove manual pause marker at " + markerPath + " if present"
 	}
 	plan := recoverPlan{
-		Repo:             rec.Path,
-		StateDB:          rec.StateDB,
-		GitDir:           gitDir,
-		CurrentBranchRef: branchRef,
-		CurrentHead:      head,
-		Generation:       gen,
-		DryRun:           dryRun,
-		ClearPause:       clearPause,
-		ManualMarkerPath: markerPath,
+		Repo:                rec.Path,
+		StateDB:             rec.StateDB,
+		GitDir:              gitDir,
+		CurrentBranchRef:    branchRef,
+		CurrentHead:         head,
+		Generation:          gen,
+		DryRun:              dryRun,
+		ClearPause:          clearPause,
+		ManualMarkerPath:    markerPath,
+		LiveIndexCandidates: liveIndexPlan.Candidates,
+		LiveIndexSkipped:    len(liveIndexPlan.Skipped),
 		Actions: []string{
 			"retarget capture_events to current branch/generation/head",
 			"retarget shadow_paths to current branch/generation/head",
@@ -173,8 +185,22 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			"reset blocked_conflict rows to pending",
 			"clear stale replay/pause daemon_meta breadcrumbs",
 			"clear daemon_meta " + daemon.MetaKeyReplayPausedUntil + " (rewind grace)",
+			"repair ACD-published live-index entries when HEAD and worktree still match captured after-state",
 			markerAction,
 		},
+	}
+	return plan, nil
+}
+
+func planLiveIndexRepair(ctx context.Context, repo, stateDB, head string) (daemon.LiveIndexRepairSummary, error) {
+	db, err := state.Open(ctx, stateDB)
+	if err != nil {
+		return daemon.LiveIndexRepairSummary{}, fmt.Errorf("acd recover: open state.db for live-index repair plan: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	plan, err := daemon.PlanPublishedLiveIndexRepair(ctx, repo, db, head, daemon.DefaultLiveIndexRepairLimit)
+	if err != nil {
+		return daemon.LiveIndexRepairSummary{}, fmt.Errorf("acd recover: plan live-index repair: %w", err)
 	}
 	return plan, nil
 }
@@ -344,6 +370,14 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 		return fmt.Errorf("acd recover: commit transaction: %w", err)
 	}
 
+	if repaired, err := daemon.RepairPublishedLiveIndex(ctx, plan.Repo, db, plan.CurrentHead, daemon.DefaultLiveIndexRepairLimit); err != nil {
+		return fmt.Errorf("acd recover: repair live index: %w", err)
+	} else {
+		plan.LiveIndexCandidates = repaired.Candidates
+		plan.LiveIndexApplied = repaired.Applied
+		plan.LiveIndexSkipped = len(repaired.Skipped)
+	}
+
 	// Post-commit: handle the durable manual pause marker. The marker is owned
 	// by `acd pause` / `acd resume` and is not stored in state.db. Without
 	// --clear-pause we always preserve it. With --clear-pause, attempt removal;
@@ -425,6 +459,10 @@ func renderRecover(out io.Writer, plan recoverPlan, jsonOut bool) error {
 	if plan.BackupPath != "" {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
 	}
+	if plan.LiveIndexCandidates > 0 || plan.LiveIndexSkipped > 0 {
+		fmt.Fprintf(out, "Live index repair plan: candidates=%d skipped=%d\n",
+			plan.LiveIndexCandidates, plan.LiveIndexSkipped)
+	}
 	for _, action := range plan.Actions {
 		fmt.Fprintf(out, "- %s\n", action)
 	}
@@ -440,6 +478,10 @@ func renderRecover(out io.Writer, plan recoverPlan, jsonOut bool) error {
 		}
 		if plan.ManualMarkerRemoveError != "" {
 			fmt.Fprintf(out, "WARNING: manual pause marker remove failed after commit: %s\n", plan.ManualMarkerRemoveError)
+		}
+		if plan.LiveIndexCandidates > 0 || plan.LiveIndexSkipped > 0 {
+			fmt.Fprintf(out, "Live index repair: candidates=%d applied=%d skipped=%d\n",
+				plan.LiveIndexCandidates, plan.LiveIndexApplied, plan.LiveIndexSkipped)
 		}
 	}
 	return nil

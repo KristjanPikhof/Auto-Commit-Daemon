@@ -263,6 +263,22 @@ func (c *IgnoreChecker) Close() error {
 	return nil
 }
 
+// Invalidate tears down the current long-lived check-ignore subprocess without
+// closing the checker. The next Check call starts a fresh git process, which is
+// required after .gitignore changes because git check-ignore does not reload
+// ignore files while it is serving a --stdin session.
+func (c *IgnoreChecker) Invalidate() {
+	if p := c.cancelPtr.Swap(nil); p != nil {
+		(*p)()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.killLocked()
+}
+
 // killLocked tears down the active subprocess. Caller must hold c.mu.
 //
 // The Wait is bounded by killWaitTimeout: a process stuck in

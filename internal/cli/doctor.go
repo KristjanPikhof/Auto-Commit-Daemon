@@ -23,6 +23,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -214,7 +216,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		}
 		// Read state.db (best-effort).
 		if fileExists(rec.StateDB) {
-			rr.StateDBReadable = readRepoState(ctx, &rr, rec.StateDB)
+			rr.StateDBReadable = readRepoState(ctx, &rr, rec.Path, rec.StateDB)
 		} else {
 			rr.Notes = append(rr.Notes, "state.db missing")
 		}
@@ -367,7 +369,7 @@ func findDaemonProcesses(ctx context.Context, repo string) []int {
 
 // readRepoState opens the per-repo DB read-only and fills the report fields
 // we can derive from daemon_state, daemon_clients and daemon_meta.
-func readRepoState(ctx context.Context, rr *doctorRepoReport, dbPath string) bool {
+func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath string) bool {
 	d, err := state.Open(ctx, dbPath)
 	if err != nil {
 		rr.Notes = append(rr.Notes, "state.db open failed: "+err.Error())
@@ -415,6 +417,14 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, dbPath string) boo
 	}
 	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
+	}
+	if head, err := git.RevParse(ctx, repoPath, "HEAD"); err == nil {
+		if plan, err := daemon.PlanPublishedLiveIndexRepair(ctx, repoPath, d, head, daemon.DefaultLiveIndexRepairLimit); err == nil {
+			if plan.Candidates > 0 || len(plan.Skipped) > 0 {
+				rr.Notes = append(rr.Notes, fmt.Sprintf("live-index repair candidates=%d skipped=%d; run acd recover --repo %s --auto --dry-run",
+					plan.Candidates, len(plan.Skipped), repoPath))
+			}
+		}
 	}
 
 	// Pending FIFO depth + terminal blocked-conflict count.

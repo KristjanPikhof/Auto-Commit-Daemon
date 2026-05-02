@@ -110,6 +110,260 @@ func TestReplay_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "hello.md", "hello\n")
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "hello.md")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD hello.md: %v", err)
+	}
+	if headOID == "" {
+		t.Fatal("HEAD missing hello.md after replay publish")
+	}
+	worktreeOID, err := git.HashObjectStdin(ctx, f.dir, []byte("hello\n"))
+	if err != nil {
+		t.Fatalf("hash worktree content: %v", err)
+	}
+	if headOID != worktreeOID {
+		t.Fatalf("HEAD/worktree blob mismatch: HEAD=%s worktree=%s", headOID, worktreeOID)
+	}
+
+	status := gitStatusPorcelain(t, ctx, f.dir)
+	if status != "" {
+		t.Fatalf("live index was not reconciled after replay publish; git status --porcelain:\n%s", status)
+	}
+	events := traceEventsByClass(trace.Events(), "replay.live_index")
+	if len(events) != 1 {
+		t.Fatalf("replay.live_index trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	if events[0].Decision != "applied" || events[0].Error != "" {
+		t.Fatalf("unexpected live-index trace event: %+v", events[0])
+	}
+}
+
+func TestReplay_ReconcilesLiveIndexForTrackedChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(t *testing.T, f *captureFixture)
+	}{
+		{
+			name: "modify",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(f.dir, "file.txt"), []byte("after\n"), 0o644); err != nil {
+					t.Fatalf("modify file: %v", err)
+				}
+			},
+		},
+		{
+			name: "delete",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.Remove(filepath.Join(f.dir, "file.txt")); err != nil {
+					t.Fatalf("delete file: %v", err)
+				}
+			},
+		},
+		{
+			name: "rename",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.Rename(filepath.Join(f.dir, "file.txt"), filepath.Join(f.dir, "renamed.txt")); err != nil {
+					t.Fatalf("rename file: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			seedTrackedFileCommit(t, ctx, f, "file.txt", "before\n")
+			if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+				t.Fatalf("BootstrapShadow: %v", err)
+			}
+
+			tc.edit(t, f)
+			if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+				IgnoreChecker:    f.ig,
+				SensitiveMatcher: f.matcher,
+			}); err != nil {
+				t.Fatalf("Capture: %v", err)
+			}
+			sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+			if err != nil {
+				t.Fatalf("Replay: %v", err)
+			}
+			if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+				t.Fatalf("unexpected summary: %+v", sum)
+			}
+			if status := gitStatusPorcelain(t, ctx, f.dir); status != "" {
+				t.Fatalf("live index was not reconciled after %s; git status --porcelain:\n%s", tc.name, status)
+			}
+		})
+	}
+}
+
+func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	unrelatedOID, err := git.HashObjectStdin(ctx, f.dir, []byte("user staged\n"))
+	if err != nil {
+		t.Fatalf("hash unrelated: %v", err)
+	}
+	samePathOID, err := git.HashObjectStdin(ctx, f.dir, []byte("same path user staged\n"))
+	if err != nil {
+		t.Fatalf("hash same-path: %v", err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, f.dir, []byte("acd after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	if err := git.UpdateIndexInfo(ctx, f.dir, "", []string{
+		git.RegularFileMode + " " + unrelatedOID + "\tunrelated.txt",
+		git.RegularFileMode + " " + samePathOID + "\tsame.txt",
+	}); err != nil {
+		t.Fatalf("seed live index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "same.txt"), []byte("acd after\n"), 0o644); err != nil {
+		t.Fatalf("write same path worktree: %v", err)
+	}
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             "same.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      "same.txt",
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	entries, err := git.LsFilesStaged(ctx, f.dir, "unrelated.txt", "same.txt")
+	if err != nil {
+		t.Fatalf("LsFilesStaged: %v", err)
+	}
+	index := map[string]git.IndexEntry{}
+	for _, entry := range entries {
+		index[entry.Path] = entry
+	}
+	if got := index["unrelated.txt"].OID; got != unrelatedOID {
+		t.Fatalf("unrelated staged OID=%s want %s", got, unrelatedOID)
+	}
+	if got := index["same.txt"].OID; got != samePathOID {
+		t.Fatalf("same-path staged OID=%s want preserved user OID %s", got, samePathOID)
+	}
+	if !traceHasDecision(trace.Events(), "skipped") {
+		t.Fatalf("expected replay.live_index skipped trace; events=%+v", trace.Events())
+	}
+}
+
+func TestRepairPublishedLiveIndexRepairsOldCreateStaleIndex(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	const path = "old-stale.txt"
+	body := []byte("old stale\n")
+	if err := os.WriteFile(filepath.Join(f.dir, path), body, 0o644); err != nil {
+		t.Fatalf("write worktree: %v", err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, f.dir, body)
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	seedTreeEntries, err := git.LsTree(ctx, f.dir, f.cctx.BaseHead, false)
+	if err != nil {
+		t.Fatalf("ls-tree seed: %v", err)
+	}
+	mkEntries := make([]git.MktreeEntry, 0, len(seedTreeEntries)+1)
+	for _, e := range seedTreeEntries {
+		mkEntries = append(mkEntries, git.MktreeEntry{Mode: e.Mode, Type: e.Type, OID: e.OID, Path: e.Path})
+	}
+	mkEntries = append(mkEntries, git.MktreeEntry{Mode: git.RegularFileMode, Type: "blob", OID: afterOID, Path: path})
+	tree, err := git.Mktree(ctx, f.dir, mkEntries)
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	commit, err := git.CommitTree(ctx, f.dir, tree, "old acd publish", f.cctx.BaseHead)
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, "HEAD", commit, f.cctx.BaseHead); err != nil {
+		t.Fatalf("update-ref HEAD: %v", err)
+	}
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             path,
+		Fidelity:         "rescan",
+		State:            state.EventStatePublished,
+		CommitOID:        sql.NullString{String: commit, Valid: true},
+		PublishedTS:      sql.NullFloat64{Float64: float64(time.Now().Unix()), Valid: true},
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      path,
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+	if status := gitStatusPorcelain(t, ctx, f.dir); !strings.Contains(status, "D  "+path) || !strings.Contains(status, "?? "+path) {
+		t.Fatalf("test did not create stale live-index shape; status:\n%s", status)
+	}
+
+	sum, err := RepairPublishedLiveIndex(ctx, f.dir, f.db, commit, DefaultLiveIndexRepairLimit)
+	if err != nil {
+		t.Fatalf("RepairPublishedLiveIndex: %v", err)
+	}
+	if sum.Applied != 1 || len(sum.Skipped) != 0 {
+		t.Fatalf("repair summary=%+v want one applied and no skips", sum)
+	}
+	if status := gitStatusPorcelain(t, ctx, f.dir); status != "" {
+		t.Fatalf("live index still stale after repair:\n%s", status)
+	}
+}
+
 func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -2517,6 +2771,33 @@ func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture,
 		t.Fatal("expected at least one pending event")
 	}
 	return len(pending)
+}
+
+func gitStatusPorcelain(t *testing.T, ctx context.Context, repoDir string) string {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status --porcelain: %v", err)
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+func seedTrackedFileCommit(t *testing.T, ctx context.Context, f *captureFixture, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte(body), 0o644); err != nil {
+		t.Fatalf("write seed file %s: %v", path, err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+		t.Fatalf("git add seed file %s: %v", path, err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed tracked file"); err != nil {
+		t.Fatalf("git commit seed file %s: %v", path, err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD after seed file: %v", err)
+	}
+	f.cctx.BaseHead = head
 }
 
 // captureEventsTotal returns the total row count of capture_events, regardless

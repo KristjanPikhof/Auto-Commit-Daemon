@@ -134,6 +134,9 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 			t.Fatalf("HEAD does not contain hello.txt; show:\n%s", showOut)
 		}
 	}
+	waitFor(t, "git status clean after replay publish", 5*time.Second, func() bool {
+		return strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")) == ""
+	})
 
 	// 5. acd stop — last session out, daemon should shut down.
 	stopRes := runAcd(t, ctx, env,
