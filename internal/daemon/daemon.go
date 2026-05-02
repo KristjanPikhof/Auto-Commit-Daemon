@@ -1312,6 +1312,10 @@ func Run(ctx context.Context, opts Options) error {
 					emptyCount = 0
 				}
 			}
+			// Bound the unresolved-fingerprint dedup map. Tied to the
+			// sweep tick so growth is bounded by sweep cadence rather
+			// than letting the map drift forever in long-lived daemons.
+			_ = sweepFingerprintWarnMap()
 			lastSweep = nowTS
 
 			// 4i. Self-terminate gate.
