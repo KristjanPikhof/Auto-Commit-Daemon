@@ -50,6 +50,15 @@ func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "init [harness]",
 		Short:        "Print install snippet for a harness adapter",
+		Long: `Print the install snippet for a supported harness adapter.
+
+When no harness is provided, acd tries to detect one installed acd-managed harness. Otherwise pass a harness name explicitly. This command prints snippets only; --apply is reserved for a future version and is hidden.
+
+Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
+		Example: `  acd init codex
+  acd init claude-code
+  acd init opencode
+  acd init shell`,
 		Args:         cobra.RangeArgs(0, 1),
 		ValidArgs:    supportedHarnesses,
 		SilenceUsage: true,
