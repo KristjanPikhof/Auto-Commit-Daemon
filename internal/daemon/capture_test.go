@@ -299,6 +299,32 @@ func TestCapture_SafeIgnoreDisableRestoresGeneratedTreeCapture(t *testing.T) {
 	t.Fatalf("expected generated file to be captured when %s=0; got %+v", state.EnvSafeIgnore, pendingOps(t, f.db))
 }
 
+func TestCapture_SafeIgnoreDirectoryPatternKeepsSameNamedFile(t *testing.T) {
+	t.Setenv(state.EnvSafeIgnore, "")
+	t.Setenv(state.EnvSafeIgnoreExtra, "")
+	f := newCaptureFixture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "target"), []byte("real file\n"), 0o644); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+
+	_, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:     f.ig,
+		SensitiveMatcher:  f.matcher,
+		SafeIgnoreMatcher: state.NewSafeIgnoreMatcher(),
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	for _, op := range pendingOps(t, f.db) {
+		if op.Path == "target" {
+			return
+		}
+	}
+	t.Fatalf("expected same-named target file to be captured, got %+v", pendingOps(t, f.db))
+}
+
 // TestCapture_OversizeMetaOnly: a file > MaxFileBytes records a daemon_meta
 // row and produces NO commit-event.
 func TestCapture_OversizeMetaOnly(t *testing.T) {
