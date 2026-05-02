@@ -578,6 +578,11 @@ func Run(ctx context.Context, opts Options) error {
 				logger.Info("pruned old shadow generations", "rows", pruned)
 			}
 		}
+		if repaired, err := RepairPublishedLiveIndex(ctx, opts.RepoPath, opts.DB, cctx.BaseHead, DefaultLiveIndexRepairLimit); err != nil {
+			logger.Warn("repair published live index", "err", err.Error())
+		} else if repaired.Applied > 0 || len(repaired.Skipped) > 0 {
+			logger.Info("published live index repair checked", "candidates", repaired.Candidates, "applied", repaired.Applied, "skipped", len(repaired.Skipped))
+		}
 	}
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
