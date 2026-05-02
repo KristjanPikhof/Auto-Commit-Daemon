@@ -2553,6 +2553,15 @@ func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture,
 	return len(pending)
 }
 
+func gitStatusPorcelain(t *testing.T, ctx context.Context, repoDir string) string {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status --porcelain: %v", err)
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
 // captureEventsTotal returns the total row count of capture_events, regardless
 // of state. Used by the rewind-grace tests to assert capture is paused
 // alongside replay (no new pending/blocked/published rows are synthesized).
