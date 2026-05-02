@@ -107,7 +107,7 @@ ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
 		if sp.UpdatedTS == 0 {
 			sp.UpdatedTS = nowSeconds()
 		}
-		if _, err := stmt.ExecContext(ctx, q,
+		if _, err := stmt.ExecContext(ctx,
 			sp.BranchRef, sp.BranchGeneration, sp.Path, sp.Operation, sp.Mode, sp.OID,
 			sp.OldPath, sp.BaseHead, sp.Fidelity, sp.UpdatedTS,
 		); err != nil {
