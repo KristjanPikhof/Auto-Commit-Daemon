@@ -1269,6 +1269,15 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 	return nil
 }
 
+// state-mutation seams for tests. Production wires straight through to the
+// state package; tests override these to inject persistence failures and
+// assert that markFailed/recordConflict propagate the error rather than
+// swallow it (which would leave the row pending and replay forever).
+var (
+	markEventPublishedFn = state.MarkEventPublished
+	markEventBlockedFn   = state.MarkEventBlocked
+)
+
 // markFailed flags an event as terminally failed and records the reason.
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
 // will not re-attempt it. Returns a non-nil error when the terminal-state
