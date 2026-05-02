@@ -249,6 +249,14 @@ acd doctor --bundle     # write a zip to ~/Downloads for issue reports
       last conflict : path/to/file.go  47s ago  "before-state mismatch for path/to/file.go"
 ```
 
+`acd doctor --json` and doctor bundles also include the active safe-ignore
+patterns. By default ACD prunes generated dependency/cache trees before capture
+or watcher descent: `node_modules/`, `target/`, `.venv/`, `venv/`,
+`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and
+`.gradle/`. This guard is internal to ACD and never edits `.gitignore`.
+Set `ACD_SAFE_IGNORE=0` to restore the older behavior, or append additional
+generated trees with `ACD_SAFE_IGNORE_EXTRA`, for example `dist/,build/`.
+
 #### `acd status --json` shape
 
 ```json
