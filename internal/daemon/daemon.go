@@ -1111,9 +1111,20 @@ func Run(ctx context.Context, opts Options) error {
 				break
 			}
 		}
-		// processBranchTokenChange is invoked once per iteration above
-		// (before the flush drain); a second call here was redundant —
-		// HEAD cannot move between the two calls without a wake.
+		// Re-check the branch token AFTER the flush drain. The drain can
+		// iterate up to DefaultFlushLimit (256) rows, and operator git
+		// surgery (`git reset/rebase/checkout`) is NOT serialized through
+		// wakeCh — HEAD can move during the drain. Without this re-check,
+		// Capture/Replay would run with a stale BranchRef/BaseHead/generation,
+		// risking events keyed under the wrong shadow generation, missed
+		// rewind grace, or replay anchored to a stale BaseHead. If a
+		// transition is observed, mark the iteration blocked and let the
+		// next tick re-evaluate after Capture/Replay are skipped.
+		if !branchTransitionBlocked && !operationPaused {
+			if processBranchTokenChange("post-flush branch token") {
+				branchTransitionBlocked = true
+			}
+		}
 
 		// 4f. Capture pass.
 		//
