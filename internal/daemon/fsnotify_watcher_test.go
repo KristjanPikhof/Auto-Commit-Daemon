@@ -944,8 +944,8 @@ func TestFsnotify_WatchCountDoesNotDriftOnRemove(t *testing.T) {
 	// Wait for the rewalk worker to register all three levels.
 	addDeadline := time.Now().Add(2 * time.Second)
 	want := map[string]bool{
-		root:                       false,
-		filepath.Join(root, "b"):   false,
+		root:                          false,
+		filepath.Join(root, "b"):      false,
 		filepath.Join(root, "b", "c"): false,
 	}
 	for time.Now().Before(addDeadline) {
