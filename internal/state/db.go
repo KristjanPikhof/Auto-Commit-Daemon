@@ -13,8 +13,19 @@ import (
 
 	// modernc.org/sqlite is the pure-Go driver mandated by D16 (zero cgo).
 	// Do not switch to mattn/go-sqlite3 — that pulls cgo and breaks the
-	// CGO_ENABLED=0 cross-compile target.
-	_ "modernc.org/sqlite"
+	// CGO_ENABLED=0 cross-compile target. Imported as `sqlite` (not blank)
+	// so isSQLiteLocked can match against the typed *sqlite.Error returned
+	// by the driver in addition to the substring fallback.
+	sqlite "modernc.org/sqlite"
+)
+
+// SQLite primary result codes we care about for retry logic. Defined locally
+// to avoid pulling in the much larger modernc.org/sqlite/lib package; the
+// public sqlite3 numeric protocol fixes these values, see
+// https://www.sqlite.org/rescode.html.
+const (
+	sqliteResultBusy   = 5 // SQLITE_BUSY
+	sqliteResultLocked = 6 // SQLITE_LOCKED
 )
 
 // driverName is registered by the modernc.org/sqlite blank import above.
