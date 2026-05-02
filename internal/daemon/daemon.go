@@ -260,13 +260,41 @@ func Run(ctx context.Context, opts Options) error {
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
 	// by Run and Closed on graceful shutdown.
+	//
+	// closeProviderOnce bounds the closer at providerCloseTimeout. A
+	// subprocess AI provider that wedges on Close (deadlocked stdin
+	// drain, hung handshake, etc.) must not stall daemon shutdown. On
+	// timeout we attempt Process.Kill via the optional processExposer
+	// interface (subprocess plugins should expose it); otherwise we log
+	// and proceed. Either way the caller observes a bounded shutdown.
 	var providerCloser io.Closer
 	closeProviderOnce := func() {
-		if providerCloser != nil {
-			if err := providerCloser.Close(); err != nil {
+		if providerCloser == nil {
+			return
+		}
+		closer := providerCloser
+		providerCloser = nil
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- closer.Close() }()
+		select {
+		case err := <-closeDone:
+			if err != nil {
 				logger.Warn("close ai provider", "err", err.Error())
 			}
-			providerCloser = nil
+		case <-time.After(providerCloseTimeout):
+			logger.Warn("close ai provider timed out; force-killing if possible",
+				"timeout", providerCloseTimeout.String())
+			if pe, ok := closer.(processExposer); ok {
+				if proc := pe.Process(); proc != nil {
+					if err := proc.Kill(); err != nil {
+						logger.Warn("ai provider kill failed",
+							"err", err.Error())
+					}
+				}
+			}
+			// Don't wait for closeDone — by definition the goroutine
+			// is still hung. Leak it; the kernel reaps once the
+			// underlying syscall unblocks.
 		}
 	}
 	defer closeProviderOnce()
