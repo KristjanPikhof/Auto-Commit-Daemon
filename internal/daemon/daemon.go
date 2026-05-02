@@ -850,20 +850,21 @@ func Run(ctx context.Context, opts Options) error {
 						"detached HEAD reattached via diverged transition")
 				}
 				if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-				logger.Warn("reseed shadow after generation bump",
-					"err", err.Error())
-				traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
-			} else {
-				traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
-				if seeded > 0 {
-					logger.Info("shadow reseeded",
-						"rows", seeded,
-						"generation", cctx.BranchGeneration)
-				}
-				if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
-					logger.Warn("prune old shadow generations", "err", pErr.Error())
-				} else if pruned > 0 {
-					logger.Info("pruned old shadow generations", "rows", pruned)
+					logger.Warn("reseed shadow after generation bump",
+						"err", err.Error())
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+				} else {
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
+					if seeded > 0 {
+						logger.Info("shadow reseeded",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration)
+					}
+					if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+						logger.Warn("prune old shadow generations", "err", pErr.Error())
+					} else if pruned > 0 {
+						logger.Info("pruned old shadow generations", "rows", pruned)
+					}
 				}
 			}
 		} else {
