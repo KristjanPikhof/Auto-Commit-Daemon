@@ -214,17 +214,13 @@ func TestRevParse_DisambiguatesAmbiguousRef(t *testing.T) {
 	if errors.Is(err, ErrRefNotFound) {
 		t.Fatalf("ambiguous ref incorrectly mapped to ErrRefNotFound: %v", err)
 	}
+	if !errors.Is(err, ErrRefAmbiguous) {
+		t.Fatalf("expected ErrRefAmbiguous, got: %v", err)
+	}
 	// The error string must surface git's ambiguity warning so callers can
 	// diagnose the misconfiguration.
 	if !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("expected error to mention 'ambiguous', got: %v", err)
-	}
-	var gerr *Error
-	if !errors.As(err, &gerr) {
-		t.Fatalf("expected *git.Error, got %T: %v", err, err)
-	}
-	if gerr.ExitCode == 0 {
-		t.Fatalf("expected non-zero exit on ambiguous ref, got %d", gerr.ExitCode)
 	}
 }
 
