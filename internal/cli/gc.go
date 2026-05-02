@@ -40,6 +40,12 @@ func newGCCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "gc",
 		Short: "Prune central registry of dead/missing repo entries",
+		Long: `Prune central registry entries for repos that are missing, have no state DB, or have had a dead daemon for at least 30 days.
+
+This command does not edit repo state.db files or captured events. Use acd list first to see registered repos, and --json when scripting cleanup.`,
+		Example: `  acd gc
+  acd gc --json
+  acd list`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			return runGC(cmd.Context(), cmd.OutOrStdout(), jsonOut)
