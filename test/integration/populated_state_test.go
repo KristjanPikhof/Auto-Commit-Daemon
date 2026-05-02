@@ -54,6 +54,10 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 	// canonical migrations run, then seed in raw SQL.
 	dbPath := initStateDBSchema(t, ctx, env, repo, "populated-bootstrap")
 
+	// Reset to a clean baseline: the schema-bootstrap start/stop above leaves
+	// a daemon_clients row + may leave a flush_request from internal wake.
+	resetForSeed(t, dbPath)
+
 	SeedFlushRequests(t, dbPath, 1000)
 	SeedDaemonClients(t, dbPath, 25)
 	SeedShadowGenerations(t, dbPath, "refs/heads/main", 3, 800)
