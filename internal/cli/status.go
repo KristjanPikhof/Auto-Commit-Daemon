@@ -63,6 +63,13 @@ func newStatusCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print current daemon + clients for one repo (default: cwd)",
+		Long: `Print daemon, client, queue, pause, and branch state for one registered repo.
+
+The default repo is the current working directory. Use --json for automation. For all registered repos, use acd list; for replay blockers and recovery hints, use acd diagnose.`,
+		Example: `  acd status
+  acd status --repo /path/to/repo
+  acd status --json
+  acd diagnose --repo . --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
