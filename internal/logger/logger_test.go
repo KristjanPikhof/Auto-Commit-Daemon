@@ -263,6 +263,71 @@ func countJSONFromReader(t *testing.T, r io.Reader, label string) int {
 	return n
 }
 
+// TestLogger_RotateDoesNotBlockWriters proves that gzipping a rotated log
+// runs in a background goroutine — concurrent writes complete promptly
+// even when gzip is artificially slow. Pre-fix, rotateLocked held w.mu
+// for the gzip duration, so a Write that landed mid-rotation blocked for
+// hundreds of ms (multi-MB log files).
+//
+// Mechanism: substitute gzipFileFn with a stub that sleeps for a long
+// fixed duration. Trigger a rotation by writing > maxSize. Issue a
+// follow-up Write and assert it returns in well under the gzip stub's
+// sleep budget.
+func TestLogger_RotateDoesNotBlockWriters(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.log")
+
+	// Slow gzip stub: simulates ~750ms of gzip work for a multi-MB log.
+	const gzipDelay = 750 * time.Millisecond
+	prev := gzipFileFn
+	gzipFileFn = func(src, dst string) error {
+		time.Sleep(gzipDelay)
+		return prev(src, dst)
+	}
+	t.Cleanup(func() { gzipFileFn = prev })
+
+	const maxSize = 4096
+	w, err := newRotatingWriter(path, maxSize, 5, 14)
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+	defer w.Close()
+
+	// Force a rotation: a payload that crosses maxSize on top of an
+	// already-non-empty file.
+	seed := []byte(strings.Repeat("x", maxSize/2) + "\n")
+	if _, err := w.Write(seed); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	rotatePayload := []byte(strings.Repeat("y", maxSize) + "\n")
+	if _, err := w.Write(rotatePayload); err != nil {
+		t.Fatalf("rotate write: %v", err)
+	}
+
+	// Now issue a follow-up write. With async gzip it must return in
+	// well under gzipDelay; the gzip is still running in the background.
+	start := time.Now()
+	if _, err := w.Write([]byte("post-rotate\n")); err != nil {
+		t.Fatalf("post-rotate write: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Generous bound: must be well below gzipDelay so a slow CI runner
+	// still proves the off-mutex property.
+	if elapsed > gzipDelay/3 {
+		t.Fatalf("post-rotate Write took %v with %v gzip stub; rotation likely held mu through gzip", elapsed, gzipDelay)
+	}
+
+	// Close must wait for the in-flight gzip so the .1.gz archive is
+	// observable on disk before we assert on it.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(path + ".1.gz"); err != nil {
+		t.Fatalf(".1.gz not produced after Close: %v", err)
+	}
+}
+
 func TestRotatingWriter_ClosedRejectsWrites(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
