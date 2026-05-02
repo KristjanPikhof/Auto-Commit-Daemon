@@ -128,9 +128,27 @@ func (w *rotatingWriter) openFile() error {
 	return nil
 }
 
-// rotateLocked performs steps 1-4 from the type comment. Caller must
-// hold w.mu.
+// rotateLocked performs the synchronous portion of rotation: close the
+// active file, shift existing .N.gz backups outward, rename the just-
+// closed active file to a unique temp name, and open a fresh active
+// file. Gzipping the renamed temp file to .1.gz happens in a background
+// goroutine so concurrent slog Writes never block on compression of
+// multi-MB log files. Caller must hold w.mu.
+//
+// Concurrency model: when rotation N+1 starts while rotation N's gzip is
+// still in flight, the per-rotation temp filename keeps the source file
+// distinct, but both rotations target `.1.gz`. To avoid collision we
+// serialize the gzip + shift step inside the goroutine via the
+// gzipWG.Wait barrier at the head of rotateLocked. This means a *second*
+// rotation does block writers while waiting for the *prior* gzip — but
+// that is rare in practice (rotations only fire on size threshold) and
+// strictly bounded by disk throughput, not by the active file's size.
 func (w *rotatingWriter) rotateLocked() error {
+	// Drain any prior in-flight gzip before we shift backups. Without
+	// this, a back-to-back rotation could try to rename .1.gz → .2.gz
+	// while the previous rotation's goroutine is still writing .1.gz.
+	w.gzipWG.Wait()
+
 	if err := w.file.Close(); err != nil {
 		return err
 	}
@@ -142,25 +160,45 @@ func (w *rotatingWriter) rotateLocked() error {
 		return err
 	}
 
-	// Compress the just-rotated active file to .1.gz. We rename the
-	// active file to a temp name first so a crash mid-gzip leaves the
-	// old plaintext readable rather than producing a half-written .gz.
-	tmp := w.path + ".rotating"
+	// Rename the just-closed active file to a unique temp name. Unique
+	// per rotation so an in-flight gzip on a prior temp cannot collide.
+	// A crash mid-gzip leaves the .rotating file readable rather than a
+	// half-written .gz.
+	tmp := fmt.Sprintf("%s.rotating-%d", w.path, time.Now().UnixNano())
+	dst := w.path + ".1.gz"
+	renamed := true
 	if err := os.Rename(w.path, tmp); err != nil {
-		// If the active file vanished (someone else cleaned up), we still
-		// want to open a fresh one rather than fail the write entirely.
 		if !os.IsNotExist(err) {
 			return err
 		}
-	} else {
-		if err := gzipFile(tmp, w.path+".1.gz"); err != nil {
-			return err
+		renamed = false
+	}
+
+	// Open the fresh active file BEFORE returning so the next Write can
+	// proceed immediately.
+	if err := w.openFile(); err != nil {
+		// Best-effort cleanup of the orphan temp; the caller will see
+		// the openFile error.
+		if renamed {
+			_ = os.Remove(tmp)
 		}
-		_ = os.Remove(tmp)
+		return err
+	}
+
+	if renamed {
+		w.gzipWG.Add(1)
+		go func(src, dst string) {
+			defer w.gzipWG.Done()
+			if err := gzipFileFn(src, dst); err != nil {
+				slog.Warn("logger: gzip rotated log failed",
+					"src", src, "dst", dst, "err", err.Error())
+			}
+			_ = os.Remove(src)
+		}(tmp, dst)
 	}
 
 	w.pruneByAge()
-	return w.openFile()
+	return nil
 }
 
 // shiftBackups renames foo.log.N.gz → foo.log.(N+1).gz, dropping anything
