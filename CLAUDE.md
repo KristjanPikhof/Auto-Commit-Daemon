@@ -106,7 +106,7 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 
 ## Known issues / flaky tests
 
-- **Timing-sensitive in `internal/daemon` under broad package runs**: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` verification when diagnosing unrelated lanes, then run the full suite before merge.
+- **Timing-sensitive in `internal/daemon` under broad package runs**: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` verification when diagnosing unrelated lanes, then run the full suite before merge. May be partially resolved by the v2026-05-02 hardening branch (leading-edge fsnotify wake + `MaxDebounceTail` clamp); re-evaluate post-merge before pruning entries from this list.
 - **Multi-phase HEAD-transition tests must phase deterministically.** When a test stages two HEAD movements and asserts a transition was classified, insert `waitForMetaValue(MetaKeyBranchHead, <phase1HeadSha>, 3s)` between the phases so the daemon's boot iteration cannot race past phase 1 unobserved. Stabilization pattern applied to `TestRun_PostFlushBranchTokenReCheck` (commit `ab52b32`); skipping it produces 3-of-50 Linux flakes under `GOMAXPROCS=1 -count=50`.
 
 ## Gotchas
