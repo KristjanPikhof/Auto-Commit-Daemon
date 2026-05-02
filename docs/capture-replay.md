@@ -246,6 +246,18 @@ acd doctor              # full diagnostics, including last_conflict path + age +
 acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue reports
 ~~~
 
+### Recover or pause replay
+
+~~~bash
+acd diagnose --repo . --json
+acd recover --repo . --auto --dry-run
+acd purge-events --repo . --blocked --pending --dry-run
+acd pause --repo . --reason "manual reset" --yes
+acd resume --repo . --yes
+~~~
+
+Review dry-run output before applying recovery or purge plans with `--yes`.
+
 `acd list --watch` redraws plain table frames on the requested interval; it is
 for watching daemon liveness and queue counts, not an interactive TUI. `acd
 logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
@@ -494,14 +506,18 @@ Use this checklist when commits stop appearing:
    ~~~
 
    `blocked_conflict` events are terminal and may hold later pending rows behind
-   a sequence barrier. Resolution options:
+   a sequence barrier. Use built-in recovery before editing SQLite directly:
 
-   - If the error is a **generation mismatch** (after a rebase or reset): the
-     captured events are stale. Remove them manually from `capture_events` (set
-     `state = 'failed'` in the SQLite DB) or restart the daemon — the next
-     capture pass will record the current worktree state from scratch.
-   - If the error is a **before-state mismatch**: the file was modified outside
-     `acd`'s knowledge. The same manual resolution applies.
+   ~~~bash
+   acd diagnose --repo .
+   acd recover --repo . --auto --dry-run
+   acd purge-events --repo . --blocked --pending --dry-run
+   ~~~
+
+   If the dry-run plan is correct, rerun the chosen command with `--yes`.
+   `recover` retargets stale generation rows after branch surgery. `purge-events`
+   deletes terminal barriers and, when selected, obsolete pending rows behind
+   them.
    - After clearing the blockers, trigger a replay: `acd wake --session-id "$ACD_SESSION_ID"`.
 
 4. **Check fsnotify mode.**
