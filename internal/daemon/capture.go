@@ -796,6 +796,33 @@ type walkOpts struct {
 // results are concatenated in order before survivors descend.
 const ignoreCheckBatchSize = 1000
 
+// classifyIgnoredBatched calls ig.Check in slices of at most batchSize
+// paths and concatenates the boolean results so the returned slice is
+// 1:1 with the input. Empty input returns a non-nil empty slice for
+// caller convenience. Any error from the underlying Check call aborts
+// the loop and surfaces immediately.
+func classifyIgnoredBatched(ctx context.Context, ig *git.IgnoreChecker, paths []string, batchSize int) ([]bool, error) {
+	out := make([]bool, 0, len(paths))
+	if len(paths) == 0 {
+		return out, nil
+	}
+	if batchSize <= 0 {
+		batchSize = ignoreCheckBatchSize
+	}
+	for start := 0; start < len(paths); start += batchSize {
+		end := start + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		results, err := ig.Check(ctx, paths[start:end])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, results...)
+	}
+	return out, nil
+}
+
 // walkLive walks the worktree and returns the live map.
 //
 // Implementation notes:
