@@ -383,6 +383,33 @@ func DeletePendingForGeneration(ctx context.Context, d *DB, branchGeneration int
 	return int(n), nil
 }
 
+// DeleteStaleUnpublishedForBranchGeneration deletes queued/unpublished rows for
+// the active branch generation whose base_head no longer matches the current
+// branch head. This is used after an external same-branch fast-forward: the
+// worktree will be reclassified against the new HEAD, so old snapshots should
+// not replay or remain as barriers.
+func DeleteStaleUnpublishedForBranchGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64, currentHead string) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: DeleteStaleUnpublishedForBranchGeneration: empty branch_ref")
+	}
+	res, err := d.conn.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND base_head <> ?
+  AND state IN (?, ?)`,
+		branchRef, branchGeneration, currentHead,
+		EventStatePending, EventStateBlockedConflict)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete stale unpublished branch generation: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: delete stale unpublished branch generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // PruneTerminalEventsBefore deletes stale terminal failure rows whose state is
 // 'blocked_conflict' or 'failed'. Rows that still form a replay barrier are
 // preserved: if a later pending event exists for the same branch ref and
