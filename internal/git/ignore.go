@@ -23,10 +23,17 @@ import (
 // eventually unblocks.
 const killWaitTimeout = 2 * time.Second
 
-// waitFn is a test seam: tests can replace it to simulate a wedged
-// subprocess that does not respond to SIGKILL. Production calls cmd.Wait
-// directly.
-var waitFn = func(cmd *exec.Cmd) error { return cmd.Wait() }
+// waitFn is a test seam: tests swap in a stub that simulates a wedged
+// subprocess (one whose Wait never returns). The pointer indirection +
+// atomic load keeps the seam race-free under -race when the swap happens
+// while a leaked killLocked goroutine is still parked inside the prior
+// implementation.
+var waitFn atomic.Pointer[func(*exec.Cmd) error]
+
+func init() {
+	defaultWait := func(cmd *exec.Cmd) error { return cmd.Wait() }
+	waitFn.Store(&defaultWait)
+}
 
 // IgnoreChecker batches paths through a single long-lived
 // `git check-ignore --stdin -z` process per repo. Reusing one subprocess
