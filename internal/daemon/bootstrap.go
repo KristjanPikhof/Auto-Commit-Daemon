@@ -223,6 +223,27 @@ func BootstrapShadow(ctx context.Context, repoDir string, db *state.DB, cctx Cap
 	return seeded, nil
 }
 
+// ReseedShadowFromHead replaces the shadow rows for the active
+// (branch_ref, branch_generation) with cctx.BaseHead's tree even when the
+// normal bootstrap marker is already present. External same-branch
+// fast-forwards use this to absorb upstream changes into the shadow baseline
+// instead of capturing them as local worktree edits.
+func ReseedShadowFromHead(ctx context.Context, repoDir string, db *state.DB, cctx CaptureContext) (int, error) {
+	if db == nil {
+		return 0, fmt.Errorf("daemon: ReseedShadowFromHead: nil db")
+	}
+	if cctx.BranchRef == "" {
+		return 0, fmt.Errorf("daemon: ReseedShadowFromHead: empty branch_ref")
+	}
+	if _, err := state.DeleteShadowGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration); err != nil {
+		return 0, err
+	}
+	if _, err := state.MetaDelete(ctx, db, ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration)); err != nil {
+		return 0, err
+	}
+	return BootstrapShadow(ctx, repoDir, db, cctx)
+}
+
 func setShadowBootstrappedMarker(ctx context.Context, db *state.DB, cctx CaptureContext) error {
 	key := ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration)
 	if err := state.MetaSet(ctx, db, key, "1"); err != nil {
