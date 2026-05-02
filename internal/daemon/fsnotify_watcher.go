@@ -351,7 +351,9 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 				if i := strings.IndexByte(childRel, '/'); i >= 0 {
 					topComponent = childRel[:i]
 				}
-				if topComponent == ".git" || topComponent == stateSubdir {
+				// .git/acd is inside .git and already covered. A literal
+				// worktree-rooted "acd/" top component is a real user dir.
+				if topComponent == ".git" {
 					continue
 				}
 				// Nested-repo / submodule pruning: any dir containing
