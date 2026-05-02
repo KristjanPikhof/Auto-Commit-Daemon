@@ -256,6 +256,60 @@ func TestFsnotifyWatcher_DoesNotPruneWildcardSensitiveDirectory(t *testing.T) {
 	}
 }
 
+func TestFsnotifyWatcher_PreWalkPrunesSafeIgnoreDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	t.Setenv(state.EnvSafeIgnore, "")
+	t.Setenv(state.EnvSafeIgnoreExtra, "")
+	dir := t.TempDir()
+	generated := filepath.Join(dir, "node_modules")
+	if err := os.MkdirAll(filepath.Join(generated, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:   dir,
+		SafeIgnore: state.NewSafeIgnoreMatcher(),
+		Debounce:   30 * time.Millisecond,
+	})
+
+	for _, p := range w.WatchedPaths() {
+		if strings.HasPrefix(filepath.Clean(p), filepath.Clean(generated)) {
+			t.Fatalf("safe-ignore dir %q ended up in watched list: %v", generated, w.WatchedPaths())
+		}
+	}
+}
+
+func TestFsnotifyWatcher_RuntimeRewalkPrunesSafeIgnoreDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	t.Setenv(state.EnvSafeIgnore, "")
+	t.Setenv(state.EnvSafeIgnoreExtra, "")
+	dir := t.TempDir()
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:   dir,
+		SafeIgnore: state.NewSafeIgnoreMatcher(),
+		Debounce:   20 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	generated := filepath.Join(dir, "node_modules")
+	if err := os.MkdirAll(filepath.Join(generated, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	for _, p := range w.WatchedPaths() {
+		if strings.HasPrefix(filepath.Clean(p), filepath.Clean(generated)) {
+			t.Fatalf("runtime safe-ignore dir %q ended up in watched list: %v", generated, w.WatchedPaths())
+		}
+	}
+}
+
 // TestPreWalk_BatchedIgnoreCheck verifies the post-walk batched ignore
 // check correctly filters out ignored directories and watches the rest in
 // one IgnoreChecker round-trip. The previous per-dir Check loop generated
