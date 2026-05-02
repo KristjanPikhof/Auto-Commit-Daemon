@@ -74,15 +74,11 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 	// the test process can either celebrate a fast stop or fall through to
 	// the SIGQUIT path on timeout.
 	stopDone := make(chan error, 1)
-	var stopExit atomic.Int32
-	stopExit.Store(-999)
-	_ = stopExit
 
 	go func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), budget)
 		defer stopCancel()
 		res := runAcd(t, stopCtx, traceEnv, "stop", "--repo", repo, "--json")
-		stopExit.Store(int32(res.ExitCode))
 		if res.ExitCode != 0 {
 			stopDone <- fmt.Errorf("acd stop exit=%d\nstdout=%s\nstderr=%s",
 				res.ExitCode, res.Stdout, res.Stderr)
