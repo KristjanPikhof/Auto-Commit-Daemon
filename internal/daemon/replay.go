@@ -1290,7 +1290,7 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue 
 		issue.Message = "replay failed"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	if err := state.MarkEventPublished(ctx, db,
+	if err := markEventPublishedFn(ctx, db,
 		ev.Seq, state.EventStateFailed,
 		sql.NullString{}, sql.NullString{String: issue.Message, Valid: true},
 		ev.Message, nowSec); err != nil {
