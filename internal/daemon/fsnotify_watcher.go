@@ -8,11 +8,16 @@
 // and registers an fsnotify watch per directory. If the platform watch
 // budget would be exceeded, it falls back to poll-only mode immediately
 // and records the reason on `daemon_meta`. While running, it coalesces
-// bursts of events into a single trailing-edge debounce (default 100ms)
-// then calls WakeFn to nudge the run loop. New directories created at
-// runtime are walked recursively to add additional watches; if that push
+// bursts of events into a leading-edge wake plus a trailing-edge debounce
+// (default 100ms) with a hard tail clamp (500ms) so a continuous
+// auto-formatter cannot starve the wake. Directory creates seen on the
+// dispatch goroutine are handed off to a sibling worker that performs
+// the recursive re-walk; the dispatch goroutine itself never blocks on
+// IgnoreChecker round-trips so fsnotify Events do not back up. New
+// directories created at runtime become watched too; if that push
 // exceeds the budget mid-flight the watcher transparently falls back to
-// poll-only. ACD_DISABLE_FSNOTIFY=1 forces poll-only at construction time.
+// poll-only. ACD_DISABLE_FSNOTIFY=1 forces poll-only at construction
+// time.
 //
 // The watcher is safe to Stop concurrently with Start; both honor the
 // passed context.
@@ -55,6 +60,27 @@ const (
 	DefaultDarwinWatchBudget = 1024 // half of typical macOS rlimit nofile
 	WatchBudgetMargin        = 0.90 // use 90% of detected platform max
 	MaxConsecutiveErrors     = 10   // streak after which we give up on fsnotify
+	// MaxDebounceTail is the hard upper bound on how long the trailing-edge
+	// debounce will keep deferring a wake under continuous events. Without
+	// this clamp, an auto-formatter that fires faster than the debounce
+	// interval would starve WakeFn forever.
+	MaxDebounceTail = 500 * time.Millisecond
+	// rewalkQueueDepth is the buffer size for the directory-create rewalk
+	// channel. A small buffer keeps memory bounded while letting bursts of
+	// mkdir events queue up without blocking the dispatch goroutine. If the
+	// queue saturates we drop the oldest pending rewalk and replace it with
+	// the newest path; capture's poll safety net still observes any new
+	// files there.
+	rewalkQueueDepth = 64
+	// diagQueueDepth is the buffer for diagnostics deliveries. We always
+	// deliver the latest snapshot — older snapshots in the buffer are
+	// superseded — so capacity 1 with replace-on-full semantics is enough.
+	diagQueueDepth = 1
+	// preWalkLayerTimeout caps every IgnoreChecker round-trip during a
+	// pre-walk layer. Long-running ignore checks (e.g. a stuck subprocess)
+	// should not stall a Stop indefinitely; the watcher-scoped context lets
+	// Stop cancel them.
+	preWalkLayerTimeout = 5 * time.Second
 )
 
 // FallbackReason values stamped into daemon_meta when fsnotify cannot run.
@@ -113,6 +139,27 @@ type FsnotifyWatcher struct {
 	watcher        *fsnotify.Watcher // nil in poll mode
 	watchedDirs    map[string]struct{}
 
+	// rewalkCh hands directory-Create events from the dispatch goroutine
+	// to the sibling rewalk worker, so dispatch never blocks on a
+	// preWalk's IgnoreChecker round-trip.
+	rewalkCh chan string
+
+	// diagCh delivers the latest WatcherDiagnostics snapshot to a sibling
+	// worker, off the dispatch goroutine, so DiagnosticsFn (which writes
+	// SQLite) cannot block event drain.
+	diagCh chan WatcherDiagnostics
+
+	// watcherCtx is the watcher-scoped context cancelled by Stop. Threaded
+	// through every potentially-blocking helper (preWalk's IgnoreChecker
+	// round-trips, the rewalk worker, the diagnostics worker) so Stop
+	// returns within bounded time even when subprocesses wedge.
+	watcherCtx    context.Context
+	watcherCancel context.CancelFunc
+
+	// workerWg counts every long-lived goroutine the watcher owns
+	// (dispatch, rewalk worker, diagnostics worker). Stop waits on it.
+	workerWg sync.WaitGroup
+
 	startOnce sync.Once
 	stopOnce  sync.Once
 	stopCh    chan struct{}
@@ -147,15 +194,20 @@ func NewFsnotifyWatcher(opts FsnotifyOptions) (*FsnotifyWatcher, error) {
 		maxWatches = detectWatchBudget(logger)
 	}
 
+	wctx, wcancel := context.WithCancel(context.Background())
 	w := &FsnotifyWatcher{
-		opts:        opts,
-		logger:      logger,
-		debounce:    debounce,
-		maxWatches:  maxWatches,
-		mode:        "fsnotify",
-		watchedDirs: map[string]struct{}{},
-		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
+		opts:          opts,
+		logger:        logger,
+		debounce:      debounce,
+		maxWatches:    maxWatches,
+		mode:          "fsnotify",
+		watchedDirs:   map[string]struct{}{},
+		rewalkCh:      make(chan string, rewalkQueueDepth),
+		diagCh:        make(chan WatcherDiagnostics, diagQueueDepth),
+		watcherCtx:    wctx,
+		watcherCancel: wcancel,
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
 	}
 
 	// Honor the disable toggle before touching the OS.
@@ -174,7 +226,7 @@ func NewFsnotifyWatcher(opts FsnotifyOptions) (*FsnotifyWatcher, error) {
 	// Pre-walk + register. Failure to enumerate is fatal (we can't trust
 	// poll either if the worktree disappeared mid-walk), but exhausting
 	// the budget is recoverable: we tear down OS watches and run poll-only.
-	if err := w.preWalk(opts.RepoPath); err != nil {
+	if err := w.preWalk(wctx, opts.RepoPath); err != nil {
 		_ = fsw.Close()
 		w.watcher = nil
 		if errors.Is(err, errBudgetExceeded) {
@@ -183,6 +235,8 @@ func NewFsnotifyWatcher(opts FsnotifyOptions) (*FsnotifyWatcher, error) {
 				"pre-walk would exceed watch budget; running poll-only")
 			return w, nil
 		}
+		// Any other error: cancel watcher-scoped ctx so no goroutines leak.
+		wcancel()
 		return nil, err
 	}
 
@@ -236,7 +290,8 @@ func detectWatchBudget(logger *slog.Logger) int {
 // preWalk walks the repo and registers watches on every accepted
 // directory. Returns errBudgetExceeded if the registered count would
 // exceed maxWatches; the caller is responsible for the poll-mode
-// fallback.
+// fallback. The watcher-scoped ctx must be passed in so Stop can cancel
+// in-flight IgnoreChecker round-trips.
 //
 // BFS layout with parent-prune: candidate directories are processed by
 // depth. Each layer collects every dir that survives the cheap filters
@@ -252,7 +307,12 @@ func detectWatchBudget(logger *slog.Logger) int {
 // through the long-lived `git check-ignore --stdin` subprocess. With
 // per-layer batching the total round-trips equal the worktree depth, not
 // the directory count.
-func (w *FsnotifyWatcher) preWalk(root string) error {
+//
+// IgnoreChecker errors are NOT swallowed — a stuck check-ignore process
+// would otherwise inflate the watched set with directories that should
+// have been pruned. The error surfaces to the caller, which falls back to
+// poll-only.
+func (w *FsnotifyWatcher) preWalk(ctx context.Context, root string) error {
 	rootInfo, err := os.Lstat(root)
 	if err != nil {
 		return err
@@ -292,13 +352,20 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rootRel) {
 			return nil
 		}
-		// Honor gitignore on the root of a runtime re-walk too.
+		// Honor gitignore on the root of a runtime re-walk too. A
+		// persistent IgnoreChecker error here is treated as ignored=false
+		// (fail-open at the root only — the layer-level pre-walk below
+		// fails closed).
 		if w.opts.IgnoreChecker != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			results, ierr := w.opts.IgnoreChecker.Check(ctx, []string{rootRel})
+			cctx, cancel := context.WithTimeout(ctx, preWalkLayerTimeout)
+			results, ierr := w.opts.IgnoreChecker.Check(cctx, []string{rootRel})
 			cancel()
 			if ierr == nil && len(results) == 1 && results[0] {
 				return nil
+			}
+			// Honor watcher-scoped cancellation so Stop unblocks promptly.
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 		}
 	}
@@ -318,6 +385,11 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 	frontier := []entry{{rel: rootRel, full: root}}
 
 	for len(frontier) > 0 {
+		// Cheap watcher-scoped cancellation check before each readdir
+		// layer so a long pre-walk shuts down fast.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var nextLayer []entry
 		for _, parent := range frontier {
 			children, err := os.ReadDir(parent.full)
@@ -376,16 +448,29 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 		// Per-layer batched ignore check: one round-trip classifies the
 		// entire layer, and ignored parents are dropped from the frontier
 		// so we never readdir into their subtrees on the next iteration.
+		// A persistent IgnoreChecker error here is treated as a hard
+		// failure: silently fail-open would inflate the watched set with
+		// directories that should have been pruned (e.g. a 10k-package
+		// node_modules), exhaust the budget, and force a misleading
+		// poll-mode fallback under FallbackBudgetExceeded.
 		ignored := map[string]bool{}
 		if w.opts.IgnoreChecker != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cctx, cancel := context.WithTimeout(ctx, preWalkLayerTimeout)
 			paths := make([]string, len(nextLayer))
 			for i, c := range nextLayer {
 				paths[i] = c.rel
 			}
-			results, ierr := w.opts.IgnoreChecker.Check(ctx, paths)
+			results, ierr := w.opts.IgnoreChecker.Check(cctx, paths)
 			cancel()
-			if ierr == nil && len(results) == len(nextLayer) {
+			if ierr != nil {
+				// Honor watcher-scoped cancellation specifically: Stop
+				// surfaces as ctx.Err and does not need a separate log.
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return ierr
+			}
+			if len(results) == len(nextLayer) {
 				for i, isIgn := range results {
 					if isIgn {
 						ignored[nextLayer[i].rel] = true
@@ -411,6 +496,10 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 
 // addWatch registers one path with the OS watcher, enforcing the budget.
 // Returns errBudgetExceeded the moment a registration would overshoot.
+// On Linux, fsw.Add returns ENOSPC when the per-user inotify watch pool
+// is exhausted (sysctl fs.inotify.max_user_watches). That is functionally
+// the same condition as our explicit budget cap, so we surface it the
+// same way.
 func (w *FsnotifyWatcher) addWatch(path string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -425,6 +514,12 @@ func (w *FsnotifyWatcher) addWatch(path string) error {
 		return errBudgetExceeded
 	}
 	if err := w.watcher.Add(path); err != nil {
+		// ENOSPC = kernel-side inotify pool exhausted. Fall back to
+		// poll-only just like an over-budget would; the caller's
+		// errBudgetExceeded handler tears down OS watches cleanly.
+		if errors.Is(err, syscall.ENOSPC) {
+			return errBudgetExceeded
+		}
 		// Treat as a soft failure — capture still sees the path on the
 		// next poll. Surface it as a dropped event so diagnostics show
 		// pressure, but do not bail.
@@ -437,12 +532,12 @@ func (w *FsnotifyWatcher) addWatch(path string) error {
 }
 
 // clearWatchedLocked drops all OS watches and resets bookkeeping. Caller
-// must already hold w.mu.
+// must already hold w.mu. fsnotify.Close already releases every watch
+// the kernel was tracking, so we do not need to issue per-path Remove
+// calls (which were costing N syscalls on big trees and could fail with
+// ENOENT during teardown).
 func (w *FsnotifyWatcher) clearWatchedLocked() {
 	if w.watcher != nil {
-		for p := range w.watchedDirs {
-			_ = w.watcher.Remove(p)
-		}
 		_ = w.watcher.Close()
 		w.watcher = nil
 	}
@@ -468,12 +563,32 @@ func (w *FsnotifyWatcher) fallbackToPoll(reason, logMsg string) {
 	w.emitDiagnostics()
 }
 
-// emitDiagnostics calls DiagnosticsFn under the snapshot lock.
+// emitDiagnostics queues a diagnostics snapshot for the worker goroutine
+// to deliver. We intentionally do NOT call DiagnosticsFn synchronously
+// here: in production it writes SQLite, and on the dispatch path that
+// would back up the fsnotify Events channel under load (kernel-side
+// inotify drops). Replace-on-full semantics: when the buffer is full we
+// drop the older queued snapshot — only the latest counts.
 func (w *FsnotifyWatcher) emitDiagnostics() {
 	if w.opts.DiagnosticsFn == nil {
 		return
 	}
-	w.opts.DiagnosticsFn(w.Diagnostics())
+	d := w.Diagnostics()
+	for {
+		select {
+		case w.diagCh <- d:
+			return
+		default:
+			// Drop the oldest snapshot, then retry; an outdated snapshot
+			// will be superseded by this newer one.
+			select {
+			case <-w.diagCh:
+			default:
+				// Worker drained between our default and the receive;
+				// loop and try the send again.
+			}
+		}
+	}
 }
 
 // Diagnostics returns a snapshot of the current watcher state. Safe to
@@ -499,6 +614,11 @@ func (w *FsnotifyWatcher) Start(ctx context.Context) error {
 		mode := w.mode
 		w.mu.Unlock()
 
+		// Spawn the diagnostics worker first so the boot snapshot is
+		// delivered even on the poll-mode path.
+		w.workerWg.Add(1)
+		go w.diagnosticsWorker()
+
 		// Always emit one diagnostics snapshot so the run loop can
 		// stamp daemon_meta exactly once at boot.
 		w.emitDiagnostics()
@@ -508,13 +628,26 @@ func (w *FsnotifyWatcher) Start(ctx context.Context) error {
 			close(w.doneCh)
 			return
 		}
-		go w.dispatch(ctx)
+		// Sibling rewalk worker absorbs directory-Create events so the
+		// dispatch goroutine never blocks on preWalk's IgnoreChecker
+		// round-trips. Spawn before dispatch so dispatch never sees a
+		// closed rewalkCh.
+		w.workerWg.Add(1)
+		go w.rewalkWorker()
+
+		w.workerWg.Add(1)
+		go func() {
+			defer w.workerWg.Done()
+			w.dispatch(ctx)
+		}()
 	})
 	return startErr
 }
 
-// dispatch runs the trailing-edge debounce + dynamic re-walk loop. Exits
-// on Stop or ctx cancellation.
+// dispatch runs the leading-edge wake plus trailing-edge debounce loop.
+// Exits on Stop or ctx cancellation. Directory creates are NOT processed
+// inline — they are forwarded to rewalkWorker via rewalkCh so a slow
+// IgnoreChecker round-trip cannot stall the fsnotify Events channel.
 func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 	defer close(w.doneCh)
 
@@ -525,29 +658,65 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 		return
 	}
 
+	// Trailing-edge debounce + tail clamp. Wakes go out via WakeFn:
+	//   - Leading edge: the first event after a quiet window fires WakeFn
+	//     immediately so consumers see activity without waiting.
+	//   - Trailing edge: the debounce timer collapses bursts into a
+	//     final wake N ms after the last event.
+	//   - Tail clamp: a separate timer (MaxDebounceTail) caps the maximum
+	//     interval between wakes under continuous events. Without this,
+	//     a tool that fires faster than `debounce` (auto-formatters,
+	//     hot reloaders) would keep resetting the trailing timer and
+	//     starve WakeFn forever.
 	var (
 		debounceTimer *time.Timer
 		debounceC     <-chan time.Time
+		tailTimer     *time.Timer
+		tailC         <-chan time.Time
+		// burstActive is true between the first event of a burst and the
+		// next quiet window; it gates the leading-edge wake.
+		burstActive bool
 	)
+	stopTimer := func(t *time.Timer) {
+		if t == nil {
+			return
+		}
+		if !t.Stop() {
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+	}
 	resetDebounce := func() {
 		if debounceTimer == nil {
 			debounceTimer = time.NewTimer(w.debounce)
 		} else {
-			if !debounceTimer.Stop() {
-				select {
-				case <-debounceTimer.C:
-				default:
-				}
-			}
+			stopTimer(debounceTimer)
 			debounceTimer.Reset(w.debounce)
 		}
 		debounceC = debounceTimer.C
 	}
-	stopDebounce := func() {
-		if debounceTimer != nil {
-			debounceTimer.Stop()
+	armTail := func() {
+		if tailTimer == nil {
+			tailTimer = time.NewTimer(MaxDebounceTail)
+		} else {
+			// Already armed: do not reset. The tail clamp must fire on
+			// its OWN schedule independent of new events; that's the
+			// whole point of the clamp.
+			return
 		}
+		tailC = tailTimer.C
+	}
+	stopTail := func() {
+		stopTimer(tailTimer)
+		tailC = nil
+	}
+	stopAll := func() {
+		stopTimer(debounceTimer)
 		debounceC = nil
+		stopTail()
+		burstActive = false
 	}
 
 	consecutiveErrors := 0
@@ -555,22 +724,31 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			stopDebounce()
+			stopAll()
 			return
 		case <-w.stopCh:
-			stopDebounce()
+			stopAll()
 			return
 		case ev, ok := <-fsw.Events:
 			if !ok {
-				stopDebounce()
+				stopAll()
 				return
 			}
 			consecutiveErrors = 0
 			w.handleEvent(ev)
+
+			// Leading-edge wake fires the moment we exit a quiet window.
+			if !burstActive {
+				burstActive = true
+				if w.opts.WakeFn != nil {
+					w.opts.WakeFn()
+				}
+				armTail()
+			}
 			resetDebounce()
 		case err, ok := <-fsw.Errors:
 			if !ok {
-				stopDebounce()
+				stopAll()
 				return
 			}
 			w.mu.Lock()
@@ -581,34 +759,132 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 			if consecutiveErrors >= MaxConsecutiveErrors {
 				w.fallbackToPoll(FallbackErrorsExceeded,
 					"fsnotify error streak exceeded; running poll-only")
-				stopDebounce()
+				stopAll()
 				return
 			}
 		case <-debounceC:
 			debounceC = nil
+			// Trailing-edge wake. End-of-burst cleanup: the next event
+			// will start a fresh burst (and re-fire the leading-edge
+			// wake), and the tail clamp is no longer needed.
+			stopTail()
+			burstActive = false
 			if w.opts.WakeFn != nil {
 				w.opts.WakeFn()
+			}
+		case <-tailC:
+			tailC = nil
+			tailTimer = nil
+			// Hard tail clamp expired during a continuous event stream.
+			// Fire WakeFn so consumers see activity even though no quiet
+			// window ever materialized. Re-arm tail so the next clamp
+			// is honored if the stream keeps going.
+			if w.opts.WakeFn != nil {
+				w.opts.WakeFn()
+			}
+			armTail()
+		}
+	}
+}
+
+// rewalkWorker consumes directory-Create paths from rewalkCh and calls
+// preWalk on each one. Runs on its own goroutine so a slow
+// IgnoreChecker.Check never delays fsnotify event drain. Exits when
+// rewalkCh is closed (by Stop) or watcherCtx is cancelled.
+func (w *FsnotifyWatcher) rewalkWorker() {
+	defer w.workerWg.Done()
+	for {
+		select {
+		case <-w.watcherCtx.Done():
+			return
+		case path, ok := <-w.rewalkCh:
+			if !ok {
+				return
+			}
+			fi, err := os.Lstat(path)
+			if err != nil {
+				continue
+			}
+			if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if err := w.preWalk(w.watcherCtx, path); err != nil {
+				if errors.Is(err, errBudgetExceeded) {
+					w.fallbackToPoll(FallbackBudgetExceeded,
+						"runtime watch growth exceeded budget; running poll-only")
+					// Drain the rest: poll mode means no further rewalks.
+					return
+				}
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				w.logger.Warn("fsnotify runtime preWalk failed",
+					"path", path, "err", err.Error())
 			}
 		}
 	}
 }
 
-// handleEvent dispatches one OS event. We add watches recursively on
-// directory creation, and reconcile bookkeeping on directory
-// Remove/Rename so watchedDirs/watchCount don't drift upward under
-// long-running directory churn (the OS-level inotify/kqueue watch is
-// already cleaned by the kernel; only our internal counters need
-// catching up).
-func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
-	// Re-walk new directories so children become watched too.
-	if ev.Op&fsnotify.Create != 0 {
-		fi, err := os.Lstat(ev.Name)
-		if err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-			if err := w.preWalk(ev.Name); err != nil {
-				if errors.Is(err, errBudgetExceeded) {
-					w.fallbackToPoll(FallbackBudgetExceeded,
-						"runtime watch growth exceeded budget; running poll-only")
+// diagnosticsWorker consumes WatcherDiagnostics from diagCh and forwards
+// each snapshot to DiagnosticsFn. Runs on its own goroutine so the SQLite
+// write inside DiagnosticsFn cannot back up the dispatch path. Exits when
+// diagCh is closed (by Stop) or watcherCtx is cancelled. We deliberately
+// drain the channel after Stop closes it so any pending snapshot still
+// reaches the run loop's daemon_meta.
+func (w *FsnotifyWatcher) diagnosticsWorker() {
+	defer w.workerWg.Done()
+	for {
+		select {
+		case <-w.watcherCtx.Done():
+			// Drain anything still pending so the final mode/reason
+			// snapshot is visible to operators.
+			for {
+				select {
+				case d, ok := <-w.diagCh:
+					if !ok {
+						return
+					}
+					w.opts.DiagnosticsFn(d)
+				default:
+					return
 				}
+			}
+		case d, ok := <-w.diagCh:
+			if !ok {
+				return
+			}
+			w.opts.DiagnosticsFn(d)
+		}
+	}
+}
+
+// handleEvent dispatches one OS event. Directory creates are forwarded
+// to the rewalk worker (NOT preWalked inline) so the dispatch goroutine
+// never blocks on an IgnoreChecker round-trip. Reconciliation of
+// Remove/Rename happens inline because it is a cheap map operation.
+func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
+	// Re-walk new directories so children become watched too. We hand
+	// off to the rewalkWorker via a buffered channel; if the queue is
+	// full, drop the oldest entry to make room (replace-on-full).
+	if ev.Op&fsnotify.Create != 0 {
+		select {
+		case w.rewalkCh <- ev.Name:
+		default:
+			// Drop the oldest pending rewalk to make room — the poll
+			// safety net still picks up the file there. Bookkeep as a
+			// dropped event so diagnostics show the pressure.
+			select {
+			case <-w.rewalkCh:
+			default:
+			}
+			select {
+			case w.rewalkCh <- ev.Name:
+			default:
+				// Worker hasn't consumed since we drained; surface this
+				// as a dropped event and move on.
+				w.mu.Lock()
+				w.droppedEvents++
+				w.mu.Unlock()
 			}
 		}
 	}
@@ -623,40 +899,96 @@ func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
 	}
 }
 
-// releaseWatch drops a single tracked directory from watchedDirs and
-// decrements watchCount. No-op if the path was not tracked. The OS
-// inotify/kqueue watch is already gone (the kernel cleans it up on
-// Remove/Rename) so we only reconcile our own counters.
+// releaseWatch drops a tracked directory and any tracked descendants
+// from watchedDirs and decrements watchCount accordingly. No-op if the
+// path was not tracked. The OS inotify/kqueue watch is already gone
+// (the kernel cleans it up on Remove/Rename, including all descendants
+// of a directory tree that was rmrf'd) so we only reconcile our own
+// counters. Without the descendant sweep, watchCount drifts upward over
+// long-running churn until it appears to hit budget.
 func (w *FsnotifyWatcher) releaseWatch(path string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, ok := w.watchedDirs[path]; !ok {
-		return
+	if _, ok := w.watchedDirs[path]; ok {
+		delete(w.watchedDirs, path)
+		if w.watchCount > 0 {
+			w.watchCount--
+		}
 	}
-	delete(w.watchedDirs, path)
-	if w.watchCount > 0 {
-		w.watchCount--
+	// Cascade: if `path` was a directory, any tracked descendants are
+	// also gone from the kernel's watch table. Sweep them out of our map
+	// too. The `path + sep` prefix avoids collapsing siblings whose
+	// names happen to share a prefix with `path`.
+	prefix := path + string(filepath.Separator)
+	for p := range w.watchedDirs {
+		if strings.HasPrefix(p, prefix) {
+			delete(w.watchedDirs, p)
+			if w.watchCount > 0 {
+				w.watchCount--
+			}
+		}
 	}
 }
 
-// Stop tears down the watcher and waits for the dispatch goroutine to
-// exit. Safe to call multiple times; only the first does work. Also safe
-// to call when Start was never invoked: in that case there is no
-// dispatch goroutine to drain so we close doneCh ourselves.
-func (w *FsnotifyWatcher) Stop() error {
+// Stop tears down the watcher and waits for every owned goroutine
+// (dispatch, rewalk worker, diagnostics worker) to exit. Safe to call
+// multiple times; only the first does work. Also safe to call when
+// Start was never invoked: in that case there is no dispatch goroutine
+// to drain so we close doneCh ourselves.
+//
+// The provided ctx bounds the wait. Stop cancels the watcher-scoped
+// context so any in-flight IgnoreChecker round-trip aborts immediately;
+// it then blocks until all workers exit OR ctx is cancelled. A nil ctx
+// is treated as context.Background().
+//
+// shutdown-lane note: this signature accepts a caller-scoped ctx so
+// outer shutdown logic can deadline the teardown without changing
+// internals.
+func (w *FsnotifyWatcher) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	w.stopOnce.Do(func() {
+		// Cancel the watcher-scoped context first so any in-flight
+		// IgnoreChecker.Check / preWalk returns promptly.
+		w.watcherCancel()
 		close(w.stopCh)
+
 		w.mu.Lock()
 		fsw := w.watcher
 		w.mu.Unlock()
 		if fsw != nil {
 			_ = fsw.Close()
 		}
+
 		// If Start was never called, no goroutine ever closes doneCh —
 		// claim it ourselves via startOnce so the wait below does not
 		// block forever.
 		w.startOnce.Do(func() { close(w.doneCh) })
-		<-w.doneCh
+
+		// Wait for dispatch (signalled via doneCh) and the worker
+		// goroutines (signalled via workerWg). The caller's ctx bounds
+		// both waits.
+		select {
+		case <-w.doneCh:
+		case <-ctx.Done():
+		}
+
+		// Close rewalkCh + diagCh so the workers exit; they also honor
+		// watcherCtx so this is belt-and-suspenders. Only safe to close
+		// once — Stop is guarded by stopOnce.
+		close(w.rewalkCh)
+		close(w.diagCh)
+
+		done := make(chan struct{})
+		go func() {
+			w.workerWg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 	})
 	return nil
 }
