@@ -2,10 +2,14 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // writeGitignore plants a .gitignore at the repo root so check-ignore has
