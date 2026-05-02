@@ -573,12 +573,20 @@ func TestFsnotifyWatcher_DiagnosticsCallback(t *testing.T) {
 	if err := w.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	mu.Lock()
-	got := len(seen)
-	mu.Unlock()
-	if got == 0 {
-		t.Fatalf("DiagnosticsFn never fired")
+	// DiagnosticsFn is delivered off the dispatch goroutine via the
+	// sibling worker so SQLite writes never back up event drain. Poll
+	// until the boot snapshot lands.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("DiagnosticsFn never fired")
 }
 
 // TestRun_FsnotifyDrivesWake: with FsnotifyEnabled=true on a slow
