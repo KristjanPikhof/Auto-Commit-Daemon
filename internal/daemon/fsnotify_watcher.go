@@ -126,6 +126,7 @@ type FsnotifyOptions struct {
 	GitDir        string
 	IgnoreChecker fsnotifyIgnoreChecker
 	Sensitive     *state.SensitiveMatcher
+	SafeIgnore    *state.SafeIgnoreMatcher
 	Debounce      time.Duration
 	MaxWatches    int
 	WakeFn        func()
@@ -362,6 +363,9 @@ func (w *FsnotifyWatcher) preWalk(ctx context.Context, root string) error {
 		if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(rootRel) {
 			return nil
 		}
+		if w.opts.SafeIgnore != nil && w.opts.SafeIgnore.MatchDirectory(rootRel) {
+			return nil
+		}
 		// Honor gitignore on the root of a runtime re-walk too. A
 		// persistent IgnoreChecker error here is treated as ignored=false
 		// (fail-open at the root only — the layer-level pre-walk below
@@ -445,6 +449,12 @@ func (w *FsnotifyWatcher) preWalk(ctx context.Context, root string) error {
 				}
 				// Sensitive directories: skip whole subtrees.
 				if w.opts.Sensitive != nil && w.opts.Sensitive.MatchDirectory(childRel) {
+					continue
+				}
+				// Generated dependency/cache directories are skipped by
+				// ACD's internal safe-ignore guard even when the repo
+				// forgot to gitignore them.
+				if w.opts.SafeIgnore != nil && w.opts.SafeIgnore.MatchDirectory(childRel) {
 					continue
 				}
 				nextLayer = append(nextLayer, entry{rel: childRel, full: childPath})
