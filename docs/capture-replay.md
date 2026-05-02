@@ -237,9 +237,21 @@ until the operator resolves the conflict or deletes the row intentionally.
 acd status              # pending_events + blocked_conflicts count for cwd repo
 acd status --json       # machine-readable version
 acd list                # PENDING + BLOCKED columns across all repos
+acd list --watch        # refresh the repo table until Ctrl-C
+acd list --watch --interval 5s
+acd logs                # tail the current repo daemon log as raw JSONL
+acd logs --lines 200    # choose the initial tail length
+acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
 acd doctor              # full diagnostics, including last_conflict path + age + error
-acd doctor --bundle     # write a zip to ~/Downloads for issue reports
+acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue reports
 ~~~
+
+`acd list --watch` redraws plain table frames on the requested interval; it is
+for watching daemon liveness and queue counts, not an interactive TUI. `acd
+logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
+file. Use `acd doctor` or `acd doctor --bundle` when you need the bundled
+diagnostics view, sanitized paths, safe-ignore details, and log tail snippets
+for issue reports.
 
 `acd doctor` human output includes:
 
@@ -434,13 +446,25 @@ Use this checklist when commits stop appearing:
 2. **Check daemon liveness.**
 
    ~~~bash
-   acd status      # Daemon field: running / stale / stopped
-   acd doctor      # daemon_alive boolean per repo
+   acd status              # Daemon field: running / stale / stopped
+   acd list --watch        # all registered repos, refreshed until Ctrl-C
+   acd doctor              # daemon_alive boolean per repo
    ~~~
 
    A `stale` daemon has a recent-looking heartbeat but a dead PID (crashed
    without updating state). Run `acd stop --force` then `acd start` to
    restart it.
+
+   To inspect the daemon's own messages while you restart or wait for replay,
+   use raw JSONL log tailing:
+
+   ~~~bash
+   acd logs --lines 200
+   acd logs --follow
+   ~~~
+
+   `acd doctor` still includes bundled diagnostics and log tail snippets; prefer
+   it for issue reports or when you need sanitized, summarized context.
 
 3. **Check for stale live-index repair candidates.**
 
