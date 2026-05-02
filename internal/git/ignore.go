@@ -49,11 +49,18 @@ var waitFn = func(cmd *exec.Cmd) error { return cmd.Wait() }
 type IgnoreChecker struct {
 	repoDir string
 
+	// cancelPtr carries the subprocess cancel func atomically so Close
+	// can fire it WITHOUT acquiring c.mu. If a Check call is mid-Wait
+	// inside killLocked (with mu held) when the daemon shuts down, an
+	// mu-bound Close would deadlock behind it. Storing cancel atomically
+	// lets Close kick the subprocess immediately, after which the holder
+	// of mu observes the cancel and unwinds.
+	cancelPtr atomic.Pointer[context.CancelFunc]
+
 	mu     sync.Mutex
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
-	cancel context.CancelFunc
 	closed bool
 }
 
