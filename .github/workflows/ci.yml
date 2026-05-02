@@ -22,3 +22,18 @@ jobs:
       - run: make lint
       - run: make test
       - run: make build
+
+  race-stress:
+    # Linux-only race lane that catches ordering bugs the macOS runners miss
+    # (real instances captured: internal/git/ignore.go cancellation goroutine
+    # racing with Check mutex). Failures here should be treated as real bugs
+    # by default; see CLAUDE.md "Pre-merge verification" for the playbook.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: race + count=3 stress on concurrency-prone packages
+        run: go test ./internal/daemon/... ./internal/git/... ./internal/state/... -race -count=3 -timeout 10m
