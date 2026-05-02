@@ -109,12 +109,19 @@ type WatcherDiagnostics struct {
 	FallbackReason string
 }
 
+// fsnotifyIgnoreChecker is the minimum surface the watcher needs from
+// git.IgnoreChecker. Defining it here lets tests substitute a slow stub
+// without modifying the production IgnoreChecker.
+type fsnotifyIgnoreChecker interface {
+	Check(ctx context.Context, paths []string) ([]bool, error)
+}
+
 // FsnotifyOptions configures one watcher. RepoPath + WakeFn are required;
 // everything else has a usable default.
 type FsnotifyOptions struct {
 	RepoPath      string
 	GitDir        string
-	IgnoreChecker *git.IgnoreChecker
+	IgnoreChecker fsnotifyIgnoreChecker
 	Sensitive     *state.SensitiveMatcher
 	Debounce      time.Duration
 	MaxWatches    int
