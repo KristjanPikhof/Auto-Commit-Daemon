@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -28,6 +30,68 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
+
+// pauseWarnLimiter coalesces repeated "malformed pause marker" / "invalid
+// rewind grace" warnings to one emission per minute per (process, key).
+// daemonPauseState runs on every replay pass; without throttling, a single
+// stale or corrupt value emits a warn line every tick (sub-second cadence
+// under fsnotify churn) and floods the operator's logs.
+//
+// Mirrors the pendingCapWarnLimiter pattern in capture.go: time-based, NTP-
+// safe (clock backward → reset gate and emit), test-overridable interval.
+var (
+	pauseWarnMu       sync.Mutex
+	pauseWarnLastUnix sync.Map // key string → *atomic.Int64 (unix seconds)
+	pauseWarnInterval atomic.Int64
+	pauseWarnNowFn    atomic.Pointer[func() time.Time]
+)
+
+const pauseWarnDefaultInterval = 60 // seconds
+
+func pauseWarnNow() time.Time {
+	if fn := pauseWarnNowFn.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return time.Now()
+}
+
+func pauseWarnIntervalSeconds() int64 {
+	if v := pauseWarnInterval.Load(); v > 0 {
+		return v
+	}
+	return pauseWarnDefaultInterval
+}
+
+// shouldEmitPauseWarn returns true at most once per interval per key.
+func shouldEmitPauseWarn(key string) bool {
+	pauseWarnMu.Lock()
+	defer pauseWarnMu.Unlock()
+	now := pauseWarnNow().Unix()
+	stored, _ := pauseWarnLastUnix.LoadOrStore(key, &atomic.Int64{})
+	last := stored.(*atomic.Int64).Load()
+	interval := pauseWarnIntervalSeconds()
+	if now <= last { // NTP backward step or same-second emit
+		stored.(*atomic.Int64).Store(now)
+		return true
+	}
+	if now-last < interval {
+		return false
+	}
+	stored.(*atomic.Int64).Store(now)
+	return true
+}
+
+// resetPauseWarnForTest clears all keys and overrides the interval. Test-only.
+func resetPauseWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
+	t.Helper()
+	pauseWarnMu.Lock()
+	pauseWarnLastUnix.Range(func(k, _ any) bool {
+		pauseWarnLastUnix.Delete(k)
+		return true
+	})
+	pauseWarnInterval.Store(intervalSeconds)
+	pauseWarnMu.Unlock()
+}
 
 // MessageFn produces a commit message for one event + its ops. Phase 1
 // callers pass DeterministicMessage; Phase 5 swaps in an AI-backed
