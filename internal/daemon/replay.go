@@ -58,10 +58,23 @@ type ReplayOpts struct {
 	GitDir string
 
 	// Limit caps the number of events drained per call. 0 = no limit.
+	//
+	// The run loop sets Limit = DefaultReplayLimit so each replay pass returns
+	// to the daemon promptly enough to claim flush_requests, refresh the
+	// heartbeat, and observe shutdown. ReplaySummary.HasMore signals whether
+	// the queue still contains pending work so the run loop can schedule an
+	// immediate follow-up wake instead of waiting for the next poll tick.
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
 }
+
+// DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
+// budget the daemon yields control back to the run loop so flush_requests,
+// heartbeat refreshes, and shutdown signals are not starved by a long queue.
+// ReplaySummary.HasMore tells the run loop whether to fire another pass
+// immediately.
+const DefaultReplayLimit = 64
 
 // ReplaySummary describes one drain.
 type ReplaySummary struct {
@@ -70,6 +83,11 @@ type ReplaySummary struct {
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
 	Skipped   bool // replay drain was intentionally skipped before reading events
+	// HasMore is true when ReplayOpts.Limit capped the batch and at least one
+	// additional pending event was visible beyond the cap. The run loop uses
+	// this to schedule an immediate follow-up replay pass without waiting for
+	// the next poll tick. Always false when Limit <= 0 (unbounded drain).
+	HasMore bool
 }
 
 // Replay drains pending capture_events for the active branch into commits.
