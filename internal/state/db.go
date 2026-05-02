@@ -13,8 +13,19 @@ import (
 
 	// modernc.org/sqlite is the pure-Go driver mandated by D16 (zero cgo).
 	// Do not switch to mattn/go-sqlite3 — that pulls cgo and breaks the
-	// CGO_ENABLED=0 cross-compile target.
-	_ "modernc.org/sqlite"
+	// CGO_ENABLED=0 cross-compile target. Imported as `sqlite` (not blank)
+	// so isSQLiteLocked can match against the typed *sqlite.Error returned
+	// by the driver in addition to the substring fallback.
+	sqlite "modernc.org/sqlite"
+)
+
+// SQLite primary result codes we care about for retry logic. Defined locally
+// to avoid pulling in the much larger modernc.org/sqlite/lib package; the
+// public sqlite3 numeric protocol fixes these values, see
+// https://www.sqlite.org/rescode.html.
+const (
+	sqliteResultBusy   = 5 // SQLITE_BUSY
+	sqliteResultLocked = 6 // SQLITE_LOCKED
 )
 
 // driverName is registered by the modernc.org/sqlite blank import above.
@@ -48,6 +59,14 @@ func (d *DB) Path() string { return d.path }
 func (d *DB) SQL() *sql.DB { return d.conn }
 
 func (d *DB) readSQL() *sql.DB { return d.readConn }
+
+// ReadSQL returns the read-only handle backed by the multi-connection read
+// pool. Exposed so adjacent packages (e.g. internal/daemon) can route status
+// and inventory queries off the single-connection writer pool. The writer
+// holds a serialized lock during long replay batches; reads issued against
+// d.SQL() block behind that lock and starve heartbeat / capture writes.
+// Callers must not run schema-changing statements through this handle.
+func (d *DB) ReadSQL() *sql.DB { return d.readConn }
 
 // Close releases the underlying database handle. Safe to call multiple times;
 // the second call returns the original close error.
@@ -217,12 +236,33 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 	return nil
 }
 
+// isSQLiteLocked reports whether err represents SQLite contention that
+// callers should retry (SQLITE_BUSY / SQLITE_LOCKED, including the
+// SHARED_CACHE extended-result variants). Detection is layered:
+//
+//  1. Typed match against *sqlite.Error via errors.As — robust against
+//     localization or future driver-level message reformatting; covers both
+//     the primary codes and any extended bits in the upper byte.
+//  2. Substring fallback — preserves the historical behavior so wrapped
+//     errors that have lost the typed sentinel (e.g. across an RPC boundary
+//     or a custom error wrapper that stringifies) are still retried.
 func isSQLiteLocked(err error) bool {
 	if err == nil {
 		return false
 	}
+	var serr *sqlite.Error
+	if errors.As(err, &serr) {
+		// Extended result codes pack additional context in the upper byte;
+		// the primary code is the low 8 bits per the sqlite3 protocol.
+		primary := serr.Code() & 0xff
+		if primary == sqliteResultBusy || primary == sqliteResultLocked {
+			return true
+		}
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY") ||
+		strings.Contains(msg, "SQLITE_LOCKED")
 }
 
 // UserVersion reads the SQLite PRAGMA user_version from the open database.

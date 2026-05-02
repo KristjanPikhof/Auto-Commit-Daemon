@@ -41,6 +41,51 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 	return nil
 }
 
+// MetaSetMany upserts multiple daemon_meta key/value pairs in a single
+// transaction. All rows share the same updated_ts timestamp (now) so they are
+// observed atomically by readers — either every key in the batch is present
+// at the new value, or none of them are.
+//
+// The single-transaction shape matters at runtime: the daemon's per-tick run
+// loop frequently stamps 2-4 small meta keys back-to-back (e.g. fsnotify
+// diagnostics, operation-in-progress transitions, branch-token transitions).
+// Under SQLite's busy_timeout=5s, each individual MetaSet call may block on
+// a contending writer; stacking N back-to-back calls per tick can amplify a
+// single contention episode into N×5s = up to 30s tick latency. Folding the
+// stamps into one transaction collapses N busy retries into 1.
+//
+// Empty pairs is a no-op. Empty keys are rejected (matches MetaSet
+// validation). The transaction is rolled back on any per-key error so the
+// daemon never observes a half-applied batch.
+func MetaSetMany(ctx context.Context, d *DB, pairs map[string]string) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	for k := range pairs {
+		if k == "" {
+			return fmt.Errorf("state: MetaSetMany: empty key")
+		}
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: meta set many: begin tx: %w", err)
+	}
+	const q = `
+INSERT INTO daemon_meta(key, value, updated_ts) VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`
+	ts := nowSeconds()
+	for k, v := range pairs {
+		if _, err := tx.ExecContext(ctx, q, k, v, ts); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("state: meta set many %q: %w", k, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: meta set many: commit: %w", err)
+	}
+	return nil
+}
+
 // MetaSetJSON marshals value as JSON and stores it under key in daemon_meta.
 func MetaSetJSON(ctx context.Context, d *DB, key string, value any) error {
 	b, err := json.Marshal(value)

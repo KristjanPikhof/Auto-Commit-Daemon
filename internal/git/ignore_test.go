@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -255,4 +256,116 @@ func dumpAllStacks() string {
 	buf := make([]byte, 1<<16)
 	n := runtime.Stack(buf, true)
 	return string(buf[:n])
+}
+
+// TestIgnoreChecker_CloseDoesNotHangOnWedgedSubprocess proves that
+// IgnoreChecker.Close returns within killWaitTimeout + a small slack
+// budget even when the underlying subprocess refuses to exit.
+//
+// We simulate a D-state / NFS-stuck process via the waitFn test seam: the
+// real cmd is replaced with a stub Wait that blocks on a never-fired
+// channel. This is more reliable cross-platform than trying to spawn an
+// uninterruptible-sleep process. Close must:
+//
+//  1. Cancel the subprocess context atomically (not under c.mu).
+//  2. Time out the Wait at killWaitTimeout and proceed.
+//  3. Return; the goroutine running waitFn is leaked but the daemon
+//     shutdown path is unblocked.
+func TestIgnoreChecker_CloseDoesNotHangOnWedgedSubprocess(t *testing.T) {
+	dir := initRepo(t)
+	writeGitignore(t, dir, "*.log\n")
+
+	// Replace waitFn with a stub that hangs indefinitely until the test
+	// ends. Restore on cleanup so other tests (and parallel runs of this
+	// one in -count=N) see a fresh seam.
+	hang := make(chan struct{})
+	var hangOnce sync.Once
+	releaseHang := func() { hangOnce.Do(func() { close(hang) }) }
+	t.Cleanup(releaseHang)
+
+	prevWait := waitFn.Load()
+	stub := func(_ *exec.Cmd) error {
+		<-hang
+		return nil
+	}
+	waitFn.Store(&stub)
+	t.Cleanup(func() { waitFn.Store(prevWait) })
+
+	checker := NewIgnoreChecker(dir)
+	// Drive the subprocess to spawn so cmd is non-nil at Close time.
+	if _, err := checker.Check(context.Background(), []string{"a.log"}); err != nil {
+		t.Fatalf("seed check: %v", err)
+	}
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		closed <- checker.Close()
+	}()
+
+	select {
+	case err := <-closed:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("Close returned err: %v", err)
+		}
+		// Allow up to 1s of scheduler slack on top of killWaitTimeout
+		// (2s) so a stressed CI runner doesn't flake.
+		if elapsed > killWaitTimeout+1500*time.Millisecond {
+			t.Fatalf("Close took %v; want <= %v", elapsed, killWaitTimeout+1500*time.Millisecond)
+		}
+	case <-time.After(killWaitTimeout + 3*time.Second):
+		t.Fatalf("Close did not return within %v — wedged-subprocess teardown regressed", killWaitTimeout+3*time.Second)
+	}
+
+	// Releasing the hang lets the leaked goroutine drain so the test
+	// doesn't trip the race detector's goroutine-leak warning at exit.
+	releaseHang()
+}
+
+// TestIgnoreChecker_ConcurrentCloseAndCheckDoesNotDeadlock proves the
+// atomic cancel split: a Close racing a Check that is mid-Wait inside
+// killLocked must not deadlock behind c.mu. Pre-fix, Close took c.mu and
+// blocked on Check's mu-bound killLocked Wait; with the atomic cancel
+// pulled out of mu, Close fires the cancel immediately and the Wait
+// unblocks via SIGTERM/pipe-closure.
+func TestIgnoreChecker_ConcurrentCloseAndCheckDoesNotDeadlock(t *testing.T) {
+	dir := initRepo(t)
+	writeGitignore(t, dir, "*.log\n")
+	checker := NewIgnoreChecker(dir)
+
+	// Prime the subprocess so subsequent Checks reuse it.
+	if _, err := checker.Check(context.Background(), []string{"a.log"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, _ = checker.Check(ctx, []string{"a.log", "b.log"})
+		}()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		// Small jitter so Close lands while at least some Checks are
+		// in flight.
+		time.Sleep(5 * time.Millisecond)
+		done <- checker.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Close deadlocked behind Check (mu-bound cancel regressed)\n%s", dumpAllStacks())
+	}
+	wg.Wait()
 }

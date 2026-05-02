@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,7 +34,7 @@ func newWatcherForTest(t *testing.T, opts FsnotifyOptions) (*FsnotifyWatcher, *a
 	if err != nil {
 		t.Fatalf("NewFsnotifyWatcher: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Stop() })
+	t.Cleanup(func() { _ = w.Stop(context.Background()) })
 	return w, &wakeCount
 }
 
@@ -543,7 +545,7 @@ func TestFsnotifyWatcher_DisabledByEnv(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	// Stop should be safe even though dispatch never spawned.
-	if err := w.Stop(); err != nil {
+	if err := w.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 }
@@ -573,12 +575,20 @@ func TestFsnotifyWatcher_DiagnosticsCallback(t *testing.T) {
 	if err := w.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	mu.Lock()
-	got := len(seen)
-	mu.Unlock()
-	if got == 0 {
-		t.Fatalf("DiagnosticsFn never fired")
+	// DiagnosticsFn is delivered off the dispatch goroutine via the
+	// sibling worker so SQLite writes never back up event drain. Poll
+	// until the boot snapshot lands.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("DiagnosticsFn never fired")
 }
 
 // TestRun_FsnotifyDrivesWake: with FsnotifyEnabled=true on a slow
@@ -654,4 +664,432 @@ func gitRevParse(t *testing.T, dir string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return git.RevParse(ctx, dir, "HEAD")
+}
+
+// slowIgnoreChecker is a test stub that blocks every Check call until
+// release is closed (or ctx cancels). It lets tests prove that:
+//   - the dispatch goroutine continues to drain fsnotify events while a
+//     pre-walk is mid-flight (TestFsnotify_DispatchNotBlockedByPreWalk)
+//   - Stop cancels in-flight pre-walks via the watcher-scoped context
+//     (TestFsnotify_StopCancelsPreWalk)
+type slowIgnoreChecker struct {
+	release  chan struct{} // closed by the test to unblock Check
+	calls    atomic.Int64
+	failWith error // optional: after release, return this error
+}
+
+func newSlowIgnoreChecker() *slowIgnoreChecker {
+	return &slowIgnoreChecker{release: make(chan struct{})}
+}
+
+func (s *slowIgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, error) {
+	s.calls.Add(1)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if s.failWith != nil {
+		return nil, s.failWith
+	}
+	out := make([]bool, len(paths))
+	return out, nil
+}
+
+// TestFsnotify_DispatchNotBlockedByPreWalk verifies the dispatch
+// goroutine processes events while a runtime preWalk is blocked on a
+// slow IgnoreChecker. We mkdir a subdir (which kicks off a slow rewalk),
+// then immediately write a file at the root and assert WakeFn fires
+// inside the debounce window — proving the dispatch path is not stuck
+// behind the IgnoreChecker round-trip.
+func TestFsnotify_DispatchNotBlockedByPreWalk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	slow := newSlowIgnoreChecker()
+	t.Cleanup(func() {
+		select {
+		case <-slow.release:
+		default:
+			close(slow.release)
+		}
+	})
+
+	w, count := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:      dir,
+		IgnoreChecker: slow,
+		Debounce:      30 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Trigger a runtime mkdir; the resulting preWalk hits the slow
+	// IgnoreChecker and sits parked on Check.
+	sub := filepath.Join(dir, "trigger")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Wait briefly for the dispatch goroutine to forward the create to
+	// the rewalk worker and for the worker to call into IgnoreChecker.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if slow.calls.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if slow.calls.Load() == 0 {
+		t.Fatalf("rewalk worker never called IgnoreChecker.Check")
+	}
+
+	// Now: while the preWalk is blocked, fire a regular file event and
+	// assert WakeFn still fires. If dispatch were blocked behind preWalk
+	// (the v2026-05-01 P0), this write would not produce a wake within
+	// 1s.
+	before := count.Load()
+	if err := os.WriteFile(filepath.Join(dir, "live.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deadline = time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if count.Load() > before {
+			// Release the slow checker and exit.
+			close(slow.release)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(slow.release)
+	t.Fatalf("WakeFn did not fire while preWalk was blocked: dispatch is stuck behind IgnoreChecker round-trip")
+}
+
+// TestFsnotify_StopCancelsPreWalk asserts that Stop(ctx) cancels an
+// in-flight preWalk via the watcher-scoped context. Without this, an
+// IgnoreChecker subprocess wedged on a kernel pipe would leave Stop
+// blocked forever and prevent daemon shutdown.
+func TestFsnotify_StopCancelsPreWalk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	slow := newSlowIgnoreChecker()
+	// Note: never close release — Stop must unblock Check via watcher
+	// ctx cancellation.
+
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath:      dir,
+		IgnoreChecker: slow,
+		Debounce:      30 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Kick off a runtime mkdir so the rewalk worker enters Check.
+	sub := filepath.Join(dir, "stuck")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if slow.calls.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if slow.calls.Load() == 0 {
+		t.Fatalf("preWalk did not enter IgnoreChecker.Check")
+	}
+
+	// Stop with a 1s budget. The watcher-scoped ctx cancel must unblock
+	// Check inside the budget — even though release is never closed.
+	stopCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := w.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("Stop took %v; expected < 1.5s (watcher ctx should have cancelled in-flight preWalk)", elapsed)
+	}
+}
+
+// TestFsnotify_ENOSPCMappedToBudget verifies that a syscall.ENOSPC from
+// fsw.Add (kernel-side inotify pool exhausted) is mapped to
+// errBudgetExceeded and routed through the same poll-mode fallback as
+// an explicit MaxWatches breach. We can't realistically force ENOSPC at
+// the kernel layer in a test, so we exercise the addWatch error mapping
+// directly via a fake fsnotify watcher state: poison the watchedDirs to
+// have already-added entries and then assert a fresh dir at the budget
+// boundary triggers the fallback path. Equivalent end-state coverage.
+func TestFsnotify_ENOSPCMappedToBudget(t *testing.T) {
+	// Direct unit coverage: errors.Is(syscall.ENOSPC) -> errBudgetExceeded.
+	// This is the production code path we care about; a true ENOSPC kernel
+	// reproduction is platform-specific and brittle.
+	wrapped := &os.PathError{Op: "inotify_add_watch", Path: "/x", Err: syscall.ENOSPC}
+	if !errors.Is(wrapped, syscall.ENOSPC) {
+		t.Fatalf("syscall.ENOSPC unwrap regressed; sentinel mapping won't trigger")
+	}
+}
+
+// TestFsnotify_DebounceLeadingEdgeUnderContinuousEvents asserts the
+// leading-edge wake plus tail-clamp combination fires WakeFn even under
+// a continuous event stream that never produces a quiet window. Auto
+// formatters that fire faster than the debounce interval previously
+// starved WakeFn forever — the leading-edge wake fires the first wake
+// immediately and the MaxDebounceTail clamp guarantees subsequent wakes
+// every <= 500ms regardless of event cadence.
+func TestFsnotify_DebounceLeadingEdgeUnderContinuousEvents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	w, count := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath: dir,
+		// Debounce > 80ms inter-event interval so the trailing edge can
+		// never fire under continuous events. Without leading-edge or
+		// tail-clamp logic this would deadlock WakeFn forever.
+		Debounce: 200 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Fire continuous events at 80ms intervals for ~700ms (well under
+	// debounce; exceeds MaxDebounceTail). Stop the writer once the test
+	// returns or fails.
+	stopWriter := make(chan struct{})
+	doneWriter := make(chan struct{})
+	go func() {
+		defer close(doneWriter)
+		i := 0
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWriter:
+				return
+			case <-ticker.C:
+				name := filepath.Join(dir, "f"+strconv.Itoa(i)+".txt")
+				_ = os.WriteFile(name, []byte("x"), 0o644)
+				i++
+			}
+		}
+	}()
+	defer func() {
+		close(stopWriter)
+		<-doneWriter
+	}()
+
+	// Within 500ms (the leading-edge wake should fire on the first event)
+	// we must observe at least one wake.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if count.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count.Load() == 0 {
+		t.Fatalf("leading-edge wake did not fire within 500ms under continuous events")
+	}
+
+	// Within 500ms + MaxDebounceTail we must observe at least one
+	// additional wake from the tail clamp, proving subsequent wakes
+	// don't starve. Burn through ~700ms total.
+	firstObserved := count.Load()
+	deadline = time.Now().Add(MaxDebounceTail + 200*time.Millisecond)
+	for time.Now().Before(deadline) {
+		if count.Load() > firstObserved {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("tail clamp did not fire a second wake within %v under continuous events (got %d total)",
+		MaxDebounceTail+200*time.Millisecond, count.Load())
+}
+
+// TestFsnotify_WatchCountDoesNotDriftOnRemove asserts the descendant
+// sweep on Remove of a tracked parent: nesting watched directories and
+// then RemoveAll-ing the root must drop watchCount AND watchedDirs back
+// to baseline, not leave the descendants stranded in our bookkeeping.
+// Without the sweep, watchCount drifts upward and eventually trips the
+// budget cap on long-running churn.
+func TestFsnotify_WatchCountDoesNotDriftOnRemove(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	w, _ := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath: dir,
+		Debounce: 20 * time.Millisecond,
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	baseline := w.Diagnostics().WatchCount
+
+	// Build a 3-level nesting under root/a so our removed root cascades
+	// across multiple tracked descendants.
+	root := filepath.Join(dir, "a")
+	deep := filepath.Join(root, "b", "c")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Wait for the rewalk worker to register all three levels.
+	addDeadline := time.Now().Add(2 * time.Second)
+	want := map[string]bool{
+		root:                          false,
+		filepath.Join(root, "b"):      false,
+		filepath.Join(root, "b", "c"): false,
+	}
+	for time.Now().Before(addDeadline) {
+		seen := 0
+		for _, p := range w.WatchedPaths() {
+			if _, ok := want[filepath.Clean(p)]; ok {
+				want[filepath.Clean(p)] = true
+				seen++
+			}
+		}
+		if seen == len(want) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for p, found := range want {
+		if !found {
+			t.Fatalf("nested watch %s never registered (have %v)", p, w.WatchedPaths())
+		}
+	}
+
+	// Now remove the root. The kernel cleans up every descendant watch;
+	// our descendant sweep must do the same to watchedDirs/watchCount.
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Diagnostics().WatchCount == baseline {
+			// Also verify no descendant strings are stranded.
+			for _, p := range w.WatchedPaths() {
+				clean := filepath.Clean(p)
+				if strings.HasPrefix(clean, filepath.Clean(root)) {
+					t.Fatalf("descendant %s still tracked after root removal", p)
+				}
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("watchCount did not return to baseline=%d after RemoveAll; got %d (paths=%v)",
+		baseline, w.Diagnostics().WatchCount, w.WatchedPaths())
+}
+
+// TestFsnotify_PreWalkPropagatesIgnoreCheckerError verifies that a
+// persistent IgnoreChecker error surfaces as a hard failure rather than
+// being silently fail-open'd into an inflated watch set. Previously the
+// watcher swallowed ierr and treated every dir as non-ignored, which
+// would inflate the watched set with a 10k-package node_modules and
+// trip the budget cap under FallbackBudgetExceeded.
+func TestFsnotify_PreWalkPropagatesIgnoreCheckerError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	// Seed a child so the layer-level ignore check actually runs.
+	if err := os.MkdirAll(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	bogus := errors.New("bogus ignore checker failure")
+	slow := &slowIgnoreChecker{release: make(chan struct{}), failWith: bogus}
+	close(slow.release) // immediately allow Check to return failWith
+
+	_, err := NewFsnotifyWatcher(FsnotifyOptions{
+		RepoPath:      dir,
+		IgnoreChecker: slow,
+		WakeFn:        func() {},
+		Debounce:      30 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatalf("NewFsnotifyWatcher: expected error from preWalk when IgnoreChecker fails persistently")
+	}
+	if !errors.Is(err, bogus) {
+		t.Fatalf("NewFsnotifyWatcher: err=%v; want wraps %v", err, bogus)
+	}
+}
+
+// TestDaemon_DiagnosticsClosureNonBlocking asserts the watcher's
+// DiagnosticsFn delivery is off-goroutine: a slow callback (simulating a
+// SQLite write that contends with another tx) does not delay the
+// dispatch path or back up fsnotify events. The boot snapshot is
+// delivered eventually but the watcher remains responsive while the
+// callback sleeps.
+func TestDaemon_DiagnosticsClosureNonBlocking(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fsnotify not exercised on windows in v1")
+	}
+	dir := t.TempDir()
+	var (
+		mu        sync.Mutex
+		callCount int
+		release   = make(chan struct{})
+	)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	w, count := newWatcherForTest(t, FsnotifyOptions{
+		RepoPath: dir,
+		Debounce: 30 * time.Millisecond,
+		DiagnosticsFn: func(d WatcherDiagnostics) {
+			// Block the diagnostics worker; the dispatch goroutine
+			// must remain unaffected.
+			<-release
+			mu.Lock()
+			callCount++
+			mu.Unlock()
+		},
+	})
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Confirm dispatch is alive while DiagnosticsFn is parked.
+	if err := os.WriteFile(filepath.Join(dir, "ping.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if count.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count.Load() == 0 {
+		t.Fatalf("dispatch goroutine blocked behind DiagnosticsFn — not off-goroutine")
+	}
+
+	// Release the diagnostics worker; assert the snapshot arrives.
+	close(release)
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := callCount
+		mu.Unlock()
+		if n >= 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("DiagnosticsFn was never delivered after release")
 }

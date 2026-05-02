@@ -58,6 +58,69 @@ ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
 	return nil
 }
 
+// AppendShadowBatch upserts a batch of ShadowPath rows in a single
+// transaction with a reused prepared statement, so bootstrap reseeds avoid
+// the per-row begin/commit fsync overhead of UpsertShadowPath. The whole
+// batch commits atomically — a context cancel mid-batch leaves shadow_paths
+// untouched (deferred Rollback runs because Commit was never reached).
+//
+// Sensitive paths must already have been filtered by the caller; this helper
+// does not consult sensitive.go on each row. Empty batches are a no-op.
+//
+// Required fields per row: BranchRef, Path, BaseHead, Operation, Fidelity.
+// UpdatedTS defaults to nowSeconds() when zero. ON CONFLICT semantics match
+// UpsertShadowPath (replace on (branch_ref, branch_generation, path)).
+func AppendShadowBatch(ctx context.Context, d *DB, rows []ShadowPath) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: begin shadow batch tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const q = `
+INSERT INTO shadow_paths(
+    branch_ref, branch_generation, path, operation, mode, oid,
+    old_path, base_head, fidelity, updated_ts
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(branch_ref, branch_generation, path) DO UPDATE SET
+    operation  = excluded.operation,
+    mode       = excluded.mode,
+    oid        = excluded.oid,
+    old_path   = excluded.old_path,
+    base_head  = excluded.base_head,
+    fidelity   = excluded.fidelity,
+    updated_ts = excluded.updated_ts`
+	stmt, err := tx.PrepareContext(ctx, q)
+	if err != nil {
+		return fmt.Errorf("state: prepare shadow batch insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for i := range rows {
+		sp := rows[i]
+		if sp.BranchRef == "" || sp.Path == "" || sp.BaseHead == "" || sp.Operation == "" || sp.Fidelity == "" {
+			return fmt.Errorf("state: AppendShadowBatch row %d: required field missing", i)
+		}
+		if sp.UpdatedTS == 0 {
+			sp.UpdatedTS = nowSeconds()
+		}
+		if _, err := stmt.ExecContext(ctx,
+			sp.BranchRef, sp.BranchGeneration, sp.Path, sp.Operation, sp.Mode, sp.OID,
+			sp.OldPath, sp.BaseHead, sp.Fidelity, sp.UpdatedTS,
+		); err != nil {
+			return fmt.Errorf("state: insert shadow batch row %d: %w", i, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: commit shadow batch tx: %w", err)
+	}
+	return nil
+}
+
 // GetShadowPath fetches one shadow row. Returns (zero, false, nil) if not
 // found. Useful for the capture diff path that asks "did we already record
 // this OID for this generation?".

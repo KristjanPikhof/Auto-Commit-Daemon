@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -9,16 +10,29 @@ import (
 // and returns the unified diff output. Used by the replay's commit-message
 // AI plugin path (§8.3).
 //
+// The output is capped at DefaultDiffCap; on overflow the partial prefix is
+// returned alongside ErrStdoutOverflow so callers can surface a truncated
+// payload or fall back to metadata-only flows.
+//
 // Either OID may be the empty tree's all-zero SHA to represent
 // creation/deletion, but most callers will use git's special "/dev/null"
 // path semantics by passing the empty string for the missing side; this
 // helper sticks to two real OIDs for now and the higher-level diff helpers
 // are introduced when the replay path lands (phase 5).
 func DiffBlobs(ctx context.Context, repoDir, oidA, oidB string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir},
+	return DiffBlobsLimited(ctx, repoDir, oidA, oidB, DefaultDiffCap)
+}
+
+// DiffBlobsLimited is DiffBlobs with an explicit stdout byte cap. A
+// maxBytes <= 0 disables the cap.
+func DiffBlobsLimited(ctx context.Context, repoDir, oidA, oidB string, maxBytes int64) (string, error) {
+	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, maxBytes,
 		"diff", "--no-color", "--no-ext-diff", oidA, oidB,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStdoutOverflow) {
+			return string(out), err
+		}
 		return "", err
 	}
 	return string(out), nil
@@ -26,12 +40,15 @@ func DiffBlobs(ctx context.Context, repoDir, oidA, oidB string) (string, error) 
 
 // DiffPath runs `git diff --no-color --no-ext-diff -- <path>` against the
 // working tree and returns the unified diff. Empty output means the path
-// matches the index.
+// matches the index. Output is capped at DefaultDiffCap.
 func DiffPath(ctx context.Context, repoDir, path string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir},
+	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, DefaultDiffCap,
 		"diff", "--no-color", "--no-ext-diff", "--", path,
 	)
 	if err != nil {
+		if errors.Is(err, ErrStdoutOverflow) {
+			return string(out), err
+		}
 		return "", err
 	}
 	return string(out), nil
@@ -39,10 +56,22 @@ func DiffPath(ctx context.Context, repoDir, path string) (string, error) {
 
 // CatFileBlob returns the bytes of a blob OID. Useful for replay's
 // "resolve many blob OIDs" path (snapshot-replay.py uses cat-file --batch
-// for this; one-off lookups go through this helper).
+// for this; one-off lookups go through this helper). Output is capped at
+// DefaultDiffCap; on overflow the prefix is returned with ErrStdoutOverflow.
 func CatFileBlob(ctx context.Context, repoDir, oid string) ([]byte, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, "cat-file", "blob", oid)
+	return CatFileBlobLimited(ctx, repoDir, oid, DefaultDiffCap)
+}
+
+// CatFileBlobLimited is CatFileBlob with an explicit stdout byte cap. A
+// maxBytes <= 0 disables the cap.
+func CatFileBlobLimited(ctx context.Context, repoDir, oid string, maxBytes int64) ([]byte, error) {
+	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, maxBytes,
+		"cat-file", "blob", oid,
+	)
 	if err != nil {
+		if errors.Is(err, ErrStdoutOverflow) {
+			return out, err
+		}
 		return nil, err
 	}
 	return out, nil

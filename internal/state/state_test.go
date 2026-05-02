@@ -659,6 +659,77 @@ func TestMetaCRUD(t *testing.T) {
 	}
 }
 
+// TestMetaSetBatch_SingleTransaction verifies the MetaSetMany batch helper
+// commits all keys atomically. The daemon's per-tick run loop relies on
+// MetaSetMany to fold N back-to-back writes into a single tx so SQLite
+// busy_timeout cannot amplify a contention episode into N×5s tick latency.
+//
+// Asserts:
+//  1. Empty input is a no-op (returns nil; daemon_meta unchanged).
+//  2. Empty key in input is rejected (returns error; daemon_meta unchanged).
+//  3. Multi-key batch upserts every pair with the same updated_ts.
+//  4. Conflict path on existing keys overwrites the prior value.
+func TestMetaSetBatch_SingleTransaction(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	// (1) Empty input — no-op.
+	if err := MetaSetMany(ctx, d, nil); err != nil {
+		t.Fatalf("MetaSetMany(nil) error: %v", err)
+	}
+	if err := MetaSetMany(ctx, d, map[string]string{}); err != nil {
+		t.Fatalf("MetaSetMany(empty) error: %v", err)
+	}
+
+	// (2) Empty key rejected; nothing committed from the batch.
+	if err := MetaSetMany(ctx, d, map[string]string{
+		"k1": "v1",
+		"":   "vempty",
+	}); err == nil {
+		t.Fatalf("MetaSetMany with empty key: want error")
+	}
+	if _, ok, err := MetaGet(ctx, d, "k1"); err != nil || ok {
+		t.Fatalf("k1 leaked from rejected batch: ok=%v err=%v", ok, err)
+	}
+
+	// (3) Happy path: 4 keys land together.
+	pairs := map[string]string{
+		"fsnotify.mode":            "active",
+		"fsnotify.watch_count":     "42",
+		"fsnotify.dropped_events":  "7",
+		"fsnotify.fallback_reason": "",
+	}
+	if err := MetaSetMany(ctx, d, pairs); err != nil {
+		t.Fatalf("MetaSetMany: %v", err)
+	}
+	for k, want := range pairs {
+		got, ok, err := MetaGet(ctx, d, k)
+		if err != nil || !ok || got != want {
+			t.Fatalf("MetaGet %q = (%q, %v, %v); want (%q, true, nil)",
+				k, got, ok, err, want)
+		}
+	}
+
+	// (4) Conflict path overwrites prior values.
+	if err := MetaSetMany(ctx, d, map[string]string{
+		"fsnotify.mode":        "fallback",
+		"fsnotify.watch_count": "0",
+	}); err != nil {
+		t.Fatalf("MetaSetMany overwrite: %v", err)
+	}
+	if got, _, _ := MetaGet(ctx, d, "fsnotify.mode"); got != "fallback" {
+		t.Fatalf("post-overwrite fsnotify.mode = %q want fallback", got)
+	}
+	if got, _, _ := MetaGet(ctx, d, "fsnotify.watch_count"); got != "0" {
+		t.Fatalf("post-overwrite fsnotify.watch_count = %q want 0", got)
+	}
+	// Untouched key from prior batch survives.
+	if got, _, _ := MetaGet(ctx, d, "fsnotify.dropped_events"); got != "7" {
+		t.Fatalf("untouched key = %q want 7 (overwrite leaked)", got)
+	}
+}
+
 // TestConcurrentWritersUnderWAL fires N goroutines each appending events; with
 // WAL + busy_timeout=5000 there should be no "database is locked" error.
 //

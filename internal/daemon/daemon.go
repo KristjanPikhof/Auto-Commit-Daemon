@@ -63,6 +63,20 @@ const (
 // (D21). The default is DefaultClientTTL (30 minutes).
 const EnvClientTTLSeconds = "ACD_CLIENT_TTL_SECONDS"
 
+// providerCloseTimeout bounds how long Run waits for the configured AI
+// provider's Closer to return before falling back to force-kill (when the
+// closer exposes Process()) and proceeding with daemon shutdown. The
+// budget is generous enough for an LSP-style flush yet short enough that
+// SIGTERM is observed within the documented ~6s envelope.
+const providerCloseTimeout = 5 * time.Second
+
+// processExposer is implemented by subprocess-backed AI provider closers
+// so Run can force-kill the underlying process when Close hangs past
+// providerCloseTimeout.
+type processExposer interface {
+	Process() *os.Process
+}
+
 // Options configures one Run invocation.
 //
 // Required: RepoPath, GitDir, DB. Everything else has a usable default.
@@ -260,13 +274,41 @@ func Run(ctx context.Context, opts Options) error {
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
 	// by Run and Closed on graceful shutdown.
+	//
+	// closeProviderOnce bounds the closer at providerCloseTimeout. A
+	// subprocess AI provider that wedges on Close (deadlocked stdin
+	// drain, hung handshake, etc.) must not stall daemon shutdown. On
+	// timeout we attempt Process.Kill via the optional processExposer
+	// interface (subprocess plugins should expose it); otherwise we log
+	// and proceed. Either way the caller observes a bounded shutdown.
 	var providerCloser io.Closer
 	closeProviderOnce := func() {
-		if providerCloser != nil {
-			if err := providerCloser.Close(); err != nil {
+		if providerCloser == nil {
+			return
+		}
+		closer := providerCloser
+		providerCloser = nil
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- closer.Close() }()
+		select {
+		case err := <-closeDone:
+			if err != nil {
 				logger.Warn("close ai provider", "err", err.Error())
 			}
-			providerCloser = nil
+		case <-time.After(providerCloseTimeout):
+			logger.Warn("close ai provider timed out; force-killing if possible",
+				"timeout", providerCloseTimeout.String())
+			if pe, ok := closer.(processExposer); ok {
+				if proc := pe.Process(); proc != nil {
+					if err := proc.Kill(); err != nil {
+						logger.Warn("ai provider kill failed",
+							"err", err.Error())
+					}
+				}
+			}
+			// Don't wait for closeDone — by definition the goroutine
+			// is still hung. Leak it; the kernel reaps once the
+			// underlying syscall unblocks.
 		}
 	}
 	defer closeProviderOnce()
@@ -357,6 +399,19 @@ func Run(ctx context.Context, opts Options) error {
 		logger.Warn("sweep orphan acked flush requests", "err", err.Error())
 	} else if n > 0 {
 		logger.Info("swept orphan acknowledged flush requests", "rows", n)
+	}
+
+	// 1b. Rewind-grace clamp. The pause marker is persisted as a wall-clock
+	// RFC3339 timestamp; if the host clock jumped forward between
+	// maybeSetRewindGrace writing the marker and the daemon restarting (or
+	// jumped backward and was later corrected), the marker can sit far
+	// beyond the configured grace window. Cap to 2*grace; legitimate values
+	// stay untouched.
+	if clamped, original, replacement, err := ClampRewindGraceAtStartup(ctx, opts.DB, now()); err != nil {
+		logger.Warn("clamp rewind grace meta at startup", "err", err.Error())
+	} else if clamped {
+		logger.Warn("clamped wall-clock-skewed rewind grace marker at startup",
+			"original", original, "replacement", replacement)
 	}
 
 	pid := os.Getpid()
@@ -548,13 +603,15 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 		diagFn := func(d WatcherDiagnostics) {
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.mode", d.Mode)
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.watch_count",
-				strconv.Itoa(d.WatchCount))
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.dropped_events",
-				strconv.Itoa(d.DroppedEvents))
-			_ = state.MetaSet(ctx, opts.DB, "fsnotify.fallback_reason",
-				d.FallbackReason)
+			// Single-tx batch so the four diagnostics are observed
+			// atomically by readers and a contending writer cannot
+			// amplify N×busy_timeout into a tick stall.
+			_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+				"fsnotify.mode":            d.Mode,
+				"fsnotify.watch_count":     strconv.Itoa(d.WatchCount),
+				"fsnotify.dropped_events":  strconv.Itoa(d.DroppedEvents),
+				"fsnotify.fallback_reason": d.FallbackReason,
+			})
 		}
 		w, err := NewFsnotifyWatcher(FsnotifyOptions{
 			RepoPath:      opts.RepoPath,
@@ -580,7 +637,13 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer func() {
 		if fsWatcher != nil {
-			_ = fsWatcher.Stop()
+			// Bound the teardown so a wedged IgnoreChecker subprocess
+			// cannot stall daemon shutdown. shutdown-lane will likely
+			// thread the outer shutdown ctx here; until then, a fixed
+			// 5s budget matches the per-layer preWalk timeout.
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = fsWatcher.Stop(stopCtx)
+			stopCancel()
 		}
 	}()
 
@@ -770,8 +833,13 @@ func Run(ctx context.Context, opts Options) error {
 			return true
 		}
 		ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
-		_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchTokenChangedAt, ts)
-		_ = state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, newToken)
+		// Single-tx batch: changedAt + token must land together so a
+		// reader between the two writes never sees a stale token paired
+		// with the new timestamp (or vice versa).
+		_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+			MetaKeyBranchTokenChangedAt: ts,
+			MetaKeyBranchToken:          newToken,
+		})
 		// Refresh HEAD for capture/replay regardless of transition kind.
 		branchRef, headOID = resolveBranch(ctx, opts.RepoPath, logger)
 		cctx.BranchRef = branchRef
@@ -1010,7 +1078,6 @@ func Run(ctx context.Context, opts Options) error {
 		// generation (their BaseHead is no longer reachable).
 		operationName, operationPaused := gitOperationInProgress(opts.GitDir)
 		if operationPaused {
-			_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
 			// Stale-marker tracking: stamp the wall-clock + HEAD the first
 			// time we see this marker, persist for diagnose, then warn
 			// periodically when both have been motionless past threshold.
@@ -1020,8 +1087,18 @@ func Run(ctx context.Context, opts Options) error {
 				opMarkerSetAt = nowTS
 				opMarkerHead = currentHead
 				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressSetAt, stamp)
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgressHead, currentHead)
+				// First-observation transition: stamp marker name +
+				// set_at + head_at atomically.
+				_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+					MetaKeyOperationInProgress:      operationName,
+					MetaKeyOperationInProgressSetAt: stamp,
+					MetaKeyOperationInProgressHead:  currentHead,
+				})
+			} else {
+				// Steady-state: only the marker name needs refreshing
+				// (no-op upsert when unchanged); set_at/head_at remain
+				// pinned to the first-observation tick.
+				_ = state.MetaSet(ctx, opts.DB, MetaKeyOperationInProgress, operationName)
 			}
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
@@ -1040,7 +1117,15 @@ func Run(ctx context.Context, opts Options) error {
 			// must run `git rebase --abort` (or remove the marker) by hand.
 			elapsed := nowTS.Sub(opMarkerSetAt)
 			if elapsed >= staleOpMarkerThreshold && currentHead == opMarkerHead {
-				if opMarkerWarnedAt.IsZero() || nowTS.Sub(opMarkerWarnedAt) >= staleOpMarkerWarnInterval {
+				// NTP-safe: nowTS.Before(opMarkerWarnedAt) catches a backward
+				// step that would otherwise leave Sub() negative and silence
+				// the warn forever. time.Time arithmetic uses monotonic
+				// readings when both operands have them, but a Time stored
+				// across boundaries that strip the monotonic clock (e.g. JSON
+				// round-trips, t.Round(0)) falls back to wall-clock and is
+				// vulnerable. Clamping cheaply covers that case.
+				sinceWarn := nowTS.Sub(opMarkerWarnedAt)
+				if opMarkerWarnedAt.IsZero() || nowTS.Before(opMarkerWarnedAt) || sinceWarn >= staleOpMarkerWarnInterval {
 					logger.Warn("operation_in_progress marker may be stale; verify git status",
 						"operation", operationName,
 						"head", currentHead,
@@ -1122,9 +1207,13 @@ func Run(ctx context.Context, opts Options) error {
 		// 4e. Drain pending flush_requests; each one triggers an immediate
 		// capture+replay cycle. The drain is bounded by flushLimit (default
 		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
-		// rest of the Run loop, and the inner loop checks ctx.Err every
-		// iteration so SIGTERM during a large drain still exits within one
-		// claim cycle (~tens of ms).
+		// rest of the Run loop, and the inner loop checks ctx.Err AND
+		// shutdownCh every iteration so SIGTERM during a large drain still
+		// exits within one claim cycle (~tens of ms). Some callers run the
+		// daemon with a non-cancelable ctx (context.Background) and expect
+		// signal delivery via shutdownCh; without the explicit shutdownCh
+		// arm here the worst-case drain (256 rows × ~30ms claim) would burn
+		// roughly 7.5s before the run loop notices the signal.
 		flushLimit := opts.FlushLimit
 		if flushLimit <= 0 {
 			flushLimit = DefaultFlushLimit
@@ -1133,6 +1222,12 @@ func Run(ctx context.Context, opts Options) error {
 		for {
 			if err := ctx.Err(); err != nil {
 				break
+			}
+			select {
+			case <-shutdownCh:
+				graceful("signal shutdown")
+				return nil
+			default:
 			}
 			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
 			if err != nil {
@@ -1185,12 +1280,24 @@ func Run(ctx context.Context, opts Options) error {
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
 		if !branchTransitionBlocked && !operationPaused && !detachedHeadPaused {
-			daemonPaus, pauseErr = daemonPauseState(ctx, opts.GitDir, opts.DB)
+			daemonPaus, pauseErr = daemonPauseStateFn(ctx, opts.GitDir, opts.DB)
 			if pauseErr != nil {
 				logger.Warn("read daemon pause state", "err", pauseErr.Error())
 			}
 		}
-		daemonPaused := pauseErr == nil && daemonPaus.Active
+		// Fail CLOSED on pause-state read errors. A transient SQLite read
+		// error on daemon_meta.replay.paused_until — or any other error
+		// surfaced by daemonPauseState that wasn't already softened to a
+		// fail-open warning inside the helper (ErrMalformed,
+		// ErrNonRegularSource on the disk marker) — must NOT be treated as
+		// "no pause active". Otherwise a flaky DB read or a partial-write
+		// during operator surgery could let capture/replay silently chew
+		// through the queue while the operator believes replay is paused.
+		// The existing on-disk-marker softening in daemonPauseState is
+		// intentional (a corrupt JSON marker should not wedge replay
+		// forever); the SQLite-side fail-closed here is the dual: when we
+		// genuinely cannot answer "is replay paused?", assume yes.
+		daemonPaused := pauseErr != nil || daemonPaus.Active
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
 		} else if operationPaused {
@@ -1286,6 +1393,10 @@ func Run(ctx context.Context, opts Options) error {
 					emptyCount = 0
 				}
 			}
+			// Bound the unresolved-fingerprint dedup map. Tied to the
+			// sweep tick so growth is bounded by sweep cadence rather
+			// than letting the map drift forever in long-lived daemons.
+			_ = sweepFingerprintWarnMap()
 			lastSweep = nowTS
 
 			// 4i. Self-terminate gate.
@@ -1417,21 +1528,26 @@ func gitOperationInProgress(gitDir string) (string, bool) {
 		if _, err := os.Stat(filepath.Join(gitDir, marker.path)); err == nil {
 			return marker.name, true
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return marker.name, true
+			// A non-ErrNotExist stat error (EACCES, EIO, transient
+			// filesystem hiccup) MUST NOT latch capture/replay into
+			// permanent pause. The previous implementation returned
+			// (name, true) on any such error, which meant a single
+			// EACCES on .git/MERGE_HEAD wedged the daemon forever (no
+			// auto-clear path; only the reverse "marker absent" branch
+			// in the run loop clears the operation gate). Treat the
+			// marker as absent for this tick — the next tick will
+			// re-stat and observe whatever state actually exists.
+			//
+			// We log via slog.Default rather than a closure-bound
+			// logger so this helper stays pure and easy to call from
+			// tests; the run loop's own pause/resume warns will still
+			// surface a real operation if the marker really is there.
+			slog.Default().Warn("git operation marker stat error; treating as absent for this tick",
+				"marker", marker.path, "err", err.Error())
+			continue
 		}
 	}
 	return "", false
-}
-
-// gitDirEnsureSubdir is a tiny helper to ensure a subdir exists under
-// .git/acd. Used by callers that want to write auxiliary files alongside
-// daemon.lock without re-implementing the mkdir-then-open dance.
-func gitDirEnsureSubdir(gitDir, sub string) (string, error) {
-	dir := filepath.Join(gitDir, stateSubdir, sub)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	return dir, nil
 }
 
 // openCentralStats opens (or creates) the central stats.db at the given
@@ -1518,7 +1634,3 @@ WHERE status = 'acknowledged'
 	}
 	return n, nil
 }
-
-// (un)used helpers retained for future phases — keep the symbol exported so
-// the test build doesn't drop them on compile.
-var _ = gitDirEnsureSubdir

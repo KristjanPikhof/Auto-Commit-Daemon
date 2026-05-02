@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -335,6 +337,96 @@ func TestSweepClients_TOCTOU_DoesNotEvictFreshRow(t *testing.T) {
 	}
 	if dropped {
 		t.Fatalf("row with replaced pid was evicted; pid TOCTOU guard failed")
+	}
+}
+
+// TestRefcount_FingerprintWarnMapBounded pins the dedup map's eviction
+// behaviour. Inserting more than fingerprintWarnCap distinct (session_id,
+// pid) pairs followed by a sweepFingerprintWarnMap call must drop the map
+// size back at or below fingerprintWarnCap. Before the bound was added the
+// underlying sync.Map grew forever in long-lived daemons attached to
+// churning peer fleets.
+func TestRefcount_FingerprintWarnMapBounded(t *testing.T) {
+	// Reset shared state so prior tests in the package don't poison the
+	// dedup map. The map is package-level on purpose (one daemon per
+	// process); within tests we treat it as a singleton with explicit
+	// resets.
+	unresolvedFingerprintMu.Lock()
+	unresolvedFingerprintWarnings = make(map[string]fingerprintWarnEntry)
+	unresolvedFingerprintMu.Unlock()
+
+	const insertN = 2000
+	for i := 0; i < insertN; i++ {
+		sess := "sess-" + strconv.Itoa(i)
+		logFingerprintUnresolved(sess, i, errors.New("ps unresolvable"))
+	}
+
+	unresolvedFingerprintMu.Lock()
+	preSweep := len(unresolvedFingerprintWarnings)
+	unresolvedFingerprintMu.Unlock()
+	if preSweep != insertN {
+		t.Fatalf("pre-sweep size=%d want %d (dedup logic regression)", preSweep, insertN)
+	}
+
+	post := sweepFingerprintWarnMap()
+	if post > fingerprintWarnCap {
+		t.Fatalf("post-sweep size=%d exceeds cap %d", post, fingerprintWarnCap)
+	}
+	// Eviction batch must be at least fingerprintWarnEvictBatch when
+	// over-cap so a stuck-at-cap state cannot happen.
+	if post > fingerprintWarnCap {
+		t.Fatalf("post-sweep size=%d still over cap %d", post, fingerprintWarnCap)
+	}
+	if want := insertN - fingerprintWarnEvictBatch; post != want && post != fingerprintWarnCap {
+		// Tolerate either exact eviction count or hard cap (both are
+		// valid post-sweep shapes). Fail only on truly unbounded growth.
+		if post > fingerprintWarnCap {
+			t.Fatalf("post-sweep size=%d unbounded; want <=%d", post, fingerprintWarnCap)
+		}
+	}
+
+	// A second sweep at-or-below cap is a no-op.
+	post2 := sweepFingerprintWarnMap()
+	if post2 != post {
+		t.Fatalf("second sweep mutated size: %d -> %d", post, post2)
+	}
+}
+
+// TestRefcount_FingerprintWarnEvictsOldestFirst pins eviction order: the
+// oldest entries (by insertion time) must drop first. Without this, the
+// "alarm under investigation" budget the cap implicitly grants can be lost
+// to the noisier never-resolves clients.
+func TestRefcount_FingerprintWarnEvictsOldestFirst(t *testing.T) {
+	unresolvedFingerprintMu.Lock()
+	unresolvedFingerprintWarnings = make(map[string]fingerprintWarnEntry)
+	unresolvedFingerprintMu.Unlock()
+
+	// Pre-populate to just over cap with monotonically increasing
+	// timestamps so eviction order is deterministic.
+	now := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	const n = fingerprintWarnCap + 100
+	unresolvedFingerprintMu.Lock()
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("sess-%04d:%d", i, i)
+		unresolvedFingerprintWarnings[key] = fingerprintWarnEntry{
+			insertedAt: now.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	unresolvedFingerprintMu.Unlock()
+
+	_ = sweepFingerprintWarnMap()
+
+	// The earliest-inserted N entries (where N = at least
+	// fingerprintWarnEvictBatch when over cap) must be gone.
+	unresolvedFingerprintMu.Lock()
+	defer unresolvedFingerprintMu.Unlock()
+	if _, present := unresolvedFingerprintWarnings["sess-0000:0"]; present {
+		t.Fatalf("oldest entry survived sweep")
+	}
+	// A recent entry (near the end) should still be present.
+	recent := fmt.Sprintf("sess-%04d:%d", n-1, n-1)
+	if _, present := unresolvedFingerprintWarnings[recent]; !present {
+		t.Fatalf("most recent entry %q evicted before older entries", recent)
 	}
 }
 

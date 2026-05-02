@@ -17,10 +17,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -28,6 +31,73 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
+
+// v2randFloat64 wraps math/rand/v2.Float64 so the package-level rngFloat64
+// hook can replace it in tests without dragging the rand/v2 import into
+// every file that needs deterministic jitter.
+func v2randFloat64() float64 { return mathrand.Float64() }
+
+// pauseWarnLimiter coalesces repeated "malformed pause marker" / "invalid
+// rewind grace" warnings to one emission per minute per (process, key).
+// daemonPauseState runs on every replay pass; without throttling, a single
+// stale or corrupt value emits a warn line every tick (sub-second cadence
+// under fsnotify churn) and floods the operator's logs.
+//
+// Mirrors the pendingCapWarnLimiter pattern in capture.go: time-based, NTP-
+// safe (clock backward → reset gate and emit), test-overridable interval.
+var (
+	pauseWarnMu       sync.Mutex
+	pauseWarnLastUnix sync.Map // key string → *atomic.Int64 (unix seconds)
+	pauseWarnInterval atomic.Int64
+	pauseWarnNowFn    atomic.Pointer[func() time.Time]
+)
+
+const pauseWarnDefaultInterval = 60 // seconds
+
+func pauseWarnNow() time.Time {
+	if fn := pauseWarnNowFn.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return time.Now()
+}
+
+func pauseWarnIntervalSeconds() int64 {
+	if v := pauseWarnInterval.Load(); v > 0 {
+		return v
+	}
+	return pauseWarnDefaultInterval
+}
+
+// shouldEmitPauseWarn returns true at most once per interval per key.
+func shouldEmitPauseWarn(key string) bool {
+	pauseWarnMu.Lock()
+	defer pauseWarnMu.Unlock()
+	now := pauseWarnNow().Unix()
+	stored, _ := pauseWarnLastUnix.LoadOrStore(key, &atomic.Int64{})
+	last := stored.(*atomic.Int64).Load()
+	interval := pauseWarnIntervalSeconds()
+	if now < last { // NTP backward step (strict; same-second still throttles)
+		stored.(*atomic.Int64).Store(now)
+		return true
+	}
+	if now-last < interval {
+		return false
+	}
+	stored.(*atomic.Int64).Store(now)
+	return true
+}
+
+// resetPauseWarnForTest clears all keys and overrides the interval. Test-only.
+func resetPauseWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
+	t.Helper()
+	pauseWarnMu.Lock()
+	pauseWarnLastUnix.Range(func(k, _ any) bool {
+		pauseWarnLastUnix.Delete(k)
+		return true
+	})
+	pauseWarnInterval.Store(intervalSeconds)
+	pauseWarnMu.Unlock()
+}
 
 // MessageFn produces a commit message for one event + its ops. Phase 1
 // callers pass DeterministicMessage; Phase 5 swaps in an AI-backed
@@ -247,12 +317,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if strings.Contains(reason, "branch ref mismatch") {
 				errorClass = replayErrorRefMissing
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			if err := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: errorClass,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			return sum, nil
@@ -264,12 +336,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		if len(ops) == 0 {
 			// No ops to apply — mark failed, do not block the queue.
-			markFailed(ctx, db, ev, replayIssue{
+			if err := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorValidation,
 				Message:    "no ops attached",
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, "no ops attached", nil)
 			sum.Failed++
 			continue
@@ -277,12 +351,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 
 		// Validate before touching the index.
 		if msg := validateOps(ops); msg != "" {
-			markFailed(ctx, db, ev, replayIssue{
+			if err := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorValidation,
 				Message:    msg,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, msg, nil)
 			sum.Failed++
 			continue
@@ -333,12 +409,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				})
 				continue
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			if err := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorBeforeStateMismatch,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			// Halt the batch: subsequent events were captured assuming
@@ -347,20 +425,26 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Apply ops to the isolated index and write a tree. We split this
-		// out from commit-tree so we can short-circuit a parallel-create
-		// no-op: when an external committer already produced the same
-		// tree on top of `parent`, the resulting tree OID matches
-		// `parent`'s tree and we settle the event as already-published
-		// without minting an empty commit.
-		treeOID, err := applyOpsAndWriteTree(ctx, repoRoot, indexFile, ops)
+		// Per-event timeout. write-tree, commit-tree, and update-ref are
+		// the heavy git ops in this loop; a pathological worktree (giant
+		// rename, GC contention, network alternates) could otherwise stall
+		// a single event for minutes and starve flush_requests / shutdown
+		// signals waiting on the run loop. Each event gets a 60s budget
+		// inherited from the caller's ctx; on timeout the event is marked
+		// failed and the batch halts so the next pass starts fresh. Tests
+		// override the budget via replayPerEventTimeoutForTest.
+		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
-			markFailed(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); markErr != nil {
+				return sum, markErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			return sum, nil
@@ -377,6 +461,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// per event would fork an extra git subprocess for every queued
 		// row in the steady state.
 		if parentTree != "" && treeOID == parentTree {
+			cancelEvent()
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
 				return sum, err
 			}
@@ -398,14 +483,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Build the commit on top of the new tree.
-		commitOID, err := buildCommitFromTree(ctx, repoRoot, treeOID, parent, ev, ops, msgFn)
+		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn)
 		if err != nil {
-			markFailed(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); markErr != nil {
+				return sum, markErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			// Halt the batch: a commit-build failure leaves `parent`
@@ -422,7 +510,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := updateReplayRefWithRetry(ctx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+		if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
 			// CAS exhausted. Before declaring conflict, give the
 			// idempotent path one shot: an external committer may have
 			// landed identical content between our write-tree and our
@@ -436,9 +524,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// against further movement).
 			headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, parent, ops)
 			if probeErr != nil {
+				cancelEvent()
 				return sum, probeErr
 			}
 			if alreadyPublished {
+				cancelEvent()
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
 					return sum, err
 				}
@@ -477,14 +567,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if expected == "" {
 				expected = oldOID
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if recErr := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCASFail,
 				Expected:   expected,
 				Actual:     actual,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); recErr != nil {
+				return sum, recErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, map[string]any{
 				"expected_sha": expected,
 				"actual_sha":   actual,
@@ -494,6 +587,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Settle the event row + publish_state.
+		cancelEvent()
 		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
 			return sum, err
 		}
@@ -526,6 +620,51 @@ var replayUpdateRefBackoffs = []time.Duration{
 	50 * time.Millisecond,
 	100 * time.Millisecond,
 	200 * time.Millisecond,
+}
+
+// DefaultReplayPerEventTimeout caps the heavy git work for a single replay
+// event (write-tree, commit-tree, update-ref retries). A pathological
+// worktree (multi-GB rename, foreign object database, GC contention) could
+// otherwise stall the run loop for minutes per event and starve flush
+// requests, heartbeat refreshes, and shutdown signals. On timeout the
+// per-event deadline fires inside the inner git op, the event is marked
+// failed/blocked, and the batch halts so the next pass starts fresh.
+const DefaultReplayPerEventTimeout = 60 * time.Second
+
+var replayPerEventTimeoutOverride atomic.Int64 // nanoseconds, 0 = use default
+
+func perEventTimeout() time.Duration {
+	if v := replayPerEventTimeoutOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return DefaultReplayPerEventTimeout
+}
+
+// replayUpdateRefJitter applies jittered backoff to update-ref retries.
+// Co-located daemons retrying the same ref at fixed 50/100/200ms cadences
+// re-collide on every retry; ±25% jitter (uniform) breaks the lockstep so
+// neighbours fan out across the wall-clock window. Tests pin a
+// deterministic source via replayUpdateRefJitterFn.
+var replayUpdateRefJitterFn atomic.Pointer[func(time.Duration) time.Duration]
+
+const replayUpdateRefJitterFraction = 0.25
+
+func defaultUpdateRefJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// math/rand/v2.Float64() ∈ [0,1). Map to [-fraction, +fraction).
+	delta := (rngFloat64()*2 - 1) * replayUpdateRefJitterFraction
+	jittered := time.Duration(float64(d) * (1 + delta))
+	if jittered <= 0 {
+		jittered = d / 2 // floor: never sleep zero or negative
+	}
+	return jittered
+}
+
+// rngFloat64 indirects math/rand/v2.Float64 so tests can pin determinism.
+var rngFloat64 = func() float64 {
+	return v2randFloat64()
 }
 
 type replayPause struct {
@@ -577,7 +716,9 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 		case ok:
 			paused, err := markerPauseState(marker, now)
 			if err != nil {
-				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+				if shouldEmitPauseWarn("invalid_pause_marker") {
+					slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
+				}
 			} else if paused.Active {
 				return paused, nil
 			}
@@ -593,7 +734,9 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 	}
 	until, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
 	if err != nil {
-		slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		if shouldEmitPauseWarn("invalid_rewind_grace") {
+			slog.Default().Warn("ignoring invalid rewind grace pause", "value", raw, "err", err.Error())
+		}
 		return replayPause{}, nil
 	}
 	if !until.After(now) {
@@ -663,7 +806,12 @@ func updateReplayRefWithRetry(
 		if finalAttempt {
 			return err
 		}
-		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
+		jitter := defaultUpdateRefJitter
+		if fn := replayUpdateRefJitterFn.Load(); fn != nil && *fn != nil {
+			jitter = *fn
+		}
+		backoff := jitter(replayUpdateRefBackoffs[attempt-1])
+		if sleepErr := replayUpdateRefSleep(ctx, backoff); sleepErr != nil {
 			return sleepErr
 		}
 	}
@@ -1121,20 +1269,43 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 	return nil
 }
 
+// state-mutation seams for tests. Production wires straight through to the
+// state package; tests override these to inject persistence failures and
+// assert that markFailed/recordConflict propagate the error rather than
+// swallow it (which would leave the row pending and replay forever).
+var (
+	markEventPublishedFn = state.MarkEventPublished
+	markEventBlockedFn   = state.MarkEventBlocked
+)
+
+// daemonPauseStateFn is a test-only seam for the run loop's pause gate.
+// Production callers invoke daemonPauseState directly; the run loop uses
+// this indirection so a test can assert that a transient SQLite/state read
+// error causes capture/replay to fail CLOSED (treated as paused) rather
+// than fail open (treated as not paused, draining the queue while the
+// operator believes replay is paused).
+var daemonPauseStateFn = daemonPauseState
+
 // markFailed flags an event as terminally failed and records the reason.
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
-// will not re-attempt it. Best-effort: persistence failures here do not
-// propagate.
-func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue) {
+// will not re-attempt it. Returns a non-nil error when the terminal-state
+// write to capture_events fails: swallowing the error would leave the
+// event in `pending` and the next pass would replay it forever. The
+// caller is expected to surface the error to the run loop so the
+// scheduler can back off rather than spin retry-storming the same row.
+func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue) error {
 	if issue.Message == "" {
 		issue.Message = "replay failed"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	_ = state.MarkEventPublished(ctx, db,
+	if err := markEventPublishedFn(ctx, db,
 		ev.Seq, state.EventStateFailed,
 		sql.NullString{}, sql.NullString{String: issue.Message, Valid: true},
-		ev.Message, nowSec)
+		ev.Message, nowSec); err != nil {
+		return fmt.Errorf("daemon: mark failed seq=%d: %w", ev.Seq, err)
+	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
+	return nil
 }
 
 // recordConflict terminally settles the event in
@@ -1147,17 +1318,26 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue 
 // every subsequent poll, so a stuck event no longer blocks the queue with
 // retry churn. Operators see the row via `acd status` (blocked_conflicts
 // count) and via daemon_meta.last_replay_conflict for the human message.
-func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, cctx CaptureContext) {
+//
+// Returns a non-nil error when MarkEventBlocked fails. Swallowing it would
+// leave the event in `pending`, so PendingEvents would resurface it on the
+// next pass and replay would loop forever on a row the daemon already
+// classified as terminally broken. The caller surfaces the error to the
+// run loop so the scheduler can back off.
+func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, cctx CaptureContext) error {
 	if issue.Message == "" {
 		issue.Message = "replay conflict"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	_ = state.MarkEventBlocked(ctx, db, ev.Seq, issue.Message, nowSec,
+	if err := markEventBlockedFn(ctx, db, ev.Seq, issue.Message, nowSec,
 		sql.NullString{String: cctx.BranchRef, Valid: true},
 		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		sql.NullString{String: cctx.BaseHead, Valid: true},
-	)
+	); err != nil {
+		return fmt.Errorf("daemon: mark blocked seq=%d: %w", ev.Seq, err)
+	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
+	return nil
 }
 
 const (

@@ -918,3 +918,86 @@ func TestCapture_ClassifyIgnoredBatched_RespectsCap(t *testing.T) {
 		t.Fatalf("len(results)=%d, len(paths)=%d — must be 1:1", len(results), len(paths))
 	}
 }
+
+// TestCapture_AcdTopLevelPathNotPruned is the P0 regression for the
+// worktree walker pruning a literal top-level "acd/" directory. The
+// daemon's state subdir lives at <gitDir>/acd, never at <worktree>/acd,
+// so a user repo that contains a real "acd/" directory at its root must
+// be walked and its files captured. The previous walker pruned by name
+// match, silently dropping every file under "acd/" — classify then
+// emitted phantom delete events and replay deleted real user files.
+func TestCapture_AcdTopLevelPathNotPruned(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Create a worktree-rooted "acd/" directory with a real file inside,
+	// plus a nested file deeper in the tree to exercise descent.
+	acdDir := filepath.Join(f.dir, "acd")
+	if err := os.MkdirAll(filepath.Join(acdDir, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir acd/nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(acdDir, "foo.txt"), []byte("user file 1"), 0o644); err != nil {
+		t.Fatalf("write acd/foo.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(acdDir, "nested", "bar.txt"), []byte("user file 2"), 0o644); err != nil {
+		t.Fatalf("write acd/nested/bar.txt: %v", err)
+	}
+
+	f.firstCapture(t)
+
+	ops := pendingOps(t, f.db)
+	wantPaths := map[string]bool{
+		"acd/foo.txt":        false,
+		"acd/nested/bar.txt": false,
+	}
+	for _, op := range ops {
+		if _, ok := wantPaths[op.Path]; ok {
+			if op.Op != "create" {
+				t.Fatalf("path %q: got op %q, want %q (all=%+v)", op.Path, op.Op, "create", ops)
+			}
+			wantPaths[op.Path] = true
+		}
+	}
+	for p, seen := range wantPaths {
+		if !seen {
+			t.Fatalf("expected create event for %q, not pruned by stale stateSubdir match (all=%+v)", p, ops)
+		}
+	}
+}
+
+// TestCapture_NTPStepBackwardDoesNotSilenceWarn proves that an NTP backward
+// step (or any wall-clock rewind) does NOT permanently silence the
+// pending-cap warn. Pre-fix the gate compared `now-last < interval` with
+// signed int64 arithmetic; if `last` was set when the clock was ahead and
+// then NTP stepped back, every subsequent comparison evaluated true and
+// suppressed the warn forever.
+//
+// Setup: stamp `last` 5 minutes in the future (simulating a clock rewind),
+// then call shouldEmitPendingCapWarn with `now` representing the corrected
+// time. The gate must fire (clamp + emit) instead of staying suppressed.
+func TestCapture_NTPStepBackwardDoesNotSilenceWarn(t *testing.T) {
+	resetPendingCapWarnForTest(t, 60)
+	defer resetPendingCapWarnForTest(t, 0)
+
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	future := now.Add(5 * time.Minute)
+
+	// Stamp `last` 5 minutes ahead — simulates the situation where the wall
+	// clock was running fast, we recorded a warn, and then NTP stepped the
+	// clock backward.
+	pendingCapWarnLastUnix.Store(future.Unix())
+
+	// Override the time source for shouldEmitPendingCapWarn to return `now`.
+	fn := func() time.Time { return now }
+	wrapped := fn
+	pendingCapNowFn.Store(&wrapped)
+	defer pendingCapNowFn.Store(nil)
+
+	if !shouldEmitPendingCapWarn() {
+		t.Fatal("NTP backward step silenced pending-cap warn forever; clamp missing")
+	}
+	// The clamp should have rewritten last to `now` so a follow-up immediately
+	// after the same now is suppressed (interval throttling still in force).
+	if shouldEmitPendingCapWarn() {
+		t.Fatal("interval throttling broken after clamp")
+	}
+}

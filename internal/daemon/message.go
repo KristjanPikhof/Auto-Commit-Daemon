@@ -46,9 +46,11 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -72,6 +74,24 @@ func diffEgressOptIn() bool {
 // "missing side" OID when synthesising create/delete diffs so we can
 // always pass two real OIDs to `git diff`.
 const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+// DefaultDiffBlobsTimeout caps the wall-clock time spent on a single
+// `git diff <before> <after>` call inside BuildOpsDiff. A pathological
+// blob (giant binary, repacked alternates) can otherwise stall the
+// commit-message rendering pass long enough to starve replay; 5s is
+// short enough to fall back to header-only without operator-visible
+// latency, long enough that ordinary text diffs always succeed. Tests
+// override via diffBlobsTimeoutOverride.
+const DefaultDiffBlobsTimeout = 5 * time.Second
+
+var diffBlobsTimeoutOverride atomic.Int64 // nanoseconds, 0 = use default
+
+func diffBlobsTimeout() time.Duration {
+	if v := diffBlobsTimeoutOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return DefaultDiffBlobsTimeout
+}
 
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
@@ -349,12 +369,42 @@ func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error
 		return hdr.String(), nil
 	}
 
-	body, err := git.DiffBlobs(ctx, repoRoot, s.beforeOID, s.afterOID)
+	// Per-DiffBlobs deadline. A pathological blob (multi-MB binary, hostile
+	// repacked archive) can otherwise stall `git diff` long enough to
+	// starve the entire BuildOpsDiff pass. 5s per op caps the wall-clock
+	// cost; on timeout we fall back to header-only for THIS op only —
+	// other ops in the same multi-op event still render. The cap is
+	// enforced at the git layer via DiffBlobsLimited so an oversize blob
+	// truncates at ai.DiffCap rather than after we've already buffered the
+	// full payload.
+	// Per-op git-layer cap. ai.DiffCap (4 KiB) is the AI provider budget
+	// applied via cappedDiffBuffer at the BuildOpsDiff outer layer; we
+	// give git 2× that so the preamble + first hunk never starve the
+	// rendered diff (git's `diff --git` + `index` + `--- /dev/null` +
+	// `+++` headers can eat ~200 bytes before the first hunk lands).
+	// Without the headroom, a giant blob's git output gets truncated mid-
+	// preamble and the outer buffer never reaches its cap, letting later
+	// ops render past the budget. The legacy code used DefaultDiffCap
+	// (1 MiB) so this is a tighten, not a regression.
+	const perOpGitCap = int64(ai.DiffCap * 2)
+	diffCtx, cancel := context.WithTimeout(ctx, diffBlobsTimeout())
+	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, perOpGitCap)
+	cancel()
 	if err != nil {
-		// Best-effort: when git refuses (missing blob, foreign archive),
-		// fall back to header-only so the model still sees the change
-		// shape.
-		return hdr.String(), nil
+		// ErrStdoutOverflow is an expected outcome for large diffs: the
+		// git-layer cap enforcement returns the prefix bytes alongside
+		// the sentinel. Keep the prefix so downstream cappedDiffBuffer
+		// still sees a real body (the legacy code relied on a 1 MiB git
+		// cap + 4 KiB buffer cap to truncate at the buffer; we now cap
+		// at the git layer for the same effect).
+		//
+		// Any other error (missing blob, foreign archive, per-op
+		// deadline) falls through to header-only so the model still sees
+		// the change shape rather than mid-hunk garbage from a stalled
+		// subprocess.
+		if !errors.Is(err, git.ErrStdoutOverflow) {
+			return hdr.String(), nil
+		}
 	}
 	body = stripGitDiffPreamble(body)
 

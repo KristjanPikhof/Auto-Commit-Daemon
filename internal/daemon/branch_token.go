@@ -401,3 +401,49 @@ func resolveRewindGrace() time.Duration {
 	}
 	return time.Duration(secs) * time.Second
 }
+
+// ClampRewindGraceAtStartup defends against wall-clock rewinds. The grace
+// marker is persisted as an absolute RFC3339 timestamp, so a backward NTP
+// step (or a clock that was set wrong before crash and corrected at boot)
+// can leave the persisted `paused_until` arbitrarily far in the future. We
+// cap any persisted value to at most `2 * grace` ahead of `now`; legitimate
+// markers are always within `grace` of now and remain untouched.
+//
+// Returns (clamped, original, replacement) when a rewrite occurred so callers
+// can log the transition. clamped=false means the marker was absent, in range,
+// already expired, or unparseable.
+//
+// Best-effort: any DB / parse failure short-circuits with the corresponding
+// error and the marker is left as-is.
+func ClampRewindGraceAtStartup(ctx context.Context, db *state.DB, now time.Time) (clamped bool, original, replacement string, err error) {
+	grace := resolveRewindGrace()
+	if grace <= 0 {
+		return false, "", "", nil
+	}
+	raw, ok, gerr := state.MetaGet(ctx, db, MetaKeyReplayPausedUntil)
+	if gerr != nil {
+		return false, "", "", fmt.Errorf("daemon: read replay pause meta: %w", gerr)
+	}
+	if !ok {
+		return false, "", "", nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false, "", "", nil
+	}
+	until, perr := time.Parse(time.RFC3339, trimmed)
+	if perr != nil {
+		// Malformed values are handled (and warned about) by the
+		// replay/branch-token paths; do not rewrite from here.
+		return false, raw, "", nil
+	}
+	maxAhead := now.UTC().Add(2 * grace)
+	if !until.UTC().After(maxAhead) {
+		return false, raw, "", nil
+	}
+	replacement = now.UTC().Add(grace).Format(time.RFC3339)
+	if serr := state.MetaSet(ctx, db, MetaKeyReplayPausedUntil, replacement); serr != nil {
+		return false, raw, "", fmt.Errorf("daemon: clamp replay pause meta: %w", serr)
+	}
+	return true, raw, replacement, nil
+}

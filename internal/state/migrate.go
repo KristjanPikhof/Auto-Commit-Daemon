@@ -11,6 +11,8 @@ import (
 // v1 was the first acd release. v2 adds idempotent indexes through schemaDDL.
 // v3 adds idx_capture_events_barrier (a covering index that keeps the
 // PendingEvents barrier subquery off a full-table scan during long pauses).
+// v4 adds idx_flush_requests_status_id so ClaimNextFlushRequest's
+// pending-by-id scan stays index-backed after long uptime.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //

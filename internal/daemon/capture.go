@@ -239,12 +239,32 @@ func pendingCapWarnIntervalSeconds() int64 {
 // shouldEmitPendingCapWarn returns true when the rate-limited token says it
 // is time to emit a fresh slog.Warn. Concurrent capture passes serialize
 // under pendingCapWarnMu so we never race two warns through the gate.
+//
+// NTP-safe: an NTP backward step would otherwise leave (now-last) negative,
+// which compares as < interval forever and silences the warn. We clamp two
+// ways:
+//
+//  1. now <= last → the clock ran backwards (or we're in the same second);
+//     reset last to now and emit so a stuck warn becomes unstuck on the next
+//     capture pass.
+//  2. last is more than `2 * interval` in the future relative to now — this
+//     can only happen when last was stamped before a bigger backward step.
+//     Reset and emit.
 func shouldEmitPendingCapWarn() bool {
 	pendingCapWarnMu.Lock()
 	defer pendingCapWarnMu.Unlock()
 	now := pendingCapWarnNow().Unix()
 	last := pendingCapWarnLastUnix.Load()
-	if now-last < pendingCapWarnIntervalSeconds() {
+	interval := pendingCapWarnIntervalSeconds()
+	// NTP backward step: clock went STRICTLY back so `last` is now in the
+	// future. Reset the gate and emit so a stuck warn does not stay
+	// suppressed. We use strict `<` (not `<=`) so same-second re-entry
+	// still throttles correctly.
+	if now < last {
+		pendingCapWarnLastUnix.Store(now)
+		return true
+	}
+	if now-last < interval {
 		return false
 	}
 	pendingCapWarnLastUnix.Store(now)
@@ -908,15 +928,21 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 					continue
 				}
 
-				// Always step around our own state subdir + .git, regardless
-				// of depth. The tokens only ever exist as top-level
-				// components, but the cheap topComponent slice keeps the
-				// check identical to the previous DFS implementation.
+				// Always step around .git, regardless of depth. The token
+				// only ever exists as a top-level component, but the cheap
+				// topComponent slice keeps the check identical to the
+				// previous DFS implementation. Our own state lives at
+				// <gitDir>/acd, which is inside .git and never reachable as
+				// a worktree-rooted top component, so we deliberately do
+				// NOT prune top-level "acd/" — that would silently delete
+				// user repos containing a literal acd/ directory.
+				// TODO: if state ever lives outside .git, prune by
+				// comparing the absolute path against gitDir/stateSubdir.
 				topComponent := childRel
 				if i := strings.IndexByte(childRel, '/'); i >= 0 {
 					topComponent = childRel[:i]
 				}
-				if topComponent == ".git" || topComponent == stateSubdir {
+				if topComponent == ".git" {
 					continue
 				}
 

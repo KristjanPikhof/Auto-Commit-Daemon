@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -217,6 +218,40 @@ func TestCaptureSelf_AsymmetricWithCapture(t *testing.T) {
 		t.Fatalf("expected CaptureSelf and Capture argv hashes to differ "+
 			"(NUL-joined vs ps space-joined); both = %s. "+
 			"If this is now legitimate, audit daemon.go fingerprint stamping.", self.ArgvHash)
+	}
+}
+
+// TestIdentity_PSInvokedWithAbsolutePath proves the fingerprint-capture
+// path uses a hardcoded absolute path to `ps` rather than relying on PATH
+// resolution. PATH-based lookup is forgeable: an attacker who can prepend
+// a writable directory to PATH could ship a shim `ps` binary that
+// reproduces an arbitrary process's start-time + argv hash, defeating the
+// PID-recycle defense in identity.Match.
+//
+// Per-platform contract:
+//
+//   - darwin: /bin/ps (base system, stable across releases).
+//   - linux:  /usr/bin/ps (procps-ng package, stable across distros).
+func TestIdentity_PSInvokedWithAbsolutePath(t *testing.T) {
+	t.Parallel()
+	if !filepath.IsAbs(psBinary) {
+		t.Fatalf("psBinary=%q is not absolute; PATH lookup is forgeable", psBinary)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if psBinary != "/bin/ps" {
+			t.Fatalf("darwin psBinary=%q want /bin/ps", psBinary)
+		}
+	case "linux":
+		if psBinary != "/usr/bin/ps" {
+			t.Fatalf("linux psBinary=%q want /usr/bin/ps", psBinary)
+		}
+	default:
+		t.Skipf("unsupported GOOS=%s", runtime.GOOS)
+	}
+	// Sanity check: the binary actually exists on the test host.
+	if _, err := os.Stat(psBinary); err != nil {
+		t.Fatalf("hardcoded psBinary %q missing on host: %v", psBinary, err)
 	}
 }
 

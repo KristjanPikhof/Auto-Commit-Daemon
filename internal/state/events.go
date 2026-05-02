@@ -194,7 +194,7 @@ ORDER BY e.seq ASC`
 		q += " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := d.conn.QueryContext(ctx, q, args...)
+	rows, err := d.readSQL().QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("state: query pending events: %w", err)
 	}
@@ -221,7 +221,7 @@ ORDER BY e.seq ASC`
 // pending depth.
 func CountEventsByState(ctx context.Context, d *DB, state string) (int, error) {
 	var n int
-	if err := d.conn.QueryRowContext(ctx,
+	if err := d.readSQL().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state).Scan(&n); err != nil {
 		return 0, fmt.Errorf("state: count events by state: %w", err)
 	}
@@ -326,7 +326,7 @@ func LoadCaptureOps(ctx context.Context, d *DB, seq int64) ([]CaptureOp, error) 
 SELECT event_seq, ord, op, path, old_path,
        before_oid, before_mode, after_oid, after_mode, fidelity
 FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
-	rows, err := d.conn.QueryContext(ctx, q, seq)
+	rows, err := d.readSQL().QueryContext(ctx, q, seq)
 	if err != nil {
 		return nil, fmt.Errorf("state: query capture ops: %w", err)
 	}
@@ -418,7 +418,7 @@ WHERE state IN ('blocked_conflict', 'failed')
 // rollup window query.
 func LatestEventSeq(ctx context.Context, d *DB) (int64, error) {
 	var seq sql.NullInt64
-	err := d.conn.QueryRowContext(ctx, `SELECT MAX(seq) FROM capture_events`).Scan(&seq)
+	err := d.readSQL().QueryRowContext(ctx, `SELECT MAX(seq) FROM capture_events`).Scan(&seq)
 	if err != nil {
 		return 0, fmt.Errorf("state: latest event seq: %w", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,16 @@ import (
 	"sync"
 	"time"
 )
+
+// gzipCloseWait bounds how long Close blocks waiting for in-flight
+// background gzip goroutines to finish. The actual gzip work is bounded
+// by file size and disk throughput; on a clean shutdown we want the
+// archive emitted but we will not wedge the daemon if disk I/O is stuck.
+const gzipCloseWait = 5 * time.Second
+
+// gzipFileFn is a test seam: tests substitute a slow implementation to
+// prove that rotateLocked does not block writers while gzip is in flight.
+var gzipFileFn = gzipFile
 
 // rotatingWriter is an io.Writer + io.Closer that owns a single active
 // log file and rotates it in place when it exceeds maxSize. Rotation:
@@ -39,6 +50,10 @@ type rotatingWriter struct {
 	maxBackups int
 	maxAgeDays int
 	closed     bool
+	// gzipWG tracks background gzip goroutines spawned by rotateLocked so
+	// Close can wait briefly for them to finish; the bound is gzipCloseWait
+	// so a wedged disk does not stall daemon shutdown.
+	gzipWG sync.WaitGroup
 }
 
 // newRotatingWriter opens path in append mode, primes the in-memory size
@@ -79,20 +94,41 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 }
 
 // Close releases the active file. After Close the writer rejects further
-// Writes with os.ErrClosed.
+// Writes with os.ErrClosed. Close briefly waits (bounded by
+// gzipCloseWait) for any in-flight background gzip goroutines so the
+// archive on disk reflects the final rotated content; if the wait
+// expires (e.g. wedged disk I/O) Close proceeds anyway and the
+// goroutines are leaked — they finish whenever the kernel unblocks
+// them.
 func (w *rotatingWriter) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.closed {
+		w.mu.Unlock()
 		return nil
 	}
 	w.closed = true
-	if w.file == nil {
-		return nil
+	var fileErr error
+	if w.file != nil {
+		fileErr = w.file.Close()
+		w.file = nil
 	}
-	err := w.file.Close()
-	w.file = nil
-	return err
+	w.mu.Unlock()
+
+	// Wait for background gzip goroutines off-mutex so a writer that
+	// races Close cannot deadlock behind us. Bound the wait so a wedged
+	// disk does not stall daemon shutdown.
+	done := make(chan struct{})
+	go func() {
+		w.gzipWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(gzipCloseWait):
+		slog.Warn("logger: in-flight gzip did not finish; proceeding with close",
+			"timeout", gzipCloseWait.String())
+	}
+	return fileErr
 }
 
 // openFile (re)opens the active log in append mode. Append mode means
@@ -113,9 +149,27 @@ func (w *rotatingWriter) openFile() error {
 	return nil
 }
 
-// rotateLocked performs steps 1-4 from the type comment. Caller must
-// hold w.mu.
+// rotateLocked performs the synchronous portion of rotation: close the
+// active file, shift existing .N.gz backups outward, rename the just-
+// closed active file to a unique temp name, and open a fresh active
+// file. Gzipping the renamed temp file to .1.gz happens in a background
+// goroutine so concurrent slog Writes never block on compression of
+// multi-MB log files. Caller must hold w.mu.
+//
+// Concurrency model: when rotation N+1 starts while rotation N's gzip is
+// still in flight, the per-rotation temp filename keeps the source file
+// distinct, but both rotations target `.1.gz`. To avoid collision we
+// serialize the gzip + shift step inside the goroutine via the
+// gzipWG.Wait barrier at the head of rotateLocked. This means a *second*
+// rotation does block writers while waiting for the *prior* gzip — but
+// that is rare in practice (rotations only fire on size threshold) and
+// strictly bounded by disk throughput, not by the active file's size.
 func (w *rotatingWriter) rotateLocked() error {
+	// Drain any prior in-flight gzip before we shift backups. Without
+	// this, a back-to-back rotation could try to rename .1.gz → .2.gz
+	// while the previous rotation's goroutine is still writing .1.gz.
+	w.gzipWG.Wait()
+
 	if err := w.file.Close(); err != nil {
 		return err
 	}
@@ -127,25 +181,45 @@ func (w *rotatingWriter) rotateLocked() error {
 		return err
 	}
 
-	// Compress the just-rotated active file to .1.gz. We rename the
-	// active file to a temp name first so a crash mid-gzip leaves the
-	// old plaintext readable rather than producing a half-written .gz.
-	tmp := w.path + ".rotating"
+	// Rename the just-closed active file to a unique temp name. Unique
+	// per rotation so an in-flight gzip on a prior temp cannot collide.
+	// A crash mid-gzip leaves the .rotating file readable rather than a
+	// half-written .gz.
+	tmp := fmt.Sprintf("%s.rotating-%d", w.path, time.Now().UnixNano())
+	dst := w.path + ".1.gz"
+	renamed := true
 	if err := os.Rename(w.path, tmp); err != nil {
-		// If the active file vanished (someone else cleaned up), we still
-		// want to open a fresh one rather than fail the write entirely.
 		if !os.IsNotExist(err) {
 			return err
 		}
-	} else {
-		if err := gzipFile(tmp, w.path+".1.gz"); err != nil {
-			return err
+		renamed = false
+	}
+
+	// Open the fresh active file BEFORE returning so the next Write can
+	// proceed immediately.
+	if err := w.openFile(); err != nil {
+		// Best-effort cleanup of the orphan temp; the caller will see
+		// the openFile error.
+		if renamed {
+			_ = os.Remove(tmp)
 		}
-		_ = os.Remove(tmp)
+		return err
+	}
+
+	if renamed {
+		w.gzipWG.Add(1)
+		go func(src, dst string) {
+			defer w.gzipWG.Done()
+			if err := gzipFileFn(src, dst); err != nil {
+				slog.Warn("logger: gzip rotated log failed",
+					"src", src, "dst", dst, "err", err.Error())
+			}
+			_ = os.Remove(src)
+		}(tmp, dst)
 	}
 
 	w.pruneByAge()
-	return w.openFile()
+	return nil
 }
 
 // shiftBackups renames foo.log.N.gz → foo.log.(N+1).gz, dropping anything
