@@ -145,8 +145,9 @@ The original 145-event incident pattern is: `daemon_state.branch_ref` and queued
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after same-branch rewind detection. `0` disables the grace. |
+| `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. |
 
-`ACD_AI_SEND_DIFF` was removed. Diff egress now follows `ACD_AI_PROVIDER` selection. Setting `ACD_AI_SEND_DIFF` in environment is ignored and emits a one-shot deprecation warn-log at daemon startup.
+Diff-egress migration: `ACD_AI_SEND_DIFF` was removed. Setting it now emits a one-shot deprecation warn-log at daemon startup. See `docs/ai-providers.md` for the full opt-in semantics — the canonical source of truth for AI payload behavior.
 
 ### Trace log format
 
