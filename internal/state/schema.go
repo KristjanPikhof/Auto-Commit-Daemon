@@ -119,6 +119,12 @@ CREATE TABLE IF NOT EXISTS flush_requests(
     note             TEXT
 );
 
+-- v4: ClaimNextFlushRequest filters status='pending' and orders by id ASC.
+-- Without an index it scans the full table, which becomes expensive after a
+-- long uptime accumulates acknowledged/completed/failed rows.
+CREATE INDEX IF NOT EXISTS idx_flush_requests_status_id
+    ON flush_requests(status, id);
+
 CREATE TABLE IF NOT EXISTS publish_state(
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
     event_seq           INTEGER,
