@@ -196,8 +196,6 @@ func TestCheck_LargePathBatch_NoDeadlock(t *testing.T) {
 		t.Fatalf("payload too small to exercise pipe-buffer hazard: %d bytes", totalBytes)
 	}
 
-	gBefore := runtime.NumGoroutine()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -220,23 +218,41 @@ func TestCheck_LargePathBatch_NoDeadlock(t *testing.T) {
 		}
 	}
 
-	// Goroutine leak check: writer goroutine must not outlive Check.
-	// Allow brief settle time + a small slack to account for the test
-	// runtime itself, but flag any sustained leak that scales with n.
+	// Goroutine-leak check: scan stacks for the writer-goroutine frame
+	// inside ignore.go after a brief settle window. The previous version
+	// asserted on runtime.NumGoroutine, which is process-global and
+	// fluctuates under shared-binary test runs (especially the race-stress
+	// lane at -count=3). A targeted stack scan is deterministic: a leaked
+	// writer parks inside (*os.File).Write or chan send for the errCh,
+	// and either frame appears with `ignore.go:` in its stack.
 	deadline := time.Now().Add(2 * time.Second)
+	var leaked string
 	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= gBefore+2 {
+		if !ignoreWriterGoroutineLive() {
+			leaked = ""
 			break
 		}
+		leaked = dumpAllStacks()
 		time.Sleep(10 * time.Millisecond)
 	}
-	if g := runtime.NumGoroutine(); g > gBefore+2 {
-		// Dump goroutine stacks to aid debugging if this fires.
-		buf := make([]byte, 1<<16)
-		n := runtime.Stack(buf, true)
-		if strings.Contains(string(buf[:n]), "ignore.go") {
-			t.Fatalf("goroutine leak: before=%d after=%d\nstacks:\n%s", gBefore, g, buf[:n])
-		}
-		t.Fatalf("goroutine leak: before=%d after=%d", gBefore, g)
+	if leaked != "" {
+		t.Fatalf("ignore.go writer goroutine still live after Check returned:\n%s", leaked)
 	}
+}
+
+// ignoreWriterGoroutineLive reports whether any goroutine has a frame
+// inside the IgnoreChecker writer path. Used to assert the per-call
+// writer goroutine drains cleanly.
+func ignoreWriterGoroutineLive() bool {
+	stacks := dumpAllStacks()
+	// The writer is launched as `go func(payload []byte)` inside Check
+	// at internal/git/ignore.go. Any live goroutine with that file in
+	// its stack is the leak we care about.
+	return strings.Contains(stacks, "internal/git/ignore.go")
+}
+
+func dumpAllStacks() string {
+	buf := make([]byte, 1<<16)
+	n := runtime.Stack(buf, true)
+	return string(buf[:n])
 }
