@@ -110,6 +110,15 @@ func newDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run install + runtime diagnostics; optionally bundle as zip",
+		Long: `Run broad install and runtime diagnostics across acd state.
+
+Doctor checks the central registry, daemon liveness, harness installs, AI provider settings, safe-ignore and sensitive-glob configuration, fsnotify status, and recent daemon log tails. Use --bundle to write a zip with sanitized diagnostic files for sharing.
+
+Use acd diagnose for focused replay/branch blockers in the current repo.`,
+		Example: `  acd doctor
+  acd doctor --json
+  acd doctor --bundle
+  acd doctor --bundle --output /tmp`,
 		RunE: func(c *cobra.Command, args []string) error {
 			jsonOut, _ := c.Flags().GetBool("json")
 			bundle, _ := c.Flags().GetBool("bundle")
