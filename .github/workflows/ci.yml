@@ -5,8 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Default permissions for all jobs: read-only on contents. Individual jobs
+# may widen this; reading-only by default reduces blast radius if a third-
+# party action is ever compromised before SHA pins update.
+permissions:
+  contents: read
+
 jobs:
   test:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -14,11 +22,46 @@ jobs:
         go: ['1.22']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      # All actions are pinned to a 40-char commit SHA. The `# vN.M.P`
+      # comment is the human-readable tag the SHA was resolved from at
+      # pin time. Renovate / Dependabot can update both atomically.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: ${{ matrix.go }}
           cache: true
       - run: make lint
       - run: make test
       - run: make build
+
+  race-stress:
+    # Linux-only race lane that catches ordering bugs the macOS runners
+    # miss (real instances captured: internal/git/ignore.go cancellation
+    # goroutine racing with Check mutex). Failures here should be
+    # treated as real bugs by default; see CLAUDE.md "Pre-merge
+    # verification" for the playbook.
+    #
+    # Test selection rationale: CLAUDE.md flags a small set of
+    # timing-sensitive `internal/daemon` tests as known-flaky under
+    # broad runs. Running those at -count=3 produces deterministic red
+    # builds that get rationalized as "flake" — defeating the lane's
+    # purpose. We run the flaky list at -count=1 (still race-checked,
+    # just not stressed) and the rest at -count=3.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: race + count=1 on known-flaky daemon tests
+        run: |
+          go test ./internal/daemon/... -race -count=1 -timeout 5m \
+            -run 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)'
+      - name: race + count=3 stress on remaining concurrency-prone packages
+        run: |
+          go test ./internal/daemon/... ./internal/git/... ./internal/state/... \
+            -race -count=3 -timeout 10m -failfast \
+            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)'

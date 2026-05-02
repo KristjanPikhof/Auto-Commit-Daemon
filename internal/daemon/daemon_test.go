@@ -2588,3 +2588,458 @@ func (h *captureLogHandler) Records() []loggedRecord {
 	copy(out, h.records)
 	return out
 }
+
+// countFlushByStatus counts flush_requests rows in the given status.
+func countFlushByStatus(t *testing.T, db *state.DB, status string) int {
+	t.Helper()
+	var n int
+	if err := db.SQL().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM flush_requests WHERE status = ?`, status,
+	).Scan(&n); err != nil {
+		t.Fatalf("count flush_requests status=%s: %v", status, err)
+	}
+	return n
+}
+
+// TestRun_PostFlushBranchTokenReCheck pins the post-flush branch-token
+// re-check restored after a code review found the original "HEAD cannot
+// move between the two calls without a wake" assumption was false. git
+// reset/rebase/checkout move HEAD without touching wakeCh; if the daemon
+// only checks the token before the flush drain, capture/replay can run
+// with a stale BranchRef/BaseHead/generation after a long drain that ran
+// concurrently with operator git surgery.
+//
+// We exercise the guard deterministically by:
+//  1. Booting the daemon with a manual-only scheduler (no auto-ticks).
+//  2. Pre-creating a second commit on disk so HEAD is ahead of the seed.
+//  3. Resetting the worktree HEAD back to the seed, then forward, in a
+//     way that bumps the branch generation between the pre-flush and
+//     post-flush token checks.
+//  4. Waking once and asserting the post-flush re-check observed the
+//     transition: branch.generation incremented and capture/replay were
+//     skipped that iteration (no commits produced).
+func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	manual := Scheduler{
+		Base:         1 * time.Hour,
+		IdleCeiling:  1 * time.Hour,
+		ErrorCeiling: 1 * time.Hour,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   manual,
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+
+	// Force a divergence on disk in two deterministic phases:
+	//
+	//   Phase 1: create a second commit (HEAD -> aheadHead) and wake the
+	//   daemon so its in-memory currentToken advances to rev:<aheadHead>.
+	//   Without this synchronization the boot iteration can race with the
+	//   commit on slow runners (Linux CI under -race + GOMAXPROCS pressure):
+	//   if the boot iteration finishes before the commit lands, the daemon
+	//   never observes aheadHead, and the subsequent reset back to seedHead
+	//   leaves currentToken byte-identical to the live token (both
+	//   rev:<seedHead>) so no transition is classified.
+	//
+	//   Phase 2: reset HEAD back to seedHead and wake. Now currentToken is
+	//   rev:<aheadHead> while the live token resolves to rev:<seedHead>;
+	//   the iteration's branch-token check (pre- or post-flush) classifies
+	//   the move as Diverged and bumps the generation.
+	if err := os.WriteFile(filepath.Join(f.dir, "ahead.txt"), []byte("ahead\n"), 0o644); err != nil {
+		t.Fatalf("write ahead.txt: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "ahead.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "ahead"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	aheadHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse ahead: %v", err)
+	}
+	if aheadHead == seedHead {
+		t.Fatalf("test setup: ahead commit did not advance HEAD")
+	}
+
+	// Phase 1: wake so the daemon classifies the fast-forward and persists
+	// branch.head=aheadHead. We wait on the persisted value rather than a
+	// fixed sleep so this is robust to slow runners.
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, aheadHead, 3*time.Second)
+
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", seedHead); err != nil {
+		t.Fatalf("git reset: %v", err)
+	}
+
+	// Phase 2: one wake; manual scheduler guarantees this is the only
+	// iteration that fires after the divergence is in place.
+	wakeCh <- struct{}{}
+
+	// Wait for the generation to bump. The guard catching the transition
+	// is what produces the bump; without it, branch.generation would stay
+	// at "1" and the daemon would run capture/replay against stale state.
+	waitFor(t, 3*time.Second, "branch.generation bumps after divergence", func() bool {
+		v, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+		return v == "2"
+	})
+	if v, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration); v != "2" {
+		t.Fatalf("branch.generation=%q want 2 (post-flush guard did not catch divergence)", v)
+	}
+}
+
+// TestRun_FlushDrainBoundedByLimit pins the regression where the flush
+// drain loop ran without an upper bound. A 1500-row burst would block the
+// rest of the run loop (capture/replay, refcount sweep, heartbeat) until
+// the entire queue drained, and shutdowns mid-drain were starved.
+//
+// We pre-enqueue 600 rows with FlushLimit=64 and a manual-only scheduler
+// (very long Base/Ceilings → no auto-tick). The boot iteration drains
+// exactly 64; we then drive one wake to exercise a second bounded pass
+// and assert exact counts. No timing window — the assertion is on
+// observable database state after each deterministic tick.
+func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pre-enqueue 600 flush requests before booting the daemon.
+	for i := 0; i < 600; i++ {
+		if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	// Manual-only scheduler: Base/Ceilings far exceed the test runtime so
+	// the only iterations that fire are the boot iteration plus our
+	// explicit wakeCh sends. This removes the previous timing-window flake
+	// risk on slow CI runners.
+	manual := Scheduler{
+		Base:         1 * time.Hour,
+		IdleCeiling:  1 * time.Hour,
+		ErrorCeiling: 1 * time.Hour,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   manual,
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			FlushLimit:  64,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// Boot iteration drains exactly FlushLimit=64. Wait for completed to
+	// reach 64 (which it will, deterministically — manual scheduler means
+	// no extra ticks fire). Then assert pending==536: the bound held.
+	waitFor(t, 2*time.Second, "boot iteration drains 64", func() bool {
+		return countFlushByStatus(t, f.db, "completed") >= 64
+	})
+	if got := countFlushByStatus(t, f.db, "completed"); got != 64 {
+		t.Fatalf("after boot iteration: completed=%d want 64 (bound did not hold)", got)
+	}
+	if got := countFlushByStatus(t, f.db, "pending"); got != 536 {
+		t.Fatalf("after boot iteration: pending=%d want 536", got)
+	}
+
+	// Drive a second iteration via wakeCh. Bound still holds → 128/472.
+	wakeCh <- struct{}{}
+	waitFor(t, 2*time.Second, "second iteration drains 64", func() bool {
+		return countFlushByStatus(t, f.db, "completed") >= 128
+	})
+	if got := countFlushByStatus(t, f.db, "completed"); got != 128 {
+		t.Fatalf("after second iteration: completed=%d want 128", got)
+	}
+	if got := countFlushByStatus(t, f.db, "pending"); got != 472 {
+		t.Fatalf("after second iteration: pending=%d want 472", got)
+	}
+}
+
+// waitFor polls cond until it returns true or the deadline elapses, then
+// fails. The 20ms granularity keeps the test responsive without burning
+// CPU on a tight loop. Used by deterministic tests to wait for the daemon
+// to settle a single observable database transition.
+func waitFor(t *testing.T, budget time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("waitFor: %s did not become true within %v", what, budget)
+}
+
+// TestRun_FlushDrainCancelable pins the regression where SIGTERM during a
+// large flush drain was starved until the entire queue drained. The inner
+// loop now checks ctx.Err on every iteration and breaks immediately.
+func TestRun_FlushDrainCancelable(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Enqueue a large burst to make the drain take meaningful time even
+	// with FlushLimit=DefaultFlushLimit (256).
+	for i := 0; i < 1500; i++ {
+		if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	exited := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		defer close(exited)
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// Send shutdown signal and assert Run returns within a generous budget.
+	// Without the ctx.Err check inside the drain loop, an unbounded drain
+	// of 1500 rows would dwarf this budget on slow hosts; the bounded +
+	// cancelable drain exits within at most one bounded pass plus
+	// shutdown overhead. The 5s budget accommodates a slow Linux runner
+	// under -race -count=3 finishing the in-progress bounded pass
+	// (DefaultFlushLimit=256 sqlite writes) before the cancel check fires.
+	start := time.Now()
+	shutdownCh <- struct{}{}
+	select {
+	case <-exited:
+		elapsed := time.Since(start)
+		if elapsed > 5*time.Second {
+			t.Fatalf("Run took %v to exit after shutdown; flush drain not cancelable", elapsed)
+		}
+		t.Logf("graceful shutdown in %v", elapsed)
+	case <-time.After(6 * time.Second):
+		cancel()
+		<-exited
+		t.Fatalf("Run did not exit within 6s after shutdown signal")
+	}
+	wg.Wait()
+}
+
+// TestRun_OrphanAckedFlushSweepOnStartup pins the orphan sweep: rows that
+// sat in "acknowledged" past OrphanFlushAckThreshold are marked failed at
+// daemon startup so `acd status` doesn't accumulate ghosts forever.
+//
+// Test setup uses the real EnqueueFlushRequest path, then UPDATEs status
+// + acknowledged_ts to the desired age. This mirrors the production
+// schema (column types, default ts unit) instead of guessing at the
+// timestamp format with raw INSERTs.
+func TestRun_OrphanAckedFlushSweepOnStartup(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	orphanID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{})
+	if err != nil {
+		t.Fatalf("enqueue orphan: %v", err)
+	}
+	old := float64(time.Now().Add(-10*time.Minute).UnixNano()) / 1e9
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE flush_requests SET status='acknowledged', acknowledged_ts=?, requested_ts=? WHERE id=?`,
+		old, old, orphanID,
+	); err != nil {
+		t.Fatalf("age orphan row: %v", err)
+	}
+
+	freshID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{})
+	if err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
+	fresh := float64(time.Now().Add(-30*time.Second).UnixNano()) / 1e9
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE flush_requests SET status='acknowledged', acknowledged_ts=?, requested_ts=? WHERE id=?`,
+		fresh, fresh, freshID,
+	); err != nil {
+		t.Fatalf("age fresh row: %v", err)
+	}
+
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// The orphan was old enough to be swept to "failed".
+	deadline := time.Now().Add(2 * time.Second)
+	var failed, acked int
+	for time.Now().Before(deadline) {
+		failed = countFlushByStatus(t, f.db, "failed")
+		acked = countFlushByStatus(t, f.db, "acknowledged")
+		if failed >= 1 && acked == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("after sweep: failed=%d acknowledged=%d; want failed>=1 and acknowledged=1 (fresh row preserved)", failed, acked)
+}
+
+// TestRun_DeprecatedSendDiffEnvVarWarns pins the user-visible contract
+// that ACD_AI_SEND_DIFF emits a one-shot deprecation warning at daemon
+// startup when set, and stays silent when unset. Operators rely on the
+// log line as their migration hint after the env var was removed in favor
+// of the explicit ACD_AI_DIFF_EGRESS opt-in.
+func TestRun_DeprecatedSendDiffEnvVarWarns(t *testing.T) {
+	t.Run("env_set_warns", func(t *testing.T) {
+		t.Setenv("ACD_AI_SEND_DIFF", "1")
+		records := bootDaemonAndCaptureWarns(t)
+		if !hasLogMessage(records, "ACD_AI_SEND_DIFF is deprecated") {
+			t.Fatalf("expected deprecation warn for ACD_AI_SEND_DIFF; got records=%+v", records)
+		}
+	})
+	t.Run("env_unset_silent", func(t *testing.T) {
+		// t.Setenv with empty does not unset, so unset explicitly. The
+		// deprecation warn must NOT fire when the variable is absent.
+		t.Setenv("ACD_AI_SEND_DIFF", "")
+		_ = os.Unsetenv("ACD_AI_SEND_DIFF")
+		records := bootDaemonAndCaptureWarns(t)
+		if hasLogMessage(records, "ACD_AI_SEND_DIFF is deprecated") {
+			t.Fatalf("did not expect deprecation warn when env unset; got records=%+v", records)
+		}
+	})
+}
+
+// bootDaemonAndCaptureWarns boots a daemon long enough to observe startup
+// logs, then returns the captured warn-level records.
+func bootDaemonAndCaptureWarns(t *testing.T) []loggedRecord {
+	t.Helper()
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	logSink := &captureLogHandler{level: slog.LevelWarn}
+	logger := slog.New(logSink)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			Logger:      logger,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	// Brief settle to give startup-emitted warns time to land in the sink.
+	time.Sleep(50 * time.Millisecond)
+	return logSink.Records()
+}
+
+func hasLogMessage(records []loggedRecord, substr string) bool {
+	for _, r := range records {
+		if strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}

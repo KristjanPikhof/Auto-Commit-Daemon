@@ -2,10 +2,14 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // writeGitignore plants a .gitignore at the repo root so check-ignore has
@@ -149,3 +153,106 @@ func TestIgnoreCheckerCloseIsIdempotent(t *testing.T) {
 type simpleErr struct{ msg string }
 
 func (e *simpleErr) Error() string { return e.msg }
+
+// TestCheck_LargePathBatch_NoDeadlock pumps a payload large enough to fill
+// a macOS pipe buffer (16 KiB) on its own. Pre-fix, Check serialized as
+// "Write all paths, then read all results", which deadlocks once the
+// payload exceeds the pipe buffer because git is simultaneously blocked
+// writing stdout while the daemon never drains stdout. Post-fix, the
+// writer runs concurrently with the read loop and the call returns well
+// inside the 5s context budget. The test also asserts that no writer
+// goroutine leaks past the call.
+func TestCheck_LargePathBatch_NoDeadlock(t *testing.T) {
+	dir := initRepo(t)
+	writeGitignore(t, dir, "*.log\n")
+
+	checker := NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	// Build 802 paths averaging ~60 bytes each so the NUL-delimited
+	// stdin payload exceeds 47 KiB — comfortably past the 16 KiB macOS
+	// pipe buffer that triggers the original deadlock.
+	const n = 802
+	paths := make([]string, 0, n)
+	want := make([]bool, 0, n)
+	for i := 0; i < n; i++ {
+		// Long stable prefix so each path is ~60+ bytes.
+		base := fmt.Sprintf("deeply/nested/path/segment/that/pads/length/more/file_%05d", i)
+		if i%2 == 0 {
+			paths = append(paths, base+".log") // ignored
+			want = append(want, true)
+		} else {
+			paths = append(paths, base+".go") // not ignored
+			want = append(want, false)
+		}
+	}
+
+	// Sanity: we are actually exercising the >47 KiB regime.
+	var totalBytes int
+	for _, p := range paths {
+		totalBytes += len(p) + 1 // path + NUL
+	}
+	if totalBytes < 47*1024 {
+		t.Fatalf("payload too small to exercise pipe-buffer hazard: %d bytes", totalBytes)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	got, err := checker.Check(ctx, paths)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Check large batch: %v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("Check returned in %v — too close to 5s timeout, suggests deadlock recovery via ctx cancel", elapsed)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len mismatch: got %d want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("Check(%q) = %v, want %v", paths[i], got[i], want[i])
+		}
+	}
+
+	// Goroutine-leak check: scan stacks for the writer-goroutine frame
+	// inside ignore.go after a brief settle window. The previous version
+	// asserted on runtime.NumGoroutine, which is process-global and
+	// fluctuates under shared-binary test runs (especially the race-stress
+	// lane at -count=3). A targeted stack scan is deterministic: a leaked
+	// writer parks inside (*os.File).Write or chan send for the errCh,
+	// and either frame appears with `ignore.go:` in its stack.
+	deadline := time.Now().Add(2 * time.Second)
+	var leaked string
+	for time.Now().Before(deadline) {
+		if !ignoreWriterGoroutineLive() {
+			leaked = ""
+			break
+		}
+		leaked = dumpAllStacks()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if leaked != "" {
+		t.Fatalf("ignore.go writer goroutine still live after Check returned:\n%s", leaked)
+	}
+}
+
+// ignoreWriterGoroutineLive reports whether any goroutine has a frame
+// inside the IgnoreChecker writer path. Used to assert the per-call
+// writer goroutine drains cleanly.
+func ignoreWriterGoroutineLive() bool {
+	stacks := dumpAllStacks()
+	// The writer is launched as `go func(payload []byte)` inside Check
+	// at internal/git/ignore.go. Any live goroutine with that file in
+	// its stack is the leak we care about.
+	return strings.Contains(stacks, "internal/git/ignore.go")
+}
+
+func dumpAllStacks() string {
+	buf := make([]byte, 1<<16)
+	n := runtime.Stack(buf, true)
+	return string(buf[:n])
+}

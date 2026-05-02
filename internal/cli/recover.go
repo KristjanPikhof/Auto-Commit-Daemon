@@ -223,6 +223,29 @@ func applyRecoverPlan(ctx context.Context, stateDB string, plan *recoverPlan) er
 	}
 	plan.BackupPath = backup
 
+	// Preflight FS probes BEFORE opening a write transaction. FS syscalls
+	// (os.Lstat, parent-dir writability probe) can stall on network mounts;
+	// performing them inside an open tx would hold the write lock during the
+	// stall. If the marker is non-removable we abort here so the DB stays
+	// untouched. Without --clear-pause the marker is always preserved and we
+	// skip the removability check entirely.
+	markerExists := false
+	if plan.ManualMarkerPath != "" {
+		if info, err := os.Lstat(plan.ManualMarkerPath); err == nil {
+			markerExists = true
+			if plan.ClearPause {
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("acd recover: manual pause marker %s is not a regular file", plan.ManualMarkerPath)
+				}
+				if err := checkParentDirWritable(plan.ManualMarkerPath); err != nil {
+					return fmt.Errorf("acd recover: manual pause marker parent not writable: %w", err)
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("acd recover: stat manual pause marker %s: %w", plan.ManualMarkerPath, err)
+		}
+	}
+
 	db, err := state.Open(ctx, stateDB)
 	if err != nil {
 		return fmt.Errorf("acd recover: open state.db: %w", err)
@@ -317,29 +340,6 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 		return fmt.Errorf("acd recover: set branch head: %w", err)
 	}
 
-	// Preflight the manual pause marker handling BEFORE committing the
-	// transaction. If --clear-pause was supplied and the marker exists, verify
-	// we can remove it (regular file + writable parent directory). If the
-	// preflight fails, abort BEFORE tx.Commit so the DB stays untouched.
-	// Without --clear-pause, the marker is always preserved and we skip the
-	// removability check entirely.
-	markerExists := false
-	if plan.ManualMarkerPath != "" {
-		if info, err := os.Lstat(plan.ManualMarkerPath); err == nil {
-			markerExists = true
-			if plan.ClearPause {
-				if !info.Mode().IsRegular() {
-					return fmt.Errorf("acd recover: manual pause marker %s is not a regular file", plan.ManualMarkerPath)
-				}
-				if err := checkParentDirWritable(plan.ManualMarkerPath); err != nil {
-					return fmt.Errorf("acd recover: manual pause marker parent not writable: %w", err)
-				}
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd recover: stat manual pause marker %s: %w", plan.ManualMarkerPath, err)
-		}
-	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("acd recover: commit transaction: %w", err)
 	}
@@ -374,9 +374,10 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 }
 
 // checkParentDirWritable verifies the parent directory of path is writable by
-// the current process. Used as a preflight before tx.Commit so a known-bad
-// removability state aborts cleanly rather than leaving a retargeted DB plus
-// stale marker.
+// the current process. Used as a preflight BEFORE db.SQL().BeginTx so a
+// known-bad removability state aborts cleanly without ever opening the SQLite
+// write transaction. Slow FS syscalls on network mounts must not stall the
+// write lock.
 func checkParentDirWritable(path string) error {
 	dir := filepath.Dir(path)
 	info, err := os.Stat(dir)

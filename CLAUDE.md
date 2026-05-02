@@ -26,19 +26,24 @@ Before declaring work done, before pushing the final commit on a branch, and bef
 
 ```bash
 make lint
-make test                                                              # ./... -race -count=1
+make test                                                                                                       # ./... -race -count=1
 go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
-go test ./internal/git/... ./internal/daemon/... -race -count=3        # stress concurrency-prone packages
+go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal/pause/... ./internal/cli/... -race -count=3 -timeout 10m
 ```
 
-Why: Ubuntu CI has caught real races (e.g. `internal/git/ignore.go` cancellation goroutine racing with `Check` mutex) that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out.
+Why: Ubuntu CI has caught real races and ordering bugs that pass on a single macOS run because of timing differences. CI failure ≠ flake by default — assume race or ordering bug until ruled out. The `race-stress` lane in `.github/workflows/ci.yml` runs the broader `-count=3` set on every PR.
 
-When CI fails on a previously-green branch, do this before retrying:
+When CI fails on a previously-green branch:
 
-1. Re-read the failing test name + file:line from the log.
-2. If the failure is a `WARNING: DATA RACE` or `panic: ... nil pointer`, treat it as a real bug and fix at root cause; do not retry.
-3. If the failure is in the timing-sensitive `internal/daemon` lane (see Known issues), reproduce locally with `-count=10` before assuming flake; only retry CI after that.
-4. Cross-check against macOS-only assumptions: fsnotify event ordering, process exec timing, and `/tmp` semantics differ on Linux.
+1. Re-read failing test name + file:line from the log.
+2. `WARNING: DATA RACE` or `panic: ... nil pointer` → real bug; fix root cause; do not retry.
+3. Timing-sensitive `internal/daemon` failure → reproduce locally with `-count=10` (and `GOMAXPROCS=1 -count=50` to expose ordering hazards). Only retry CI if you cannot reproduce after both.
+4. Cross-check macOS-only assumptions: fsnotify event ordering, process exec timing, `/tmp` semantics differ on Linux.
+
+Common Linux-only failure modes seen on this codebase:
+
+- **Test-design race against boot iteration.** Test stages multiple HEAD transitions but the daemon's boot iteration may observe phase 1 *or* phase 2 depending on scheduler. Fix: `waitForMetaValue(MetaKeyBranchHead, <expected>, 3s)` between phases so each phase is observed deterministically before moving on. Pattern in `TestRun_PostFlushBranchTokenReCheck`.
+- **Real ordering bug masked by macOS scheduling.** Daemon iteration finishes before the test mutates state on macOS, hiding a missing meta-clear. On Linux the iteration races and exposes it. Don't relax the assertion — fix the production path. Example: Diverged-attached-from-detached must clear `MetaKeyDetachedHeadPaused` and `MetaKeyReplayPausedUntil` (`internal/daemon/daemon.go` Diverged branch); otherwise the dedicated reattach branch is bypassed forever once `cctx.BranchRef` is set.
 
 ## Refresh local install
 
@@ -72,14 +77,27 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 - **Replay conflict metadata is structured.** `daemon_meta.last_replay_conflict` stores JSON with `ts`, `seq`, `error_class`, `expected_sha`, `actual_sha`, `ref`, `path`, and `message`. `last_replay_conflict_legacy` mirrors the old single-line string for backward-compatible tooling.
 - **AI diff text follows provider capability.** Network providers declare `NeedsDiff=true` and receive a redacted unified diff built from `before_oid` and `after_oid` blobs (`internal/daemon/message.go::BuildOpsDiff`). `DeterministicProvider` declares `NeedsDiff=false` and receives an empty `DiffText`. Diff rendering is capped at `DiffCap` during construction.
 - **Trace logging is opt-in and best-effort.** `ACD_TRACE=1` writes JSONL decision records to `<gitDir>/acd/trace/` or `ACD_TRACE_DIR`. Trace writes never block or abort capture/replay.
+- **`walkLive` and `fsnotify_watcher.preWalk` both use BFS-by-layer ignore-prune.** Each directory layer is batch-classified via `IgnoreChecker.Check` with `ignoreCheckBatchSize=1000` paths per call before descending; ignored directories are pruned from the next frontier so subtrees like `build/`, `node_modules/`, `DerivedData/` are never readdir'd. The two paths are deliberately symmetric — divergence between them previously hid the v2026-05-01 P0 capture deadlock. Helper: `classifyIgnoredBatched` in `internal/daemon/capture.go`.
+- **`IgnoreChecker.Check` stream-pumps stdin via a writer goroutine** before entering the read loop. Single `stdin.Write` of every path would deadlock against the macOS 16 KiB pipe buffer when the batch is large. On read error the subprocess is `killLocked` and `errCh` is drained; on read success deferred write errors surface via `errCh`. Do not refactor back to a synchronous write.
+
+## Daemon run-loop invariants
+
+- **`processBranchTokenChange` runs ONCE per Run iteration.** The double-call pattern (pre-capture and post-flush) was a v2026-05-01 bug; HEAD does not move between the two calls without an explicit wake.
+- **Diverged-attached-from-detached must clear pause markers.** When `tokenBranchRef(oldToken) == ""` and the new token is attached, the Diverged branch in the run loop must `MetaDelete(MetaKeyDetachedHeadPaused)` and `clearRewindGraceMeta`. Otherwise the dedicated reattach branch (which fires only when `cctx.BranchRef == ""`) is bypassed forever once the Diverged path sets `cctx.BranchRef`.
+- **Replay budget is bounded.** `DefaultReplayLimit = 64`; `Replay` queries `Limit+1` rows, trims the extra, and sets `ReplaySummary.HasMore` to cue the next-iteration decision (immediate re-wake vs. natural tick). The run loop wires `ReplayLimit: DefaultReplayLimit` on every call.
+- **Flush drain is bounded.** `DefaultFlushLimit = 256`; the run loop resolves `flushLimit` from `opts.FlushLimit` falling back to the default. The inner drain loop checks `ctx.Err()` at the top of every iteration and breaks on cancel — SIGTERM mid-drain exits within ~100 ms.
+- **`MetaKeyBranchHead` per-tick MetaSet is value-guarded.** A closure-scoped `lastStampedBranchHead` (seeded from `persistedHead`) skips the keep-alive write when `liveHead == lastStampedBranchHead`. Idle daemons do not churn the meta table every tick.
+- **Startup orphan-acked sweep.** `sweepOrphanAckedFlushRequests` runs once at boot and marks `acknowledged` rows older than `OrphanFlushAckThreshold = 5 * time.Minute` as `failed`, so a crashed worker does not leave forever-stuck rows.
+- **`daemonPauseState` fails open on non-regular markers.** `pause.Read` returning `ErrMalformed` *or* `ErrNonRegularSource` (FIFO/socket/dir/symlink at `<gitDir>/acd/paused`) logs a warning and treats the marker as absent. Stale FIFOs do not wedge replay.
 
 ## Known issues / flaky tests
 
-- **Timing-sensitive in `internal/daemon` under broad package runs**: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, and `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` verification when diagnosing unrelated lanes, then run the full suite before merge.
+- **Timing-sensitive in `internal/daemon` under broad package runs**: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`. Prefer focused `-run` verification when diagnosing unrelated lanes, then run the full suite before merge.
+- **Multi-phase HEAD-transition tests must phase deterministically.** When a test stages two HEAD movements and asserts a transition was classified, insert `waitForMetaValue(MetaKeyBranchHead, <phase1HeadSha>, 3s)` between the phases so the daemon's boot iteration cannot race past phase 1 unobserved. Stabilization pattern applied to `TestRun_PostFlushBranchTokenReCheck` (commit `ab52b32`); skipping it produces 3-of-50 Linux flakes under `GOMAXPROCS=1 -count=50`.
 
 ## Gotchas
 
-- **`modernc.org/sqlite`** drives the DB without cgo. Pinned at `v1.36.0` to keep the `go 1.22` directive (newer sqlite needs go ≥ 1.23). Platform breakage = §17.1 risk, STOP and surface options.
+- **`modernc.org/sqlite`** drives the DB without cgo. Pinned at `v1.36.0` to keep the `go 1.22` directive (newer sqlite needs go ≥ 1.23). Platform breakage = STOP and surface options to the user; do not bump go or sqlite without explicit approval.
 - **Symlinks**: always captured as mode `120000`. Never descend into symlinked directories. Fixture: `TestCapture_SymlinkToDirAsMode120000`.
 - **Sensitive globs**: empty `ACD_SENSITIVE_GLOBS` falls back to defaults. Never let a typo open the gate.
 - **Sensitive directory pruning**: fsnotify prunes only literal sensitive directory names. Wildcard file patterns like `credentials*` are applied at file granularity so ordinary directories such as `credentials_repo` are still watched.
@@ -145,8 +163,9 @@ The original 145-event incident pattern is: `daemon_state.branch_ref` and queued
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Number of prior shadow generations retained after reseed. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string falls back to defaults. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after same-branch rewind detection. `0` disables the grace. |
+| `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. |
 
-`ACD_AI_SEND_DIFF` was removed. Diff egress now follows `ACD_AI_PROVIDER` selection. Setting `ACD_AI_SEND_DIFF` in environment is ignored and emits a one-shot deprecation warn-log at daemon startup.
+Diff-egress migration: `ACD_AI_SEND_DIFF` was removed. Setting it now emits a one-shot deprecation warn-log at daemon startup. See `docs/ai-providers.md` for the full opt-in semantics — the canonical source of truth for AI payload behavior.
 
 ### Trace log format
 

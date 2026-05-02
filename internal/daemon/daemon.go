@@ -44,6 +44,19 @@ const (
 	// attempts. The aggregator is also forced once per UTC-day boundary
 	// crossing regardless of this floor.
 	DefaultRollupInterval = 5 * time.Minute
+	// DefaultFlushLimit caps how many flush_requests are drained per
+	// run-loop iteration. A bursty enqueue (1500+ rows) must not starve
+	// other Run-loop work, and the inner drain must remain context-
+	// cancelable. Tests can override Options.FlushLimit (e.g. 1) for
+	// tighter control.
+	DefaultFlushLimit = 256
+	// OrphanFlushAckThreshold is how long a flush_request may stay in the
+	// "acknowledged" state before the daemon's startup sweep marks it
+	// "failed". Acknowledged-but-never-completed rows are an orphan from a
+	// prior daemon crash between ClaimNextFlushRequest and
+	// CompleteFlushRequest. Sweeping them at startup keeps `acd status` /
+	// queue depth metrics from accumulating ghosts forever.
+	OrphanFlushAckThreshold = 5 * time.Minute
 )
 
 // EnvClientTTLSeconds is the environment knob for ACD_CLIENT_TTL_SECONDS
@@ -156,7 +169,8 @@ type Options struct {
 	SkipSignals bool
 
 	// FlushLimit caps how many flush_requests are drained per iteration.
-	// Zero means "drain them all". Tests set it to 1 for tighter control.
+	// Zero falls back to DefaultFlushLimit (256). Tests set it to 1 for
+	// tighter control.
 	FlushLimit int
 
 	// FsnotifyEnabled turns on the recursive fsnotify watcher (D11 hybrid).
@@ -258,7 +272,7 @@ func Run(ctx context.Context, opts Options) error {
 	defer closeProviderOnce()
 
 	if _, ok := os.LookupEnv("ACD_AI_SEND_DIFF"); ok {
-		logger.Warn("ACD_AI_SEND_DIFF is deprecated and ignored; diff egress is now controlled by ACD_AI_PROVIDER",
+		logger.Warn("ACD_AI_SEND_DIFF is deprecated and ignored; diff egress is now opt-in via ACD_AI_DIFF_EGRESS=1",
 			slog.String("env", "ACD_AI_SEND_DIFF"))
 	}
 
@@ -283,7 +297,21 @@ func Run(ctx context.Context, opts Options) error {
 		} else if opts.MessageProviderCloser != nil {
 			providerCloser = opts.MessageProviderCloser
 		}
-		msgFn = providerMessageFn(provider, opts.RepoPath)
+		// Diff egress is OFF by default. Network-bound providers receive
+		// only metadata (paths + op kinds + branch + timestamp) unless the
+		// operator explicitly opts in via ACD_AI_DIFF_EGRESS. Reason: the
+		// reconstructed unified diff carries source bytes; redaction is
+		// pattern-based and best-effort; an unset default that silently
+		// transmits diffs would be a privacy regression on upgrade. When
+		// the opt-in is missing for a provider that wants diffs, surface a
+		// one-shot warn so operators see what they need to set.
+		effectiveRepoRoot := opts.RepoPath
+		if ai.ProviderNeedsDiff(provider) && !diffEgressOptIn() {
+			effectiveRepoRoot = ""
+			logger.Warn("AI provider supports diff context but ACD_AI_DIFF_EGRESS=1 is not set; sending metadata only",
+				"provider", provider.Name())
+		}
+		msgFn = providerMessageFn(provider, effectiveRepoRoot)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
@@ -319,6 +347,17 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
 	}
 	defer func() { _ = dlock.Release() }()
+
+	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
+	// OrphanFlushAckThreshold are presumed orphans from a previous daemon
+	// crash between ClaimNextFlushRequest and CompleteFlushRequest. Mark
+	// them failed so `acd status` / queue depth probes do not show ghost
+	// requests forever. Best-effort — log and continue on failure.
+	if n, err := sweepOrphanAckedFlushRequests(ctx, opts.DB, now(), OrphanFlushAckThreshold); err != nil {
+		logger.Warn("sweep orphan acked flush requests", "err", err.Error())
+	} else if n > 0 {
+		logger.Info("swept orphan acknowledged flush requests", "rows", n)
+	}
 
 	pid := os.Getpid()
 	bootTime := now()
@@ -624,6 +663,19 @@ func Run(ctx context.Context, opts Options) error {
 		"repo", opts.RepoPath, "pid", pid, "branch", branchRef,
 		"head", headOID, "token", currentToken)
 
+	// lastStampedBranchHead is the most recent value the run loop has
+	// written to MetaKeyBranchHead through the SameGeneration "per-tick
+	// keep-alive" path inside processBranchTokenChange. The previous
+	// implementation called state.MetaSet on every tick regardless of the
+	// value, which produced steady write churn on otherwise-idle daemons.
+	// We now skip the upsert when the live HEAD matches what we last
+	// stamped; the cross-tick rewind probe still runs because it reads
+	// persisted via LoadBranchHead, not via lastStampedBranchHead.
+	//
+	// Seed lastStampedBranchHead from the persisted value at startup so
+	// the very first idle tick does not re-stamp an unchanged value.
+	lastStampedBranchHead := persistedHead
+
 	processBranchTokenChange := func(logPrefix string) bool {
 		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
@@ -694,16 +746,19 @@ func Run(ctx context.Context, opts Options) error {
 					}
 				}
 			}
-			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync
+			// Conditional stamp: keep persisted MetaKeyBranchHead in sync
 			// with the freshly-observed live HEAD so the next tick's probe
 			// has a current baseline rather than a stale value written by an
-			// old transition. Cheap meta upsert; no error abort — a failure
-			// just means the next probe sees the same stale value, which is
-			// what the previous code did unconditionally.
-			if liveHead != "" {
+			// old transition. Skip the upsert when liveHead matches what we
+			// last stamped — otherwise an idle daemon writes a meta row on
+			// every tick. A failure here just means the next probe sees the
+			// same stale value, matching the previous unconditional behaviour.
+			if liveHead != "" && liveHead != lastStampedBranchHead {
 				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead); err != nil {
 					logger.Warn(logPrefix+" stamp branch head per-tick",
 						"err", err.Error())
+				} else {
+					lastStampedBranchHead = liveHead
 				}
 			}
 			return false
@@ -761,6 +816,12 @@ func Run(ctx context.Context, opts Options) error {
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
 					"err", err.Error())
+			} else {
+				// Keep the in-memory cache in sync with the persisted
+				// MetaKeyBranchHead so the SameGeneration "skip if equal"
+				// guard at the bottom of this closure does not produce a
+				// redundant MetaSet on the next idle tick.
+				lastStampedBranchHead = headOID
 			}
 			// shadow_paths is keyed by (branch_ref, branch_generation).
 			// After a divergence the new key is empty; without
@@ -769,21 +830,41 @@ func Run(ctx context.Context, opts Options) error {
 			if cctx.BranchRef == "" {
 				_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
 				logger.Warn("detached HEAD detected; capture/replay paused")
-			} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-				logger.Warn("reseed shadow after generation bump",
-					"err", err.Error())
-				traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
 			} else {
-				traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
-				if seeded > 0 {
-					logger.Info("shadow reseeded",
-						"rows", seeded,
-						"generation", cctx.BranchGeneration)
+				// Detached -> attached transition can land here when the
+				// reattach branch at line 1057 races with this Diverged
+				// path: if iteration N's resolveBranch ran before the
+				// operator's checkout but processBranchTokenChange ran
+				// after, cctx.BranchRef is set right here and the line
+				// 1057 reattach clear is skipped on iteration N+1. Clear
+				// the detached-HEAD marker and any stale rewind grace
+				// from the prior detach window symmetrically with the
+				// dedicated reattach branch above so capture/replay
+				// resume immediately rather than staying muted up to
+				// ACD_REWIND_GRACE_SECONDS.
+				if tokenBranchRef(oldToken) == "" {
+					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+					}
+					clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+						"detached HEAD reattached via diverged transition")
 				}
-				if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
-					logger.Warn("prune old shadow generations", "err", pErr.Error())
-				} else if pruned > 0 {
-					logger.Info("pruned old shadow generations", "rows", pruned)
+				if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+					logger.Warn("reseed shadow after generation bump",
+						"err", err.Error())
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+				} else {
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "generation bump shadow reseed", seeded)
+					if seeded > 0 {
+						logger.Info("shadow reseeded",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration)
+					}
+					if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+						logger.Warn("prune old shadow generations", "err", pErr.Error())
+					} else if pruned > 0 {
+						logger.Info("pruned old shadow generations", "rows", pruned)
+					}
 				}
 			}
 		} else {
@@ -832,6 +913,8 @@ func Run(ctx context.Context, opts Options) error {
 					cctx.BranchGeneration, headOID); err != nil {
 					logger.Warn("persist branch generation after FF-in-grace",
 						"err", err.Error())
+				} else {
+					lastStampedBranchHead = headOID
 				}
 				if cctx.BranchRef != "" {
 					if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
@@ -1037,10 +1120,20 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
-		// capture+replay cycle. We advance through the queue until empty
-		// (or FlushLimit is exceeded).
+		// capture+replay cycle. The drain is bounded by flushLimit (default
+		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
+		// rest of the Run loop, and the inner loop checks ctx.Err every
+		// iteration so SIGTERM during a large drain still exits within one
+		// claim cycle (~tens of ms).
+		flushLimit := opts.FlushLimit
+		if flushLimit <= 0 {
+			flushLimit = DefaultFlushLimit
+		}
 		flushed := 0
 		for {
+			if err := ctx.Err(); err != nil {
+				break
+			}
 			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
 			if err != nil {
 				logger.Warn("claim flush request", "err", err.Error())
@@ -1056,12 +1149,23 @@ func Run(ctx context.Context, opts Options) error {
 				sql.NullString{String: "flushed", Valid: true}); err != nil {
 				logger.Warn("complete flush", "err", err.Error())
 			}
-			if opts.FlushLimit > 0 && flushed >= opts.FlushLimit {
+			if flushed >= flushLimit {
 				break
 			}
 		}
-		if !operationPaused && processBranchTokenChange("pre-capture branch token") {
-			branchTransitionBlocked = true
+		// Re-check the branch token AFTER the flush drain. The drain can
+		// iterate up to DefaultFlushLimit (256) rows, and operator git
+		// surgery (`git reset/rebase/checkout`) is NOT serialized through
+		// wakeCh — HEAD can move during the drain. Without this re-check,
+		// Capture/Replay would run with a stale BranchRef/BaseHead/generation,
+		// risking events keyed under the wrong shadow generation, missed
+		// rewind grace, or replay anchored to a stale BaseHead. If a
+		// transition is observed, mark the iteration blocked and let the
+		// next tick re-evaluate after Capture/Replay are skipped.
+		if !branchTransitionBlocked && !operationPaused {
+			if processBranchTokenChange("post-flush branch token") {
+				branchTransitionBlocked = true
+			}
 		}
 
 		// 4f. Capture pass.
@@ -1120,11 +1224,17 @@ func Run(ctx context.Context, opts Options) error {
 			repErr error
 		)
 		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
-			// 4g. Replay pass.
+			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
+			// pending queue cannot starve flush_request claims, heartbeat
+			// refresh, or shutdown observation. ReplaySummary.HasMore is
+			// folded into hadWork below so the scheduler resets to the base
+			// poll interval and an immediate follow-up pass drains the rest
+			// without waiting for the idle ceiling.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 				MessageFn: msgFn,
 				GitDir:    opts.GitDir,
 				Trace:     tracer,
+				Limit:     DefaultReplayLimit,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
@@ -1154,7 +1264,11 @@ func Run(ctx context.Context, opts Options) error {
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
 		}
 
-		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0
+		// repSum.HasMore is true when the bounded replay pass returned with
+		// pending work still visible beyond DefaultReplayLimit. Treat it as
+		// work so the scheduler resets to the base interval and the next
+		// iteration drains the remainder without waiting for the idle ceiling.
+		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0 || repSum.HasMore
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
@@ -1367,6 +1481,42 @@ func clearRewindGraceMeta(ctx context.Context, db *state.DB, repoPath string, cc
 	})
 	logger.Info("rewind grace cleared on operator transition",
 		"reason", reason, "previous_until", prev)
+}
+
+// sweepOrphanAckedFlushRequests marks any flush_request that has been in the
+// "acknowledged" state past `threshold` as failed. It is invoked once per
+// daemon boot.
+//
+// The drain in the run loop transitions a row pending -> acknowledged ->
+// completed atomically: if the daemon dies between those two writes the row
+// is left in "acknowledged" with no completed_ts, and `acd status` /
+// PendingFlushDepth-style probes count it forever. The sweep is the only
+// release valve since CompleteFlushRequest doesn't expose a "fail by id +
+// timeout" API and the task forbids touching the state package.
+//
+// Returns the number of rows updated. Best-effort: log + continue on err.
+func sweepOrphanAckedFlushRequests(ctx context.Context, db *state.DB, now time.Time, threshold time.Duration) (int64, error) {
+	if db == nil || threshold <= 0 {
+		return 0, nil
+	}
+	cutoff := float64(now.Add(-threshold).UnixNano()) / 1e9
+	const q = `
+UPDATE flush_requests
+SET status = 'failed',
+    completed_ts = ?,
+    note = COALESCE(note, '') || ' [orphan-acked sweep]'
+WHERE status = 'acknowledged'
+  AND acknowledged_ts IS NOT NULL
+  AND acknowledged_ts <= ?`
+	res, err := db.SQL().ExecContext(ctx, q, float64(now.UnixNano())/1e9, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: sweep orphan acked flush requests: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("daemon: rows affected: %w", err)
+	}
+	return n, nil
 }
 
 // (un)used helpers retained for future phases — keep the symbol exported so

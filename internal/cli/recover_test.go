@@ -508,3 +508,112 @@ func TestRecover_PreservesMarkerWithoutClearPauseFlag(t *testing.T) {
 			branchRef, gen, eventState)
 	}
 }
+
+// TestRecover_PreflightFailsBeforeOpeningTx pins that when --clear-pause is
+// supplied but the manual pause marker fails its FS preflight (here: it is a
+// directory rather than a regular file), applyRecoverPlan aborts BEFORE
+// db.SQL().BeginTx is opened. The state.db file must remain byte-identical
+// to its pre-call contents so we know no write transaction was started and
+// then rolled back. This matches the P1 reliability requirement that slow
+// or failing FS syscalls do not hold the SQLite write lock.
+func TestRecover_PreflightFailsBeforeOpeningTx(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	// Stage a stale-branch incident so applyRecoverPlan would otherwise have
+	// real work to do. If the preflight gating regresses, the UPDATE
+	// statements would mutate these rows and the checksum check below would
+	// catch it.
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:              999999,
+		Mode:             "stopped",
+		BranchRef:        sql.NullString{String: "refs/heads/stale", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
+	if err := state.MetaSet(ctx, db, "branch.generation", "2"); err != nil {
+		t.Fatalf("MetaSet generation: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/stale",
+		BranchGeneration: 2,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "blocked.txt",
+		Fidelity:         "full",
+		State:            state.EventStateBlockedConflict,
+		Error:            sql.NullString{String: "old conflict", Valid: true},
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "blocked.txt",
+		Fidelity:  "full",
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	// Force the preflight to fail: create the marker path as a DIRECTORY,
+	// not a regular file. With --clear-pause the preflight insists on a
+	// regular file and must abort.
+	gitDir := filepath.Join(repo, ".git")
+	markerPath := pausepkg.Path(gitDir)
+	if err := os.MkdirAll(markerPath, 0o755); err != nil {
+		t.Fatalf("mkdir marker: %v", err)
+	}
+
+	// Snapshot state.db contents AFTER the fixture is fully staged so we
+	// can prove no write tx ran during applyRecoverPlan.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close state db before snapshot: %v", err)
+	}
+	dbBefore, err := os.ReadFile(stateDB)
+	if err != nil {
+		t.Fatalf("read state.db before: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = runRecover(ctx, &out, repo, true, false, true, true, true)
+	if err == nil {
+		t.Fatalf("runRecover unexpectedly succeeded; want preflight failure")
+	}
+	if !strings.Contains(err.Error(), "manual pause marker") {
+		t.Fatalf("err=%v want preflight failure mentioning manual pause marker", err)
+	}
+
+	// state.db MUST be byte-identical to its pre-call contents — no UPDATE
+	// or INSERT may have run, even speculatively. This is the core
+	// invariant the P1 fix protects.
+	dbAfter, err := os.ReadFile(stateDB)
+	if err != nil {
+		t.Fatalf("read state.db after: %v", err)
+	}
+	if !bytes.Equal(dbBefore, dbAfter) {
+		t.Fatalf("preflight failure mutated state.db (write tx leaked); len before=%d after=%d", len(dbBefore), len(dbAfter))
+	}
+
+	// Re-open the DB and confirm the staged stale row was NOT retargeted.
+	reopened, err := state.Open(ctx, stateDB)
+	if err != nil {
+		t.Fatalf("reopen state.db: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	var branchRef, eventState string
+	var gen int64
+	if err := reopened.SQL().QueryRowContext(ctx,
+		`SELECT branch_ref, branch_generation, state FROM capture_events WHERE seq = ?`, seq,
+	).Scan(&branchRef, &gen, &eventState); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if branchRef != "refs/heads/stale" || gen != 2 || eventState != state.EventStateBlockedConflict {
+		t.Fatalf("preflight failure leaked retarget: branch=%q gen=%d state=%q want stale/2/blocked_conflict",
+			branchRef, gen, eventState)
+	}
+}

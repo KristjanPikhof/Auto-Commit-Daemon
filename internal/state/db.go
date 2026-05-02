@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	// modernc.org/sqlite is the pure-Go driver mandated by D16 (zero cgo).
@@ -38,12 +37,6 @@ type DB struct {
 	conn     *sql.DB // single-connection write handle; kept for package compatibility.
 	readConn *sql.DB
 	path     string
-
-	// initOnce guards the schema-bootstrap path so callers can safely call
-	// Open repeatedly with the same file (e.g. tests reopening to verify
-	// idempotence) without re-running migrate logic in parallel.
-	initOnce sync.Once
-	initErr  error
 }
 
 // Path returns the absolute path to the underlying state.db file.
@@ -161,23 +154,23 @@ func buildDSN(dbPath string) string {
 	return "file:" + dbPath + "?" + q.Encode()
 }
 
-// bootstrap applies the DDL and stamps user_version on first open. Subsequent
-// calls first check user_version and return without taking a write lock when
-// the database is already current.
-func (d *DB) bootstrap(ctx context.Context) error {
-	d.initOnce.Do(func() {
-		d.initErr = d.runBootstrap(ctx)
-	})
-	return d.initErr
-}
-
+// bootstrapWithRetry runs the schema bootstrap with a small backoff loop on
+// SQLite "busy/locked" errors so a concurrent contender starting up at the
+// same moment does not race the schema apply. runBootstrap is idempotent:
+// it early-returns when user_version already equals SchemaVersion, and
+// otherwise applies the DDL inside a single transaction. We retry directly
+// across attempts; the previous implementation kept a sync.Once for a
+// no-retry path that no caller invoked, and mutating a Once after use is
+// undefined under the race detector.
 func (d *DB) bootstrapWithRetry(ctx context.Context) error {
 	const attempts = 8
+	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		err := d.bootstrap(ctx)
+		err := d.runBootstrap(ctx)
 		if err == nil || !isSQLiteLocked(err) {
 			return err
 		}
+		lastErr = err
 		timer := time.NewTimer(time.Duration(attempt+1) * 25 * time.Millisecond)
 		select {
 		case <-ctx.Done():
@@ -185,13 +178,8 @@ func (d *DB) bootstrapWithRetry(ctx context.Context) error {
 			return ctx.Err()
 		case <-timer.C:
 		}
-
-		// Allow another try after a transient lock. runBootstrap itself is
-		// idempotent, and current-version databases return before writing.
-		d.initOnce = sync.Once{}
-		d.initErr = nil
 	}
-	return d.bootstrap(ctx)
+	return lastErr
 }
 
 func (d *DB) runBootstrap(ctx context.Context) error {
