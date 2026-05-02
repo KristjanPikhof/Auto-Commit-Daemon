@@ -1420,6 +1420,42 @@ func clearRewindGraceMeta(ctx context.Context, db *state.DB, repoPath string, cc
 		"reason", reason, "previous_until", prev)
 }
 
+// sweepOrphanAckedFlushRequests marks any flush_request that has been in the
+// "acknowledged" state past `threshold` as failed. It is invoked once per
+// daemon boot.
+//
+// The drain in the run loop transitions a row pending -> acknowledged ->
+// completed atomically: if the daemon dies between those two writes the row
+// is left in "acknowledged" with no completed_ts, and `acd status` /
+// PendingFlushDepth-style probes count it forever. The sweep is the only
+// release valve since CompleteFlushRequest doesn't expose a "fail by id +
+// timeout" API and the task forbids touching the state package.
+//
+// Returns the number of rows updated. Best-effort: log + continue on err.
+func sweepOrphanAckedFlushRequests(ctx context.Context, db *state.DB, now time.Time, threshold time.Duration) (int64, error) {
+	if db == nil || threshold <= 0 {
+		return 0, nil
+	}
+	cutoff := float64(now.Add(-threshold).UnixNano()) / 1e9
+	const q = `
+UPDATE flush_requests
+SET status = 'failed',
+    completed_ts = ?,
+    note = COALESCE(note, '') || ' [orphan-acked sweep]'
+WHERE status = 'acknowledged'
+  AND acknowledged_ts IS NOT NULL
+  AND acknowledged_ts <= ?`
+	res, err := db.SQL().ExecContext(ctx, q, float64(now.UnixNano())/1e9, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: sweep orphan acked flush requests: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("daemon: rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // (un)used helpers retained for future phases — keep the symbol exported so
 // the test build doesn't drop them on compile.
 var _ = gitDirEnsureSubdir
