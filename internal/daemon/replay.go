@@ -616,6 +616,51 @@ var replayUpdateRefBackoffs = []time.Duration{
 	200 * time.Millisecond,
 }
 
+// DefaultReplayPerEventTimeout caps the heavy git work for a single replay
+// event (write-tree, commit-tree, update-ref retries). A pathological
+// worktree (multi-GB rename, foreign object database, GC contention) could
+// otherwise stall the run loop for minutes per event and starve flush
+// requests, heartbeat refreshes, and shutdown signals. On timeout the
+// per-event deadline fires inside the inner git op, the event is marked
+// failed/blocked, and the batch halts so the next pass starts fresh.
+const DefaultReplayPerEventTimeout = 60 * time.Second
+
+var replayPerEventTimeoutOverride atomic.Int64 // nanoseconds, 0 = use default
+
+func perEventTimeout() time.Duration {
+	if v := replayPerEventTimeoutOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return DefaultReplayPerEventTimeout
+}
+
+// replayUpdateRefJitter applies jittered backoff to update-ref retries.
+// Co-located daemons retrying the same ref at fixed 50/100/200ms cadences
+// re-collide on every retry; ±25% jitter (uniform) breaks the lockstep so
+// neighbours fan out across the wall-clock window. Tests pin a
+// deterministic source via replayUpdateRefJitterFn.
+var replayUpdateRefJitterFn atomic.Pointer[func(time.Duration) time.Duration]
+
+const replayUpdateRefJitterFraction = 0.25
+
+func defaultUpdateRefJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// math/rand/v2.Float64() ∈ [0,1). Map to [-fraction, +fraction).
+	delta := (rngFloat64()*2 - 1) * replayUpdateRefJitterFraction
+	jittered := time.Duration(float64(d) * (1 + delta))
+	if jittered <= 0 {
+		jittered = d / 2 // floor: never sleep zero or negative
+	}
+	return jittered
+}
+
+// rngFloat64 indirects math/rand/v2.Float64 so tests can pin determinism.
+var rngFloat64 = func() float64 {
+	return v2randFloat64()
+}
+
 type replayPause struct {
 	Active    bool
 	Source    string
