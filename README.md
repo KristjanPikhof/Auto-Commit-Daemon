@@ -89,7 +89,16 @@ acd recover --repo . --auto --yes
 `recover` refuses to run while the daemon PID is alive. Applying a plan copies
 `.git/acd/state.db` to `.git/acd/state.db.recover-<timestamp>`, retargets stale
 pending/blocked rows to the current attached branch, resets `blocked_conflict`
-rows to `pending`, and clears stale replay metadata.
+rows to `pending`, clears stale replay metadata, and repairs ACD-owned stale
+live-index entries when the current `HEAD` and worktree still match the
+published event. `acd doctor` also reports live-index repair candidates and
+points at the recover dry-run command.
+
+ACD uses an isolated scratch index for replay correctness, then performs a
+guarded path-scoped live-index reconciliation so IDEs see the committed state
+for ACD-owned paths. It will not run broad `git reset`, `git checkout`, or
+`git read-tree` against your live index, and it skips same-path staged work
+that no longer matches the captured before-state.
 
 Use a manual pause when you want to reset, rebase, inspect, or stage branch
 changes without replay racing you:
