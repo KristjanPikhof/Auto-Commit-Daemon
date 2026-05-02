@@ -830,7 +830,26 @@ func Run(ctx context.Context, opts Options) error {
 			if cctx.BranchRef == "" {
 				_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
 				logger.Warn("detached HEAD detected; capture/replay paused")
-			} else if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+			} else {
+				// Detached -> attached transition can land here when the
+				// reattach branch at line 1057 races with this Diverged
+				// path: if iteration N's resolveBranch ran before the
+				// operator's checkout but processBranchTokenChange ran
+				// after, cctx.BranchRef is set right here and the line
+				// 1057 reattach clear is skipped on iteration N+1. Clear
+				// the detached-HEAD marker and any stale rewind grace
+				// from the prior detach window symmetrically with the
+				// dedicated reattach branch above so capture/replay
+				// resume immediately rather than staying muted up to
+				// ACD_REWIND_GRACE_SECONDS.
+				if tokenBranchRef(oldToken) == "" {
+					if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
+						_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+					}
+					clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+						"detached HEAD reattached via diverged transition")
+				}
+				if seeded, err := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
 				logger.Warn("reseed shadow after generation bump",
 					"err", err.Error())
 				traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
