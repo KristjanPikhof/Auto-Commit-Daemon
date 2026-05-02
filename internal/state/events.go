@@ -194,7 +194,7 @@ ORDER BY e.seq ASC`
 		q += " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := d.conn.QueryContext(ctx, q, args...)
+	rows, err := d.readSQL().QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("state: query pending events: %w", err)
 	}
