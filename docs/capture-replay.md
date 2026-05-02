@@ -434,7 +434,21 @@ Use this checklist when commits stop appearing:
    without updating state). Run `acd stop --force` then `acd start` to
    restart it.
 
-3. **Resolve blocked conflicts.**
+3. **Check for stale live-index repair candidates.**
+
+   ~~~bash
+   acd doctor
+   acd recover --repo . --auto --dry-run
+   ~~~
+
+   A legacy stale-index shape looks like `D  path` plus `?? path` even though
+   `HEAD:path` and the worktree file match. Current daemon startup and
+   `acd recover --auto --yes` repair only ACD-owned published paths proved from
+   `capture_events`/`capture_ops`, current `HEAD` ancestry, and matching
+   worktree content. Ambiguous same-path staged work is skipped; use normal git
+   inspection to decide whether it is user intent.
+
+4. **Resolve blocked conflicts.**
 
    ~~~bash
    acd doctor      # last conflict: <path> <age> "<error>"
