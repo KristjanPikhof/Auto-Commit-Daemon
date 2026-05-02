@@ -721,16 +721,19 @@ func Run(ctx context.Context, opts Options) error {
 					}
 				}
 			}
-			// Unconditional stamp: keep persisted MetaKeyBranchHead in sync
+			// Conditional stamp: keep persisted MetaKeyBranchHead in sync
 			// with the freshly-observed live HEAD so the next tick's probe
 			// has a current baseline rather than a stale value written by an
-			// old transition. Cheap meta upsert; no error abort — a failure
-			// just means the next probe sees the same stale value, which is
-			// what the previous code did unconditionally.
-			if liveHead != "" {
+			// old transition. Skip the upsert when liveHead matches what we
+			// last stamped — otherwise an idle daemon writes a meta row on
+			// every tick. A failure here just means the next probe sees the
+			// same stale value, matching the previous unconditional behaviour.
+			if liveHead != "" && liveHead != lastStampedBranchHead {
 				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead); err != nil {
 					logger.Warn(logPrefix+" stamp branch head per-tick",
 						"err", err.Error())
+				} else {
+					lastStampedBranchHead = liveHead
 				}
 			}
 			return false
