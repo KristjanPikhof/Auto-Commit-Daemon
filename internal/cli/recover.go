@@ -154,9 +154,12 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			gen = parsed
 		}
 	}
-	liveIndexPlan, err := planLiveIndexRepair(ctx, rec.Path, rec.StateDB, head)
-	if err != nil {
-		return recoverPlan{}, err
+	var liveIndexPlan daemon.LiveIndexRepairSummary
+	if !dryRun {
+		liveIndexPlan, err = planLiveIndexRepair(ctx, rec.Path, rec.StateDB, head)
+		if err != nil {
+			return recoverPlan{}, err
+		}
 	}
 
 	markerAction := "preserve manual pause marker at " + markerPath + " (use --clear-pause to remove)"
