@@ -32,6 +32,15 @@ consult the diff at all, so its output is identical regardless of diff
 reconstruction success or failure. See [capture-replay.md](capture-replay.md)
 for the full storage model.
 
+Diff size is now bounded **at the git layer**, not after-the-fact in
+`BuildOpsDiff`. Each `before_oid`/`after_oid` pair is rendered through
+`git.DiffBlobsLimited` with `git.DefaultDiffCap` (1 MiB) and a per-op 5s
+timeout; on overflow the partial prefix is returned alongside
+`git.ErrStdoutOverflow` so truncation is observable instead of silent.
+The `internal/ai/prompt.go` 4000-byte `DiffCap` then applies as the
+final outbound trim before the provider sees the payload. A single hung
+blob render therefore cannot stall message construction.
+
 ### Migration from `ACD_AI_SEND_DIFF`
 
 `ACD_AI_SEND_DIFF` was removed. The daemon emits a one-shot deprecation
