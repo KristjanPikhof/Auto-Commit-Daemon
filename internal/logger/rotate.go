@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +13,16 @@ import (
 	"sync"
 	"time"
 )
+
+// gzipCloseWait bounds how long Close blocks waiting for in-flight
+// background gzip goroutines to finish. The actual gzip work is bounded
+// by file size and disk throughput; on a clean shutdown we want the
+// archive emitted but we will not wedge the daemon if disk I/O is stuck.
+const gzipCloseWait = 5 * time.Second
+
+// gzipFileFn is a test seam: tests substitute a slow implementation to
+// prove that rotateLocked does not block writers while gzip is in flight.
+var gzipFileFn = gzipFile
 
 // rotatingWriter is an io.Writer + io.Closer that owns a single active
 // log file and rotates it in place when it exceeds maxSize. Rotation:
