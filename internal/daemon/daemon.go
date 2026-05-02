@@ -334,6 +334,17 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer func() { _ = dlock.Release() }()
 
+	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
+	// OrphanFlushAckThreshold are presumed orphans from a previous daemon
+	// crash between ClaimNextFlushRequest and CompleteFlushRequest. Mark
+	// them failed so `acd status` / queue depth probes do not show ghost
+	// requests forever. Best-effort — log and continue on failure.
+	if n, err := sweepOrphanAckedFlushRequests(ctx, opts.DB, now(), OrphanFlushAckThreshold); err != nil {
+		logger.Warn("sweep orphan acked flush requests", "err", err.Error())
+	} else if n > 0 {
+		logger.Info("swept orphan acknowledged flush requests", "rows", n)
+	}
+
 	pid := os.Getpid()
 	bootTime := now()
 
