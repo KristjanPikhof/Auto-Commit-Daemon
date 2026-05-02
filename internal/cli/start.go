@@ -87,6 +87,15 @@ func newStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Register a session and ensure a daemon is running for this repo",
+		Long: `Register a client session for the resolved repo and start the daemon if it is not already running.
+
+Without flags, acd start uses the current working directory as the repo and creates a manual session. Harness integrations normally pass --session-id, --harness, and --watch-pid so acd can keep a refcount and clean up when the harness process exits.
+
+Use acd status to inspect the daemon and acd stop to stop the current repo daemon or deregister a harness session.`,
+		Example: `  acd start
+  acd start --repo /path/to/repo
+  acd start --session-id "$ACD_SESSION_ID" --harness codex --watch-pid "$PPID"
+  acd start --json`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			jsonOut, _ := c.Flags().GetBool("json")
