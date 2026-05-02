@@ -21,6 +21,15 @@ import (
 // the checker is left usable for retry by spawning a fresh subprocess on
 // the next call. Each Check is its own request/response on the long-lived
 // pipe — concurrent callers serialize through mu.
+//
+// Pipe-buffer hazard: macOS pipes default to a 16 KiB buffer (Linux 64 KiB).
+// A naive implementation that writes the whole NUL-delimited path payload
+// before reading any results deadlocks once the payload exceeds the pipe
+// buffer: the daemon blocks on stdin.Write while git simultaneously blocks
+// on stdout.Write because nobody is draining stdout. Check therefore pumps
+// stdin in a writer goroutine while the main goroutine concurrently reads
+// stdout. The writer surfaces its error through errCh; on a read error we
+// kill the subprocess AND drain errCh so the writer goroutine cannot leak.
 type IgnoreChecker struct {
 	repoDir string
 
