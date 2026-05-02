@@ -21,6 +21,15 @@ import (
 // the checker is left usable for retry by spawning a fresh subprocess on
 // the next call. Each Check is its own request/response on the long-lived
 // pipe — concurrent callers serialize through mu.
+//
+// Pipe-buffer hazard: macOS pipes default to a 16 KiB buffer (Linux 64 KiB).
+// A naive implementation that writes the whole NUL-delimited path payload
+// before reading any results deadlocks once the payload exceeds the pipe
+// buffer: the daemon blocks on stdin.Write while git simultaneously blocks
+// on stdout.Write because nobody is draining stdout. Check therefore pumps
+// stdin in a writer goroutine while the main goroutine concurrently reads
+// stdout. The writer surfaces its error through errCh; on a read error we
+// kill the subprocess AND drain errCh so the writer goroutine cannot leak.
 type IgnoreChecker struct {
 	repoDir string
 
@@ -135,16 +144,24 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		}
 	}()
 
-	// Write all paths NUL-delimited.
+	// Build the NUL-delimited stdin payload.
 	var buf bytes.Buffer
 	for _, p := range paths {
 		buf.WriteString(p)
 		buf.WriteByte(0)
 	}
-	if _, err := c.stdin.Write(buf.Bytes()); err != nil {
-		c.killLocked()
-		return nil, fmt.Errorf("check-ignore write: %w", err)
-	}
+
+	// Pump stdin from a writer goroutine concurrently with the main
+	// goroutine's stdout read loop. This avoids the pipe-buffer deadlock
+	// described on the type comment: the writer can block on a full stdin
+	// pipe while the reader drains stdout, and vice versa. The writer
+	// reports its outcome through errCh.
+	stdin := c.stdin
+	errCh := make(chan error, 1)
+	go func(payload []byte) {
+		_, err := stdin.Write(payload)
+		errCh <- err
+	}(buf.Bytes())
 
 	// Read 4 NUL-delimited fields per input path.
 	results := make([]bool, len(paths))
@@ -153,11 +170,16 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		for f := 0; f < 4; f++ {
 			tok, err := c.stdout.ReadBytes(0)
 			if err != nil {
+				// Kill the subprocess and drain the writer goroutine
+				// so it cannot leak. After killLocked closes stdin,
+				// the in-flight Write returns immediately.
 				c.killLocked()
+				<-errCh
 				return nil, fmt.Errorf("check-ignore read: %w", err)
 			}
 			if len(tok) == 0 {
 				c.killLocked()
+				<-errCh
 				return nil, fmt.Errorf("check-ignore: short read")
 			}
 			fields[f] = string(tok[:len(tok)-1]) // strip NUL
@@ -167,6 +189,25 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		// patterns with a leading "!" — those un-ignore the path.
 		source, pattern := fields[0], fields[2]
 		results[i] = source != "" && !strings.HasPrefix(pattern, "!")
+	}
+
+	// Reads completed cleanly; surface any deferred writer error. A write
+	// error here means git accepted enough bytes to satisfy len(paths)
+	// records but then closed its stdin half early, which is still a
+	// protocol violation — fail closed and reset the subprocess. Honor
+	// ctx cancellation so a hung writer (git accepted only part of the
+	// payload and never closed stdin) does not deadlock the call; the
+	// killLocked path then unblocks the writer goroutine for a clean drain.
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			c.killLocked()
+			return nil, fmt.Errorf("check-ignore write: %w", werr)
+		}
+	case <-ctx.Done():
+		c.killLocked()
+		<-errCh
+		return nil, fmt.Errorf("check-ignore write: %w", ctx.Err())
 	}
 	return results, nil
 }

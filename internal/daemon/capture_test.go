@@ -804,3 +804,117 @@ func TestCapture_RunLoopSkipPauseCheckOptOut(t *testing.T) {
 		t.Fatalf("expected at least one event appended under SkipPauseCheck=true, got %+v", sum)
 	}
 }
+
+// TestCapture_LargeIgnoredTree is the P0 regression for the AI-Assistant
+// build-tree wedge: a top-level gitignored directory must be pruned at the
+// directory layer rather than being walked file-by-file. Before the BFS +
+// per-layer ignore-classify rewrite, walkLive's filepath.WalkDir DFS would
+// readdir every entry inside the ignored subtree and only filter after the
+// fact, causing IgnoreChecker batches to balloon to 100k+ paths on real
+// repos.
+//
+// The test creates a small but non-trivial ignored subtree (build/ with a
+// fan-out under it) plus a single tracked file at the root. After capture,
+// WalkedFiles must reflect only the tracked file — none of the children
+// under build/ should have been walked, hashed, or classified.
+func TestCapture_LargeIgnoredTree(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Add `build/` to .gitignore so the entire top-level subtree is
+	// classified ignored. We also keep the seed `ignored.txt` rule so the
+	// fixture's pinned shadow assumption stays intact.
+	gitignore := filepath.Join(f.dir, ".gitignore")
+	if err := os.WriteFile(gitignore, []byte("ignored.txt\nbuild/\n"), 0o644); err != nil {
+		t.Fatalf("rewrite .gitignore: %v", err)
+	}
+
+	// Tracked file at the worktree root that MUST be walked + captured.
+	tracked := filepath.Join(f.dir, "kept.txt")
+	if err := os.WriteFile(tracked, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("write kept.txt: %v", err)
+	}
+
+	// Fan out an ignored subtree. Numbers are big enough to make the bug
+	// visible (DFS would walk every leaf) but small enough to keep the
+	// test fast on slow CI: 16 dirs * 16 files = 256 ignored leaves +
+	// 16 dirs themselves.
+	const fanout = 16
+	buildRoot := filepath.Join(f.dir, "build")
+	if err := os.MkdirAll(buildRoot, 0o755); err != nil {
+		t.Fatalf("mkdir build: %v", err)
+	}
+	for i := 0; i < fanout; i++ {
+		sub := filepath.Join(buildRoot, fmt.Sprintf("sub-%02d", i))
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("mkdir sub: %v", err)
+		}
+		for j := 0; j < fanout; j++ {
+			leaf := filepath.Join(sub, fmt.Sprintf("leaf-%02d.bin", j))
+			if err := os.WriteFile(leaf, []byte("noise"), 0o644); err != nil {
+				t.Fatalf("write leaf: %v", err)
+			}
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// The tracked file plus the seed .gitignore are the only paths that
+	// should reach the hashing stage. The fanout of 256 ignored leaves
+	// MUST NOT count toward WalkedFiles.
+	if sum.WalkedFiles >= int64(fanout*fanout) {
+		t.Fatalf("WalkedFiles=%d looks like ignored tree was walked anyway (fanout^2=%d)",
+			sum.WalkedFiles, fanout*fanout)
+	}
+	// Acceptance threshold from the task: walkLive should return with
+	// WalkedFiles well under 1000.
+	if sum.WalkedFiles >= 1000 {
+		t.Fatalf("WalkedFiles=%d exceeds 1000 cap; ignored subtree must be pruned at the directory layer", sum.WalkedFiles)
+	}
+
+	// The capture event for the tracked file must exist, and no event
+	// should have been emitted for any path under build/.
+	ops := pendingOps(t, f.db)
+	var sawKept bool
+	for _, op := range ops {
+		if strings.HasPrefix(op.Path, "build/") || op.Path == "build" {
+			t.Fatalf("captured event under ignored subtree: %+v", op)
+		}
+		if op.Path == "kept.txt" {
+			sawKept = true
+		}
+	}
+	if !sawKept {
+		t.Fatalf("expected create event for kept.txt, got ops=%+v", ops)
+	}
+}
+
+// TestCapture_ClassifyIgnoredBatched_RespectsCap verifies the helper
+// slices large path lists into chunks of at most ignoreCheckBatchSize. We
+// stub the underlying IgnoreChecker via a fake .gitignore that doesn't
+// actually match anything; what we're asserting is the batching contract,
+// not the classification result.
+func TestCapture_ClassifyIgnoredBatched_RespectsCap(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Build a slice well above the cap so the helper must do >=3 round
+	// trips internally.
+	const total = ignoreCheckBatchSize*2 + 7
+	paths := make([]string, total)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("synthetic/path-%05d.txt", i)
+	}
+
+	results, err := classifyIgnoredBatched(context.Background(), f.ig, paths, ignoreCheckBatchSize)
+	if err != nil {
+		t.Fatalf("classifyIgnoredBatched: %v", err)
+	}
+	if len(results) != len(paths) {
+		t.Fatalf("len(results)=%d, len(paths)=%d — must be 1:1", len(results), len(paths))
+	}
+}

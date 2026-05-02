@@ -316,6 +316,158 @@ func TestReplay_MalformedMarkerFailsOpen(t *testing.T) {
 	}
 }
 
+// TestReplay_NonRegularMarkerFailOpen pins the §replay.daemonPauseState
+// invariant that a non-regular pause-marker inode (FIFO, socket, device,
+// directory, symlink) MUST fail open with a warning. Without this guard a
+// single stale FIFO at <gitDir>/acd/paused would wedge replay forever — every
+// pass would surface the same ErrNonRegularSource and the queue would never
+// drain.
+//
+// We exercise the directory case (a `mkdir paused`) because it is portable
+// across linux/darwin without needing unix.Mkfifo, and it triggers the same
+// pausepkg.ErrNonRegularSource branch (the source path's stat is not a
+// regular file).
+func TestReplay_NonRegularMarkerFailOpen(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	captureOnePendingFile(t, ctx, f, "non-regular-marker.txt", "drain\n")
+
+	markerPath := pausepkg.Path(f.gitDir)
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker parent: %v", err)
+	}
+	// Plant a directory at the marker path. pausepkg.Read opens it with
+	// O_NOFOLLOW, stats it, and returns ErrNonRegularSource — daemonPauseState
+	// must treat this exactly like ErrMalformed (warn + fail open).
+	if err := os.Mkdir(markerPath, 0o700); err != nil {
+		t.Fatalf("mkdir non-regular marker: %v", err)
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// Splitting the previous OR-chain into individual asserts surfaces
+	// which property regressed if the fail-open path is ever broken.
+	// captureOnePendingFile guarantees at least one pending event, so the
+	// fail-open path MUST publish at least one commit (Published >= 1).
+	if sum.Skipped {
+		t.Fatalf("non-regular marker fail-open: replay was Skipped, want drained: %+v", sum)
+	}
+	if sum.Published < 1 {
+		t.Fatalf("non-regular marker fail-open: Published=%d want >=1: %+v", sum.Published, sum)
+	}
+	if sum.Conflicts != 0 {
+		t.Fatalf("non-regular marker fail-open: Conflicts=%d want 0: %+v", sum.Conflicts, sum)
+	}
+	if sum.Failed != 0 {
+		t.Fatalf("non-regular marker fail-open: Failed=%d want 0: %+v", sum.Failed, sum)
+	}
+}
+
+// TestReplay_BoundedBatchYields pins the §replay.ReplayOpts.Limit invariant:
+// when more pending events are visible than the per-pass budget, replay
+// publishes exactly Limit events, sets sum.HasMore=true, and leaves the
+// remainder in the pending queue so the next replay call drains them.
+//
+// The run loop relies on HasMore to schedule an immediate follow-up wake
+// instead of waiting for the next poll tick — without this signal, draining a
+// 1k-event queue at 64 events per pass would otherwise stall behind the
+// ~1s poll interval.
+func TestReplay_BoundedBatchYields(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Capture three independent files. Each one becomes a separate pending
+	// event so a budget of 2 must publish two and leave one queued.
+	const totalFiles = 3
+	for i := 0; i < totalFiles; i++ {
+		name := "batch-" + strconv.Itoa(i) + ".txt"
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker:    f.ig,
+			SensitiveMatcher: f.matcher,
+		}); err != nil {
+			t.Fatalf("Capture %s: %v", name, err)
+		}
+	}
+	pendingBefore, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pendingBefore) < totalFiles {
+		t.Fatalf("want >=%d pending, got %d", totalFiles, len(pendingBefore))
+	}
+
+	// Cap the pass at 2 so at least one event must remain queued.
+	const limit = 2
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     limit,
+	})
+	if err != nil {
+		t.Fatalf("Replay (bounded): %v", err)
+	}
+	if sum.Published != limit {
+		t.Fatalf("first pass Published=%d want %d (sum=%+v)", sum.Published, limit, sum)
+	}
+	if sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected conflicts/failed in bounded pass: %+v", sum)
+	}
+	if !sum.HasMore {
+		t.Fatalf("HasMore=false after bounded pass with %d>%d pending; sum=%+v",
+			len(pendingBefore), limit, sum)
+	}
+
+	pendingAfter, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents post-pass: %v", err)
+	}
+	if len(pendingAfter) != len(pendingBefore)-limit {
+		t.Fatalf("pending after first pass=%d want %d", len(pendingAfter), len(pendingBefore)-limit)
+	}
+
+	// Refresh BaseHead — the run loop normally does this between passes by
+	// reading sum.BaseHead. Without it the second pass would seed its scratch
+	// index from a now-stale HEAD and reject the remaining events.
+	f.cctx.BaseHead = sum.BaseHead
+
+	// Second pass with the same budget drains the remainder. There is no
+	// queued event behind it, so HasMore must be false.
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     limit,
+	})
+	if err != nil {
+		t.Fatalf("Replay (drain remainder): %v", err)
+	}
+	if sum2.Published != len(pendingAfter) {
+		t.Fatalf("second pass Published=%d want %d (sum=%+v)",
+			sum2.Published, len(pendingAfter), sum2)
+	}
+	if sum2.HasMore {
+		t.Fatalf("HasMore=true after final drain; sum=%+v", sum2)
+	}
+
+	// Sanity check: a Limit=0 (unbounded) drain on an empty queue must NOT
+	// signal HasMore.
+	f.cctx.BaseHead = sum2.BaseHead
+	sum3, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+	})
+	if err != nil {
+		t.Fatalf("Replay (empty unbounded): %v", err)
+	}
+	if sum3.HasMore {
+		t.Fatalf("HasMore=true on empty queue with Limit=0; sum=%+v", sum3)
+	}
+}
+
 // TestReplay_Conflict: when the scratch index diverges from the event's
 // before-state, replay must terminally settle the event in
 // state.EventStateBlockedConflict and upsert publish_state.status to match.

@@ -5,20 +5,27 @@ on:
     tags:
       - 'v*'
 
+# Default to read; the goreleaser job widens to contents: write because it
+# needs to publish release artifacts. Pinning every action to a 40-char
+# commit SHA prevents a hostile force-push to a moving major-version tag
+# (`@v5`, `@v6`) from injecting code into a release pipeline that holds
+# secrets.GORELEASER_TOKEN-equivalent privileges.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.22'
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           version: '~> v2'
           args: release --clean --skip=homebrew

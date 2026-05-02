@@ -58,10 +58,23 @@ type ReplayOpts struct {
 	GitDir string
 
 	// Limit caps the number of events drained per call. 0 = no limit.
+	//
+	// The run loop sets Limit = DefaultReplayLimit so each replay pass returns
+	// to the daemon promptly enough to claim flush_requests, refresh the
+	// heartbeat, and observe shutdown. ReplaySummary.HasMore signals whether
+	// the queue still contains pending work so the run loop can schedule an
+	// immediate follow-up wake instead of waiting for the next poll tick.
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
 }
+
+// DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
+// budget the daemon yields control back to the run loop so flush_requests,
+// heartbeat refreshes, and shutdown signals are not starved by a long queue.
+// ReplaySummary.HasMore tells the run loop whether to fire another pass
+// immediately.
+const DefaultReplayLimit = 64
 
 // ReplaySummary describes one drain.
 type ReplaySummary struct {
@@ -70,6 +83,11 @@ type ReplaySummary struct {
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
 	Skipped   bool // replay drain was intentionally skipped before reading events
+	// HasMore is true when ReplayOpts.Limit capped the batch and at least one
+	// additional pending event was visible beyond the cap. The run loop uses
+	// this to schedule an immediate follow-up replay pass without waiting for
+	// the next poll tick. Always false when Limit <= 0 (unbounded drain).
+	HasMore bool
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -156,9 +174,21 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		_ = os.Remove(indexFile)
 	}
 
-	pending, err := state.PendingEvents(ctx, db, opts.Limit)
+	// Per-pass batch budget. When opts.Limit > 0 we query one extra row so the
+	// "is there more queued behind this batch?" question can be answered
+	// without a follow-up COUNT — sum.HasMore tells the run loop to schedule
+	// an immediate next pass instead of waiting for the poll tick.
+	queryLimit := opts.Limit
+	if queryLimit > 0 {
+		queryLimit = opts.Limit + 1
+	}
+	pending, err := state.PendingEvents(ctx, db, queryLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
+	}
+	if opts.Limit > 0 && len(pending) > opts.Limit {
+		pending = pending[:opts.Limit]
+		sum.HasMore = true
 	}
 	if len(pending) == 0 {
 		return sum, nil
@@ -512,7 +542,9 @@ type replayPause struct {
 //
 //  1. Manual pause marker at <gitDir>/acd/paused (durable JSON written by
 //     `acd pause`, cleared by `acd resume`). Active when present and not
-//     expired. Malformed markers fail open with a warning.
+//     expired. Malformed markers fail open with a warning. Non-regular
+//     markers (FIFO, socket, device, directory, symlink) also fail open
+//     with a warning so a stale inode cannot wedge replay indefinitely.
 //  2. Rewind grace under daemon_meta.replay.paused_until — set when the
 //     daemon detects a same-branch rewind (newHead is an ancestor of the
 //     previous head, e.g. operator ran `git reset --soft HEAD~1`). The
@@ -530,11 +562,19 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 	now := time.Now().UTC()
 	if gitDir != "" {
 		marker, ok, err := pausepkg.Read(gitDir)
-		if errors.Is(err, pausepkg.ErrMalformed) {
+		switch {
+		case errors.Is(err, pausepkg.ErrMalformed):
 			slog.Default().Warn("ignoring malformed pause marker", "err", err.Error())
-		} else if err != nil {
+		case errors.Is(err, pausepkg.ErrNonRegularSource):
+			// A non-regular pause marker (FIFO, socket, device, directory,
+			// symlink) would otherwise wedge replay forever — every pass
+			// would re-surface the same error. Fail open with a warning so
+			// the queue keeps draining; the operator can investigate the
+			// stray inode at <gitDir>/acd/paused at their leisure.
+			slog.Default().Warn("ignoring non-regular pause marker", "err", err.Error())
+		case err != nil:
 			return replayPause{}, fmt.Errorf("daemon: read pause marker: %w", err)
-		} else if ok {
+		case ok:
 			paused, err := markerPauseState(marker, now)
 			if err != nil {
 				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())

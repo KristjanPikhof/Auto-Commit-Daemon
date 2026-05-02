@@ -321,3 +321,136 @@ func waitForMetaCleared(t *testing.T, dbPath, key string, timeout time.Duration)
 func sqliteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
+
+// SeedFlushRequests inserts n flush_requests rows in 'pending' status using a
+// single batched INSERT. Used by populated-state startup tests to simulate a
+// real-world AI-Assistant repo where the daemon was killed mid-burst.
+func SeedFlushRequests(t *testing.T, dbPath string, n int) {
+	t.Helper()
+	if n <= 0 {
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("BEGIN; ")
+	now := nowFloatSeconds()
+	const chunk = 500
+	for start := 0; start < n; start += chunk {
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+		sb.WriteString("INSERT INTO flush_requests(command, non_blocking, requested_ts, status) VALUES ")
+		for i := start; i < end; i++ {
+			if i > start {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "('wake', 0, %f, 'pending')", now+float64(i)*1e-6)
+		}
+		sb.WriteString("; ")
+	}
+	sb.WriteString("COMMIT;")
+	if out, err := exec.Command("sqlite3", dbPath, sb.String()).CombinedOutput(); err != nil {
+		t.Fatalf("seed flush_requests: %v\n%s", err, out)
+	}
+}
+
+// SeedDaemonClients inserts n stale daemon_clients rows whose watch_pid
+// targets PIDs that are extremely unlikely to be alive. The fingerprints are
+// distinct so the daemon's GC sweep evicts them on its next pass.
+func SeedDaemonClients(t *testing.T, dbPath string, n int) {
+	t.Helper()
+	if n <= 0 {
+		return
+	}
+	now := nowFloatSeconds()
+	var sb strings.Builder
+	sb.WriteString("BEGIN; ")
+	for i := 0; i < n; i++ {
+		// Use very high PIDs that are vanishingly unlikely to be live so the
+		// GC sweep classifies the row as stale immediately.
+		pid := 2000000 + i
+		fmt.Fprintf(&sb,
+			"INSERT OR REPLACE INTO daemon_clients(session_id, harness, watch_pid, watch_fp, registered_ts, last_seen_ts) "+
+				"VALUES ('stale-client-%04d', 'shell', %d, 'stale|fp|%d', %f, %f); ",
+			i, pid, i, now-3600, now-3600)
+	}
+	sb.WriteString("COMMIT;")
+	if out, err := exec.Command("sqlite3", dbPath, sb.String()).CombinedOutput(); err != nil {
+		t.Fatalf("seed daemon_clients: %v\n%s", err, out)
+	}
+}
+
+// SeedShadowGenerations writes `generations` distinct (branch_ref, branch_generation)
+// shadow rows of `rowsPerGen` size each. The newest generation matches the
+// caller's intent for the active branch generation; older ones are present to
+// stress retention/pruning and bootstrap idempotency. Paths are deterministic
+// so the seeded state is reproducible across runs.
+func SeedShadowGenerations(t *testing.T, dbPath, branchRef string, generations, rowsPerGen int) {
+	t.Helper()
+	if generations <= 0 || rowsPerGen <= 0 {
+		return
+	}
+	now := nowFloatSeconds()
+	const chunk = 400
+	for gen := 1; gen <= generations; gen++ {
+		// Every (gen,path) needs a unique 40-char OID. Use sha-shaped padding.
+		baseHead := fmt.Sprintf("%040x", gen)
+		for start := 0; start < rowsPerGen; start += chunk {
+			end := start + chunk
+			if end > rowsPerGen {
+				end = rowsPerGen
+			}
+			var sb strings.Builder
+			sb.WriteString("BEGIN; INSERT INTO shadow_paths(branch_ref, branch_generation, path, operation, mode, oid, base_head, fidelity, updated_ts) VALUES ")
+			for i := start; i < end; i++ {
+				if i > start {
+					sb.WriteString(", ")
+				}
+				oid := fmt.Sprintf("%040x", (gen<<24)|(i+1))
+				path := fmt.Sprintf("seed/g%d/p%05d.txt", gen, i)
+				fmt.Fprintf(&sb, "(%s, %d, %s, 'create', '100644', '%s', '%s', 'rescan', %f)",
+					sqliteLiteral(branchRef), gen, sqliteLiteral(path), oid, baseHead, now)
+			}
+			sb.WriteString("; COMMIT;")
+			if out, err := exec.Command("sqlite3", dbPath, sb.String()).CombinedOutput(); err != nil {
+				t.Fatalf("seed shadow_paths gen=%d: %v\n%s", gen, err, out)
+			}
+		}
+	}
+}
+
+// readHeartbeatTs reads daemon_state.heartbeat_ts (or 0).
+func readHeartbeatTs(repoDir string) float64 {
+	dbPath := filepath.Join(repoDir, ".git", "acd", "state.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return 0
+	}
+	out, err := exec.Command("sqlite3", dbPath, "SELECT heartbeat_ts FROM daemon_state WHERE id = 1").CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	v := strings.TrimSpace(string(out))
+	var f float64
+	fmt.Sscanf(v, "%f", &f)
+	return f
+}
+
+// initStateDBSchema brings <repo>/.git/acd/state.db into existence with the
+// canonical schema applied. The integration suite cannot import the internal
+// state package, so we use the production `acd` binary itself: a brief
+// `acd start` + `acd stop` cycle migrates the schema, after which we are
+// free to seed arbitrary rows for the populated-state scenarios.
+//
+// Returns the absolute path to the state.db.
+func initStateDBSchema(t *testing.T, ctx context.Context, env []string, repo, sessionID string) string {
+	t.Helper()
+	startSession(t, ctx, env, repo, sessionID, "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("state.db not created by start/stop bootstrap: %v", err)
+	}
+	return dbPath
+}
