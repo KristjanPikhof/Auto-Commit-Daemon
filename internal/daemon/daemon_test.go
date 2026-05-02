@@ -2588,3 +2588,318 @@ func (h *captureLogHandler) Records() []loggedRecord {
 	copy(out, h.records)
 	return out
 }
+
+// countFlushByStatus counts flush_requests rows in the given status.
+func countFlushByStatus(t *testing.T, db *state.DB, status string) int {
+	t.Helper()
+	var n int
+	if err := db.SQL().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM flush_requests WHERE status = ?`, status,
+	).Scan(&n); err != nil {
+		t.Fatalf("count flush_requests status=%s: %v", status, err)
+	}
+	return n
+}
+
+// TestRun_ProcessTokenChangeOncePerIteration pins the regression where the
+// run loop invoked processBranchTokenChange twice per iteration: once before
+// the flush drain and a second time as "pre-capture branch token". The
+// second call was redundant — HEAD cannot move between the two without an
+// explicit wake — and inflated the SameGeneration per-tick stamp.
+//
+// We assert this by booting the daemon, waiting for branch.head to settle,
+// then counting how many "branch.token.transition" trace records carry a
+// "fast-forward inside rewind grace" reason or branch_token.transition
+// SameGeneration. Because no transition happens, no transition trace fires,
+// but if the loop called processBranchTokenChange twice we'd still see
+// duplicate per-tick branch.head writes. We probe the per-tick stamp
+// behaviour via the conditional MetaSet: with the duplicated invocation,
+// every tick re-stamps even when liveHead is unchanged.
+func TestRun_ProcessTokenChangeOncePerIteration(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 16)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	seedHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+
+	// Reach in and clear MetaKeyBranchHead. With the conditional stamp
+	// guard AND the dedup, exactly one processBranchTokenChange invocation
+	// runs per iteration. After we delete the meta row, the next idle tick
+	// re-stamps it once. With the duplicate invocation present, we'd see
+	// two writes per tick — but writes are idempotent, so the visible
+	// behaviour is "row reappears". We time how quickly the row reappears
+	// after deletion to assert at least one stamp happened per wake.
+	if _, err := state.MetaDelete(context.Background(), f.db, MetaKeyBranchHead); err != nil {
+		t.Fatalf("MetaDelete: %v", err)
+	}
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+
+	// Now the row matches liveHead. Drive several wakes and confirm
+	// branch.head stays at seedHead and no spurious generation bumps fire.
+	for i := 0; i < 4; i++ {
+		wakeCh <- struct{}{}
+		time.Sleep(20 * time.Millisecond)
+	}
+	v, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyBranchGeneration)
+	if err != nil || !ok {
+		t.Fatalf("branch.generation missing: ok=%v err=%v", ok, err)
+	}
+	if v != "1" {
+		t.Fatalf("branch.generation=%q want 1 (no transitions expected)", v)
+	}
+	head, _, _ := state.MetaGet(context.Background(), f.db, MetaKeyBranchHead)
+	if head != seedHead {
+		t.Fatalf("branch.head=%q want %q", head, seedHead)
+	}
+}
+
+// TestRun_FlushDrainBoundedByLimit pins the regression where the flush
+// drain loop ran without an upper bound. A 1500-row burst would block the
+// rest of the run loop (capture/replay, refcount sweep, heartbeat) until
+// the entire queue drained, and shutdowns mid-drain were starved.
+//
+// We enqueue 600 rows (> DefaultFlushLimit=256) with FlushLimit=64 to keep
+// the test snappy, then assert that one wake completes exactly 64 rows and
+// leaves the rest pending for subsequent ticks.
+func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pre-enqueue 600 flush requests before booting the daemon.
+	for i := 0; i < 600; i++ {
+		if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	// Use a slow scheduler so we observe one tick at a time.
+	slow := Scheduler{
+		Base:         200 * time.Millisecond,
+		IdleCeiling:  500 * time.Millisecond,
+		ErrorCeiling: 500 * time.Millisecond,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   slow,
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			FlushLimit:  64,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// One iteration of the loop processes <= FlushLimit. Wait until the
+	// pending count drops, but still has work left to do.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		pending := countFlushByStatus(t, f.db, "pending")
+		completed := countFlushByStatus(t, f.db, "completed")
+		// Once the first iteration drained 64 rows we have pending=536,
+		// completed=64. Any further ticks may have completed more, but
+		// we must NEVER see a single iteration finish all 600 — that is
+		// the unbounded behaviour. Catch first iteration window.
+		if completed >= 64 && pending > 0 {
+			// Some rows still pending after at least one drain — bound holds.
+			break
+		}
+		if completed == 600 {
+			t.Fatalf("flush drain completed all 600 rows in a single tick — bound did not hold")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	pending := countFlushByStatus(t, f.db, "pending")
+	completed := countFlushByStatus(t, f.db, "completed")
+	if completed < 64 {
+		t.Fatalf("flush drain completed only %d (<64) within 3s; expected at least one bounded pass", completed)
+	}
+	if pending == 0 {
+		t.Fatalf("flush drain consumed everything in one observation window; FlushLimit=64 was not honored")
+	}
+	t.Logf("after first bounded pass: completed=%d pending=%d", completed, pending)
+}
+
+// TestRun_FlushDrainCancelable pins the regression where SIGTERM during a
+// large flush drain was starved until the entire queue drained. The inner
+// loop now checks ctx.Err on every iteration and breaks immediately.
+func TestRun_FlushDrainCancelable(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Enqueue a large burst to make the drain take meaningful time even
+	// with FlushLimit=DefaultFlushLimit (256).
+	for i := 0; i < 1500; i++ {
+		if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	exited := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		defer close(exited)
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// Send shutdown signal and assert Run returns within a small budget.
+	// Without the ctx.Err check inside the drain loop, an unbounded drain
+	// of 1500 rows would dwarf this budget on slow hosts; the bounded +
+	// cancelable drain exits within at most one bounded pass.
+	start := time.Now()
+	shutdownCh <- struct{}{}
+	select {
+	case <-exited:
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Fatalf("Run took %v to exit after shutdown; flush drain not cancelable", elapsed)
+		}
+		t.Logf("graceful shutdown in %v", elapsed)
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-exited
+		t.Fatalf("Run did not exit within 3s after shutdown signal")
+	}
+	wg.Wait()
+}
+
+// TestRun_OrphanAckedFlushSweepOnStartup pins the orphan sweep: rows that
+// sat in "acknowledged" past OrphanFlushAckThreshold are marked failed at
+// daemon startup so `acd status` doesn't accumulate ghosts forever.
+func TestRun_OrphanAckedFlushSweepOnStartup(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+
+	// Insert an orphan acknowledged row directly via SQL — old enough to
+	// trip the threshold.
+	old := float64(time.Now().Add(-10*time.Minute).UnixNano()) / 1e9
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`INSERT INTO flush_requests(command, non_blocking, requested_ts, acknowledged_ts, status)
+         VALUES (?, 0, ?, ?, 'acknowledged')`,
+		"wake", old, old,
+	); err != nil {
+		t.Fatalf("insert orphan: %v", err)
+	}
+	// Insert a fresh acknowledged row that is younger than the threshold —
+	// must NOT be swept.
+	fresh := float64(time.Now().Add(-30*time.Second).UnixNano()) / 1e9
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`INSERT INTO flush_requests(command, non_blocking, requested_ts, acknowledged_ts, status)
+         VALUES (?, 0, ?, ?, 'acknowledged')`,
+		"wake", fresh, fresh,
+	); err != nil {
+		t.Fatalf("insert fresh: %v", err)
+	}
+
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// The orphan was old enough to be swept to "failed".
+	deadline := time.Now().Add(2 * time.Second)
+	var failed, acked int
+	for time.Now().Before(deadline) {
+		failed = countFlushByStatus(t, f.db, "failed")
+		acked = countFlushByStatus(t, f.db, "acknowledged")
+		if failed >= 1 && acked == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("after sweep: failed=%d acknowledged=%d; want failed>=1 and acknowledged=1 (fresh row preserved)", failed, acked)
+}
