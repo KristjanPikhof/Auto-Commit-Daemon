@@ -56,6 +56,23 @@ func TestSafeIgnoreDirectoryPruning(t *testing.T) {
 	}
 }
 
+func TestSafeIgnoreDirectoryPatternsDoNotMatchSameNamedFiles(t *testing.T) {
+	t.Setenv(EnvSafeIgnore, "")
+	t.Setenv(EnvSafeIgnoreExtra, "dist/, web/build/")
+	m := NewSafeIgnoreMatcher()
+
+	for _, rel := range []string{"node_modules", "target", "pkg/target", "dist", "web/build"} {
+		if m.MatchFile(rel) {
+			t.Fatalf("MatchFile(%q) = true, want false for same-named file", rel)
+		}
+	}
+	for _, rel := range []string{"node_modules/pkg/index.js", "pkg/target/debug/app", "dist/app.js", "web/build/app.js"} {
+		if !m.MatchFile(rel) {
+			t.Fatalf("MatchFile(%q) = false, want true for descendant", rel)
+		}
+	}
+}
+
 func TestSafeIgnoreDisableEnv(t *testing.T) {
 	for _, value := range []string{"0", "false", "FALSE", " no ", "off"} {
 		t.Run("disable="+quoted(value), func(t *testing.T) {
