@@ -963,3 +963,41 @@ func TestCapture_AcdTopLevelPathNotPruned(t *testing.T) {
 		}
 	}
 }
+
+// TestCapture_NTPStepBackwardDoesNotSilenceWarn proves that an NTP backward
+// step (or any wall-clock rewind) does NOT permanently silence the
+// pending-cap warn. Pre-fix the gate compared `now-last < interval` with
+// signed int64 arithmetic; if `last` was set when the clock was ahead and
+// then NTP stepped back, every subsequent comparison evaluated true and
+// suppressed the warn forever.
+//
+// Setup: stamp `last` 5 minutes in the future (simulating a clock rewind),
+// then call shouldEmitPendingCapWarn with `now` representing the corrected
+// time. The gate must fire (clamp + emit) instead of staying suppressed.
+func TestCapture_NTPStepBackwardDoesNotSilenceWarn(t *testing.T) {
+	resetPendingCapWarnForTest(t, 60)
+	defer resetPendingCapWarnForTest(t, 0)
+
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	future := now.Add(5 * time.Minute)
+
+	// Stamp `last` 5 minutes ahead — simulates the situation where the wall
+	// clock was running fast, we recorded a warn, and then NTP stepped the
+	// clock backward.
+	pendingCapWarnLastUnix.Store(future.Unix())
+
+	// Override the time source for shouldEmitPendingCapWarn to return `now`.
+	fn := func() time.Time { return now }
+	wrapped := fn
+	pendingCapNowFn.Store(&wrapped)
+	defer pendingCapNowFn.Store(nil)
+
+	if !shouldEmitPendingCapWarn() {
+		t.Fatal("NTP backward step silenced pending-cap warn forever; clamp missing")
+	}
+	// The clamp should have rewritten last to `now` so a follow-up immediately
+	// after the same now is suppressed (interval throttling still in force).
+	if shouldEmitPendingCapWarn() {
+		t.Fatal("interval throttling broken after clamp")
+	}
+}
