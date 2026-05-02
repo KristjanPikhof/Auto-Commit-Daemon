@@ -223,6 +223,29 @@ func applyRecoverPlan(ctx context.Context, stateDB string, plan *recoverPlan) er
 	}
 	plan.BackupPath = backup
 
+	// Preflight FS probes BEFORE opening a write transaction. FS syscalls
+	// (os.Lstat, parent-dir writability probe) can stall on network mounts;
+	// performing them inside an open tx would hold the write lock during the
+	// stall. If the marker is non-removable we abort here so the DB stays
+	// untouched. Without --clear-pause the marker is always preserved and we
+	// skip the removability check entirely.
+	markerExists := false
+	if plan.ManualMarkerPath != "" {
+		if info, err := os.Lstat(plan.ManualMarkerPath); err == nil {
+			markerExists = true
+			if plan.ClearPause {
+				if !info.Mode().IsRegular() {
+					return fmt.Errorf("acd recover: manual pause marker %s is not a regular file", plan.ManualMarkerPath)
+				}
+				if err := checkParentDirWritable(plan.ManualMarkerPath); err != nil {
+					return fmt.Errorf("acd recover: manual pause marker parent not writable: %w", err)
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("acd recover: stat manual pause marker %s: %w", plan.ManualMarkerPath, err)
+		}
+	}
+
 	db, err := state.Open(ctx, stateDB)
 	if err != nil {
 		return fmt.Errorf("acd recover: open state.db: %w", err)
