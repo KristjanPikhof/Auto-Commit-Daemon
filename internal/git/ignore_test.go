@@ -176,8 +176,8 @@ func TestCheck_LargePathBatch_NoDeadlock(t *testing.T) {
 	paths := make([]string, 0, n)
 	want := make([]bool, 0, n)
 	for i := 0; i < n; i++ {
-		// Long stable prefix so each path is ~60 bytes.
-		base := fmt.Sprintf("deeply/nested/path/segment/that/pads/length/file_%05d", i)
+		// Long stable prefix so each path is ~60+ bytes.
+		base := fmt.Sprintf("deeply/nested/path/segment/that/pads/length/more/file_%05d", i)
 		if i%2 == 0 {
 			paths = append(paths, base+".log") // ignored
 			want = append(want, true)
