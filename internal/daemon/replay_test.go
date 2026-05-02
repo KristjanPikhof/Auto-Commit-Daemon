@@ -442,6 +442,7 @@ func TestReplay_BoundedBatchYields(t *testing.T) {
 
 	// Sanity check: a Limit=0 (unbounded) drain on an empty queue must NOT
 	// signal HasMore.
+	f.cctx.BaseHead = sum2.BaseHead
 	sum3, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
