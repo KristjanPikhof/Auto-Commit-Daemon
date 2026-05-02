@@ -76,6 +76,7 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 	stopDone := make(chan error, 1)
 	var stopExit atomic.Int32
 	stopExit.Store(-999)
+	_ = stopExit
 
 	go func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), budget)
