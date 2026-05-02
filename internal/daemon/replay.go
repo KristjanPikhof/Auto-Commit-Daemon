@@ -174,9 +174,21 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		_ = os.Remove(indexFile)
 	}
 
-	pending, err := state.PendingEvents(ctx, db, opts.Limit)
+	// Per-pass batch budget. When opts.Limit > 0 we query one extra row so the
+	// "is there more queued behind this batch?" question can be answered
+	// without a follow-up COUNT — sum.HasMore tells the run loop to schedule
+	// an immediate next pass instead of waiting for the poll tick.
+	queryLimit := opts.Limit
+	if queryLimit > 0 {
+		queryLimit = opts.Limit + 1
+	}
+	pending, err := state.PendingEvents(ctx, db, queryLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
+	}
+	if opts.Limit > 0 && len(pending) > opts.Limit {
+		pending = pending[:opts.Limit]
+		sum.HasMore = true
 	}
 	if len(pending) == 0 {
 		return sum, nil
