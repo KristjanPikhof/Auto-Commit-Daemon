@@ -1321,7 +1321,7 @@ func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, is
 		issue.Message = "replay conflict"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	if err := state.MarkEventBlocked(ctx, db, ev.Seq, issue.Message, nowSec,
+	if err := markEventBlockedFn(ctx, db, ev.Seq, issue.Message, nowSec,
 		sql.NullString{String: cctx.BranchRef, Valid: true},
 		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		sql.NullString{String: cctx.BaseHead, Valid: true},
