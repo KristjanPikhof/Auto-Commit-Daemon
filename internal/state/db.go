@@ -49,6 +49,14 @@ func (d *DB) SQL() *sql.DB { return d.conn }
 
 func (d *DB) readSQL() *sql.DB { return d.readConn }
 
+// ReadSQL returns the read-only handle backed by the multi-connection read
+// pool. Exposed so adjacent packages (e.g. internal/daemon) can route status
+// and inventory queries off the single-connection writer pool. The writer
+// holds a serialized lock during long replay batches; reads issued against
+// d.SQL() block behind that lock and starve heartbeat / capture writes.
+// Callers must not run schema-changing statements through this handle.
+func (d *DB) ReadSQL() *sql.DB { return d.readConn }
+
 // Close releases the underlying database handle. Safe to call multiple times;
 // the second call returns the original close error.
 func (d *DB) Close() error {
