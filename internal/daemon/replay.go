@@ -70,7 +70,7 @@ func shouldEmitPauseWarn(key string) bool {
 	stored, _ := pauseWarnLastUnix.LoadOrStore(key, &atomic.Int64{})
 	last := stored.(*atomic.Int64).Load()
 	interval := pauseWarnIntervalSeconds()
-	if now <= last { // NTP backward step or same-second emit
+	if now < last { // NTP backward step (strict; same-second still throttles)
 		stored.(*atomic.Int64).Store(now)
 		return true
 	}
