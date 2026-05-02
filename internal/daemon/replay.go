@@ -403,12 +403,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				})
 				continue
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			if err := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorBeforeStateMismatch,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			// Halt the batch: subsequent events were captured assuming
@@ -417,20 +419,26 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Apply ops to the isolated index and write a tree. We split this
-		// out from commit-tree so we can short-circuit a parallel-create
-		// no-op: when an external committer already produced the same
-		// tree on top of `parent`, the resulting tree OID matches
-		// `parent`'s tree and we settle the event as already-published
-		// without minting an empty commit.
-		treeOID, err := applyOpsAndWriteTree(ctx, repoRoot, indexFile, ops)
+		// Per-event timeout. write-tree, commit-tree, and update-ref are
+		// the heavy git ops in this loop; a pathological worktree (giant
+		// rename, GC contention, network alternates) could otherwise stall
+		// a single event for minutes and starve flush_requests / shutdown
+		// signals waiting on the run loop. Each event gets a 60s budget
+		// inherited from the caller's ctx; on timeout the event is marked
+		// failed and the batch halts so the next pass starts fresh. Tests
+		// override the budget via replayPerEventTimeoutForTest.
+		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
-			markFailed(ctx, db, ev, replayIssue{
+			cancelEvent()
+			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); markErr != nil {
+				return sum, markErr
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
 			sum.Failed++
 			return sum, nil
