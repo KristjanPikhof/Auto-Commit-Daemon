@@ -151,6 +151,31 @@ func TestIgnoreCheckerCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestIgnoreCheckerInvalidateReloadsGitignore(t *testing.T) {
+	dir := initRepo(t)
+	checker := NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	got, err := checker.Check(context.Background(), []string{"node_modules/pkg/index.js"})
+	if err != nil {
+		t.Fatalf("initial Check: %v", err)
+	}
+	if got[0] {
+		t.Fatalf("node_modules unexpectedly ignored before .gitignore exists")
+	}
+
+	writeGitignore(t, dir, "node_modules/\n")
+	checker.Invalidate()
+
+	got, err = checker.Check(context.Background(), []string{"node_modules/pkg/index.js"})
+	if err != nil {
+		t.Fatalf("Check after invalidate: %v", err)
+	}
+	if !got[0] {
+		t.Fatalf("node_modules was not ignored after .gitignore reload")
+	}
+}
+
 type simpleErr struct{ msg string }
 
 func (e *simpleErr) Error() string { return e.msg }
