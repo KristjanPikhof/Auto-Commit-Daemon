@@ -260,9 +260,10 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("Run returned %v", runErr)
 	}
-	if mode := daemonMode(t, f.db); mode != "stopped" {
-		t.Fatalf("daemon_state.mode=%q want stopped", mode)
-	}
+	// graceful() commits mode=stopped via a fresh background ctx, but the
+	// read pool's WAL snapshot can briefly trail the writer pool's commit
+	// under broad-suite scheduling on macOS. Poll instead of one-shot read.
+	waitForDaemonMode(t, f.db, "stopped", 2*time.Second)
 }
 
 // TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
