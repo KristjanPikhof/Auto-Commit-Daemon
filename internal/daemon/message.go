@@ -377,8 +377,18 @@ func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error
 	// enforced at the git layer via DiffBlobsLimited so an oversize blob
 	// truncates at ai.DiffCap rather than after we've already buffered the
 	// full payload.
+	// Per-op git-layer cap. ai.DiffCap (4 KiB) is the AI provider budget
+	// applied via cappedDiffBuffer at the BuildOpsDiff outer layer; we
+	// give git 2× that so the preamble + first hunk never starve the
+	// rendered diff (git's `diff --git` + `index` + `--- /dev/null` +
+	// `+++` headers can eat ~200 bytes before the first hunk lands).
+	// Without the headroom, a giant blob's git output gets truncated mid-
+	// preamble and the outer buffer never reaches its cap, letting later
+	// ops render past the budget. The legacy code used DefaultDiffCap
+	// (1 MiB) so this is a tighten, not a regression.
+	const perOpGitCap = int64(ai.DiffCap * 2)
 	diffCtx, cancel := context.WithTimeout(ctx, diffBlobsTimeout())
-	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, int64(ai.DiffCap))
+	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, perOpGitCap)
 	cancel()
 	if err != nil {
 		// ErrStdoutOverflow is an expected outcome for large diffs: the
