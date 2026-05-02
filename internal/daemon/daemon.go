@@ -1232,7 +1232,7 @@ func Run(ctx context.Context, opts Options) error {
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
 		if !branchTransitionBlocked && !operationPaused && !detachedHeadPaused {
-			daemonPaus, pauseErr = daemonPauseState(ctx, opts.GitDir, opts.DB)
+			daemonPaus, pauseErr = daemonPauseStateFn(ctx, opts.GitDir, opts.DB)
 			if pauseErr != nil {
 				logger.Warn("read daemon pause state", "err", pauseErr.Error())
 			}
