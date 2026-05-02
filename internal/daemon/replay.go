@@ -1578,10 +1578,15 @@ func traceReplayPaused(logger acdtrace.Logger, repoRoot string, cctx CaptureCont
 }
 
 func traceError(decision, reason string) string {
-	if decision == state.EventStatePublished || reason == "" {
+	if reason == "" {
 		return ""
 	}
-	return reason
+	switch decision {
+	case state.EventStateFailed, state.EventStateBlockedConflict:
+		return reason
+	default:
+		return ""
+	}
 }
 
 // checkEventGeneration is the §8.9 stale-event guard. Returns a non-empty
