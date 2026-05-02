@@ -359,6 +359,19 @@ func Run(ctx context.Context, opts Options) error {
 		logger.Info("swept orphan acknowledged flush requests", "rows", n)
 	}
 
+	// 1b. Rewind-grace clamp. The pause marker is persisted as a wall-clock
+	// RFC3339 timestamp; if the host clock jumped forward between
+	// maybeSetRewindGrace writing the marker and the daemon restarting (or
+	// jumped backward and was later corrected), the marker can sit far
+	// beyond the configured grace window. Cap to 2*grace; legitimate values
+	// stay untouched.
+	if clamped, original, replacement, err := ClampRewindGraceAtStartup(ctx, opts.DB, now()); err != nil {
+		logger.Warn("clamp rewind grace meta at startup", "err", err.Error())
+	} else if clamped {
+		logger.Warn("clamped wall-clock-skewed rewind grace marker at startup",
+			"original", original, "replacement", replacement)
+	}
+
 	pid := os.Getpid()
 	bootTime := now()
 
