@@ -81,7 +81,7 @@ func TestCapture_LargeIgnoredTree(t *testing.T) {
 	traceEnv := envWith(env, "ACD_TRACE=1", "ACD_TRACE_DIR="+traceDir)
 
 	startWall := time.Now()
-	startSession(t, traceEnv2Ctx(ctx), traceEnv, repo, "ignored-1", "shell",
+	startSession(t, ctx, traceEnv, repo, "ignored-1", "shell",
 		"ACD_TRACE=1", "ACD_TRACE_DIR="+traceDir)
 	waitFor(t, "daemon mode=running within 10s for 50k ignored tree", 10*time.Second, func() bool {
 		return readDaemonStateMode(repo) == "running"
