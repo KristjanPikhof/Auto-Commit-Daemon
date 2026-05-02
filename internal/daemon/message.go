@@ -380,12 +380,20 @@ func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error
 	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, int64(ai.DiffCap))
 	cancel()
 	if err != nil {
-		// Best-effort: when git refuses (missing blob, foreign archive,
-		// per-op deadline hit, stdout overflow), fall back to header-only
-		// so the model still sees the change shape. ErrStdoutOverflow
-		// returns the partial prefix; a header-only fallback is safer for
-		// the model than a truncated mid-hunk body.
-		return hdr.String(), nil
+		// ErrStdoutOverflow is an expected outcome for large diffs: the
+		// git-layer cap enforcement returns the prefix bytes alongside
+		// the sentinel. Keep the prefix so downstream cappedDiffBuffer
+		// still sees a real body (the legacy code relied on a 1 MiB git
+		// cap + 4 KiB buffer cap to truncate at the buffer; we now cap
+		// at the git layer for the same effect).
+		//
+		// Any other error (missing blob, foreign archive, per-op
+		// deadline) falls through to header-only so the model still sees
+		// the change shape rather than mid-hunk garbage from a stalled
+		// subprocess.
+		if !errors.Is(err, git.ErrStdoutOverflow) {
+			return hdr.String(), nil
+		}
 	}
 	body = stripGitDiffPreamble(body)
 
