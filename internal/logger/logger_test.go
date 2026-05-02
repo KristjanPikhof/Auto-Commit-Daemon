@@ -298,13 +298,17 @@ func TestLogger_RotateDoesNotBlockWriters(t *testing.T) {
 	}
 	defer w.Close()
 
-	// Force a rotation: a payload that crosses maxSize on top of an
-	// already-non-empty file.
+	// Force exactly one rotation: write enough to push the active file
+	// past maxSize with the second Write, but not so much that the
+	// follow-up Write below would trigger ANOTHER rotation (which would
+	// block on gzipWG.Wait for the prior gzip).
 	seed := []byte(strings.Repeat("x", maxSize/2) + "\n")
 	if _, err := w.Write(seed); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}
-	rotatePayload := []byte(strings.Repeat("y", maxSize) + "\n")
+	// Just enough to exceed maxSize on top of the seed. After rotation
+	// the new active file holds only this payload.
+	rotatePayload := []byte(strings.Repeat("y", maxSize/2+200) + "\n")
 	if _, err := w.Write(rotatePayload); err != nil {
 		t.Fatalf("rotate write: %v", err)
 	}
