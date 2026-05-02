@@ -1212,13 +1212,20 @@ func TestReplay_CASRetryRecoversFromLock(t *testing.T) {
 	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
 		t.Fatalf("unexpected summary: %+v", sum)
 	}
-	wantSleeps := []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
-	if len(sleeps) != len(wantSleeps) {
-		t.Fatalf("sleeps=%v want %v", sleeps, wantSleeps)
+	// Backoffs are jittered ±25% around the configured base (50ms, 100ms)
+	// to avoid co-located daemons retrying in lockstep on the same ref.
+	// Assert each sample falls inside the ±25% envelope rather than
+	// pinning exact values.
+	bases := []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
+	if len(sleeps) != len(bases) {
+		t.Fatalf("sleeps=%v want %d samples", sleeps, len(bases))
 	}
-	for i := range wantSleeps {
-		if sleeps[i] != wantSleeps[i] {
-			t.Fatalf("sleeps=%v want %v", sleeps, wantSleeps)
+	for i, base := range bases {
+		minD := time.Duration(float64(base) * 0.75)
+		maxD := time.Duration(float64(base) * 1.25)
+		if sleeps[i] < minD || sleeps[i] >= maxD {
+			t.Fatalf("sleeps[%d]=%v not in [%v, %v) (jittered base %v)",
+				i, sleeps[i], minD, maxD, base)
 		}
 	}
 
