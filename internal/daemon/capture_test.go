@@ -220,6 +220,85 @@ func TestCapture_SensitiveDefaultDeny(t *testing.T) {
 	}
 }
 
+func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
+	t.Setenv(state.EnvSafeIgnore, "")
+	t.Setenv(state.EnvSafeIgnoreExtra, "")
+	f := newCaptureFixture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "fine.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write fine: %v", err)
+	}
+	for _, root := range []string{"node_modules", "target"} {
+		for i := 0; i < 16; i++ {
+			dir := filepath.Join(f.dir, root, fmt.Sprintf("pkg-%02d", i))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", dir, err)
+			}
+			for j := 0; j < 16; j++ {
+				leaf := filepath.Join(dir, fmt.Sprintf("leaf-%02d.txt", j))
+				if err := os.WriteFile(leaf, []byte("generated"), 0o644); err != nil {
+					t.Fatalf("write %s: %v", leaf, err)
+				}
+			}
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:     f.ig,
+		SensitiveMatcher:  f.matcher,
+		SafeIgnoreMatcher: state.NewSafeIgnoreMatcher(),
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.WalkedFiles >= 100 {
+		t.Fatalf("WalkedFiles=%d; generated trees should be pruned before descendants are read", sum.WalkedFiles)
+	}
+
+	var sawFine bool
+	for _, op := range pendingOps(t, f.db) {
+		if strings.HasPrefix(op.Path, "node_modules/") || strings.HasPrefix(op.Path, "target/") {
+			t.Fatalf("safe-ignore generated path captured: %+v", op)
+		}
+		if op.Path == "fine.txt" {
+			sawFine = true
+		}
+	}
+	if !sawFine {
+		t.Fatalf("expected fine.txt to be captured, got %+v", pendingOps(t, f.db))
+	}
+}
+
+func TestCapture_SafeIgnoreDisableRestoresGeneratedTreeCapture(t *testing.T) {
+	t.Setenv(state.EnvSafeIgnore, "0")
+	t.Setenv(state.EnvSafeIgnoreExtra, "")
+	f := newCaptureFixture(t)
+
+	generated := filepath.Join(f.dir, "node_modules", "pkg", "index.js")
+	if err := os.MkdirAll(filepath.Dir(generated), 0o755); err != nil {
+		t.Fatalf("mkdir generated: %v", err)
+	}
+	if err := os.WriteFile(generated, []byte("module.exports = 1\n"), 0o644); err != nil {
+		t.Fatalf("write generated: %v", err)
+	}
+
+	_, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:     f.ig,
+		SensitiveMatcher:  f.matcher,
+		SafeIgnoreMatcher: state.NewSafeIgnoreMatcher(),
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	for _, op := range pendingOps(t, f.db) {
+		if op.Path == "node_modules/pkg/index.js" {
+			return
+		}
+	}
+	t.Fatalf("expected generated file to be captured when %s=0; got %+v", state.EnvSafeIgnore, pendingOps(t, f.db))
+}
+
 // TestCapture_OversizeMetaOnly: a file > MaxFileBytes records a daemon_meta
 // row and produces NO commit-event.
 func TestCapture_OversizeMetaOnly(t *testing.T) {
