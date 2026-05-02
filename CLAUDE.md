@@ -112,9 +112,12 @@ Required after any `templates/*` edit (templates baked at build time via `templa
 ## Gotchas
 
 - **`modernc.org/sqlite`** drives the DB without cgo. Pinned at `v1.36.0` to keep the `go 1.22` directive (newer sqlite needs go ≥ 1.23). Platform breakage = STOP and surface options to the user; do not bump go or sqlite without explicit approval.
+- **`isSQLiteLocked` matches typed errors first.** `internal/state/db.go` imports `modernc.org/sqlite` as a named package and unwraps to `*sqlite.Error`, comparing the typed code before falling back to substring matching on the message. Do not regress to substring-only matching — sqlite localizes some message strings.
 - **Symlinks**: always captured as mode `120000`. Never descend into symlinked directories. Fixture: `TestCapture_SymlinkToDirAsMode120000`.
 - **Sensitive globs**: empty `ACD_SENSITIVE_GLOBS` falls back to defaults. Never let a typo open the gate.
 - **Sensitive directory pruning**: fsnotify prunes only literal sensitive directory names. Wildcard file patterns like `credentials*` are applied at file granularity so ordinary directories such as `credentials_repo` are still watched.
+- **`ACD_AI_DIFF_EGRESS` payloads are bounded at the git layer.** `BuildOpsDiff` calls `git.DiffBlobsLimited` with `git.DefaultDiffCap` per op; oversize diffs return `ErrStdoutOverflow` and surface a truncated prefix instead of being silently dropped. There is no longer a post-render trim step in `BuildOpsDiff`.
+- **`ps` is invoked via absolute path.** `internal/identity/ps_darwin.go` pins `/bin/ps` and `internal/identity/ps_linux.go` pins `/usr/bin/ps`; do not refactor these to a `PATH` lookup. A forged `ps` on `$PATH` would otherwise spoof process fingerprints.
 
 ## Harness adapter gotchas
 
