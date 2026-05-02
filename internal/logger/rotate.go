@@ -50,6 +50,10 @@ type rotatingWriter struct {
 	maxBackups int
 	maxAgeDays int
 	closed     bool
+	// gzipWG tracks background gzip goroutines spawned by rotateLocked so
+	// Close can wait briefly for them to finish; the bound is gzipCloseWait
+	// so a wedged disk does not stall daemon shutdown.
+	gzipWG sync.WaitGroup
 }
 
 // newRotatingWriter opens path in append mode, primes the in-memory size
