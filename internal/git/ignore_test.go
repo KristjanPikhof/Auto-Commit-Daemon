@@ -153,3 +153,90 @@ func TestIgnoreCheckerCloseIsIdempotent(t *testing.T) {
 type simpleErr struct{ msg string }
 
 func (e *simpleErr) Error() string { return e.msg }
+
+// TestCheck_LargePathBatch_NoDeadlock pumps a payload large enough to fill
+// a macOS pipe buffer (16 KiB) on its own. Pre-fix, Check serialized as
+// "Write all paths, then read all results", which deadlocks once the
+// payload exceeds the pipe buffer because git is simultaneously blocked
+// writing stdout while the daemon never drains stdout. Post-fix, the
+// writer runs concurrently with the read loop and the call returns well
+// inside the 5s context budget. The test also asserts that no writer
+// goroutine leaks past the call.
+func TestCheck_LargePathBatch_NoDeadlock(t *testing.T) {
+	dir := initRepo(t)
+	writeGitignore(t, dir, "*.log\n")
+
+	checker := NewIgnoreChecker(dir)
+	t.Cleanup(func() { _ = checker.Close() })
+
+	// Build 802 paths averaging ~60 bytes each so the NUL-delimited
+	// stdin payload exceeds 47 KiB — comfortably past the 16 KiB macOS
+	// pipe buffer that triggers the original deadlock.
+	const n = 802
+	paths := make([]string, 0, n)
+	want := make([]bool, 0, n)
+	for i := 0; i < n; i++ {
+		// Long stable prefix so each path is ~60 bytes.
+		base := fmt.Sprintf("deeply/nested/path/segment/that/pads/length/file_%05d", i)
+		if i%2 == 0 {
+			paths = append(paths, base+".log") // ignored
+			want = append(want, true)
+		} else {
+			paths = append(paths, base+".go") // not ignored
+			want = append(want, false)
+		}
+	}
+
+	// Sanity: we are actually exercising the >47 KiB regime.
+	var totalBytes int
+	for _, p := range paths {
+		totalBytes += len(p) + 1 // path + NUL
+	}
+	if totalBytes < 47*1024 {
+		t.Fatalf("payload too small to exercise pipe-buffer hazard: %d bytes", totalBytes)
+	}
+
+	gBefore := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	got, err := checker.Check(ctx, paths)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Check large batch: %v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("Check returned in %v — too close to 5s timeout, suggests deadlock recovery via ctx cancel", elapsed)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len mismatch: got %d want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("Check(%q) = %v, want %v", paths[i], got[i], want[i])
+		}
+	}
+
+	// Goroutine leak check: writer goroutine must not outlive Check.
+	// Allow brief settle time + a small slack to account for the test
+	// runtime itself, but flag any sustained leak that scales with n.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= gBefore+2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if g := runtime.NumGoroutine(); g > gBefore+2 {
+		// Dump goroutine stacks to aid debugging if this fires.
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		if strings.Contains(string(buf[:n]), "ignore.go") {
+			t.Fatalf("goroutine leak: before=%d after=%d\nstacks:\n%s", gBefore, g, buf[:n])
+		}
+		t.Fatalf("goroutine leak: before=%d after=%d", gBefore, g)
+	}
+}
