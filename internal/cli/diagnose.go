@@ -81,6 +81,13 @@ func newDiagnoseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "diagnose",
 		Short: "Inspect replay blockers and branch anchors without mutating state",
+		Long: `Inspect replay blockers, pending depth, branch anchor state, git-operation markers, and remediation hints for one repo.
+
+The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Use acd recover --auto --dry-run to preview a repair when diagnose points to stale replay state.`,
+		Example: `  acd diagnose
+  acd diagnose --repo /path/to/repo
+  acd diagnose --json
+  acd recover --repo . --auto --dry-run --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
