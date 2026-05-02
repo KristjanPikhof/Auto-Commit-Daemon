@@ -324,10 +324,6 @@ func TestReconcileLiveIndexAppliesSafePathScopedUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hash after: %v", err)
 	}
-	empty, err := HashObjectStdin(ctx, dir, nil)
-	if err != nil {
-		t.Fatalf("hash empty: %v", err)
-	}
 	fresh, err := HashObjectStdin(ctx, dir, []byte("fresh\n"))
 	if err != nil {
 		t.Fatalf("hash fresh: %v", err)
@@ -388,6 +384,10 @@ func TestReconcileLiveIndexSkipsProtectedLiveIndexStates(t *testing.T) {
 	after, err := HashObjectStdin(ctx, dir, []byte("after\n"))
 	if err != nil {
 		t.Fatalf("hash after: %v", err)
+	}
+	empty, err := HashObjectStdin(ctx, dir, nil)
+	if err != nil {
+		t.Fatalf("hash empty: %v", err)
 	}
 	if err := UpdateIndexInfo(ctx, dir, "", []string{
 		RegularFileMode + " " + other + "\tmismatch.txt",
