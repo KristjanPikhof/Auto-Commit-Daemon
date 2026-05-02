@@ -806,7 +806,12 @@ func updateReplayRefWithRetry(
 		if finalAttempt {
 			return err
 		}
-		if sleepErr := replayUpdateRefSleep(ctx, replayUpdateRefBackoffs[attempt-1]); sleepErr != nil {
+		jitter := defaultUpdateRefJitter
+		if fn := replayUpdateRefJitterFn.Load(); fn != nil && *fn != nil {
+			jitter = *fn
+		}
+		backoff := jitter(replayUpdateRefBackoffs[attempt-1])
+		if sleepErr := replayUpdateRefSleep(ctx, backoff); sleepErr != nil {
 			return sleepErr
 		}
 	}
