@@ -194,10 +194,20 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 	// Reads completed cleanly; surface any deferred writer error. A write
 	// error here means git accepted enough bytes to satisfy len(paths)
 	// records but then closed its stdin half early, which is still a
-	// protocol violation — fail closed and reset the subprocess.
-	if werr := <-errCh; werr != nil {
+	// protocol violation — fail closed and reset the subprocess. Honor
+	// ctx cancellation so a hung writer (git accepted only part of the
+	// payload and never closed stdin) does not deadlock the call; the
+	// killLocked path then unblocks the writer goroutine for a clean drain.
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			c.killLocked()
+			return nil, fmt.Errorf("check-ignore write: %w", werr)
+		}
+	case <-ctx.Done():
 		c.killLocked()
-		return nil, fmt.Errorf("check-ignore write: %w", werr)
+		<-errCh
+		return nil, fmt.Errorf("check-ignore write: %w", ctx.Err())
 	}
 	return results, nil
 }
