@@ -96,7 +96,7 @@ func newStartCmd() *cobra.Command {
 			return runStart(c.Context(), c.OutOrStdout(), repoFlag, sessionID, harness, watchPID, jsonOut)
 		},
 	}
-	cmd.Flags().String("session-id", "", "Universal session identifier (UUID, required)")
+	cmd.Flags().String("session-id", "", "Universal session identifier (UUID; optional for manual starts)")
 	cmd.Flags().String("harness", "", "Harness identifier (claude-code|codex|opencode|pi|shell|other)")
 	cmd.Flags().Int("watch-pid", 0, "Optional fast-path PID for liveness probe (0 to disable)")
 	return cmd
@@ -106,11 +106,8 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if sessionID == "" {
-		return errors.New("acd start: --session-id is required")
-	}
-	if harness == "" {
-		harness = "other"
+	if sessionID == "" && harness != "" {
+		return errors.New("acd start: --session-id is required when --harness is set")
 	}
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
@@ -118,6 +115,16 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	if !fileExists(repo) {
 		return fmt.Errorf("acd start: repo %s does not exist", repo)
+	}
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		return fmt.Errorf("acd start: repo hash: %w", err)
+	}
+	if sessionID == "" {
+		sessionID = humanStartSessionID(repoHash)
+	}
+	if harness == "" {
+		harness = "other"
 	}
 	gitDir, err := resolveGitDir(ctx, repo)
 	if err != nil {
@@ -239,10 +246,6 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 
 	// Update central registry — atomic via WithLock.
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		return fmt.Errorf("acd start: repo hash: %w", err)
-	}
 	roots, err := paths.Resolve()
 	if err != nil {
 		return fmt.Errorf("acd start: resolve paths: %w", err)
@@ -282,6 +285,10 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			sessionID, daemonPID)
 	}
 	return nil
+}
+
+func humanStartSessionID(repoHash string) string {
+	return "human:" + repoHash
 }
 
 func acquireStartControlLock(ctx context.Context, gitDir string) (*daemon.ControlLock, error) {
