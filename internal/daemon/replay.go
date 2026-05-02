@@ -1191,18 +1191,24 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 
 // markFailed flags an event as terminally failed and records the reason.
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
-// will not re-attempt it. Best-effort: persistence failures here do not
-// propagate.
-func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue) {
+// will not re-attempt it. Returns a non-nil error when the terminal-state
+// write to capture_events fails: swallowing the error would leave the
+// event in `pending` and the next pass would replay it forever. The
+// caller is expected to surface the error to the run loop so the
+// scheduler can back off rather than spin retry-storming the same row.
+func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue) error {
 	if issue.Message == "" {
 		issue.Message = "replay failed"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	_ = state.MarkEventPublished(ctx, db,
+	if err := state.MarkEventPublished(ctx, db,
 		ev.Seq, state.EventStateFailed,
 		sql.NullString{}, sql.NullString{String: issue.Message, Valid: true},
-		ev.Message, nowSec)
+		ev.Message, nowSec); err != nil {
+		return fmt.Errorf("daemon: mark failed seq=%d: %w", ev.Seq, err)
+	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
+	return nil
 }
 
 // recordConflict terminally settles the event in
@@ -1215,17 +1221,26 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue 
 // every subsequent poll, so a stuck event no longer blocks the queue with
 // retry churn. Operators see the row via `acd status` (blocked_conflicts
 // count) and via daemon_meta.last_replay_conflict for the human message.
-func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, cctx CaptureContext) {
+//
+// Returns a non-nil error when MarkEventBlocked fails. Swallowing it would
+// leave the event in `pending`, so PendingEvents would resurface it on the
+// next pass and replay would loop forever on a row the daemon already
+// classified as terminally broken. The caller surfaces the error to the
+// run loop so the scheduler can back off.
+func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue replayIssue, cctx CaptureContext) error {
 	if issue.Message == "" {
 		issue.Message = "replay conflict"
 	}
 	nowSec := float64(time.Now().UnixNano()) / 1e9
-	_ = state.MarkEventBlocked(ctx, db, ev.Seq, issue.Message, nowSec,
+	if err := state.MarkEventBlocked(ctx, db, ev.Seq, issue.Message, nowSec,
 		sql.NullString{String: cctx.BranchRef, Valid: true},
 		sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		sql.NullString{String: cctx.BaseHead, Valid: true},
-	)
+	); err != nil {
+		return fmt.Errorf("daemon: mark blocked seq=%d: %w", ev.Seq, err)
+	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
+	return nil
 }
 
 const (
