@@ -11,8 +11,11 @@ package state
 // first acd release; v2 adds capture_events indexes used by replay barriers
 // and pruning; v3 adds idx_capture_events_barrier — a covering index that
 // keeps the PendingEvents barrier subquery off a full-table scan when
-// long-running pauses fan capture_events into tens of thousands of rows.
-const SchemaVersion = 3
+// long-running pauses fan capture_events into tens of thousands of rows;
+// v4 adds idx_flush_requests_status_id so ClaimNextFlushRequest's
+// `status='pending' ORDER BY id ASC` lookup stays O(log n) after the queue
+// accumulates completed/acknowledged rows over a long uptime.
+const SchemaVersion = 4
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
