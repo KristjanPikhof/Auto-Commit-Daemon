@@ -518,7 +518,9 @@ Use this checklist when commits stop appearing:
    `recover` retargets stale generation rows after branch surgery. `purge-events`
    deletes terminal barriers and, when selected, obsolete pending rows behind
    them.
-   - After clearing the blockers, trigger a replay: `acd wake --session-id "$ACD_SESSION_ID"`.
+
+   After clearing the blockers, trigger a replay:
+   `acd wake --session-id "$ACD_SESSION_ID"`.
 
 4. **Check fsnotify mode.**
 
