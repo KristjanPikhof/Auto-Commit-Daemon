@@ -47,7 +47,7 @@ func newDaemonCmd() *cobra.Command {
 	return cmd
 }
 
-func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag string) error {
+func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag string) (retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -107,13 +107,15 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 	if err != nil {
 		return err
 	}
+	if logCloser != nil {
+		defer func() {
+			if closeErr := logCloser.Close(); closeErr != nil && retErr == nil {
+				retErr = fmt.Errorf("acd daemon run: close daemon log: %w", closeErr)
+			}
+		}()
+	}
 
 	runErr := daemon.Run(cctx, opts)
-	if logCloser != nil {
-		if closeErr := logCloser.Close(); closeErr != nil && runErr == nil {
-			return fmt.Errorf("acd daemon run: close daemon log: %w", closeErr)
-		}
-	}
 	if runErr != nil {
 		if errors.Is(runErr, daemon.ErrDaemonLockHeld) {
 			fmt.Fprintf(errOut, "acd daemon run: another daemon is already running for %s\n", repo)
@@ -137,7 +139,7 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 //   - CentralStatsDBPath + RepoHash are wired from the same canonical
 //     path resolution used by `acd logs`, so stats and logs agree on the
 //     repo identity.
-func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) (daemon.Options, io.Closer, error) {
+func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daemon.Options, io.Closer, error) {
 	fsEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
 		fsEnabled = true
