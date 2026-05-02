@@ -37,6 +37,29 @@ func TestLogsTailPrintsLastLinesRaw(t *testing.T) {
 	}
 }
 
+func TestReadLastLogLinesReturnsEOFOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	body := strings.Join([]string{
+		`{"msg":"one"}`,
+		`{"msg":"two"}`,
+		`{"msg":"three"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	lines, offset, err := readLastLogLines(path, 2)
+	if err != nil {
+		t.Fatalf("readLastLogLines: %v", err)
+	}
+	if offset != int64(len(body)) {
+		t.Fatalf("offset=%d want EOF %d", offset, len(body))
+	}
+	if got, want := strings.Join(lines, "\n"), `{"msg":"two"}`+"\n"+`{"msg":"three"}`; got != want {
+		t.Fatalf("lines=%q want %q", got, want)
+	}
+}
+
 func TestLogsMissingLogReturnsActionableError(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo, stateDB, d := makeRepoStateDB(t)
