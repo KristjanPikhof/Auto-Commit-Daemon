@@ -575,6 +575,30 @@ func TestListWatch_AlreadyCanceledContextReturnsNil(t *testing.T) {
 	}
 }
 
+func TestListWatchIntervalFlagParsesGoDuration(t *testing.T) {
+	withIsolatedHome(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--watch", "--interval", "250ms"})
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("ExecuteContext valid duration: %v", err)
+	}
+
+	cmd = newRootCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"list", "--watch", "--interval", "250bad"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("Execute invalid duration: got nil, want error")
+	}
+}
+
 type cancelAfterFramesWriter struct {
 	mu     sync.Mutex
 	buf    bytes.Buffer
