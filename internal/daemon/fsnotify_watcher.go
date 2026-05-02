@@ -115,6 +115,10 @@ type fsnotifyIgnoreChecker interface {
 	Check(ctx context.Context, paths []string) ([]bool, error)
 }
 
+type fsnotifyIgnoreInvalidator interface {
+	Invalidate()
+}
+
 // FsnotifyOptions configures one watcher. RepoPath + WakeFn are required;
 // everything else has a usable default.
 type FsnotifyOptions struct {
@@ -869,6 +873,12 @@ func (w *FsnotifyWatcher) diagnosticsWorker() {
 // never blocks on an IgnoreChecker round-trip. Reconciliation of
 // Remove/Rename happens inline because it is a cheap map operation.
 func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
+	if isWorktreeIgnoreFile(w.opts.RepoPath, ev.Name) {
+		if invalidator, ok := w.opts.IgnoreChecker.(fsnotifyIgnoreInvalidator); ok {
+			invalidator.Invalidate()
+		}
+	}
+
 	// Re-walk new directories so children become watched too. We hand
 	// off to the rewalkWorker via a buffered channel; if the queue is
 	// full, drop the oldest entry to make room (replace-on-full).
@@ -903,6 +913,18 @@ func (w *FsnotifyWatcher) handleEvent(ev fsnotify.Event) {
 	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		w.releaseWatch(ev.Name)
 	}
+}
+
+func isWorktreeIgnoreFile(repoPath, path string) bool {
+	if filepath.Base(path) != ".gitignore" {
+		return false
+	}
+	rel, err := filepath.Rel(repoPath, path)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel == ".gitignore" || (!strings.HasPrefix(rel, "../") && rel != "..")
 }
 
 // releaseWatch drops a tracked directory and any tracked descendants
