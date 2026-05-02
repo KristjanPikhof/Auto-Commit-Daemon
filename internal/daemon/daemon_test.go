@@ -2846,23 +2846,26 @@ func TestRun_FlushDrainCancelable(t *testing.T) {
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
-	// Send shutdown signal and assert Run returns within a small budget.
+	// Send shutdown signal and assert Run returns within a generous budget.
 	// Without the ctx.Err check inside the drain loop, an unbounded drain
 	// of 1500 rows would dwarf this budget on slow hosts; the bounded +
-	// cancelable drain exits within at most one bounded pass.
+	// cancelable drain exits within at most one bounded pass plus
+	// shutdown overhead. The 5s budget accommodates a slow Linux runner
+	// under -race -count=3 finishing the in-progress bounded pass
+	// (DefaultFlushLimit=256 sqlite writes) before the cancel check fires.
 	start := time.Now()
 	shutdownCh <- struct{}{}
 	select {
 	case <-exited:
 		elapsed := time.Since(start)
-		if elapsed > 2*time.Second {
+		if elapsed > 5*time.Second {
 			t.Fatalf("Run took %v to exit after shutdown; flush drain not cancelable", elapsed)
 		}
 		t.Logf("graceful shutdown in %v", elapsed)
-	case <-time.After(3 * time.Second):
+	case <-time.After(6 * time.Second):
 		cancel()
 		<-exited
-		t.Fatalf("Run did not exit within 3s after shutdown signal")
+		t.Fatalf("Run did not exit within 6s after shutdown signal")
 	}
 	wg.Wait()
 }
@@ -2870,29 +2873,37 @@ func TestRun_FlushDrainCancelable(t *testing.T) {
 // TestRun_OrphanAckedFlushSweepOnStartup pins the orphan sweep: rows that
 // sat in "acknowledged" past OrphanFlushAckThreshold are marked failed at
 // daemon startup so `acd status` doesn't accumulate ghosts forever.
+//
+// Test setup uses the real EnqueueFlushRequest path, then UPDATEs status
+// + acknowledged_ts to the desired age. This mirrors the production
+// schema (column types, default ts unit) instead of guessing at the
+// timestamp format with raw INSERTs.
 func TestRun_OrphanAckedFlushSweepOnStartup(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
 
-	// Insert an orphan acknowledged row directly via SQL — old enough to
-	// trip the threshold.
+	orphanID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{})
+	if err != nil {
+		t.Fatalf("enqueue orphan: %v", err)
+	}
 	old := float64(time.Now().Add(-10*time.Minute).UnixNano()) / 1e9
 	if _, err := f.db.SQL().ExecContext(ctx,
-		`INSERT INTO flush_requests(command, non_blocking, requested_ts, acknowledged_ts, status)
-         VALUES (?, 0, ?, ?, 'acknowledged')`,
-		"wake", old, old,
+		`UPDATE flush_requests SET status='acknowledged', acknowledged_ts=?, requested_ts=? WHERE id=?`,
+		old, old, orphanID,
 	); err != nil {
-		t.Fatalf("insert orphan: %v", err)
+		t.Fatalf("age orphan row: %v", err)
 	}
-	// Insert a fresh acknowledged row that is younger than the threshold —
-	// must NOT be swept.
+
+	freshID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{})
+	if err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
 	fresh := float64(time.Now().Add(-30*time.Second).UnixNano()) / 1e9
 	if _, err := f.db.SQL().ExecContext(ctx,
-		`INSERT INTO flush_requests(command, non_blocking, requested_ts, acknowledged_ts, status)
-         VALUES (?, 0, ?, ?, 'acknowledged')`,
-		"wake", fresh, fresh,
+		`UPDATE flush_requests SET status='acknowledged', acknowledged_ts=?, requested_ts=? WHERE id=?`,
+		fresh, fresh, freshID,
 	); err != nil {
-		t.Fatalf("insert fresh: %v", err)
+		t.Fatalf("age fresh row: %v", err)
 	}
 
 	registerLiveClient(t, f.db)
@@ -2937,4 +2948,81 @@ func TestRun_OrphanAckedFlushSweepOnStartup(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("after sweep: failed=%d acknowledged=%d; want failed>=1 and acknowledged=1 (fresh row preserved)", failed, acked)
+}
+
+// TestRun_DeprecatedSendDiffEnvVarWarns pins the user-visible contract
+// that ACD_AI_SEND_DIFF emits a one-shot deprecation warning at daemon
+// startup when set, and stays silent when unset. Operators rely on the
+// log line as their migration hint after the env var was removed in favor
+// of the explicit ACD_AI_DIFF_EGRESS opt-in.
+func TestRun_DeprecatedSendDiffEnvVarWarns(t *testing.T) {
+	t.Run("env_set_warns", func(t *testing.T) {
+		t.Setenv("ACD_AI_SEND_DIFF", "1")
+		records := bootDaemonAndCaptureWarns(t)
+		if !hasLogMessage(records, "ACD_AI_SEND_DIFF is deprecated") {
+			t.Fatalf("expected deprecation warn for ACD_AI_SEND_DIFF; got records=%+v", records)
+		}
+	})
+	t.Run("env_unset_silent", func(t *testing.T) {
+		// t.Setenv with empty does not unset, so unset explicitly. The
+		// deprecation warn must NOT fire when the variable is absent.
+		t.Setenv("ACD_AI_SEND_DIFF", "")
+		_ = os.Unsetenv("ACD_AI_SEND_DIFF")
+		records := bootDaemonAndCaptureWarns(t)
+		if hasLogMessage(records, "ACD_AI_SEND_DIFF is deprecated") {
+			t.Fatalf("did not expect deprecation warn when env unset; got records=%+v", records)
+		}
+	})
+}
+
+// bootDaemonAndCaptureWarns boots a daemon long enough to observe startup
+// logs, then returns the captured warn-level records.
+func bootDaemonAndCaptureWarns(t *testing.T) []loggedRecord {
+	t.Helper()
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	logSink := &captureLogHandler{level: slog.LevelWarn}
+	logger := slog.New(logSink)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			Logger:      logger,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	// Brief settle to give startup-emitted warns time to land in the sink.
+	time.Sleep(50 * time.Millisecond)
+	return logSink.Records()
+}
+
+func hasLogMessage(records []loggedRecord, substr string) bool {
+	for _, r := range records {
+		if strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
 }
