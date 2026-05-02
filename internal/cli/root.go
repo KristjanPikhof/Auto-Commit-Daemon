@@ -36,6 +36,8 @@ func newRootCmd() *cobra.Command {
 			return ErrNoCommand
 		},
 	}
+	cmd.CompletionOptions.HiddenDefaultCmd = true
+	cmd.SetHelpTemplate(rootHelpTemplate)
 
 	pf := cmd.PersistentFlags()
 	pf.StringVar(&repoPath, "repo", "", "Repo root (default: cwd)")
