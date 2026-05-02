@@ -29,7 +29,7 @@ func newLogsCmd() *cobra.Command {
 		Short: "Print the current repo daemon log tail",
 		Long: `Print the current repo daemon log tail as raw JSONL.
 
-By default acd logs prints the last 100 raw log lines and exits. Use --lines to
+The default repo is the current working directory. By default acd logs prints the last 100 raw log lines and exits. Use --lines to
 choose the initial tail length, or --follow to keep streaming appended lines
 until interrupted. For bundled diagnostics and sanitized tails, use acd doctor
 or acd doctor --bundle.`,
