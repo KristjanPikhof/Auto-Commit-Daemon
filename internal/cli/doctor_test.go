@@ -35,7 +35,7 @@ func TestDoctor_Human_HasSectionHeaders(t *testing.T) {
 		t.Fatalf("runDoctor: %v", err)
 	}
 	body := out.String()
-	for _, want := range []string{"acd doctor", "Registry", "Sensitive globs", "Repos"} {
+	for _, want := range []string{"acd doctor", "Registry", "Sensitive globs", "Safe-ignore patterns", "Repos"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected %q in human output:\n%s", want, body)
 		}
@@ -74,6 +74,9 @@ func TestDoctor_JSON_Shape(t *testing.T) {
 	}
 	if len(got.SensitiveGlobsActive) == 0 {
 		t.Fatalf("sensitive globs should be non-empty by default")
+	}
+	if len(got.SafeIgnoreActive) == 0 {
+		t.Fatalf("safe-ignore patterns should be non-empty by default")
 	}
 }
 
@@ -167,6 +170,7 @@ func TestDoctor_Bundle_LayoutMatchesSpec(t *testing.T) {
 			"daemon-clients.json",
 			"daemon-meta.json",
 			"sensitive-globs.txt",
+			"safe-ignore-patterns.txt",
 			"fsnotify-stats.json",
 			"daemon-tail.log",
 		} {

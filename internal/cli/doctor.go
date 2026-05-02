@@ -98,6 +98,9 @@ type doctorReport struct {
 	RegistryRepoCount    int                   `json:"registry_repo_count"`
 	SensitiveGlobsEnv    string                `json:"sensitive_globs_env"`
 	SensitiveGlobsActive []string              `json:"sensitive_globs_active"`
+	SafeIgnoreEnv        string                `json:"safe_ignore_env"`
+	SafeIgnoreExtraEnv   string                `json:"safe_ignore_extra_env"`
+	SafeIgnoreActive     []string              `json:"safe_ignore_active"`
 	Harnesses            []doctorHarnessReport `json:"harnesses"`
 	AI                   doctorAIReport        `json:"ai"`
 	Repos                []doctorRepoReport    `json:"repos"`
@@ -187,6 +190,9 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 
 	rep.SensitiveGlobsEnv = os.Getenv(state.EnvSensitiveGlobs)
 	rep.SensitiveGlobsActive = state.SensitivePatterns()
+	rep.SafeIgnoreEnv = os.Getenv(state.EnvSafeIgnore)
+	rep.SafeIgnoreExtraEnv = os.Getenv(state.EnvSafeIgnoreExtra)
+	rep.SafeIgnoreActive = state.SafeIgnorePatterns()
 	rep.Harnesses = collectDoctorHarnesses()
 	rep.AI = collectDoctorAI()
 
@@ -512,6 +518,8 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 
 	fmt.Fprintf(out, "\nSensitive globs (env=%q, %d active)\n",
 		r.SensitiveGlobsEnv, len(r.SensitiveGlobsActive))
+	fmt.Fprintf(out, "Safe-ignore patterns (env=%q extra=%q, %d active)\n",
+		r.SafeIgnoreEnv, r.SafeIgnoreExtraEnv, len(r.SafeIgnoreActive))
 
 	fmt.Fprintf(out, "\nInstall\n")
 	fmt.Fprintf(out, "  hooks:\n")
@@ -615,6 +623,7 @@ type bundleResult struct {
 //	repos/<repo-hash>/daemon-meta.json
 //	repos/<repo-hash>/daemon-tail.log
 //	repos/<repo-hash>/sensitive-globs.txt
+//	repos/<repo-hash>/safe-ignore-patterns.txt
 //	repos/<repo-hash>/fsnotify-stats.json
 func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) (bundleResult, error) {
 	if outputDir == "" {
@@ -721,6 +730,10 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		// sensitive-globs.txt — same active list per repo.
 		globs := strings.Join(rep.SensitiveGlobsActive, "\n") + "\n"
 		if err := add(base+"sensitive-globs.txt", []byte(globs)); err != nil {
+			return bundleResult{}, err
+		}
+		safeIgnore := strings.Join(rep.SafeIgnoreActive, "\n") + "\n"
+		if err := add(base+"safe-ignore-patterns.txt", []byte(safeIgnore)); err != nil {
 			return bundleResult{}, err
 		}
 		// fsnotify-stats.json

@@ -588,6 +588,7 @@ func Run(ctx context.Context, opts Options) error {
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
 	matcher := state.NewSensitiveMatcher()
+	safeIgnore := state.NewSafeIgnoreMatcher()
 
 	// 3a. fsnotify watcher (D11 hybrid). Disabled by default so existing
 	// poll-only tests stay deterministic; the run loop subscribes to a
@@ -623,6 +624,7 @@ func Run(ctx context.Context, opts Options) error {
 			GitDir:        opts.GitDir,
 			IgnoreChecker: ignoreChecker,
 			Sensitive:     matcher,
+			SafeIgnore:    safeIgnore,
 			Debounce:      opts.FsnotifyDebounce,
 			MaxWatches:    opts.FsnotifyMaxWatches,
 			WakeFn:        wakeFn,
@@ -1328,11 +1330,12 @@ func Run(ctx context.Context, opts Options) error {
 			// is still wired through so that direct callers (tests,
 			// future CLI wrappers) honor the same gate symmetrically.
 			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
-				IgnoreChecker:    ignoreChecker,
-				SensitiveMatcher: matcher,
-				Trace:            tracer,
-				GitDir:           opts.GitDir,
-				SkipPauseCheck:   true,
+				IgnoreChecker:     ignoreChecker,
+				SensitiveMatcher:  matcher,
+				SafeIgnoreMatcher: safeIgnore,
+				Trace:             tracer,
+				GitDir:            opts.GitDir,
+				SkipPauseCheck:    true,
 			})
 		}
 
