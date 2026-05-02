@@ -595,7 +595,13 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer func() {
 		if fsWatcher != nil {
-			_ = fsWatcher.Stop()
+			// Bound the teardown so a wedged IgnoreChecker subprocess
+			// cannot stall daemon shutdown. shutdown-lane will likely
+			// thread the outer shutdown ctx here; until then, a fixed
+			// 5s budget matches the per-layer preWalk timeout.
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = fsWatcher.Stop(stopCtx)
+			stopCancel()
 		}
 	}()
 
