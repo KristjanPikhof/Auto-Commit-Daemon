@@ -119,6 +119,16 @@ func NewSafeIgnoreMatcher() *SafeIgnoreMatcher {
 
 // Match reports whether rel matches any safe-ignore pattern.
 func (m *SafeIgnoreMatcher) Match(rel string) bool {
+	return m.match(rel, true)
+}
+
+// MatchFile reports whether rel is a file-like path that should be skipped.
+// Directory patterns match descendants, but not a same-named file/symlink.
+func (m *SafeIgnoreMatcher) MatchFile(rel string) bool {
+	return m.match(rel, false)
+}
+
+func (m *SafeIgnoreMatcher) match(rel string, includeDirSelf bool) bool {
 	if m == nil || len(m.patterns) == 0 {
 		return false
 	}
@@ -128,7 +138,7 @@ func (m *SafeIgnoreMatcher) Match(rel string) bool {
 	}
 	for _, pattern := range m.patterns {
 		if strings.HasSuffix(pattern, "/") {
-			if matchSafeIgnoreDirPattern(strings.TrimSuffix(pattern, "/"), rel) {
+			if matchSafeIgnoreDirPattern(strings.TrimSuffix(pattern, "/"), rel, includeDirSelf) {
 				return true
 			}
 			continue
@@ -163,15 +173,23 @@ func cleanSafeIgnoreRel(rel string) string {
 	return rel
 }
 
-func matchSafeIgnoreDirPattern(pattern, rel string) bool {
+func matchSafeIgnoreDirPattern(pattern, rel string, includeSelf bool) bool {
 	if pattern == "" || rel == "" {
 		return false
 	}
 	if strings.Contains(pattern, "/") {
-		return rel == pattern || strings.HasPrefix(rel, pattern+"/")
+		if includeSelf && rel == pattern {
+			return true
+		}
+		return strings.HasPrefix(rel, pattern+"/")
 	}
 	segments := strings.Split(rel, "/")
-	for _, segment := range segments {
+	limit := len(segments)
+	if !includeSelf {
+		limit--
+	}
+	for i := 0; i < limit; i++ {
+		segment := segments[i]
 		if ok, _ := path.Match(pattern, segment); ok {
 			return true
 		}
