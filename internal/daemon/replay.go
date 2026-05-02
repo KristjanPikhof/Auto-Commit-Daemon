@@ -542,7 +542,9 @@ type replayPause struct {
 //
 //  1. Manual pause marker at <gitDir>/acd/paused (durable JSON written by
 //     `acd pause`, cleared by `acd resume`). Active when present and not
-//     expired. Malformed markers fail open with a warning.
+//     expired. Malformed markers fail open with a warning. Non-regular
+//     markers (FIFO, socket, device, directory, symlink) also fail open
+//     with a warning so a stale inode cannot wedge replay indefinitely.
 //  2. Rewind grace under daemon_meta.replay.paused_until — set when the
 //     daemon detects a same-branch rewind (newHead is an ancestor of the
 //     previous head, e.g. operator ran `git reset --soft HEAD~1`). The
