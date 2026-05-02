@@ -1237,7 +1237,19 @@ func Run(ctx context.Context, opts Options) error {
 				logger.Warn("read daemon pause state", "err", pauseErr.Error())
 			}
 		}
-		daemonPaused := pauseErr == nil && daemonPaus.Active
+		// Fail CLOSED on pause-state read errors. A transient SQLite read
+		// error on daemon_meta.replay.paused_until — or any other error
+		// surfaced by daemonPauseState that wasn't already softened to a
+		// fail-open warning inside the helper (ErrMalformed,
+		// ErrNonRegularSource on the disk marker) — must NOT be treated as
+		// "no pause active". Otherwise a flaky DB read or a partial-write
+		// during operator surgery could let capture/replay silently chew
+		// through the queue while the operator believes replay is paused.
+		// The existing on-disk-marker softening in daemonPauseState is
+		// intentional (a corrupt JSON marker should not wedge replay
+		// forever); the SQLite-side fail-closed here is the dual: when we
+		// genuinely cannot answer "is replay paused?", assume yes.
+		daemonPaused := pauseErr != nil || daemonPaus.Active
 		if branchTransitionBlocked {
 			logger.Warn("capture/replay paused until branch transition is classified")
 		} else if operationPaused {
