@@ -311,12 +311,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if strings.Contains(reason, "branch ref mismatch") {
 				errorClass = replayErrorRefMissing
 			}
-			recordConflict(ctx, db, ev, replayIssue{
+			if err := recordConflict(ctx, db, ev, replayIssue{
 				ErrorClass: errorClass,
 				Message:    reason,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			}, activeCtx)
+			}, activeCtx); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
 			sum.Conflicts++
 			return sum, nil
