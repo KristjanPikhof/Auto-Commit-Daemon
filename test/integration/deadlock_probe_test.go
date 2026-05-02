@@ -77,7 +77,7 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 	go func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), budget)
 		defer stopCancel()
-		res := runAcd(t, stopCtx, traceEnv, "stop", "--repo", repo, "--json")
+		res := runAcd(t, stopCtx, traceEnv, "stop", "--repo", repo, "--force", "--json")
 		if res.ExitCode != 0 {
 			stopDone <- fmt.Errorf("acd stop exit=%d\nstdout=%s\nstderr=%s",
 				res.ExitCode, res.Stdout, res.Stderr)
