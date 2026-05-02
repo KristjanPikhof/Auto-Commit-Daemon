@@ -67,7 +67,14 @@ Precedence:
   acd stop --force [--session-id SESSION]
     Best-effort deregister SESSION when provided, then terminate the daemon and escalate if needed.
   acd stop --all [--force]
-    Apply the same stop mode to every registered repo and keep stopped/deferred/failed buckets.`,
+    Apply the same stop mode to every registered repo and keep stopped/deferred/failed buckets.
+
+Use acd status before stopping when you need to see active sessions.`,
+		Example: `  acd stop
+  acd stop --repo /path/to/repo
+  acd stop --session-id "$ACD_SESSION_ID"
+  acd stop --force
+  acd stop --all --json`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			jsonOut, _ := c.Flags().GetBool("json")

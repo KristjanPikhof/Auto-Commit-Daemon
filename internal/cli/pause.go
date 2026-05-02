@@ -53,6 +53,15 @@ func newPauseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "pause",
 		Short: "Pause daemon capture and replay for a repo",
+		Long: `Write a durable manual pause marker for one repo so the daemon stops capture and replay.
+
+The default repo is the current working directory. Use --reason to record why the pause exists and --ttl for an expiring marker. If a marker already exists, pass --yes to overwrite it.
+
+Use acd resume to remove the marker and acd status to inspect pause state.`,
+		Example: `  acd pause --reason "manual maintenance"
+  acd pause --ttl 1h --reason "repo surgery"
+  acd pause --repo /path/to/repo --reason "manual reset" --yes
+  acd status --repo .`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			reason, _ := c.Flags().GetString("reason")
@@ -72,6 +81,15 @@ func newResumeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "resume",
 		Short: "Resume daemon capture and replay for a repo",
+		Long: `Remove a durable manual pause marker for one repo.
+
+The default repo is the current working directory. Pass --yes to confirm marker removal. The --accept-overflow flag is separate and clears a durable capture-backpressure pause when you explicitly accept possible dropped filesystem events.
+
+Use acd status before and after resume to confirm pause state.`,
+		Example: `  acd resume --yes
+  acd resume --repo /path/to/repo --yes
+  acd resume --accept-overflow
+  acd status --repo .`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			yes, _ := c.Flags().GetBool("yes")

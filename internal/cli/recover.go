@@ -49,6 +49,15 @@ func newRecoverCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "recover",
 		Short: "Retarget stale replay state after an anchored-branch incident",
+		Long: `Plan or apply recovery for stale replay state in one repo.
+
+The default repo is the current working directory. Start with --auto --dry-run to inspect the plan; applying recovery requires --yes and refuses to run while the daemon PID is alive. Recovery backs up state.db, retargets pending/blocked rows to the current attached branch/generation, clears replay pause metadata, and can remove a manual pause marker with --clear-pause.
+
+Use acd diagnose first when you are not sure recovery is the right action.`,
+		Example: `  acd recover --auto --dry-run
+  acd recover --auto --dry-run --json
+  acd recover --auto --yes
+  acd recover --repo /path/to/repo --auto --yes --clear-pause`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			auto, _ := cmd.Flags().GetBool("auto")

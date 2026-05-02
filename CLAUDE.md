@@ -46,6 +46,7 @@ Release smoke: `make build && install -m 0755 ./bin/acd ~/.local/bin/acd`; `git 
 - Timing failures: focused `-count=10`; `GOMAXPROCS=1 -count=50` for ordering hazards.
 - Multi-phase HEAD-transition tests usually wait for `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
 - Broad-run-sensitive tests: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`.
+- When adding or changing CLI commands, update Cobra help/examples and the compact root help grouping.
 - Template edits must preserve embedded FS behavior.
 
 ## State and branch model
