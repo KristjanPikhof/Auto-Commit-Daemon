@@ -386,6 +386,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
 					return sum, err
 				}
+				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after idempotent publish: %w", err)
 				}
@@ -465,6 +466,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
 				return sum, err
 			}
+			reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 			// Reseed the scratch index from `parent` so chained events
 			// see a clean baseline (write-tree leaves stale entries
 			// otherwise).
@@ -532,6 +534,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
 					return sum, err
 				}
+				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after cas idempotent publish: %w", err)
 				}
@@ -591,6 +594,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
 			return sum, err
 		}
+		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 
 		parent = commitOID
 		// Carry forward `treeOID` as the new parent's tree. The commit we
