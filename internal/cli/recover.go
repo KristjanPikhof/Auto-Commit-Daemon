@@ -164,15 +164,15 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 		markerAction = "remove manual pause marker at " + markerPath + " if present"
 	}
 	plan := recoverPlan{
-		Repo:             rec.Path,
-		StateDB:          rec.StateDB,
-		GitDir:           gitDir,
-		CurrentBranchRef: branchRef,
-		CurrentHead:      head,
-		Generation:       gen,
-		DryRun:           dryRun,
-		ClearPause:       clearPause,
-		ManualMarkerPath: markerPath,
+		Repo:                rec.Path,
+		StateDB:             rec.StateDB,
+		GitDir:              gitDir,
+		CurrentBranchRef:    branchRef,
+		CurrentHead:         head,
+		Generation:          gen,
+		DryRun:              dryRun,
+		ClearPause:          clearPause,
+		ManualMarkerPath:    markerPath,
 		LiveIndexCandidates: liveIndexPlan.Candidates,
 		LiveIndexSkipped:    len(liveIndexPlan.Skipped),
 		Actions: []string{
