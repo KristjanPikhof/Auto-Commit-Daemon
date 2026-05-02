@@ -156,6 +156,35 @@ type IndexEntry struct {
 	Path  string
 }
 
+// LiveIndexOp describes one path-scoped reconciliation against the repo's
+// default live index. Empty BeforeMode/BeforeOID means the path is expected
+// to be absent. Delete removes the entry when the before-state matches;
+// otherwise AfterMode/AfterOID is written.
+type LiveIndexOp struct {
+	Path       string
+	BeforeMode string
+	BeforeOID  string
+	AfterMode  string
+	AfterOID   string
+	Delete     bool
+}
+
+// LiveIndexSkip records a path that was intentionally not reconciled because
+// the live index contained protected user state or no longer matched the
+// expected before-state.
+type LiveIndexSkip struct {
+	Path   string
+	Reason string
+}
+
+// LiveIndexReconcileResult reports which path-scoped operations were applied
+// and which were skipped. Applied paths are populated only after update-index
+// succeeds.
+type LiveIndexReconcileResult struct {
+	Applied []string
+	Skipped []LiveIndexSkip
+}
+
 // LsFilesStaged returns the staged index entries for the given repo's
 // default index, optionally scoped to the supplied paths. NUL-delimited
 // output so paths with spaces or newlines are handled correctly.
@@ -245,6 +274,108 @@ func UpdateIndexInfo(ctx context.Context, repoDir, indexFile string, lines []str
 		ExtraEnv: extra,
 	}, "update-index", "-z", "--index-info")
 	return err
+}
+
+// ReconcileLiveIndex applies guarded, path-scoped compare-and-swap updates to
+// the repo's default live index. It never reads from or writes to a scratch
+// GIT_INDEX_FILE, and it never mutates the worktree.
+func ReconcileLiveIndex(ctx context.Context, repoDir string, ops []LiveIndexOp) (LiveIndexReconcileResult, error) {
+	var res LiveIndexReconcileResult
+	if len(ops) == 0 {
+		return res, nil
+	}
+
+	paths := make([]string, 0, len(ops))
+	for _, op := range ops {
+		paths = append(paths, op.Path)
+	}
+	entries, err := LsFilesStaged(ctx, repoDir, paths...)
+	if err != nil {
+		return res, err
+	}
+	byPath := make(map[string][]IndexEntry)
+	for _, entry := range entries {
+		byPath[entry.Path] = append(byPath[entry.Path], entry)
+	}
+
+	const zeroOID = "0000000000000000000000000000000000000000"
+	var lines []string
+	var applied []string
+	for _, op := range ops {
+		if op.Path == "" {
+			res.Skipped = append(res.Skipped, LiveIndexSkip{Path: op.Path, Reason: "empty_path"})
+			continue
+		}
+		current := byPath[op.Path]
+		if reason, ok, err := liveIndexBeforeMatches(ctx, repoDir, op, current); err != nil {
+			return res, err
+		} else if !ok {
+			res.Skipped = append(res.Skipped, LiveIndexSkip{Path: op.Path, Reason: reason})
+			continue
+		}
+		if op.Delete {
+			lines = append(lines, fmt.Sprintf("0 %s\t%s", zeroOID, op.Path))
+		} else if op.AfterMode == "" || op.AfterOID == "" {
+			res.Skipped = append(res.Skipped, LiveIndexSkip{Path: op.Path, Reason: "missing_after_state"})
+			continue
+		} else {
+			lines = append(lines, fmt.Sprintf("%s %s\t%s", op.AfterMode, op.AfterOID, op.Path))
+		}
+		applied = append(applied, op.Path)
+	}
+	if len(lines) == 0 {
+		return res, nil
+	}
+	if err := UpdateIndexInfo(ctx, repoDir, "", lines); err != nil {
+		return res, err
+	}
+	res.Applied = applied
+	return res, nil
+}
+
+func liveIndexBeforeMatches(ctx context.Context, repoDir string, op LiveIndexOp, entries []IndexEntry) (string, bool, error) {
+	if len(entries) == 0 {
+		if op.BeforeMode == "" && op.BeforeOID == "" {
+			return "", true, nil
+		}
+		return "missing_expected_entry", false, nil
+	}
+	if len(entries) != 1 || entries[0].Stage != 0 {
+		return "unmerged_entry", false, nil
+	}
+	entry := entries[0]
+	if flags, err := liveIndexDebugFlags(ctx, repoDir, op.Path); err != nil {
+		return "", false, err
+	} else if flags != "" && flags != "0" {
+		return "protected_index_flags", false, nil
+	}
+	if op.BeforeMode == "" && op.BeforeOID == "" {
+		return "unexpected_existing_entry", false, nil
+	}
+	if entry.Mode != op.BeforeMode || entry.OID != op.BeforeOID {
+		return "mismatched_entry", false, nil
+	}
+	return "", true, nil
+}
+
+func liveIndexDebugFlags(ctx context.Context, repoDir, path string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir}, "ls-files", "--debug", "-z", "--", path)
+	if err != nil {
+		return "", err
+	}
+	_, debug, ok := bytes.Cut(out, []byte{0})
+	if !ok {
+		return "", nil
+	}
+	for _, line := range bytes.Split(debug, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("size: ")) {
+			if i := bytes.Index(line, []byte("flags: ")); i >= 0 {
+				return strings.TrimSpace(string(line[i+len("flags: "):])), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // WriteTree runs `git write-tree` and returns the OID of the tree built
