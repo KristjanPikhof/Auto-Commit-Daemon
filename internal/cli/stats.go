@@ -59,6 +59,13 @@ func newStatsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stats",
 		Short: "Aggregated commits/events/bytes across all repos",
+		Long: `Print aggregate commit, event, file, byte, and error counts from the central stats database.
+
+Stats are across all registered repos and default to the last 7 days. Use --since with a duration such as 24h, 30d, or 1y, and --json for automation.`,
+		Example: `  acd stats
+  acd stats --since 30d
+  acd stats --since 1y --json
+  acd list`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			since, _ := cmd.Flags().GetString("since")
 			jsonOut, _ := cmd.Flags().GetBool("json")
