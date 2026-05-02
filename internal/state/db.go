@@ -236,12 +236,33 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 	return nil
 }
 
+// isSQLiteLocked reports whether err represents SQLite contention that
+// callers should retry (SQLITE_BUSY / SQLITE_LOCKED, including the
+// SHARED_CACHE extended-result variants). Detection is layered:
+//
+//  1. Typed match against *sqlite.Error via errors.As — robust against
+//     localization or future driver-level message reformatting; covers both
+//     the primary codes and any extended bits in the upper byte.
+//  2. Substring fallback — preserves the historical behavior so wrapped
+//     errors that have lost the typed sentinel (e.g. across an RPC boundary
+//     or a custom error wrapper that stringifies) are still retried.
 func isSQLiteLocked(err error) bool {
 	if err == nil {
 		return false
 	}
+	var serr *sqlite.Error
+	if errors.As(err, &serr) {
+		// Extended result codes pack additional context in the upper byte;
+		// the primary code is the low 8 bits per the sqlite3 protocol.
+		primary := serr.Code() & 0xff
+		if primary == sqliteResultBusy || primary == sqliteResultLocked {
+			return true
+		}
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY")
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY") ||
+		strings.Contains(msg, "SQLITE_LOCKED")
 }
 
 // UserVersion reads the SQLite PRAGMA user_version from the open database.
