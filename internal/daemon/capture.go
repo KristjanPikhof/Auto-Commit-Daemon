@@ -10,6 +10,7 @@
 //   - Skip nested .git (file or dir) and submodule (gitlink mode 160000).
 //   - Skip ACD's own .git/acd state subdir.
 //   - Sensitive default-deny via state.SensitiveMatcher.
+//   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
 //   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) -> meta-only.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
@@ -155,6 +156,10 @@ type CaptureOpts struct {
 	// owns the lifetime; nil falls back to a fresh matcher per pass (slow
 	// but correct).
 	SensitiveMatcher *state.SensitiveMatcher
+	// SafeIgnoreMatcher precomputes generated dependency/cache trees that
+	// ACD skips internally even when they are not gitignored. Nil falls
+	// back to a fresh matcher per pass.
+	SafeIgnoreMatcher *state.SafeIgnoreMatcher
 	// SubmodulePaths is the set of repo-relative paths that are submodules
 	// (mode 160000 in HEAD's tree). Capture must not descend into them.
 	SubmodulePaths map[string]bool
@@ -597,10 +602,15 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	if matcher == nil {
 		matcher = state.NewSensitiveMatcher()
 	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
 	maxBytes := resolveMaxFileBytes(opts.MaxFileBytes)
 
 	live, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
 		matcher:       matcher,
+		safeIgnore:    safeIgnore,
 		ignoreChecker: opts.IgnoreChecker,
 		submodules:    opts.SubmodulePaths,
 		maxBytes:      maxBytes,
@@ -802,6 +812,7 @@ func nullString(s string) sql.NullString {
 // readable.
 type walkOpts struct {
 	matcher       *state.SensitiveMatcher
+	safeIgnore    *state.SafeIgnoreMatcher
 	ignoreChecker *git.IgnoreChecker
 	submodules    map[string]bool
 	maxBytes      int64
