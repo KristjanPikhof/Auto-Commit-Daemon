@@ -347,8 +347,21 @@ func TestReplay_NonRegularMarkerFailOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if sum.Skipped || sum.Published == 0 || sum.Conflicts != 0 || sum.Failed != 0 {
-		t.Fatalf("expected non-regular marker to fail open, got %+v", sum)
+	// Splitting the previous OR-chain into individual asserts surfaces
+	// which property regressed if the fail-open path is ever broken.
+	// captureOnePendingFile guarantees at least one pending event, so the
+	// fail-open path MUST publish at least one commit (Published >= 1).
+	if sum.Skipped {
+		t.Fatalf("non-regular marker fail-open: replay was Skipped, want drained: %+v", sum)
+	}
+	if sum.Published < 1 {
+		t.Fatalf("non-regular marker fail-open: Published=%d want >=1: %+v", sum.Published, sum)
+	}
+	if sum.Conflicts != 0 {
+		t.Fatalf("non-regular marker fail-open: Conflicts=%d want 0: %+v", sum.Conflicts, sum)
+	}
+	if sum.Failed != 0 {
+		t.Fatalf("non-regular marker fail-open: Failed=%d want 0: %+v", sum.Failed, sum)
 	}
 }
 
