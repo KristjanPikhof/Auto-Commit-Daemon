@@ -110,6 +110,40 @@ func TestReplay_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	captureOnePendingFile(t, ctx, f, "hello.md", "hello\n")
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+
+	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "hello.md")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD hello.md: %v", err)
+	}
+	if headOID == "" {
+		t.Fatal("HEAD missing hello.md after replay publish")
+	}
+	worktreeOID, err := git.HashObjectStdin(ctx, f.dir, []byte("hello\n"))
+	if err != nil {
+		t.Fatalf("hash worktree content: %v", err)
+	}
+	if headOID != worktreeOID {
+		t.Fatalf("HEAD/worktree blob mismatch: HEAD=%s worktree=%s", headOID, worktreeOID)
+	}
+
+	status := gitStatusPorcelain(t, ctx, f.dir)
+	if status != "" {
+		t.Fatalf("live index was not reconciled after replay publish; git status --porcelain:\n%s", status)
+	}
+}
+
 func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
