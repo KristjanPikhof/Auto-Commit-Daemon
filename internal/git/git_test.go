@@ -90,6 +90,76 @@ func TestRunRespectsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestRun_TimeoutKillsHungGit(t *testing.T) {
+	requireGit(t)
+	dir := initRepo(t)
+
+	// hash-object --stdin blocks until stdin is closed; pipe with no
+	// writer-close + a never-cancelled background ctx exercises the
+	// per-call RunOpts.Timeout path specifically.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+
+	const budget = 250 * time.Millisecond
+	start := time.Now()
+	_, err = Run(context.Background(), RunOpts{
+		Dir:     dir,
+		Stdin:   r,
+		Timeout: budget,
+	}, "hash-object", "-w", "--stdin")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected error from per-call timeout")
+	}
+	// Allow generous jitter for slow CI runners but assert we did not
+	// wait anywhere near forever.
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("timeout did not kill child quickly (took %s, budget %s)", elapsed, budget)
+	}
+}
+
+func TestRun_ZeroTimeoutDoesNotImposeDeadline(t *testing.T) {
+	requireGit(t)
+	dir := initRepo(t)
+	// A trivial command must complete normally with Timeout=0 (default).
+	out, err := Run(context.Background(), RunOpts{Dir: dir}, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "true" {
+		t.Fatalf("expected 'true', got %q", string(out))
+	}
+}
+
+func TestScrubEnvKeepsLCAllC(t *testing.T) {
+	requireGit(t)
+	// Even when the host overrides LC_ALL, the scrubbed env must force C
+	// so we can parse git output deterministically.
+	t.Setenv("LC_ALL", "fr_FR.UTF-8")
+	env := scrubEnv(nil)
+	joined := strings.Join(env, "\x00")
+	if !strings.Contains(joined, "LC_ALL=C") {
+		t.Fatalf("expected LC_ALL=C in scrubbed env, got %v", env)
+	}
+	if strings.Contains(joined, "LC_ALL=fr_FR.UTF-8") {
+		t.Fatalf("host LC_ALL leaked: %v", env)
+	}
+	// Only one LC_ALL entry should appear (scrub appends our forced
+	// value, not the host one).
+	count := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LC_ALL=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one LC_ALL entry, got %d: %v", count, env)
+	}
+}
+
 func TestScrubEnvDropsGitVarsButKeepsAllowlist(t *testing.T) {
 	requireGit(t)
 	// Set a sentinel GIT_* var on the host; if the scrub fails, the child
