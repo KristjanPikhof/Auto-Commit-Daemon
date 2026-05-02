@@ -3043,3 +3043,203 @@ func hasLogMessage(records []loggedRecord, substr string) bool {
 	}
 	return false
 }
+
+// TestGitOperationInProgress_StatErrorTreatedAsAbsent pins the fix that
+// turns a non-ErrNotExist stat error (EACCES, ELOOP, EIO) into "marker
+// absent" rather than "marker present, paused forever". Before the fix,
+// a single transient stat hiccup latched capture/replay into permanent
+// pause because the only auto-clear path is the reverse "marker absent"
+// branch in the run loop.
+//
+// We exercise this by creating a self-referential symlink at MERGE_HEAD;
+// os.Stat follows symlinks and returns ELOOP for the cycle. The function
+// must report (_, false) for that marker (logged + skipped) and continue
+// scanning the remaining markers.
+func TestGitOperationInProgress_StatErrorTreatedAsAbsent(t *testing.T) {
+	gitDir := t.TempDir()
+
+	// Self-referential symlink at MERGE_HEAD triggers ELOOP on stat.
+	mergePath := filepath.Join(gitDir, "MERGE_HEAD")
+	if err := os.Symlink(mergePath, mergePath); err != nil {
+		t.Fatalf("symlink loop: %v", err)
+	}
+
+	name, paused := gitOperationInProgress(gitDir)
+	if paused {
+		t.Fatalf("gitOperationInProgress=(%q,%v); want (_, false) when stat errors are treated as absent",
+			name, paused)
+	}
+	if name != "" {
+		t.Fatalf("gitOperationInProgress returned name=%q for absent markers", name)
+	}
+
+	// Sanity: with a real marker present, the function still reports paused.
+	rebasePath := filepath.Join(gitDir, "rebase-merge")
+	if err := os.Mkdir(rebasePath, 0o755); err != nil {
+		t.Fatalf("mkdir rebase-merge: %v", err)
+	}
+	name, paused = gitOperationInProgress(gitDir)
+	if !paused || name != "rebase-merge" {
+		t.Fatalf("gitOperationInProgress with real marker = (%q, %v); want (rebase-merge, true)",
+			name, paused)
+	}
+}
+
+// TestRun_GitOperationStatErrorRecovers exercises the same fix via the full
+// run loop: a marker path that produces a non-ErrNotExist stat error must
+// not wedge capture/replay. After the bad path is replaced by a real
+// absence, the daemon must process subsequent edits and produce a commit.
+func TestRun_GitOperationStatErrorRecovers(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Create a self-referential symlink so os.Stat returns ELOOP (a non-
+	// ErrNotExist error). Pre-fix this would latch the daemon into
+	// "operation in progress; capture/replay paused" forever.
+	bad := filepath.Join(f.gitDir, "MERGE_HEAD")
+	if err := os.Symlink(bad, bad); err != nil {
+		t.Fatalf("symlink loop: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// The "operation in progress" gate must NEVER latch on the bad path.
+	// A previous bug returned (name, true) for ELOOP and the next clear
+	// branch never fires (since the symlink keeps returning ELOOP).
+	// Remove the symlink and write a file; capture/replay should commit.
+	if err := os.Remove(bad); err != nil {
+		t.Fatalf("remove bad symlink: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "recover.txt"),
+		[]byte("after stat error\n"), 0o644); err != nil {
+		t.Fatalf("write recover: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	if newHead == startHead {
+		t.Fatalf("HEAD did not advance; capture/replay wedged after stat error")
+	}
+
+	// Operation marker meta should never have been stamped (the fix path
+	// treats stat errors as absent, so MetaKeyOperationInProgress stays
+	// unset throughout).
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyOperationInProgress); err != nil {
+		t.Fatalf("MetaGet operation_in_progress: %v", err)
+	} else if ok {
+		t.Fatalf("MetaKeyOperationInProgress was set despite stat-error-as-absent semantics")
+	}
+}
+
+// TestRun_FlushDrainExitsOnShutdownCh pins the fix that adds a non-blocking
+// shutdownCh check to the inner flush-drain loop. A caller using a non-
+// cancelable ctx (context.Background) and signaling shutdown via the
+// channel must observe the daemon exit promptly — not after the entire
+// bounded drain (~hundreds of rows × per-row claim cost) elapses.
+//
+// Setup:
+//  - Enqueue a large burst of flush_requests (1500 rows).
+//  - Run the daemon under ctx == context.Background() so ctx.Err is never
+//    set.
+//  - Push a shutdown signal and assert Run returns within ~1s. Pre-fix
+//    this could take up to ~7.5s on a slow host (DefaultFlushLimit=256
+//    rows × ~30ms per claim cycle).
+func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+
+	// Crucial: use a non-cancelable ctx so the only exit signal is
+	// shutdownCh. Without the new arm in the drain inner loop, the
+	// drain would have to finish (or the bounded pass complete) before
+	// the run loop notices the signal.
+	bgCtx := context.Background()
+
+	for i := 0; i < 1500; i++ {
+		if _, err := state.EnqueueFlushRequest(bgCtx, f.db, "wake", false, sql.NullString{}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	exited := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(exited)
+		_ = Run(bgCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	// Wake the loop so it enters the drain immediately, then push
+	// the shutdown signal.
+	wakeCh <- struct{}{}
+	// Tiny settle so the drain enters its inner loop before we push
+	// shutdown — the assertion is "exits promptly while drain is in
+	// flight", not "exits promptly when idle". 50ms is generous on a
+	// race-instrumented Linux runner without being fragile.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	shutdownCh <- struct{}{}
+
+	select {
+	case <-exited:
+		elapsed := time.Since(start)
+		// 2s budget tolerates -race + a slow CI runner finishing the
+		// in-flight per-row claim. Pre-fix worst-case was ~7.5s.
+		if elapsed > 2*time.Second {
+			t.Fatalf("Run took %v to exit on shutdownCh; want <=2s (drain not shutdown-aware)",
+				elapsed)
+		}
+		t.Logf("graceful shutdown via shutdownCh in %v with non-cancelable ctx", elapsed)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Run did not exit within 3s after shutdownCh signal under non-cancelable ctx")
+	}
+	wg.Wait()
+}
