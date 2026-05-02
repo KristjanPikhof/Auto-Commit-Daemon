@@ -560,11 +560,19 @@ func daemonPauseState(ctx context.Context, gitDir string, db *state.DB) (replayP
 	now := time.Now().UTC()
 	if gitDir != "" {
 		marker, ok, err := pausepkg.Read(gitDir)
-		if errors.Is(err, pausepkg.ErrMalformed) {
+		switch {
+		case errors.Is(err, pausepkg.ErrMalformed):
 			slog.Default().Warn("ignoring malformed pause marker", "err", err.Error())
-		} else if err != nil {
+		case errors.Is(err, pausepkg.ErrNonRegularSource):
+			// A non-regular pause marker (FIFO, socket, device, directory,
+			// symlink) would otherwise wedge replay forever — every pass
+			// would re-surface the same error. Fail open with a warning so
+			// the queue keeps draining; the operator can investigate the
+			// stray inode at <gitDir>/acd/paused at their leisure.
+			slog.Default().Warn("ignoring non-regular pause marker", "err", err.Error())
+		case err != nil:
 			return replayPause{}, fmt.Errorf("daemon: read pause marker: %w", err)
-		} else if ok {
+		case ok:
 			paused, err := markerPauseState(marker, now)
 			if err != nil {
 				slog.Default().Warn("ignoring invalid pause marker", "err", err.Error())
