@@ -154,6 +154,10 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			gen = parsed
 		}
 	}
+	liveIndexPlan, err := planLiveIndexRepair(ctx, rec.Path, rec.StateDB, head)
+	if err != nil {
+		return recoverPlan{}, err
+	}
 
 	markerAction := "preserve manual pause marker at " + markerPath + " (use --clear-pause to remove)"
 	if clearPause {
@@ -169,6 +173,8 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 		DryRun:           dryRun,
 		ClearPause:       clearPause,
 		ManualMarkerPath: markerPath,
+		LiveIndexCandidates: liveIndexPlan.Candidates,
+		LiveIndexSkipped:    len(liveIndexPlan.Skipped),
 		Actions: []string{
 			"retarget capture_events to current branch/generation/head",
 			"retarget shadow_paths to current branch/generation/head",
@@ -179,6 +185,19 @@ func buildRecoverPlan(ctx context.Context, rec central.RepoRecord, dryRun, clear
 			"repair ACD-published live-index entries when HEAD and worktree still match captured after-state",
 			markerAction,
 		},
+	}
+	return plan, nil
+}
+
+func planLiveIndexRepair(ctx context.Context, repo, stateDB, head string) (daemon.LiveIndexRepairSummary, error) {
+	db, err := state.Open(ctx, stateDB)
+	if err != nil {
+		return daemon.LiveIndexRepairSummary{}, fmt.Errorf("acd recover: open state.db for live-index repair plan: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	plan, err := daemon.PlanPublishedLiveIndexRepair(ctx, repo, db, head, daemon.DefaultLiveIndexRepairLimit)
+	if err != nil {
+		return daemon.LiveIndexRepairSummary{}, fmt.Errorf("acd recover: plan live-index repair: %w", err)
 	}
 	return plan, nil
 }
@@ -436,6 +455,10 @@ func renderRecover(out io.Writer, plan recoverPlan, jsonOut bool) error {
 	fmt.Fprintf(out, "Anchor: %s @ %s generation=%d\n", plan.CurrentBranchRef, plan.CurrentHead, plan.Generation)
 	if plan.BackupPath != "" {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
+	}
+	if plan.LiveIndexCandidates > 0 || plan.LiveIndexSkipped > 0 {
+		fmt.Fprintf(out, "Live index repair plan: candidates=%d skipped=%d\n",
+			plan.LiveIndexCandidates, plan.LiveIndexSkipped)
 	}
 	for _, action := range plan.Actions {
 		fmt.Fprintf(out, "- %s\n", action)
