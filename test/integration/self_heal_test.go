@@ -229,7 +229,7 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 	// Poll until the daemon clears replay.paused_until (rewind grace expired).
 	waitForMetaCleared(t, dbPath, "replay.paused_until", 5*time.Second)
 	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-rewind")
-	waitForEventState(t, dbPath, "rewind.txt", "published", 8*time.Second)
+	waitForEventSeqAfterState(t, dbPath, "rewind.txt", rewindSeqBefore, "published", 8*time.Second)
 	assertNoSelfHealTerminalRows(t, dbPath)
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head == seedHead {
 		t.Fatalf("HEAD did not advance after rewind grace expired")
@@ -405,6 +405,16 @@ func waitForEventState(t *testing.T, dbPath, path, want string, timeout time.Dur
 	t.Helper()
 	waitFor(t, fmt.Sprintf("%s state=%s", path, want), timeout, func() bool {
 		return latestEventState(t, dbPath, path) == want
+	})
+}
+
+func waitForEventSeqAfterState(t *testing.T, dbPath, path string, afterSeq int64, want string, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("%s seq>%d state=%s", path, afterSeq, want), timeout, func() bool {
+		got := sqliteScalar(t, dbPath,
+			fmt.Sprintf("SELECT state FROM capture_events WHERE path = %s AND seq > %d ORDER BY seq DESC LIMIT 1",
+				sqliteQuote(path), afterSeq))
+		return got == want
 	})
 }
 
