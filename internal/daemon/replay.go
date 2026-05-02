@@ -330,12 +330,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		if len(ops) == 0 {
 			// No ops to apply — mark failed, do not block the queue.
-			markFailed(ctx, db, ev, replayIssue{
+			if err := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorValidation,
 				Message:    "no ops attached",
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, "no ops attached", nil)
 			sum.Failed++
 			continue
@@ -343,12 +345,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 
 		// Validate before touching the index.
 		if msg := validateOps(ops); msg != "" {
-			markFailed(ctx, db, ev, replayIssue{
+			if err := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorValidation,
 				Message:    msg,
 				Ref:        activeCtx.BranchRef,
 				Path:       ev.Path,
-			})
+			}); err != nil {
+				return sum, err
+			}
 			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, msg, nil)
 			sum.Failed++
 			continue
