@@ -870,11 +870,28 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 		var nextDirs []dirEntry
 		var fileCands []candidate
 
+		// layerHadError coalesces per-entry soft errors into a single
+		// summary.Errors bump for the whole BFS layer. Previously the DFS
+		// path bumped Errors at most once per pass; the BFS rewrite would
+		// otherwise inflate the counter linearly with the number of
+		// unreadable entries (a corrupt subtree with 10k bad children
+		// reported Errors=10k instead of Errors=1), breaking comparison
+		// across versions for triage. The trace event_class table still
+		// emits the per-entry detail; only the aggregate counter is
+		// coalesced here.
+		layerHadError := false
+		bumpLayerError := func() {
+			if !layerHadError {
+				summary.Errors++
+				layerHadError = true
+			}
+		}
+
 		for _, parent := range frontier {
 			children, err := os.ReadDir(parent.full)
 			if err != nil {
 				// Soft error: the directory vanished or is unreadable.
-				summary.Errors++
+				bumpLayerError()
 				continue
 			}
 			for _, d := range children {
@@ -887,7 +904,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				}
 				if hasControlPathChar(childRel) {
 					recordInvalidPath(ctx, opts.db, childRel, "control_chars")
-					summary.Errors++
+					bumpLayerError()
 					continue
 				}
 
@@ -906,7 +923,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				childFull := filepath.Join(parent.full, name)
 				fi, lstatErr := os.Lstat(childFull)
 				if lstatErr != nil {
-					summary.Errors++
+					bumpLayerError()
 					continue
 				}
 				mode := fi.Mode()
