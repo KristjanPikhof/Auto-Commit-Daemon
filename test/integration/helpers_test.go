@@ -435,29 +435,22 @@ func readHeartbeatTs(repoDir string) float64 {
 	return f
 }
 
-// initStateDBSchema creates an empty <repo>/.git/acd/state.db using the
-// running `acd` binary's daemon migrate path. We do this by invoking
-// `acd diagnose --repo <repo>` which (best-effort) opens the DB and applies
-// the schema. As a fallback we shell out to sqlite3 with the canonical DDL
-// extracted from internal/state/schema.go — but the diagnose path is the
-// canonical method.
+// initStateDBSchema brings <repo>/.git/acd/state.db into existence with the
+// canonical schema applied. The integration suite cannot import the internal
+// state package, so we use the production `acd` binary itself: a brief
+// `acd start` + `acd stop` cycle migrates the schema, after which we are
+// free to seed arbitrary rows for the populated-state scenarios.
 //
-// Returns the absolute path to the state.db. Used by populated-state tests
-// that need to seed rows BEFORE `acd start` so the daemon observes them.
-func initStateDBSchema(t *testing.T, ctx context.Context, env []string, repo string) string {
+// Returns the absolute path to the state.db.
+func initStateDBSchema(t *testing.T, ctx context.Context, env []string, repo, sessionID string) string {
 	t.Helper()
-	dbDir := filepath.Join(repo, ".git", "acd")
-	if err := os.MkdirAll(dbDir, 0o755); err != nil {
-		t.Fatalf("mkdir acd dir: %v", err)
-	}
-	// `acd diagnose` opens+migrates the DB without requiring a running daemon.
-	res := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
-	if res.ExitCode != 0 {
-		t.Fatalf("acd diagnose exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
-	}
-	dbPath := filepath.Join(dbDir, "state.db")
+	startSession(t, ctx, env, repo, sessionID, "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	if _, err := os.Stat(dbPath); err != nil {
-		t.Fatalf("state.db not created by diagnose: %v", err)
+		t.Fatalf("state.db not created by start/stop bootstrap: %v", err)
 	}
 	return dbPath
 }
