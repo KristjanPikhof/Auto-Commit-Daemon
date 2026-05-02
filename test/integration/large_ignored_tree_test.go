@@ -226,4 +226,3 @@ func classifyWalkedFiles(line string) (int64, bool) {
 	}
 	return n, true
 }
-
