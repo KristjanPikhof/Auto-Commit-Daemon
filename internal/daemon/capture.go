@@ -256,9 +256,11 @@ func shouldEmitPendingCapWarn() bool {
 	now := pendingCapWarnNow().Unix()
 	last := pendingCapWarnLastUnix.Load()
 	interval := pendingCapWarnIntervalSeconds()
-	// NTP backward step: clock went back so `last` is now in the future.
-	// Reset the gate and emit so a stuck warn does not stay suppressed.
-	if now <= last {
+	// NTP backward step: clock went STRICTLY back so `last` is now in the
+	// future. Reset the gate and emit so a stuck warn does not stay
+	// suppressed. We use strict `<` (not `<=`) so same-second re-entry
+	// still throttles correctly.
+	if now < last {
 		pendingCapWarnLastUnix.Store(now)
 		return true
 	}
