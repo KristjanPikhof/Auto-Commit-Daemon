@@ -44,6 +44,19 @@ const (
 	// attempts. The aggregator is also forced once per UTC-day boundary
 	// crossing regardless of this floor.
 	DefaultRollupInterval = 5 * time.Minute
+	// DefaultFlushLimit caps how many flush_requests are drained per
+	// run-loop iteration. A bursty enqueue (1500+ rows) must not starve
+	// other Run-loop work, and the inner drain must remain context-
+	// cancelable. Tests can override Options.FlushLimit (e.g. 1) for
+	// tighter control.
+	DefaultFlushLimit = 256
+	// OrphanFlushAckThreshold is how long a flush_request may stay in the
+	// "acknowledged" state before the daemon's startup sweep marks it
+	// "failed". Acknowledged-but-never-completed rows are an orphan from a
+	// prior daemon crash between ClaimNextFlushRequest and
+	// CompleteFlushRequest. Sweeping them at startup keeps `acd status` /
+	// queue depth metrics from accumulating ghosts forever.
+	OrphanFlushAckThreshold = 5 * time.Minute
 )
 
 // EnvClientTTLSeconds is the environment knob for ACD_CLIENT_TTL_SECONDS
