@@ -1278,6 +1278,14 @@ var (
 	markEventBlockedFn   = state.MarkEventBlocked
 )
 
+// daemonPauseStateFn is a test-only seam for the run loop's pause gate.
+// Production callers invoke daemonPauseState directly; the run loop uses
+// this indirection so a test can assert that a transient SQLite/state read
+// error causes capture/replay to fail CLOSED (treated as paused) rather
+// than fail open (treated as not paused, draining the queue while the
+// operator believes replay is paused).
+var daemonPauseStateFn = daemonPauseState
+
 // markFailed flags an event as terminally failed and records the reason.
 // "failed" is terminal — PendingEvents excludes the row, so the next pass
 // will not re-attempt it. Returns a non-nil error when the terminal-state
