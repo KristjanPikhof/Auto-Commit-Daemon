@@ -118,7 +118,8 @@ func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
 	captureOnePendingFile(t, ctx, f, "hello.md", "hello\n")
-	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -144,6 +145,13 @@ func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
 	status := gitStatusPorcelain(t, ctx, f.dir)
 	if status != "" {
 		t.Fatalf("live index was not reconciled after replay publish; git status --porcelain:\n%s", status)
+	}
+	events := traceEventsByClass(trace.Events(), "replay.live_index")
+	if len(events) != 1 {
+		t.Fatalf("replay.live_index trace events=%d want 1; events=%+v", len(events), trace.Events())
+	}
+	if events[0].Decision != "applied" || events[0].Error != "" {
+		t.Fatalf("unexpected live-index trace event: %+v", events[0])
 	}
 }
 
