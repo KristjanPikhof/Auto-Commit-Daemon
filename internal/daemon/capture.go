@@ -908,15 +908,21 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 					continue
 				}
 
-				// Always step around our own state subdir + .git, regardless
-				// of depth. The tokens only ever exist as top-level
-				// components, but the cheap topComponent slice keeps the
-				// check identical to the previous DFS implementation.
+				// Always step around .git, regardless of depth. The token
+				// only ever exists as a top-level component, but the cheap
+				// topComponent slice keeps the check identical to the
+				// previous DFS implementation. Our own state lives at
+				// <gitDir>/acd, which is inside .git and never reachable as
+				// a worktree-rooted top component, so we deliberately do
+				// NOT prune top-level "acd/" — that would silently delete
+				// user repos containing a literal acd/ directory.
+				// TODO: if state ever lives outside .git, prune by
+				// comparing the absolute path against gitDir/stateSubdir.
 				topComponent := childRel
 				if i := strings.IndexByte(childRel, '/'); i >= 0 {
 					topComponent = childRel[:i]
 				}
-				if topComponent == ".git" || topComponent == stateSubdir {
+				if topComponent == ".git" {
 					continue
 				}
 
