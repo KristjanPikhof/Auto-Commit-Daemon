@@ -144,16 +144,24 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		}
 	}()
 
-	// Write all paths NUL-delimited.
+	// Build the NUL-delimited stdin payload.
 	var buf bytes.Buffer
 	for _, p := range paths {
 		buf.WriteString(p)
 		buf.WriteByte(0)
 	}
-	if _, err := c.stdin.Write(buf.Bytes()); err != nil {
-		c.killLocked()
-		return nil, fmt.Errorf("check-ignore write: %w", err)
-	}
+
+	// Pump stdin from a writer goroutine concurrently with the main
+	// goroutine's stdout read loop. This avoids the pipe-buffer deadlock
+	// described on the type comment: the writer can block on a full stdin
+	// pipe while the reader drains stdout, and vice versa. The writer
+	// reports its outcome through errCh.
+	stdin := c.stdin
+	errCh := make(chan error, 1)
+	go func(payload []byte) {
+		_, err := stdin.Write(payload)
+		errCh <- err
+	}(buf.Bytes())
 
 	// Read 4 NUL-delimited fields per input path.
 	results := make([]bool, len(paths))
@@ -162,11 +170,16 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		for f := 0; f < 4; f++ {
 			tok, err := c.stdout.ReadBytes(0)
 			if err != nil {
+				// Kill the subprocess and drain the writer goroutine
+				// so it cannot leak. After killLocked closes stdin,
+				// the in-flight Write returns immediately.
 				c.killLocked()
+				<-errCh
 				return nil, fmt.Errorf("check-ignore read: %w", err)
 			}
 			if len(tok) == 0 {
 				c.killLocked()
+				<-errCh
 				return nil, fmt.Errorf("check-ignore: short read")
 			}
 			fields[f] = string(tok[:len(tok)-1]) // strip NUL
@@ -176,6 +189,15 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 		// patterns with a leading "!" — those un-ignore the path.
 		source, pattern := fields[0], fields[2]
 		results[i] = source != "" && !strings.HasPrefix(pattern, "!")
+	}
+
+	// Reads completed cleanly; surface any deferred writer error. A write
+	// error here means git accepted enough bytes to satisfy len(paths)
+	// records but then closed its stdin half early, which is still a
+	// protocol violation — fail closed and reset the subprocess.
+	if werr := <-errCh; werr != nil {
+		c.killLocked()
+		return nil, fmt.Errorf("check-ignore write: %w", werr)
 	}
 	return results, nil
 }
