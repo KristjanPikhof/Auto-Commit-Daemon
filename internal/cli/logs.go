@@ -84,7 +84,6 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 				return fmt.Errorf("acd logs: write output: %w", err)
 			}
 		}
-		}
 		if follow {
 			return followLog(ctx, out, logPath, offset, logFollowPollInterval)
 		}
