@@ -281,7 +281,8 @@ func (c *IgnoreChecker) killLocked() {
 	if c.cmd != nil {
 		cmd := c.cmd
 		waitDone := make(chan error, 1)
-		go func() { waitDone <- waitFn(cmd) }()
+		wait := *waitFn.Load()
+		go func() { waitDone <- wait(cmd) }()
 		select {
 		case <-waitDone:
 		case <-time.After(killWaitTimeout):
