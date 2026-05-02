@@ -6,13 +6,14 @@ const rootHelpTemplate = `{{if eq .CommandPath "acd"}}{{with (or .Long .Short)}}
   acd <command> [flags]
 
 Common workflow:
-  acd start        Register this session and ensure the repo daemon is running
-  acd status       Show daemon, branch, and client state for the current repo
-  acd list         List known repo daemons
-  acd list --watch Watch known repo daemons live
-  acd logs         Tail the current repo daemon log
-  acd wake         Refresh heartbeat and nudge replay
-  acd stop         Stop the repo daemon or deregister a session
+  acd start                         Register this session and ensure the repo daemon is running
+  acd status                        Show daemon, branch, and client state for the current repo
+  acd list                          List known repo daemons
+  acd list --watch --interval 5s     Watch known repo daemons live
+  acd logs --lines 200              Tail the current repo daemon log as raw JSONL
+  acd logs --follow                 Stream appended raw JSONL daemon log lines
+  acd wake                          Refresh heartbeat and nudge replay
+  acd stop                          Stop the repo daemon or deregister a session
 
 Diagnostics and recovery:
   acd diagnose     Inspect replay blockers and branch anchors
