@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
