@@ -106,6 +106,9 @@ func runListWatch(ctx context.Context, out, errOut io.Writer, interval time.Dura
 
 		snapshot, err := collectListSnapshot(ctx, errOut)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return err
 		}
 		if err := renderListWatchFrame(out, snapshot); err != nil {
