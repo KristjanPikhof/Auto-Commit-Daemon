@@ -283,6 +283,79 @@ func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
 	}
 }
 
+func TestRepairPublishedLiveIndexRepairsOldCreateStaleIndex(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	const path = "old-stale.txt"
+	body := []byte("old stale\n")
+	if err := os.WriteFile(filepath.Join(f.dir, path), body, 0o644); err != nil {
+		t.Fatalf("write worktree: %v", err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, f.dir, body)
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	seedTreeEntries, err := git.LsTree(ctx, f.dir, f.cctx.BaseHead, false)
+	if err != nil {
+		t.Fatalf("ls-tree seed: %v", err)
+	}
+	mkEntries := make([]git.MktreeEntry, 0, len(seedTreeEntries)+1)
+	for _, e := range seedTreeEntries {
+		mkEntries = append(mkEntries, git.MktreeEntry{Mode: e.Mode, Type: e.Type, OID: e.OID, Path: e.Path})
+	}
+	mkEntries = append(mkEntries, git.MktreeEntry{Mode: git.RegularFileMode, Type: "blob", OID: afterOID, Path: path})
+	tree, err := git.Mktree(ctx, f.dir, mkEntries)
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	commit, err := git.CommitTree(ctx, f.dir, tree, "old acd publish", f.cctx.BaseHead)
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, "HEAD", commit, f.cctx.BaseHead); err != nil {
+		t.Fatalf("update-ref HEAD: %v", err)
+	}
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             path,
+		Fidelity:         "rescan",
+		State:            state.EventStatePublished,
+		CommitOID:        sql.NullString{String: commit, Valid: true},
+		PublishedTS:      sql.NullFloat64{Float64: float64(time.Now().Unix()), Valid: true},
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      path,
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+	if status := gitStatusPorcelain(t, ctx, f.dir); !strings.Contains(status, "D  "+path) || !strings.Contains(status, "?? "+path) {
+		t.Fatalf("test did not create stale live-index shape; status:\n%s", status)
+	}
+
+	sum, err := RepairPublishedLiveIndex(ctx, f.dir, f.db, commit, DefaultLiveIndexRepairLimit)
+	if err != nil {
+		t.Fatalf("RepairPublishedLiveIndex: %v", err)
+	}
+	if sum.Applied != 1 || len(sum.Skipped) != 0 {
+		t.Fatalf("repair summary=%+v want one applied and no skips", sum)
+	}
+	if status := gitStatusPorcelain(t, ctx, f.dir); status != "" {
+		t.Fatalf("live index still stale after repair:\n%s", status)
+	}
+}
+
 func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
