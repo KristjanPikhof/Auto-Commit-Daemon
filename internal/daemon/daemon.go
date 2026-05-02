@@ -489,6 +489,7 @@ func Run(ctx context.Context, opts Options) error {
 		currentToken = ""
 	}
 	branchTransitionBlocked := false
+	startupFastForwardResync := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -538,6 +539,8 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
+		} else if transition == TokenTransitionFastForward {
+			startupFastForwardResync = true
 		}
 	}
 	cctx := CaptureContext{
@@ -553,6 +556,27 @@ func Run(ctx context.Context, opts Options) error {
 	if !branchTransitionBlocked {
 		if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
 			logger.Warn("seed branch token", "err", err.Error())
+		}
+	}
+	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
+		dropped, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
+			cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
+		if dropErr != nil {
+			logger.Warn("drop stale unpublished events after startup fast-forward",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", dropErr.Error())
+		}
+		if seeded, err := ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+			logger.Warn("reseed shadow after startup fast-forward",
+				"err", err.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+		} else {
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "startup fast-forward shadow reseed", seeded)
+			logger.Info("shadow reseeded after startup fast-forward",
+				"rows", seeded,
+				"generation", cctx.BranchGeneration,
+				"dropped_unpublished", dropped)
 		}
 	}
 
@@ -831,6 +855,30 @@ func Run(ctx context.Context, opts Options) error {
 					lastStampedBranchHead = liveHead
 				}
 			}
+			if cctx.BranchRef != "" && cctx.BaseHead != "" {
+				bootstrapped, bErr := IsShadowBootstrapped(ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+				if bErr != nil {
+					logger.Warn(logPrefix+" read shadow bootstrap marker",
+						"err", bErr.Error())
+					return true
+				}
+				if !bootstrapped {
+					seeded, seedErr := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx)
+					if seedErr != nil {
+						logger.Warn(logPrefix+" bootstrap missing shadow",
+							"err", seedErr.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
+						return true
+					}
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "missing shadow bootstrap", seeded)
+					if seeded > 0 {
+						logger.Info("shadow bootstrapped after missing marker",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration)
+					}
+					return true
+				}
+			}
 			return false
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
@@ -1016,9 +1064,35 @@ func Run(ctx context.Context, opts Options) error {
 				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
 					"fast-forward inside rewind grace")
 			} else {
+				droppedUnpublished, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
+					cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
+				if dropErr != nil {
+					logger.Warn("drop stale unpublished events after branch fast-forward",
+						"branch_ref", cctx.BranchRef,
+						"generation", cctx.BranchGeneration,
+						"err", dropErr.Error())
+				}
+				seeded := 0
+				if cctx.BranchRef != "" {
+					var seedErr error
+					seeded, seedErr = ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx)
+					if seedErr != nil {
+						logger.Warn("reseed shadow after branch fast-forward",
+							"err", seedErr.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
+					} else {
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
+						logger.Info("shadow reseeded after branch fast-forward",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration,
+							"dropped_unpublished", droppedUnpublished)
+					}
+				}
 				logger.Debug("branch fast-forwarded",
 					"old", oldToken, "new", newToken,
-					"generation", cctx.BranchGeneration)
+					"generation", cctx.BranchGeneration,
+					"dropped_unpublished", droppedUnpublished,
+					"shadow_rows", seeded)
 				recordTrace(tracer, acdtrace.Event{
 					Repo:       opts.RepoPath,
 					BranchRef:  cctx.BranchRef,
@@ -1027,7 +1101,12 @@ func Run(ctx context.Context, opts Options) error {
 					Decision:   transition.String(),
 					Reason:     "run-loop token transition classified",
 					Input:      map[string]any{"previous": oldToken, "current": newToken},
-					Output:     map[string]any{"generation": cctx.BranchGeneration},
+					Output: map[string]any{
+						"generation":           cctx.BranchGeneration,
+						"dropped_unpublished":  droppedUnpublished,
+						"shadow_rows_reseeded": seeded,
+					},
+					Error:      traceErrString(dropErr),
 					Generation: cctx.BranchGeneration,
 				})
 				if err := SaveBranchGeneration(ctx, opts.DB,
@@ -1036,7 +1115,7 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
-		return false
+		return true
 	}
 
 	for {
@@ -1306,7 +1385,7 @@ func Run(ctx context.Context, opts Options) error {
 		// genuinely cannot answer "is replay paused?", assume yes.
 		daemonPaused := pauseErr != nil || daemonPaus.Active
 		if branchTransitionBlocked {
-			logger.Warn("capture/replay paused until branch transition is classified")
+			logger.Warn("capture/replay paused for branch transition settle")
 		} else if operationPaused {
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
