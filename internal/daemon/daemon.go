@@ -1056,7 +1056,15 @@ func Run(ctx context.Context, opts Options) error {
 			// must run `git rebase --abort` (or remove the marker) by hand.
 			elapsed := nowTS.Sub(opMarkerSetAt)
 			if elapsed >= staleOpMarkerThreshold && currentHead == opMarkerHead {
-				if opMarkerWarnedAt.IsZero() || nowTS.Sub(opMarkerWarnedAt) >= staleOpMarkerWarnInterval {
+				// NTP-safe: nowTS.Before(opMarkerWarnedAt) catches a backward
+				// step that would otherwise leave Sub() negative and silence
+				// the warn forever. time.Time arithmetic uses monotonic
+				// readings when both operands have them, but a Time stored
+				// across boundaries that strip the monotonic clock (e.g. JSON
+				// round-trips, t.Round(0)) falls back to wall-clock and is
+				// vulnerable. Clamping cheaply covers that case.
+				sinceWarn := nowTS.Sub(opMarkerWarnedAt)
+				if opMarkerWarnedAt.IsZero() || nowTS.Before(opMarkerWarnedAt) || sinceWarn >= staleOpMarkerWarnInterval {
 					logger.Warn("operation_in_progress marker may be stale; verify git status",
 						"operation", operationName,
 						"head", currentHead,
@@ -1553,4 +1561,3 @@ WHERE status = 'acknowledged'
 	}
 	return n, nil
 }
-
