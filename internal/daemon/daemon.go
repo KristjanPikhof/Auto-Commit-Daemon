@@ -1122,9 +1122,13 @@ func Run(ctx context.Context, opts Options) error {
 		// 4e. Drain pending flush_requests; each one triggers an immediate
 		// capture+replay cycle. The drain is bounded by flushLimit (default
 		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
-		// rest of the Run loop, and the inner loop checks ctx.Err every
-		// iteration so SIGTERM during a large drain still exits within one
-		// claim cycle (~tens of ms).
+		// rest of the Run loop, and the inner loop checks ctx.Err AND
+		// shutdownCh every iteration so SIGTERM during a large drain still
+		// exits within one claim cycle (~tens of ms). Some callers run the
+		// daemon with a non-cancelable ctx (context.Background) and expect
+		// signal delivery via shutdownCh; without the explicit shutdownCh
+		// arm here the worst-case drain (256 rows × ~30ms claim) would burn
+		// roughly 7.5s before the run loop notices the signal.
 		flushLimit := opts.FlushLimit
 		if flushLimit <= 0 {
 			flushLimit = DefaultFlushLimit
@@ -1133,6 +1137,12 @@ func Run(ctx context.Context, opts Options) error {
 		for {
 			if err := ctx.Err(); err != nil {
 				break
+			}
+			select {
+			case <-shutdownCh:
+				graceful("signal shutdown")
+				return nil
+			default:
 			}
 			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
 			if err != nil {
