@@ -49,6 +49,15 @@ func newWakeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "wake",
 		Short: "Heartbeat refresh + nudge daemon",
+		Long: `Refresh one session heartbeat for the resolved repo and request an immediate daemon wake.
+
+The default repo is the current working directory. Harness integrations call wake with --session-id after edits so the daemon can notice work promptly. If the session is absent, wake lazily registers it with harness "other" before signaling the daemon.
+
+Use acd touch when you only need a heartbeat refresh without signaling.`,
+		Example: `  acd wake --session-id "$ACD_SESSION_ID"
+  acd wake --repo /path/to/repo --session-id "$ACD_SESSION_ID"
+  acd wake --session-id "$ACD_SESSION_ID" --json
+  acd touch --session-id "$ACD_SESSION_ID"`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repoFlag, _ := c.Flags().GetString("repo")
 			jsonOut, _ := c.Flags().GetBool("json")
