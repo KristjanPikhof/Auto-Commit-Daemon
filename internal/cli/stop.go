@@ -118,7 +118,7 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	}
 	for _, rec := range reg.Repos {
 		// Use the caller's force mode for each repo; without --force,
-		// the per-repo refcount-aware shutdown path applies.
+		// the default graceful stop path applies.
 		res, err := stopOneRepoForAll(ctx, rec.Path, "", force)
 		if err != nil {
 			res = stopRepoResult{Repo: rec.Path, Reason: err.Error()}
