@@ -52,6 +52,16 @@ func newListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all known daemons across repos",
+		Long: `List repos registered with acd and show daemon liveness, clients, queue
+depth, blocked conflicts, last commit, and pause/stale status.
+
+Use --watch to refresh the table until interrupted. --interval controls the
+refresh cadence and accepts Go durations such as 500ms, 2s, or 1m. Watch mode
+prints plain table frames and does not support --json.`,
+		Example: `  acd list
+  acd list --watch
+  acd list --watch --interval 5s
+  acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			if watch {
