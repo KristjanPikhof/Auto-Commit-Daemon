@@ -147,9 +147,17 @@ for the full `event_class` enumeration.
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
+| `ACD_SAFE_IGNORE` | enabled | Set to `0`, `false`, `no`, or `off` to disable ACD's internal generated-tree pruning. |
+| `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated patterns appended to the safe-ignore defaults, for example `dist/,build/`. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
+
+ACD also skips common generated dependency/cache trees even when a project has
+not gitignored them: `node_modules/`, `target/`, `.venv/`, `venv/`,
+`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and
+`.gradle/`. This does not edit `.gitignore`; it only prunes ACD capture and
+watcher work. Use `acd doctor` to inspect the active safe-ignore pattern list.
 
 ## Docs
 
