@@ -3002,9 +3002,10 @@ func TestReplay_MarkFailedErrorPropagated(t *testing.T) {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	// Corrupt the captured ops so validateOps fires markFailed.
+	// Corrupt the captured ops so validateOps fires markFailed (empty
+	// path → "missing path for op …").
 	if _, err := f.db.SQL().ExecContext(ctx,
-		`UPDATE capture_ops SET path = '' WHERE seq = (SELECT seq FROM capture_events ORDER BY seq DESC LIMIT 1)`); err != nil {
+		`UPDATE capture_ops SET path = '' WHERE event_seq = (SELECT seq FROM capture_events ORDER BY seq DESC LIMIT 1)`); err != nil {
 		t.Fatalf("corrupt op: %v", err)
 	}
 
