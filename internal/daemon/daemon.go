@@ -156,7 +156,8 @@ type Options struct {
 	SkipSignals bool
 
 	// FlushLimit caps how many flush_requests are drained per iteration.
-	// Zero means "drain them all". Tests set it to 1 for tighter control.
+	// Zero falls back to DefaultFlushLimit (256). Tests set it to 1 for
+	// tighter control.
 	FlushLimit int
 
 	// FsnotifyEnabled turns on the recursive fsnotify watcher (D11 hybrid).
