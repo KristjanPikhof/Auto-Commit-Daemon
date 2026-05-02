@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"text/tabwriter"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+const defaultListWatchInterval = 2 * time.Second
 
 // listEntry is one row in the `acd list` output. JSON marshal tags match
 // the §7.7 example shape.
@@ -43,28 +46,104 @@ type listEntry struct {
 }
 
 func newListCmd() *cobra.Command {
+	var watch bool
+	var interval time.Duration
+
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all known daemons across repos",
+		Long: `List repos registered with acd and show daemon liveness, clients, queue
+depth, blocked conflicts, last commit, and pause/stale status.
+
+Use --watch to refresh the table until interrupted. --interval controls the
+refresh cadence and accepts Go durations such as 500ms, 2s, or 1m. Watch mode
+prints plain table frames and does not support --json.`,
+		Example: `  acd list
+  acd list --watch
+  acd list --watch --interval 5s
+  acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if watch {
+				if jsonOut {
+					return fmt.Errorf("acd list: --watch does not support --json")
+				}
+				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval)
+			}
 			return runList(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonOut)
 		},
 	}
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh list output until interrupted")
+	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
 	return cmd
 }
 
+type listSnapshot struct {
+	UpdatedAt time.Time
+	Entries   []listEntry
+}
+
 func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
+	snapshot, err := collectListSnapshot(ctx, errOut)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return renderListJSON(out, snapshot.Entries)
+	}
+	return renderListTable(out, snapshot.Entries)
+}
+
+func runListWatch(ctx context.Context, out, errOut io.Writer, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("acd list: --interval must be positive")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		snapshot, err := collectListSnapshot(ctx, errOut)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		if err := renderListWatchFrame(out, snapshot); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd list: resolve paths: %w", err)
+		return listSnapshot{}, fmt.Errorf("acd list: resolve paths: %w", err)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd list: load registry: %w", err)
+		return listSnapshot{}, fmt.Errorf("acd list: load registry: %w", err)
 	}
 
 	now := time.Now()
@@ -146,14 +225,21 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		entries = append(entries, e)
 	}
 
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(struct {
-			Repos []listEntry `json:"repos"`
-		}{Repos: entries})
-	}
+	return listSnapshot{
+		UpdatedAt: now,
+		Entries:   entries,
+	}, nil
+}
 
+func renderListJSON(out io.Writer, entries []listEntry) error {
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(struct {
+		Repos []listEntry `json:"repos"`
+	}{Repos: entries})
+}
+
+func renderListTable(out io.Writer, entries []listEntry) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tLAST_COMMIT\tSTATUS")
 	for _, e := range entries {
@@ -179,6 +265,12 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 		return fmt.Errorf("acd list: flush: %w", err)
 	}
 	return nil
+}
+
+func renderListWatchFrame(out io.Writer, snapshot listSnapshot) error {
+	fmt.Fprint(out, "\033[2J\033[H")
+	fmt.Fprintf(out, "Updated: %s\n\n", snapshot.UpdatedAt.Format(time.RFC3339))
+	return renderListTable(out, snapshot.Entries)
 }
 
 // dashIfMissing returns "-" when the row represents a missing/unreadable

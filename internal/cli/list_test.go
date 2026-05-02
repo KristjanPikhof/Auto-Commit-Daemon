@@ -5,15 +5,33 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func TestList_HumanOneShotOutputStaysTableOnly(t *testing.T) {
+	withIsolatedHome(t)
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(context.Background(), &stdout, &stderr, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q, want empty", stderr.String())
+	}
+	want := "REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS\n"
+	if stdout.String() != want {
+		t.Fatalf("one-shot output drifted:\ngot  %q\nwant %q", stdout.String(), want)
+	}
+}
 
 func TestList_Human_TwoRepos(t *testing.T) {
 	roots := withIsolatedHome(t)
@@ -496,6 +514,133 @@ func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
 	if len(got.Repos) != 1 {
 		t.Fatalf("paused-stale repo with no clients was hidden: %+v", got.Repos)
 	}
+}
+
+func TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel(t *testing.T) {
+	withIsolatedHome(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdout := newCancelAfterFramesWriter(cancel, 2)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runListWatch(ctx, stdout, io.Discard, time.Millisecond)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runListWatch: %v", err)
+		}
+		if stdout.frameCount() < 2 {
+			t.Fatalf("watch exited before two frames:\n%s", stdout.String())
+		}
+	case <-stdout.done:
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runListWatch after cancel: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runListWatch did not stop after context cancellation")
+	}
+
+	got := stdout.String()
+	if strings.Count(got, "Updated:") < 2 {
+		t.Fatalf("watch output missing repeated timestamps:\n%s", got)
+	}
+	if strings.Count(got, "\033[2J\033[H") < 2 {
+		t.Fatalf("watch output missing repeated redraw escapes:\n%q", got)
+	}
+	if strings.Count(got, "REPO") < 2 {
+		t.Fatalf("watch output missing repeated table renders:\n%s", got)
+	}
+}
+
+func TestListWatch_AlreadyCanceledContextReturnsNil(t *testing.T) {
+	withIsolatedHome(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var stdout bytes.Buffer
+	if err := runListWatch(ctx, &stdout, io.Discard, time.Millisecond); err != nil {
+		t.Fatalf("runListWatch: %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout=%q, want empty for pre-canceled context", stdout.String())
+	}
+}
+
+func TestListWatchIntervalFlagParsesGoDuration(t *testing.T) {
+	withIsolatedHome(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--watch", "--interval", "250ms"})
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("ExecuteContext valid duration: %v", err)
+	}
+
+	cmd = newRootCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"list", "--watch", "--interval", "250bad"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("Execute invalid duration: got nil, want error")
+	}
+}
+
+type cancelAfterFramesWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	done   chan struct{}
+	cancel context.CancelFunc
+	frames int
+	want   int
+	once   sync.Once
+}
+
+func newCancelAfterFramesWriter(cancel context.CancelFunc, want int) *cancelAfterFramesWriter {
+	return &cancelAfterFramesWriter{
+		done:   make(chan struct{}),
+		cancel: cancel,
+		want:   want,
+	}
+}
+
+func (w *cancelAfterFramesWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	w.frames += strings.Count(string(p), "Updated:")
+	if w.frames >= w.want {
+		w.once.Do(func() {
+			w.cancel()
+			close(w.done)
+		})
+	}
+	return n, err
+}
+
+func (w *cancelAfterFramesWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func (w *cancelAfterFramesWriter) frameCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.frames
 }
 
 func TestPauseState_GitDirDerivation_Pinned(t *testing.T) {

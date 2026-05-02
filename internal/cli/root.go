@@ -50,6 +50,7 @@ func newRootCmd() *cobra.Command {
 		newWakeCmd(),
 		newTouchCmd(),
 		newStatusCmd(),
+		newLogsCmd(),
 		newListCmd(),
 		newStatsCmd(),
 		newDiagnoseCmd(),
