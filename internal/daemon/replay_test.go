@@ -147,6 +147,142 @@ func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
 	}
 }
 
+func TestReplay_ReconcilesLiveIndexForTrackedChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(t *testing.T, f *captureFixture)
+	}{
+		{
+			name: "modify",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(f.dir, "file.txt"), []byte("after\n"), 0o644); err != nil {
+					t.Fatalf("modify file: %v", err)
+				}
+			},
+		},
+		{
+			name: "delete",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.Remove(filepath.Join(f.dir, "file.txt")); err != nil {
+					t.Fatalf("delete file: %v", err)
+				}
+			},
+		},
+		{
+			name: "rename",
+			edit: func(t *testing.T, f *captureFixture) {
+				t.Helper()
+				if err := os.Rename(filepath.Join(f.dir, "file.txt"), filepath.Join(f.dir, "renamed.txt")); err != nil {
+					t.Fatalf("rename file: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			seedTrackedFileCommit(t, ctx, f, "file.txt", "before\n")
+			if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+				t.Fatalf("BootstrapShadow: %v", err)
+			}
+
+			tc.edit(t, f)
+			if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+				IgnoreChecker:    f.ig,
+				SensitiveMatcher: f.matcher,
+			}); err != nil {
+				t.Fatalf("Capture: %v", err)
+			}
+			sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+			if err != nil {
+				t.Fatalf("Replay: %v", err)
+			}
+			if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+				t.Fatalf("unexpected summary: %+v", sum)
+			}
+			if status := gitStatusPorcelain(t, ctx, f.dir); status != "" {
+				t.Fatalf("live index was not reconciled after %s; git status --porcelain:\n%s", tc.name, status)
+			}
+		})
+	}
+}
+
+func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	unrelatedOID, err := git.HashObjectStdin(ctx, f.dir, []byte("user staged\n"))
+	if err != nil {
+		t.Fatalf("hash unrelated: %v", err)
+	}
+	samePathOID, err := git.HashObjectStdin(ctx, f.dir, []byte("same path user staged\n"))
+	if err != nil {
+		t.Fatalf("hash same-path: %v", err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, f.dir, []byte("acd after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	if err := git.UpdateIndexInfo(ctx, f.dir, "", []string{
+		git.RegularFileMode + " " + unrelatedOID + "\tunrelated.txt",
+		git.RegularFileMode + " " + samePathOID + "\tsame.txt",
+	}); err != nil {
+		t.Fatalf("seed live index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "same.txt"), []byte("acd after\n"), 0o644); err != nil {
+		t.Fatalf("write same path worktree: %v", err)
+	}
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         f.cctx.BaseHead,
+		Operation:        "create",
+		Path:             "same.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:        "create",
+		Path:      "same.txt",
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, Trace: trace})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	entries, err := git.LsFilesStaged(ctx, f.dir, "unrelated.txt", "same.txt")
+	if err != nil {
+		t.Fatalf("LsFilesStaged: %v", err)
+	}
+	index := map[string]git.IndexEntry{}
+	for _, entry := range entries {
+		index[entry.Path] = entry
+	}
+	if got := index["unrelated.txt"].OID; got != unrelatedOID {
+		t.Fatalf("unrelated staged OID=%s want %s", got, unrelatedOID)
+	}
+	if got := index["same.txt"].OID; got != samePathOID {
+		t.Fatalf("same-path staged OID=%s want preserved user OID %s", got, samePathOID)
+	}
+	if !traceHasDecision(trace.Events(), "skipped") {
+		t.Fatalf("expected replay.live_index skipped trace; events=%+v", trace.Events())
+	}
+}
+
 func TestReplay_SkipsDrainWhenManualMarkerPresent(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
