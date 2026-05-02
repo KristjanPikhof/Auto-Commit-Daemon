@@ -32,7 +32,7 @@ func newWatcherForTest(t *testing.T, opts FsnotifyOptions) (*FsnotifyWatcher, *a
 	if err != nil {
 		t.Fatalf("NewFsnotifyWatcher: %v", err)
 	}
-	t.Cleanup(func() { _ = w.Stop() })
+	t.Cleanup(func() { _ = w.Stop(context.Background()) })
 	return w, &wakeCount
 }
 
