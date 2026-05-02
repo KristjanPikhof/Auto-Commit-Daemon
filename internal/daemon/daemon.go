@@ -1417,7 +1417,23 @@ func gitOperationInProgress(gitDir string) (string, bool) {
 		if _, err := os.Stat(filepath.Join(gitDir, marker.path)); err == nil {
 			return marker.name, true
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return marker.name, true
+			// A non-ErrNotExist stat error (EACCES, EIO, transient
+			// filesystem hiccup) MUST NOT latch capture/replay into
+			// permanent pause. The previous implementation returned
+			// (name, true) on any such error, which meant a single
+			// EACCES on .git/MERGE_HEAD wedged the daemon forever (no
+			// auto-clear path; only the reverse "marker absent" branch
+			// in the run loop clears the operation gate). Treat the
+			// marker as absent for this tick — the next tick will
+			// re-stat and observe whatever state actually exists.
+			//
+			// We log via slog.Default rather than a closure-bound
+			// logger so this helper stays pure and easy to call from
+			// tests; the run loop's own pause/resume warns will still
+			// surface a real operation if the marker really is there.
+			slog.Default().Warn("git operation marker stat error; treating as absent for this tick",
+				"marker", marker.path, "err", err.Error())
+			continue
 		}
 	}
 	return "", false
