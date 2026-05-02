@@ -27,10 +27,10 @@ var ErrRefNotFound = errors.New("git: ref not found")
 //     reach us.
 //   - Other exit codes → *Error verbatim.
 func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
-	out, stderr, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
+	out, err := Run(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
 	if err != nil {
 		var gerr *Error
-		if errors.As(err, &gerr) && gerr.ExitCode == 1 && strings.TrimSpace(string(stderr)) == "" {
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 && strings.TrimSpace(gerr.Stderr) == "" {
 			return "", ErrRefNotFound
 		}
 		return "", err
