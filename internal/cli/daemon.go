@@ -15,6 +15,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	acdlogger "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/logger"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -102,13 +103,23 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 
 	fmt.Fprintf(out, "acd daemon run: repo=%s git_dir=%s pid=%d\n", repo, gitDir, os.Getpid())
 
-	opts := buildDaemonRunOptions(repo, gitDir, db, errOut)
-	if err := daemon.Run(cctx, opts); err != nil {
-		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+	opts, logCloser, err := buildDaemonRunOptions(repo, gitDir, db, errOut)
+	if err != nil {
+		return err
+	}
+
+	runErr := daemon.Run(cctx, opts)
+	if logCloser != nil {
+		if closeErr := logCloser.Close(); closeErr != nil && runErr == nil {
+			return fmt.Errorf("acd daemon run: close daemon log: %w", closeErr)
+		}
+	}
+	if runErr != nil {
+		if errors.Is(runErr, daemon.ErrDaemonLockHeld) {
 			fmt.Fprintf(errOut, "acd daemon run: another daemon is already running for %s\n", repo)
 			os.Exit(daemon.ExitTempFail)
 		}
-		return fmt.Errorf("acd daemon run: %w", err)
+		return fmt.Errorf("acd daemon run: %w", runErr)
 	}
 	fmt.Fprintln(out, "acd daemon run: stopped")
 	return nil
@@ -119,16 +130,16 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 // invariants without spinning up the full daemon loop.
 //
 // Behaviour:
+//   - Logger writes to the canonical per-repo daemon.log path and its
+//     closer is returned to the caller for shutdown.
 //   - FsnotifyEnabled comes from ACD_FSNOTIFY_ENABLED (any value other
 //     than "" / "0" / "false" enables it).
 //   - CentralStatsDBPath + RepoHash are resolved best-effort. A
 //     resolution failure is logged to errOut but does not abort the
 //     run loop — the daemon's rollup-push step gates on non-empty
 //     values, so missing wiring degrades to "no stats" rather than a
-//     fatal error. Both fields MUST be wired here; the previous
-//     implementation left them blank, which silently disabled
-//     `acd stats` for every install.
-func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) daemon.Options {
+//     fatal error. Both fields MUST be wired here.
+func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) (daemon.Options, io.Closer, error) {
 	fsEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
 		fsEnabled = true
@@ -137,6 +148,8 @@ func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) 
 	var (
 		centralStatsPath string
 		repoHash         string
+		log              io.Closer
+		runLogger        = daemon.Options{}.Logger
 	)
 	if roots, rErr := paths.Resolve(); rErr != nil {
 		if errOut != nil {
@@ -152,13 +165,26 @@ func buildDaemonRunOptions(repo, gitDir string, db *state.DB, errOut io.Writer) 
 	} else {
 		repoHash = h
 	}
+	if repoHash != "" {
+		if roots, rErr := paths.Resolve(); rErr != nil {
+			return daemon.Options{}, nil, fmt.Errorf("acd daemon run: resolve paths for log: %w", rErr)
+		} else {
+			logger, closer, lErr := acdlogger.New(acdlogger.Options{Path: roots.RepoLogPath(repoHash)})
+			if lErr != nil {
+				return daemon.Options{}, nil, fmt.Errorf("acd daemon run: open daemon log: %w", lErr)
+			}
+			runLogger = logger
+			log = closer
+		}
+	}
 
 	return daemon.Options{
 		RepoPath:           repo,
 		GitDir:             gitDir,
 		DB:                 db,
+		Logger:             runLogger,
 		FsnotifyEnabled:    fsEnabled,
 		CentralStatsDBPath: centralStatsPath,
 		RepoHash:           repoHash,
-	}
+	}, log, nil
 }
