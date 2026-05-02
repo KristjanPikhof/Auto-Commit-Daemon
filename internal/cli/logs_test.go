@@ -15,8 +15,8 @@ import (
 
 func TestLogsTailPrintsLastLinesRaw(t *testing.T) {
 	roots := withIsolatedHome(t)
-	repo, _, d := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, "", "codex")
+	repo, stateDB, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, stateDB, "codex")
 	if err := d.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -39,8 +39,8 @@ func TestLogsTailPrintsLastLinesRaw(t *testing.T) {
 
 func TestLogsMissingLogReturnsActionableError(t *testing.T) {
 	roots := withIsolatedHome(t)
-	repo, _, d := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, "", "codex")
+	repo, stateDB, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, stateDB, "codex")
 	if err := d.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
@@ -72,8 +72,8 @@ func TestLogsUnregisteredRepoReturnsActionableError(t *testing.T) {
 
 func TestLogsFollowStreamsAppendedLines(t *testing.T) {
 	roots := withIsolatedHome(t)
-	repo, _, d := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, "", "codex")
+	repo, stateDB, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, stateDB, "codex")
 	if err := d.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
