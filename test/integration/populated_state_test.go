@@ -61,7 +61,11 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 
 	SeedFlushRequests(t, dbPath, 1000)
 	SeedDaemonClients(t, dbPath, 25)
-	SeedShadowGenerations(t, dbPath, "refs/heads/main", 3, 800)
+	// Seed three historical shadow generations on a foreign branch ref so the
+	// rows act as background data — they contribute to the bootstrap path's
+	// row counts and prune workload but do NOT collide with the active
+	// (refs/heads/main, generation=1) shadow that the daemon reseeds.
+	SeedShadowGenerations(t, dbPath, "refs/heads/legacy", 3, 800)
 
 	// Sanity probes: confirm the seeded counts are what we think.
 	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM flush_requests WHERE status='pending'"); got != "1000" {
