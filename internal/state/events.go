@@ -221,7 +221,7 @@ ORDER BY e.seq ASC`
 // pending depth.
 func CountEventsByState(ctx context.Context, d *DB, state string) (int, error) {
 	var n int
-	if err := d.conn.QueryRowContext(ctx,
+	if err := d.readSQL().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state).Scan(&n); err != nil {
 		return 0, fmt.Errorf("state: count events by state: %w", err)
 	}
