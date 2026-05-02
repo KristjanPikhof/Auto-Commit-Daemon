@@ -2960,13 +2960,16 @@ func TestReplay_MarkEventBlockedErrorPropagated(t *testing.T) {
 		return markErr
 	}
 
-	// Force a conflict path. Use checkEventGeneration's branch-ref mismatch
-	// by handing Replay a CaptureContext with a different BranchRef than
-	// the captured event's branch.
-	mismatchCtx := f.cctx
-	mismatchCtx.BranchRef = "refs/heads/not-the-captured-branch"
+	// Force a conflict path: rewrite the captured event's branch_ref in
+	// the DB so checkEventGeneration's branch-ref mismatch fires when
+	// Replay resolves the live repo branch ref via resolveBranch.
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET branch_ref = ? WHERE seq = (SELECT seq FROM capture_events ORDER BY seq DESC LIMIT 1)`,
+		"refs/heads/not-the-captured-branch"); err != nil {
+		t.Fatalf("rewrite branch_ref: %v", err)
+	}
 
-	_, err := Replay(ctx, f.dir, f.db, mismatchCtx, ReplayOpts{
+	_, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		MessageFn: DeterministicMessage,
 		GitDir:    f.gitDir,
 		Limit:     1,
