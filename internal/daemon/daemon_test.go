@@ -746,7 +746,11 @@ func TestRewindGrace_DoesNotResurrectRewoundWork(t *testing.T) {
 
 	// Pre-set the rewind grace marker to a future time. The daemon Run loop
 	// reads this via daemonPauseState and must skip both capture and replay.
-	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
+	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
+	// our pre-set marker in place; otherwise the clamp normalizes the
+	// timestamp and the test loses track of the value it stamped.
+	until := time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
@@ -2267,7 +2271,11 @@ func TestClearRewindGraceMeta_DeletesPersistedKey(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
 
-	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
+	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
+	// our pre-set marker in place; otherwise the clamp normalizes the
+	// timestamp and the test loses track of the value it stamped.
+	until := time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
@@ -2326,7 +2334,11 @@ func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
 	if err := state.MetaSet(ctx, f.db, MetaKeyDetachedHeadPaused, "1"); err != nil {
 		t.Fatalf("MetaSet detached: %v", err)
 	}
-	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
+	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
+	// our pre-set marker in place; otherwise the clamp normalizes the
+	// timestamp and the test loses track of the value it stamped.
+	until := time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
@@ -2387,7 +2399,11 @@ func TestRun_OperationClearedClearsStaleRewindGrace(t *testing.T) {
 	if err := os.MkdirAll(rebaseDir, 0o755); err != nil {
 		t.Fatalf("mkdir rebase-merge: %v", err)
 	}
-	until := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
+	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
+	// our pre-set marker in place; otherwise the clamp normalizes the
+	// timestamp and the test loses track of the value it stamped.
+	until := time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339)
 	if err := state.MetaSet(ctx, f.db, MetaKeyReplayPausedUntil, until); err != nil {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
@@ -3170,12 +3186,12 @@ func TestRun_GitOperationStatErrorRecovers(t *testing.T) {
 // bounded drain (~hundreds of rows × per-row claim cost) elapses.
 //
 // Setup:
-//  - Enqueue a large burst of flush_requests (1500 rows).
-//  - Run the daemon under ctx == context.Background() so ctx.Err is never
-//    set.
-//  - Push a shutdown signal and assert Run returns within ~1s. Pre-fix
-//    this could take up to ~7.5s on a slow host (DefaultFlushLimit=256
-//    rows × ~30ms per claim cycle).
+//   - Enqueue a large burst of flush_requests (1500 rows).
+//   - Run the daemon under ctx == context.Background() so ctx.Err is never
+//     set.
+//   - Push a shutdown signal and assert Run returns within ~1s. Pre-fix
+//     this could take up to ~7.5s on a slow host (DefaultFlushLimit=256
+//     rows × ~30ms per claim cycle).
 func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
