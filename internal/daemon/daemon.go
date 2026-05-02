@@ -63,6 +63,20 @@ const (
 // (D21). The default is DefaultClientTTL (30 minutes).
 const EnvClientTTLSeconds = "ACD_CLIENT_TTL_SECONDS"
 
+// providerCloseTimeout bounds how long Run waits for the configured AI
+// provider's Closer to return before falling back to force-kill (when the
+// closer exposes Process()) and proceeding with daemon shutdown. The
+// budget is generous enough for an LSP-style flush yet short enough that
+// SIGTERM is observed within the documented ~6s envelope.
+const providerCloseTimeout = 5 * time.Second
+
+// processExposer is implemented by subprocess-backed AI provider closers
+// so Run can force-kill the underlying process when Close hangs past
+// providerCloseTimeout.
+type processExposer interface {
+	Process() *os.Process
+}
+
 // Options configures one Run invocation.
 //
 // Required: RepoPath, GitDir, DB. Everything else has a usable default.
