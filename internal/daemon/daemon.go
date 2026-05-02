@@ -1067,10 +1067,20 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		// 4e. Drain pending flush_requests; each one triggers an immediate
-		// capture+replay cycle. We advance through the queue until empty
-		// (or FlushLimit is exceeded).
+		// capture+replay cycle. The drain is bounded by flushLimit (default
+		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
+		// rest of the Run loop, and the inner loop checks ctx.Err every
+		// iteration so SIGTERM during a large drain still exits within one
+		// claim cycle (~tens of ms).
+		flushLimit := opts.FlushLimit
+		if flushLimit <= 0 {
+			flushLimit = DefaultFlushLimit
+		}
 		flushed := 0
 		for {
+			if err := ctx.Err(); err != nil {
+				break
+			}
 			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
 			if err != nil {
 				logger.Warn("claim flush request", "err", err.Error())
@@ -1086,13 +1096,13 @@ func Run(ctx context.Context, opts Options) error {
 				sql.NullString{String: "flushed", Valid: true}); err != nil {
 				logger.Warn("complete flush", "err", err.Error())
 			}
-			if opts.FlushLimit > 0 && flushed >= opts.FlushLimit {
+			if flushed >= flushLimit {
 				break
 			}
 		}
-		if !operationPaused && processBranchTokenChange("pre-capture branch token") {
-			branchTransitionBlocked = true
-		}
+		// processBranchTokenChange is invoked once per iteration above
+		// (before the flush drain); a second call here was redundant —
+		// HEAD cannot move between the two calls without a wake.
 
 		// 4f. Capture pass.
 		//
