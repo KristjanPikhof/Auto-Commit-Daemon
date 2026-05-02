@@ -2701,6 +2701,24 @@ func gitStatusPorcelain(t *testing.T, ctx context.Context, repoDir string) strin
 	return strings.TrimRight(string(out), "\n")
 }
 
+func seedTrackedFileCommit(t *testing.T, ctx context.Context, f *captureFixture, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte(body), 0o644); err != nil {
+		t.Fatalf("write seed file %s: %v", path, err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+		t.Fatalf("git add seed file %s: %v", path, err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed tracked file"); err != nil {
+		t.Fatalf("git commit seed file %s: %v", path, err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD after seed file: %v", err)
+	}
+	f.cctx.BaseHead = head
+}
+
 // captureEventsTotal returns the total row count of capture_events, regardless
 // of state. Used by the rewind-grace tests to assert capture is paused
 // alongside replay (no new pending/blocked/published rows are synthesized).
