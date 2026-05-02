@@ -1439,17 +1439,6 @@ func gitOperationInProgress(gitDir string) (string, bool) {
 	return "", false
 }
 
-// gitDirEnsureSubdir is a tiny helper to ensure a subdir exists under
-// .git/acd. Used by callers that want to write auxiliary files alongside
-// daemon.lock without re-implementing the mkdir-then-open dance.
-func gitDirEnsureSubdir(gitDir, sub string) (string, error) {
-	dir := filepath.Join(gitDir, stateSubdir, sub)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
 // openCentralStats opens (or creates) the central stats.db at the given
 // absolute path. Wraps central.OpenAt so the daemon package owns the
 // "open + log + skip" policy without re-implementing the bootstrap dance.
