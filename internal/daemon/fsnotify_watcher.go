@@ -279,7 +279,11 @@ func (w *FsnotifyWatcher) preWalk(root string) error {
 		if i := strings.IndexByte(rootRel, '/'); i >= 0 {
 			topComponent = rootRel[:i]
 		}
-		if topComponent == ".git" || topComponent == stateSubdir {
+		// Our state lives at <gitDir>/acd, which is inside .git and is
+		// already covered by the .git prune above. Do NOT match a literal
+		// worktree-rooted "acd/" top component — that path is a legitimate
+		// user directory and pruning it silently drops real files.
+		if topComponent == ".git" {
 			return nil
 		}
 		if _, err := os.Stat(filepath.Join(root, ".git")); err == nil {
