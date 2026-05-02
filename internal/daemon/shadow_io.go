@@ -14,7 +14,10 @@ import (
 // (branch, generation). Sensitive paths must already have been excluded
 // from the table on insert so we do not re-filter here.
 func loadShadow(ctx context.Context, db *state.DB, cctx CaptureContext) (map[string]ShadowEntry, error) {
-	rows, err := db.SQL().QueryContext(ctx,
+	// Read via the multi-connection read pool so a long-running replay
+	// drain holding the serialized writer connection does not block the
+	// per-pass shadow load (which capture relies on for diff classification).
+	rows, err := db.ReadSQL().QueryContext(ctx,
 		`SELECT path, mode, oid FROM shadow_paths
 		   WHERE branch_ref = ? AND branch_generation = ?`,
 		cctx.BranchRef, cctx.BranchGeneration)
