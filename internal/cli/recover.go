@@ -340,29 +340,6 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 		return fmt.Errorf("acd recover: set branch head: %w", err)
 	}
 
-	// Preflight the manual pause marker handling BEFORE committing the
-	// transaction. If --clear-pause was supplied and the marker exists, verify
-	// we can remove it (regular file + writable parent directory). If the
-	// preflight fails, abort BEFORE tx.Commit so the DB stays untouched.
-	// Without --clear-pause, the marker is always preserved and we skip the
-	// removability check entirely.
-	markerExists := false
-	if plan.ManualMarkerPath != "" {
-		if info, err := os.Lstat(plan.ManualMarkerPath); err == nil {
-			markerExists = true
-			if plan.ClearPause {
-				if !info.Mode().IsRegular() {
-					return fmt.Errorf("acd recover: manual pause marker %s is not a regular file", plan.ManualMarkerPath)
-				}
-				if err := checkParentDirWritable(plan.ManualMarkerPath); err != nil {
-					return fmt.Errorf("acd recover: manual pause marker parent not writable: %w", err)
-				}
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd recover: stat manual pause marker %s: %w", plan.ManualMarkerPath, err)
-		}
-	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("acd recover: commit transaction: %w", err)
 	}
