@@ -16,6 +16,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/fsnotify/fsnotify"
 )
 
 // newWatcherForTest spins up a watcher rooted at a fresh tempdir and
@@ -51,6 +52,40 @@ func waitForFsnotifyReady(t *testing.T, db *state.DB, timeout time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("fsnotify watcher was not ready within %v", timeout)
+}
+
+type invalidatingIgnoreChecker struct {
+	invalidates atomic.Int64
+}
+
+func (c *invalidatingIgnoreChecker) Check(context.Context, []string) ([]bool, error) {
+	return nil, nil
+}
+
+func (c *invalidatingIgnoreChecker) Invalidate() {
+	c.invalidates.Add(1)
+}
+
+func TestHandleEventInvalidatesIgnoreCheckerOnGitignoreChange(t *testing.T) {
+	dir := t.TempDir()
+	checker := &invalidatingIgnoreChecker{}
+	w := &FsnotifyWatcher{
+		opts: FsnotifyOptions{
+			RepoPath:      dir,
+			IgnoreChecker: checker,
+		},
+		rewalkCh: make(chan string, 1),
+	}
+
+	w.handleEvent(fsnotify.Event{Name: filepath.Join(dir, ".gitignore"), Op: fsnotify.Write})
+	if got := checker.invalidates.Load(); got != 1 {
+		t.Fatalf("invalidates=%d, want 1", got)
+	}
+
+	w.handleEvent(fsnotify.Event{Name: filepath.Join(dir, "src", "main.go"), Op: fsnotify.Write})
+	if got := checker.invalidates.Load(); got != 1 {
+		t.Fatalf("invalidates after non-ignore file=%d, want 1", got)
+	}
 }
 
 // TestFsnotifyWatcher_HappyPath: enabling the watcher on a real tempdir
