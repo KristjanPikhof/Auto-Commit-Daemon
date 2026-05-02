@@ -89,7 +89,11 @@ func TestDiffBlobs_BoundedOutput(t *testing.T) {
 		// The cap is generous enough to capture at least the diff header
 		// or hunk marker; if not, the prefix is still bounded but flag a
 		// regression-friendly hint.
-		t.Logf("diff prefix did not include header markers (len=%d): %q", len(out), out[:min(len(out), 200)])
+		end := len(out)
+		if end > 200 {
+			end = 200
+		}
+		t.Logf("diff prefix did not include header markers (len=%d): %q", len(out), out[:end])
 	}
 
 	// Within-cap call must succeed end-to-end.
