@@ -36,6 +36,7 @@ acd init shell         # universal direnv / zshrc fallback
 Open your harness. Edit files. Commits land automatically.
 
 ~~~bash
+acd start               # start or refresh the current repo daemon
 acd list                # daemons running across all your repos
                         # columns: REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS
 acd list --watch        # refresh the repo table until Ctrl-C
@@ -53,9 +54,15 @@ acd pause --reason "resetting branch" --yes   # durable manual replay pause
 acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
 acd gc                  # prune stale central-registry entries
-acd stop --repo X       # graceful stop, refcount-aware
+acd stop                # graceful stop for the current repo daemon
+acd stop --session-id X # harness/refcount stop; exits only when no peers remain
 acd stop --all          # stop every daemon
 ~~~
+
+Manual `acd start` / `acd stop` commands default to the current repository.
+Harness integrations should continue passing `--session-id` (and usually
+`--harness`) so ACD can refresh heartbeats and keep shared daemons alive until
+the final harness client exits.
 
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
@@ -139,7 +146,7 @@ pending rows for replay.
 Enable local decision tracing when you need a replay/capture audit trail:
 
 ~~~bash
-ACD_TRACE=1 acd start --repo . --session-id debug --harness shell
+ACD_TRACE=1 acd start
 ACD_TRACE=1 ACD_TRACE_DIR=/tmp/acd-trace acd daemon run --repo .
 ~~~
 
