@@ -17,6 +17,8 @@
 
 ### Changed
 
+- Root `acd --help` is now compact and grouped by workflow.
+- User-facing commands now include more practical help text and examples.
 - `acd stop --session-id <id>` is now documented as the harness/refcount path:
   it deregisters one client and stops the daemon only when no peers remain.
 - Harness templates keep passing explicit `--session-id`; the new no-flag
