@@ -1211,7 +1211,11 @@ func Run(ctx context.Context, opts Options) error {
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
 		}
 
-		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0
+		// repSum.HasMore is true when the bounded replay pass returned with
+		// pending work still visible beyond DefaultReplayLimit. Treat it as
+		// work so the scheduler resets to the base interval and the next
+		// iteration drains the remainder without waiting for the idle ceiling.
+		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0 || repSum.HasMore
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
