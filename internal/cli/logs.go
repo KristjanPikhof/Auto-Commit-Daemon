@@ -88,6 +88,11 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 		if follow {
 			return followLog(ctx, out, logPath, offset, logFollowPollInterval)
 		}
+		return nil
+	}
+
+	if !follow {
+		return nil
 	}
 
 	info, err := os.Stat(logPath)
