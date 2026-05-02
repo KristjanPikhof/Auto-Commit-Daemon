@@ -67,13 +67,18 @@ func TestRotation_TriggersOnSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRotatingWriter: %v", err)
 	}
-	defer w.Close()
 
 	payload := []byte(strings.Repeat("x", 80) + "\n")
 	for i := 0; i < 10; i++ {
 		if _, err := w.Write(payload); err != nil {
 			t.Fatalf("Write %d: %v", i, err)
 		}
+	}
+	// Gzip now runs off-mutex in a background goroutine. Close blocks
+	// until in-flight compressors drain (bounded by gzipCloseWait), so
+	// the .gz archives are fully observable here.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	backups, err := listBackups(path)
 	if err != nil {
