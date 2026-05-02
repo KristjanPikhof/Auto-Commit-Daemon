@@ -918,3 +918,48 @@ func TestCapture_ClassifyIgnoredBatched_RespectsCap(t *testing.T) {
 		t.Fatalf("len(results)=%d, len(paths)=%d — must be 1:1", len(results), len(paths))
 	}
 }
+
+// TestCapture_AcdTopLevelPathNotPruned is the P0 regression for the
+// worktree walker pruning a literal top-level "acd/" directory. The
+// daemon's state subdir lives at <gitDir>/acd, never at <worktree>/acd,
+// so a user repo that contains a real "acd/" directory at its root must
+// be walked and its files captured. The previous walker pruned by name
+// match, silently dropping every file under "acd/" — classify then
+// emitted phantom delete events and replay deleted real user files.
+func TestCapture_AcdTopLevelPathNotPruned(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Create a worktree-rooted "acd/" directory with a real file inside,
+	// plus a nested file deeper in the tree to exercise descent.
+	acdDir := filepath.Join(f.dir, "acd")
+	if err := os.MkdirAll(filepath.Join(acdDir, "nested"), 0o755); err != nil {
+		t.Fatalf("mkdir acd/nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(acdDir, "foo.txt"), []byte("user file 1"), 0o644); err != nil {
+		t.Fatalf("write acd/foo.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(acdDir, "nested", "bar.txt"), []byte("user file 2"), 0o644); err != nil {
+		t.Fatalf("write acd/nested/bar.txt: %v", err)
+	}
+
+	f.firstCapture(t)
+
+	ops := pendingOps(t, f.db)
+	wantPaths := map[string]bool{
+		"acd/foo.txt":        false,
+		"acd/nested/bar.txt": false,
+	}
+	for _, op := range ops {
+		if _, ok := wantPaths[op.Path]; ok {
+			if op.Op != "create" {
+				t.Fatalf("path %q: got op %q, want %q (all=%+v)", op.Path, op.Op, "create", ops)
+			}
+			wantPaths[op.Path] = true
+		}
+	}
+	for p, seen := range wantPaths {
+		if !seen {
+			t.Fatalf("expected create event for %q, not pruned by stale stateSubdir match (all=%+v)", p, ops)
+		}
+	}
+}
