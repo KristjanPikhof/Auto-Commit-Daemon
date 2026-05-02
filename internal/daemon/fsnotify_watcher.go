@@ -37,7 +37,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
