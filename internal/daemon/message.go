@@ -73,6 +73,24 @@ func diffEgressOptIn() bool {
 // always pass two real OIDs to `git diff`.
 const emptyBlobOID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
+// DefaultDiffBlobsTimeout caps the wall-clock time spent on a single
+// `git diff <before> <after>` call inside BuildOpsDiff. A pathological
+// blob (giant binary, repacked alternates) can otherwise stall the
+// commit-message rendering pass long enough to starve replay; 5s is
+// short enough to fall back to header-only without operator-visible
+// latency, long enough that ordinary text diffs always succeed. Tests
+// override via diffBlobsTimeoutOverride.
+const DefaultDiffBlobsTimeout = 5 * time.Second
+
+var diffBlobsTimeoutOverride atomic.Int64 // nanoseconds, 0 = use default
+
+func diffBlobsTimeout() time.Duration {
+	if v := diffBlobsTimeoutOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return DefaultDiffBlobsTimeout
+}
+
 // DeterministicMessage produces a commit subject + optional body from the
 // event + ops alone. Pure forwarder over ai.DeterministicProvider.
 //
