@@ -2924,3 +2924,325 @@ func TestAlreadyPublishedAtHEAD_HEADMovedDuringProbe(t *testing.T) {
 		t.Fatalf("post-move headOID=%q want %q", gotHead, unrelated)
 	}
 }
+
+// TestReplay_MarkEventBlockedErrorPropagated pins the fix for terminal-state
+// write failures in recordConflict. Before: the error was swallowed via
+// `_ = state.MarkEventBlocked(...)` so the row stayed pending and the next
+// replay pass retried the same broken predecessor forever. After: the error
+// surfaces up to the run loop so the scheduler can back off.
+func TestReplay_MarkEventBlockedErrorPropagated(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Stage a real conflict: write the seed file with content unrelated to
+	// what the index would have, then capture, then mutate HEAD so replay's
+	// before-state check fires recordConflict.
+	if err := os.WriteFile(filepath.Join(f.dir, "blocked.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// Stub MarkEventBlocked to fail; assert recordConflict (and thus
+	// Replay) propagates the error rather than silently continuing.
+	origBlocked := markEventBlockedFn
+	t.Cleanup(func() { markEventBlockedFn = origBlocked })
+	markErr := errors.New("stubbed: state store unreachable")
+	markEventBlockedFn = func(ctx context.Context, d *state.DB, seq int64, errMsg string, ts float64,
+		branchRef sql.NullString, gen sql.NullInt64, src sql.NullString) error {
+		return markErr
+	}
+
+	// Force a conflict path. Use checkEventGeneration's branch-ref mismatch
+	// by handing Replay a CaptureContext with a different BranchRef than
+	// the captured event's branch.
+	mismatchCtx := f.cctx
+	mismatchCtx.BranchRef = "refs/heads/not-the-captured-branch"
+
+	_, err := Replay(ctx, f.dir, f.db, mismatchCtx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err == nil {
+		t.Fatal("Replay returned nil error; want propagated MarkEventBlocked failure")
+	}
+	if !errors.Is(err, markErr) {
+		t.Fatalf("Replay err=%v; want wrapped %v", err, markErr)
+	}
+}
+
+// TestReplay_MarkFailedErrorPropagated mirrors the recordConflict test for
+// the markFailed path: a terminal-state write failure must propagate so the
+// run loop does not silently retry a broken event forever.
+func TestReplay_MarkFailedErrorPropagated(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "fail.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// Corrupt the captured ops so validateOps fires markFailed.
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_ops SET path = '' WHERE seq = (SELECT seq FROM capture_events ORDER BY seq DESC LIMIT 1)`); err != nil {
+		t.Fatalf("corrupt op: %v", err)
+	}
+
+	origPublished := markEventPublishedFn
+	t.Cleanup(func() { markEventPublishedFn = origPublished })
+	markErr := errors.New("stubbed: published-state write failed")
+	markEventPublishedFn = func(ctx context.Context, d *state.DB, seq int64, st string,
+		commitOID sql.NullString, errMsg sql.NullString, message sql.NullString, ts float64) error {
+		if st == state.EventStateFailed {
+			return markErr
+		}
+		return state.MarkEventPublished(ctx, d, seq, st, commitOID, errMsg, message, ts)
+	}
+
+	_, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err == nil {
+		t.Fatal("Replay returned nil error; want propagated markFailed failure")
+	}
+	if !errors.Is(err, markErr) {
+		t.Fatalf("Replay err=%v; want wrapped %v", err, markErr)
+	}
+}
+
+// TestReplay_UpdateRefRetryHasJitter samples the jitter function many times
+// and asserts that the resulting sleep distribution falls inside the ±25%
+// envelope around the base backoff and exhibits non-zero variance. Without
+// jitter, co-located daemons retrying CAS contention would collide on every
+// retry; jitter spreads the retries across the wall-clock window.
+func TestReplay_UpdateRefRetryHasJitter(t *testing.T) {
+	const samples = 500
+	base := replayUpdateRefBackoffs[0]
+
+	collected := make([]time.Duration, samples)
+	var sum, sumSq float64
+	for i := 0; i < samples; i++ {
+		d := defaultUpdateRefJitter(base)
+		collected[i] = d
+		minD := time.Duration(float64(base) * 0.75)
+		maxD := time.Duration(float64(base) * 1.25)
+		if d < minD || d >= maxD {
+			t.Fatalf("sample[%d]=%v not in [%v, %v) for base %v", i, d, minD, maxD, base)
+		}
+		sum += float64(d)
+		sumSq += float64(d) * float64(d)
+	}
+	mean := sum / float64(samples)
+	variance := sumSq/float64(samples) - mean*mean
+	if variance <= 0 {
+		t.Fatalf("variance=%v want >0 (samples appear deterministic; jitter is missing)", variance)
+	}
+
+	// Pin the determinism seam: a stubbed rngFloat64 produces predictable
+	// values so the inverse mapping into the [-25%, +25%] window can be
+	// verified without a stats library.
+	origRng := rngFloat64
+	t.Cleanup(func() { rngFloat64 = origRng })
+
+	rngFloat64 = func() float64 { return 0.0 } // -25% boundary
+	if got := defaultUpdateRefJitter(base); got != time.Duration(float64(base)*0.75) {
+		t.Fatalf("rng=0 → jittered=%v want %v", got, time.Duration(float64(base)*0.75))
+	}
+	rngFloat64 = func() float64 { return 0.5 } // mid: no jitter
+	if got := defaultUpdateRefJitter(base); got != base {
+		t.Fatalf("rng=0.5 → jittered=%v want %v", got, base)
+	}
+	rngFloat64 = func() float64 { return 0.999999 } // ~+25% boundary
+	if got := defaultUpdateRefJitter(base); got >= time.Duration(float64(base)*1.25) {
+		t.Fatalf("rng~1 → jittered=%v want <%v", got, time.Duration(float64(base)*1.25))
+	}
+}
+
+// TestReplay_PerEventTimeout pins the per-event 60s budget. A pathological
+// git op (write-tree, commit-tree, update-ref) must NOT stall the entire
+// replay pass; on deadline expiry the event is marked failed and the batch
+// halts with a fresh seed for the next pass. We override the budget to 50ms
+// and inject an update-ref hook that respects ctx.Done so the timeout
+// surfaces as the actual return path the caller sees in production.
+func TestReplay_PerEventTimeout(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "slow.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	// Cap each event at 50ms.
+	replayPerEventTimeoutOverride.Store(int64(50 * time.Millisecond))
+	t.Cleanup(func() { replayPerEventTimeoutOverride.Store(0) })
+
+	restoreReplayRefSeams(t)
+	replayUpdateRef = func(ctx context.Context, repoRoot, ref, newOID, oldOID string) error {
+		// Block until the per-event ctx fires. Production git would also
+		// honor ctx.Done via os/exec.CommandContext.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	replayUpdateRefSleep = func(ctx context.Context, d time.Duration) error {
+		// Cooperate with the ctx so a cancelled per-event ctx exits sleep
+		// promptly rather than serializing the whole backoff list.
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			return nil
+		}
+	}
+
+	start := time.Now()
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Replay returned err=%v; per-event timeout should be handled inside the loop", err)
+	}
+	if sum.Conflicts == 0 && sum.Failed == 0 {
+		t.Fatalf("expected timeout to terminate event as failed/blocked; sum=%+v", sum)
+	}
+	// Generous upper bound: 50ms timeout × 3 retry attempts × 1.25 jitter
+	// + bookkeeping. Anything > 5s indicates the timeout failed to fire.
+	if elapsed > 5*time.Second {
+		t.Fatalf("Replay took %v; per-event timeout did not bound the pass", elapsed)
+	}
+
+	// Pending must NOT remain — the event row should be terminal so the
+	// next pass does not retry it forever.
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d after timeout; want 0 (event must be in a terminal state)", len(pending))
+	}
+}
+
+// TestRun_PauseStateReadFailClosed pins the daemon-side fail-CLOSED behavior
+// for SQLite/state read errors on the pause gate. When daemonPauseState
+// returns a non-nil error (e.g. a transient SQLite read failure on
+// daemon_meta.replay.paused_until), the run loop must treat capture/replay
+// as paused. Otherwise a flaky DB read would let the queue drain while the
+// operator believes replay is suspended.
+func TestRun_PauseStateReadFailClosed(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	// Stub the pause-state seam: every call returns a synthetic error.
+	// Active is left false so the test would FAIL if the run loop fell
+	// back to "no pause" semantics.
+	origFn := daemonPauseStateFn
+	t.Cleanup(func() { daemonPauseStateFn = origFn })
+	daemonPauseStateFn = func(ctx context.Context, gitDir string, db *state.DB) (replayPause, error) {
+		return replayPause{}, errors.New("stubbed: state read failed")
+	}
+
+	startHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	// Edit a file that would normally produce a captured event; force
+	// several wakes so the run loop has clear opportunities to fall through
+	// the gate.
+	if err := os.WriteFile(filepath.Join(f.dir, "fail-closed.txt"), []byte("transient\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	// HEAD must NOT advance: the run loop's pause gate must treat the read
+	// error as "paused", so neither Capture nor Replay run.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse while paused: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced despite pause-state read error: %s; want %s (fail-CLOSED gate broken)",
+			head, startHead)
+	}
+
+	// And capture_events must be empty: capture is paused alongside replay,
+	// matching the symmetric behavior tested in TestRewindGrace_DoesNotResurrectRewoundWork.
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("capture_events=%d want 0 while pause-state read fails (fail-CLOSED)", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
