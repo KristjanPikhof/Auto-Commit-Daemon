@@ -19,10 +19,8 @@ package daemon
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
