@@ -2662,11 +2662,21 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
 
-	// Force a divergence on disk: create a second commit then reset the
-	// worktree pointer back. The branch SHA changes; the next iteration's
-	// token check (whether pre- or post-flush) classifies as Diverged and
-	// bumps the generation. With the post-flush guard in place, the
-	// transition is caught even if it lands during the flush drain.
+	// Force a divergence on disk in two deterministic phases:
+	//
+	//   Phase 1: create a second commit (HEAD -> aheadHead) and wake the
+	//   daemon so its in-memory currentToken advances to rev:<aheadHead>.
+	//   Without this synchronization the boot iteration can race with the
+	//   commit on slow runners (Linux CI under -race + GOMAXPROCS pressure):
+	//   if the boot iteration finishes before the commit lands, the daemon
+	//   never observes aheadHead, and the subsequent reset back to seedHead
+	//   leaves currentToken byte-identical to the live token (both
+	//   rev:<seedHead>) so no transition is classified.
+	//
+	//   Phase 2: reset HEAD back to seedHead and wake. Now currentToken is
+	//   rev:<aheadHead> while the live token resolves to rev:<seedHead>;
+	//   the iteration's branch-token check (pre- or post-flush) classifies
+	//   the move as Diverged and bumps the generation.
 	if err := os.WriteFile(filepath.Join(f.dir, "ahead.txt"), []byte("ahead\n"), 0o644); err != nil {
 		t.Fatalf("write ahead.txt: %v", err)
 	}
@@ -2683,12 +2693,19 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	if aheadHead == seedHead {
 		t.Fatalf("test setup: ahead commit did not advance HEAD")
 	}
+
+	// Phase 1: wake so the daemon classifies the fast-forward and persists
+	// branch.head=aheadHead. We wait on the persisted value rather than a
+	// fixed sleep so this is robust to slow runners.
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, aheadHead, 3*time.Second)
+
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", seedHead); err != nil {
 		t.Fatalf("git reset: %v", err)
 	}
 
-	// One wake; manual scheduler guarantees this is the only iteration
-	// that fires after the divergence is in place.
+	// Phase 2: one wake; manual scheduler guarantees this is the only
+	// iteration that fires after the divergence is in place.
 	wakeCh <- struct{}{}
 
 	// Wait for the generation to bump. The guard catching the transition
