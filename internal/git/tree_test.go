@@ -2,8 +2,10 @@ package git
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -307,6 +309,167 @@ func TestLsFilesIndex_PathFiltering(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("expected no entries, got %+v", none)
+	}
+}
+
+func TestReconcileLiveIndexAppliesSafePathScopedUpdates(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	before, err := HashObjectStdin(ctx, dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	after, err := HashObjectStdin(ctx, dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	fresh, err := HashObjectStdin(ctx, dir, []byte("fresh\n"))
+	if err != nil {
+		t.Fatalf("hash fresh: %v", err)
+	}
+	unrelated, err := HashObjectStdin(ctx, dir, []byte("unrelated\n"))
+	if err != nil {
+		t.Fatalf("hash unrelated: %v", err)
+	}
+
+	if err := UpdateIndexInfo(ctx, dir, "", []string{
+		RegularFileMode + " " + before + "\tmodify.txt",
+		RegularFileMode + " " + before + "\tdelete.txt",
+		RegularFileMode + " " + unrelated + "\tunrelated.txt",
+	}); err != nil {
+		t.Fatalf("seed live index: %v", err)
+	}
+
+	res, err := ReconcileLiveIndex(ctx, dir, []LiveIndexOp{
+		{Path: "create.txt", AfterMode: RegularFileMode, AfterOID: fresh},
+		{Path: "modify.txt", BeforeMode: RegularFileMode, BeforeOID: before, AfterMode: RegularFileMode, AfterOID: after},
+		{Path: "delete.txt", BeforeMode: RegularFileMode, BeforeOID: before, Delete: true},
+	})
+	if err != nil {
+		t.Fatalf("ReconcileLiveIndex: %v", err)
+	}
+	if len(res.Skipped) != 0 {
+		t.Fatalf("unexpected skips: %+v", res.Skipped)
+	}
+	if got := strings.Join(res.Applied, ","); got != "create.txt,modify.txt,delete.txt" {
+		t.Fatalf("applied=%q", got)
+	}
+
+	entries, err := LsFilesStaged(ctx, dir, "create.txt", "modify.txt", "delete.txt", "unrelated.txt")
+	if err != nil {
+		t.Fatalf("LsFilesStaged: %v", err)
+	}
+	index := indexEntriesByPath(entries)
+	assertIndexEntry(t, index, "create.txt", RegularFileMode, fresh)
+	assertIndexEntry(t, index, "modify.txt", RegularFileMode, after)
+	if _, ok := index["delete.txt"]; ok {
+		t.Fatalf("delete.txt still present in live index: %+v", index["delete.txt"])
+	}
+	assertIndexEntry(t, index, "unrelated.txt", RegularFileMode, unrelated)
+}
+
+func TestReconcileLiveIndexSkipsProtectedLiveIndexStates(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	before, err := HashObjectStdin(ctx, dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	other, err := HashObjectStdin(ctx, dir, []byte("other\n"))
+	if err != nil {
+		t.Fatalf("hash other: %v", err)
+	}
+	after, err := HashObjectStdin(ctx, dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	if err := UpdateIndexInfo(ctx, dir, "", []string{
+		RegularFileMode + " " + other + "\tmismatch.txt",
+		RegularFileMode + " " + before + " 1\tconflict.txt",
+		RegularFileMode + " " + other + "\texisting-create.txt",
+	}); err != nil {
+		t.Fatalf("seed live index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "intent.txt"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatalf("write intent: %v", err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "add", "-N", "--", "intent.txt"); err != nil {
+		t.Fatalf("git add -N: %v", err)
+	}
+
+	res, err := ReconcileLiveIndex(ctx, dir, []LiveIndexOp{
+		{Path: "mismatch.txt", BeforeMode: RegularFileMode, BeforeOID: before, AfterMode: RegularFileMode, AfterOID: after},
+		{Path: "conflict.txt", BeforeMode: RegularFileMode, BeforeOID: before, AfterMode: RegularFileMode, AfterOID: after},
+		{Path: "existing-create.txt", AfterMode: RegularFileMode, AfterOID: after},
+		{Path: "intent.txt", BeforeMode: RegularFileMode, BeforeOID: emptyBlobOID, AfterMode: RegularFileMode, AfterOID: after},
+	})
+	if err != nil {
+		t.Fatalf("ReconcileLiveIndex: %v", err)
+	}
+	if len(res.Applied) != 0 {
+		t.Fatalf("applied unsafe paths: %+v", res.Applied)
+	}
+	gotReasons := map[string]string{}
+	for _, skip := range res.Skipped {
+		gotReasons[skip.Path] = skip.Reason
+	}
+	wantReasons := map[string]string{
+		"mismatch.txt":        "mismatched_entry",
+		"conflict.txt":        "unmerged_entry",
+		"existing-create.txt": "unexpected_existing_entry",
+		"intent.txt":          "protected_index_flags",
+	}
+	for path, want := range wantReasons {
+		if gotReasons[path] != want {
+			t.Fatalf("skip reason for %s=%q want %q; all skips=%+v", path, gotReasons[path], want, res.Skipped)
+		}
+	}
+}
+
+func TestReconcileLiveIndexHandlesWhitespacePaths(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	blob, err := HashObjectStdin(ctx, dir, []byte("weird\n"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	path := "dir/weird name\nfile.txt"
+	res, err := ReconcileLiveIndex(ctx, dir, []LiveIndexOp{
+		{Path: path, AfterMode: RegularFileMode, AfterOID: blob},
+	})
+	if err != nil {
+		t.Fatalf("ReconcileLiveIndex: %v", err)
+	}
+	if len(res.Applied) != 1 || res.Applied[0] != path || len(res.Skipped) != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	entries, err := LsFilesStaged(ctx, dir, path)
+	if err != nil {
+		t.Fatalf("LsFilesStaged: %v", err)
+	}
+	index := indexEntriesByPath(entries)
+	assertIndexEntry(t, index, path, RegularFileMode, blob)
+}
+
+func indexEntriesByPath(entries []IndexEntry) map[string]IndexEntry {
+	out := make(map[string]IndexEntry, len(entries))
+	for _, entry := range entries {
+		out[entry.Path] = entry
+	}
+	return out
+}
+
+func assertIndexEntry(t *testing.T, entries map[string]IndexEntry, path, mode, oid string) {
+	t.Helper()
+	entry, ok := entries[path]
+	if !ok {
+		t.Fatalf("missing index entry %q; entries=%+v", path, entries)
+	}
+	if entry.Mode != mode || entry.OID != oid || entry.Stage != 0 {
+		t.Fatalf("index entry %q=%+v want mode=%s oid=%s stage=0", path, entry, mode, oid)
 	}
 }
 
