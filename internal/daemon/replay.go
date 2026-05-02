@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,6 +31,11 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
+
+// v2randFloat64 wraps math/rand/v2.Float64 so the package-level rngFloat64
+// hook can replace it in tests without dragging the rand/v2 import into
+// every file that needs deterministic jitter.
+func v2randFloat64() float64 { return mathrand.Float64() }
 
 // pauseWarnLimiter coalesces repeated "malformed pause marker" / "invalid
 // rewind grace" warnings to one emission per minute per (process, key).
