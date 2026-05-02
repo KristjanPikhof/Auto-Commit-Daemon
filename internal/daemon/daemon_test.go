@@ -1329,6 +1329,78 @@ func (c *closerCounter) Close() error {
 	return nil
 }
 
+// hangingCloser blocks Close indefinitely until release is closed. Used
+// to prove daemon shutdown is bounded by providerCloseTimeout even when
+// the AI provider's Close hangs.
+type hangingCloser struct {
+	released chan struct{}
+	calls    atomic.Int64
+}
+
+func (c *hangingCloser) Close() error {
+	c.calls.Add(1)
+	<-c.released
+	return nil
+}
+
+// TestRun_ShutdownCompletesWithin5sUnderHungProvider proves that a
+// wedged AI provider Close cannot stall daemon shutdown past
+// providerCloseTimeout (5s) plus a small slack budget. Pre-fix,
+// closeProviderOnce called Close synchronously with no deadline, so a
+// subprocess plugin that hangs on Close would wedge the daemon.
+func TestRun_ShutdownCompletesWithin5sUnderHungProvider(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	stub := &stubProvider{subject: "feat: stub-injected subject"}
+	closer := &hangingCloser{released: make(chan struct{})}
+	t.Cleanup(func() { close(closer.released) })
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = Run(ctx, Options{
+			RepoPath:              f.dir,
+			GitDir:                f.gitDir,
+			DB:                    f.db,
+			Scheduler:             fastScheduler(),
+			BootGrace:             30 * time.Second,
+			WakeCh:                wakeCh,
+			ShutdownCh:            shutdownCh,
+			SkipSignals:           true,
+			MessageProvider:       stub,
+			MessageProviderCloser: closer,
+		})
+	}()
+
+	// Give Run a beat to install the closer.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	start := time.Now()
+	select {
+	case <-runDone:
+		elapsed := time.Since(start)
+		// 5s closer budget + slack for run-loop teardown (signals, db,
+		// trace writer, fs watcher). 8s is well under the wedge bound.
+		if elapsed > 8*time.Second {
+			t.Fatalf("Run shutdown took %v with hung provider closer; want <= %v",
+				elapsed, 8*time.Second)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Run did not exit on cancel within 15s — hung provider regressed shutdown bound")
+	}
+
+	if got := closer.calls.Load(); got != 1 {
+		t.Fatalf("hangingCloser.Close calls=%d want 1", got)
+	}
+}
+
 // TestRun_AIProvider_FallbackToDeterministic: when ACD_AI_PROVIDER=
 // openai-compat is set without an API key, the daemon must warn-and-degrade
 // to the deterministic generator so commits keep landing.
