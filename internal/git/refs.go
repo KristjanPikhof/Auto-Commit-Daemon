@@ -13,12 +13,24 @@ var ErrRefNotFound = errors.New("git: ref not found")
 
 // RevParse resolves rev (any acceptable revision spec — HEAD, refs/...,
 // short hash, etc.) to a full SHA. Returns ErrRefNotFound when the rev does
-// not exist; other failures surface as *Error.
+// not exist; other failures (ambiguous ref, wrong-type expansion, etc.)
+// surface as *Error.
+//
+// Disambiguation contract:
+//
+//   - Exit 1 + empty stderr  → ErrRefNotFound (the canonical "no such rev"
+//     case; --quiet was historically how we forced this shape, but git also
+//     emits ambiguity / wrong-type warnings to stderr at exit 1).
+//   - Exit 1 + non-empty stderr → real *Error wrapping the stderr; the
+//     caller can match on the message ("ambiguous", "needed a single
+//     revision", etc.). We deliberately drop --quiet so those messages
+//     reach us.
+//   - Other exit codes → *Error verbatim.
 func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", "--quiet", rev)
+	out, stderr, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
 	if err != nil {
 		var gerr *Error
-		if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 && strings.TrimSpace(string(stderr)) == "" {
 			return "", ErrRefNotFound
 		}
 		return "", err
