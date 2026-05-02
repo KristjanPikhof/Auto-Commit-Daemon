@@ -609,3 +609,61 @@ func writeFileForTest(dir, rel, body string) error {
 	}
 	return os.WriteFile(full, []byte(body), 0o644)
 }
+
+// TestBuildOpsDiff_DiffBlobsTimeoutFallback pins the per-DiffBlobs 5s
+// timeout. When `git diff <before> <after>` would otherwise stall longer
+// than the per-op budget, BuildOpsDiff falls back to header-only for the
+// affected op (so other ops in the same multi-op event still render) and
+// the overall pass returns within the budget rather than aborting.
+//
+// We force the deadline by overriding diffBlobsTimeoutOverride to 1ns; the
+// git subprocess cannot exec inside a sub-microsecond window, so its ctx
+// cancels before stdout is read and DiffBlobsLimited returns
+// context.DeadlineExceeded.
+func TestBuildOpsDiff_DiffBlobsTimeoutFallback(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeOID := hashContent(t, f.dir, "alpha\n")
+	afterOID := hashContent(t, f.dir, "beta\n")
+
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "src/foo.go",
+		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterOID, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	// 1ns budget: deterministically expires before the git subprocess
+	// produces any stdout.
+	diffBlobsTimeoutOverride.Store(1)
+	t.Cleanup(func() { diffBlobsTimeoutOverride.Store(0) })
+
+	start := time.Now()
+	diff, err := BuildOpsDiff(ctx, f.dir, []state.CaptureOp{op})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("BuildOpsDiff returned err=%v; per-op timeout must surface as header-only fallback", err)
+	}
+	// The default 5s budget is the upper bound: anything slower means the
+	// timeout did not fire and we waited on the real git diff.
+	if elapsed > DefaultDiffBlobsTimeout {
+		t.Fatalf("BuildOpsDiff took %v; per-op timeout did not bound the pass (budget %v)",
+			elapsed, DefaultDiffBlobsTimeout)
+	}
+	if !strings.Contains(diff, "diff --git a/src/foo.go b/src/foo.go") {
+		t.Fatalf("header-only fallback missing diff header:\n%s", diff)
+	}
+	// Body lines must NOT be present (deadline tripped before content
+	// landed). A successful DiffBlobs would have rendered `+beta` /
+	// `-alpha`.
+	if strings.Contains(diff, "-alpha") || strings.Contains(diff, "+beta") {
+		t.Fatalf("expected header-only fallback; got body:\n%s", diff)
+	}
+	if strings.Contains(diff, "@@ ") {
+		t.Fatalf("expected header-only fallback; got hunk:\n%s", diff)
+	}
+}
