@@ -21,6 +21,14 @@ type LiveIndexRepairSummary struct {
 }
 
 func RepairPublishedLiveIndex(ctx context.Context, repoRoot string, db *state.DB, head string, limit int) (LiveIndexRepairSummary, error) {
+	return repairPublishedLiveIndex(ctx, repoRoot, db, head, limit, true)
+}
+
+func PlanPublishedLiveIndexRepair(ctx context.Context, repoRoot string, db *state.DB, head string, limit int) (LiveIndexRepairSummary, error) {
+	return repairPublishedLiveIndex(ctx, repoRoot, db, head, limit, false)
+}
+
+func repairPublishedLiveIndex(ctx context.Context, repoRoot string, db *state.DB, head string, limit int, apply bool) (LiveIndexRepairSummary, error) {
 	var sum LiveIndexRepairSummary
 	if repoRoot == "" || db == nil || head == "" {
 		return sum, nil
@@ -54,6 +62,9 @@ func RepairPublishedLiveIndex(ctx context.Context, repoRoot string, db *state.DB
 			continue
 		}
 		sum.Candidates += len(liveOps)
+		if !apply {
+			continue
+		}
 		res, err := git.ReconcileLiveIndex(ctx, repoRoot, liveOps)
 		if err != nil {
 			return sum, err
