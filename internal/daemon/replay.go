@@ -810,6 +810,9 @@ func replayIntentBatch(
 	if len(window) == 0 {
 		return sum, nil
 	}
+	if updated, halted, err := rejectInvalidIntentWindowEvents(ctx, repoRoot, db, activeCtx, opts, parent, window, sum); halted || err != nil {
+		return updated, err
+	}
 	if len(pending) > len(window) {
 		sum.HasMore = true
 	}
@@ -840,7 +843,44 @@ func replayIntentBatch(
 	sort.Slice(selected, func(i, j int) bool {
 		return selected[i].event.Seq < selected[j].event.Seq
 	})
-	return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, cfg, indexFile, selected, plan, parent, parentTree, sum)
+	return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+}
+
+func rejectInvalidIntentWindowEvents(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	parent string,
+	events []state.CaptureEvent,
+	sum ReplaySummary,
+) (ReplaySummary, bool, error) {
+	for _, ev := range events {
+		reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx)
+		if err != nil {
+			return sum, false, err
+		}
+		if reason == "" {
+			continue
+		}
+		errorClass := replayErrorValidation
+		if strings.Contains(reason, "branch ref mismatch") {
+			errorClass = replayErrorRefMissing
+		}
+		if err := recordConflict(ctx, db, ev, replayIssue{
+			ErrorClass: errorClass,
+			Message:    reason,
+			Ref:        activeCtx.BranchRef,
+			Path:       ev.Path,
+		}, activeCtx); err != nil {
+			return sum, true, err
+		}
+		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
+		sum.Conflicts++
+		return sum, true, nil
+	}
+	return sum, false, nil
 }
 
 func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, error) {
@@ -1084,7 +1124,6 @@ func publishIntentSelection(
 	db *state.DB,
 	activeCtx CaptureContext,
 	opts ReplayOpts,
-	cfg intentReplayConfig,
 	indexFile string,
 	selected []intentReplayItem,
 	plan ai.IntentPlan,
@@ -1349,7 +1388,6 @@ func publishIntentSelection(
 		"group":  true,
 		"events": len(selected),
 	})
-	_ = cfg
 	return sum, nil
 }
 
