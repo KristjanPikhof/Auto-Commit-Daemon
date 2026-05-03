@@ -125,7 +125,7 @@ func TestExplainValidationAndHelp(t *testing.T) {
 		t.Fatalf("explain help: %v\nstderr:\n%s", err, errOut.String())
 	}
 	help := out.String()
-	for _, want := range []string{"Explain why ACD", "--path", "--commit", "--last", "--since"} {
+	for _, want := range []string{"Explain recent ACD decisions", "--path", "--commit", "--last", "--since"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("explain help missing %q:\n%s", want, help)
 		}
