@@ -14,10 +14,10 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 	}{
 		{"start", []string{"acd start --repo /path/to/repo", "--session-id", "acd status"}},
 		{"stop", []string{"acd stop --session-id", "acd stop --all --json", "active sessions"}},
-		{"status", []string{"current working directory", "acd list", "acd diagnose"}},
+		{"status", []string{"current working directory", "acd list", "acd explain"}},
 		{"list", []string{"acd list --watch --interval 5s", "--watch", "--interval"}},
 		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
-		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd diagnose"}},
+		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
 		{"diagnose", []string{"state read-only", "acd recover --repo . --auto --dry-run --json"}},
 		{"recover", []string{"acd recover --auto --dry-run", "requires --yes", "--clear-pause"}},
 		{"pause", []string{"acd pause --ttl 1h", "acd resume", "acd status"}},
