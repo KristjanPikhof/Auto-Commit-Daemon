@@ -105,6 +105,12 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, jsonOu
 	if dryRun {
 		return renderFix(out, plan, jsonOut)
 	}
+	if len(plan.Unsafe) > 0 {
+		if err := renderFix(out, plan, jsonOut); err != nil {
+			return err
+		}
+		return fmt.Errorf("acd fix: refusing to mutate state while unsafe conditions remain")
+	}
 	if len(plan.Actions) > 0 {
 		if err := applyFixPlan(ctx, rec.StateDB, &plan); err != nil {
 			return err
@@ -435,6 +441,17 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	defer func() { _ = db.Close() }()
 	if err := refuseRecoverWhenDaemonAlive(ctx, db); err != nil {
 		return err
+	}
+	branchRef, err := git.RunBranchRef(ctx, plan.Repo)
+	if err != nil {
+		return fmt.Errorf("acd fix: recheck HEAD branch: %w", err)
+	}
+	head, err := git.RevParse(ctx, plan.Repo, "HEAD")
+	if err != nil {
+		return fmt.Errorf("acd fix: recheck HEAD: %w", err)
+	}
+	if branchRef != plan.CurrentBranchRef || head != plan.CurrentHead {
+		return fmt.Errorf("acd fix: refusing to mutate state because HEAD changed during planning")
 	}
 
 	tx, err := db.SQL().BeginTx(ctx, nil)
