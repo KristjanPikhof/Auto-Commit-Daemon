@@ -187,7 +187,7 @@ func TestDiagnose_FailedBarrierGuidance(t *testing.T) {
 	if rep.FailedEvents != 1 || rep.FailedBlockingPending != 1 {
 		t.Fatalf("failed fields = events %d blocking %d, want 1/1", rep.FailedEvents, rep.FailedBlockingPending)
 	}
-	if len(rep.RecentBlocked) == 0 || rep.RecentBlocked[0].State != state.EventStatePending && rep.RecentBlocked[0].State != state.EventStateFailed {
+	if len(rep.RecentBlocked) == 0 || rep.RecentBlocked[0].State != state.EventStateFailed {
 		t.Fatalf("recent barriers missing state: %+v", rep.RecentBlocked)
 	}
 	if !containsStringWith(rep.Remediation, "acd fix --dry-run") {
