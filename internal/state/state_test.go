@@ -82,7 +82,7 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
 		"capture_events", "capture_ops", "flush_requests",
-		"publish_state", "daemon_meta", "daily_rollups",
+		"decision_records", "publish_state", "daemon_meta", "daily_rollups",
 	}
 	for _, table := range tables {
 		var name string
