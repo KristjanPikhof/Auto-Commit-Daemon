@@ -1341,7 +1341,7 @@ func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error
 	return tree, nil
 }
 
-func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID string) error {
+func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason string) error {
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	if err := state.MarkEventPublished(ctx, db,
 		ev.Seq, state.EventStatePublished,
@@ -1366,7 +1366,66 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 		slog.Default().Warn("save publish_state after MarkEventPublished",
 			"seq", ev.Seq, "commit", commitOID, "err", err.Error())
 	}
+	if decisionKind != "" {
+		recordReplayDecision(ctx, db, ev, cctx, nowSec, decisionKind, decisionReason, commitOID)
+	}
 	return nil
+}
+
+func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, ts float64, kind, reason, commitOID string) {
+	action := "published"
+	switch kind {
+	case state.DecisionKindHandledExternal:
+		action = "handled externally"
+	case state.DecisionKindSupersededExternal:
+		action = "superseded externally"
+	case state.DecisionKindCommitted:
+		action = "committed"
+	}
+	message := replayDecisionMessage(kind, ev.Path, commitOID)
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:       ts,
+		Kind:             kind,
+		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: ev.Seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		CommitOID:        sql.NullString{String: commitOID, Valid: commitOID != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: true},
+		UserMessage:      sql.NullString{String: message, Valid: message != ""},
+	}); err != nil {
+		slog.Default().Warn("append replay decision",
+			"seq", ev.Seq, "kind", kind, "commit", commitOID, "err", err.Error())
+	}
+}
+
+func replayDecisionMessage(kind, path, commitOID string) string {
+	shortCommit := commitOID
+	if len(shortCommit) > 12 {
+		shortCommit = shortCommit[:12]
+	}
+	switch kind {
+	case state.DecisionKindHandledExternal:
+		if path != "" {
+			return fmt.Sprintf("External commit already contains %s.", path)
+		}
+		return "External commit already contains this change."
+	case state.DecisionKindSupersededExternal:
+		if path != "" {
+			return fmt.Sprintf("External history superseded queued change for %s.", path)
+		}
+		return "External history superseded this queued change."
+	case state.DecisionKindCommitted:
+		if path != "" && shortCommit != "" {
+			return fmt.Sprintf("Committed %s as %s.", path, shortCommit)
+		}
+		if shortCommit != "" {
+			return fmt.Sprintf("Committed queued change as %s.", shortCommit)
+		}
+	}
+	return ""
 }
 
 // state-mutation seams for tests. Production wires straight through to the
