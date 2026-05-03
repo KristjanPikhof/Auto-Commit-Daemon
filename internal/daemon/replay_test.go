@@ -3233,6 +3233,39 @@ func restoreReplayRefSeams(t *testing.T) {
 	})
 }
 
+type recordingIntentPlanner struct {
+	name     string
+	plan     ai.IntentPlan
+	plans    []ai.IntentPlan
+	err      error
+	calls    int
+	requests []ai.IntentPlanRequest
+}
+
+func (p *recordingIntentPlanner) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "recording-intent-planner"
+}
+
+func (p *recordingIntentPlanner) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return ai.IntentPlan{}, err
+	}
+	p.calls++
+	p.requests = append(p.requests, req)
+	if p.err != nil {
+		return ai.IntentPlan{}, p.err
+	}
+	if len(p.plans) > 0 {
+		plan := p.plans[0]
+		p.plans = p.plans[1:]
+		return plan, nil
+	}
+	return p.plan, nil
+}
+
 type memoryTraceLogger struct {
 	mu     sync.Mutex
 	events []acdtrace.Event
