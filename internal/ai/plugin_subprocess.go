@@ -368,15 +368,17 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 // names so the JSON shape matches the contract regardless of struct
 // renames.
 type subprocessRequest struct {
-	Version  int            `json:"version"`
-	Path     string         `json:"path,omitempty"`
-	Op       string         `json:"op,omitempty"`
-	OldPath  string         `json:"old_path,omitempty"`
-	Diff     string         `json:"diff,omitempty"`
-	RepoRoot string         `json:"repo_root,omitempty"`
-	Branch   string         `json:"branch,omitempty"`
-	MultiOp  []subprocessOp `json:"multi_op,omitempty"`
-	Now      string         `json:"now,omitempty"`
+	Version        int                `json:"version"`
+	RequestType    string             `json:"request_type,omitempty"`
+	Path           string             `json:"path,omitempty"`
+	Op             string             `json:"op,omitempty"`
+	OldPath        string             `json:"old_path,omitempty"`
+	Diff           string             `json:"diff,omitempty"`
+	RepoRoot       string             `json:"repo_root,omitempty"`
+	Branch         string             `json:"branch,omitempty"`
+	MultiOp        []subprocessOp     `json:"multi_op,omitempty"`
+	Now            string             `json:"now,omitempty"`
+	PlannerRequest *IntentPlanRequest `json:"planner_request,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire
@@ -389,10 +391,14 @@ type subprocessOp struct {
 
 // subprocessResponse is the JSONL response envelope.
 type subprocessResponse struct {
-	Version int    `json:"version"`
-	Subject string `json:"subject"`
-	Body    string `json:"body"`
-	Error   string `json:"error"`
+	Version         int              `json:"version"`
+	Subject         string           `json:"subject"`
+	Body            string           `json:"body"`
+	Error           string           `json:"error"`
+	SelectedSeqs    []int64          `json:"selected_seqs,omitempty"`
+	DeferredSeqs    []int64          `json:"deferred_seqs,omitempty"`
+	GroupingReason  string           `json:"grouping_reason,omitempty"`
+	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner
