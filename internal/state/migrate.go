@@ -2,8 +2,41 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
+
+const decisionRecordsV6MigrationDDL = `
+DROP TABLE IF EXISTS decision_records_v6;
+
+CREATE TABLE decision_records_v6(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          REAL NOT NULL,
+    kind                TEXT NOT NULL,
+    path                TEXT,
+    reason              TEXT,
+    event_seq           INTEGER,
+    head_sha            TEXT,
+    commit_oid          TEXT,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    action_taken        TEXT,
+    user_message        TEXT
+);
+
+INSERT OR IGNORE INTO decision_records_v6(
+    id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+    branch_ref, branch_generation, action_taken, user_message
+)
+SELECT
+    id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+    branch_ref, branch_generation, action_taken, user_message
+FROM decision_records;
+
+DROP TABLE decision_records;
+
+ALTER TABLE decision_records_v6 RENAME TO decision_records;
+`
 
 // Migrate brings the database forward from whatever PRAGMA user_version it
 // currently reports up to SchemaVersion.
@@ -23,11 +56,11 @@ import (
 // Open's runBootstrap re-applies the idempotent schemaDDL whenever the
 // stored user_version is below SchemaVersion, so simply bumping SchemaVersion
 // and adding idempotent statements to schemaDDL is sufficient for pure-DDL
-// migrations (such as v2→v3). v6 also uses schemaDDL's transactional table
-// rebuild to migrate already-v5 decision_records rows before stamping the new
-// version. v7 is a pure DDL migration through schemaDDL. Migrate is wired now
-// so future phases requiring separate data
-// backfill have a single entry point to extend.
+// migrations (such as v2→v3). v6 uses an explicit table rebuild for only
+// pre-v6 databases whose decision_records table still has the old event_seq
+// foreign key. v7 is a pure DDL migration through schemaDDL. Migrate is wired
+// now so future phases requiring separate data backfill have a single entry
+// point to extend.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
 	if err != nil {
@@ -42,4 +75,42 @@ func (d *DB) Migrate(ctx context.Context) error {
 	// Open applies the idempotent schemaDDL for older databases before it stamps
 	// SchemaVersion, so no explicit post-open migration step exists yet.
 	return nil
+}
+
+func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
+	if cur < 6 {
+		rebuilt, err := migrateDecisionRecordsV6(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if rebuilt {
+			if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
+				return fmt.Errorf("state: reapply schema after v6 decision_records migration: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func migrateDecisionRecordsV6(ctx context.Context, tx *sql.Tx) (bool, error) {
+	hasFK, err := decisionRecordsHasForeignKeys(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if !hasFK {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, decisionRecordsV6MigrationDDL); err != nil {
+		return false, fmt.Errorf("state: migrate decision_records v6: %w", err)
+	}
+	return true, nil
+}
+
+func decisionRecordsHasForeignKeys(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_foreign_key_list('decision_records')`).Scan(&n); err != nil {
+		return false, fmt.Errorf("state: inspect decision_records foreign keys: %w", err)
+	}
+	return n > 0, nil
 }
