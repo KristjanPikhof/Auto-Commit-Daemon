@@ -147,18 +147,6 @@ export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
 
-~~~bash
-# Strict-message builds for teams with commit-message validators.
-export ACD_COMMIT_STRATEGY=intent
-export ACD_COMMIT_MESSAGE_STRICT=1
-export ACD_AI_REPAIR_ATTEMPTS=2
-~~~
-
-Set `ACD_COMMIT_MESSAGE_STRICT` and `ACD_AI_REPAIR_ATTEMPTS` only with a build
-that includes strict message validation. For this intent strategy, ACD's
-grouping safety and planner validation still run before any strict-message
-repair layer.
-
 Troubleshooting:
 
 - `acd status` and `acd diagnose --json` show active strategy, deferred count,
@@ -184,7 +172,7 @@ Subprocess plugins are external binaries on `$PATH` named `acd-provider-<name>`.
 
 One JSON object per line in both directions (JSONL). The `version` field exists for future negotiation without breaking older plugins.
 
-**Request (daemon → plugin, one line per commit event):**
+**Commit-message request (daemon → plugin, one line per commit event):**
 
 ```json
 {
@@ -206,7 +194,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 `multi_op` is present when one daemon event covers more than one file.  
 `diff` is empty unless **both** the selected provider declares `NeedsDiff=true` and the operator has set `ACD_AI_DIFF_EGRESS=1`. When both signals are set, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
 
-**Response (plugin → daemon, one line per request):**
+**Commit-message response (plugin → daemon, one line per request):**
 
 ```json
 {
@@ -218,6 +206,51 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 ```
 
 `subject` must be non-empty for a successful response. `body` may be empty. Set `error` to a non-empty string to signal a soft error (see lifecycle below).
+
+**Intent-planner request (daemon → plugin, one line per planning window):**
+
+When `ACD_COMMIT_STRATEGY=intent` is active, the same subprocess can also
+receive planning requests. The envelope has `request_type: "intent_plan"` and a
+`planner_request` payload. The payload includes the offered captures, recent
+commit context, branch/repo metadata, and whether the window is forced aging.
+
+```json
+{
+  "version": 1,
+  "request_type": "intent_plan",
+  "planner_request": {
+    "repo_root": "/abs/path/to/repo",
+    "branch": "refs/heads/main",
+    "forced_aging": false,
+    "offered_captures": [
+      {"seq": 101, "path": "src/auth.go", "op": "modify"}
+    ],
+    "recent_commits": [
+      {"oid": "abc123", "subject": "Update auth flow"}
+    ]
+  }
+}
+```
+
+**Intent-planner response (plugin → daemon):**
+
+```json
+{
+  "version": 1,
+  "selected_seqs": [101],
+  "deferred_seqs": [],
+  "subject": "Update auth flow",
+  "body": "",
+  "grouping_reason": "single focused auth change",
+  "deferred_reasons": [],
+  "error": ""
+}
+```
+
+Every offered seq must appear in either `selected_seqs` or `deferred_seqs`.
+`selected_seqs` must be non-empty. Add one `{ "seq": <id>, "reason": "..." }`
+entry to `deferred_reasons` for every deferred seq. Invalid responses are
+recorded as planner errors and fall back to safe one-capture planning.
 
 ### Lifecycle
 
@@ -261,6 +294,24 @@ import json, sys, os
 
 for line in sys.stdin:
     req = json.loads(line)
+    if req.get("request_type") == "intent_plan":
+        offered = req["planner_request"]["offered_captures"]
+        first = offered[0]
+        sys.stdout.write(json.dumps({
+            "version": 1,
+            "selected_seqs": [first["seq"]],
+            "deferred_seqs": [c["seq"] for c in offered[1:]],
+            "subject": f"{first['op']} {os.path.basename(first['path'])}",
+            "body": "",
+            "grouping_reason": "choose the first focused capture",
+            "deferred_reasons": [
+                {"seq": c["seq"], "reason": "separate follow-up capture"}
+                for c in offered[1:]
+            ],
+            "error": "",
+        }) + "\n")
+        sys.stdout.flush()
+        continue
     path = req.get("path", "")
     op   = req.get("op", "modify")
     subject = f"{op} {os.path.basename(path)}"
