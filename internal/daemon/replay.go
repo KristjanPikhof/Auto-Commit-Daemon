@@ -1180,22 +1180,6 @@ func normalizeIntentDependencyPath(path string) string {
 	return path
 }
 
-func pathsOverlap(a, b []string) bool {
-	if len(a) == 0 || len(b) == 0 {
-		return false
-	}
-	seen := make(map[string]struct{}, len(a))
-	for _, path := range a {
-		seen[path] = struct{}{}
-	}
-	for _, path := range b {
-		if _, ok := seen[path]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan, items []intentReplayItem, cctx CaptureContext, ts float64) error {
 	reasons := make(map[int64]string, len(plan.DeferredReasons))
 	for _, item := range plan.DeferredReasons {
