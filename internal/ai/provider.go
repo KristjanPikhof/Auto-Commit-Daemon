@@ -12,7 +12,10 @@
 // open-code the "try AI then deterministic" pattern.
 package ai
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Provider abstracts commit-message generation. Implementations must be
 // concurrency-safe; the run loop may invoke Generate from multiple
@@ -102,4 +105,34 @@ func (c *composed) Generate(ctx context.Context, cc CommitContext) (Result, erro
 		r.Source = c.fallback.Name()
 	}
 	return r, nil
+}
+
+// PlanIntent tries the primary planner and falls back to the secondary planner
+// on provider errors or invalid/empty plans. This mirrors Generate's fallback
+// contract for commit-message generation.
+func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return IntentPlan{}, err
+	}
+	if primary, ok := c.primary.(IntentPlanner); ok {
+		plan, err := primary.PlanIntent(ctx, req)
+		if err == nil && len(plan.SelectedSeqs) > 0 {
+			if plan.Source == "" {
+				plan.Source = c.primary.Name()
+			}
+			return plan, nil
+		}
+	}
+	fallback, ok := c.fallback.(IntentPlanner)
+	if !ok {
+		return IntentPlan{}, errors.New("ai: composed fallback does not implement intent planning")
+	}
+	plan, err := fallback.PlanIntent(ctx, req)
+	if err != nil {
+		return IntentPlan{}, err
+	}
+	if plan.Source == "" {
+		plan.Source = c.fallback.Name()
+	}
+	return plan, nil
 }
