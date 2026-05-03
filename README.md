@@ -41,7 +41,14 @@ acd list                # daemons running across all your repos
                         # columns: REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS
 acd list --watch        # refresh the repo table until Ctrl-C
 acd list --watch --interval 5s
-acd status              # current repo's daemon (shows pending_events + blocked_conflicts)
+acd status              # current repo daemon, queue, pause, and recent decisions
+acd status --watch      # refresh the same repo until Ctrl-C
+acd events              # show the durable product decision ledger
+acd events --watch      # stream appended decisions until Ctrl-C
+acd explain --path FILE # explain why a path was captured, skipped, or blocked
+acd explain --commit HEAD # explain decisions linked to a commit
+acd fix --dry-run       # plan safe remediation for a stuck repo
+acd fix --yes           # apply the safe plan after reading it
 acd logs                # tail the current repo daemon log as raw JSONL
 acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
@@ -78,9 +85,13 @@ client and stops the shared daemon only after the final harness client exits.
 If commits stop appearing, see [docs/capture-replay.md](docs/capture-replay.md)
 for a step-by-step troubleshooting checklist.
 
-`acd logs` reads the daemon's per-repo JSONL log directly. It does not pretty
-print, summarize, or sanitize the stream; use `acd doctor` when you want the
-bundled diagnostics view with tail snippets and safe metadata for reports.
+For daily "what happened?" questions, start with
+[docs/user-workflows.md](docs/user-workflows.md). The usual loop is
+`acd status`, `acd events`, and `acd explain --path FILE`; use
+`acd fix --dry-run` before applying any safe remediation. `acd logs` reads the
+daemon's per-repo JSONL log directly. It does not pretty print, summarize, or
+sanitize the stream; use `acd doctor --bundle` when you want bundled
+diagnostics with tail snippets and safe metadata for reports.
 
 See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
 for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
@@ -94,9 +105,29 @@ lands a commit before `acd`'s replay tick, the daemon detects the match and
 settles the queued event as `published` with no duplicate commit. Real content
 mismatches still produce `blocked_conflict`.
 
-## Trace and recovery
+## Workflows and recovery
 
-Use `acd diagnose` first when replay stalls:
+Use the daily workflow commands first:
+
+~~~bash
+acd status
+acd events --watch
+acd explain --path path/to/file
+acd explain --commit HEAD
+acd fix --dry-run
+~~~
+
+`status` shows daemon health, queue counts, pause state, and recent decision
+counts. `events` streams the durable decision ledger. `explain` answers why ACD
+captured, skipped, committed, treated work as externally handled, or blocked a
+path or commit. `fix --dry-run` plans conservative cleanup for common stuck
+states; apply only after reading the plan:
+
+~~~bash
+acd fix --yes
+~~~
+
+Use `acd diagnose` when replay stalls or `fix` needs more context:
 
 ~~~bash
 acd diagnose --repo .
@@ -141,18 +172,18 @@ acd wake --repo . --session-id "$ACD_SESSION_ID"
 `acd status` and `acd list` show the pause source and remaining TTL when one is
 active.
 
-If a parallel committer already landed the captured edits, do not requeue those
-rows with `recover`: they will usually hit the same before-state mismatch. Use
-`purge-events` to delete the terminal barrier and, when that tail is obsolete,
-the pending rows behind it:
+If a parallel committer already landed the captured edits, first check the
+decision ledger:
 
 ~~~bash
-acd purge-events --repo . --blocked --pending --dry-run
-acd purge-events --repo . --blocked --pending --yes
+acd events --path path/to/file
+acd explain --commit HEAD
+acd fix --dry-run
 ~~~
 
-Use `--blocked` alone when you only want to lift the barrier and keep later
-pending rows for replay.
+You should usually see `handled_external` or `superseded_external`. Use
+`purge-events` only as an advanced fallback when `diagnose` or `fix` points at
+obsolete terminal barriers that must be deleted.
 
 Enable local decision tracing when you need a replay/capture audit trail:
 
@@ -189,6 +220,7 @@ watcher work. Use `acd doctor` to inspect the active safe-ignore pattern list.
 ## Docs
 
 - [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, `blocked_conflict`, branch-generation safety, revert workflows, AI diff from captured blobs, operator troubleshooting, pause JSON shapes, trace event classes
+- [docs/user-workflows.md](docs/user-workflows.md) — daily user workflows for status, events, explain, fix, skipped files, external commits, branch resets, conflicts, and support bundles
 - [docs/multi-tool.md](docs/multi-tool.md) — running `acd` alongside Claude Code auto-commit, Codex ACD hook, or any parallel committer
 - [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
