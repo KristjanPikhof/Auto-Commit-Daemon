@@ -220,6 +220,46 @@ func TestCapture_SensitiveDefaultDeny(t *testing.T) {
 	}
 }
 
+func TestCapture_TrackedEnvExampleIsNotPhantomDelete(t *testing.T) {
+	t.Setenv(state.EnvSensitiveGlobs, "") // explicit empty -> defaults
+	f := newCaptureFixture(t)
+	f.matcher = state.NewSensitiveMatcher()
+	ctx := context.Background()
+
+	envPath := filepath.Join(f.dir, "apps", "server", ".env.example")
+	if err := os.MkdirAll(filepath.Dir(envPath), 0o755); err != nil {
+		t.Fatalf("mkdir env dir: %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte("API_URL=http://localhost:3000\n"), 0o644); err != nil {
+		t.Fatalf("write env example: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "apps/server/.env.example"); err != nil {
+		t.Fatalf("git add env example: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "add env example"); err != nil {
+		t.Fatalf("git commit env example: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+
+	if ops := pendingOps(t, f.db); len(ops) != 0 {
+		t.Fatalf("tracked .env.example should not be captured as a change, got %+v", ops)
+	}
+}
+
 func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
 	t.Setenv(state.EnvSafeIgnore, "")
 	t.Setenv(state.EnvSafeIgnoreExtra, "")

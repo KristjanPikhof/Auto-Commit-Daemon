@@ -41,6 +41,8 @@ func TestSensitiveDefaultsBlockSecrets(t *testing.T) {
 		{"credentials_backup", true},
 
 		// Negative cases — make sure normal source files pass through.
+		{".env.example", false},
+		{"apps/server/.env.example", false},
 		{"src/main.go", false},
 		{"README.md", false},
 		{"docs/architecture.md", false},
@@ -88,6 +90,14 @@ func TestSensitiveExplicitOverrideReplacesDefaults(t *testing.T) {
 	}
 	if !IsSensitivePath("leaked.txt") {
 		t.Fatalf("override pattern **/leaked.txt should also match root-level leaked.txt (gitignore semantics)")
+	}
+}
+
+func TestSensitiveExplicitOverrideCanDenyEnvExample(t *testing.T) {
+	t.Setenv(EnvSensitiveGlobs, ".env.*")
+
+	if !IsSensitivePath(".env.example") {
+		t.Fatalf("explicit override .env.* should be allowed to deny .env.example")
 	}
 }
 

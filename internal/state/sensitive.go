@@ -62,6 +62,19 @@ var DefaultSensitiveGlobs = []string{
 	"**/credentials*",
 }
 
+// DefaultSensitiveAllowGlobs are conventional template files that would
+// otherwise be caught by the broad .env.* deny rule. Keep this list narrow:
+// real .env.local / .env.production files must remain default-denied.
+var DefaultSensitiveAllowGlobs = []string{
+	".env.example",
+	"**/.env.example",
+}
+
+type sensitiveGlobConfig struct {
+	deny  []string
+	allow []string
+}
+
 // expandGlobs pairs every "**/X" pattern with its bare "X" form so root-level
 // matches are caught. Mirrors snapshot_state._expand_globs verbatim. Go's
 // path.Match (and filepath.Match) does not understand "**" the way gitignore
@@ -88,6 +101,24 @@ func expandGlobs(patterns []string) []string {
 	return out
 }
 
+func sensitiveGlobConfigFromEnv() sensitiveGlobConfig {
+	override := os.Getenv(EnvSensitiveGlobs)
+	if strings.TrimSpace(override) == "" {
+		return sensitiveGlobConfig{
+			deny:  expandGlobs(DefaultSensitiveGlobs),
+			allow: expandGlobs(DefaultSensitiveAllowGlobs),
+		}
+	}
+	parsed := splitAndTrim(override)
+	if len(parsed) == 0 {
+		return sensitiveGlobConfig{
+			deny:  expandGlobs(DefaultSensitiveGlobs),
+			allow: expandGlobs(DefaultSensitiveAllowGlobs),
+		}
+	}
+	return sensitiveGlobConfig{deny: expandGlobs(parsed)}
+}
+
 // SensitivePatterns returns the active sensitive-path glob list, applying the
 // EnvSensitiveGlobs override semantics described above.
 //
@@ -97,15 +128,7 @@ func expandGlobs(patterns []string) []string {
 // from NewSensitiveMatcher) so the hot capture path does not pay the env-read
 // or expansion cost on every file.
 func SensitivePatterns() []string {
-	override := os.Getenv(EnvSensitiveGlobs)
-	if strings.TrimSpace(override) == "" {
-		return expandGlobs(DefaultSensitiveGlobs)
-	}
-	parsed := splitAndTrim(override)
-	if len(parsed) == 0 {
-		return expandGlobs(DefaultSensitiveGlobs)
-	}
-	return expandGlobs(parsed)
+	return sensitiveGlobConfigFromEnv().deny
 }
 
 func splitAndTrim(s string) []string {
@@ -129,7 +152,13 @@ func splitAndTrim(s string) []string {
 // the OS separator and would mismatch Windows-style "\" on darwin/linux.
 func IsSensitivePath(rel string) bool {
 	rel = filepath.ToSlash(rel)
-	for _, pattern := range SensitivePatterns() {
+	cfg := sensitiveGlobConfigFromEnv()
+	for _, pattern := range cfg.allow {
+		if matchGlob(pattern, rel) {
+			return false
+		}
+	}
+	for _, pattern := range cfg.deny {
 		if matchGlob(pattern, rel) {
 			return true
 		}
@@ -142,16 +171,23 @@ func IsSensitivePath(rel string) bool {
 // env-var manipulation.
 type SensitiveMatcher struct {
 	patterns []string
+	allow    []string
 }
 
 // NewSensitiveMatcher snapshots SensitivePatterns() once.
 func NewSensitiveMatcher() *SensitiveMatcher {
-	return &SensitiveMatcher{patterns: SensitivePatterns()}
+	cfg := sensitiveGlobConfigFromEnv()
+	return &SensitiveMatcher{patterns: cfg.deny, allow: cfg.allow}
 }
 
 // Match reports whether rel matches any pattern in the snapshot.
 func (m *SensitiveMatcher) Match(rel string) bool {
 	rel = filepath.ToSlash(rel)
+	for _, pattern := range m.allow {
+		if matchGlob(pattern, rel) {
+			return false
+		}
+	}
 	for _, pattern := range m.patterns {
 		if matchGlob(pattern, rel) {
 			return true
