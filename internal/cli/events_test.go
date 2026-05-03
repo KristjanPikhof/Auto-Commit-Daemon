@@ -35,7 +35,6 @@ func TestEventsJSONFiltersAndCursor(t *testing.T) {
 		DecisionTS:  11,
 		Kind:        state.DecisionKindCaptured,
 		Path:        sqlNullStr("src/app.go"),
-		EventSeq:    sql.NullInt64{Int64: 7, Valid: true},
 		ActionTaken: sqlNullStr("queued"),
 	})
 	if err != nil {
@@ -174,7 +173,7 @@ func TestEventsErrorsAndCommandHelp(t *testing.T) {
 		t.Fatalf("events help: %v\nstderr:\n%s", err, helpErr.String())
 	}
 	help := helpOut.String()
-	for _, want := range []string{"Show product decisions", "--watch", "--path", "--since", "--limit"} {
+	for _, want := range []string{"Show product-facing ACD decisions", "--watch", "--path", "--since", "--limit"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("events help missing %q:\n%s", want, help)
 		}
