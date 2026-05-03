@@ -93,7 +93,8 @@ acd fix --yes
 ~~~
 
 Use `recover` or `purge-events` only as advanced fallbacks when `diagnose` or
-`fix --dry-run` points at stale branch anchors or obsolete terminal barriers:
+`fix --dry-run` points at stale branch anchors, obsolete terminal barriers, or
+failed terminal barriers that are blocking later pending replay:
 
 ~~~bash
 acd recover --repo . --auto --dry-run
@@ -121,12 +122,16 @@ acd init codex   # wake hook only — no separate commit hook
 
 Run both hooks simultaneously. The idempotent publish probe absorbs the
 parallel committer's commits silently. Watch `acd status` to confirm
-`blocked_conflicts` stays at `0`, or stream the decision ledger:
+`blocked_conflicts` stays at `0` and no failed terminal barrier is blocking
+pending replay, or stream the decision ledger:
 
 ~~~bash
 acd events --watch
 acd explain --commit HEAD
 ~~~
+
+`acd events --watch` starts at the current ledger tail when `--since` is
+omitted, so it prints only decisions appended after watch starts.
 
 Enable trace logging only when you need internal replay decisions:
 
