@@ -822,18 +822,29 @@ func replayIntentBatch(
 	if err != nil {
 		return sum, err
 	}
+	traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
 	nowSec := float64(time.Now().UnixNano()) / 1e9
+	if forced {
+		if err := recordIntentForcedDecision(ctx, db, items, activeCtx, nowSec, cfg.deferLimit); err != nil {
+			return sum, err
+		}
+		traceIntentForcedAging(opts.Trace, repoRoot, activeCtx, items, cfg.deferLimit)
+	}
 	for _, item := range items {
 		if err := state.RecordPlannerOffer(ctx, db, item.event.Seq, nowSec); err != nil {
 			return sum, err
 		}
 	}
 
-	plan, err := planIntentWithFallback(ctx, db, cfg.planner, req, items, nowSec)
+	plan, validationFailure, err := planIntentWithFallback(ctx, db, cfg.planner, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
-	if err := recordIntentDeferrals(ctx, db, plan, nowSec); err != nil {
+	if validationFailure != "" {
+		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
+	}
+	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if err := recordIntentDeferrals(ctx, db, plan, items, activeCtx, nowSec); err != nil {
 		return sum, err
 	}
 
