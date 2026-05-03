@@ -450,6 +450,19 @@ func waitForDecision(t *testing.T, dbPath, path, kind, reason string, timeout ti
 	})
 }
 
+func eventStateBecomes(dbPath, path, want string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	query := fmt.Sprintf("SELECT state FROM capture_events WHERE path = %s ORDER BY seq DESC LIMIT 1", sqliteQuote(path))
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("sqlite3", dbPath, query).CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) == want {
+			return true
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return false
+}
+
 func fileSHA256(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
