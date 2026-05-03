@@ -15,6 +15,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"start", []string{"acd start --repo /path/to/repo", "--session-id", "acd status"}},
 		{"stop", []string{"acd stop --session-id", "acd stop --all --json", "active sessions"}},
 		{"status", []string{"current working directory", "acd list", "acd explain"}},
+		{"fix", []string{"acd fix --dry-run", "requires --yes", "safe remediation"}},
 		{"list", []string{"acd list --watch --interval 5s", "--watch", "--interval"}},
 		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
 		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
