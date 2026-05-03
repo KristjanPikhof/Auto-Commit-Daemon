@@ -2923,6 +2923,30 @@ func commitSingleFileTree(t *testing.T, ctx context.Context, repoDir, path, blob
 	return commit
 }
 
+func assertReplayDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64, kind, reason string) {
+	t.Helper()
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind != kind {
+			continue
+		}
+		if reason != "" && (!decision.Reason.Valid || decision.Reason.String != reason) {
+			continue
+		}
+		if !decision.Path.Valid || decision.Path.String == "" {
+			t.Fatalf("decision for seq %d missing path: %+v", seq, decision)
+		}
+		if !decision.CommitOID.Valid || decision.CommitOID.String == "" {
+			t.Fatalf("decision for seq %d missing commit oid: %+v", seq, decision)
+		}
+		return
+	}
+	t.Fatalf("missing replay decision kind=%q reason=%q for seq %d: %+v", kind, reason, seq, decisions)
+}
+
 func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
 	t.Helper()
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "rev-list", "--count", rev)
