@@ -338,20 +338,32 @@ func OldestOverduePlannerEvent(ctx context.Context, d *DB, branchRef string, bra
 		deferLimit = 0
 	}
 	const q = `
+WITH barrier AS (
+    SELECT MIN(seq) AS first_seq
+    FROM capture_events
+    WHERE branch_ref = ?
+      AND branch_generation = ?
+      AND state IN (?, ?)
+)
 SELECT e.seq, e.branch_ref, e.branch_generation, e.base_head, e.operation, e.path, e.old_path,
        e.fidelity, e.captured_ts, e.published_ts, e.state, e.commit_oid, e.error, e.message,
        ps.event_seq, ps.defer_count, ps.last_planned_ts, ps.last_defer_reason, ps.last_plan_error
 FROM planner_state ps
 JOIN capture_events e ON e.seq = ps.event_seq
+CROSS JOIN barrier b
 WHERE e.branch_ref = ?
   AND e.branch_generation = ?
   AND e.state = ?
   AND ps.defer_count >= ?
+  AND (b.first_seq IS NULL OR e.seq < b.first_seq)
 ORDER BY ps.last_planned_ts ASC, ps.event_seq ASC
 LIMIT 1`
 	var ev CaptureEvent
 	var ps PlannerState
-	err := d.readSQL().QueryRowContext(ctx, q, branchRef, branchGeneration, EventStatePending, deferLimit).Scan(
+	err := d.readSQL().QueryRowContext(ctx, q,
+		branchRef, branchGeneration, EventStateBlockedConflict, EventStateFailed,
+		branchRef, branchGeneration, EventStatePending, deferLimit,
+	).Scan(
 		&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead, &ev.Operation, &ev.Path, &ev.OldPath,
 		&ev.Fidelity, &ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID, &ev.Error, &ev.Message,
 		&ps.EventSeq, &ps.DeferCount, &ps.LastPlannedTS, &ps.LastDeferReason, &ps.LastPlanError,
