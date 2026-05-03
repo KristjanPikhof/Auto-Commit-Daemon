@@ -467,6 +467,101 @@ func TestPlannerStateConcurrentDefersAndMissingEvent(t *testing.T) {
 	}
 }
 
+func TestPlannerStateSchemaMigratesFromV6WithoutDataLoss(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+CREATE TABLE capture_events(
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_ref       TEXT NOT NULL,
+    branch_generation INTEGER NOT NULL,
+    base_head        TEXT NOT NULL,
+    operation        TEXT NOT NULL,
+    path             TEXT NOT NULL,
+    old_path         TEXT,
+    fidelity         TEXT NOT NULL,
+    captured_ts      REAL NOT NULL,
+    published_ts     REAL,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    commit_oid       TEXT,
+    error            TEXT,
+    message          TEXT
+);
+INSERT INTO capture_events(
+    seq, branch_ref, branch_generation, base_head, operation, path, fidelity,
+    captured_ts, state
+) VALUES (
+    42, 'refs/heads/main', 3, 'abc123', 'modify', 'keep.txt', 'exact',
+    12.5, 'pending'
+);
+PRAGMA user_version = 6;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v6 db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v6: %v", err)
+	}
+	defer d.Close()
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("user_version = %d, want %d", uv, SchemaVersion)
+	}
+
+	var path string
+	if err := d.SQL().QueryRowContext(ctx, `SELECT path FROM capture_events WHERE seq = 42`).Scan(&path); err != nil {
+		t.Fatalf("query migrated event: %v", err)
+	}
+	if path != "keep.txt" {
+		t.Fatalf("migrated path=%q want keep.txt", path)
+	}
+	if err := RecordPlannerDefer(ctx, d, 42, 22, "migrated event"); err != nil {
+		t.Fatalf("RecordPlannerDefer migrated event: %v", err)
+	}
+	ps, ok, err := PlannerStateForEvent(ctx, d, 42)
+	if err != nil || !ok || ps.DeferCount != 1 {
+		t.Fatalf("PlannerStateForEvent migrated = %+v ok=%v err=%v, want defer_count=1", ps, ok, err)
+	}
+}
+
+func TestPlannerStateIndexesExist(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	for _, idx := range []string{
+		"idx_planner_state_defer_count_planned",
+		"idx_planner_state_last_planned",
+	} {
+		var name string
+		err := d.SQL().QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'planner_state' AND name = ?`, idx).Scan(&name)
+		if err != nil {
+			t.Fatalf("planner_state index %q missing: %v", idx, err)
+		}
+		if name != idx {
+			t.Fatalf("planner_state index name=%q want %q", name, idx)
+		}
+	}
+}
+
 func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
