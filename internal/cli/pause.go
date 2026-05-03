@@ -248,6 +248,7 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("acd resume: remove marker: %w", err)
 	}
+	stampManualPauseResume(ctx, gitDir)
 
 	res := resumeResult{
 		OK:                  true,
@@ -262,6 +263,16 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		BackpressureSetAt:   bpSetAt,
 	}
 	return renderResume(out, res, jsonOut)
+}
+
+func stampManualPauseResume(ctx context.Context, gitDir string) {
+	db, err := state.Open(ctx, state.DBPathFromGitDir(gitDir))
+	if err != nil {
+		return
+	}
+	defer func() { _ = db.Close() }()
+	stamp := fmt.Sprintf("%f", float64(time.Now().UTC().UnixNano())/1e9)
+	_ = state.MetaSet(ctx, db, daemon.MetaKeyManualPauseResumedAt, stamp)
 }
 
 // clearBackpressureFromCLI loads the per-repo state.db, inspects the
