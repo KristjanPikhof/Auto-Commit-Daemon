@@ -142,6 +142,55 @@ func TestFix_ApplyDeletesObsoleteBarrierAndLeavesPending(t *testing.T) {
 	}
 }
 
+func TestFix_ApplyRefusesWhenPlanHasUnsafeReasons(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         head,
+		Operation:        "modify",
+		Path:             "unsafe.txt",
+		Fidelity:         "exact",
+		State:            state.EventStateBlockedConflict,
+		Error:            sql.NullString{String: "before-state mismatch", Valid: true},
+	}, nil)
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:             state.DecisionKindHandledExternal,
+		Path:             sql.NullString{String: "unsafe.txt", Valid: true},
+		Reason:           sql.NullString{String: "already_published_by_external_committer", Valid: true},
+		EventSeq:         sql.NullInt64{Int64: seq, Valid: true},
+		CommitOID:        sql.NullString{String: "1111111111111111111111111111111111111111", Valid: true},
+		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("AppendDecision: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = runFix(ctx, &out, repo, false, true, true)
+	if err == nil {
+		t.Fatalf("runFix apply succeeded despite unsafe plan:\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "unsafe conditions") {
+		t.Fatalf("error=%v want unsafe refusal", err)
+	}
+	var stateName string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&stateName); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStateBlockedConflict {
+		t.Fatalf("event state=%q want blocked_conflict", stateName)
+	}
+}
+
 func TestFix_ApplyMarksDecisionLedExternalRowPublished(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
