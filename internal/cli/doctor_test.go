@@ -472,6 +472,94 @@ func TestDoctor_BlockedConflictSurfaced(t *testing.T) {
 	}
 }
 
+func TestDoctor_FailedBarrierSurfaced(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 77, Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "bad.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "bad.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append failed event: %v", err)
+	}
+	if err := state.MarkEventPublished(ctx, d, seq, state.EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowFloat()); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "later.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "later.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending successor: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	_ = d.Close()
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal doctor: %v\n%s", err, jsonOut.String())
+	}
+	if len(rep.Repos) != 1 {
+		t.Fatalf("repos len=%d want 1", len(rep.Repos))
+	}
+	rr := rep.Repos[0]
+	if rr.FailedEvents != 1 || rr.FailedBlockingPending != 1 || rr.LastReplayFailurePath != "bad.go" {
+		t.Fatalf("failed doctor fields = %+v, want failed blocker bad.go", rr)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
+		t.Fatalf("runDoctor human: %v", err)
+	}
+	for _, want := range []string{"failed     : 1", "failed blockers : 1", "acd fix --dry-run", "last failure : bad.go"} {
+		if !strings.Contains(humanOut.String(), want) {
+			t.Fatalf("doctor human missing %q in:\n%s", want, humanOut.String())
+		}
+	}
+}
+
+func TestDoctorBundleReadsPreDecisionLedgerDBReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	preparePreDecisionLedgerDB(t, db, dbPath)
+	before := mustSHA256(t, dbPath)
+	versionBefore := readUserVersionReadOnly(t, dbPath)
+
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, true, t.TempDir(), true); err != nil {
+		t.Fatalf("runDoctor bundle: %v\n%s", err, out.String())
+	}
+	var bundle bundleResult
+	if err := json.Unmarshal(out.Bytes(), &bundle); err != nil {
+		t.Fatalf("unmarshal bundle: %v\n%s", err, out.String())
+	}
+	if bundle.Path == "" || bundle.FilesCount == 0 {
+		t.Fatalf("bundle result not populated: %+v", bundle)
+	}
+	if after := mustSHA256(t, dbPath); after != before {
+		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
+	}
+	if got := readUserVersionReadOnly(t, dbPath); got != versionBefore {
+		t.Fatalf("user_version changed: before=%d after=%d", versionBefore, got)
+	}
+}
+
 func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
