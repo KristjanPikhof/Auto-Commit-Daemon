@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -81,7 +82,7 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	// Confirm every §6.1 table exists.
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
-		"capture_events", "capture_ops", "flush_requests",
+		"capture_events", "capture_ops", "planner_state", "flush_requests",
 		"decision_records", "publish_state", "daemon_meta", "daily_rollups",
 	}
 	for _, table := range tables {
