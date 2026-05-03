@@ -87,6 +87,11 @@ const (
 	// MetaKeyReplayPausedUntil stores an RFC3339 UTC timestamp until which
 	// replay should skip drain passes after a detected branch rewind.
 	MetaKeyReplayPausedUntil = "replay.paused_until"
+	// MetaKeyManualPauseResumedAt stores the wall-clock seconds when
+	// `acd resume` removed a manual pause marker. The run loop uses this
+	// short-lived breadcrumb to distinguish a fast-forward that landed during
+	// a manual pause from an ordinary upstream pull observed while unpaused.
+	MetaKeyManualPauseResumedAt = "manual_pause.resumed_at"
 )
 
 // EnvRewindGraceSeconds controls the post-rewind replay pause window. The

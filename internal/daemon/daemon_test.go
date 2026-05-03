@@ -1758,6 +1758,118 @@ func TestRun_BranchGenerationBumpsOnExternalReset(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			MessageFn:   DeterministicMessage,
+		})
+	}()
+
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 3*time.Second)
+
+	upstreamBody := []byte("from upstream\n")
+	upstreamBlob, err := git.HashObjectStdin(ctx, f.dir, upstreamBody)
+	if err != nil {
+		t.Fatalf("hash upstream blob: %v", err)
+	}
+	seedEntries, err := git.LsTree(ctx, f.dir, seedHead, false)
+	if err != nil {
+		t.Fatalf("ls-tree seed: %v", err)
+	}
+	mkEntries := make([]git.MktreeEntry, 0, len(seedEntries)+1)
+	for _, e := range seedEntries {
+		mkEntries = append(mkEntries, git.MktreeEntry{Mode: e.Mode, Type: e.Type, OID: e.OID, Path: e.Path})
+	}
+	mkEntries = append(mkEntries, git.MktreeEntry{Mode: git.RegularFileMode, Type: "blob", OID: upstreamBlob, Path: "upstream.txt"})
+	upstreamTree, err := git.Mktree(ctx, f.dir, mkEntries)
+	if err != nil {
+		t.Fatalf("mktree upstream: %v", err)
+	}
+	upstreamHead, err := git.CommitTree(ctx, f.dir, upstreamTree, "upstream fast-forward", seedHead)
+	if err != nil {
+		t.Fatalf("commit-tree upstream: %v", err)
+	}
+
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", upstreamHead, seedHead); err != nil {
+		t.Fatalf("update-ref upstream: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "upstream.txt"), upstreamBody, 0o644); err != nil {
+		t.Fatalf("write upstream worktree: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, upstreamHead, 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var oid string
+		err := f.db.SQL().QueryRowContext(ctx,
+			`SELECT oid FROM shadow_paths
+			 WHERE branch_ref = ? AND branch_generation = ? AND path = ?`,
+			"refs/heads/main", int64(1), "upstream.txt").Scan(&oid)
+		if err == nil && oid == upstreamBlob {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var shadowOID string
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT oid FROM shadow_paths
+		 WHERE branch_ref = ? AND branch_generation = ? AND path = ?`,
+		"refs/heads/main", int64(1), "upstream.txt").Scan(&shadowOID); err != nil {
+		t.Fatalf("upstream.txt not reseeded into shadow: %v", err)
+	}
+	if shadowOID != upstreamBlob {
+		t.Fatalf("shadow upstream oid=%s want %s", shadowOID, upstreamBlob)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	var events int
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if events != 0 {
+		t.Fatalf("external fast-forward captured %d upstream events, want 0", events)
+	}
+
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
 func TestRun_BranchSwitchDropsPending(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()

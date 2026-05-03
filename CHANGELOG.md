@@ -2,8 +2,24 @@
 
 ## Unreleased
 
+### Fixed
+
+- Same-branch fast-forwards, such as `git checkout main && git pull`, now
+  refresh ACD's shadow baseline from the new `HEAD` instead of replaying stale
+  work captured before the pull.
+- Manual pause/resume now preserves self-heal behavior when an external commit
+  lands during the pause, so the resumed daemon can mark matching work as
+  already published instead of treating it like upstream-only content.
+
+## v2026-05-03
+
 ### Added
 
+- `acd recover --auto` can repair stale live-index entries left by older
+  ACD-published commits, and `acd doctor` can report repair candidates.
+- Generated dependency and cache directories such as `node_modules/`,
+  `target/`, virtualenvs, and common tool caches are ignored by default during
+  capture and watcher walks.
 - `acd start` now works without `--session-id` for manual current-repo use.
   It registers a stable human client for the repo, so repeated manual starts
   refresh the same row instead of creating a pile of stale clients.
@@ -17,6 +33,8 @@
 
 ### Changed
 
+- Replay now reconciles the live Git index after publishing commits, guarded by
+  path-scoped before-state checks so user-staged changes are not overwritten.
 - Root `acd --help` is now compact and grouped by workflow.
 - User-facing commands now include more practical help text and examples.
 - `acd stop --session-id <id>` is now documented as the harness/refcount path:
@@ -24,10 +42,17 @@
 - Harness templates keep passing explicit `--session-id`; the new no-flag
   start/stop defaults are for humans at a terminal.
 - Updated README and troubleshooting docs with examples for watch mode and
-  log tailing, plus the simpler current-repo start/stop flow.
+  log tailing, live-index recovery, safe-ignore defaults, and the simpler
+  current-repo start/stop flow.
 
 ### Fixed
 
+- Daemon runs now wire the per-repo JSONL file logger through the same canonical
+  repo hash used by `acd logs` and central stats.
+- Published replay events no longer leave the live index stale after ACD moves
+  `HEAD`.
+- Generated dependency/cache trees no longer show up as capture events or
+  watcher load when a repo forgot to gitignore them.
 - `acd logs --follow` no longer misses lines appended while switching from
   the initial tail read to follow mode.
 
@@ -41,12 +66,12 @@
 
 ### Added
 
-- `acd recover --auto` can repair old live-index drift after ACD-published
-  commits.
-- Generated directories such as `node_modules/`, `target/`, virtualenvs, and
-  common cache folders are ignored by default during capture and watcher walks.
-- `acd doctor` includes watcher diagnostics and active ignore settings in
-  reports and bundles.
+- `acd diagnose`, `acd recover`, `acd pause`, `acd resume`, and
+  `acd purge-events` give operators first-class recovery controls for replay
+  blockers, branch incidents, and manual pause state.
+- Recursive fsnotify watching can drive daemon wakeups when enabled.
+- Best-effort JSONL trace files record capture, replay, branch-token, pause,
+  and daemon-transition decisions.
 
 ### Changed
 
@@ -54,15 +79,16 @@
   more aggressively bounded so the daemon is less likely to hang.
 - Git diff/blob rendering now has stronger caps for large files.
 - Process checks use pinned system `ps` paths on macOS and Linux.
-- Docs now cover AI diff egress, live-index recovery, safe-ignore defaults, and
+- Schema v4 adds faster flush-request lookup and read-heavy state paths use the
+  read pool where possible.
+- Docs now cover AI diff egress, branch-token handling, recovery workflows, and
   daemon troubleshooting.
 
 ### Fixed
 
-- Fixed stale live-index state after replay publishes a commit.
-- Fixed generated ignored trees showing up as capture events or watcher load.
 - Fixed several edge cases around ambiguous refs, SQLite lock handling,
-  rewind grace, malformed pause markers, and git-operation marker stat errors.
+  rewind grace, malformed pause markers, detached-to-attached branch recovery,
+  shadow bootstrap atomicity, and git-operation marker stat errors.
 
 ## v2026-04-28
 

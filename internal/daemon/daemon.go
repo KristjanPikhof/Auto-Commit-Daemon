@@ -57,6 +57,10 @@ const (
 	// CompleteFlushRequest. Sweeping them at startup keeps `acd status` /
 	// queue depth metrics from accumulating ghosts forever.
 	OrphanFlushAckThreshold = 5 * time.Minute
+	// manualResumeResyncWindow is the grace period after `acd resume` during
+	// which a same-branch fast-forward preserves shadow state so paused local
+	// edits can self-heal against an external commit that landed while paused.
+	manualResumeResyncWindow = 30 * time.Second
 )
 
 // EnvClientTTLSeconds is the environment knob for ACD_CLIENT_TTL_SECONDS
@@ -489,6 +493,7 @@ func Run(ctx context.Context, opts Options) error {
 		currentToken = ""
 	}
 	branchTransitionBlocked := false
+	startupFastForwardResync := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -538,6 +543,8 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
+		} else if transition == TokenTransitionFastForward {
+			startupFastForwardResync = true
 		}
 	}
 	cctx := CaptureContext{
@@ -553,6 +560,46 @@ func Run(ctx context.Context, opts Options) error {
 	if !branchTransitionBlocked {
 		if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
 			logger.Warn("seed branch token", "err", err.Error())
+		}
+	}
+	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
+		startupPaused, pauseErr := daemonPauseState(ctx, opts.GitDir, opts.DB)
+		if pauseErr != nil {
+			logger.Warn("read pause state before startup fast-forward resync",
+				"err", pauseErr.Error())
+			startupFastForwardResync = false
+			branchTransitionBlocked = true
+		} else if startupPaused.Active {
+			logger.Info("startup fast-forward observed while paused; preserving shadow for resume",
+				"source", startupPaused.Source,
+				"reason", startupPaused.Reason)
+			startupFastForwardResync = false
+		} else if resumed, stamp := manualPauseRecentlyResumed(ctx, opts.DB, now()); resumed {
+			logger.Info("startup fast-forward observed after manual resume; preserving shadow for self-heal",
+				"resumed_at", stamp)
+			startupFastForwardResync = false
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
+		}
+	}
+	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
+		dropped, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
+			cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
+		if dropErr != nil {
+			logger.Warn("drop stale unpublished events after startup fast-forward",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", dropErr.Error())
+		}
+		if seeded, err := ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
+			logger.Warn("reseed shadow after startup fast-forward",
+				"err", err.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+		} else {
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "startup fast-forward shadow reseed", seeded)
+			logger.Info("shadow reseeded after startup fast-forward",
+				"rows", seeded,
+				"generation", cctx.BranchGeneration,
+				"dropped_unpublished", dropped)
 		}
 	}
 
@@ -831,6 +878,30 @@ func Run(ctx context.Context, opts Options) error {
 					lastStampedBranchHead = liveHead
 				}
 			}
+			if cctx.BranchRef != "" && cctx.BaseHead != "" {
+				bootstrapped, bErr := IsShadowBootstrapped(ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+				if bErr != nil {
+					logger.Warn(logPrefix+" read shadow bootstrap marker",
+						"err", bErr.Error())
+					return true
+				}
+				if !bootstrapped {
+					seeded, seedErr := BootstrapShadow(ctx, opts.RepoPath, opts.DB, cctx)
+					if seedErr != nil {
+						logger.Warn(logPrefix+" bootstrap missing shadow",
+							"err", seedErr.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
+						return true
+					}
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "missing shadow bootstrap", seeded)
+					if seeded > 0 {
+						logger.Info("shadow bootstrapped after missing marker",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration)
+					}
+					return true
+				}
+			}
 			return false
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
@@ -1016,9 +1087,95 @@ func Run(ctx context.Context, opts Options) error {
 				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
 					"fast-forward inside rewind grace")
 			} else {
+				fastForwardPaused, pauseErr := daemonPauseState(ctx, opts.GitDir, opts.DB)
+				if pauseErr != nil {
+					logger.Warn("read pause state before branch fast-forward resync",
+						"err", pauseErr.Error())
+					return true
+				}
+				if fastForwardPaused.Active {
+					logger.Info("branch fast-forward observed while paused; preserving shadow for resume",
+						"old", oldToken,
+						"new", newToken,
+						"generation", cctx.BranchGeneration,
+						"source", fastForwardPaused.Source,
+						"reason", fastForwardPaused.Reason)
+					recordTrace(tracer, acdtrace.Event{
+						Repo:       opts.RepoPath,
+						BranchRef:  cctx.BranchRef,
+						HeadSHA:    cctx.BaseHead,
+						EventClass: "branch_token.transition",
+						Decision:   transition.String(),
+						Reason:     "fast-forward observed while paused; preserving shadow for resume",
+						Input:      map[string]any{"previous": oldToken, "current": newToken},
+						Output: map[string]any{
+							"generation": cctx.BranchGeneration,
+							"source":     fastForwardPaused.Source,
+						},
+						Generation: cctx.BranchGeneration,
+					})
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist branch head", "err", err.Error())
+					}
+					return true
+				}
+				if resumed, stamp := manualPauseRecentlyResumed(ctx, opts.DB, now()); resumed {
+					logger.Info("branch fast-forward observed after manual resume; preserving shadow for self-heal",
+						"old", oldToken,
+						"new", newToken,
+						"generation", cctx.BranchGeneration,
+						"resumed_at", stamp)
+					recordTrace(tracer, acdtrace.Event{
+						Repo:       opts.RepoPath,
+						BranchRef:  cctx.BranchRef,
+						HeadSHA:    cctx.BaseHead,
+						EventClass: "branch_token.transition",
+						Decision:   transition.String(),
+						Reason:     "fast-forward observed after manual resume; preserving shadow for self-heal",
+						Input:      map[string]any{"previous": oldToken, "current": newToken},
+						Output: map[string]any{
+							"generation": cctx.BranchGeneration,
+							"resumed_at": stamp,
+						},
+						Generation: cctx.BranchGeneration,
+					})
+					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist branch head", "err", err.Error())
+					}
+					return true
+				}
+				droppedUnpublished, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
+					cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
+				if dropErr != nil {
+					logger.Warn("drop stale unpublished events after branch fast-forward",
+						"branch_ref", cctx.BranchRef,
+						"generation", cctx.BranchGeneration,
+						"err", dropErr.Error())
+				}
+				seeded := 0
+				if cctx.BranchRef != "" {
+					var seedErr error
+					seeded, seedErr = ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx)
+					if seedErr != nil {
+						logger.Warn("reseed shadow after branch fast-forward",
+							"err", seedErr.Error())
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
+					} else {
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
+						logger.Info("shadow reseeded after branch fast-forward",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration,
+							"dropped_unpublished", droppedUnpublished)
+					}
+				}
 				logger.Debug("branch fast-forwarded",
 					"old", oldToken, "new", newToken,
-					"generation", cctx.BranchGeneration)
+					"generation", cctx.BranchGeneration,
+					"dropped_unpublished", droppedUnpublished,
+					"shadow_rows", seeded)
 				recordTrace(tracer, acdtrace.Event{
 					Repo:       opts.RepoPath,
 					BranchRef:  cctx.BranchRef,
@@ -1027,7 +1184,12 @@ func Run(ctx context.Context, opts Options) error {
 					Decision:   transition.String(),
 					Reason:     "run-loop token transition classified",
 					Input:      map[string]any{"previous": oldToken, "current": newToken},
-					Output:     map[string]any{"generation": cctx.BranchGeneration},
+					Output: map[string]any{
+						"generation":           cctx.BranchGeneration,
+						"dropped_unpublished":  droppedUnpublished,
+						"shadow_rows_reseeded": seeded,
+					},
+					Error:      traceErrString(dropErr),
 					Generation: cctx.BranchGeneration,
 				})
 				if err := SaveBranchGeneration(ctx, opts.DB,
@@ -1036,7 +1198,7 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
-		return false
+		return true
 	}
 
 	for {
@@ -1306,7 +1468,7 @@ func Run(ctx context.Context, opts Options) error {
 		// genuinely cannot answer "is replay paused?", assume yes.
 		daemonPaused := pauseErr != nil || daemonPaus.Active
 		if branchTransitionBlocked {
-			logger.Warn("capture/replay paused until branch transition is classified")
+			logger.Warn("capture/replay paused for branch transition settle")
 		} else if operationPaused {
 			logger.Warn("git operation in progress; capture/replay paused",
 				"operation", operationName)
@@ -1568,6 +1730,24 @@ func gitOperationInProgress(gitDir string) (string, bool) {
 // "open + log + skip" policy without re-implementing the bootstrap dance.
 func openCentralStats(ctx context.Context, dbPath string) (*central.StatsDB, error) {
 	return central.OpenAt(ctx, dbPath)
+}
+
+func manualPauseRecentlyResumed(ctx context.Context, db *state.DB, now time.Time) (bool, string) {
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyManualPauseResumedAt)
+	if err != nil || !ok || raw == "" {
+		return false, ""
+	}
+	sec, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		_, _ = state.MetaDelete(ctx, db, MetaKeyManualPauseResumedAt)
+		return false, raw
+	}
+	resumedAt := time.Unix(0, int64(sec*1e9))
+	if now.Before(resumedAt) || now.Sub(resumedAt) <= manualResumeResyncWindow {
+		return true, raw
+	}
+	_, _ = state.MetaDelete(ctx, db, MetaKeyManualPauseResumedAt)
+	return false, raw
 }
 
 // clearRewindGraceMeta removes a stale daemon_meta.replay.paused_until row.
