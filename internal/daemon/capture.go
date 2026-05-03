@@ -810,6 +810,56 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
+func protectShadowFromSkippedPresent(ctx context.Context, db *state.DB, cctx CaptureContext, shadow map[string]ShadowEntry, protected map[string]skippedPresent) int {
+	if len(shadow) == 0 || len(protected) == 0 {
+		return 0
+	}
+	count := 0
+	for path := range shadow {
+		reason, ok := protectedReasonForPath(path, protected)
+		if !ok {
+			continue
+		}
+		delete(shadow, path)
+		count++
+		recordProtectedSkipDecision(ctx, db, cctx, path, reason)
+	}
+	return count
+}
+
+func protectedReasonForPath(path string, protected map[string]skippedPresent) (string, bool) {
+	if skip, ok := protected[path]; ok {
+		return skip.Reason, true
+	}
+	for prefix, skip := range protected {
+		if !skip.Dir {
+			continue
+		}
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return skip.Reason, true
+		}
+	}
+	return "", false
+}
+
+func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx CaptureContext, path, reason string) {
+	if db == nil || path == "" {
+		return
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:             state.DecisionKindProtected,
+		Path:             sql.NullString{String: path, Valid: true},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: "no_delete_generated", Valid: true},
+		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped present protected path %s without generating a delete.", path), Valid: true},
+	}); err != nil {
+		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
+	}
+}
+
 // walkOpts bundles inputs to walkLive so the function signature stays
 // readable.
 type walkOpts struct {
