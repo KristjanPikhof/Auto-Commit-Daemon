@@ -20,6 +20,7 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
+	testEnv := envWith(env, "ACD_REWIND_GRACE_SECONDS=2", "ACD_FSNOTIFY_ENABLED=0")
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -272,7 +273,7 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 
-	startSession(t, ctx, env, repo, "selfheal-ff-grace", "shell", "ACD_REWIND_GRACE_SECONDS=2")
+	startSession(t, ctx, env, repo, "selfheal-ff-grace", "shell", "ACD_REWIND_GRACE_SECONDS=2", "ACD_FSNOTIFY_ENABLED=0")
 	waitMode(t, repo, "running", 5*time.Second)
 
 	dbPath := selfHealStateDB(repo)
@@ -281,7 +282,7 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	// Drive the daemon to commit H2 with the file.
 	target := filepath.Join(repo, "ff-grace.txt")
 	writeFile(t, target, "ff content\n")
-	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
 	h2 := waitForCommitContaining(t, repo, "ff-grace.txt", 8*time.Second)
 	if h2 == seedHead {
 		t.Fatal("daemon did not commit H2")
@@ -293,7 +294,7 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != seedHead {
 		t.Fatalf("hard reset HEAD=%s want seed %s", head, seedHead)
 	}
-	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
 	waitFor(t, "replay.paused_until set after rewind", 8*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'replay.paused_until'") != ""
 	})
@@ -311,7 +312,7 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
 		t.Fatalf("ff-merge HEAD=%s want H2 %s", head, h2)
 	}
-	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
 
 	// The FF-in-grace path must reseed shadow + clear the grace marker.
 	waitForMetaCleared(t, dbPath, "replay.paused_until", 6*time.Second)
@@ -319,8 +320,8 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	// Wait for the natural grace expiry to elapse so any post-grace
 	// capture pass on a subsequent wake has had a chance to misbehave.
 	time.Sleep(3 * time.Second)
-	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
-	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
+	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
 	time.Sleep(500 * time.Millisecond)
 
 	// HEAD must still equal H2 — no extra commits beyond the reseeded baseline.
