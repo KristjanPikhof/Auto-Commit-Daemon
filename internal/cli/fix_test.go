@@ -63,6 +63,26 @@ func TestFix_DryRunPlansSafeActionsWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestFix_DryRunToleratesPreV5DB(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	seedPurgeFixtureRows(t, db)
+	if _, err := db.SQL().ExecContext(context.Background(), `DROP TABLE decision_records`); err != nil {
+		t.Fatalf("drop decision_records: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runFix(context.Background(), &out, repo, true, false, true); err != nil {
+		t.Fatalf("runFix dry-run should tolerate missing decision_records: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal fix plan: %v\n%s", err, out.String())
+	}
+	if !hasFixAction(plan, fixActionDeleteObsoleteBarrier) {
+		t.Fatalf("pre-v5 fix plan lacks obsolete barrier cleanup: %+v", plan.Actions)
+	}
+}
+
 func TestFix_ApplyClearsExpiredPauseAndDrainedBackpressure(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
