@@ -16,6 +16,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -395,6 +396,9 @@ ORDER BY e.seq ASC, d.id DESC`,
 }
 
 func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
+	if plan.CurrentBranchRef == "" {
+		return fmt.Errorf("acd fix: refusing to mutate state while HEAD is detached")
+	}
 	if err := preflightFixFS(plan); err != nil {
 		return err
 	}
