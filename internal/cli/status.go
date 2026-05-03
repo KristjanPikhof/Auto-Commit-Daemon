@@ -64,6 +64,7 @@ type statusReport struct {
 	DecisionCounts        map[string]int `json:"decision_counts,omitempty"`
 	RecentDecisions       []eventEntry   `json:"recent_decisions,omitempty"`
 	DecisionCursor        int64          `json:"decision_cursor,omitempty"`
+	IntentStrategy        intentStrategyReport `json:"intent_strategy"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -316,6 +317,11 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		report.Paused = true
 		report.Pause = info
 	}
+	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
+		return report, fmt.Errorf("intent strategy: %w", err)
+	} else {
+		report.IntentStrategy = intentStrategy
+	}
 	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
 		return report, err
 	}
@@ -550,6 +556,8 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 				formatDurationCompact(time.Duration(r.Pause.RemainingSeconds)*time.Second))
 		}
 	}
+
+	renderIntentStrategyHuman(out, r.IntentStrategy)
 
 	if len(r.DecisionCounts) > 0 {
 		fmt.Fprintf(out, "Decisions: %s\n", formatDecisionCounts(r.DecisionCounts))
