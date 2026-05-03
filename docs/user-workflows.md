@@ -21,6 +21,11 @@ durable decision ledger. It tells you what ACD captured, skipped, committed,
 blocked, or treated as already handled by another committer. `acd explain`
 turns those decisions into a path or commit answer.
 
+`acd events --watch` follows new ledger rows. Without `--since`, it starts at
+the current ledger tail and prints only decisions appended after watch starts.
+Use `acd events --since <cursor>` when you want to resume from an older
+decision cursor.
+
 Reach for the raw log only when you need daemon internals:
 
 ~~~bash
@@ -112,7 +117,8 @@ acd explain --path path/to/file
 
 If the queued work was made obsolete by the revert or by a newer manual commit,
 you should see `handled_external` or `superseded_external`. If the queue is
-blocked by old terminal rows, preview the conservative cleanup:
+blocked by old terminal rows, including failed terminal barriers surfaced by
+`status`, `diagnose`, or `doctor`, preview the conservative cleanup:
 
 ~~~bash
 acd fix --dry-run
@@ -184,19 +190,31 @@ Expected decisions include:
 To adjust generated-tree handling:
 
 ~~~bash
+acd stop
 ACD_SAFE_IGNORE=0 acd start
+
+acd stop
 ACD_SAFE_IGNORE_EXTRA=dist/,build/ acd start
 ~~~
+
+An already-running daemon keeps the safe-ignore settings it started with. Stop
+and restart it before expecting `ACD_SAFE_IGNORE` or `ACD_SAFE_IGNORE_EXTRA`
+changes to affect capture or watcher pruning.
 
 For sensitive paths, set `ACD_SENSITIVE_GLOBS` carefully. Empty or whitespace
 values keep the default sensitive deny-list so a typo does not disable the
 defaults.
 
-## Blocked conflicts
+## Blocked conflicts and failed barriers
 
 `blocked_conflict` means ACD could not prove that replaying the captured event
 would be safe. Later pending events on the same branch generation wait behind
 that barrier.
+
+`failed` rows are also terminal. When `acd status`, `acd diagnose`, or
+`acd doctor` reports failed terminal events or `failed_blocking_pending`, treat
+that as the same kind of replay barrier: inspect first, then preview cleanup
+with `acd fix --dry-run`.
 
 ~~~bash
 acd status
