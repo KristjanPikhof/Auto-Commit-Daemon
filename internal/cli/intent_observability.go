@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -24,6 +25,31 @@ type intentStrategyReport struct {
 	LastPlannerErrorEventSeq int64  `json:"last_planner_error_event_seq,omitempty"`
 	LastPlannerErrorPath     string `json:"last_planner_error_path,omitempty"`
 	LastPlannerError         string `json:"last_planner_error,omitempty"`
+}
+
+func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
+	status := "event"
+	if r.Strategy != "" {
+		status = r.Strategy
+	}
+	if r.Active {
+		fmt.Fprintf(out, "Commit strategy: %s (window %d, recent commits %d, defer limit %d)\n",
+			status, r.Window, r.RecentCommits, r.DeferLimit)
+	} else {
+		fmt.Fprintf(out, "Commit strategy: %s\n", status)
+	}
+	if r.DeferredEvents > 0 || r.ForcedAgingReady > 0 || r.LastPlannerError != "" {
+		fmt.Fprintf(out, "Intent planner: deferred=%d max_defer=%d forced_ready=%d\n",
+			r.DeferredEvents, r.MaxDeferCount, r.ForcedAgingReady)
+		if r.LastDeferredReason != "" {
+			fmt.Fprintf(out, "  Last defer: seq %d %s (%s)\n",
+				r.LastDeferredEventSeq, valueOrUnset(r.LastDeferredPath), r.LastDeferredReason)
+		}
+		if r.LastPlannerError != "" {
+			fmt.Fprintf(out, "  Last planner error: seq %d %s (%s)\n",
+				r.LastPlannerErrorEventSeq, valueOrUnset(r.LastPlannerErrorPath), r.LastPlannerError)
+		}
+	}
 }
 
 func intentStrategyFromEnv() intentStrategyReport {
