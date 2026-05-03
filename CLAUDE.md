@@ -53,7 +53,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Stubs must compile: `package <name>` plus `// TODO(phase N): <intent>`.
 - Treat races, panics, nil pointers, ordering failures, and CI flakes as bugs; inspect/narrow before retrying.
 - Timing failures: focused `-count=10`; `GOMAXPROCS=1 -count=50` for ordering hazards.
-- Broad-run-sensitive: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, `TestRun_RepeatedEditsToSameFile_OrderedCommits`, `TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream`, `TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms`.
+- Broad-run-sensitive: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, repeated edits, external fast-forward reseed, FF-in-grace self-heal.
 - HEAD-transition tests usually wait for `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
 - CLI changes need Cobra help/examples/root help updates. Template changes must preserve embedded FS behavior.
 - Changelog/release notes should describe user impact, not file diffs.
