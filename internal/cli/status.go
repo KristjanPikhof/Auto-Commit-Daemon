@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"net/url"
 	"strconv"
 	"strings"
@@ -57,25 +59,44 @@ type statusReport struct {
 	BackpressurePaused   bool           `json:"backpressure_paused,omitempty"`
 	BackpressurePausedAt string         `json:"backpressure_paused_at,omitempty"`
 	EventsDroppedTotal   int64          `json:"events_dropped_total,omitempty"`
+	DecisionCounts       map[string]int `json:"decision_counts,omitempty"`
+	RecentDecisions      []eventEntry   `json:"recent_decisions,omitempty"`
+	DecisionCursor       int64          `json:"decision_cursor,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
+	var watch bool
+	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print current daemon + clients for one repo (default: cwd)",
-		Long: `Print daemon, client, queue, pause, and branch state for one registered repo.
+		Long: `Print daemon, client, queue, pause, branch, and recent decision state for one registered repo.
 
-The default repo is the current working directory. Use --json for automation. For all registered repos, use acd list; for replay blockers and recovery hints, use acd diagnose.`,
+The default repo is the current working directory. Use --watch to refresh the
+same repo until interrupted. Use --json for automation. For all registered
+repos, use acd list; for why/how questions, use acd explain and acd events.`,
 		Example: `  acd status
+  acd status --watch
   acd status --repo /path/to/repo
   acd status --json
+  acd explain --path internal/state/schema.go
   acd diagnose --repo . --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if watch {
+				if jsonOut {
+					return fmt.Errorf("acd status: --watch does not support --json")
+				}
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+				defer stop()
+				return runStatusWatch(ctx, cmd.OutOrStdout(), repo, interval)
+			}
 			return runStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
 		},
 	}
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh status output until interrupted")
+	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
 	return cmd
 }
 
@@ -283,8 +304,88 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		report.Paused = true
 		report.Pause = info
 	}
+	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
+		return report, err
+	}
 
 	return report, nil
+}
+
+func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("acd status: --interval must be positive")
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		fmt.Fprint(out, "\033[2J\033[H")
+		fmt.Fprintf(out, "Updated: %s\n\n", time.Now().Format(time.RFC3339))
+		if err := runStatus(ctx, out, repo, false); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func statusDecisionSummary(ctx context.Context, conn *sql.DB, report *statusReport) error {
+	rows, err := conn.QueryContext(ctx, `SELECT kind, COUNT(*) FROM decision_records GROUP BY kind`)
+	if err != nil {
+		return fmt.Errorf("decision counts: %w", err)
+	}
+	counts := map[string]int{}
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan decision counts: %w", err)
+		}
+		counts[kind] = n
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iter decision counts: %w", err)
+	}
+	rows.Close()
+	if len(counts) > 0 {
+		report.DecisionCounts = counts
+	}
+
+	recentRows, err := conn.QueryContext(ctx, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+ORDER BY id DESC
+LIMIT 3`)
+	if err != nil {
+		return fmt.Errorf("recent decisions: %w", err)
+	}
+	defer recentRows.Close()
+	for recentRows.Next() {
+		var row state.DecisionRecord
+		if err := recentRows.Scan(&row.ID, &row.DecisionTS, &row.Kind, &row.Path, &row.Reason,
+			&row.EventSeq, &row.HeadSHA, &row.CommitOID, &row.BranchRef,
+			&row.BranchGeneration, &row.ActionTaken, &row.UserMessage); err != nil {
+			return fmt.Errorf("scan recent decision: %w", err)
+		}
+		report.RecentDecisions = append(report.RecentDecisions, decisionEntry(row))
+		if row.ID > report.DecisionCursor {
+			report.DecisionCursor = row.ID
+		}
+	}
+	if err := recentRows.Err(); err != nil {
+		return fmt.Errorf("iter recent decisions: %w", err)
+	}
+	return nil
 }
 
 // metaLookup is the read-only equivalent of state.MetaGet against a raw
