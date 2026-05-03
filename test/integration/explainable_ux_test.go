@@ -430,3 +430,29 @@ func hasIntegrationFixAction(actions []struct {
 	}
 	return false
 }
+
+func waitForDecision(t *testing.T, dbPath, path, kind, reason string, timeout time.Duration) {
+	t.Helper()
+	query := fmt.Sprintf(
+		"SELECT COUNT(*) FROM decision_records WHERE path = %s AND kind = %s AND reason = %s",
+		sqliteQuote(path),
+		sqliteQuote(kind),
+		sqliteQuote(reason),
+	)
+	waitFor(t, fmt.Sprintf("decision %s for %s", kind, path), timeout, func() bool {
+		return sqliteScalar(t, dbPath, query) != "0"
+	})
+}
+
+func fileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+func sqliteQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
