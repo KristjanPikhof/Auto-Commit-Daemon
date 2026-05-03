@@ -7,9 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -495,10 +495,58 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		}
 	}
 
+	if len(r.DecisionCounts) > 0 {
+		fmt.Fprintf(out, "Decisions: %s\n", formatDecisionCounts(r.DecisionCounts))
+		if len(r.RecentDecisions) > 0 {
+			fmt.Fprintln(out, "Recent decisions:")
+			for _, ev := range r.RecentDecisions {
+				fmt.Fprintf(out, "  - #%d %s", ev.ID, ev.Kind)
+				if ev.Path != "" {
+					fmt.Fprintf(out, " %s", ev.Path)
+				}
+				if ev.ActionTaken != "" {
+					fmt.Fprintf(out, " (%s)", ev.ActionTaken)
+				} else if ev.Reason != "" {
+					fmt.Fprintf(out, " (%s)", ev.Reason)
+				}
+				fmt.Fprintln(out)
+			}
+		}
+		fmt.Fprintln(out, "Explain: acd explain --path FILE; stream: acd events --watch")
+	}
+
 	if r.BranchGenToken != "" {
 		fmt.Fprintf(out, "Branch generation: %s\n", r.BranchGenToken)
 	}
 	return nil
+}
+
+func formatDecisionCounts(counts map[string]int) string {
+	order := []string{
+		state.DecisionKindProtected,
+		state.DecisionKindHandledExternal,
+		state.DecisionKindSupersededExternal,
+		state.DecisionKindBlocked,
+		state.DecisionKindCommitted,
+		state.DecisionKindCaptured,
+		state.DecisionKindSkipped,
+		state.DecisionKindPaused,
+		state.DecisionKindResumed,
+	}
+	seen := make(map[string]bool, len(counts))
+	var parts []string
+	for _, kind := range order {
+		if n, ok := counts[kind]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
+			seen[kind] = true
+		}
+	}
+	for kind, n := range counts {
+		if !seen[kind] {
+			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // joinParens renders ["running", "pid 123", "heartbeat 2s ago"] as
