@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Same-branch fast-forwards, such as `git checkout main && git pull`, now
+  refresh ACD's shadow baseline from the new `HEAD` instead of replaying stale
+  work captured before the pull.
+- Manual pause/resume now preserves self-heal behavior when an external commit
+  lands during the pause, so the resumed daemon can mark matching work as
+  already published instead of treating it like upstream-only content.
+
 ## v2026-05-03
 
 ### Added
