@@ -51,9 +51,9 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 			t.Fatalf("marshal intent plan: %v", err)
 		}
 		resp := map[string]any{
-			"id":      "chatcmpl-intent",
-			"object":  "chat.completion",
-			"model":   "gpt-4o-mini",
+			"id":     "chatcmpl-intent",
+			"object": "chat.completion",
+			"model":  "gpt-4o-mini",
 			"choices": []map[string]any{{
 				"index": 0,
 				"message": map[string]any{
