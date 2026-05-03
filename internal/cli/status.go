@@ -410,6 +410,9 @@ LIMIT 3`)
 	if err := recentRows.Err(); err != nil {
 		return fmt.Errorf("iter recent decisions: %w", err)
 	}
+	if err := enrichEventEntries(ctx, conn, report.RecentDecisions); err != nil {
+		return fmt.Errorf("enrich recent decisions: %w", err)
+	}
 	return nil
 }
 
@@ -573,6 +576,9 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 				} else if ev.Reason != "" {
 					fmt.Fprintf(out, " (%s)", ev.Reason)
 				}
+				if len(ev.GroupedSeqs) > 1 {
+					fmt.Fprintf(out, " seqs=%s", formatSeqs(ev.GroupedSeqs))
+				}
 				fmt.Fprintln(out)
 			}
 		}
@@ -596,6 +602,9 @@ func formatDecisionCounts(counts map[string]int) string {
 		state.DecisionKindSkipped,
 		state.DecisionKindPaused,
 		state.DecisionKindResumed,
+		state.DecisionKindIntentDeferred,
+		state.DecisionKindIntentForced,
+		state.DecisionKindIntentPlannerError,
 	}
 	seen := make(map[string]bool, len(counts))
 	var parts []string
