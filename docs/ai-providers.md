@@ -25,21 +25,19 @@ file has been edited many times since. Before transmission, the diff is
 scrubbed for obvious secret shapes (AWS access keys, Slack/GitHub
 tokens, bearer tokens, JWTs, private-key markers, assigned
 password/secret/token values, and high-entropy token-like strings), then
-capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`). Long diffs
-are truncated at a line boundary while preserving the diff header so the
-model still sees the file path. The deterministic provider does not
-consult the diff at all, so its output is identical regardless of diff
-reconstruction success or failure. See [capture-replay.md](capture-replay.md)
-for the full storage model.
+capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`) while diff
+sections are appended. Large diffs may stop mid-section once the provider
+budget is consumed. The deterministic provider does not consult the diff at
+all, so its output is identical regardless of diff reconstruction success or
+failure. See [capture-replay.md](capture-replay.md) for the full storage model.
 
-Diff size is now bounded **at the git layer**, not after-the-fact in
-`BuildOpsDiff`. Each `before_oid`/`after_oid` pair is rendered through
-`git.DiffBlobsLimited` with `git.DefaultDiffCap` (1 MiB) and a per-op 5s
-timeout; on overflow the partial prefix is returned alongside
-`git.ErrStdoutOverflow` so truncation is observable instead of silent.
-The `internal/ai/prompt.go` 4000-byte `DiffCap` then applies as the
-final outbound trim before the provider sees the payload. A single hung
-blob render therefore cannot stall message construction.
+Diff size is bounded in two places. Each `before_oid`/`after_oid` pair is
+rendered through `git.DiffBlobsLimited` with a per-op cap of
+`2 * internal/ai.DiffCap` and a 5s timeout; on overflow the partial prefix is
+returned alongside `git.ErrStdoutOverflow` so truncation is observable instead
+of silent. `BuildOpsDiff` then keeps the rendered event diff within the
+4000-byte provider budget while sections are appended, and callers still apply
+redaction plus a final truncate before sending.
 
 ### Migration from `ACD_AI_SEND_DIFF`
 
