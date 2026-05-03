@@ -391,7 +391,7 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 			entry.Error = errMsg.String
 		}
 		entry.ErrorClass = classifyDiagnoseError(entry.Seq, entry.Error, lastMeta)
-		counts[entry.State+":"+entry.ErrorClass]++
+		counts[entry.ErrorClass]++
 		if len(report.RecentBlocked) < 5 {
 			report.RecentBlocked = append(report.RecentBlocked, entry)
 		}
@@ -494,7 +494,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				report.OperationInProgress, report.OperationMarkerDuration))
 	}
 	if len(remediation) == 0 {
-		remediation = append(remediation, "No anchor mismatch or blocked replay conflicts detected.")
+		remediation = append(remediation, "No anchor mismatch or terminal replay barriers detected.")
 	}
 	return remediation
 }
