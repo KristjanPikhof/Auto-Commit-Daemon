@@ -254,8 +254,8 @@ func normalizeHistoryPathspecs(paths []string) []string {
 		if _, ok := seen[path]; ok {
 			continue
 		}
-		seen[path] = struct{}{}
-		out = append(out, path)
+			seen[path] = struct{}{}
+			out = append(out, LiteralPathspec(path))
 		if len(out) >= MaxHistoryPathspecs {
 			break
 		}
