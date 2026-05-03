@@ -84,6 +84,8 @@ func TestExplainableUX_DecisionLedgerDrivesEventsExplainAndFix(t *testing.T) {
 
 	writeFile(t, filepath.Join(repo, "manual.txt"), "landed outside acd\n")
 	manualHead := gitCommitAll(t, repo, "manual external commit", "manual.txt")
+	manualOID := strings.Fields(runGitOK(t, repo, "ls-tree", manualHead, "manual.txt"))[2]
+	revertedAfterOID := gitHashObjectStdin(t, repo, "queued work that was later reverted\n")
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
 	if gen == "" {
@@ -93,17 +95,21 @@ func TestExplainableUX_DecisionLedgerDrivesEventsExplainAndFix(t *testing.T) {
 
 	seedSQL := fmt.Sprintf(`
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/main', %s, '%s', 'modify', 'manual.txt', 'exact', %f, 'blocked_conflict', 'before-state mismatch');
+VALUES ('refs/heads/main', %s, '%s', 'create', 'manual.txt', 'exact', %f, 'blocked_conflict', 'before-state mismatch');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', 'manual.txt', '%s', '100644', 'exact');
 INSERT INTO decision_records(decision_ts, kind, path, reason, event_seq, commit_oid, branch_ref, branch_generation, action_taken, user_message)
 VALUES (%f, 'handled_external', 'manual.txt', 'already_published_by_external_committer', last_insert_rowid(), '%s', 'refs/heads/main', %s, 'marked_published', 'Manual commit already contains this change.');
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/main', %s, '%s', 'modify', 'reverted.txt', 'exact', %f, 'pending', NULL);
+VALUES ('refs/heads/main', %s, '%s', 'create', 'reverted.txt', 'exact', %f, 'pending', NULL);
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', 'reverted.txt', '%s', '100644', 'exact');
 INSERT INTO decision_records(decision_ts, kind, path, reason, event_seq, commit_oid, branch_ref, branch_generation, action_taken, user_message)
 VALUES (%f, 'superseded_external', 'reverted.txt', 'superseded_external_current_head_matches_captured_before_state', last_insert_rowid(), '%s', 'refs/heads/main', %s, 'marked_published', 'Manual revert superseded queued ACD work.');
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
 VALUES ('refs/heads/main', %s, '%s', 'modify', 'obsolete-blocker.txt', 'rescan', %f, 'blocked_conflict', 'before-state mismatch');
-`, gen, manualHead, now, now+0.001, manualHead, gen,
-		gen, manualHead, now+0.002, now+0.003, manualHead, gen,
+`, gen, manualHead, now, manualOID, now+0.001, manualHead, gen,
+		gen, manualHead, now+0.002, revertedAfterOID, now+0.003, manualHead, gen,
 		gen, manualHead, now+0.004)
 	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
 		t.Fatalf("seed decision ledger: %v\n%s", err, out)
