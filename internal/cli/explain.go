@@ -185,11 +185,11 @@ LIMIT ?`, resolved, limit)
 
 func summarizeExplain(report explainReport) (string, string) {
 	if len(report.Decisions) == 0 {
-		if report.DecisionCursor > 0 && report.Mode == "recent" {
-			return "No ACD decisions have been recorded after that cursor.", "Run `acd events --watch` to stream newly appended decisions."
-		}
 		if !report.DecisionLedgerAvailable {
 			return missingDecisionLedgerMessage, "Run `acd status`; start or restart acd with a current version if you need product decision history."
+		}
+		if report.DecisionCursor > 0 && report.Mode == "recent" {
+			return "No ACD decisions have been recorded after that cursor.", "Run `acd events --watch` to stream newly appended decisions."
 		}
 		switch report.Mode {
 		case "path":
