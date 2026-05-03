@@ -1137,7 +1137,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 	for _, c := range pending {
 		if err := ctx.Err(); err != nil {
-			return nil, summary, err
+			return nil, protected, summary, err
 		}
 		summary.WalkedFiles++
 		entry, ok, reason, err := hashCandidate(ctx, repoRoot, c, opts)
