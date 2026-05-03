@@ -50,7 +50,7 @@ Common answers:
 
 | What you see | Meaning | Next step |
 |---|---|---|
-| `captured` with action `queued` | ACD noticed the file and replay has not published it yet. | Wait one tick or run `acd wake --session-id "$ACD_SESSION_ID"`. If pending grows, check `acd status`. |
+| `captured` with action `queued` | ACD noticed the file and replay has not published it yet. | Wait one tick, or run `acd wake --session-id "$ACD_SESSION_ID"` from a harness shell. If pending grows, check `acd status`. |
 | `committed` | ACD already made the commit. | Use `acd explain --commit HEAD` or `git log -- path/to/file`. |
 | `protected` or `skipped` | ACD intentionally left the path uncommitted. | Check safe-ignore, sensitive globs, `.gitignore`, or whether the file is outside the repo. |
 | No decision and no pending event | ACD has not seen the path. | Confirm the daemon is running for this repo and the path is not ignored or generated. |
@@ -104,8 +104,12 @@ For planned revert, reset, or rebase work, pause first:
 acd pause --repo . --reason "manual revert" --yes
 # run git revert, git reset, or git rebase
 acd resume --repo . --yes
-acd wake --repo . --session-id "$ACD_SESSION_ID"
 ~~~
+
+If you are inside a harness shell with `ACD_SESSION_ID` set, run
+`acd wake --repo . --session-id "$ACD_SESSION_ID"` after `resume` to nudge the
+daemon immediately. Terminal users can usually run `acd status --watch` and wait
+for the next tick.
 
 After the operation:
 
@@ -165,7 +169,9 @@ acd fix --dry-run
 
 `diagnose` focuses on replay blockers and branch anchors. `fix` plans safe
 state cleanup. Use `acd recover --repo . --auto --dry-run` only when diagnose
-specifically reports stale replay state that should be retargeted.
+specifically reports stale replay state that should be retargeted. Recovery
+preserves a manual pause marker unless you apply it with `--clear-pause`; use
+`acd resume --yes` when the marker itself is the only problem.
 
 ## Skipped generated or sensitive files
 
@@ -184,8 +190,12 @@ Expected decisions include:
 
 | Decision | Typical reason | Meaning |
 |---|---|---|
-| `protected` | `sensitive` or `safe-ignore` | ACD preserved an existing tracked/protected path without synthesizing a delete. |
-| `skipped` | ignore or policy reason | ACD left the path uncommitted by design. |
+| `protected` | `sensitive`, `safe_ignore`, or `gitignore` | ACD preserved an existing tracked/protected path without synthesizing a delete. |
+| `skipped` | oversize, unreadable, invalid, unstable, or non-regular path | ACD left the path uncommitted by design. |
+
+A new untracked file under a pruned generated tree or sensitive path can have no
+decision row because ACD skipped walking that subtree. In that case, `doctor`
+shows the active safe-ignore and sensitive-glob configuration.
 
 To adjust generated-tree handling:
 
@@ -231,9 +241,11 @@ matches what happened:
 
 ~~~bash
 acd fix --yes
-acd wake --repo . --session-id "$ACD_SESSION_ID"
 acd status
 ~~~
+
+If you are inside a harness shell with `ACD_SESSION_ID` set, run
+`acd wake --repo . --session-id "$ACD_SESSION_ID"` before checking status.
 
 If `fix --dry-run` reports unsafe conditions, keep the output and create a
 support bundle.
@@ -271,7 +283,7 @@ artifact for issue reports.
 | `handled_external` | Another commit already contains the captured after-state. |
 | `superseded_external` | External history made the queued work obsolete. |
 | `blocked` | Replay stopped because applying the event was not provably safe. |
-| `paused` / `resumed` | Capture or replay paused/resumed because of manual pause, rewind grace, or git operation state. |
+| `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
 
 ## See also
 
