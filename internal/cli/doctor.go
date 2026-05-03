@@ -840,11 +840,11 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 // writeRepoBundleFiles dumps state-schema.txt + daemon-{state,clients,meta}
 // from the per-repo state.db into the zip under base.
 func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath string, files *int) error {
-	d, err := state.Open(ctx, dbPath)
+	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	defer d.Close()
+	defer conn.Close()
 
 	add := func(name string, body []byte) error {
 		w, err := zw.Create(name)
@@ -859,8 +859,9 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// state-schema.txt
-	uv, _ := d.UserVersion(ctx)
-	rows, err := d.SQL().QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+	uv := 0
+	_ = conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&uv)
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
 	tables := []string{}
 	if err == nil {
 		for rows.Next() {
@@ -880,13 +881,16 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-state.json
-	st, _, err := state.LoadDaemonState(ctx, d)
-	if err == nil {
+	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts, updated_ts FROM daemon_state WHERE id = 1`)
+	var pid int
+	var mode string
+	var heartbeatTS, updatedTS sql.NullFloat64
+	if err := row.Scan(&pid, &mode, &heartbeatTS, &updatedTS); err == nil {
 		dsObj := map[string]any{
-			"pid":          st.PID,
-			"mode":         st.Mode,
-			"heartbeat_ts": st.HeartbeatTS,
-			"updated_ts":   st.UpdatedTS,
+			"pid":          pid,
+			"mode":         mode,
+			"heartbeat_ts": nullableFloat64(heartbeatTS),
+			"updated_ts":   nullableFloat64(updatedTS),
 		}
 		body, _ := json.MarshalIndent(dsObj, "", "  ")
 		if err := add(base+"daemon-state.json", body); err != nil {
@@ -895,18 +899,27 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-clients.json
-	clients, err := state.ListClients(ctx, d)
+	crows, err := conn.QueryContext(ctx,
+		`SELECT session_id, harness, watch_pid, registered_ts, last_seen_ts
+		 FROM daemon_clients ORDER BY last_seen_ts DESC`)
 	if err == nil {
-		entries := make([]map[string]any, 0, len(clients))
-		for _, c := range clients {
+		entries := []map[string]any{}
+		for crows.Next() {
+			var sessionID, harness string
+			var watchPID sql.NullInt64
+			var registeredTS, lastSeenTS float64
+			if err := crows.Scan(&sessionID, &harness, &watchPID, &registeredTS, &lastSeenTS); err != nil {
+				continue
+			}
 			entries = append(entries, map[string]any{
-				"session_id":    c.SessionID,
-				"harness":       c.Harness,
-				"watch_pid":     c.WatchPID.Int64,
-				"registered_ts": c.RegisteredTS,
-				"last_seen_ts":  c.LastSeenTS,
+				"session_id":    sessionID,
+				"harness":       harness,
+				"watch_pid":     nullableInt64(watchPID),
+				"registered_ts": registeredTS,
+				"last_seen_ts":  lastSeenTS,
 			})
 		}
+		crows.Close()
 		body, _ := json.MarshalIndent(entries, "", "  ")
 		if err := add(base+"daemon-clients.json", body); err != nil {
 			return err
@@ -914,7 +927,7 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-meta.json
-	mrows, err := d.SQL().QueryContext(ctx, `SELECT key, value FROM daemon_meta ORDER BY key`)
+	mrows, err := conn.QueryContext(ctx, `SELECT key, value FROM daemon_meta ORDER BY key`)
 	if err == nil {
 		meta := map[string]string{}
 		for mrows.Next() {
@@ -930,6 +943,20 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 		}
 	}
 	return nil
+}
+
+func nullableFloat64(v sql.NullFloat64) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Float64
+}
+
+func nullableInt64(v sql.NullInt64) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Int64
 }
 
 // sanitizeReport replaces $HOME prefixes inside the report's path strings
