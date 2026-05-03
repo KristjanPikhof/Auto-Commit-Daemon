@@ -312,6 +312,10 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
 		t.Fatalf("ff-merge HEAD=%s want H2 %s", head, h2)
 	}
+	// The pre-merge remove above is only a test workaround for the daemon's
+	// path-scoped index repair state. Restore from the fast-forwarded HEAD so
+	// the post-grace assertion checks for phantom capture, not this local delete.
+	runGitOK(t, repo, "checkout", "HEAD", "--", "ff-grace.txt")
 	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
 
 	// The FF-in-grace path must reseed shadow + clear the grace marker.
