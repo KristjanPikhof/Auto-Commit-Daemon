@@ -64,6 +64,17 @@ type CaptureOp struct {
 	Fidelity   string
 }
 
+// PlannerState is durable, per-event bookkeeping for intent planning. It is
+// keyed by capture_events.seq so planner retries and deferrals survive daemon
+// restarts without changing capture_events lifecycle state.
+type PlannerState struct {
+	EventSeq         int64
+	DeferCount      int
+	LastPlannedTS   float64
+	LastDeferReason sql.NullString
+	LastPlanError   sql.NullString
+}
+
 // AppendCaptureEvent inserts a capture event plus its ordered ops in a single
 // transaction. The returned seq is the autoincrement primary key, which the
 // caller can use to correlate downstream commit_oid back to the event.
@@ -213,6 +224,132 @@ ORDER BY e.seq ASC`
 		return nil, fmt.Errorf("state: iter events: %w", err)
 	}
 	return out, nil
+}
+
+// PlannerStateForEvent returns persisted planner bookkeeping for one event.
+func PlannerStateForEvent(ctx context.Context, d *DB, eventSeq int64) (PlannerState, bool, error) {
+	if eventSeq <= 0 {
+		return PlannerState{}, false, fmt.Errorf("state: PlannerStateForEvent: event_seq must be positive")
+	}
+	var ps PlannerState
+	err := d.readSQL().QueryRowContext(ctx, `
+SELECT event_seq, defer_count, last_planned_ts, last_defer_reason, last_plan_error
+FROM planner_state WHERE event_seq = ?`, eventSeq).Scan(
+		&ps.EventSeq, &ps.DeferCount, &ps.LastPlannedTS, &ps.LastDeferReason, &ps.LastPlanError)
+	if err == sql.ErrNoRows {
+		return PlannerState{}, false, nil
+	}
+	if err != nil {
+		return PlannerState{}, false, fmt.Errorf("state: load planner state: %w", err)
+	}
+	return ps, true, nil
+}
+
+// RecordPlannerOffer marks an event as considered by the intent planner. It
+// does not mutate capture_events.state, so replay barriers and pending FIFO
+// semantics remain owned by the replay layer.
+func RecordPlannerOffer(ctx context.Context, d *DB, eventSeq int64, plannedTS float64) error {
+	if eventSeq <= 0 {
+		return fmt.Errorf("state: RecordPlannerOffer: event_seq must be positive")
+	}
+	if plannedTS <= 0 {
+		plannedTS = nowSeconds()
+	}
+	const q = `
+INSERT INTO planner_state(event_seq, defer_count, last_planned_ts, last_defer_reason, last_plan_error)
+VALUES (?, 0, ?, NULL, NULL)
+ON CONFLICT(event_seq) DO UPDATE SET
+    last_planned_ts = excluded.last_planned_ts,
+    last_plan_error = NULL`
+	if _, err := d.conn.ExecContext(ctx, q, eventSeq, plannedTS); err != nil {
+		return fmt.Errorf("state: record planner offer: %w", err)
+	}
+	return nil
+}
+
+// RecordPlannerDefer increments an event's deferral count and stores the most
+// recent reason. The increment happens inside SQLite, so concurrent callers do
+// not lose updates.
+func RecordPlannerDefer(ctx context.Context, d *DB, eventSeq int64, plannedTS float64, reason string) error {
+	if eventSeq <= 0 {
+		return fmt.Errorf("state: RecordPlannerDefer: event_seq must be positive")
+	}
+	if plannedTS <= 0 {
+		plannedTS = nowSeconds()
+	}
+	reasonValue := sql.NullString{String: reason, Valid: reason != ""}
+	const q = `
+INSERT INTO planner_state(event_seq, defer_count, last_planned_ts, last_defer_reason, last_plan_error)
+VALUES (?, 1, ?, ?, NULL)
+ON CONFLICT(event_seq) DO UPDATE SET
+    defer_count = planner_state.defer_count + 1,
+    last_planned_ts = excluded.last_planned_ts,
+    last_defer_reason = excluded.last_defer_reason,
+    last_plan_error = NULL`
+	if _, err := d.conn.ExecContext(ctx, q, eventSeq, plannedTS, reasonValue); err != nil {
+		return fmt.Errorf("state: record planner defer: %w", err)
+	}
+	return nil
+}
+
+// RecordPlannerError stores the last planner failure for an event without
+// moving the capture event out of the pending queue.
+func RecordPlannerError(ctx context.Context, d *DB, eventSeq int64, plannedTS float64, errMsg string) error {
+	if eventSeq <= 0 {
+		return fmt.Errorf("state: RecordPlannerError: event_seq must be positive")
+	}
+	if plannedTS <= 0 {
+		plannedTS = nowSeconds()
+	}
+	errValue := sql.NullString{String: errMsg, Valid: errMsg != ""}
+	const q = `
+INSERT INTO planner_state(event_seq, defer_count, last_planned_ts, last_defer_reason, last_plan_error)
+VALUES (?, 0, ?, NULL, ?)
+ON CONFLICT(event_seq) DO UPDATE SET
+    last_planned_ts = excluded.last_planned_ts,
+    last_plan_error = excluded.last_plan_error`
+	if _, err := d.conn.ExecContext(ctx, q, eventSeq, plannedTS, errValue); err != nil {
+		return fmt.Errorf("state: record planner error: %w", err)
+	}
+	return nil
+}
+
+// OldestOverduePlannerEvent returns the oldest pending event whose defer_count
+// has reached deferLimit. Ties are resolved by event_seq for deterministic
+// planner behavior.
+func OldestOverduePlannerEvent(ctx context.Context, d *DB, branchRef string, branchGeneration int64, deferLimit int) (CaptureEvent, PlannerState, bool, error) {
+	if branchRef == "" {
+		return CaptureEvent{}, PlannerState{}, false, fmt.Errorf("state: OldestOverduePlannerEvent: empty branch_ref")
+	}
+	if deferLimit < 0 {
+		deferLimit = 0
+	}
+	const q = `
+SELECT e.seq, e.branch_ref, e.branch_generation, e.base_head, e.operation, e.path, e.old_path,
+       e.fidelity, e.captured_ts, e.published_ts, e.state, e.commit_oid, e.error, e.message,
+       ps.event_seq, ps.defer_count, ps.last_planned_ts, ps.last_defer_reason, ps.last_plan_error
+FROM planner_state ps
+JOIN capture_events e ON e.seq = ps.event_seq
+WHERE e.branch_ref = ?
+  AND e.branch_generation = ?
+  AND e.state = ?
+  AND ps.defer_count >= ?
+ORDER BY ps.last_planned_ts ASC, ps.event_seq ASC
+LIMIT 1`
+	var ev CaptureEvent
+	var ps PlannerState
+	err := d.readSQL().QueryRowContext(ctx, q, branchRef, branchGeneration, EventStatePending, deferLimit).Scan(
+		&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead, &ev.Operation, &ev.Path, &ev.OldPath,
+		&ev.Fidelity, &ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID, &ev.Error, &ev.Message,
+		&ps.EventSeq, &ps.DeferCount, &ps.LastPlannedTS, &ps.LastDeferReason, &ps.LastPlanError,
+	)
+	if err == sql.ErrNoRows {
+		return CaptureEvent{}, PlannerState{}, false, nil
+	}
+	if err != nil {
+		return CaptureEvent{}, PlannerState{}, false, fmt.Errorf("state: oldest overdue planner event: %w", err)
+	}
+	return ev, ps, true, nil
 }
 
 // CountEventsByState returns the number of capture_events rows matching the
