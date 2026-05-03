@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,6 +156,7 @@ func runPause(ctx context.Context, out io.Writer, repoFlag, reason, ttlFlag stri
 		Overwrote:  overwrote,
 		Marker:     marker,
 	}
+	appendPauseDecision(ctx, gitDir, state.DecisionKindPaused, reason, "manual pause marker written")
 	return renderPause(out, res, jsonOut)
 }
 
@@ -249,6 +251,7 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		return fmt.Errorf("acd resume: remove marker: %w", err)
 	}
 	stampManualPauseResume(ctx, gitDir)
+	appendPauseDecision(ctx, gitDir, state.DecisionKindResumed, marker.Reason, "manual pause marker removed")
 
 	res := resumeResult{
 		OK:                  true,
@@ -263,6 +266,37 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 		BackpressureSetAt:   bpSetAt,
 	}
 	return renderResume(out, res, jsonOut)
+}
+
+func appendPauseDecision(ctx context.Context, gitDir, kind, reason, action string) {
+	dbPath := state.DBPathFromGitDir(gitDir)
+	if _, err := os.Stat(dbPath); err != nil {
+		return
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		return
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:        kind,
+		Reason:      sql.NullString{String: reason, Valid: reason != ""},
+		ActionTaken: sql.NullString{String: action, Valid: action != ""},
+		UserMessage: sql.NullString{String: pauseDecisionMessage(kind, reason), Valid: true},
+	}); err != nil {
+		log.Printf("acd pause: append %s decision: %v", kind, err)
+	}
+}
+
+func pauseDecisionMessage(kind, reason string) string {
+	switch kind {
+	case state.DecisionKindPaused:
+		return fmt.Sprintf("Manual pause started: %s.", reason)
+	case state.DecisionKindResumed:
+		return fmt.Sprintf("Manual pause resumed: %s.", reason)
+	default:
+		return kind
+	}
 }
 
 func stampManualPauseResume(ctx context.Context, gitDir string) {
