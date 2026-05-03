@@ -57,6 +57,10 @@ const (
 	// CompleteFlushRequest. Sweeping them at startup keeps `acd status` /
 	// queue depth metrics from accumulating ghosts forever.
 	OrphanFlushAckThreshold = 5 * time.Minute
+	// manualResumeResyncWindow is the grace period after `acd resume` during
+	// which a same-branch fast-forward preserves shadow state so paused local
+	// edits can self-heal against an external commit that landed while paused.
+	manualResumeResyncWindow = 30 * time.Second
 )
 
 // EnvClientTTLSeconds is the environment knob for ACD_CLIENT_TTL_SECONDS
