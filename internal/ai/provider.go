@@ -107,21 +107,27 @@ func (c *composed) Generate(ctx context.Context, cc CommitContext) (Result, erro
 	return r, nil
 }
 
-// PlanIntent tries the primary planner and falls back to the secondary planner
-// on provider errors or invalid/empty plans. This mirrors Generate's fallback
-// contract for commit-message generation.
+// PlanIntent uses the primary planner when it supports intent planning. Unlike
+// Generate, primary planner errors and invalid plans are returned directly so
+// replay can record intent_planner_error diagnostics before invoking its own
+// deterministic fallback path.
 func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (IntentPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return IntentPlan{}, err
 	}
 	if primary, ok := c.primary.(IntentPlanner); ok {
 		plan, err := primary.PlanIntent(ctx, req)
-		if err == nil && ValidateIntentPlan(req, plan) == nil {
-			if plan.Source == "" {
-				plan.Source = c.primary.Name()
-			}
-			return plan, nil
+		if err != nil {
+			return IntentPlan{}, err
 		}
+		plan = NormalizeIntentPlanReasons(plan)
+		if err := ValidateIntentPlan(req, plan); err != nil {
+			return IntentPlan{}, err
+		}
+		if plan.Source == "" {
+			plan.Source = c.primary.Name()
+		}
+		return plan, nil
 	}
 	fallback, ok := c.fallback.(IntentPlanner)
 	if !ok {
@@ -129,6 +135,10 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 	}
 	plan, err := fallback.PlanIntent(ctx, req)
 	if err != nil {
+		return IntentPlan{}, err
+	}
+	plan = NormalizeIntentPlanReasons(plan)
+	if err := ValidateIntentPlan(req, plan); err != nil {
 		return IntentPlan{}, err
 	}
 	if plan.Source == "" {
