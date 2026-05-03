@@ -559,6 +559,20 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
+		startupPaused, pauseErr := daemonPauseState(ctx, opts.GitDir, opts.DB)
+		if pauseErr != nil {
+			logger.Warn("read pause state before startup fast-forward resync",
+				"err", pauseErr.Error())
+			startupFastForwardResync = false
+			branchTransitionBlocked = true
+		} else if startupPaused.Active {
+			logger.Info("startup fast-forward observed while paused; preserving shadow for resume",
+				"source", startupPaused.Source,
+				"reason", startupPaused.Reason)
+			startupFastForwardResync = false
+		}
+	}
+	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
 		dropped, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
 			cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
 		if dropErr != nil {
@@ -1064,6 +1078,39 @@ func Run(ctx context.Context, opts Options) error {
 				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
 					"fast-forward inside rewind grace")
 			} else {
+				fastForwardPaused, pauseErr := daemonPauseState(ctx, opts.GitDir, opts.DB)
+				if pauseErr != nil {
+					logger.Warn("read pause state before branch fast-forward resync",
+						"err", pauseErr.Error())
+					return true
+				}
+				if fastForwardPaused.Active {
+					logger.Info("branch fast-forward observed while paused; preserving shadow for resume",
+						"old", oldToken,
+						"new", newToken,
+						"generation", cctx.BranchGeneration,
+						"source", fastForwardPaused.Source,
+						"reason", fastForwardPaused.Reason)
+					recordTrace(tracer, acdtrace.Event{
+						Repo:       opts.RepoPath,
+						BranchRef:  cctx.BranchRef,
+						HeadSHA:    cctx.BaseHead,
+						EventClass: "branch_token.transition",
+						Decision:   transition.String(),
+						Reason:     "fast-forward observed while paused; preserving shadow for resume",
+						Input:      map[string]any{"previous": oldToken, "current": newToken},
+						Output: map[string]any{
+							"generation": cctx.BranchGeneration,
+							"source":     fastForwardPaused.Source,
+						},
+						Generation: cctx.BranchGeneration,
+					})
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist branch head", "err", err.Error())
+					}
+					return true
+				}
 				droppedUnpublished, dropErr := state.DeleteStaleUnpublishedForBranchGeneration(ctx, opts.DB,
 					cctx.BranchRef, cctx.BranchGeneration, cctx.BaseHead)
 				if dropErr != nil {
