@@ -6,7 +6,6 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 )
 
 func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
@@ -176,8 +177,12 @@ func TestIntentStrategy_InvalidEnvFallsBackToEventDefaults(t *testing.T) {
 	t.Setenv("ACD_INTENT_WINDOW", "0")
 	t.Setenv("ACD_INTENT_RECENT_COMMITS", "bogus")
 	t.Setenv("ACD_INTENT_DEFER_LIMIT", "-1")
-	cfg := aiProviderConfigForIntegrationTest()
-	if got := fmt.Sprint(cfg.CommitStrategy, cfg.IntentWindow, cfg.IntentRecentCommits, cfg.IntentDeferLimit); got != "event1052" {
-		t.Fatalf("fallback config = %s, want event1052", got)
+	cfg := ai.LoadProviderConfigFromEnv()
+	if cfg.CommitStrategy != ai.CommitStrategyEvent ||
+		cfg.IntentWindow != ai.DefaultIntentWindow ||
+		cfg.IntentRecentCommits != ai.DefaultIntentRecentCommits ||
+		cfg.IntentDeferLimit != ai.DefaultIntentDeferLimit {
+		t.Fatalf("fallback config = strategy=%s window=%d recent=%d defer=%d",
+			cfg.CommitStrategy, cfg.IntentWindow, cfg.IntentRecentCommits, cfg.IntentDeferLimit)
 	}
 }
