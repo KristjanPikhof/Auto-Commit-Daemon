@@ -147,6 +147,18 @@ export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
 
+~~~bash
+# Strict-message builds for teams with commit-message validators.
+export ACD_COMMIT_STRATEGY=intent
+export ACD_COMMIT_MESSAGE_STRICT=1
+export ACD_AI_REPAIR_ATTEMPTS=2
+~~~
+
+Set `ACD_COMMIT_MESSAGE_STRICT` and `ACD_AI_REPAIR_ATTEMPTS` only with a build
+that includes strict message validation. For this intent strategy, ACD's
+grouping safety and planner validation still run before any strict-message
+repair layer.
+
 Troubleshooting:
 
 - `acd status` and `acd diagnose --json` show active strategy, deferred count,
