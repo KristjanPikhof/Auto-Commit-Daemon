@@ -27,6 +27,7 @@ type explainReport struct {
 	Explanation    string       `json:"explanation"`
 	Recommended    string       `json:"recommended_next_step"`
 	DecisionCursor int64        `json:"decision_cursor,omitempty"`
+	DecisionLedgerAvailable bool `json:"decision_ledger_available"`
 	Decisions      []eventEntry `json:"decisions"`
 }
 
@@ -113,6 +114,7 @@ func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, comm
 	if err != nil {
 		return report, fmt.Errorf("acd explain: decision table check: %w", err)
 	}
+	report.DecisionLedgerAvailable = hasLedger
 	switch {
 	case path != "":
 		report.Mode = "path"
@@ -186,7 +188,7 @@ func summarizeExplain(report explainReport) (string, string) {
 		if report.DecisionCursor > 0 && report.Mode == "recent" {
 			return "No ACD decisions have been recorded after that cursor.", "Run `acd events --watch` to stream newly appended decisions."
 		}
-		if !decisionLedgerPresent(report) {
+		if !report.DecisionLedgerAvailable {
 			return missingDecisionLedgerMessage, "Run `acd status`; start or restart acd with a current version if you need product decision history."
 		}
 		switch report.Mode {
@@ -216,10 +218,6 @@ func summarizeExplain(report explainReport) (string, string) {
 		next = "Replay is still pending for this path; run `acd status` to check blockers."
 	}
 	return explanation, next
-}
-
-func decisionLedgerPresent(report explainReport) bool {
-	return len(report.Decisions) > 0 || report.DecisionCursor == 0
 }
 
 func explainByKind(d eventEntry) string {
