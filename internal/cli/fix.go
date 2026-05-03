@@ -173,10 +173,16 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun bool) (fixPl
 	if err := planBackpressureFix(ctx, conn, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
-		return fixPlan{}, err
+	hasDecisionRecords, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fixPlan{}, fmt.Errorf("acd fix: check decision ledger: %w", err)
 	}
-	if err := planObsoleteBarrierFix(ctx, conn, &plan); err != nil {
+	if hasDecisionRecords {
+		if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
+			return fixPlan{}, err
+		}
+	}
+	if err := planObsoleteBarrierFix(ctx, conn, hasDecisionRecords, &plan); err != nil {
 		return fixPlan{}, err
 	}
 	return plan, nil
@@ -273,11 +279,10 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 	return nil
 }
 
-func planObsoleteBarrierFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
-	rows, err := conn.QueryContext(ctx, `
-SELECT seq, path, state
-FROM capture_events e
-WHERE state IN (?, ?)
+func planObsoleteBarrierFix(ctx context.Context, conn *sql.DB, hasDecisionRecords bool, plan *fixPlan) error {
+	decisionFilter := ""
+	if hasDecisionRecords {
+		decisionFilter = `
   AND NOT EXISTS (
       SELECT 1
       FROM decision_records d
@@ -285,7 +290,13 @@ WHERE state IN (?, ?)
         AND d.kind IN (?, ?)
         AND d.commit_oid IS NOT NULL
         AND d.commit_oid <> ''
-  )
+  )`
+	}
+	q := `
+SELECT seq, path, state
+FROM capture_events e
+WHERE state IN (?, ?)
+` + decisionFilter + `
   AND NOT EXISTS (
       SELECT 1
       FROM capture_events pending
@@ -294,10 +305,13 @@ WHERE state IN (?, ?)
         AND pending.seq > e.seq
         AND pending.state = ?
   )
-ORDER BY seq ASC`,
-		state.EventStateBlockedConflict, state.EventStateFailed,
-		state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal,
-		state.EventStatePending)
+ORDER BY seq ASC`
+	args := []any{state.EventStateBlockedConflict, state.EventStateFailed}
+	if hasDecisionRecords {
+		args = append(args, state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal)
+	}
+	args = append(args, state.EventStatePending)
+	rows, err := conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("acd fix: query obsolete barriers: %w", err)
 	}
@@ -323,10 +337,9 @@ ORDER BY seq ASC`,
 	}
 
 	var blocking int
-	if err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM capture_events e
-WHERE state IN (?, ?)
+	blockingDecisionFilter := ""
+	if hasDecisionRecords {
+		blockingDecisionFilter = `
   AND NOT EXISTS (
       SELECT 1
       FROM decision_records d
@@ -334,7 +347,13 @@ WHERE state IN (?, ?)
         AND d.kind IN (?, ?)
         AND d.commit_oid IS NOT NULL
         AND d.commit_oid <> ''
-  )
+  )`
+	}
+	blockingQ := `
+SELECT COUNT(*)
+FROM capture_events e
+WHERE state IN (?, ?)
+` + blockingDecisionFilter + `
   AND EXISTS (
       SELECT 1
       FROM capture_events pending
@@ -342,10 +361,13 @@ WHERE state IN (?, ?)
         AND pending.branch_generation = e.branch_generation
         AND pending.seq > e.seq
         AND pending.state = ?
-  )`,
-		state.EventStateBlockedConflict, state.EventStateFailed,
-		state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal,
-		state.EventStatePending).Scan(&blocking); err != nil {
+  )`
+	blockingArgs := []any{state.EventStateBlockedConflict, state.EventStateFailed}
+	if hasDecisionRecords {
+		blockingArgs = append(blockingArgs, state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal)
+	}
+	blockingArgs = append(blockingArgs, state.EventStatePending)
+	if err := conn.QueryRowContext(ctx, blockingQ, blockingArgs...).Scan(&blocking); err != nil {
 		return fmt.Errorf("acd fix: count active barriers: %w", err)
 	}
 	if blocking > 0 {
@@ -395,6 +417,14 @@ ORDER BY e.seq ASC, d.id DESC`,
 			continue
 		}
 		seen[c.seq] = true
+		ops, err := loadFixCaptureOps(ctx, conn, c.seq)
+		if err != nil {
+			return err
+		}
+		if len(ops) == 0 {
+			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d has no capture ops to verify", c.decisionID, c.seq))
+			continue
+		}
 		ok, err := git.IsAncestor(ctx, repo, c.commitOID, head)
 		if err != nil {
 			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d references unresolved commit %s", c.decisionID, c.seq, c.commitOID))
@@ -402,6 +432,14 @@ ORDER BY e.seq ASC, d.id DESC`,
 		}
 		if !ok {
 			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d references commit %s outside current HEAD history", c.decisionID, c.seq, shortOID(c.commitOID, 12)))
+			continue
+		}
+		matches, err := currentHeadMatchesFixDecision(ctx, repo, head, c.kind, ops)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d no longer matches current HEAD tree", c.decisionID, c.seq))
 			continue
 		}
 		plan.Actions = append(plan.Actions, fixAction{
