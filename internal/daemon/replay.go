@@ -1464,6 +1464,8 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 		action = "superseded externally"
 	case state.DecisionKindCommitted:
 		action = "committed"
+	case state.DecisionKindBlocked:
+		action = "blocked_conflict"
 	}
 	message := replayDecisionMessage(kind, ev.Path, commitOID)
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
@@ -1507,6 +1509,11 @@ func replayDecisionMessage(kind, path, commitOID string) string {
 		if shortCommit != "" {
 			return fmt.Sprintf("Committed queued change as %s.", shortCommit)
 		}
+	case state.DecisionKindBlocked:
+		if path != "" {
+			return fmt.Sprintf("Blocked replay for %s.", path)
+		}
+		return "Blocked replay for queued change."
 	}
 	return ""
 }
@@ -1578,6 +1585,7 @@ func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, is
 	); err != nil {
 		return fmt.Errorf("daemon: mark blocked seq=%d: %w", ev.Seq, err)
 	}
+	recordReplayDecision(ctx, db, ev, cctx, nowSec, state.DecisionKindBlocked, issue.Message, "")
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
 	return nil
 }
