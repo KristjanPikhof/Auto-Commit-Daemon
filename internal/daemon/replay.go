@@ -321,6 +321,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		return sum, err
 	}
 
+	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
+	if err != nil {
+		return sum, err
+	}
+	if closeIntentPlanner != nil {
+		defer closeIntentPlanner()
+	}
+	if intentCfg.enabled {
+		return replayIntentBatch(ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile, pending, parent, parentTree, sum)
+	}
+
 	for _, ev := range pending {
 		if err := ctx.Err(); err != nil {
 			return sum, err
