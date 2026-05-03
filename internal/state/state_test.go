@@ -599,6 +599,74 @@ PRAGMA user_version = 6;`); err != nil {
 	}
 }
 
+func TestPlannerStateMigrationFromV6DoesNotRebuildDecisionRecords(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+CREATE TABLE decision_records(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          REAL NOT NULL,
+    kind                TEXT NOT NULL,
+    path                TEXT,
+    reason              TEXT,
+    event_seq           INTEGER,
+    head_sha            TEXT,
+    commit_oid          TEXT,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    action_taken        TEXT,
+    user_message        TEXT
+);
+CREATE INDEX custom_decision_records_kind ON decision_records(kind);
+INSERT INTO decision_records(
+    id, decision_ts, kind, path, event_seq, commit_oid, branch_ref,
+    branch_generation, action_taken
+) VALUES (
+    5, 30, 'committed', 'src/app.go', 7, 'def456', 'refs/heads/main',
+    1, 'committed'
+);
+PRAGMA user_version = 6;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v6 db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v6: %v", err)
+	}
+	defer d.Close()
+
+	var customIndex string
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'decision_records' AND name = 'custom_decision_records_kind'`).Scan(&customIndex); err != nil {
+		t.Fatalf("custom decision_records index missing after v6->v7 migration: %v", err)
+	}
+	if customIndex != "custom_decision_records_kind" {
+		t.Fatalf("custom index name=%q want custom_decision_records_kind", customIndex)
+	}
+
+	got, err := DecisionsForEvent(ctx, d, 7, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != 5 {
+		t.Fatalf("decisions after v6->v7 migration = %+v, want id 5", got)
+	}
+}
+
 func TestPlannerStateIndexesExist(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
