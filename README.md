@@ -215,6 +215,10 @@ for the full `event_class` enumeration.
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated patterns appended to the safe-ignore defaults, for example `dist/,build/`. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
+| `ACD_COMMIT_STRATEGY` | `event` | `event` preserves one captured event per commit. `intent` asks the AI planner to select one or more pending captures for the next commit. |
+| `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the intent planner in one normal planning pass. |
+| `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact planner context. |
+| `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before ACD forces the overdue capture into a one-item planning window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
 
 ACD also skips common generated dependency/cache trees even when a project has
@@ -224,6 +228,45 @@ not gitignored them: `node_modules/`, `target/`, `.venv/`, `venv/`,
 watcher work. Use `acd doctor` to inspect the active safe-ignore pattern list.
 `ACD_SAFE_IGNORE` and `ACD_SAFE_IGNORE_EXTRA` are read when the daemon starts;
 stop and restart an existing daemon before expecting those changes to apply.
+
+### Commit strategy profiles
+
+Compatibility default:
+
+~~~bash
+export ACD_COMMIT_STRATEGY=event
+~~~
+
+Reviewer-friendly local work:
+
+~~~bash
+export ACD_COMMIT_STRATEGY=intent
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+~~~
+
+Private-code metadata-only setup:
+
+~~~bash
+export ACD_COMMIT_STRATEGY=intent
+export ACD_AI_PROVIDER=openai-compat
+# Leave ACD_AI_DIFF_EGRESS unset.
+~~~
+
+Self-hosted AI with explicit diff egress:
+
+~~~bash
+export ACD_COMMIT_STRATEGY=intent
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_BASE_URL=https://ai.example.internal/v1
+export ACD_AI_DIFF_EGRESS=1
+~~~
+
+Use `event` for CI smoke runs and compatibility-sensitive shared branches.
+Use `intent` when review quality matters and the AI endpoint is trusted. Intent
+planning may group related captures, choose exactly one capture, or defer
+unrelated captures. Over-deferred captures are forced through a one-capture
+planner window so they cannot starve.
 
 ## Docs
 
