@@ -197,23 +197,23 @@ repeated rebases.
 
 ## AI diff from captured blobs
 
-When a network-bound AI provider is configured (`openai-compat` or
-`subprocess:<name>`), `acd` reconstructs a unified diff from the captured
-`before_oid` / `after_oid` blobs rather than inspecting the live worktree.
-This means:
+When an AI provider can use diff context, `acd` reconstructs a unified diff only
+if both conditions are true: the provider declares `NeedsDiff`, and the operator
+has opted in with `ACD_AI_DIFF_EGRESS=1`. The diff is built from captured
+`before_oid` / `after_oid` blobs rather than inspecting the live worktree. This
+means:
 
 - The diff reflects exactly what was captured, even if the file has changed
   many times since.
-- The diff is capped at `DiffCap` (4000 bytes) while it is rendered. Long diffs
-  stop at a line boundary while preserving the diff header(s) so the model
-  still sees which file is being described.
+- The rendered diff is capped at `DiffCap` (4000 bytes) while sections are
+  appended. Each per-op git diff has a smaller git-layer cap of `2 * DiffCap`
+  and a 5s timeout, so a large blob cannot stall the whole message build.
 - `create` and `delete` ops use git's well-known empty-blob OID
   (`e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`) for the missing side.
 
-Diff reconstruction is gated on provider capability via `ai.ProviderNeedsDiff`.
 The deterministic provider declares that it does not need diffs, so default
-replay skips reconstruction entirely and only builds diff text for providers
-that can use it.
+replay skips reconstruction. Selecting `openai-compat` or `subprocess:<name>` is
+not enough by itself; without `ACD_AI_DIFF_EGRESS=1`, ACD sends metadata only.
 
 ---
 
@@ -765,8 +765,8 @@ See [docs/ai-providers.md](ai-providers.md) for the full provider reference.
 
 Enable `ACD_TRACE=1` to write JSONL decision records to `<gitDir>/acd/trace/`
 (see `CLAUDE.md` Trace log format for the full record schema). Every record
-has an `event_class` field that identifies the decision point. The complete
-enumeration:
+has an `event_class` field that identifies the decision point. Current event
+classes:
 
 | `event_class` | When emitted | Key `input` fields | Key `output` fields |
 |---|---|---|---|
@@ -778,6 +778,7 @@ enumeration:
 | `replay.conflict` | Event becomes `blocked_conflict` (before-state mismatch, CAS failure, or generation mismatch) | `operation`, `path` | `expected_sha`, `actual_sha`, `ref` |
 | `replay.failed` | Event becomes `failed` (bad op data, ancestry error, write-tree failure) | `operation`, `path` | — |
 | `replay.update_ref` | Each `git update-ref` attempt during commit publish (per-retry) | — | `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha`, `actual_sha` |
+| `replay.live_index` | Path-scoped live-index reconciliation after publish or startup repair | `operation`, `path` | `decision`, `reason` |
 | `replay.pause` | Replay drain skipped because paused (manual or rewind grace) | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
 | `branch_token.transition` | HEAD movement classified at startup or per poll tick | `previous`, `current` | `prev_generation`, `new_generation`, `dropped_pending` |
 | `daemon.pause` | Git operation in progress (rebase, merge, cherry-pick, bisect) detected (decision `paused`) or cleared (decision `resumed`) | `operation` | — |
