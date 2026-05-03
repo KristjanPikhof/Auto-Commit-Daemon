@@ -766,7 +766,7 @@ func regDaemonSelfTerminatesOnEmptySweeps(t *testing.T) {
 	// Out-of-band: drop every daemon_clients row so the daemon's next
 	// sweep observes empty.
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if out, err := exec.Command("sqlite3", dbPath, "DELETE FROM daemon_clients").CombinedOutput(); err != nil {
+	if out, err := exec.Command("sqlite3", dbPath, "PRAGMA busy_timeout=5000; DELETE FROM daemon_clients").CombinedOutput(); err != nil {
 		t.Fatalf("drop clients: %v\n%s", err, out)
 	}
 
