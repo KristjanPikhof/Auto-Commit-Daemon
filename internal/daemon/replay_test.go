@@ -3203,6 +3203,44 @@ func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
 	return n
 }
 
+func TestPathsTouchedBetween_QuietDiffExitCodesAndCancellation(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "touched.txt", beforeBlob, "base")
+	after := commitSingleFileTree(t, ctx, f.dir, "touched.txt", afterBlob, "after", base)
+
+	touched, err := pathsTouchedBetween(ctx, f.dir, base, after, []string{"touched.txt"})
+	if err != nil {
+		t.Fatalf("pathsTouchedBetween changed path: %v", err)
+	}
+	if !touched {
+		t.Fatal("changed path reported untouched")
+	}
+
+	touched, err = pathsTouchedBetween(ctx, f.dir, base, after, []string{"other.txt"})
+	if err != nil {
+		t.Fatalf("pathsTouchedBetween unrelated path: %v", err)
+	}
+	if touched {
+		t.Fatal("unrelated path reported touched")
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := pathsTouchedBetween(cancelled, f.dir, base, after, []string{"touched.txt"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pathsTouchedBetween canceled err=%v want context.Canceled", err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // alreadyPublishedAtHEAD probe-gap unit tests.
 //
