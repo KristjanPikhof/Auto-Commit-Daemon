@@ -59,7 +59,7 @@ func TestExplainableUX_ProtectedTrackedSensitiveFileIsNotDeleted(t *testing.T) {
 	if explain.ExitCode != 0 {
 		t.Fatalf("acd explain exit=%d\nstdout=%s\nstderr=%s", explain.ExitCode, explain.Stdout, explain.Stderr)
 	}
-	for _, want := range []string{"Explanation:", "ACD skipped .env", "Next: No action is needed"} {
+	for _, want := range []string{"Explanation:", "Skipped present protected path .env", "Next: No action is needed"} {
 		if !strings.Contains(explain.Stdout, want) {
 			t.Fatalf("explain output missing %q:\n%s", want, explain.Stdout)
 		}
