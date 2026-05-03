@@ -231,16 +231,17 @@ larger non-empty subset. Every offered seq must be either selected or deferred.
 
 ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
 omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
-events that would leapfrog an earlier same-path dependency. Selected captures
-are sorted by seq, applied through the scratch index in order, written as one
-tree, committed once, and settled with a shared `commit_oid`. Deferred captures
-stay pending and get durable `planner_state` with `defer_count`,
-`last_planned_ts`, and `last_defer_reason`.
+events that would leapfrog an earlier same-path or nested-path dependency
+(`foo` before `foo/bar`, including rename sources). Selected captures are sorted
+by seq, applied through the scratch index in order, written as one tree,
+committed once, and settled with a shared `commit_oid`. Deferred captures stay
+pending and get durable `planner_state` with `defer_count`, `last_planned_ts`,
+and `last_defer_reason`.
 
 When `defer_count >= ACD_INTENT_DEFER_LIMIT`, the oldest overdue capture is
-forced through a one-item planning window unless an earlier pending same-path
+forced through a one-item planning window unless an earlier pending related-path
 capture must land first. This prevents starvation while preserving ordered
-same-path replay.
+path-dependent replay.
 
 Intent-specific observability:
 
