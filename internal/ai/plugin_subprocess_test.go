@@ -90,6 +90,43 @@ done
 	}
 }
 
+func TestSubprocess_PlanIntent(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"intent_plan"'*'"planner_request"'*)
+      printf '{"version":1,"selected_seqs":[101],"deferred_seqs":[102],"subject":"Update checkout flow","body":"","grouping_reason":"single focused checkout change","deferred_reasons":[{"seq":102,"reason":"separate documentation change"}],"error":""}\n'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing planner request"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	plan, err := p.PlanIntent(context.Background(), sampleIntentPlanRequest(t))
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected=%v", plan.SelectedSeqs)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Reason == "" {
+		t.Fatalf("deferred reasons=%+v", plan.DeferredReasons)
+	}
+	if plan.Source != "subprocess:test" {
+		t.Fatalf("source=%q", plan.Source)
+	}
+}
+
 func TestSubprocess_RedactsDiffBeforeSend(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
