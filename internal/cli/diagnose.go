@@ -494,6 +494,16 @@ func diagnoseRemediation(report diagnoseReport) []string {
 			fmt.Sprintf("capture is in durable backpressure (paused at %s, %d events dropped lifetime); replay must drain pending below the high-water mark, or run `acd resume --accept-overflow` to clear the gate and accept the loss.",
 				report.BackpressurePausedAt, report.EventsDroppedTotal))
 	}
+	if report.IntentStrategy.LastPlannerError != "" {
+		remediation = append(remediation,
+			fmt.Sprintf("intent planner last failed validation for seq %d (%s); replay will use deterministic fallback until planner output is valid.",
+				report.IntentStrategy.LastPlannerErrorEventSeq, report.IntentStrategy.LastPlannerError))
+	}
+	if report.IntentStrategy.ForcedAgingReady > 0 {
+		remediation = append(remediation,
+			fmt.Sprintf("%d pending capture(s) reached the intent defer limit and are eligible for forced one-item planning windows.",
+				report.IntentStrategy.ForcedAgingReady))
+	}
 	if report.StaleOperationMarker {
 		remediation = append(remediation,
 			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
