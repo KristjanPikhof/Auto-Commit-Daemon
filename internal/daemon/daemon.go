@@ -574,6 +574,11 @@ func Run(ctx context.Context, opts Options) error {
 				"source", startupPaused.Source,
 				"reason", startupPaused.Reason)
 			startupFastForwardResync = false
+		} else if resumed, stamp := manualPauseRecentlyResumed(ctx, opts.DB, now()); resumed {
+			logger.Info("startup fast-forward observed after manual resume; preserving shadow for self-heal",
+				"resumed_at", stamp)
+			startupFastForwardResync = false
+			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
 		}
 	}
 	if startupFastForwardResync && cctx.BranchRef != "" && cctx.BaseHead != "" {
@@ -1109,6 +1114,33 @@ func Run(ctx context.Context, opts Options) error {
 						},
 						Generation: cctx.BranchGeneration,
 					})
+					if err := SaveBranchGeneration(ctx, opts.DB,
+						cctx.BranchGeneration, headOID); err != nil {
+						logger.Warn("persist branch head", "err", err.Error())
+					}
+					return true
+				}
+				if resumed, stamp := manualPauseRecentlyResumed(ctx, opts.DB, now()); resumed {
+					logger.Info("branch fast-forward observed after manual resume; preserving shadow for self-heal",
+						"old", oldToken,
+						"new", newToken,
+						"generation", cctx.BranchGeneration,
+						"resumed_at", stamp)
+					recordTrace(tracer, acdtrace.Event{
+						Repo:       opts.RepoPath,
+						BranchRef:  cctx.BranchRef,
+						HeadSHA:    cctx.BaseHead,
+						EventClass: "branch_token.transition",
+						Decision:   transition.String(),
+						Reason:     "fast-forward observed after manual resume; preserving shadow for self-heal",
+						Input:      map[string]any{"previous": oldToken, "current": newToken},
+						Output: map[string]any{
+							"generation": cctx.BranchGeneration,
+							"resumed_at": stamp,
+						},
+						Generation: cctx.BranchGeneration,
+					})
+					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
 					if err := SaveBranchGeneration(ctx, opts.DB,
 						cctx.BranchGeneration, headOID); err != nil {
 						logger.Warn("persist branch head", "err", err.Error())
