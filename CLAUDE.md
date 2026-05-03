@@ -119,20 +119,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - `acd list --watch --interval 2s` redraws table with timestamp; one-shot output unchanged; one-shot `--json` works; `--watch` rejects `--json`.
 - `acd events --watch`: no `--since` starts at current ledger tail; with `--since`, resumes after cursor.
 - `acd status`, `acd diagnose`, `acd doctor` show `failed_events`, `failed_blocking_pending`, intent summaries; guide to `acd fix --dry-run`.
-- `acd doctor` tails logs best-effort, sanitizes `$HOME` to `~`, bundles logs, ignore patterns, fsnotify stats, state/meta JSON.
-
-```bash
-acd status --repo .
-acd list --watch --interval 2s
-acd events --watch
-acd logs --repo . --lines 100
-acd logs --repo . --lines 50 --follow
-acd diagnose --repo . --json
-acd doctor --repo . --json
-sqlite3 .git/acd/state.db "SELECT state, COUNT(*) FROM capture_events GROUP BY state;"
-sqlite3 .git/acd/state.db "SELECT seq, operation, path, substr(error,1,100) FROM capture_events WHERE state IN ('blocked_conflict','failed') ORDER BY seq DESC LIMIT 20;"
-git status --short --ignored
-```
+- Useful probes: `acd status --repo .`; `acd events --watch`; `acd logs --repo . --lines 50 --follow`; `acd diagnose --repo . --json`; `acd doctor --repo . --json`; `git status --short --ignored`.
 
 ## CLI read-only UX
 
