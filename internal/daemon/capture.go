@@ -736,6 +736,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		if err != nil {
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
+		recordCapturedDecision(ctx, db, cctx, seq, op)
 		summary.EventsAppended++
 		if pendingCap > 0 {
 			pending++
@@ -846,6 +847,17 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 	if db == nil || path == "" {
 		return
 	}
+	if latest, err := state.DecisionsForPath(ctx, db, path, 1); err == nil && len(latest) == 1 {
+		d := latest[0]
+		if d.Kind == state.DecisionKindProtected &&
+			d.Reason.Valid && d.Reason.String == reason &&
+			d.ActionTaken.Valid && d.ActionTaken.String == "no_delete_generated" &&
+			d.HeadSHA.Valid && d.HeadSHA.String == cctx.BaseHead &&
+			d.BranchRef.Valid && d.BranchRef.String == cctx.BranchRef &&
+			d.BranchGeneration.Valid && d.BranchGeneration.Int64 == cctx.BranchGeneration {
+			return
+		}
+	}
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
 		Kind:             state.DecisionKindProtected,
 		Path:             sql.NullString{String: path, Valid: true},
@@ -857,6 +869,27 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped present protected path %s without generating a delete.", path), Valid: true},
 	}); err != nil {
 		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
+	}
+}
+
+func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureContext, seq int64, op Op) {
+	if db == nil || op.Path == "" {
+		return
+	}
+	action := "queued"
+	message := fmt.Sprintf("Captured %s for %s and queued it for replay.", op.Op, op.Path)
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:             state.DecisionKindCaptured,
+		Path:             sql.NullString{String: op.Path, Valid: true},
+		Reason:           sql.NullString{String: op.Fidelity, Valid: op.Fidelity != ""},
+		EventSeq:         sql.NullInt64{Int64: seq, Valid: seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: true},
+		UserMessage:      sql.NullString{String: message, Valid: true},
+	}); err != nil {
+		slog.Default().Warn("append capture decision", "path", op.Path, "seq", seq, "err", err.Error())
 	}
 }
 
