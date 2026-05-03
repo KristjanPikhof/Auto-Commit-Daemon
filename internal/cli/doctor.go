@@ -109,16 +109,18 @@ type doctorReport struct {
 func newDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Run install + runtime diagnostics; optionally bundle as zip",
-		Long: `Run broad install and runtime diagnostics across acd state.
+		Short: "Collect install/runtime diagnostics and support bundles",
+		Long: `Collect broad install and runtime diagnostics across acd state.
 
 Doctor checks the central registry, daemon liveness, harness installs, AI provider settings, safe-ignore and sensitive-glob configuration, fsnotify status, and recent daemon log tails. Use --bundle to write a zip with sanitized diagnostic files for sharing.
 
-Use acd diagnose for focused replay/branch blockers in the current repo.`,
+Doctor is the support/health command, not the daily "why" view. Use acd status for the current repo snapshot, acd events to follow product decisions, acd explain for path or commit answers, and acd diagnose for focused replay/branch blockers.`,
 		Example: `  acd doctor
   acd doctor --json
   acd doctor --bundle
-  acd doctor --bundle --output /tmp`,
+  acd doctor --bundle --output /tmp
+  acd explain --path internal/state/schema.go
+  acd events --watch`,
 		RunE: func(c *cobra.Command, args []string) error {
 			jsonOut, _ := c.Flags().GetBool("json")
 			bundle, _ := c.Flags().GetBool("bundle")
