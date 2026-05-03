@@ -30,8 +30,11 @@ produce a faithful, chronological commit history without operator intervention.
    each event the daemon applies ops against an isolated scratch index (seeded
    from `BaseHead`), writes a tree with `git write-tree`, creates a commit with
    `git commit-tree`, and advances the branch ref atomically with
-   `git update-ref`. Events that fail conflict checks become `blocked_conflict`
-   (terminal — operator action required) and halt the batch.
+   `git update-ref`. Events that fail conflict checks become
+   `blocked_conflict`; events that fail before a safe commit can be built become
+   `failed`. Both are terminal barriers when they have later pending successors,
+   and `acd status`, `acd diagnose`, `acd doctor`, and `acd fix --dry-run`
+   guide operator recovery.
 
 3. **AI messages.** Commit subjects come from the configured AI provider (or the
    deterministic rule-based fallback). The diff handed to AI providers is
