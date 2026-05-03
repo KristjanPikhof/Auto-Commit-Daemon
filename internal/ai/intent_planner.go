@@ -56,10 +56,10 @@ type IntentPlanRequest struct {
 // serialized. IncludeCapturedDiffs must be true only after the daemon's current
 // diff-egress gates allow it: provider NeedsDiff=true and operator opt-in.
 type IntentPlanRequestOptions struct {
-	LatestCommit        *CommitSummary
-	PathCommitContext   []PathCommitContext
-	OfferedCaptures     []OfferedCapture
-	ForcedAging         bool
+	LatestCommit         *CommitSummary
+	PathCommitContext    []PathCommitContext
+	OfferedCaptures      []OfferedCapture
+	ForcedAging          bool
 	IncludeCapturedDiffs bool
 }
 
