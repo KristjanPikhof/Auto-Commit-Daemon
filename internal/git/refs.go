@@ -38,7 +38,7 @@ var ErrRefAmbiguous = errors.New("git: ref is ambiguous")
 // Pre-fix the call passed --quiet which suppressed both the ambiguity
 // warning AND collapsed missing-ref to exit 1, masking misconfiguration.
 func RevParse(ctx context.Context, repoDir, rev string) (string, error) {
-	out, stderr, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "rev-parse", "--verify", rev)
+	out, stderr, err := RunWithStderr(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "rev-parse", "--verify", rev)
 	if err != nil {
 		var gerr *Error
 		if errors.As(err, &gerr) {
