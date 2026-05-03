@@ -358,6 +358,9 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 		if message == "" {
 			message = "-"
 		}
+		if len(entry.GroupedSeqs) > 1 {
+			message = fmt.Sprintf("%s seqs=%s", message, formatSeqs(entry.GroupedSeqs))
+		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
 			entry.ID, entry.Time, entry.Kind, path, action, message)
 	}
@@ -365,6 +368,17 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 		return fmt.Errorf("acd events: flush output: %w", err)
 	}
 	return nil
+}
+
+func formatSeqs(seqs []int64) string {
+	if len(seqs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(seqs))
+	for _, seq := range seqs {
+		parts = append(parts, strconv.FormatInt(seq, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func decisionEntry(row state.DecisionRecord) eventEntry {
