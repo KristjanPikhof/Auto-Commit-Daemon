@@ -323,6 +323,150 @@ func TestEventsAppendAndPending(t *testing.T) {
 	}
 }
 
+func TestPlannerStateCRUDAndOldestOverdue(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, path string, stateName string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			State:            stateName,
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	first := appendEvent("refs/heads/main", 1, "first.txt", EventStatePending)
+	second := appendEvent("refs/heads/main", 1, "second.txt", EventStatePending)
+	otherBranch := appendEvent("refs/heads/feature", 1, "feature.txt", EventStatePending)
+	published := appendEvent("refs/heads/main", 1, "published.txt", EventStatePublished)
+
+	if err := RecordPlannerOffer(ctx, d, first, 20); err != nil {
+		t.Fatalf("RecordPlannerOffer: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, first, 30, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer first 1: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, first, 40, "still waiting"); err != nil {
+		t.Fatalf("RecordPlannerDefer first 2: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, second, 10, "newer seq but older plan"); err != nil {
+		t.Fatalf("RecordPlannerDefer second: %v", err)
+	}
+	if err := RecordPlannerError(ctx, d, second, 15, "planner parse failed"); err != nil {
+		t.Fatalf("RecordPlannerError: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, otherBranch, 1, "other branch"); err != nil {
+		t.Fatalf("RecordPlannerDefer other branch: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, published, 1, "terminal event"); err != nil {
+		t.Fatalf("RecordPlannerDefer published: %v", err)
+	}
+
+	ps, ok, err := PlannerStateForEvent(ctx, d, first)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent first: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 2 || ps.LastPlannedTS != 40 {
+		t.Fatalf("first planner state = %+v, want defer_count=2 last_planned_ts=40", ps)
+	}
+	if !ps.LastDeferReason.Valid || ps.LastDeferReason.String != "still waiting" {
+		t.Fatalf("first LastDeferReason = %+v", ps.LastDeferReason)
+	}
+	if ps.LastPlanError.Valid {
+		t.Fatalf("first LastPlanError valid after defer: %+v", ps.LastPlanError)
+	}
+
+	ps, ok, err = PlannerStateForEvent(ctx, d, second)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent second: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 1 || !ps.LastPlanError.Valid || ps.LastPlanError.String != "planner parse failed" {
+		t.Fatalf("second planner state = %+v", ps)
+	}
+
+	ev, overdue, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != second || overdue.EventSeq != second {
+		t.Fatalf("oldest overdue seq = event %d planner %d, want second %d", ev.Seq, overdue.EventSeq, second)
+	}
+
+	ev, overdue, ok, err = OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 2)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent limit 2: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != first || overdue.DeferCount != 2 {
+		t.Fatalf("limit 2 overdue = event %+v planner %+v, want first defer_count=2", ev, overdue)
+	}
+
+	if _, _, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 3); err != nil || ok {
+		t.Fatalf("OldestOverduePlannerEvent limit 3: ok=%v err=%v, want not found", ok, err)
+	}
+}
+
+func TestPlannerStateConcurrentDefersAndMissingEvent(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "deadbeef",
+		Operation:        "modify",
+		Path:             "race.txt",
+		Fidelity:         "exact",
+	}, []CaptureOp{{Op: "modify", Path: "race.txt", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- RecordPlannerDefer(ctx, d, seq, float64(i+1), "concurrent defer")
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("RecordPlannerDefer concurrent: %v", err)
+		}
+	}
+
+	ps, ok, err := PlannerStateForEvent(ctx, d, seq)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != workers {
+		t.Fatalf("DeferCount=%d want %d", ps.DeferCount, workers)
+	}
+
+	if err := RecordPlannerOffer(ctx, d, seq+1000, 1); err == nil {
+		t.Fatalf("RecordPlannerOffer for missing event returned nil error")
+	}
+	if _, ok, err := PlannerStateForEvent(ctx, d, seq+1000); err != nil || ok {
+		t.Fatalf("PlannerStateForEvent missing = ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
 func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
