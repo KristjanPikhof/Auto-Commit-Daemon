@@ -471,10 +471,10 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 			DeferredSeqs:   []int64{102},
 			Subject:        "Update checkout flow.",
 			Body:           "- apply checkout validation",
-			GroupingReason: "single focused checkout change",
+			GroupingReason: " \tsingle\x00 focused\ncheckout change\x7f ",
 			DeferredReasons: []DeferredReason{{
 				Seq:    102,
-				Reason: "documentation should commit separately",
+				Reason: " \rdocumentation\x1b should commit separately\t ",
 			}},
 		})
 	})
@@ -487,6 +487,12 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 	}
 	if plan.Source != "openai-compat" {
 		t.Fatalf("source=%q", plan.Source)
+	}
+	if plan.GroupingReason != "single focusedcheckout change" {
+		t.Fatalf("grouping reason=%q", plan.GroupingReason)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Reason != "documentation should commit separately" {
+		t.Fatalf("deferred reasons=%+v", plan.DeferredReasons)
 	}
 
 	var sent struct {
@@ -536,7 +542,7 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 	}
 }
 
-func TestOpenAIIntentPlan_InvalidPlanFallsBackWhenComposed(t *testing.T) {
+func TestOpenAIIntentPlan_InvalidPlanReturnsErrorWhenComposed(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 200, cannedIntentPlanToolCall(IntentPlan{
@@ -551,14 +557,11 @@ func TestOpenAIIntentPlan_InvalidPlanFallsBackWhenComposed(t *testing.T) {
 		})
 	})
 	planner := Compose(p, DeterministicProvider{})
-	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
-	if err != nil {
-		t.Fatalf("PlanIntent: %v", err)
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error")
 	}
-	if plan.Source != "deterministic" {
-		t.Fatalf("source=%q want deterministic fallback", plan.Source)
-	}
-	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
-		t.Fatalf("selected=%v", plan.SelectedSeqs)
+	if !strings.Contains(err.Error(), "selected seq 999 outside offered window") {
+		t.Fatalf("error=%v", err)
 	}
 }
