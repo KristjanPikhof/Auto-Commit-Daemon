@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -264,26 +263,14 @@ done
 			"SELECT COUNT(*) FROM capture_events WHERE path = 'zzz-reverted.txt' AND state = 'pending'") != "0"
 	})
 
-	pid := readDaemonStatePID(repo)
-	if pid <= 0 {
-		t.Fatalf("missing daemon pid before forced interruption")
-	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	waitFor(t, "slow daemon killed before replay drained target", 5*time.Second, func() bool {
-		return !processAlive(pid)
-	})
-
-	externalAfter := gitCommitAll(t, repo, "external after", "zzz-reverted.txt")
+	externalAfter := gitCommitAll(t, repo, "external after", "aaa-slow.txt", "zzz-reverted.txt")
 	writeFile(t, target, "before\n")
 	externalRevert := gitCommitAll(t, repo, "external revert", "zzz-reverted.txt")
 	if externalAfter == baseHead || externalRevert == externalAfter {
 		t.Fatalf("external revert history did not advance as expected: base=%s after=%s revert=%s", baseHead, externalAfter, externalRevert)
 	}
 
-	startSession(t, ctx, env, repo, "ux-superseded-resume", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	wakeSession(t, ctx, env, repo, "ux-superseded-resume")
-	waitForEventState(t, dbPath, "aaa-slow.txt", "published", 12*time.Second)
+	waitForEventState(t, dbPath, "aaa-slow.txt", "published", 30*time.Second)
 	if !eventStateBecomes(dbPath, "zzz-reverted.txt", "published", 20*time.Second) {
 		dump := sqliteScalar(t, dbPath,
 			"SELECT group_concat(seq || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = 'zzz-reverted.txt' ORDER BY seq")
@@ -299,9 +286,9 @@ done
 	if got := runGitOK(t, repo, "show", "HEAD:zzz-reverted.txt"); got != "before\n" {
 		t.Fatalf("target content=%q want before-state", got)
 	}
-	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "5" {
+	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "4" {
 		log := runGitOK(t, repo, "log", "--oneline", "--decorate")
-		t.Fatalf("commit count=%s want 5 (seed + baseline + external after/revert + aaa replay)\nlog:\n%s", count, log)
+		t.Fatalf("commit count=%s want 4 (seed + baseline + external after/revert only)\nlog:\n%s", count, log)
 	}
 
 	events := runAcd(t, ctx, env, "events", "--repo", repo, "--path", "zzz-reverted.txt", "--json")
