@@ -136,20 +136,20 @@ git status --short --ignored
 
 ## CLI read-only UX
 
-- `events`, `explain`, `doctor` read paths must not call `state.Open` or migrate old DBs; use read-only SQLite projections (`openStateDBReadOnly` pattern).
+- `events`, `explain`, `doctor` read paths must not call `state.Open` or migrate DBs; use read-only SQLite projections (`openStateDBReadOnly` pattern).
 - Missing `decision_records` or `planner_state`: empty summaries, clear human text, valid JSON, no table creation.
 - `explain --since` summarizes newest post-cursor decision.
-- Status JSON includes `decision_counts`, `recent_decisions`, `decision_cursor`, `failed_events`, `failed_blocking_pending`, `intent_strategy`.
+- Status JSON: `decision_counts`, `recent_decisions`, `decision_cursor`, `failed_events`, `failed_blocking_pending`, `intent_strategy`.
 
 ## Git, AI, trace
 
-- `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`, `git.DefaultDiffCap` (1 MiB). `RevParse` ambiguous refs -> `git.ErrRefAmbiguous`.
+- `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`, `git.DefaultDiffCap` (1 MiB). Ambiguous `RevParse` -> `git.ErrRefAmbiguous`.
 - Pinned `ps`: `/bin/ps` on Darwin, `/usr/bin/ps` on Linux. Do not use `$PATH`. `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
 - AI providers declare `NeedsDiff`; network providers receive redacted diffs only when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` is truthy. `DeterministicProvider` uses `NeedsDiff=false`.
-- `BuildOpsDiff` caps rendered text at `ai.DiffCap`; each per-op git diff uses `2 * ai.DiffCap` and 5s timeout. Redaction plus final truncate run before provider send.
+- `BuildOpsDiff` caps rendered text at `ai.DiffCap`; per-op git diff uses `2 * ai.DiffCap` and 5s timeout. Redact + truncate before provider send.
 - `ACD_AI_SEND_DIFF` was removed; if set, emit one startup deprecation warning.
 - Generic messages like `Update PopupApp.tsx` are low-priority message-quality issues unless replay/state is wrong.
-- `ACD_TRACE=1` writes best-effort JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`; `ACD_TRACE_DIR` overrides; never block/abort. Verify event-class additions with `rg -n "EventClass:" internal/`.
+- `ACD_TRACE=1` writes best-effort JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`; `ACD_TRACE_DIR` overrides. Never block/abort. Verify classes with `rg -n "EventClass:" internal/`.
 
 ## Recovery
 
@@ -164,7 +164,7 @@ acd status --repo .
 ```
 
 - `acd recover --auto` refuses while daemon PID is alive.
-- It creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows to current attached branch/generation, resets blocked rows, clears replay/pause metadata, removes manual pause marker.
+- It creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows to current branch/generation, resets blocked rows, clears replay/pause metadata, removes manual pause marker.
 - Use `acd resume --yes` when only lifting manual pause.
 - Manual cleanup: `acd pause --repo . --reason "manual reset" --yes`; `acd resume --repo . --yes`; `sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"`.
 
@@ -172,8 +172,7 @@ acd status --repo .
 
 - Codex template: `templates/codex/config.snippet.toml`.
 - Codex hooks require `[features] codex_hooks = true`, `[[hooks.<EventName>]]`, then nested `[[hooks.<EventName>.hooks]]`; flat `[[hooks]]` fails.
-- Hook stdout must be valid JSON; snippet redirects `acd` output to `/dev/null` and emits `printf "{}\n"`.
-- No `Stop` hook; it races replay drain.
+- Hook stdout must be valid JSON; snippet redirects `acd` output to `/dev/null` and emits `printf "{}\n"`. No `Stop` hook; it races replay drain.
 - Codex can auto-load `~/.codex/hooks.json` and `~/.codex/config.toml`; delete old `hooks.json` after installing toml snippet.
 - Templates use `acd hook-stdin-extract <field>` instead of `jq`; keep `internal/cli/hookhelper.go` and AdapterE2E coverage.
 
