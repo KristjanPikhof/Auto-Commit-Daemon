@@ -3,12 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -155,7 +154,7 @@ func makeExplainRepo(t *testing.T, roots paths.Roots) (repoDir, dbPath string, d
 func writeAndCommitSeed(t *testing.T, ctx context.Context, repoDir string) error {
 	t.Helper()
 	path := filepath.Join(repoDir, "seed.txt")
-	if err := osWriteFile(path, []byte("seed\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("seed\n"), 0o644); err != nil {
 		return err
 	}
 	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "add", "seed.txt"); err != nil {
@@ -163,12 +162,4 @@ func writeAndCommitSeed(t *testing.T, ctx context.Context, repoDir string) error
 	}
 	_, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "commit", "-q", "-m", "seed")
 	return err
-}
-
-var osWriteFile = func(name string, data []byte, perm uint32) error {
-	return writeFilePerm(name, data, perm)
-}
-
-func writeFilePerm(name string, data []byte, perm uint32) error {
-	return os.WriteFile(name, data, os.FileMode(perm))
 }
