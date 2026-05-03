@@ -1732,6 +1732,24 @@ func openCentralStats(ctx context.Context, dbPath string) (*central.StatsDB, err
 	return central.OpenAt(ctx, dbPath)
 }
 
+func manualPauseRecentlyResumed(ctx context.Context, db *state.DB, now time.Time) (bool, string) {
+	raw, ok, err := state.MetaGet(ctx, db, MetaKeyManualPauseResumedAt)
+	if err != nil || !ok || raw == "" {
+		return false, ""
+	}
+	sec, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		_, _ = state.MetaDelete(ctx, db, MetaKeyManualPauseResumedAt)
+		return false, raw
+	}
+	resumedAt := time.Unix(0, int64(sec*1e9))
+	if now.Before(resumedAt) || now.Sub(resumedAt) <= manualResumeResyncWindow {
+		return true, raw
+	}
+	_, _ = state.MetaDelete(ctx, db, MetaKeyManualPauseResumedAt)
+	return false, raw
+}
+
 // clearRewindGraceMeta removes a stale daemon_meta.replay.paused_until row.
 //
 // It is a best-effort helper invoked on explicit operator transitions where
