@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -116,6 +117,92 @@ func TestDecisionRecordsRoundTripAndQueries(t *testing.T) {
 	}
 }
 
+func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	type eventCase struct {
+		name  string
+		state string
+	}
+	cases := []eventCase{
+		{name: "published", state: EventStatePublished},
+		{name: "failed", state: EventStateFailed},
+		{name: "blocked", state: EventStateBlockedConflict},
+	}
+
+	seqs := make([]int64, 0, len(cases))
+	decisionIDs := make(map[int64]int64, len(cases))
+	for i, tc := range cases {
+		path := fmt.Sprintf("src/%s.go", tc.name)
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         "abc123",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			CapturedTS:       float64(10 + i),
+			PublishedTS:      sql.NullFloat64{Float64: float64(20 + i), Valid: true},
+			State:            tc.state,
+			CommitOID:        sqlNullStr(fmt.Sprintf("commit-%s", tc.name)),
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", tc.name, err)
+		}
+		id, err := AppendDecision(ctx, d, DecisionRecord{
+			DecisionTS:  float64(30 + i),
+			Kind:        DecisionKindCommitted,
+			Path:        sqlNullStr(path),
+			EventSeq:    sql.NullInt64{Int64: seq, Valid: true},
+			CommitOID:   sqlNullStr(fmt.Sprintf("commit-%s", tc.name)),
+			ActionTaken: sqlNullStr(tc.state),
+		})
+		if err != nil {
+			t.Fatalf("AppendDecision %s: %v", tc.name, err)
+		}
+		seqs = append(seqs, seq)
+		decisionIDs[seq] = id
+	}
+
+	publishedPruned, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if publishedPruned != 1 {
+		t.Fatalf("published pruned = %d, want 1", publishedPruned)
+	}
+	terminalPruned, err := PruneTerminalEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PruneTerminalEventsBefore: %v", err)
+	}
+	if terminalPruned != 2 {
+		t.Fatalf("terminal pruned = %d, want 2", terminalPruned)
+	}
+
+	for _, seq := range seqs {
+		var eventCount int
+		if err := d.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&eventCount); err != nil {
+			t.Fatalf("count event %d: %v", seq, err)
+		}
+		if eventCount != 0 {
+			t.Fatalf("capture event %d survived prune", seq)
+		}
+		got, err := DecisionsForEvent(ctx, d, seq, 10)
+		if err != nil {
+			t.Fatalf("DecisionsForEvent %d: %v", seq, err)
+		}
+		if len(got) != 1 || got[0].ID != decisionIDs[seq] {
+			t.Fatalf("DecisionsForEvent %d = %+v, want decision %d", seq, got, decisionIDs[seq])
+		}
+		if !got[0].EventSeq.Valid || got[0].EventSeq.Int64 != seq {
+			t.Fatalf("decision event_seq after prune = %+v, want %d", got[0].EventSeq, seq)
+		}
+	}
+}
+
 func TestDecisionRecordsValidateAndClamp(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -153,6 +240,109 @@ func TestDecisionRecordsValidateAndClamp(t *testing.T) {
 	}
 	if len(got) != maxDecisionLimit {
 		t.Fatalf("capped recent len = %d, want %d", len(got), maxDecisionLimit)
+	}
+}
+
+func TestDecisionRecordsSchemaMigratesFromV5ForeignKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+CREATE TABLE capture_events(
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_ref       TEXT NOT NULL,
+    branch_generation INTEGER NOT NULL,
+    base_head        TEXT NOT NULL,
+    operation        TEXT NOT NULL,
+    path             TEXT NOT NULL,
+    old_path         TEXT,
+    fidelity         TEXT NOT NULL,
+    captured_ts      REAL NOT NULL,
+    published_ts     REAL,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    commit_oid       TEXT,
+    error            TEXT,
+    message          TEXT
+);
+CREATE TABLE decision_records(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          REAL NOT NULL,
+    kind                TEXT NOT NULL,
+    path                TEXT,
+    reason              TEXT,
+    event_seq           INTEGER,
+    head_sha            TEXT,
+    commit_oid          TEXT,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    action_taken        TEXT,
+    user_message        TEXT,
+    FOREIGN KEY (event_seq) REFERENCES capture_events(seq) ON DELETE SET NULL
+);
+INSERT INTO capture_events(
+    seq, branch_ref, branch_generation, base_head, operation, path, fidelity,
+    captured_ts, published_ts, state, commit_oid
+) VALUES (
+    7, 'refs/heads/main', 1, 'abc123', 'modify', 'src/app.go', 'exact',
+    10, 20, 'published', 'def456'
+);
+INSERT INTO decision_records(
+    id, decision_ts, kind, path, event_seq, commit_oid, branch_ref,
+    branch_generation, action_taken
+) VALUES (
+    3, 30, 'committed', 'src/app.go', 7, 'def456', 'refs/heads/main',
+    1, 'committed'
+);
+PRAGMA user_version = 5;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v5 db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v5: %v", err)
+	}
+	defer d.Close()
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("user_version = %d, want %d", uv, SchemaVersion)
+	}
+	var fkCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_foreign_key_list('decision_records')`).Scan(&fkCount); err != nil {
+		t.Fatalf("foreign_key_list: %v", err)
+	}
+	if fkCount != 0 {
+		t.Fatalf("decision_records foreign keys = %d, want 0", fkCount)
+	}
+	pruned, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	got, err := DecisionsForEvent(ctx, d, 7, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent after prune: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != 3 || !got[0].EventSeq.Valid || got[0].EventSeq.Int64 != 7 {
+		t.Fatalf("migrated decision after prune = %+v, want id 3 event_seq 7", got)
 	}
 }
 
