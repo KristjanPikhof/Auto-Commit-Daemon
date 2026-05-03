@@ -87,9 +87,9 @@ func runExplain(ctx context.Context, out io.Writer, repo, path, commit string, l
 	if err != nil {
 		return err
 	}
-	db, err := state.Open(ctx, rec.StateDB)
+	db, err := openStateDBReadOnly(ctx, rec.StateDB)
 	if err != nil {
-		return fmt.Errorf("acd explain: open state.db for repo %s: %w", rec.Path, err)
+		return fmt.Errorf("acd explain: open state.db read-only for repo %s: %w", rec.Path, err)
 	}
 	defer db.Close()
 
@@ -105,20 +105,29 @@ func runExplain(ctx context.Context, out io.Writer, repo, path, commit string, l
 	return renderExplainHuman(out, report)
 }
 
-func buildExplainReport(ctx context.Context, repo string, db *state.DB, path, commit string, last bool, since int64, limit int) (explainReport, error) {
+func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, commit string, last bool, since int64, limit int) (explainReport, error) {
 	report := explainReport{Repo: repo}
 	var rows []state.DecisionRecord
 	var err error
+	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
+	if err != nil {
+		return report, fmt.Errorf("acd explain: decision table check: %w", err)
+	}
 	switch {
 	case path != "":
 		report.Mode = "path"
 		report.Path = path
 		report.CurrentState = explainPathState(ctx, repo, path)
 		report.PendingEvents = countPendingEventsForPath(ctx, db, path)
+		if !hasLedger {
+			report.DecisionCursor = since
+			report.Explanation, report.Recommended = summarizeExplain(report)
+			return report, nil
+		}
 		if since > 0 {
-			rows, err = state.DecisionsForPathSince(ctx, db, path, since, limit)
+			rows, err = loadDecisionEvents(ctx, db, path, since, limit)
 		} else {
-			rows, err = state.DecisionsForPath(ctx, db, path, limit)
+			rows, err = loadDecisionEvents(ctx, db, path, 0, limit)
 		}
 	case commit != "" || last:
 		report.Mode = "commit"
@@ -131,13 +140,34 @@ func buildExplainReport(ctx context.Context, repo string, db *state.DB, path, co
 			return report, fmt.Errorf("acd explain: resolve commit %s: %w", rev, rerr)
 		}
 		report.Commit = resolved
-		rows, err = state.DecisionsForCommit(ctx, db, resolved, limit)
+		if !hasLedger {
+			report.DecisionCursor = since
+			report.Explanation, report.Recommended = summarizeExplain(report)
+			return report, nil
+		}
+		rows, err = queryDecisionRecordsSQL(ctx, db, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+WHERE commit_oid = ?
+ORDER BY id DESC
+LIMIT ?`, resolved, limit)
 	case since > 0:
 		report.Mode = "recent"
-		rows, err = state.DecisionsSince(ctx, db, since, limit)
+		if !hasLedger {
+			report.DecisionCursor = since
+			report.Explanation, report.Recommended = summarizeExplain(report)
+			return report, nil
+		}
+		rows, err = loadDecisionEvents(ctx, db, "", since, limit)
 	default:
 		report.Mode = "summary"
-		rows, err = state.RecentDecisions(ctx, db, limit)
+		if !hasLedger {
+			report.DecisionCursor = since
+			report.Explanation, report.Recommended = summarizeExplain(report)
+			return report, nil
+		}
+		rows, err = loadDecisionEvents(ctx, db, "", 0, limit)
 	}
 	if err != nil {
 		return report, fmt.Errorf("acd explain: query decisions: %w", err)
@@ -153,6 +183,12 @@ func buildExplainReport(ctx context.Context, repo string, db *state.DB, path, co
 
 func summarizeExplain(report explainReport) (string, string) {
 	if len(report.Decisions) == 0 {
+		if report.DecisionCursor > 0 && report.Mode == "recent" {
+			return "No ACD decisions have been recorded after that cursor.", "Run `acd events --watch` to stream newly appended decisions."
+		}
+		if !decisionLedgerPresent(report) {
+			return missingDecisionLedgerMessage, "Run `acd status`; start or restart acd with a current version if you need product decision history."
+		}
 		switch report.Mode {
 		case "path":
 			if report.PendingEvents > 0 {
@@ -166,13 +202,9 @@ func summarizeExplain(report explainReport) (string, string) {
 		}
 	}
 	latest := report.Decisions[0]
-	if report.Mode != "commit" && report.Mode != "summary" && len(report.Decisions) > 1 {
-		// Path queries are newest-first; since queries are oldest-first. The
-		// highest cursor is the most recent durable decision either way.
-		for _, d := range report.Decisions[1:] {
-			if d.ID > latest.ID {
-				latest = d
-			}
+	for _, d := range report.Decisions[1:] {
+		if d.ID > latest.ID {
+			latest = d
 		}
 	}
 	explanation := latest.UserMessage
@@ -184,6 +216,10 @@ func summarizeExplain(report explainReport) (string, string) {
 		next = "Replay is still pending for this path; run `acd status` to check blockers."
 	}
 	return explanation, next
+}
+
+func decisionLedgerPresent(report explainReport) bool {
+	return len(report.Decisions) > 0 || report.DecisionCursor == 0
 }
 
 func explainByKind(d eventEntry) string {
@@ -231,9 +267,13 @@ func explainPathState(ctx context.Context, repo, path string) string {
 	return "unknown"
 }
 
-func countPendingEventsForPath(ctx context.Context, db *state.DB, path string) int {
+func countPendingEventsForPath(ctx context.Context, db *sql.DB, path string) int {
+	ok, err := sqliteTableExists(ctx, db, "capture_events")
+	if err != nil || !ok {
+		return 0
+	}
 	var n int
-	err := db.ReadSQL().QueryRowContext(ctx,
+	err = db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE path = ? AND state = ?`,
 		path, state.EventStatePending).Scan(&n)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
