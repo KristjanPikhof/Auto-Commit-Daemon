@@ -118,6 +118,30 @@ type ReplayOpts struct {
 	// DeterministicMessage.
 	MessageFn MessageFn
 
+	// CommitStrategy selects the replay mode. Empty preserves the event
+	// strategy: one capture event becomes one commit.
+	CommitStrategy ai.CommitStrategy
+
+	// IntentPlanner chooses/defer captures when CommitStrategy is intent.
+	// Nil falls back to ai.DeterministicProvider.
+	IntentPlanner ai.IntentPlanner
+
+	// IntentWindow caps how many pending captures are offered per intent
+	// planning pass. Zero falls back to ai.DefaultIntentWindow.
+	IntentWindow int
+
+	// IntentRecentCommits caps recent branch/path history supplied to the
+	// planner. Zero falls back to ai.DefaultIntentRecentCommits.
+	IntentRecentCommits int
+
+	// IntentDeferLimit controls forced-aging. Zero is a valid "force after
+	// first defer" setting; negative values fall back to ai.DefaultIntentDeferLimit.
+	IntentDeferLimit int
+
+	// IncludeIntentDiffs is true only after the caller has applied the
+	// provider NeedsDiff + ACD_AI_DIFF_EGRESS privacy gates.
+	IncludeIntentDiffs bool
+
 	// IndexFile is the GIT_INDEX_FILE path used for an isolated index. When
 	// empty, Replay creates a per-pass tempfile under <gitDir>/acd and
 	// removes it before returning. Caller-provided values are left in place
