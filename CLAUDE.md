@@ -124,7 +124,7 @@ git status --short --ignored
 
 ## Git/AI/trace
 
-- `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`; diff/blob caps use `git.DefaultDiffCap` (1 MiB). `RevParse` ambiguous refs -> `git.ErrRefAmbiguous`.
+- `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`, and `git.DefaultDiffCap` (1 MiB) for generic limited reads. AI diff rendering uses the smaller `BuildOpsDiff` cap below. `RevParse` ambiguous refs -> `git.ErrRefAmbiguous`.
 - Pinned `ps`: `/bin/ps` on Darwin, `/usr/bin/ps` on Linux. Do not use `$PATH`. `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
 - AI providers declare `NeedsDiff`; network providers receive redacted diffs only when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` is truthy. `DeterministicProvider` uses `NeedsDiff=false`.
 - `BuildOpsDiff` caps rendered text at `ai.DiffCap` while appending sections; each per-op git diff uses `2 * ai.DiffCap` and a 5s timeout. Redaction plus final truncate still run before provider send.
