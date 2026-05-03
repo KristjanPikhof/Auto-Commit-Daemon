@@ -179,6 +179,9 @@ LIMIT ?`, resolved, limit)
 	for _, row := range rows {
 		report.Decisions = append(report.Decisions, decisionEntry(row))
 	}
+	if err := enrichEventEntries(ctx, db, report.Decisions); err != nil {
+		return report, fmt.Errorf("acd explain: enrich decisions: %w", err)
+	}
 	report.Explanation, report.Recommended = summarizeExplain(report)
 	return report, nil
 }
@@ -226,6 +229,12 @@ func explainByKind(d eventEntry) string {
 		path = "this change"
 	}
 	switch d.Kind {
+	case state.DecisionKindIntentDeferred:
+		return fmt.Sprintf("ACD deferred %s from the current intent planning window because %s.", path, fallback(d.Reason, "the planner selected a different group"))
+	case state.DecisionKindIntentForced:
+		return fmt.Sprintf("ACD forced %s into a one-item intent planning window after repeated deferrals.", path)
+	case state.DecisionKindIntentPlannerError:
+		return fmt.Sprintf("ACD rejected an intent planner result for %s because %s.", path, fallback(d.Reason, "the planner output failed validation"))
 	case state.DecisionKindProtected, state.DecisionKindSkipped:
 		return fmt.Sprintf("ACD skipped %s because %s.", path, fallback(d.Reason, "it matched a protection rule"))
 	case state.DecisionKindHandledExternal:
@@ -245,6 +254,12 @@ func nextStepByKind(d eventEntry) string {
 	switch d.Kind {
 	case state.DecisionKindProtected, state.DecisionKindSkipped:
 		return "No action is needed unless you want to change ignore/sensitive settings."
+	case state.DecisionKindIntentDeferred:
+		return "No action needed; replay will reconsider this capture in a later intent planning window."
+	case state.DecisionKindIntentForced:
+		return "No action needed; this capture is being forced through a one-item planning window."
+	case state.DecisionKindIntentPlannerError:
+		return "No action needed unless this repeats; ACD falls back to deterministic planning for safety."
 	case state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal, state.DecisionKindCommitted:
 		return "No action needed."
 	case state.DecisionKindBlocked:
