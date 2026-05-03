@@ -810,7 +810,8 @@ func replayIntentBatch(
 	if len(window) == 0 {
 		return sum, nil
 	}
-	if updated, halted, err := rejectInvalidIntentWindowEvents(ctx, repoRoot, db, activeCtx, opts, parent, window, sum); halted || err != nil {
+	preflight := intentPreflightEvents(pending, window, forced)
+	if updated, halted, err := rejectInvalidIntentWindowEvents(ctx, repoRoot, db, activeCtx, opts, parent, preflight, sum); halted || err != nil {
 		return updated, err
 	}
 	if len(pending) > len(window) {
@@ -909,6 +910,13 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 	}
 	if forcedOK {
+		if hasEarlierPotentialPathDependency(pending, forcedEvent) {
+			n := cfg.window
+			if n > len(pending) {
+				n = len(pending)
+			}
+			return pending[:n], false, nil
+		}
 		return []state.CaptureEvent{forcedEvent}, true, nil
 	}
 	n := cfg.window
@@ -916,6 +924,51 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		n = len(pending)
 	}
 	return pending[:n], false, nil
+}
+
+func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
+	if !forced || len(window) == 0 {
+		return window
+	}
+	for i, ev := range pending {
+		if ev.Seq == window[0].Seq {
+			return pending[:i+1]
+		}
+	}
+	return window
+}
+
+func hasEarlierPotentialPathDependency(pending []state.CaptureEvent, forced state.CaptureEvent) bool {
+	for _, ev := range pending {
+		if ev.Seq >= forced.Seq {
+			return false
+		}
+		if captureEventsMayTouchSamePath(ev, forced) {
+			return true
+		}
+	}
+	return false
+}
+
+func captureEventsMayTouchSamePath(a, b state.CaptureEvent) bool {
+	aPaths := captureEventPathSet(a)
+	for path := range captureEventPathSet(b) {
+		if _, ok := aPaths[path]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func captureEventPathSet(ev state.CaptureEvent) map[string]struct{} {
+	out := map[string]struct{}{}
+	if ev.Path != "" {
+		out[ev.Path] = struct{}{}
+	}
+	if ev.OldPath.Valid && ev.OldPath.String != "" {
+		out[ev.OldPath.String] = struct{}{}
+	}
+	return out
 }
 
 func buildIntentPlanRequest(
