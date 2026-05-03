@@ -17,8 +17,9 @@ package state
 // accumulates completed/acknowledged rows over a long uptime; v5 adds
 // append-only product decision records for explainable capture/replay/CLI UX;
 // v6 rebuilds decision_records so event_seq is denormalized ledger data rather
-// than a foreign key cleared by capture_events pruning.
-const SchemaVersion = 6
+// than a foreign key cleared by capture_events pruning; v7 adds planner_state
+// for bounded intent-planner deferrals.
+const SchemaVersion = 7
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -110,6 +111,21 @@ CREATE TABLE IF NOT EXISTS capture_ops(
     PRIMARY KEY (event_seq, ord),
     FOREIGN KEY (event_seq) REFERENCES capture_events(seq) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS planner_state(
+    event_seq          INTEGER PRIMARY KEY,
+    defer_count        INTEGER NOT NULL DEFAULT 0 CHECK (defer_count >= 0),
+    last_planned_ts    REAL NOT NULL DEFAULT 0,
+    last_defer_reason  TEXT,
+    last_plan_error    TEXT,
+    FOREIGN KEY (event_seq) REFERENCES capture_events(seq) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_planner_state_defer_count_planned
+    ON planner_state(defer_count, last_planned_ts, event_seq);
+
+CREATE INDEX IF NOT EXISTS idx_planner_state_last_planned
+    ON planner_state(last_planned_ts, event_seq);
 
 CREATE TABLE IF NOT EXISTS flush_requests(
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
