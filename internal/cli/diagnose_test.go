@@ -141,6 +141,79 @@ func TestDiagnose_BlockedHistogram(t *testing.T) {
 	}
 }
 
+func TestDiagnose_FailedBarrierGuidance(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running", BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "bad.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "bad.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append failed event: %v", err)
+	}
+	if err := state.MarkEventPublished(ctx, d, seq, state.EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowFloat()); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "later.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "later.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending successor: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose json: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.FailedEvents != 1 || rep.FailedBlockingPending != 1 {
+		t.Fatalf("failed fields = events %d blocking %d, want 1/1", rep.FailedEvents, rep.FailedBlockingPending)
+	}
+	if len(rep.RecentBlocked) == 0 || rep.RecentBlocked[0].State != state.EventStatePending && rep.RecentBlocked[0].State != state.EventStateFailed {
+		t.Fatalf("recent barriers missing state: %+v", rep.RecentBlocked)
+	}
+	if !containsStringWith(rep.Remediation, "acd fix --dry-run") {
+		t.Fatalf("remediation missing fix dry-run: %v", rep.Remediation)
+	}
+
+	out.Reset()
+	if err := runDiagnose(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runDiagnose human: %v", err)
+	}
+	for _, want := range []string{"Failed terminal events: 1", "blocking pending replay", "acd fix --dry-run", "failed modify bad.go"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("diagnose human missing %q in:\n%s", want, out.String())
+		}
+	}
+}
+
+func containsStringWith(items []string, needle string) bool {
+	for _, item := range items {
+		if strings.Contains(item, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDiagnose_LegacyReplayConflictMetadataFallsBackToRowError(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
