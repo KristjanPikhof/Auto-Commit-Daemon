@@ -4,6 +4,16 @@
 
 ### Added
 
+- AI intent commit strategy: `ACD_COMMIT_STRATEGY=intent` can ask the
+  configured AI provider to group related pending captures into one reviewable
+  commit while keeping the existing `event` strategy as the default.
+- Intent planning controls: `ACD_INTENT_WINDOW`,
+  `ACD_INTENT_RECENT_COMMITS`, and `ACD_INTENT_DEFER_LIMIT` tune planner
+  context, offered capture windows, and starvation protection for deferred
+  work.
+- Intent grouping observability in `status`, `diagnose`, `doctor`, `events`,
+  and `explain`, including grouped event sequences, deferral reasons,
+  forced-aging decisions, and planner validation failures.
 - Explainable ACD history: `acd events`, `acd explain`, and richer
   `status`/`diagnose`/`doctor` output now show why work was captured,
   committed, skipped, protected, blocked, or handled by external history.
@@ -13,6 +23,9 @@
 
 ### Changed
 
+- AI provider docs now include setup profiles for compatibility mode,
+  reviewer-friendly intent grouping, metadata-only private repos, self-hosted
+  providers, explicit diff egress, and guarded strict-message builds.
 - Read-only observability commands no longer migrate old repo databases just to
   inspect them. If a decision ledger is missing, they return an empty history
   instead of changing the DB.
@@ -23,6 +36,13 @@
 
 ### Fixed
 
+- Intent strategy falls back to event-style publishing when configuration is
+  invalid or planner output cannot be trusted, so replay safety stays under ACD
+  control.
+- Fast-forward during rewind grace now has integration coverage that preserves
+  the fast-forwarded worktree before checking for phantom capture events.
+- Integration SQLite setup now waits for transient daemon DB locks before
+  injecting PID-reuse test rows.
 - Decision records keep their original event sequence after old capture events
   are pruned, so historical explanations stay useful.
 - Replay no longer marks work as `superseded_external` unless history, `HEAD`,
