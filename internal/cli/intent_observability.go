@@ -90,6 +90,9 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	} else if ok {
 		report.DeferLimit = parseIntentMetaInt(v, report.DeferLimit)
 	}
+	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
+		return report, err
+	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {
 		return report, fmt.Errorf("planner_state table check: %w", err)
@@ -101,14 +104,30 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 SELECT COUNT(*), COALESCE(MAX(ps.defer_count), 0)
 FROM planner_state ps
 JOIN capture_events e ON e.seq = ps.event_seq
-WHERE e.state = ? AND ps.defer_count > 0`, state.EventStatePending).Scan(&report.DeferredEvents, &report.MaxDeferCount); err != nil {
+WHERE e.state = ? AND ps.defer_count > 0
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events barrier
+      WHERE barrier.branch_ref = e.branch_ref
+        AND barrier.branch_generation = e.branch_generation
+        AND barrier.seq < e.seq
+        AND barrier.state IN (?, ?)
+  )`, state.EventStatePending, state.EventStateFailed, state.EventStateBlockedConflict).Scan(&report.DeferredEvents, &report.MaxDeferCount); err != nil {
 		return report, fmt.Errorf("planner deferred summary: %w", err)
 	}
 	if err := conn.QueryRowContext(ctx, `
 SELECT COUNT(*)
 FROM planner_state ps
 JOIN capture_events e ON e.seq = ps.event_seq
-WHERE e.state = ? AND ps.defer_count >= ?`, state.EventStatePending, report.DeferLimit).Scan(&report.ForcedAgingReady); err != nil {
+WHERE e.state = ? AND ps.defer_count >= ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events barrier
+      WHERE barrier.branch_ref = e.branch_ref
+        AND barrier.branch_generation = e.branch_generation
+        AND barrier.seq < e.seq
+        AND barrier.state IN (?, ?)
+  )`, state.EventStatePending, report.DeferLimit, state.EventStateFailed, state.EventStateBlockedConflict).Scan(&report.ForcedAgingReady); err != nil {
 		return report, fmt.Errorf("planner forced-aging summary: %w", err)
 	}
 	var lastDeferredSeq sql.NullInt64
@@ -118,8 +137,16 @@ SELECT ps.event_seq, e.path, ps.last_defer_reason
 FROM planner_state ps
 JOIN capture_events e ON e.seq = ps.event_seq
 WHERE e.state = ? AND ps.last_defer_reason IS NOT NULL AND ps.last_defer_reason != ''
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events barrier
+      WHERE barrier.branch_ref = e.branch_ref
+        AND barrier.branch_generation = e.branch_generation
+        AND barrier.seq < e.seq
+        AND barrier.state IN (?, ?)
+  )
 ORDER BY ps.last_planned_ts DESC, ps.event_seq DESC
-LIMIT 1`, state.EventStatePending).Scan(&lastDeferredSeq, &lastDeferredPath, &lastDeferredReason)
+LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlockedConflict).Scan(&lastDeferredSeq, &lastDeferredPath, &lastDeferredReason)
 	if err != nil && err != sql.ErrNoRows {
 		return report, fmt.Errorf("planner last defer: %w", err)
 	}
@@ -133,17 +160,27 @@ LIMIT 1`, state.EventStatePending).Scan(&lastDeferredSeq, &lastDeferredPath, &la
 		report.LastDeferredReason = lastDeferredReason.String
 	}
 
+	return report, nil
+}
+
+func loadLastIntentPlannerError(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fmt.Errorf("decision table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
 	var lastErrorSeq sql.NullInt64
 	var lastErrorPath, lastError sql.NullString
 	err = conn.QueryRowContext(ctx, `
-SELECT ps.event_seq, e.path, ps.last_plan_error
-FROM planner_state ps
-JOIN capture_events e ON e.seq = ps.event_seq
-WHERE e.state = ? AND ps.last_plan_error IS NOT NULL AND ps.last_plan_error != ''
-ORDER BY ps.last_planned_ts DESC, ps.event_seq DESC
-LIMIT 1`, state.EventStatePending).Scan(&lastErrorSeq, &lastErrorPath, &lastError)
+SELECT event_seq, path, COALESCE(NULLIF(reason, ''), NULLIF(user_message, ''), NULLIF(action_taken, ''))
+FROM decision_records
+WHERE kind = ?
+ORDER BY id DESC
+LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPath, &lastError)
 	if err != nil && err != sql.ErrNoRows {
-		return report, fmt.Errorf("planner last error: %w", err)
+		return fmt.Errorf("planner last error: %w", err)
 	}
 	if lastErrorSeq.Valid {
 		report.LastPlannerErrorEventSeq = lastErrorSeq.Int64
@@ -154,7 +191,7 @@ LIMIT 1`, state.EventStatePending).Scan(&lastErrorSeq, &lastErrorPath, &lastErro
 	if lastError.Valid {
 		report.LastPlannerError = lastError.String
 	}
-	return report, nil
+	return nil
 }
 
 func parseIntentMetaInt(raw string, fallback int) int {
