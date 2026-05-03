@@ -88,7 +88,25 @@ SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
 FROM decision_records
 WHERE path = ?
 ORDER BY id DESC
-LIMIT ?`, path, clampDecisionLimit(limit))
+	LIMIT ?`, path, clampDecisionLimit(limit))
+}
+
+// DecisionsForPathSince returns path decisions with id greater than cursorID in
+// insertion order. This supports watch polling with a path filter.
+func DecisionsForPathSince(ctx context.Context, d *DB, path string, cursorID int64, limit int) ([]DecisionRecord, error) {
+	if path == "" {
+		return nil, fmt.Errorf("state: DecisionsForPathSince: empty path")
+	}
+	if cursorID < 0 {
+		return nil, fmt.Errorf("state: DecisionsForPathSince: negative cursor %d", cursorID)
+	}
+	return queryDecisions(ctx, d, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+WHERE path = ? AND id > ?
+ORDER BY id ASC
+LIMIT ?`, path, cursorID, clampDecisionLimit(limit))
 }
 
 // DecisionsForEvent returns decisions linked to a capture event in insertion
@@ -132,7 +150,20 @@ SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
 FROM decision_records
 WHERE id > ?
 ORDER BY id ASC
-LIMIT ?`, cursorID, clampDecisionLimit(limit))
+	LIMIT ?`, cursorID, clampDecisionLimit(limit))
+}
+
+// LatestDecisionID returns the highest decision cursor ID, or 0 when no
+// decisions exist.
+func LatestDecisionID(ctx context.Context, d *DB) (int64, error) {
+	var id sql.NullInt64
+	if err := d.readSQL().QueryRowContext(ctx, `SELECT MAX(id) FROM decision_records`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("state: latest decision id: %w", err)
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
 }
 
 func queryDecisions(ctx context.Context, d *DB, q string, args ...any) ([]DecisionRecord, error) {
