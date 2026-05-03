@@ -492,7 +492,7 @@ func regPIDReuseRejectedByFingerprint(t *testing.T) {
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	myPID := os.Getpid()
 	insert := fmt.Sprintf(
-		"INSERT OR REPLACE INTO daemon_clients(session_id, harness, watch_pid, watch_fp, registered_ts, last_seen_ts) VALUES ('pidreuse-bogus', 'shell', %d, 'bogus|fingerprint', %f, %f);",
+		"PRAGMA busy_timeout=5000; INSERT OR REPLACE INTO daemon_clients(session_id, harness, watch_pid, watch_fp, registered_ts, last_seen_ts) VALUES ('pidreuse-bogus', 'shell', %d, 'bogus|fingerprint', %f, %f);",
 		myPID,
 		nowFloatSeconds(),
 		nowFloatSeconds(),
