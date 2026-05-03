@@ -93,6 +93,49 @@ var openAICommitMessageParameters = map[string]any{
 	"additionalProperties": false,
 }
 
+var openAIIntentPlanParameters = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"selected_seqs": map[string]any{
+			"type":        "array",
+			"description": "Non-empty seqs selected for the next commit.",
+			"items":       map[string]any{"type": "integer"},
+		},
+		"deferred_seqs": map[string]any{
+			"type":        "array",
+			"description": "Every offered seq not selected for this commit.",
+			"items":       map[string]any{"type": "integer"},
+		},
+		"subject": map[string]any{
+			"type":        "string",
+			"description": "Imperative subject line for the selected captures; <= 72 chars; no trailing period.",
+		},
+		"body": map[string]any{
+			"type":        "string",
+			"description": "Optional bullet body explaining what/why; may be empty.",
+		},
+		"grouping_reason": map[string]any{
+			"type":        "string",
+			"description": "Evidence-grounded reason these selected captures belong together.",
+		},
+		"deferred_reasons": map[string]any{
+			"type":        "array",
+			"description": "One reason for every deferred seq.",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"seq":    map[string]any{"type": "integer"},
+					"reason": map[string]any{"type": "string"},
+				},
+				"required":             []string{"seq", "reason"},
+				"additionalProperties": false,
+			},
+		},
+	},
+	"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
+	"additionalProperties": false,
+}
+
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
 // usable: Generate fills in the BaseURL/Model/HTTP/Now defaults on first
 // call. Once initialized the provider is concurrency-safe (the http
@@ -192,6 +235,77 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		Body:    bodyOut,
 		Source:  "openai-compat",
 	}, nil
+}
+
+// PlanIntent POSTs the planner request and parses the structured tool-call.
+func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRequest) (IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return IntentPlan{}, err
+	}
+	if strings.TrimSpace(p.APIKey) == "" {
+		return IntentPlan{}, errors.New("openai-compat: missing API key")
+	}
+
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return IntentPlan{}, err
+	}
+	model := p.Model
+	if model == "" {
+		model = DefaultOpenAIModel
+	}
+	httpClient := p.HTTP
+	if httpClient == nil {
+		httpClient = defaultOpenAIClient()
+	}
+
+	body, err := buildOpenAIIntentPlanRequest(model, plannerReq)
+	if err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: build intent plan request: %w", err)
+	}
+
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: http: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: read body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return IntentPlan{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+	}
+
+	plan, err := parseIntentPlanToolCall(raw)
+	if err != nil {
+		return IntentPlan{}, err
+	}
+	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
+	parts := strings.SplitN(cleaned, "\n\n", 2)
+	plan.Subject = parts[0]
+	if len(parts) == 2 {
+		plan.Body = parts[1]
+	} else {
+		plan.Body = ""
+	}
+	plan.Source = p.Name()
+	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
+		return IntentPlan{}, err
+	}
+	return plan, nil
 }
 
 func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
@@ -334,6 +448,63 @@ func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, er
 	return json.Marshal(body)
 }
 
+func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([]byte, error) {
+	userPrompt, err := BuildIntentPlanUserPrompt(plannerReq)
+	if err != nil {
+		return nil, err
+	}
+
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type funcDecl struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description,omitempty"`
+		Parameters  map[string]any `json:"parameters"`
+	}
+	type tool struct {
+		Type     string   `json:"type"`
+		Function funcDecl `json:"function"`
+	}
+	type toolChoiceFn struct {
+		Name string `json:"name"`
+	}
+	type toolChoice struct {
+		Type     string       `json:"type"`
+		Function toolChoiceFn `json:"function"`
+	}
+	type req struct {
+		Model       string     `json:"model"`
+		Messages    []message  `json:"messages"`
+		Tools       []tool     `json:"tools"`
+		ToolChoice  toolChoice `json:"tool_choice"`
+		Temperature float64    `json:"temperature"`
+	}
+
+	body := req{
+		Model: model,
+		Messages: []message{
+			{Role: "system", Content: IntentPlannerSystemPrompt()},
+			{Role: "user", Content: userPrompt},
+		},
+		Tools: []tool{{
+			Type: "function",
+			Function: funcDecl{
+				Name:        "capture_intent_plan",
+				Description: "Select or defer every offered capture for the next commit.",
+				Parameters:  openAIIntentPlanParameters,
+			},
+		}},
+		ToolChoice: toolChoice{
+			Type:     "function",
+			Function: toolChoiceFn{Name: "capture_intent_plan"},
+		},
+		Temperature: 0.2,
+	}
+	return json.Marshal(body)
+}
+
 // parseToolCall extracts subject + body from a chat-completion response
 // whose assistant message carries a single tool_call to commit_message.
 // Tolerates the OpenAI-canonical shape and the (older / vLLM) shape that
@@ -399,4 +570,65 @@ func parseToolCall(raw []byte) (subject string, body string, err error) {
 		return "", "", errors.New("openai-compat: tool call returned empty subject")
 	}
 	return fa.Subject, fa.Body, nil
+}
+
+func parseIntentPlanToolCall(raw []byte) (IntentPlan, error) {
+	type fcall struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	type toolCall struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function fcall  `json:"function"`
+	}
+	type message struct {
+		Role         string     `json:"role"`
+		Content      string     `json:"content"`
+		ToolCalls    []toolCall `json:"tool_calls"`
+		FunctionCall *fcall     `json:"function_call"`
+	}
+	type choice struct {
+		Index   int     `json:"index"`
+		Message message `json:"message"`
+	}
+	type respShape struct {
+		Choices []choice `json:"choices"`
+		Error   *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	var r respShape
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: parse response: %w", err)
+	}
+	if r.Error != nil && r.Error.Message != "" {
+		return IntentPlan{}, fmt.Errorf("openai-compat: api error: %s", r.Error.Message)
+	}
+	if len(r.Choices) == 0 {
+		return IntentPlan{}, errors.New("openai-compat: no choices in response")
+	}
+	msg := r.Choices[0].Message
+
+	var args string
+	switch {
+	case len(msg.ToolCalls) > 0 && msg.ToolCalls[0].Function.Arguments != "":
+		if msg.ToolCalls[0].Function.Name != "capture_intent_plan" {
+			return IntentPlan{}, fmt.Errorf("openai-compat: unexpected tool %q", msg.ToolCalls[0].Function.Name)
+		}
+		args = msg.ToolCalls[0].Function.Arguments
+	case msg.FunctionCall != nil && msg.FunctionCall.Arguments != "":
+		if msg.FunctionCall.Name != "capture_intent_plan" {
+			return IntentPlan{}, fmt.Errorf("openai-compat: unexpected function %q", msg.FunctionCall.Name)
+		}
+		args = msg.FunctionCall.Arguments
+	default:
+		return IntentPlan{}, errors.New("openai-compat: response carried no intent-plan tool_call arguments")
+	}
+
+	var plan IntentPlan
+	if err := json.Unmarshal([]byte(args), &plan); err != nil {
+		return IntentPlan{}, fmt.Errorf("openai-compat: parse intent-plan tool arguments: %w", err)
+	}
+	return plan, nil
 }
