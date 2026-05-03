@@ -383,7 +383,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			}
 			if alreadyPublished {
 				sourceHead := parent
-				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID,
+					state.DecisionKindHandledExternal, "already_published_by_external_committer",
+				); err != nil {
 					return sum, err
 				}
 				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -426,6 +428,27 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
+		if superseded, reason, err := supersededByExternalHistory(ctx, repoRoot, parent, ev, ops); err != nil {
+			return sum, err
+		} else if superseded {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent,
+				state.DecisionKindSupersededExternal, reason,
+			); err != nil {
+				return sum, err
+			}
+			if err := git.ReadTree(ctx, repoRoot, indexFile, parent); err != nil {
+				return sum, fmt.Errorf("daemon: replay reseed index after superseded external: %w", err)
+			}
+			activeCtx.BaseHead = parent
+			sum.BaseHead = parent
+			sum.Published++
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, reason, map[string]any{
+				"commit": parent,
+				"parent": parent,
+			})
+			continue
+		}
+
 		// Per-event timeout. write-tree, commit-tree, and update-ref are
 		// the heavy git ops in this loop; a pathological worktree (giant
 		// rename, GC contention, network alternates) could otherwise stall
@@ -463,7 +486,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// row in the steady state.
 		if parentTree != "" && treeOID == parentTree {
 			cancelEvent()
-			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent,
+				state.DecisionKindHandledExternal, "already_published_no_op_tree",
+			); err != nil {
 				return sum, err
 			}
 			reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -531,7 +556,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			}
 			if alreadyPublished {
 				cancelEvent()
-				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID,
+					state.DecisionKindHandledExternal, "already_published_after_cas_exhaustion",
+				); err != nil {
 					return sum, err
 				}
 				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -591,7 +618,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 
 		// Settle the event row + publish_state.
 		cancelEvent()
-		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
+		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID,
+			state.DecisionKindCommitted, "event published",
+		); err != nil {
 			return sum, err
 		}
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
