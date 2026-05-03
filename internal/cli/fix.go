@@ -167,10 +167,10 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun bool) (fixPl
 	if err := planBackpressureFix(ctx, conn, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	if err := planObsoleteBarrierFix(ctx, conn, &plan); err != nil {
+	if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
+	if err := planObsoleteBarrierFix(ctx, conn, &plan); err != nil {
 		return fixPlan{}, err
 	}
 	return plan, nil
@@ -274,6 +274,14 @@ FROM capture_events e
 WHERE state IN (?, ?)
   AND NOT EXISTS (
       SELECT 1
+      FROM decision_records d
+      WHERE d.event_seq = e.seq
+        AND d.kind IN (?, ?)
+        AND d.commit_oid IS NOT NULL
+        AND d.commit_oid <> ''
+  )
+  AND NOT EXISTS (
+      SELECT 1
       FROM capture_events pending
       WHERE pending.branch_ref = e.branch_ref
         AND pending.branch_generation = e.branch_generation
@@ -281,7 +289,9 @@ WHERE state IN (?, ?)
         AND pending.state = ?
   )
 ORDER BY seq ASC`,
-		state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending)
+		state.EventStateBlockedConflict, state.EventStateFailed,
+		state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal,
+		state.EventStatePending)
 	if err != nil {
 		return fmt.Errorf("acd fix: query obsolete barriers: %w", err)
 	}
@@ -311,6 +321,14 @@ ORDER BY seq ASC`,
 SELECT COUNT(*)
 FROM capture_events e
 WHERE state IN (?, ?)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM decision_records d
+      WHERE d.event_seq = e.seq
+        AND d.kind IN (?, ?)
+        AND d.commit_oid IS NOT NULL
+        AND d.commit_oid <> ''
+  )
   AND EXISTS (
       SELECT 1
       FROM capture_events pending
@@ -319,7 +337,9 @@ WHERE state IN (?, ?)
         AND pending.seq > e.seq
         AND pending.state = ?
   )`,
-		state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending).Scan(&blocking); err != nil {
+		state.EventStateBlockedConflict, state.EventStateFailed,
+		state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal,
+		state.EventStatePending).Scan(&blocking); err != nil {
 		return fmt.Errorf("acd fix: count active barriers: %w", err)
 	}
 	if blocking > 0 {
