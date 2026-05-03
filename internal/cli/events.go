@@ -49,6 +49,12 @@ type eventEntry struct {
 	ActionTaken      string  `json:"action_taken,omitempty"`
 	UserMessage      string  `json:"user_message,omitempty"`
 	DecisionTS       float64 `json:"decision_ts"`
+	GroupedSeqs      []int64 `json:"grouped_seqs,omitempty"`
+	GroupSize        int     `json:"group_size,omitempty"`
+	IntentGroup      bool    `json:"intent_group,omitempty"`
+	Deferred         bool    `json:"deferred,omitempty"`
+	ForcedAging      bool    `json:"forced_aging,omitempty"`
+	PlannerError     bool    `json:"planner_error,omitempty"`
 }
 
 func newEventsCmd() *cobra.Command {
@@ -119,7 +125,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 		return fmt.Errorf("acd events: decision table check: %w", err)
 	}
 	if !hasLedger {
-		return renderEvents(out, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
+		return renderEvents(ctx, out, db, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
 	}
 
 	var rows []state.DecisionRecord
@@ -143,7 +149,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 		}
 	}
 	if len(rows) > 0 || !watch {
-		if err := renderEvents(out, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
+		if err := renderEvents(ctx, out, db, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
 			return err
 		}
 	}
@@ -290,16 +296,21 @@ func followEvents(ctx context.Context, out io.Writer, db *sql.DB, repo, path str
 			continue
 		}
 		cursor = maxDecisionCursor(rows, cursor)
-		if err := renderEvents(out, repo, rows, cursor, jsonOut, false, ""); err != nil {
+		if err := renderEvents(ctx, out, db, repo, rows, cursor, jsonOut, false, ""); err != nil {
 			return err
 		}
 	}
 }
 
-func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
+func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
 	entries := make([]eventEntry, 0, len(rows))
 	for _, row := range rows {
 		entries = append(entries, decisionEntry(row))
+	}
+	if db != nil {
+		if err := enrichEventEntries(ctx, db, entries); err != nil {
+			return err
+		}
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -392,7 +403,63 @@ func decisionEntry(row state.DecisionRecord) eventEntry {
 	if row.UserMessage.Valid {
 		entry.UserMessage = row.UserMessage.String
 	}
+	entry.IntentGroup = entry.ActionTaken == "intent_group_committed" || strings.HasPrefix(entry.Reason, "intent_group:")
+	entry.Deferred = row.Kind == state.DecisionKindIntentDeferred
+	entry.ForcedAging = row.Kind == state.DecisionKindIntentForced
+	entry.PlannerError = row.Kind == state.DecisionKindIntentPlannerError
 	return entry
+}
+
+func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) error {
+	if len(entries) == 0 || db == nil {
+		return nil
+	}
+	cache := map[string][]int64{}
+	for i := range entries {
+		commit := entries[i].CommitOID
+		if commit == "" {
+			continue
+		}
+		seqs, ok := cache[commit]
+		if !ok {
+			var err error
+			seqs, err = decisionSeqsForCommitSQL(ctx, db, commit)
+			if err != nil {
+				return err
+			}
+			cache[commit] = seqs
+		}
+		if len(seqs) > 1 {
+			entries[i].GroupedSeqs = append([]int64(nil), seqs...)
+			entries[i].GroupSize = len(seqs)
+			entries[i].IntentGroup = true
+		}
+	}
+	return nil
+}
+
+func decisionSeqsForCommitSQL(ctx context.Context, db *sql.DB, commitOID string) ([]int64, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT DISTINCT event_seq
+FROM decision_records
+WHERE commit_oid = ? AND event_seq IS NOT NULL
+ORDER BY event_seq ASC`, commitOID)
+	if err != nil {
+		return nil, fmt.Errorf("acd events: query commit grouped seqs: %w", err)
+	}
+	defer rows.Close()
+	var seqs []int64
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return nil, fmt.Errorf("acd events: scan commit grouped seq: %w", err)
+		}
+		seqs = append(seqs, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("acd events: iter commit grouped seqs: %w", err)
+	}
+	return seqs, nil
 }
 
 func maxDecisionCursor(rows []state.DecisionRecord, fallback int64) int64 {
