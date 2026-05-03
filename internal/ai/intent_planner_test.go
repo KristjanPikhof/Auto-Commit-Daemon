@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +229,29 @@ func TestValidateIntentPlanRejectsInvalidShapes(t *testing.T) {
 	}
 }
 
+func TestNormalizeIntentPlanReasons(t *testing.T) {
+	long := strings.Repeat("x", IntentReasonCap+20)
+	plan := NormalizeIntentPlanReasons(IntentPlan{
+		GroupingReason: " \tgroup\x00ing\nreason\x7f ",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: " \rdefer\x1breason\t ",
+		}, {
+			Seq:    103,
+			Reason: long,
+		}},
+	})
+	if plan.GroupingReason != "groupingreason" {
+		t.Fatalf("grouping reason=%q", plan.GroupingReason)
+	}
+	if plan.DeferredReasons[0].Reason != "deferreason" {
+		t.Fatalf("deferred reason=%q", plan.DeferredReasons[0].Reason)
+	}
+	if got := len([]rune(plan.DeferredReasons[1].Reason)); got != IntentReasonCap {
+		t.Fatalf("bounded reason length=%d want %d", got, IntentReasonCap)
+	}
+}
+
 func TestDeterministicPlanIntentSelectsOneAndDefersRest(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan, err := (DeterministicProvider{}).PlanIntent(context.Background(), req)
@@ -251,6 +275,7 @@ func TestDeterministicPlanIntentSelectsOneAndDefersRest(t *testing.T) {
 type staticIntentPlannerProvider struct {
 	name string
 	plan IntentPlan
+	err  error
 }
 
 func (p staticIntentPlannerProvider) Name() string { return p.name }
@@ -260,12 +285,15 @@ func (p staticIntentPlannerProvider) Generate(context.Context, CommitContext) (R
 }
 
 func (p staticIntentPlannerProvider) PlanIntent(context.Context, IntentPlanRequest) (IntentPlan, error) {
+	if p.err != nil {
+		return IntentPlan{}, p.err
+	}
 	plan := p.plan
 	plan.Source = p.name
 	return plan, nil
 }
 
-func TestComposedPlanIntentValidatesPrimaryBeforeAccepting(t *testing.T) {
+func TestComposedPlanIntentReturnsPrimaryValidationError(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	primary := staticIntentPlannerProvider{
 		name: "bad-primary",
@@ -276,14 +304,21 @@ func TestComposedPlanIntentValidatesPrimaryBeforeAccepting(t *testing.T) {
 		},
 	}
 	planner := Compose(primary, DeterministicProvider{})
-	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
-	if err != nil {
-		t.Fatalf("PlanIntent: %v", err)
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error")
 	}
-	if plan.Source != "deterministic" {
-		t.Fatalf("source=%q want deterministic fallback", plan.Source)
+	if !strings.Contains(err.Error(), "omitted from selected/deferred") {
+		t.Fatalf("error=%v", err)
 	}
-	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 102 {
-		t.Fatalf("deferred=%v", plan.DeferredSeqs)
+}
+
+func TestComposedPlanIntentReturnsPrimaryProviderError(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	primaryErr := errors.New("primary unavailable")
+	planner := Compose(staticIntentPlannerProvider{name: "bad-primary", err: primaryErr}, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if !errors.Is(err, primaryErr) {
+		t.Fatalf("error=%v want %v", err, primaryErr)
 	}
 }
