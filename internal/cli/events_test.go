@@ -103,12 +103,12 @@ func TestEventsWatchStreamsAppendedRowsOnce(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond)
 	if _, err := state.AppendDecision(context.Background(), db, state.DecisionRecord{
-		DecisionTS:   20,
-		Kind:         state.DecisionKindCaptured,
-		Path:         sqlNullStr("a.txt"),
-		UserMessage:  sqlNullStr("first append"),
-		ActionTaken:  sqlNullStr("queued"),
-		BranchRef:    sqlNullStr("refs/heads/main"),
+		DecisionTS:       20,
+		Kind:             state.DecisionKindCaptured,
+		Path:             sqlNullStr("a.txt"),
+		UserMessage:      sqlNullStr("first append"),
+		ActionTaken:      sqlNullStr("queued"),
+		BranchRef:        sqlNullStr("refs/heads/main"),
 		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
 	}); err != nil {
 		t.Fatalf("append first: %v", err)
@@ -196,4 +196,11 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func sqlNullStr(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
