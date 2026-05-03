@@ -428,9 +428,35 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		if superseded, reason, err := supersededByExternalHistory(ctx, repoRoot, parent, ev, ops); err != nil {
+		// Per-event timeout. The external-history superseded probe, write-tree,
+		// commit-tree, and update-ref are the heavy git ops in this loop; a
+		// pathological history/worktree (giant path history, giant rename, GC
+		// contention, network alternates) could otherwise stall a single event
+		// for minutes and starve flush_requests / shutdown signals waiting on
+		// the run loop. Each event gets a 60s budget inherited from the caller's
+		// ctx; on timeout the event is marked failed and the batch halts so the
+		// next pass starts fresh. Tests override the budget via
+		// replayPerEventTimeoutForTest.
+		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+
+		if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, parent, ev, ops); err != nil {
+			cancelEvent()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				if markErr := markFailed(ctx, db, ev, replayIssue{
+					ErrorClass: replayErrorCommitBuildFailure,
+					Message:    err.Error(),
+					Ref:        activeCtx.BranchRef,
+					Path:       ev.Path,
+				}); markErr != nil {
+					return sum, markErr
+				}
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+				sum.Failed++
+				return sum, nil
+			}
 			return sum, err
 		} else if superseded {
+			cancelEvent()
 			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent,
 				state.DecisionKindSupersededExternal, reason,
 			); err != nil {
@@ -449,15 +475,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			continue
 		}
 
-		// Per-event timeout. write-tree, commit-tree, and update-ref are
-		// the heavy git ops in this loop; a pathological worktree (giant
-		// rename, GC contention, network alternates) could otherwise stall
-		// a single event for minutes and starve flush_requests / shutdown
-		// signals waiting on the run loop. Each event gets a 60s budget
-		// inherited from the caller's ctx; on timeout the event is marked
-		// failed and the batch halts so the next pass starts fresh. Tests
-		// override the budget via replayPerEventTimeoutForTest.
-		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
 		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
 			cancelEvent()
