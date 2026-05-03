@@ -637,6 +637,23 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 				fmt.Fprintf(out, "      last conflict : %s\n", strings.Join(bits, " "))
 			}
 		}
+		if rr.FailedEvents > 0 {
+			fmt.Fprintf(out, "      failed     : %d\n", rr.FailedEvents)
+			if rr.FailedBlockingPending > 0 {
+				fmt.Fprintf(out, "      failed blockers : %d pending successors; run acd fix --dry-run\n", rr.FailedBlockingPending)
+			}
+			if rr.LastReplayFailurePath != "" {
+				bits := []string{rr.LastReplayFailurePath}
+				if rr.LastReplayFailureTS > 0 {
+					age := time.Since(time.Unix(rr.LastReplayFailureTS, 0))
+					bits = append(bits, formatDurationCompact(age)+" ago")
+				}
+				if rr.LastReplayFailureErr != "" {
+					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayFailureErr))
+				}
+				fmt.Fprintf(out, "      last failure : %s\n", strings.Join(bits, " "))
+			}
+		}
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
 				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
