@@ -101,6 +101,49 @@ func TestLatestPathCommitSummaries_ReturnsTouchedRelevance(t *testing.T) {
 	assertStringSliceEqual(t, got[2].TouchedPaths, []string{"README.md"})
 }
 
+func TestLatestPathCommitSummaries_TreatsPathspecMagicAsLiteral(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		literal    string
+		distractor string
+	}{
+		{
+			name:       "star",
+			literal:    "literal*.txt",
+			distractor: "literal-any.txt",
+		},
+		{
+			name:       "bracket",
+			literal:    "bracket[abc].txt",
+			distractor: "bracketa.txt",
+		},
+		{
+			name:       "colon_magic",
+			literal:    ":(top)colon.txt",
+			distractor: "colon.txt",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := initRepoWithMain(t)
+			ctx := context.Background()
+			literalCommit := commitWorktreeFileLiteral(t, ctx, dir, tc.literal, "literal\n", "literal path")
+			commitWorktreeFileLiteral(t, ctx, dir, tc.distractor, "distractor\n", "distractor path")
+
+			got, err := LatestPathCommitSummaries(ctx, dir, "HEAD", []string{tc.literal}, 5)
+			if err != nil {
+				t.Fatalf("latest path commits: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("commits=%d want 1 literal match: %#v", len(got), got)
+			}
+			if got[0].ShortOID != literalCommit[:12] || got[0].Subject != "literal path" {
+				t.Fatalf("literal commit mismatch: %#v want oid prefix %s subject %q", got[0], literalCommit[:12], "literal path")
+			}
+			assertStringSliceEqual(t, got[0].TouchedPaths, []string{tc.literal})
+		})
+	}
+}
+
 func TestLatestPathCommitSummaries_MissingPathReturnsEmpty(t *testing.T) {
 	dir := initRepoWithMain(t)
 	ctx := context.Background()
@@ -177,6 +220,22 @@ func commitWorktreeFile(t *testing.T, ctx context.Context, dir, path, content, m
 	}
 	if _, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultWriteTimeout}, "commit", "-q", "-m", message); err != nil {
 		t.Fatalf("git commit %s: %v", path, err)
+	}
+	head, err := RevParse(ctx, dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return head
+}
+
+func commitWorktreeFileLiteral(t *testing.T, ctx context.Context, dir, path, content, message string) string {
+	t.Helper()
+	writeFile(t, filepath.Join(dir, path), content)
+	if _, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultWriteTimeout}, "--literal-pathspecs", "add", "--", path); err != nil {
+		t.Fatalf("git add literal %s: %v", path, err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultWriteTimeout}, "commit", "-q", "-m", message); err != nil {
+		t.Fatalf("git commit literal %s: %v", path, err)
 	}
 	head, err := RevParse(ctx, dir, "HEAD")
 	if err != nil {
