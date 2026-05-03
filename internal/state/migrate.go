@@ -15,7 +15,8 @@ import (
 // pending-by-id scan stays index-backed after long uptime. v5 adds
 // decision_records, an append-only ledger for product-facing decisions. v6
 // rebuilds decision_records without the event_seq foreign key so capture_event
-// pruning cannot erase denormalized ledger identity.
+// pruning cannot erase denormalized ledger identity. v7 adds planner_state for
+// bounded intent-planner deferrals.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -24,7 +25,8 @@ import (
 // and adding idempotent statements to schemaDDL is sufficient for pure-DDL
 // migrations (such as v2→v3). v6 also uses schemaDDL's transactional table
 // rebuild to migrate already-v5 decision_records rows before stamping the new
-// version. Migrate is wired now so future phases requiring separate data
+// version. v7 is a pure DDL migration through schemaDDL. Migrate is wired now
+// so future phases requiring separate data
 // backfill have a single entry point to extend.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
