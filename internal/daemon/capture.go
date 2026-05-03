@@ -608,7 +608,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	}
 	maxBytes := resolveMaxFileBytes(opts.MaxFileBytes)
 
-	live, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
+	live, protectedSkips, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
 		matcher:       matcher,
 		safeIgnore:    safeIgnore,
 		ignoreChecker: opts.IgnoreChecker,
@@ -632,6 +632,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	if err != nil {
 		return summary, fmt.Errorf("daemon: load shadow: %w", err)
 	}
+	protectedSkipCount := protectShadowFromSkippedPresent(ctx, db, cctx, shadow, protectedSkips)
 
 	ops := Classify(shadow, live)
 	recordTrace(opts.Trace, acdtrace.Event{
@@ -646,6 +647,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			"walked_files": summary.WalkedFiles,
 			"oversize":     summary.Oversize,
 			"errors":       summary.Errors,
+			"protected":    protectedSkipCount,
 		},
 		Generation: cctx.BranchGeneration,
 	})
