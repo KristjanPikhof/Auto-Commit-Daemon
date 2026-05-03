@@ -240,6 +240,74 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	}, nil
 }
 
+// PlanIntent asks the subprocess plugin to select/defer every offered capture.
+// The JSONL request uses request_type=intent_plan and carries the shared
+// IntentPlanRequest payload; response fields mirror IntentPlan.
+func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRequest) (IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return IntentPlan{}, err
+	}
+	if p.resolveErr != nil {
+		return IntentPlan{}, p.resolveErr
+	}
+
+	req := subprocessRequest{
+		Version:        pluginProtocolVersion,
+		RequestType:    "intent_plan",
+		PlannerRequest: &plannerReq,
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	var resp subprocessResponse
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var session *pluginSession
+		session, err = p.acquire()
+		if err != nil {
+			return IntentPlan{}, err
+		}
+		resp, err = session.exchange(reqCtx, req)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markCrashed(session)
+			return IntentPlan{}, err
+		}
+		p.markCrashed(session)
+	}
+	if err != nil {
+		return IntentPlan{}, err
+	}
+	if strings.TrimSpace(resp.Error) != "" {
+		return IntentPlan{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+	}
+
+	plan := IntentPlan{
+		SelectedSeqs:    resp.SelectedSeqs,
+		DeferredSeqs:    resp.DeferredSeqs,
+		Subject:         resp.Subject,
+		Body:            resp.Body,
+		GroupingReason:  resp.GroupingReason,
+		DeferredReasons: resp.DeferredReasons,
+		Source:          p.Name(),
+	}
+	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
+	parts := strings.SplitN(cleaned, "\n\n", 2)
+	plan.Subject = parts[0]
+	if len(parts) == 2 {
+		plan.Body = parts[1]
+	} else {
+		plan.Body = ""
+	}
+	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
+		return IntentPlan{}, err
+	}
+	return plan, nil
+}
+
 // Close shuts down the plugin process if running. Idempotent and safe to
 // call from any goroutine. After Close, Generate returns an error.
 func (p *SubprocessProvider) Close() error {
