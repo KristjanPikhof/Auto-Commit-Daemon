@@ -429,52 +429,67 @@ func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) e
 	if len(entries) == 0 || db == nil {
 		return nil
 	}
-	cache := map[string][]int64{}
+	cache := map[string]decisionCommitSummary{}
 	for i := range entries {
 		commit := entries[i].CommitOID
 		if commit == "" {
 			continue
 		}
-		seqs, ok := cache[commit]
+		summary, ok := cache[commit]
 		if !ok {
 			var err error
-			seqs, err = decisionSeqsForCommitSQL(ctx, db, commit)
+			summary, err = decisionCommitSummarySQL(ctx, db, commit)
 			if err != nil {
 				return err
 			}
-			cache[commit] = seqs
+			cache[commit] = summary
 		}
-		if len(seqs) > 1 {
-			entries[i].GroupedSeqs = append([]int64(nil), seqs...)
-			entries[i].GroupSize = len(seqs)
+		if len(summary.Seqs) > 1 {
+			entries[i].GroupedSeqs = append([]int64(nil), summary.Seqs...)
+			entries[i].GroupSize = len(summary.Seqs)
+		}
+		if summary.IntentGroup {
 			entries[i].IntentGroup = true
 		}
 	}
 	return nil
 }
 
-func decisionSeqsForCommitSQL(ctx context.Context, db *sql.DB, commitOID string) ([]int64, error) {
+type decisionCommitSummary struct {
+	Seqs        []int64
+	IntentGroup bool
+}
+
+func decisionCommitSummarySQL(ctx context.Context, db *sql.DB, commitOID string) (decisionCommitSummary, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT DISTINCT event_seq
+SELECT event_seq, action_taken, reason
 FROM decision_records
 WHERE commit_oid = ? AND event_seq IS NOT NULL
 ORDER BY event_seq ASC`, commitOID)
 	if err != nil {
-		return nil, fmt.Errorf("acd events: query commit grouped seqs: %w", err)
+		return decisionCommitSummary{}, fmt.Errorf("acd events: query commit grouped seqs: %w", err)
 	}
 	defer rows.Close()
-	var seqs []int64
+	var summary decisionCommitSummary
+	seen := map[int64]struct{}{}
 	for rows.Next() {
 		var seq int64
-		if err := rows.Scan(&seq); err != nil {
-			return nil, fmt.Errorf("acd events: scan commit grouped seq: %w", err)
+		var action, reason sql.NullString
+		if err := rows.Scan(&seq, &action, &reason); err != nil {
+			return decisionCommitSummary{}, fmt.Errorf("acd events: scan commit grouped seq: %w", err)
 		}
-		seqs = append(seqs, seq)
+		if _, ok := seen[seq]; !ok {
+			summary.Seqs = append(summary.Seqs, seq)
+			seen[seq] = struct{}{}
+		}
+		if action.String == "intent_group_committed" || strings.HasPrefix(reason.String, "intent_group:") {
+			summary.IntentGroup = true
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("acd events: iter commit grouped seqs: %w", err)
+		return decisionCommitSummary{}, fmt.Errorf("acd events: iter commit grouped seqs: %w", err)
 	}
-	return seqs, nil
+	return summary, nil
 }
 
 func maxDecisionCursor(rows []state.DecisionRecord, fallback int64) int64 {
