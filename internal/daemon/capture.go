@@ -872,7 +872,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 	}
 }
 
-func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureContext, seq int64, op Op) {
+func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureContext, seq int64, op ClassifiedOp) {
 	if db == nil || op.Path == "" {
 		return
 	}
