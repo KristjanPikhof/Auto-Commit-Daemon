@@ -18,17 +18,17 @@ import (
 const defaultExplainLimit = 10
 
 type explainReport struct {
-	Repo           string       `json:"repo"`
-	Mode           string       `json:"mode"`
-	Path           string       `json:"path,omitempty"`
-	Commit         string       `json:"commit,omitempty"`
-	CurrentState   string       `json:"current_state,omitempty"`
-	PendingEvents  int          `json:"pending_events,omitempty"`
-	Explanation    string       `json:"explanation"`
-	Recommended    string       `json:"recommended_next_step"`
-	DecisionCursor int64        `json:"decision_cursor,omitempty"`
-	DecisionLedgerAvailable bool `json:"decision_ledger_available"`
-	Decisions      []eventEntry `json:"decisions"`
+	Repo                    string       `json:"repo"`
+	Mode                    string       `json:"mode"`
+	Path                    string       `json:"path,omitempty"`
+	Commit                  string       `json:"commit,omitempty"`
+	CurrentState            string       `json:"current_state,omitempty"`
+	PendingEvents           int          `json:"pending_events,omitempty"`
+	Explanation             string       `json:"explanation"`
+	Recommended             string       `json:"recommended_next_step"`
+	DecisionCursor          int64        `json:"decision_cursor,omitempty"`
+	DecisionLedgerAvailable bool         `json:"decision_ledger_available"`
+	Decisions               []eventEntry `json:"decisions"`
 }
 
 func newExplainCmd() *cobra.Command {
