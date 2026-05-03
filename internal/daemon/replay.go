@@ -1134,12 +1134,50 @@ func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan)
 			if _, priorSelected := selected[prior.event.Seq]; priorSelected {
 				continue
 			}
-			if pathsOverlap(touchedPaths(item.ops), touchedPaths(prior.ops)) {
+			if pathsRelatedForIntent(touchedPaths(item.ops), touchedPaths(prior.ops)) {
 				return fmt.Errorf("intent planner: selected seq %d depends on deferred earlier seq %d for the same path", item.event.Seq, prior.event.Seq)
 			}
 		}
 	}
 	return nil
+}
+
+func pathsRelatedForIntent(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	for _, left := range a {
+		for _, right := range b {
+			if sameOrNestedRepoPath(left, right) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameOrNestedRepoPath(a, b string) bool {
+	a = normalizeIntentDependencyPath(a)
+	b = normalizeIntentDependencyPath(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) < len(b) {
+		return strings.HasPrefix(b, a+"/")
+	}
+	return strings.HasPrefix(a, b+"/")
+}
+
+func normalizeIntentDependencyPath(path string) string {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	path = strings.TrimPrefix(path, "./")
+	for strings.HasSuffix(path, "/") {
+		path = strings.TrimSuffix(path, "/")
+	}
+	return path
 }
 
 func pathsOverlap(a, b []string) bool {
@@ -2423,8 +2461,12 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 	if len(paths) == 0 {
 		return false, nil
 	}
-	args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
-	args = append(args, paths...)
+		pathspecs := git.LiteralPathspecs(paths)
+		if len(pathspecs) == 0 {
+			return false, nil
+		}
+		args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
+		args = append(args, pathspecs...)
 	_, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, args...)
 	if err != nil {
 		var gerr *git.Error
@@ -2437,7 +2479,7 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 	// fallback bounded to one commit OID instead of buffering path names for
 	// the whole range.
 	args = []string{"rev-list", "--max-count=1", before + ".." + after, "--"}
-	args = append(args, paths...)
+	args = append(args, pathspecs...)
 	out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, 64, args...)
 	if err != nil {
 		return false, fmt.Errorf("rev-list touched paths %s..%s: %w", before, after, err)
