@@ -878,9 +878,16 @@ func classifyIgnoredBatched(ctx context.Context, ig *git.IgnoreChecker, paths []
 //   - Sensitive + ignore checks short-circuit before O_NOFOLLOW + read.
 //   - All errors except context cancellation are soft: the daemon must keep
 //     running across permission errors or file races.
-func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]LiveEntry, CaptureSummary, error) {
+func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]LiveEntry, map[string]skippedPresent, CaptureSummary, error) {
 	live := map[string]LiveEntry{}
+	protected := map[string]skippedPresent{}
 	var summary CaptureSummary
+	markProtected := func(rel, reason string, dir bool) {
+		if rel == "" || reason == "" {
+			return
+		}
+		protected[rel] = skippedPresent{Reason: reason, Dir: dir}
+	}
 
 	// First pass: BFS the worktree, collecting (a) regular-file + symlink
 	// candidates that survived the cheap filters and (b) the directory
@@ -902,7 +909,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 	for len(frontier) > 0 {
 		if err := ctx.Err(); err != nil {
-			return nil, summary, err
+			return nil, protected, summary, err
 		}
 
 		var nextDirs []dirEntry
@@ -929,6 +936,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			children, err := os.ReadDir(parent.full)
 			if err != nil {
 				// Soft error: the directory vanished or is unreadable.
+				markProtected(parent.rel, "unreadable", true)
 				bumpLayerError()
 				continue
 			}
@@ -942,6 +950,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				}
 				if hasControlPathChar(childRel) {
 					recordInvalidPath(ctx, opts.db, childRel, "control_chars")
+					markProtected(childRel, "invalid_path", false)
 					bumpLayerError()
 					continue
 				}
@@ -967,6 +976,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				childFull := filepath.Join(parent.full, name)
 				fi, lstatErr := os.Lstat(childFull)
 				if lstatErr != nil {
+					markProtected(childRel, "lstat_error", false)
 					bumpLayerError()
 					continue
 				}
@@ -975,9 +985,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				// Symlinks: capture as 120000 candidate, never descend.
 				if mode&os.ModeSymlink != 0 {
 					if opts.matcher != nil && opts.matcher.Match(childRel) {
+						markProtected(childRel, "sensitive", false)
 						continue
 					}
 					if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
+						markProtected(childRel, "safe_ignore", false)
 						continue
 					}
 					fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -994,9 +1006,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 						continue
 					}
 					if opts.matcher != nil && opts.matcher.MatchDirectory(childRel) {
+						markProtected(childRel, "sensitive", true)
 						continue
 					}
 					if opts.safeIgnore != nil && opts.safeIgnore.MatchDirectory(childRel) {
+						markProtected(childRel, "safe_ignore", true)
 						continue
 					}
 					nextDirs = append(nextDirs, dirEntry{rel: childRel, full: childFull})
@@ -1008,9 +1022,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 					continue
 				}
 				if opts.matcher != nil && opts.matcher.Match(childRel) {
+					markProtected(childRel, "sensitive", false)
 					continue
 				}
 				if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
+					markProtected(childRel, "safe_ignore", false)
 					continue
 				}
 				fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -1037,12 +1053,13 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				// Fail-closed: if check-ignore is busted, abort the pass
 				// rather than silently committing files git considers
 				// ignored.
-				return nil, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
+				return nil, protected, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
 			}
 
 			survivorDirs := make([]dirEntry, 0, len(nextDirs))
 			for i, e := range nextDirs {
 				if results[i] {
+					markProtected(e.rel, "gitignore", true)
 					continue
 				}
 				survivorDirs = append(survivorDirs, e)
@@ -1052,6 +1069,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			survivorFiles := make([]candidate, 0, len(fileCands))
 			for j, c := range fileCands {
 				if results[origDirCount+j] {
+					markProtected(c.rel, "gitignore", false)
 					continue
 				}
 				survivorFiles = append(survivorFiles, c)
@@ -1064,7 +1082,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, summary, err
+		return nil, protected, summary, err
 	}
 
 	for _, c := range pending {
@@ -1072,19 +1090,21 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			return nil, summary, err
 		}
 		summary.WalkedFiles++
-		entry, ok, err := hashCandidate(ctx, repoRoot, c, opts)
+		entry, ok, reason, err := hashCandidate(ctx, repoRoot, c, opts)
 		if err != nil {
+			markProtected(c.rel, "unreadable", false)
 			summary.Errors++
 			continue
 		}
 		if !ok {
+			markProtected(c.rel, reason, false)
 			summary.Oversize++
 			continue
 		}
 		live[c.rel] = entry
 	}
 
-	return live, summary, nil
+	return live, protected, summary, nil
 }
 
 // hashCandidate hashes one candidate path into the git object store. For
