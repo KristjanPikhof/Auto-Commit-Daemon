@@ -68,7 +68,7 @@ type CaptureOp struct {
 // keyed by capture_events.seq so planner retries and deferrals survive daemon
 // restarts without changing capture_events lifecycle state.
 type PlannerState struct {
-	EventSeq         int64
+	EventSeq        int64
 	DeferCount      int
 	LastPlannedTS   float64
 	LastDeferReason sql.NullString
