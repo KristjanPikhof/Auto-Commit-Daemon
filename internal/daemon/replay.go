@@ -1158,14 +1158,24 @@ func pathsOverlap(a, b []string) bool {
 	return false
 }
 
-func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan, ts float64) error {
+func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan, items []intentReplayItem, cctx CaptureContext, ts float64) error {
 	reasons := make(map[int64]string, len(plan.DeferredReasons))
 	for _, item := range plan.DeferredReasons {
 		reasons[item.Seq] = item.Reason
 	}
+	events := make(map[int64]state.CaptureEvent, len(items))
+	for _, item := range items {
+		events[item.event.Seq] = item.event
+	}
 	for _, seq := range plan.DeferredSeqs {
-		if err := state.RecordPlannerDefer(ctx, db, seq, ts, reasons[seq]); err != nil {
+		reason := reasons[seq]
+		if err := state.RecordPlannerDefer(ctx, db, seq, ts, reason); err != nil {
 			return err
+		}
+		if ev, ok := events[seq]; ok {
+			if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts, state.DecisionKindIntentDeferred, reason, "deferred", "Deferred from this intent planning window: "+fallback(reason, "planner selected a different capture group")+"." ); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
