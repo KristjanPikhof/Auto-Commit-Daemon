@@ -294,6 +294,9 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		DeferredReasons: resp.DeferredReasons,
 		Source:          p.Name(),
 	}
+	if strings.TrimSpace(plan.Subject) == "" {
+		return IntentPlan{}, fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+	}
 	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
 	plan.Subject = parts[0]
