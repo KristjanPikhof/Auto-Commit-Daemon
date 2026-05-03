@@ -391,81 +391,87 @@ func findDaemonProcesses(ctx context.Context, repo string) []int {
 // readRepoState opens the per-repo DB read-only and fills the report fields
 // we can derive from daemon_state, daemon_clients and daemon_meta.
 func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath string) bool {
-	d, err := state.Open(ctx, dbPath)
+	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
 		rr.Notes = append(rr.Notes, "state.db open failed: "+err.Error())
 		return false
 	}
-	defer d.Close()
+	defer conn.Close()
 
-	st, _, err := state.LoadDaemonState(ctx, d)
-	if err != nil {
+	var pid int
+	var mode string
+	var heartbeatTS sql.NullFloat64
+	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts FROM daemon_state WHERE id = 1`)
+	if err := row.Scan(&pid, &mode, &heartbeatTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		rr.Notes = append(rr.Notes, "daemon_state read failed: "+err.Error())
 		return true
-	}
-	rr.DaemonPID = st.PID
-	rr.DaemonMode = st.Mode
-	rr.DaemonAlive = st.PID > 0 && identity.Alive(st.PID)
-	if st.HeartbeatTS > 0 {
-		rr.HeartbeatTS = int64(st.HeartbeatTS)
-		age := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
-		rr.HeartbeatAgeS = int64(age.Seconds())
-		if age > clientTTL() {
-			rr.HeartbeatStale = true
+	} else if err == nil {
+		rr.DaemonPID = pid
+		rr.DaemonMode = mode
+		rr.DaemonAlive = pid > 0 && identity.Alive(pid)
+		if heartbeatTS.Valid && heartbeatTS.Float64 > 0 {
+			rr.HeartbeatTS = int64(heartbeatTS.Float64)
+			age := time.Since(time.Unix(int64(heartbeatTS.Float64), 0))
+			rr.HeartbeatAgeS = int64(age.Seconds())
+			if age > clientTTL() {
+				rr.HeartbeatStale = true
+			}
 		}
 	}
-	if n, err := state.CountClients(ctx, d); err == nil {
+	if n, err := countDoctorClients(ctx, conn); err == nil {
 		rr.Clients = n
 	}
 
 	// fsnotify diagnostics — defensive: missing keys mean "not yet
 	// recorded by the fsnotify lane". We do not invent values.
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.mode"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.mode"); ok {
 		rr.FsnotifyMode = v
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.watch_count"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.watch_count"); ok {
 		if n, perr := strconv.Atoi(v); perr == nil {
 			rr.FsnotifyWatches = n
 		}
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.dropped_events"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.dropped_events"); ok {
 		if n, perr := strconv.Atoi(v); perr == nil {
 			rr.FsnotifyDropped = n
 		}
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.fallback_reason"); ok && v != "" {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.fallback_reason"); ok && v != "" {
 		rr.FsnotifyFallbackReason = v
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
+	if v, ok, _ := metaLookup(ctx, conn, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
-	}
-	if head, err := git.RevParse(ctx, repoPath, "HEAD"); err == nil {
-		if plan, err := daemon.PlanPublishedLiveIndexRepair(ctx, repoPath, d, head, daemon.DefaultLiveIndexRepairLimit); err == nil {
-			if plan.Candidates > 0 || len(plan.Skipped) > 0 {
-				rr.Notes = append(rr.Notes, fmt.Sprintf("live-index repair candidates=%d skipped=%d; run acd recover --repo %s --auto --dry-run",
-					plan.Candidates, len(plan.Skipped), repoPath))
-			}
-		}
 	}
 
 	// Pending FIFO depth + terminal blocked-conflict count.
 	// Best-effort: a missing capture_events table (older schema) yields a
 	// note rather than failing the whole doctor run.
-	if n, err := state.CountEventsByState(ctx, d, state.EventStatePending); err == nil {
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStatePending); err == nil {
 		rr.PendingEvents = n
 	} else {
 		rr.Notes = append(rr.Notes, "pending events count failed: "+err.Error())
 	}
-	if n, err := state.CountEventsByState(ctx, d, state.EventStateBlockedConflict); err == nil {
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateBlockedConflict); err == nil {
 		rr.BlockedConflicts = n
 	} else {
 		rr.Notes = append(rr.Notes, "blocked conflicts count failed: "+err.Error())
+	}
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateFailed); err == nil {
+		rr.FailedEvents = n
+	} else {
+		rr.Notes = append(rr.Notes, "failed events count failed: "+err.Error())
+	}
+	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err == nil {
+		rr.FailedBlockingPending = n
+	} else {
+		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
 	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
 	if rr.BlockedConflicts > 0 {
-		row := d.SQL().QueryRowContext(ctx,
+		row := conn.QueryRowContext(ctx,
 			`SELECT path, published_ts, error FROM capture_events
 			 WHERE state = ?
 			 ORDER BY seq DESC LIMIT 1`, state.EventStateBlockedConflict)
@@ -484,8 +490,45 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 			rr.Notes = append(rr.Notes, "last replay conflict lookup failed: "+err.Error())
 		}
 	}
+	if rr.FailedEvents > 0 {
+		row := conn.QueryRowContext(ctx,
+			`SELECT path, published_ts, error FROM capture_events
+			 WHERE state = ?
+			 ORDER BY seq DESC LIMIT 1`, state.EventStateFailed)
+		var path string
+		var ts sql.NullFloat64
+		var errMsg sql.NullString
+		if err := row.Scan(&path, &ts, &errMsg); err == nil {
+			rr.LastReplayFailurePath = path
+			if ts.Valid {
+				rr.LastReplayFailureTS = int64(ts.Float64)
+			}
+			if errMsg.Valid {
+				rr.LastReplayFailureErr = errMsg.String
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			rr.Notes = append(rr.Notes, "last replay failure lookup failed: "+err.Error())
+		}
+	}
 
 	return true
+}
+
+func countDoctorClients(ctx context.Context, conn *sql.DB) (int, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func countEventsByStateSQL(ctx context.Context, conn *sql.DB, stateName string) (int, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, stateName).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // tailLogLines returns the last n lines of path. Best-effort: errors yield
