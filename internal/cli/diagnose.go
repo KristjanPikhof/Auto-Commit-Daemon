@@ -42,6 +42,7 @@ type diagnoseBlockedClass struct {
 
 type diagnoseBlockedEntry struct {
 	Seq              int64  `json:"seq"`
+	State            string `json:"state"`
 	Path             string `json:"path"`
 	Operation        string `json:"operation"`
 	ErrorClass       string `json:"error_class"`
@@ -57,6 +58,8 @@ type diagnoseReport struct {
 	StateDB                 string                 `json:"state_db"`
 	Anchor                  diagnoseAnchorReport   `json:"anchor"`
 	PendingDepth            int                    `json:"pending_depth"`
+	FailedEvents            int                    `json:"failed_events"`
+	FailedBlockingPending   int                    `json:"failed_blocking_pending"`
 	PendingHighWater        int64                  `json:"pending_high_water"`
 	BackpressurePaused      bool                   `json:"backpressure_paused"`
 	BackpressurePausedAt    string                 `json:"backpressure_paused_at,omitempty"`
@@ -261,6 +264,16 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		return fmt.Errorf("pending depth: %w", err)
 	}
 	report.PendingDepth = depth
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
+		return fmt.Errorf("failed events: %w", err)
+	}
+	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
+		return fmt.Errorf("failed blocking pending: %w", err)
+	} else {
+		report.FailedBlockingPending = n
+	}
 
 	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
 	if err != nil {
@@ -353,12 +366,12 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 		return err
 	}
 	rows, err := conn.QueryContext(ctx,
-		`SELECT seq, branch_ref, branch_generation, operation, path, published_ts, error
+		`SELECT seq, state, branch_ref, branch_generation, operation, path, published_ts, error
 		 FROM capture_events
-		 WHERE state = ?
-		 ORDER BY seq DESC`, state.EventStateBlockedConflict)
+		 WHERE state IN (?, ?)
+		 ORDER BY seq DESC`, state.EventStateBlockedConflict, state.EventStateFailed)
 	if err != nil {
-		return fmt.Errorf("blocked conflicts: %w", err)
+		return fmt.Errorf("terminal replay barriers: %w", err)
 	}
 	defer rows.Close()
 
@@ -367,9 +380,9 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 		var entry diagnoseBlockedEntry
 		var published sql.NullFloat64
 		var errMsg sql.NullString
-		if err := rows.Scan(&entry.Seq, &entry.BranchRef, &entry.BranchGeneration,
+		if err := rows.Scan(&entry.Seq, &entry.State, &entry.BranchRef, &entry.BranchGeneration,
 			&entry.Operation, &entry.Path, &published, &errMsg); err != nil {
-			return fmt.Errorf("scan blocked conflict: %w", err)
+			return fmt.Errorf("scan terminal replay barrier: %w", err)
 		}
 		if published.Valid {
 			entry.PublishedTS = int64(published.Float64)
@@ -378,7 +391,7 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 			entry.Error = errMsg.String
 		}
 		entry.ErrorClass = classifyDiagnoseError(entry.Seq, entry.Error, lastMeta)
-		counts[entry.ErrorClass]++
+		counts[entry.State+":"+entry.ErrorClass]++
 		if len(report.RecentBlocked) < 5 {
 			report.RecentBlocked = append(report.RecentBlocked, entry)
 		}
@@ -460,7 +473,11 @@ func diagnoseRemediation(report diagnoseReport) []string {
 	}
 	if len(report.RecentBlocked) > 0 {
 		remediation = append(remediation,
-			"Resolve the listed paths in the worktree/index, then remove terminal blocked_conflict rows only after the predecessor is safe to discard.")
+			"Resolve the listed replay barrier paths in the worktree/index, then run `acd fix --dry-run` to preview safe cleanup before removing terminal rows.")
+	}
+	if report.FailedBlockingPending > 0 {
+		remediation = append(remediation,
+			fmt.Sprintf("%d failed terminal barrier(s) block later pending replay; inspect the recent barriers and run `acd fix --dry-run` before purging.", report.FailedBlockingPending))
 	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
@@ -519,6 +536,13 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 
 	fmt.Fprintf(out, "Capture queue: pending=%d high_water=%d dropped_total=%d\n",
 		r.PendingDepth, r.PendingHighWater, r.EventsDroppedTotal)
+	if r.FailedEvents > 0 {
+		fmt.Fprintf(out, "Failed terminal events: %d", r.FailedEvents)
+		if r.FailedBlockingPending > 0 {
+			fmt.Fprintf(out, " (%d blocking pending replay; run acd fix --dry-run)", r.FailedBlockingPending)
+		}
+		fmt.Fprintln(out)
+	}
 	if r.BackpressurePaused {
 		fmt.Fprintf(out, "Backpressure: paused at %s\n", valueOrUnset(r.BackpressurePausedAt))
 	}
@@ -532,7 +556,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 			r.OperationInProgress, r.OperationMarkerDuration, stale)
 	}
 
-	fmt.Fprintln(out, "Blocked conflict histogram:")
+	fmt.Fprintln(out, "Terminal replay barrier histogram:")
 	if len(r.BlockedHistogram) == 0 {
 		fmt.Fprintln(out, "  none")
 	} else {
@@ -541,12 +565,12 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 	}
 
-	fmt.Fprintln(out, "Recent blocked entries:")
+	fmt.Fprintln(out, "Recent replay barriers:")
 	if len(r.RecentBlocked) == 0 {
 		fmt.Fprintln(out, "  none")
 	} else {
 		for _, entry := range r.RecentBlocked {
-			fmt.Fprintf(out, "  - seq %d %s %s (%s)", entry.Seq, entry.Operation, entry.Path, entry.ErrorClass)
+			fmt.Fprintf(out, "  - seq %d %s %s %s (%s)", entry.Seq, entry.State, entry.Operation, entry.Path, entry.ErrorClass)
 			if entry.Error != "" {
 				fmt.Fprintf(out, ": %s", entry.Error)
 			}
