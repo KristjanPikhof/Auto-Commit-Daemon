@@ -230,6 +230,82 @@ func TestStatus_BodyRendersPauseSection(t *testing.T) {
 	}
 }
 
+func TestStatus_DecisionSummary(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	firstID, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  10,
+		Kind:        state.DecisionKindProtected,
+		Path:        sqlNullStr("secrets.env"),
+		Reason:      sqlNullStr("sensitive"),
+		ActionTaken: sqlNullStr("no_delete_generated"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision protected: %v", err)
+	}
+	secondID, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  11,
+		Kind:        state.DecisionKindHandledExternal,
+		Path:        sqlNullStr("src/app.go"),
+		Reason:      sqlNullStr("already_published_by_external_committer"),
+		ActionTaken: sqlNullStr("marked_published"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision handled: %v", err)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	human := humanOut.String()
+	for _, want := range []string{
+		"Decisions: protected=1 handled_external=1",
+		"Recent decisions:",
+		"#" + strconv.FormatInt(secondID, 10) + " handled_external src/app.go (marked_published)",
+		"#" + strconv.FormatInt(firstID, 10) + " protected secrets.env (no_delete_generated)",
+		"acd explain --path FILE",
+		"acd events --watch",
+	} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("status output missing %q in:\n%s", want, human)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.DecisionCursor != secondID {
+		t.Fatalf("DecisionCursor = %d, want %d", rep.DecisionCursor, secondID)
+	}
+	if rep.DecisionCounts[state.DecisionKindProtected] != 1 || rep.DecisionCounts[state.DecisionKindHandledExternal] != 1 {
+		t.Fatalf("DecisionCounts = %#v, want protected=1 handled_external=1", rep.DecisionCounts)
+	}
+	if len(rep.RecentDecisions) != 2 || rep.RecentDecisions[0].ID != secondID || rep.RecentDecisions[1].ID != firstID {
+		t.Fatalf("RecentDecisions = %#v, want newest first", rep.RecentDecisions)
+	}
+}
+
+func TestStatusWatchRejectsNonPositiveInterval(t *testing.T) {
+	var out bytes.Buffer
+	if err := runStatusWatch(context.Background(), &out, ".", 0); err == nil {
+		t.Fatal("runStatusWatch with zero interval succeeded")
+	}
+}
+
 // TestList_Status_Doctor_AgreeOnCounts asserts that when the same repo is
 // inspected by acd list, acd status, and acd doctor they all report the
 // same pending + blocked_conflict counts. This is the contract the cli-lane
