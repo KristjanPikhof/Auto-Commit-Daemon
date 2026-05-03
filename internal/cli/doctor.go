@@ -56,6 +56,7 @@ type doctorRepoReport struct {
 	BlockedConflicts       int      `json:"blocked_conflicts"`
 	FailedEvents           int      `json:"failed_events"`
 	FailedBlockingPending  int      `json:"failed_blocking_pending"`
+	IntentStrategy         intentStrategyReport `json:"intent_strategy"`
 	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
@@ -466,6 +467,11 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	} else {
 		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
 	}
+	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
+		rr.IntentStrategy = intentStrategy
+	} else {
+		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
+	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
@@ -651,6 +657,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayFailureErr))
 				}
 				fmt.Fprintf(out, "      last failure : %s\n", strings.Join(bits, " "))
+			}
+		}
+		if rr.IntentStrategy.Active || rr.IntentStrategy.DeferredEvents > 0 || rr.IntentStrategy.LastPlannerError != "" {
+			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
+				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
+			if rr.IntentStrategy.LastPlannerError != "" {
+				fmt.Fprintf(out, "      planner err: seq %d %s\n",
+					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
 			}
 		}
 		if rr.FsnotifyMode != "" {
