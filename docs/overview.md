@@ -41,6 +41,10 @@ For a detailed walkthrough of the storage model, replay index semantics,
 branch-generation safety, and conflict resolution, see
 [capture-replay.md](capture-replay.md).
 
+For day-to-day troubleshooting with `acd status`, `acd events`,
+`acd explain`, `acd fix`, `acd diagnose`, and `acd doctor --bundle`, see
+[user-workflows.md](user-workflows.md).
+
 For AI provider configuration and the subprocess plugin protocol, see
 [ai-providers.md](ai-providers.md).
 
