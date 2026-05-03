@@ -2548,10 +2548,16 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 		action = "superseded externally"
 	case state.DecisionKindCommitted:
 		action = "committed"
+		if strings.HasPrefix(reason, "intent_group:") {
+			action = "intent_group_committed"
+		}
 	case state.DecisionKindBlocked:
 		action = "blocked_conflict"
 	}
 	message := replayDecisionMessage(kind, ev.Path, commitOID)
+	if kind == state.DecisionKindCommitted && strings.HasPrefix(reason, "intent_group:") && message != "" {
+		message = strings.TrimSuffix(message, ".") + " in an intent group."
+	}
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
 		DecisionTS:       ts,
 		Kind:             kind,
