@@ -23,7 +23,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -56,9 +55,14 @@ type doctorRepoReport struct {
 	LastCaptureError       string   `json:"last_capture_error,omitempty"`
 	PendingEvents          int      `json:"pending_events"`
 	BlockedConflicts       int      `json:"blocked_conflicts"`
+	FailedEvents           int      `json:"failed_events"`
+	FailedBlockingPending  int      `json:"failed_blocking_pending"`
 	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS    int64    `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath  string   `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr   string   `json:"last_replay_failure_error,omitempty"`
 	Notes                  []string `json:"notes,omitempty"`
 }
 
