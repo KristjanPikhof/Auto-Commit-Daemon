@@ -262,6 +262,18 @@ export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
 
+Strict-message builds:
+
+~~~bash
+export ACD_COMMIT_STRATEGY=intent
+export ACD_COMMIT_MESSAGE_STRICT=1
+export ACD_AI_REPAIR_ATTEMPTS=2
+~~~
+
+Only set the strict-message variables when your installed `acd` build includes
+strict commit-message validation. They are listed here as the recommended
+profile for teams that require validator-repaired subjects.
+
 Use `event` for CI smoke runs and compatibility-sensitive shared branches.
 Use `intent` when review quality matters and the AI endpoint is trusted. Intent
 planning may group related captures, choose exactly one capture, or defer
