@@ -217,6 +217,44 @@ not enough by itself; without `ACD_AI_DIFF_EGRESS=1`, ACD sends metadata only.
 
 ---
 
+## Commit strategy
+
+`ACD_COMMIT_STRATEGY=event` is the default replay strategy. It preserves the
+original invariant that every pending capture event is considered separately
+and, when published, produces at most one commit.
+
+`ACD_COMMIT_STRATEGY=intent` keeps capture durability unchanged but changes how
+pending events are offered to replay. ACD builds a bounded window of pending
+captures, adds recent branch and path-aware commit context, and asks the AI
+provider for a structured plan. The plan can select exactly one capture or any
+larger non-empty subset. Every offered seq must be either selected or deferred.
+
+ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
+omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
+events that would leapfrog an earlier same-path dependency. Selected captures
+are sorted by seq, applied through the scratch index in order, written as one
+tree, committed once, and settled with a shared `commit_oid`. Deferred captures
+stay pending and get durable `planner_state` with `defer_count`,
+`last_planned_ts`, and `last_defer_reason`.
+
+When `defer_count >= ACD_INTENT_DEFER_LIMIT`, the oldest overdue capture is
+forced through a one-item planning window unless an earlier pending same-path
+capture must land first. This prevents starvation while preserving ordered
+same-path replay.
+
+Intent-specific observability:
+
+- `acd status` shows the active commit strategy and planner deferral summary.
+- `acd diagnose --json` reports deferred count, forced-aging readiness, and the
+  last planner error without mutating state.
+- `acd events` and `acd explain` expose grouped seqs, deferral reasons,
+  forced-aging windows, and planner validation failures from
+  `decision_records`.
+- `ACD_TRACE=1` records planner input/output summaries, selected seqs, deferred
+  seqs, and validation failures without writing captured source diffs.
+
+---
+
 ## `blocked_conflict`: terminal state, operator action required
 
 A `blocked_conflict` event will never be retried automatically. It signals that
