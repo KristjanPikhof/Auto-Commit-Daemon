@@ -293,6 +293,9 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	if err != nil {
 		return IntentPlan{}, err
 	}
+	if strings.TrimSpace(plan.Subject) == "" {
+		return IntentPlan{}, errors.New("openai-compat: intent plan returned empty subject")
+	}
 	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
 	plan.Subject = parts[0]
