@@ -821,6 +821,11 @@ type walkOpts struct {
 	db            *state.DB
 }
 
+type skippedPresent struct {
+	Reason string
+	Dir    bool
+}
+
 // ignoreCheckBatchSize caps how many paths walkLive sends per
 // IgnoreChecker.Check call. The cap is by file count (not byte size) so
 // pathological worktrees with very long path names cannot wedge the
