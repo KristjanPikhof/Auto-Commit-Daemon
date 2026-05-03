@@ -13,15 +13,19 @@ import (
 // PendingEvents barrier subquery off a full-table scan during long pauses).
 // v4 adds idx_flush_requests_status_id so ClaimNextFlushRequest's
 // pending-by-id scan stays index-backed after long uptime. v5 adds
-// decision_records, an append-only ledger for product-facing decisions.
+// decision_records, an append-only ledger for product-facing decisions. v6
+// rebuilds decision_records without the event_seq foreign key so capture_event
+// pruning cannot erase denormalized ledger identity.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
 // Open's runBootstrap re-applies the idempotent schemaDDL whenever the
 // stored user_version is below SchemaVersion, so simply bumping SchemaVersion
-// and adding `CREATE INDEX IF NOT EXISTS` to schemaDDL is sufficient for
-// pure-DDL migrations (such as v2→v3). Migrate is wired now so future phases
-// requiring data backfill have a single entry point to extend.
+// and adding idempotent statements to schemaDDL is sufficient for pure-DDL
+// migrations (such as v2→v3). v6 also uses schemaDDL's transactional table
+// rebuild to migrate already-v5 decision_records rows before stamping the new
+// version. Migrate is wired now so future phases requiring separate data
+// backfill have a single entry point to extend.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
 	if err != nil {
