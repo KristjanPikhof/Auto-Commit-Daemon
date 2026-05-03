@@ -222,6 +222,9 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
 		return fmt.Errorf("state: apply schema: %w", err)
 	}
+	if err := applyVersionedMigrations(ctx, tx, cur); err != nil {
+		return err
+	}
 
 	// Set the schema version. PRAGMA user_version is per-database (stored in
 	// the file header), not per-connection — safe to set once.
