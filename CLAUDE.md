@@ -14,7 +14,7 @@ make tidy           # go mod tidy
 ./bin/acd version
 ```
 
-Required before done/push/PR/final handoff:
+Required before done/push/PR/final:
 
 ```bash
 make lint
@@ -68,7 +68,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Fast-forward keeps generation; reset/rebase/switch/same-SHA ref switch bumps; legacy bare rev upgraded to attached forces Diverged.
 - Detached HEAD pauses capture/replay; `acd start` refuses it. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - Git-operation markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`; non-`ErrNotExist` stat errors fail open with warning.
-- Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins; malformed/non-regular marker fails open.
+- Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins.
 - SQLite read errors in `daemonPauseState` fail closed for that tick.
 - Diverged drops stale `pending` rows for previous generation only; keep `published`, `failed`, `blocked_conflict`; attached-from-detached clears `MetaKeyDetachedHeadPaused` and rewind grace.
 
@@ -78,7 +78,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - `walkLive` BFSes by directory layer, batches ignore checks (`ignoreCheckBatchSize=1000`), prunes ignored/sensitive/safe-ignore dirs before readdir.
 - `fsnotify_watcher.preWalk` mirrors `walkLive`; never prune worktree-rooted `acd/` (`.git/acd` is daemon state). Symlinks are mode `120000`; never descend.
 - Empty `ACD_SENSITIVE_GLOBS` keeps defaults; typos must not disable defaults. Sensitive dir pruning uses literal dir names; wildcards are file-granular.
-- Safe-ignore defaults include dependency/cache dirs (`node_modules/`, `target/`, venvs, Python caches, `.gradle/`). `ACD_SAFE_IGNORE=0|false|no|off` disables; `ACD_SAFE_IGNORE_EXTRA=dist/,build/` appends. Restart daemon for env changes.
+- Safe-ignore defaults include dependency/cache dirs. `ACD_SAFE_IGNORE=0|false|no|off` disables; `ACD_SAFE_IGNORE_EXTRA=dist/,build/` appends. Restart daemon for env changes.
 - Safe-ignore dirs prune descendants, not same-named files. Use `SafeIgnoreMatcher.MatchFile` for files/symlinks and `MatchDirectory` for dirs.
 - Protected skipped dirs mean dir exists, not every tracked child: `protectShadowFromSkippedPresent` must `Lstat` shadow children; `os.ErrNotExist` leaves row so delete classification emits delete.
 - `IgnoreChecker.Check`: long-lived `git check-ignore --stdin -z --non-matching --verbose`; stream stdin from writer goroutine while reading stdout. One large `stdin.Write` deadlocks on macOS 16 KiB pipes. Invalidate before each capture pass and on `.gitignore` fsnotify events.
@@ -119,7 +119,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - `acd list --watch --interval 2s` redraws table with timestamp; one-shot output unchanged; one-shot `--json` works; `--watch` rejects `--json`.
 - `acd events --watch`: no `--since` starts at current ledger tail; with `--since`, resumes after cursor.
 - `acd status`, `acd diagnose`, `acd doctor` show `failed_events`, `failed_blocking_pending`, intent summaries; guide to `acd fix --dry-run`.
-- Useful probes: `acd status --repo .`; `acd events --watch`; `acd logs --repo . --lines 50 --follow`; `acd diagnose --repo . --json`; `acd doctor --repo . --json`; `git status --short --ignored`.
+- Probes: `acd status --repo .`; `acd events --watch`; `acd logs --repo . --lines 50 --follow`; `acd diagnose --repo . --json`; `acd doctor --repo . --json`; `git status --short --ignored`.
 
 ## CLI read-only UX
 
