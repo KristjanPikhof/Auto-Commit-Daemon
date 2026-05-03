@@ -73,6 +73,33 @@ func cannedToolCall(subject, body string) string {
 	return string(out)
 }
 
+func cannedIntentPlanToolCall(plan IntentPlan) string {
+	args, _ := json.Marshal(plan)
+	resp := map[string]any{
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "",
+					"tool_calls": []any{
+						map[string]any{
+							"id":   "call_1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "capture_intent_plan",
+								"arguments": string(args),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	out, _ := json.Marshal(resp)
+	return string(out)
+}
+
 func TestOpenAI_HappyPath(t *testing.T) {
 	p, last, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
 		return 200, cannedToolCall("Update token expiry", "- refresh tokens now last 7 days")
@@ -433,5 +460,105 @@ func TestOpenAI_ForwardsCommitContext(t *testing.T) {
 		inner.MultiOp[0].Path != "src/a.go" ||
 		inner.MultiOp[1].Path != "src/b.go" {
 		t.Fatalf("multi_op=%+v", inner.MultiOp)
+	}
+}
+
+func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{101},
+			DeferredSeqs:   []int64{102},
+			Subject:        "Update checkout flow.",
+			Body:           "- apply checkout validation",
+			GroupingReason: "single focused checkout change",
+			DeferredReasons: []DeferredReason{{
+				Seq:    102,
+				Reason: "documentation should commit separately",
+			}},
+		})
+	})
+	plan, err := p.PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if plan.Subject != "Update checkout flow" {
+		t.Fatalf("subject=%q", plan.Subject)
+	}
+	if plan.Source != "openai-compat" {
+		t.Fatalf("source=%q", plan.Source)
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Name       string `json:"name"`
+				Parameters struct {
+					Required []string `json:"required"`
+				} `json:"parameters"`
+			} `json:"function"`
+		} `json:"tools"`
+		ToolChoice struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(last.rawBody, &sent); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if len(sent.Tools) != 1 || sent.Tools[0].Function.Name != "capture_intent_plan" {
+		t.Fatalf("tool=%+v", sent.Tools)
+	}
+	if sent.ToolChoice.Function.Name != "capture_intent_plan" {
+		t.Fatalf("tool_choice=%+v", sent.ToolChoice)
+	}
+	required := strings.Join(sent.Tools[0].Function.Parameters.Required, ",")
+	for _, field := range []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"} {
+		if !strings.Contains(required, field) {
+			t.Fatalf("schema required fields %q missing %q", required, field)
+		}
+	}
+	var userContent string
+	for _, m := range sent.Messages {
+		if m.Role == "user" {
+			userContent = m.Content
+		}
+	}
+	if !strings.Contains(userContent, `"latest_commit"`) ||
+		!strings.Contains(userContent, `"path_commit_context"`) ||
+		!strings.Contains(userContent, `"offered_captures"`) {
+		t.Fatalf("planner request missing context: %s", userContent)
+	}
+}
+
+func TestOpenAIIntentPlan_InvalidPlanFallsBackWhenComposed(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{999},
+			DeferredSeqs:   []int64{102},
+			Subject:        "Invent bad plan",
+			GroupingReason: "bad",
+			DeferredReasons: []DeferredReason{{
+				Seq:    102,
+				Reason: "defer",
+			}},
+		})
+	})
+	planner := Compose(p, DeterministicProvider{})
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if plan.Source != "deterministic" {
+		t.Fatalf("source=%q want deterministic fallback", plan.Source)
+	}
+	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected=%v", plan.SelectedSeqs)
 	}
 }
