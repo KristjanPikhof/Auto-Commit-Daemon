@@ -356,6 +356,44 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	}
 }
 
+func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	for k, v := range map[string]string{
+		"commit.strategy":       "intent",
+		"intent.window":         "7",
+		"intent.recent_commits": "3",
+		"intent.defer_limit":    "1",
+	} {
+		if err := state.MetaSet(ctx, d, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+
+	t.Setenv("ACD_COMMIT_STRATEGY", "event")
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if !rep.IntentStrategy.Active || rep.IntentStrategy.Strategy != "intent" ||
+		rep.IntentStrategy.Window != 7 || rep.IntentStrategy.RecentCommits != 3 ||
+		rep.IntentStrategy.DeferLimit != 1 {
+		t.Fatalf("intent strategy = %+v, want daemon metadata", rep.IntentStrategy)
+	}
+}
+
 func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
