@@ -135,6 +135,24 @@ func pendingOps(t *testing.T, db *state.DB) []struct{ Op, Path string } {
 	return out
 }
 
+func assertProtectedDecision(t *testing.T, db *state.DB, path, reason string) {
+	t.Helper()
+	decisions, err := state.DecisionsForPath(context.Background(), db, path, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPath: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindProtected &&
+			decision.Reason.Valid &&
+			decision.Reason.String == reason &&
+			decision.ActionTaken.Valid &&
+			decision.ActionTaken.String == "no_delete_generated" {
+			return
+		}
+	}
+	t.Fatalf("missing protected decision path=%q reason=%q: %+v", path, reason, decisions)
+}
+
 // TestCapture_SymlinkDirNotRecursed: the legacy regression. A symlink to a
 // directory must capture as mode 120000 with no descent into the link
 // target. The contained file MUST NOT appear in capture_events.
