@@ -50,6 +50,8 @@ type statusReport struct {
 	Clients              []statusClient `json:"clients"`
 	PendingEvents        int            `json:"pending_events"`
 	BlockedConflicts     int            `json:"blocked_conflicts"`
+	FailedEvents         int            `json:"failed_events"`
+	FailedBlockingPending int           `json:"failed_blocking_pending"`
 	LastCommitOID        string         `json:"last_commit_oid,omitempty"`
 	LastCommitTS         int64          `json:"last_commit_ts,omitempty"`
 	LastCommitMessage    string         `json:"last_commit_message,omitempty"`
@@ -254,6 +256,16 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateBlockedConflict).Scan(&report.BlockedConflicts); err != nil {
 		return report, fmt.Errorf("blocked conflicts: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
+		return report, fmt.Errorf("failed events: %w", err)
+	}
+	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
+		return report, fmt.Errorf("failed blocking pending: %w", err)
+	} else {
+		report.FailedBlockingPending = n
 	}
 
 	// Last commit (latest seq with commit_oid).
@@ -460,6 +472,13 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	fmt.Fprintf(out, "Pending events: %d\n", r.PendingEvents)
 	if r.BlockedConflicts > 0 {
 		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
+	}
+	if r.FailedEvents > 0 {
+		fmt.Fprintf(out, "Failed terminal events: %d\n", r.FailedEvents)
+		if r.FailedBlockingPending > 0 {
+			fmt.Fprintf(out, "Failed barriers blocking pending replay: %d (inspect with `acd diagnose`; preview cleanup with `acd fix --dry-run`)\n",
+				r.FailedBlockingPending)
+		}
 	}
 	if r.BackpressurePaused {
 		stamp := r.BackpressurePausedAt
