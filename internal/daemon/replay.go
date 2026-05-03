@@ -1362,7 +1362,7 @@ func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, e
 		}
 		paths = append(paths, op.Path)
 	}
-	changed, err := pathsChangedBetween(ctx, repoRoot, ev.BaseHead, parent, paths)
+	changed, err := pathsTouchedBetween(ctx, repoRoot, ev.BaseHead, parent, paths)
 	if err != nil {
 		return false, "", err
 	}
@@ -1377,19 +1377,26 @@ func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, e
 		if !matches {
 			return false, "", nil
 		}
+		baseMatches, err := treeMatchesCapturedBefore(ctx, repoRoot, ev.BaseHead, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !baseMatches {
+			return false, "", nil
+		}
 	}
 	return true, "superseded_external_current_head_matches_captured_before_state", nil
 }
 
-func pathsChangedBetween(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
+func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
 	if len(paths) == 0 {
 		return false, nil
 	}
-	args := []string{"diff", "--name-only", "-z", before, after, "--"}
+	args := []string{"log", "--format=", "--name-only", "-z", before + ".." + after, "--"}
 	args = append(args, paths...)
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot}, args...)
 	if err != nil {
-		return false, fmt.Errorf("diff changed paths %s..%s: %w", before, after, err)
+		return false, fmt.Errorf("log touched paths %s..%s: %w", before, after, err)
 	}
 	return len(out) > 0, nil
 }
