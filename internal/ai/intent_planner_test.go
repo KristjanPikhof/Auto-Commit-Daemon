@@ -247,3 +247,43 @@ func TestDeterministicPlanIntentSelectsOneAndDefersRest(t *testing.T) {
 		t.Fatalf("source=%q", plan.Source)
 	}
 }
+
+type staticIntentPlannerProvider struct {
+	name string
+	plan IntentPlan
+}
+
+func (p staticIntentPlannerProvider) Name() string { return p.name }
+
+func (p staticIntentPlannerProvider) Generate(context.Context, CommitContext) (Result, error) {
+	return Result{}, nil
+}
+
+func (p staticIntentPlannerProvider) PlanIntent(context.Context, IntentPlanRequest) (IntentPlan, error) {
+	plan := p.plan
+	plan.Source = p.name
+	return plan, nil
+}
+
+func TestComposedPlanIntentValidatesPrimaryBeforeAccepting(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	primary := staticIntentPlannerProvider{
+		name: "bad-primary",
+		plan: IntentPlan{
+			SelectedSeqs:   []int64{101},
+			Subject:        "Update checkout flow",
+			GroupingReason: "omits the deferred seq",
+		},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if plan.Source != "deterministic" {
+		t.Fatalf("source=%q want deterministic fallback", plan.Source)
+	}
+	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 102 {
+		t.Fatalf("deferred=%v", plan.DeferredSeqs)
+	}
+}
