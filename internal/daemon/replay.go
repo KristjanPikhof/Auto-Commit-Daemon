@@ -1173,7 +1173,11 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 			return err
 		}
 		if ev, ok := events[seq]; ok {
-			if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts, state.DecisionKindIntentDeferred, reason, "deferred", "Deferred from this intent planning window: "+fallback(reason, "planner selected a different capture group")+"." ); err != nil {
+			msgReason := strings.TrimSpace(reason)
+			if msgReason == "" {
+				msgReason = "planner selected a different capture group"
+			}
+			if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts, state.DecisionKindIntentDeferred, reason, "deferred", "Deferred from this intent planning window: "+msgReason+"."); err != nil {
 				return err
 			}
 		}
