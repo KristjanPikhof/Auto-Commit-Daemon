@@ -2603,6 +2603,29 @@ func TestReplay_CASRetry_ExternalLandedSameContent(t *testing.T) {
 	if blocked != 0 {
 		t.Fatalf("blocked_conflict count=%d want 0; CAS exhaustion should settle idempotently", blocked)
 	}
+	published, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(published) != 0 {
+		t.Fatalf("pending events remain after CAS idempotent settle: %+v", published)
+	}
+	decisions, err := state.DecisionsForPath(ctx, f.db, filename, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPath: %v", err)
+	}
+	foundDecision := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindHandledExternal &&
+			decision.Reason.Valid &&
+			decision.Reason.String == "already_published_after_cas_exhaustion" {
+			foundDecision = true
+			break
+		}
+	}
+	if !foundDecision {
+		t.Fatalf("missing CAS handled_external decision for %s: %+v", filename, decisions)
+	}
 
 	idempotentTraceFired := false
 	for _, ev := range trace.Events() {
