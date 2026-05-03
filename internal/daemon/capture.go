@@ -1113,65 +1113,65 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 // size cap (recording oversize via daemon_meta), then hash via stdin.
 //
 // Returns:
-//   - (entry, true,  nil) — captured ok.
-//   - (zero,  false, nil) — skipped (oversize, vanished, type changed).
-//   - (zero,  _,     err) — hard error worth recording in summary.
-func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, error) {
+//   - (entry, true,  "",     nil) — captured ok.
+//   - (zero,  false, reason, nil) — skipped (oversize, vanished, type changed).
+//   - (zero,  _,     "",     err) — hard error worth recording in summary.
+func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, string, error) {
 	mode := c.fi.Mode()
 	if mode&os.ModeSymlink != 0 {
 		target, rerr := os.Readlink(c.full)
 		if rerr != nil {
-			return LiveEntry{}, false, rerr
+			return LiveEntry{}, false, "", rerr
 		}
 		oid, _, herr := git.HashSymlinkBlob(ctx, repoRoot, target)
 		if herr != nil {
-			return LiveEntry{}, false, herr
+			return LiveEntry{}, false, "", herr
 		}
-		return LiveEntry{Path: c.rel, Mode: git.SymlinkMode, OID: oid}, true, nil
+		return LiveEntry{Path: c.rel, Mode: git.SymlinkMode, OID: oid}, true, "", nil
 	}
 
 	// Regular file: O_NOFOLLOW + verify ino/dev/mode (TOCTOU defense).
 	flags := os.O_RDONLY | syscall.O_NOFOLLOW
 	f, err := os.OpenFile(c.full, flags, 0)
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	defer f.Close()
 
 	post, err := f.Stat()
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	if !sameFile(c.fi, post) {
 		// Swapped between lstat and open — discard.
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "unstable", nil
 	}
 	if !post.Mode().IsRegular() {
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "non_regular", nil
 	}
 	if post.Size() > opts.maxBytes {
 		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "oversize", nil
 	}
 	// Read up to maxBytes+1 to detect truncation/grow during read; if we
 	// exceed, record oversize and discard.
 	buf, err := io.ReadAll(f)
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	if int64(len(buf)) > opts.maxBytes {
 		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "oversize", nil
 	}
 	oid, herr := git.HashObjectStdin(ctx, repoRoot, buf)
 	if herr != nil {
-		return LiveEntry{}, false, herr
+		return LiveEntry{}, false, "", herr
 	}
 	return LiveEntry{
 		Path: c.rel,
 		Mode: gitModeFor(post.Mode()),
 		OID:  oid,
-	}, true, nil
+	}, true, "", nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the
