@@ -255,6 +255,7 @@ Private-code metadata-only setup:
 ~~~bash
 export ACD_COMMIT_STRATEGY=intent
 export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 # Leave ACD_AI_DIFF_EGRESS unset.
 ~~~
 
@@ -263,6 +264,7 @@ Self-hosted AI with explicit diff egress:
 ~~~bash
 export ACD_COMMIT_STRATEGY=intent
 export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
