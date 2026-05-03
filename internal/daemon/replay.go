@@ -1341,6 +1341,82 @@ func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error
 	return tree, nil
 }
 
+func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (bool, string, error) {
+	if parent == "" || ev.BaseHead == "" || parent == ev.BaseHead || len(ops) == 0 {
+		return false, "", nil
+	}
+	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if err != nil {
+		return false, "", fmt.Errorf("superseded ancestry probe %s..%s: %w", ev.BaseHead, parent, err)
+	}
+	if !ok {
+		return false, "", nil
+	}
+	paths := make([]string, 0, len(ops))
+	for _, op := range ops {
+		if op.Op == "rename" {
+			return false, "", nil
+		}
+		if op.Path == "" {
+			return false, "", nil
+		}
+		paths = append(paths, op.Path)
+	}
+	changed, err := pathsChangedBetween(ctx, repoRoot, ev.BaseHead, parent, paths)
+	if err != nil {
+		return false, "", err
+	}
+	if !changed {
+		return false, "", nil
+	}
+	for _, op := range ops {
+		matches, err := treeMatchesCapturedBefore(ctx, repoRoot, parent, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !matches {
+			return false, "", nil
+		}
+	}
+	return true, "superseded_external_current_head_matches_captured_before_state", nil
+}
+
+func pathsChangedBetween(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
+	if len(paths) == 0 {
+		return false, nil
+	}
+	args := []string{"diff", "--name-only", "-z", before, after, "--"}
+	args = append(args, paths...)
+	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot}, args...)
+	if err != nil {
+		return false, fmt.Errorf("diff changed paths %s..%s: %w", before, after, err)
+	}
+	return len(out) > 0, nil
+}
+
+func treeMatchesCapturedBefore(ctx context.Context, repoRoot, commit string, op state.CaptureOp) (bool, error) {
+	if op.Op == "create" {
+		absent, err := isPathAbsentInTree(ctx, repoRoot, commit, op.Path)
+		if err != nil {
+			return false, err
+		}
+		return absent, nil
+	}
+	if !op.BeforeOID.Valid || op.BeforeOID.String == "" || !op.BeforeMode.Valid || op.BeforeMode.String == "" {
+		return false, nil
+	}
+	entries, err := git.LsTree(ctx, repoRoot, commit, false, op.Path)
+	if err != nil {
+		return false, fmt.Errorf("ls-tree before-state %s: %w", op.Path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path == op.Path && entry.Type == "blob" {
+			return entry.OID == op.BeforeOID.String && entry.Mode == op.BeforeMode.String, nil
+		}
+	}
+	return false, nil
+}
+
 func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason string) error {
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	if err := state.MarkEventPublished(ctx, db,
