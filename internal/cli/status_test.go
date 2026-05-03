@@ -300,6 +300,30 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	}
 }
 
+func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `DROP TABLE decision_records`); err != nil {
+		t.Fatalf("drop decision_records: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runStatus should tolerate missing decision_records: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "Decisions:") {
+		t.Fatalf("pre-v5 status rendered decisions unexpectedly:\n%s", out.String())
+	}
+}
+
 func TestStatusWatchRejectsNonPositiveInterval(t *testing.T) {
 	var out bytes.Buffer
 	if err := runStatusWatch(context.Background(), &out, ".", 0); err == nil {
