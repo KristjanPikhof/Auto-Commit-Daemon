@@ -912,13 +912,13 @@ func Run(ctx context.Context, opts Options) error {
 			return false
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
-			if cErr != nil {
-				logger.Warn(logPrefix+" classify failed; will retry",
-					"err", cErr.Error())
-				return true
-			}
-			branchTransitionSettleUntil = now().Add(branchTransitionSettleDelay)
-			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
+		if cErr != nil {
+			logger.Warn(logPrefix+" classify failed; will retry",
+				"err", cErr.Error())
+			return true
+		}
+		branchTransitionSettleUntil = now().Add(branchTransitionSettleDelay)
+		ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 		// Single-tx batch: changedAt + token must land together so a
 		// reader between the two writes never sees a stale token paired
 		// with the new timestamp (or vice versa).
@@ -1434,20 +1434,20 @@ func Run(ctx context.Context, opts Options) error {
 		// rewind grace, or replay anchored to a stale BaseHead. If a
 		// transition is observed, mark the iteration blocked and let the
 		// next tick re-evaluate after Capture/Replay are skipped.
-			if !branchTransitionBlocked && !operationPaused {
-				if processBranchTokenChange("post-flush branch token") {
-					branchTransitionBlocked = true
-				}
+		if !branchTransitionBlocked && !operationPaused {
+			if processBranchTokenChange("post-flush branch token") {
+				branchTransitionBlocked = true
 			}
-			if !branchTransitionBlocked && !branchTransitionSettleUntil.IsZero() {
-				if now().Before(branchTransitionSettleUntil) {
-					branchTransitionBlocked = true
-				} else {
-					branchTransitionSettleUntil = time.Time{}
-				}
+		}
+		if !branchTransitionBlocked && !branchTransitionSettleUntil.IsZero() {
+			if now().Before(branchTransitionSettleUntil) {
+				branchTransitionBlocked = true
+			} else {
+				branchTransitionSettleUntil = time.Time{}
 			}
+		}
 
-			// 4f. Capture pass.
+		// 4f. Capture pass.
 		//
 		// Manual pause + rewind grace pause BOTH capture and replay. This is
 		// symmetric with the detached-HEAD pause and the git-operation pause:
