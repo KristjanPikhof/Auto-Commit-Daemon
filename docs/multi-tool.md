@@ -13,6 +13,10 @@ conflict-resolution mechanics this document references.
 
 `acd` captures file operations at the moment they happen and queues them as
 `pending` events in SQLite. The replay loop drains the queue on each poll tick.
+With `ACD_COMMIT_STRATEGY=event`, it considers one event at a time. With
+`ACD_COMMIT_STRATEGY=intent`, it may publish a selected group as one commit, but
+the same safety checks and idempotent settle rules still apply to each selected
+capture.
 When another tool (Claude Code hook, Codex hook, or any `git commit` call) lands
 a commit *before* `acd`'s replay tick, the branch ref has already advanced. On
 the next replay pass `acd` detects this via its idempotent publish probe
