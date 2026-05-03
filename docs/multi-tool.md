@@ -52,8 +52,9 @@ branch *before* `acd`'s next replay tick. Typical sequence:
                    → event marked published (no new commit)
 ```
 
-The net result is the same commit history you would get from `acd` alone —
-the Claude Code hook just gets there first. `acd status` will show
+The net result is the same file state without a duplicate ACD commit. `acd`
+marks the event published against the external commit, so author, message, and
+timing come from the tool that committed first. `acd status` will show
 `pending_events: 0` within one tick after the hook runs.
 
 ---
@@ -101,6 +102,10 @@ acd recover --repo . --auto --dry-run
 acd purge-events --repo . --blocked --dry-run
 acd wake --session-id "$ACD_SESSION_ID"
 ~~~
+
+`wake` requires a non-empty session id. Use it from harness shells that set
+`ACD_SESSION_ID`; otherwise wait for the next daemon tick after applying a safe
+plan.
 
 ---
 
