@@ -331,11 +331,11 @@ func Run(ctx context.Context, opts Options) error {
 	providerCfg := ai.LoadProviderConfigFromEnv()
 	providerCfg.Logger = logger
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
-		"commit.strategy":        string(providerCfg.CommitStrategy),
-		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
-		"intent.recent_commits":  strconv.Itoa(providerCfg.IntentRecentCommits),
-		"intent.defer_limit":     strconv.Itoa(providerCfg.IntentDeferLimit),
-		"intent.diff_egress":     strconv.FormatBool(diffEgressOptIn()),
+		"commit.strategy":       string(providerCfg.CommitStrategy),
+		"intent.window":         strconv.Itoa(providerCfg.IntentWindow),
+		"intent.recent_commits": strconv.Itoa(providerCfg.IntentRecentCommits),
+		"intent.defer_limit":    strconv.Itoa(providerCfg.IntentDeferLimit),
+		"intent.diff_egress":    strconv.FormatBool(diffEgressOptIn()),
 	}); err != nil {
 		logger.Warn("stamp commit strategy metadata", "err", err.Error())
 	}
