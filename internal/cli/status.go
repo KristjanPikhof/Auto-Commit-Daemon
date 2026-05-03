@@ -417,6 +417,26 @@ func sqliteTableExists(ctx context.Context, conn *sql.DB, name string) (bool, er
 	return n > 0, nil
 }
 
+func countBlockingTerminalEvents(ctx context.Context, conn *sql.DB, terminalState string) (int, error) {
+	var n int
+	err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events e
+WHERE e.state = ?
+  AND EXISTS (
+      SELECT 1
+      FROM capture_events pending
+      WHERE pending.branch_ref = e.branch_ref
+        AND pending.branch_generation = e.branch_generation
+        AND pending.seq > e.seq
+        AND pending.state = ?
+  )`, terminalState, state.EventStatePending).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // metaLookup is the read-only equivalent of state.MetaGet against a raw
 // *sql.DB connection (we don't want to spin up the migration path on a
 // read-only DSN).
