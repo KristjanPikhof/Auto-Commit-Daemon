@@ -1428,7 +1428,16 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 		}
 		return false, fmt.Errorf("diff touched paths %s..%s: %w", before, after, err)
 	}
-	return false, nil
+	// Endpoint diff is silent for "changed then reverted" history. Keep the
+	// fallback bounded to one commit OID instead of buffering path names for
+	// the whole range.
+	args = []string{"rev-list", "--max-count=1", before + ".." + after, "--"}
+	args = append(args, paths...)
+	out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, 64, args...)
+	if err != nil {
+		return false, fmt.Errorf("rev-list touched paths %s..%s: %w", before, after, err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
 }
 
 func liveWorktreeMatchesCapturedBefore(ctx context.Context, repoRoot string, op state.CaptureOp) (bool, error) {
