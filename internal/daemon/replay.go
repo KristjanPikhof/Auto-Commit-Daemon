@@ -436,7 +436,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// the run loop. Each event gets a 60s budget inherited from the caller's
 		// ctx; on timeout the event is marked failed and the batch halts so the
 		// next pass starts fresh. Tests override the budget via
-		// replayPerEventTimeoutForTest.
+		// replayPerEventTimeoutOverride.
 		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
 
 		if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, parent, ev, ops); err != nil {
