@@ -390,9 +390,20 @@ pruning.
   "last_commit_ts": 1746000250,
   "last_commit_message": "modify auth.go",
   "capture_errors": 0,
+  "intent_strategy": {
+    "strategy": "intent",
+    "active": true,
+    "window": 10,
+    "recent_commits": 5,
+    "defer_limit": 2,
+    "deferred_events": 1,
+    "max_defer_count": 1,
+    "forced_aging_ready": 0
+  },
   "decision_counts": {
     "captured": 8,
     "committed": 7,
+    "intent_deferred": 1,
     "blocked": 1
   },
   "recent_decisions": [
@@ -434,6 +445,11 @@ with `acd fix --dry-run`.
 the decision ledger exists and has rows. `recent_decisions` uses the same entry
 shape as `acd events --json`; `decision_cursor` is the newest decision ID in
 that recent set and can be passed to `acd events --since`.
+
+`intent_strategy` is always present. In `event` mode it reports
+`{"strategy":"event","active":false}` plus resolved planner defaults. In
+`intent` mode it includes active window settings, pending deferral counts,
+forced-aging readiness, and last planner error fields when available.
 
 `paused` and `pause` are omitted when replay is not paused. The `pause` object fields:
 
@@ -665,12 +681,20 @@ version lives in [user-workflows.md](user-workflows.md).
    why native watching was unavailable (Linux: check `inotify_max_user_watches`
    via `acd doctor`).
 
-7. **Check AI provider status.**
+7. **Check AI provider and intent-planner status.**
 
    If commits are appearing but messages look generic, the AI provider may be
-   falling back to deterministic. Set `ACD_AI_PROVIDER=deterministic` explicitly
-   if you want the default behavior, or check `ACD_AI_API_KEY` / network
-   connectivity and restart the daemon.
+   falling back to deterministic. If `ACD_COMMIT_STRATEGY=intent` is active and
+   groups are not forming, inspect planner deferrals and errors:
+
+   ~~~bash
+   acd status --json
+   acd events --watch
+   ~~~
+
+   Set `ACD_AI_PROVIDER=deterministic` explicitly if you want the default
+   behavior, or check `ACD_AI_API_KEY` / network connectivity and restart the
+   daemon.
 
 ---
 
