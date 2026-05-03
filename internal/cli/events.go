@@ -28,10 +28,10 @@ const (
 var eventsWatchPollInterval = defaultEventsWatchInterval
 
 type eventsReport struct {
-	Repo   string       `json:"repo"`
-	Cursor int64        `json:"cursor"`
-	Events []eventEntry `json:"events"`
-	Message string      `json:"message,omitempty"`
+	Repo    string       `json:"repo"`
+	Cursor  int64        `json:"cursor"`
+	Events  []eventEntry `json:"events"`
+	Message string       `json:"message,omitempty"`
 }
 
 type eventEntry struct {
