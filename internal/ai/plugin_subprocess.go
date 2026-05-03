@@ -305,6 +305,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	} else {
 		plan.Body = ""
 	}
+	plan = NormalizeIntentPlanReasons(plan)
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		return IntentPlan{}, err
 	}
