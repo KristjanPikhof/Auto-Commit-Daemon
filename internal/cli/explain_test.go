@@ -42,7 +42,7 @@ func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
 
 	var out bytes.Buffer
 	if err := runExplain(ctx, &out, repo, "secret.env", "", false, 0, 10, false); err != nil {
-		t.Fatalf("runExplain path: %v")
+		t.Fatalf("runExplain path: %v", err)
 	}
 	got := out.String()
 	for _, want := range []string{
