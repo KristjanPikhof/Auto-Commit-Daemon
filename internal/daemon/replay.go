@@ -1379,7 +1379,7 @@ func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, e
 		}
 		paths = append(paths, op.Path)
 	}
-	changed, err := pathsTouchedBetween(ctx, repoRoot, ev.BaseHead, parent, paths)
+	changed, err := pathsTouchedBetweenFn(ctx, repoRoot, ev.BaseHead, parent, paths)
 	if err != nil {
 		return false, "", err
 	}
@@ -1401,21 +1401,74 @@ func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, e
 		if !baseMatches {
 			return false, "", nil
 		}
+		liveMatches, err := liveWorktreeMatchesCapturedBefore(ctx, repoRoot, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !liveMatches {
+			return false, "", nil
+		}
 	}
 	return true, "superseded_external_current_head_matches_captured_before_state", nil
 }
+
+var pathsTouchedBetweenFn = pathsTouchedBetween
 
 func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
 	if len(paths) == 0 {
 		return false, nil
 	}
-	args := []string{"log", "--format=", "--name-only", "-z", before + ".." + after, "--"}
+	args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
 	args = append(args, paths...)
-	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot}, args...)
+	_, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, args...)
 	if err != nil {
-		return false, fmt.Errorf("log touched paths %s..%s: %w", before, after, err)
+		var gerr *git.Error
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("diff touched paths %s..%s: %w", before, after, err)
 	}
-	return len(out) > 0, nil
+	return false, nil
+}
+
+func liveWorktreeMatchesCapturedBefore(ctx context.Context, repoRoot string, op state.CaptureOp) (bool, error) {
+	if op.Path == "" {
+		return false, nil
+	}
+	full := filepath.Join(repoRoot, filepath.FromSlash(op.Path))
+	if op.Op == "create" {
+		if _, err := os.Lstat(full); err == nil {
+			return false, nil
+		} else if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		return false, nil
+	}
+	if !op.BeforeOID.Valid || op.BeforeOID.String == "" || !op.BeforeMode.Valid || op.BeforeMode.String == "" {
+		return false, nil
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		return false, nil
+	}
+	entry, ok, _, err := hashCandidate(ctx, repoRoot, candidateLike{
+		rel:  op.Path,
+		full: full,
+		fi:   fi,
+	}, walkOpts{maxBytes: DefaultMaxFileBytes})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		return false, nil
+	}
+	if !ok {
+		return false, nil
+	}
+	return entry.OID == op.BeforeOID.String && entry.Mode == op.BeforeMode.String, nil
 }
 
 func treeMatchesCapturedBefore(ctx context.Context, repoRoot, commit string, op state.CaptureOp) (bool, error) {
