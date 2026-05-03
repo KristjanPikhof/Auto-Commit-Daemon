@@ -10,6 +10,7 @@ Common workflow:
   acd status                        Show daemon, branch, and client state for the current repo
   acd events                        Show recent product decisions for the current repo
   acd events --watch                Stream appended product decisions
+  acd explain --path FILE           Explain why ACD did or did not commit a path
   acd list                          List known repo daemons
   acd list --watch --interval 5s     Watch known repo daemons live
   acd logs --lines 200              Tail the current repo daemon log as raw JSONL
