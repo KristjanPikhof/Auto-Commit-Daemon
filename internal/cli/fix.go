@@ -459,6 +459,117 @@ ORDER BY e.seq ASC, d.id DESC`,
 	return nil
 }
 
+func loadFixCaptureOps(ctx context.Context, conn *sql.DB, seq int64) ([]state.CaptureOp, error) {
+	rows, err := conn.QueryContext(ctx, `
+SELECT event_seq, ord, op, path, old_path,
+       before_oid, before_mode, after_oid, after_mode, fidelity
+FROM capture_ops
+WHERE event_seq = ?
+ORDER BY ord ASC`, seq)
+	if err != nil {
+		return nil, fmt.Errorf("acd fix: query capture ops for event %d: %w", seq, err)
+	}
+	defer rows.Close()
+	var ops []state.CaptureOp
+	for rows.Next() {
+		var op state.CaptureOp
+		if err := rows.Scan(&op.EventSeq, &op.Ord, &op.Op, &op.Path, &op.OldPath,
+			&op.BeforeOID, &op.BeforeMode, &op.AfterOID, &op.AfterMode, &op.Fidelity); err != nil {
+			return nil, fmt.Errorf("acd fix: scan capture op for event %d: %w", seq, err)
+		}
+		ops = append(ops, op)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("acd fix: iterate capture ops for event %d: %w", seq, err)
+	}
+	return ops, nil
+}
+
+func currentHeadMatchesFixDecision(ctx context.Context, repo, head, kind string, ops []state.CaptureOp) (bool, error) {
+	for _, op := range ops {
+		var ok bool
+		var err error
+		switch kind {
+		case state.DecisionKindHandledExternal:
+			ok, err = treeMatchesCapturedAfter(ctx, repo, head, op)
+		case state.DecisionKindSupersededExternal:
+			ok, err = treeMatchesCapturedBeforeForFix(ctx, repo, head, op)
+		default:
+			ok = false
+		}
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func treeMatchesCapturedAfter(ctx context.Context, repo, ref string, op state.CaptureOp) (bool, error) {
+	if op.Op == "delete" {
+		return treePathAbsent(ctx, repo, ref, op.Path)
+	}
+	if !op.AfterOID.Valid || op.AfterOID.String == "" {
+		return false, nil
+	}
+	if ok, err := treeBlobMatches(ctx, repo, ref, op.Path, op.AfterOID.String, op.AfterMode); err != nil || !ok {
+		return ok, err
+	}
+	if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
+		return treePathAbsent(ctx, repo, ref, op.OldPath.String)
+	}
+	return true, nil
+}
+
+func treeMatchesCapturedBeforeForFix(ctx context.Context, repo, ref string, op state.CaptureOp) (bool, error) {
+	switch op.Op {
+	case "create":
+		return treePathAbsent(ctx, repo, ref, op.Path)
+	case "delete", "modify":
+		if !op.BeforeOID.Valid || op.BeforeOID.String == "" {
+			return false, nil
+		}
+		return treeBlobMatches(ctx, repo, ref, op.Path, op.BeforeOID.String, op.BeforeMode)
+	default:
+		return false, nil
+	}
+}
+
+func treeBlobMatches(ctx context.Context, repo, ref, path, oid string, mode sql.NullString) (bool, error) {
+	entries, err := git.LsTree(ctx, repo, ref, false, path)
+	if err != nil {
+		return false, fmt.Errorf("acd fix: ls-tree %s %s: %w", ref, path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path != path || entry.Type != "blob" {
+			continue
+		}
+		if entry.OID != oid {
+			return false, nil
+		}
+		if mode.Valid && mode.String != "" && entry.Mode != mode.String {
+			return false, nil
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func treePathAbsent(ctx context.Context, repo, ref, path string) (bool, error) {
+	entries, err := git.LsTree(ctx, repo, ref, false, path)
+	if err != nil {
+		return false, fmt.Errorf("acd fix: ls-tree %s %s: %w", ref, path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path == path {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	if plan.CurrentBranchRef == "" {
 		return fmt.Errorf("acd fix: refusing to mutate state while HEAD is detached")
