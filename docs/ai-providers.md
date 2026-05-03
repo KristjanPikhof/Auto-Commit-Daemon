@@ -265,7 +265,10 @@ recorded as planner errors and fall back to safe one-capture planning.
 
 ## Example plugin: bash skeleton
 
-The following script is a minimal but runnable subprocess provider. It requires `jq` for JSON parsing; see the note below if `jq` is not available.
+The following script is a minimal commit-message provider. It requires `jq` for
+JSON parsing. It does not implement `request_type: "intent_plan"`; if you use it
+with `ACD_COMMIT_STRATEGY=intent`, ACD falls back to deterministic intent
+planning while still using the plugin for commit-message requests.
 
 ```bash
 #!/usr/bin/env bash
