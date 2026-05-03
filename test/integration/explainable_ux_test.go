@@ -6,11 +6,14 @@ package integration_test
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -167,6 +170,184 @@ VALUES ('refs/heads/main', %s, '%s', 'modify', 'obsolete-blocker.txt', 'rescan',
 	}
 	if state := sqliteScalar(t, dbPath, fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", manualSeq)); state != "published" {
 		t.Fatalf("manual external event state=%q want published\ndry-run=%s\napply=%s", state, fixDryRun.Stdout, fixApply.Stdout)
+	}
+}
+
+func TestExplainableUX_DaemonRecordsHandledExternalDecision(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	target := filepath.Join(repo, "external-handled.txt")
+	writeFile(t, target, "before\n")
+	baseHead := gitCommitAll(t, repo, "baseline handled external", "external-handled.txt")
+
+	startSession(t, ctx, env, repo, "ux-handled-daemon", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	pauseReplay(t, ctx, env, repo, "handled external integration")
+	writeFile(t, target, "same change\n")
+	externalHead := gitCommitAll(t, repo, "external handled commit", "external-handled.txt")
+	if externalHead == baseHead {
+		t.Fatalf("external commit did not advance HEAD")
+	}
+
+	resumeReplay(t, ctx, env, repo)
+	wakeSession(t, ctx, env, repo, "ux-handled-daemon")
+	waitForEventState(t, dbPath, "external-handled.txt", "published", 8*time.Second)
+	waitForDecision(t, dbPath, "external-handled.txt", "handled_external", "already_published_by_external_committer", 8*time.Second)
+
+	if got := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'external-handled.txt' ORDER BY seq DESC LIMIT 1"); got != externalHead {
+		t.Fatalf("published commit_oid=%q want external HEAD %s", got, externalHead)
+	}
+	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "3" {
+		log := runGitOK(t, repo, "log", "--oneline", "--decorate")
+		t.Fatalf("commit count=%s want 3 (seed + baseline + external only)\nlog:\n%s", count, log)
+	}
+
+	events := runAcd(t, ctx, env, "events", "--repo", repo, "--path", "external-handled.txt", "--json")
+	if events.ExitCode != 0 {
+		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
+	}
+	if !strings.Contains(events.Stdout, `"kind": "handled_external"`) {
+		t.Fatalf("events output missing daemon-recorded handled_external:\n%s", events.Stdout)
+	}
+}
+
+func TestExplainableUX_DaemonRecordsSupersededExternalDecision(t *testing.T) {
+	requireSQLite(t)
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available; slow subprocess provider requires bash")
+	}
+
+	plugDir := writePluginScript(t, "slow", `#!/usr/bin/env bash
+while IFS= read -r line; do
+  sleep 10
+  printf '{"version":1,"subject":"slow provider","body":"","error":""}\n'
+done
+`)
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	target := filepath.Join(repo, "zzz-reverted.txt")
+	writeFile(t, target, "before\n")
+	baseHead := gitCommitAll(t, repo, "baseline reverted external", "zzz-reverted.txt")
+
+	slowEnv := envWith(env,
+		"ACD_AI_PROVIDER=subprocess:slow",
+		"ACD_AI_TIMEOUT=30s",
+		pathPrepended(plugDir),
+	)
+	startSession(t, ctx, slowEnv, repo, "ux-superseded-daemon", "shell",
+		"ACD_AI_PROVIDER=subprocess:slow",
+		"ACD_AI_TIMEOUT=30s",
+		pathPrepended(plugDir),
+	)
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	writeFile(t, filepath.Join(repo, "aaa-slow.txt"), "first queued event\n")
+	writeFile(t, target, "after\n")
+	wakeSession(t, ctx, slowEnv, repo, "ux-superseded-daemon")
+	waitFor(t, "daemon captured superseded target before replay", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM capture_events WHERE path = 'zzz-reverted.txt' AND state = 'pending'") != "0"
+	})
+
+	pid := readDaemonStatePID(repo)
+	if pid <= 0 {
+		t.Fatalf("missing daemon pid before forced interruption")
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	waitFor(t, "slow daemon killed before replay drained target", 5*time.Second, func() bool {
+		return !processAlive(pid)
+	})
+
+	externalAfter := gitCommitAll(t, repo, "external after", "zzz-reverted.txt")
+	writeFile(t, target, "before\n")
+	externalRevert := gitCommitAll(t, repo, "external revert", "zzz-reverted.txt")
+	if externalAfter == baseHead || externalRevert == externalAfter {
+		t.Fatalf("external revert history did not advance as expected: base=%s after=%s revert=%s", baseHead, externalAfter, externalRevert)
+	}
+
+	startSession(t, ctx, env, repo, "ux-superseded-resume", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	wakeSession(t, ctx, env, repo, "ux-superseded-resume")
+	waitForEventState(t, dbPath, "aaa-slow.txt", "published", 12*time.Second)
+	waitForEventState(t, dbPath, "zzz-reverted.txt", "published", 12*time.Second)
+	waitForDecision(t, dbPath, "zzz-reverted.txt", "superseded_external", "superseded_external_current_head_matches_captured_before_state", 8*time.Second)
+
+	if out, err := runGit(repo, "cat-file", "-e", "HEAD:zzz-reverted.txt"); err != nil {
+		t.Fatalf("target missing after superseded replay: %v\n%s", err, out)
+	}
+	if got := runGitOK(t, repo, "show", "HEAD:zzz-reverted.txt"); got != "before\n" {
+		t.Fatalf("target content=%q want before-state", got)
+	}
+	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "5" {
+		log := runGitOK(t, repo, "log", "--oneline", "--decorate")
+		t.Fatalf("commit count=%s want 5 (seed + baseline + external after/revert + aaa replay)\nlog:\n%s", count, log)
+	}
+
+	events := runAcd(t, ctx, env, "events", "--repo", repo, "--path", "zzz-reverted.txt", "--json")
+	if events.ExitCode != 0 {
+		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
+	}
+	if !strings.Contains(events.Stdout, `"kind": "superseded_external"`) {
+		t.Fatalf("events output missing daemon-recorded superseded_external:\n%s", events.Stdout)
+	}
+}
+
+func TestExplainableUX_ReadOnlyCommandsDoNotMigratePreDecisionLedgerDB(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	dbPath := initStateDBSchema(t, ctx, env, repo, "ux-readonly-bootstrap")
+	if out, err := exec.Command("sqlite3", dbPath, `
+DROP TABLE IF EXISTS decision_records;
+PRAGMA user_version = 4;
+PRAGMA wal_checkpoint(TRUNCATE);
+`).CombinedOutput(); err != nil {
+		t.Fatalf("prepare pre-decision-ledger db: %v\n%s", err, out)
+	}
+	before := fileSHA256(t, dbPath)
+	versionBefore := sqliteScalar(t, dbPath, "PRAGMA user_version")
+
+	events := runAcd(t, ctx, env, "events", "--repo", repo, "--json")
+	if events.ExitCode != 0 {
+		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
+	}
+	if !strings.Contains(events.Stdout, "Decision ledger is not available") {
+		t.Fatalf("events did not report missing decision ledger:\n%s", events.Stdout)
+	}
+	explain := runAcd(t, ctx, env, "explain", "--repo", repo, "--json")
+	if explain.ExitCode != 0 {
+		t.Fatalf("acd explain exit=%d\nstdout=%s\nstderr=%s", explain.ExitCode, explain.Stdout, explain.Stderr)
+	}
+	if !strings.Contains(explain.Stdout, "Decision ledger is not available") {
+		t.Fatalf("explain did not report missing decision ledger:\n%s", explain.Stdout)
+	}
+
+	if after := fileSHA256(t, dbPath); after != before {
+		t.Fatalf("read-only commands changed state.db checksum: before=%s after=%s", before, after)
+	}
+	if got := sqliteScalar(t, dbPath, "PRAGMA user_version"); got != versionBefore {
+		t.Fatalf("user_version changed: before=%s after=%s", versionBefore, got)
 	}
 }
 
