@@ -143,6 +143,7 @@ export ACD_AI_API_KEY=...
 # Private/self-hosted endpoint with explicit diff egress.
 export ACD_COMMIT_STRATEGY=intent
 export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
