@@ -39,17 +39,35 @@ import (
 // Env var names — kept exported so the CLI / docs can reference them
 // without re-typing the literal strings.
 const (
-	EnvProvider = "ACD_AI_PROVIDER"
-	EnvBaseURL  = "ACD_AI_BASE_URL"
-	EnvAPIKey   = "ACD_AI_API_KEY"
-	EnvModel    = "ACD_AI_MODEL"
-	EnvTimeout  = "ACD_AI_TIMEOUT"
-	EnvCAFile   = "ACD_AI_CA_FILE"
+	EnvProvider            = "ACD_AI_PROVIDER"
+	EnvBaseURL             = "ACD_AI_BASE_URL"
+	EnvAPIKey              = "ACD_AI_API_KEY"
+	EnvModel               = "ACD_AI_MODEL"
+	EnvTimeout             = "ACD_AI_TIMEOUT"
+	EnvCAFile              = "ACD_AI_CA_FILE"
+	EnvCommitStrategy      = "ACD_COMMIT_STRATEGY"
+	EnvIntentWindow        = "ACD_INTENT_WINDOW"
+	EnvIntentRecentCommits = "ACD_INTENT_RECENT_COMMITS"
+	EnvIntentDeferLimit    = "ACD_INTENT_DEFER_LIMIT"
 )
 
 // DefaultProviderTimeout is the per-request timeout applied to the
 // OpenAI-compat HTTP provider when ACD_AI_TIMEOUT is unset or invalid.
 const DefaultProviderTimeout = 30 * time.Second
+
+const (
+	DefaultIntentWindow        = 10
+	DefaultIntentRecentCommits = 5
+	DefaultIntentDeferLimit    = 2
+)
+
+// CommitStrategy selects how pending capture events are turned into commits.
+type CommitStrategy string
+
+const (
+	CommitStrategyEvent  CommitStrategy = "event"
+	CommitStrategyIntent CommitStrategy = "intent"
+)
 
 // ProviderConfig captures the env-driven configuration for the replay
 // provider chain. Mode is the user-facing selector; the remaining fields
@@ -82,6 +100,23 @@ type ProviderConfig struct {
 	// OpenAI-compatible HTTPS gateway.
 	CAFile string
 
+	// CommitStrategy chooses the replay planner. The default is event,
+	// preserving one capture event per commit until intent planning is
+	// explicitly enabled.
+	CommitStrategy CommitStrategy
+
+	// IntentWindow caps how many pending events the intent planner may
+	// consider at once.
+	IntentWindow int
+
+	// IntentRecentCommits caps recent commit context supplied to intent
+	// planning.
+	IntentRecentCommits int
+
+	// IntentDeferLimit caps how many times an event may be deferred before
+	// the planner must surface it as overdue.
+	IntentDeferLimit int
+
 	// Logger receives warning logs from BuildProvider's degraded paths.
 	// Nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -94,11 +129,15 @@ type ProviderConfig struct {
 // on Linux.
 func LoadProviderConfigFromEnv() ProviderConfig {
 	cfg := ProviderConfig{
-		Mode:    normalizeMode(os.Getenv(EnvProvider)),
-		BaseURL: strings.TrimSpace(os.Getenv(EnvBaseURL)),
-		APIKey:  strings.TrimSpace(os.Getenv(EnvAPIKey)),
-		Model:   strings.TrimSpace(os.Getenv(EnvModel)),
-		CAFile:  strings.TrimSpace(os.Getenv(EnvCAFile)),
+		Mode:                normalizeMode(os.Getenv(EnvProvider)),
+		BaseURL:             strings.TrimSpace(os.Getenv(EnvBaseURL)),
+		APIKey:              strings.TrimSpace(os.Getenv(EnvAPIKey)),
+		Model:               strings.TrimSpace(os.Getenv(EnvModel)),
+		CAFile:              strings.TrimSpace(os.Getenv(EnvCAFile)),
+		CommitStrategy:      normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
+		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
+		IntentRecentCommits: parsePositiveIntEnv(EnvIntentRecentCommits, DefaultIntentRecentCommits),
+		IntentDeferLimit:    parseNonNegativeIntEnv(EnvIntentDeferLimit, DefaultIntentDeferLimit),
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultOpenAIBaseURL
@@ -117,6 +156,41 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		cfg.Timeout = DefaultProviderTimeout
 	}
 	return cfg
+}
+
+func normalizeCommitStrategy(raw string) CommitStrategy {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(CommitStrategyEvent):
+		return CommitStrategyEvent
+	case string(CommitStrategyIntent):
+		return CommitStrategyIntent
+	default:
+		return CommitStrategyEvent
+	}
+}
+
+func parsePositiveIntEnv(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func parseNonNegativeIntEnv(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }
 
 // normalizeMode trims whitespace, lowercases the prefix (the part before
