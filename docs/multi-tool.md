@@ -84,16 +84,20 @@ matches the captured intent. The following scenarios bypass it and become
 Resolve `blocked_conflict` rows with the standard workflow:
 
 ~~~bash
+acd status
+acd events --watch
+acd explain --path path/to/file
 acd diagnose --repo .
-acd recover --repo . --auto --dry-run
-acd recover --repo . --auto --yes
+acd fix --dry-run
+acd fix --yes
 ~~~
 
-Or delete terminal barriers and replay the clean portion:
+Use `recover` or `purge-events` only as advanced fallbacks when `diagnose` or
+`fix --dry-run` points at stale branch anchors or obsolete terminal barriers:
 
 ~~~bash
+acd recover --repo . --auto --dry-run
 acd purge-events --repo . --blocked --dry-run
-acd purge-events --repo . --blocked --yes
 acd wake --session-id "$ACD_SESSION_ID"
 ~~~
 
@@ -117,7 +121,14 @@ acd init codex   # wake hook only — no separate commit hook
 
 Run both hooks simultaneously. The idempotent publish probe absorbs the
 parallel committer's commits silently. Watch `acd status` to confirm
-`blocked_conflicts` stays at `0`. Enable trace logging to audit decisions:
+`blocked_conflicts` stays at `0`, or stream the decision ledger:
+
+~~~bash
+acd events --watch
+acd explain --commit HEAD
+~~~
+
+Enable trace logging only when you need internal replay decisions:
 
 ~~~bash
 ACD_TRACE=1 acd start --repo . --session-id debug --harness claude-code
@@ -135,6 +146,8 @@ grep already_published .git/acd/trace/*.jsonl | python3 -c \
 
 ## See also
 
+- [User workflows](user-workflows.md) — daily status, events, explain, fix, and
+  support diagnostics workflows.
 - [Revert workflows](capture-replay.md#revert-workflows) — git revert, reset,
   and rebase with ACD running.
 - [Replay mechanics](capture-replay.md#replay-how-a-pending-event-becomes-a-commit)
