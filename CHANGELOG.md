@@ -6,9 +6,10 @@
 
 - Explainable ACD history: `acd events`, `acd explain`, and richer
   `status`/`diagnose`/`doctor` output now show why work was captured,
-  committed, skipped, blocked, or repaired.
-- `acd fix` can plan and apply recovery for blocked or failed replay rows,
-  including stale external-work cases that are safe to settle.
+  committed, skipped, protected, blocked, or handled by external history.
+- `acd fix` can plan and apply safe recovery for blocked or failed replay rows,
+  stale external-work cases, expired manual pause markers, and drained
+  backpressure.
 
 ### Changed
 
