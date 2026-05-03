@@ -304,6 +304,7 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	} else {
 		plan.Body = ""
 	}
+	plan = NormalizeIntentPlanReasons(plan)
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		return IntentPlan{}, err
