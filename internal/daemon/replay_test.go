@@ -1267,6 +1267,56 @@ func TestReplay_ParallelCreate_NoEmptyCommit(t *testing.T) {
 	}
 }
 
+func TestReplay_NoOpTreeRecordsHandledExternalDecision(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("same\n"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "same.txt", blob, "seed same")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "same.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "same.txt",
+		BeforeOID:  sql.NullString{String: blob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; no-op tree should not create a commit", beforeCount, got)
+	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindHandledExternal, "already_published_no_op_tree")
+}
+
 // TestReplay_DeleteIdempotent_PathReplacedByDirectory_StillBlocks
 // covers the delete-non-blob case: the queued delete targets a path
 // that HEAD now resolves to a directory (tree entry), not a file. The
