@@ -39,6 +39,17 @@
 - Intent strategy falls back to event-style publishing when configuration is
   invalid or planner output cannot be trusted, so replay safety stays under ACD
   control.
+- Intent grouping now treats nested paths as ordered dependencies, so a later
+  child path cannot publish ahead of an earlier parent-path capture.
+- Git history and supersede probes now use literal pathspecs, so paths
+  containing characters such as `*`, `[`, or `:` cannot match unrelated files
+  while proving planner context or external supersede history.
+- Planner failures from OpenAI-compatible and subprocess providers are recorded
+  as `intent_planner_error` decisions before deterministic fallback, and
+  planner reason text is normalized before it reaches diagnostics.
+- v6 to v7 state database migration now adds `planner_state` without rebuilding
+  the existing decision ledger, and intent deferral summaries ignore pending
+  rows hidden behind terminal replay barriers.
 - Fast-forward during rewind grace now has integration coverage that preserves
   the fast-forwarded worktree before checking for phantom capture events.
 - Integration SQLite setup now waits for transient daemon DB locks before
