@@ -135,6 +135,37 @@ type IntentPlan struct {
 	Source          string           `json:"-"`
 }
 
+// IntentReasonCap bounds planner explanation fields before they are persisted
+// into the decision ledger.
+const IntentReasonCap = 512
+
+// NormalizeIntentPlanReasons trims planner explanation fields, removes ASCII
+// control characters, and caps them to a bounded size for diagnostics.
+func NormalizeIntentPlanReasons(plan IntentPlan) IntentPlan {
+	plan.GroupingReason = NormalizeIntentReason(plan.GroupingReason)
+	for i := range plan.DeferredReasons {
+		plan.DeferredReasons[i].Reason = NormalizeIntentReason(plan.DeferredReasons[i].Reason)
+	}
+	return plan
+}
+
+// NormalizeIntentReason applies the shared normalization for planner reason
+// strings.
+func NormalizeIntentReason(reason string) string {
+	reason = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, reason)
+	reason = strings.TrimSpace(reason)
+	runes := []rune(reason)
+	if len(runes) <= IntentReasonCap {
+		return reason
+	}
+	return string(runes[:IntentReasonCap])
+}
+
 // ValidateIntentPlan rejects malformed or incomplete planner output before it
 // can influence replay.
 func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
@@ -247,6 +278,7 @@ func (p DeterministicProvider) PlanIntent(ctx context.Context, req IntentPlanReq
 			Reason: "deferred by deterministic fallback",
 		})
 	}
+	plan = NormalizeIntentPlanReasons(plan)
 	if err := ValidateIntentPlan(req, plan); err != nil {
 		return IntentPlan{}, err
 	}
