@@ -1,6 +1,9 @@
 # acd — Auto-Commit-Daemon
 
-One static binary. Watches your git worktree. Captures every meaningful change as an atomic commit. Plays nicely with Claude Code, Codex, OpenCode, Pi, and any tool that runs commands at session start.
+One static binary. Watches your git worktree. Captures meaningful changes, then
+publishes them as chronological commits. By default each captured event becomes
+one commit; with `ACD_COMMIT_STRATEGY=intent`, AI can group related pending
+captures into one reviewable commit.
 
 ## Install
 
@@ -118,12 +121,14 @@ acd fix --dry-run
 ~~~
 
 `status` shows daemon health, queue counts, pause state, failed terminal
-barriers, and recent decision counts. `status --json` includes the decision
-cursor plus recent decision records, and includes `failed_events` /
-`failed_blocking_pending` when failed rows are holding pending replay behind a
-terminal barrier. `events --watch` starts at the current decision-ledger tail
-unless `--since` is provided, so it prints only decisions appended after watch
-starts. `explain` answers why ACD captured, skipped, committed, treated work as
+barriers, recent decision counts, and the active commit strategy. `status
+--json` includes the decision cursor plus recent decision records, and includes
+`failed_events` / `failed_blocking_pending` when failed rows are holding pending
+replay behind a terminal barrier. With intent grouping enabled, it also reports
+planner deferrals, forced-aging readiness, and the latest planner error.
+`events --watch` starts at the current decision-ledger tail unless `--since` is
+provided, so it prints only decisions appended after watch starts. `explain`
+answers why ACD captured, skipped, committed, deferred, grouped, treated work as
 externally handled, or blocked a path or commit. `fix --dry-run` plans
 conservative cleanup for common stuck states; apply only after reading the plan:
 
@@ -261,18 +266,6 @@ export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_BASE_URL=https://ai.example.internal/v1
 export ACD_AI_DIFF_EGRESS=1
 ~~~
-
-Strict-message builds:
-
-~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_COMMIT_MESSAGE_STRICT=1
-export ACD_AI_REPAIR_ATTEMPTS=2
-~~~
-
-Only set the strict-message variables when your installed `acd` build includes
-strict commit-message validation. They are listed here as the recommended
-profile for teams that require validator-repaired subjects.
 
 Use `event` for CI smoke runs and compatibility-sensitive shared branches.
 Use `intent` when review quality matters and the AI endpoint is trusted. Intent
