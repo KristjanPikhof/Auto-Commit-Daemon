@@ -54,7 +54,7 @@ acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
 acd stats --since 7d    # last week's commits
 acd doctor              # health/support diagnostics, including queue blockers
-acd doctor --bundle     # diagnostics zip with bundled/tail diagnostics for issue reports
+acd doctor --bundle     # write a diagnostics zip for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
 acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
 acd pause --reason "resetting branch" --yes   # durable manual replay pause
@@ -154,7 +154,9 @@ pending/blocked rows to the current attached branch, resets `blocked_conflict`
 rows to `pending`, clears stale replay metadata, and repairs ACD-owned stale
 live-index entries when the current `HEAD` and worktree still match the
 published event. `acd doctor` also reports live-index repair candidates and
-points at the recover dry-run command.
+points at the recover dry-run command. A manual pause marker is preserved unless
+you pass `--clear-pause`; use `acd resume --yes` when you only need to lift a
+manual pause.
 
 ACD uses an isolated scratch index for replay correctness, then performs a
 guarded path-scoped live-index reconciliation so IDEs see the committed state
