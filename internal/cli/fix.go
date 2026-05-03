@@ -22,41 +22,41 @@ import (
 )
 
 const (
-	fixActionClearExpiredManualPause = "clear_expired_manual_pause"
+	fixActionClearExpiredManualPause  = "clear_expired_manual_pause"
 	fixActionClearDrainedBackpressure = "clear_drained_backpressure"
 	fixActionDeleteObsoleteBarrier    = "delete_obsolete_barrier"
 	fixActionMarkExternalPublished    = "mark_external_published"
 )
 
 type fixPlan struct {
-	Repo              string      `json:"repo"`
-	StateDB           string      `json:"state_db"`
-	GitDir            string      `json:"git_dir,omitempty"`
-	CurrentBranchRef  string      `json:"current_branch_ref,omitempty"`
-	CurrentHead       string      `json:"current_head,omitempty"`
-	Generation        int64       `json:"generation,omitempty"`
-	DryRun            bool        `json:"dry_run"`
-	BackupPath        string      `json:"backup_path,omitempty"`
-	Actions           []fixAction `json:"actions"`
-	Unsafe            []string    `json:"unsafe,omitempty"`
+	Repo               string      `json:"repo"`
+	StateDB            string      `json:"state_db"`
+	GitDir             string      `json:"git_dir,omitempty"`
+	CurrentBranchRef   string      `json:"current_branch_ref,omitempty"`
+	CurrentHead        string      `json:"current_head,omitempty"`
+	Generation         int64       `json:"generation,omitempty"`
+	DryRun             bool        `json:"dry_run"`
+	BackupPath         string      `json:"backup_path,omitempty"`
+	Actions            []fixAction `json:"actions"`
+	Unsafe             []string    `json:"unsafe,omitempty"`
 	Suggestions        []string    `json:"suggestions,omitempty"`
-	RowsChanged       int64       `json:"rows_changed"`
-	ManualPauseRemoved bool       `json:"manual_pause_removed,omitempty"`
-	ManualPausePath    string     `json:"manual_pause_path,omitempty"`
+	RowsChanged        int64       `json:"rows_changed"`
+	ManualPauseRemoved bool        `json:"manual_pause_removed,omitempty"`
+	ManualPausePath    string      `json:"manual_pause_path,omitempty"`
 }
 
 type fixAction struct {
-	ID          string  `json:"id"`
-	Kind        string  `json:"kind"`
-	Description string  `json:"description"`
-	Reason      string  `json:"reason,omitempty"`
-	Seq         int64   `json:"seq,omitempty"`
-	Path        string  `json:"path,omitempty"`
-	DecisionID  int64   `json:"decision_id,omitempty"`
-	CommitOID   string  `json:"commit_oid,omitempty"`
-	RowsChanged int64   `json:"rows_changed,omitempty"`
-	Applied     bool    `json:"applied,omitempty"`
-	SetAt       string  `json:"set_at,omitempty"`
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Description string `json:"description"`
+	Reason      string `json:"reason,omitempty"`
+	Seq         int64  `json:"seq,omitempty"`
+	Path        string `json:"path,omitempty"`
+	DecisionID  int64  `json:"decision_id,omitempty"`
+	CommitOID   string `json:"commit_oid,omitempty"`
+	RowsChanged int64  `json:"rows_changed,omitempty"`
+	Applied     bool   `json:"applied,omitempty"`
+	SetAt       string `json:"set_at,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
