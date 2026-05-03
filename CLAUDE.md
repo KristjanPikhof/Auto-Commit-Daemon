@@ -99,7 +99,7 @@ Release smoke: `make build && install -m 0755 ./bin/acd ~/.local/bin/acd`; `git 
 - fsnotify dispatch must not block: runtime creates use `rewalkCh`/`rewalkWorker`; diagnostics use `diagCh`; trailing timer clamps at `MaxDebounceTail = 500ms`; ENOSPC -> `errBudgetExceeded`; `Stop(context.Context)` bounded.
 - Logs: raw JSONL at `paths.Roots.RepoLogPath(repoHash)` (`~/.local/state/acd/<repo-hash>/daemon.log`) with rotation/compression.
 - `acd logs --follow` streams from EOF reached by initial tail read; do not re-`Stat` after tailing.
-- `acd list --watch --interval 2s` redraws table with timestamp; one-shot output unchanged; no `--json`.
+- `acd list --watch --interval 2s` redraws table with timestamp; one-shot output unchanged; one-shot `--json` works; `--watch` rejects `--json`.
 - `acd events --watch`: with no `--since`, starts at current ledger tail; with `--since`, resumes after cursor.
 - `acd status`, `acd diagnose`, `acd doctor` surface `failed_events` and `failed_blocking_pending`; guide to `acd fix --dry-run`.
 - `acd doctor` tails logs best-effort, sanitizes `$HOME` to `~`, bundles logs, ignore patterns, fsnotify stats, state/meta JSON.
@@ -127,7 +127,7 @@ git status --short --ignored
 - `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`; diff/blob caps use `git.DefaultDiffCap` (1 MiB). `RevParse` ambiguous refs -> `git.ErrRefAmbiguous`.
 - Pinned `ps`: `/bin/ps` on Darwin, `/usr/bin/ps` on Linux. Do not use `$PATH`. `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
 - AI providers declare `NeedsDiff`; network providers receive redacted diffs only when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` is truthy. `DeterministicProvider` uses `NeedsDiff=false`.
-- `BuildOpsDiff` uses `git.DiffBlobsLimited` / `git.CatFileBlobLimited`; no post-render trim. Per-op timeout 5s.
+- `BuildOpsDiff` caps rendered text at `ai.DiffCap` while appending sections; each per-op git diff uses `2 * ai.DiffCap` and a 5s timeout. Redaction plus final truncate still run before provider send.
 - `ACD_AI_SEND_DIFF` was removed; if set, emit one startup deprecation warning.
 - Generic messages like `Update PopupApp.tsx` are low-priority message-quality issues unless replay/state is wrong.
 - `ACD_TRACE=1` writes best-effort JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`; `ACD_TRACE_DIR` overrides; never block/abort. Verify event-class additions with `rg -n "EventClass:" internal/`.
