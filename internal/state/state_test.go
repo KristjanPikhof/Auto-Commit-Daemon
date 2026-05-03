@@ -415,6 +415,64 @@ func TestPlannerStateCRUDAndOldestOverdue(t *testing.T) {
 	}
 }
 
+func TestOldestOverduePlannerEventStopsAfterTerminalPredecessor(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+		}
+		return seq
+	}
+
+	visibleSeq := appendEvent("visible.txt")
+	barrierSeq := appendEvent("barrier.txt")
+	hiddenSeq := appendEvent("hidden.txt")
+
+	if err := MarkEventPublished(ctx, d, barrierSeq, EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowSeconds(),
+	); err != nil {
+		t.Fatalf("MarkEventPublished failed: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, hiddenSeq, 1, "oldest but behind barrier"); err != nil {
+		t.Fatalf("RecordPlannerDefer hidden: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, visibleSeq, 30, "visible before barrier"); err != nil {
+		t.Fatalf("RecordPlannerDefer visible: %v", err)
+	}
+
+	ev, ps, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != visibleSeq || ps.EventSeq != visibleSeq {
+		t.Fatalf("oldest overdue = event %d planner %d, want visible %d before barrier %d; hidden %d must be held",
+			ev.Seq, ps.EventSeq, visibleSeq, barrierSeq, hiddenSeq)
+	}
+
+	if err := MarkEventPublished(ctx, d, visibleSeq, EventStatePublished,
+		sql.NullString{String: "abc123", Valid: true}, sql.NullString{},
+		sql.NullString{}, nowSeconds(),
+	); err != nil {
+		t.Fatalf("MarkEventPublished visible: %v", err)
+	}
+	if _, _, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1); err != nil || ok {
+		t.Fatalf("OldestOverduePlannerEvent behind barrier only: ok=%v err=%v, want not found", ok, err)
+	}
+}
+
 func TestPlannerStateConcurrentDefersAndMissingEvent(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
