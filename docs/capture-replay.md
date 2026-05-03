@@ -57,8 +57,9 @@ product terms:
 | `blocked` | Replay stopped because applying the event was not provably safe. |
 | `paused` / `resumed` | Capture or replay paused/resumed because of manual pause, rewind grace, or git operation state. |
 
-Use `acd events --watch` to stream new decisions, `acd explain --path FILE` to
-answer why one path was or was not committed, and `acd explain --commit HEAD` to
+Use `acd events --watch` to stream decisions appended after watch starts,
+`acd explain --path FILE` to answer why one path was or was not committed, and
+`acd explain --commit HEAD` to
 explain a commit. See [user-workflows.md](user-workflows.md) for complete daily
 flows.
 
@@ -590,11 +591,14 @@ version lives in [user-workflows.md](user-workflows.md).
 5. **Resolve blocked conflicts.**
 
    ~~~bash
-   acd doctor      # last conflict: <path> <age> "<error>"
+   acd doctor      # last conflict/failure plus failed blocker counts when present
    ~~~
 
-   `blocked_conflict` events are terminal and may hold later pending rows behind
-   a sequence barrier. Use built-in recovery before editing SQLite directly:
+   `blocked_conflict` and `failed` events are terminal and may hold later
+   pending rows behind a sequence barrier. `status`, `diagnose`, and `doctor`
+   surface failed terminal barriers as failed event counts and
+   `failed_blocking_pending`. Use built-in recovery before editing SQLite
+   directly:
 
    ~~~bash
    acd diagnose --repo .
