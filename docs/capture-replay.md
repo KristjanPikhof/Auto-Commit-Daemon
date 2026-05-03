@@ -261,7 +261,7 @@ acd status              # daemon, queue, pause, branch, and recent decisions
 acd status --watch      # refresh the same repo until Ctrl-C
 acd status --json       # machine-readable version
 acd events              # durable product decision ledger
-acd events --watch      # stream appended decisions until Ctrl-C
+acd events --watch      # stream decisions appended after watch starts
 acd explain --path FILE # explain why a path was captured, skipped, or blocked
 acd explain --commit HEAD # explain decisions linked to a commit
 acd list                # PENDING + BLOCKED columns across all repos
@@ -270,7 +270,7 @@ acd list --watch --interval 5s
 acd logs                # tail the current repo daemon log as raw JSONL
 acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
-acd doctor              # full diagnostics, including last_conflict path + age + error
+acd doctor              # full diagnostics, including queue blockers and failures
 acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue reports
 ~~~
 
@@ -303,6 +303,8 @@ for issue reports.
       pending    : N
       blocked    : N
       last conflict : path/to/file.go  47s ago  "before-state mismatch for path/to/file.go"
+      failed     : N
+      failed blockers : N pending successors; run acd fix --dry-run
 ```
 
 `acd doctor --json` and doctor bundles also include the active safe-ignore
@@ -312,6 +314,9 @@ or watcher descent: `node_modules/`, `target/`, `.venv/`, `venv/`,
 `.gradle/`. This guard is internal to ACD and never edits `.gitignore`.
 Set `ACD_SAFE_IGNORE=0` to restore the older behavior, or append additional
 generated trees with `ACD_SAFE_IGNORE_EXTRA`, for example `dist/,build/`.
+Those variables are read when the daemon starts. Stop and restart an existing
+daemon before expecting safe-ignore changes to affect capture or watcher
+pruning.
 
 #### `acd status --json` shape
 
@@ -340,10 +345,36 @@ generated trees with `ACD_SAFE_IGNORE_EXTRA`, for example `dist/,build/`.
   ],
   "pending_events": 2,
   "blocked_conflicts": 0,
+  "failed_events": 1,
+  "failed_blocking_pending": 1,
   "last_commit_oid": "deadbeef...",
   "last_commit_ts": 1746000250,
   "last_commit_message": "modify auth.go",
   "capture_errors": 0,
+  "decision_counts": {
+    "captured": 8,
+    "committed": 7,
+    "blocked": 1
+  },
+  "recent_decisions": [
+    {
+      "id": 42,
+      "timestamp": 1746000301,
+      "time": "2026-04-30T10:05:01Z",
+      "kind": "blocked",
+      "path": "internal/state/schema.go",
+      "reason": "before-state mismatch",
+      "event_seq": 12,
+      "head_sha": "abc123...",
+      "commit_oid": "deadbeef...",
+      "branch_ref": "refs/heads/main",
+      "branch_generation": 3,
+      "action_taken": "blocked_conflict",
+      "user_message": "Replay stopped before publishing this path.",
+      "decision_ts": 1746000301.5
+    }
+  ],
+  "decision_cursor": 42,
   "paused": true,
   "pause": {
     "source": "manual",
@@ -354,6 +385,16 @@ generated trees with `ACD_SAFE_IGNORE_EXTRA`, for example `dist/,build/`.
   }
 }
 ```
+
+`failed_events` counts terminal failed replay rows. `failed_blocking_pending`
+is non-zero when failed terminal rows have later pending successors hidden
+behind the sequence barrier; inspect with `acd diagnose` and preview cleanup
+with `acd fix --dry-run`.
+
+`decision_counts`, `recent_decisions`, and `decision_cursor` are present when
+the decision ledger exists and has rows. `recent_decisions` uses the same entry
+shape as `acd events --json`; `decision_cursor` is the newest decision ID in
+that recent set and can be passed to `acd events --since`.
 
 `paused` and `pause` are omitted when replay is not paused. The `pause` object fields:
 
