@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -67,6 +68,27 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	report := intentStrategyFromEnv()
 	if conn == nil {
 		return report, nil
+	}
+	if strategy, ok, err := metaLookup(ctx, conn, "commit.strategy"); err != nil {
+		return report, fmt.Errorf("commit.strategy: %w", err)
+	} else if ok && strategy != "" {
+		report.Strategy = strategy
+		report.Active = strategy == string(ai.CommitStrategyIntent)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.window"); err != nil {
+		return report, fmt.Errorf("intent.window: %w", err)
+	} else if ok {
+		report.Window = parseIntentMetaInt(v, report.Window)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.recent_commits"); err != nil {
+		return report, fmt.Errorf("intent.recent_commits: %w", err)
+	} else if ok {
+		report.RecentCommits = parseIntentMetaInt(v, report.RecentCommits)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.defer_limit"); err != nil {
+		return report, fmt.Errorf("intent.defer_limit: %w", err)
+	} else if ok {
+		report.DeferLimit = parseIntentMetaInt(v, report.DeferLimit)
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {
@@ -133,4 +155,12 @@ LIMIT 1`, state.EventStatePending).Scan(&lastErrorSeq, &lastErrorPath, &lastErro
 		report.LastPlannerError = lastError.String
 	}
 	return report, nil
+}
+
+func parseIntentMetaInt(raw string, fallback int) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
