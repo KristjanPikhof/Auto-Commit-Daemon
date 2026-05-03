@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ type eventsReport struct {
 	Repo   string       `json:"repo"`
 	Cursor int64        `json:"cursor"`
 	Events []eventEntry `json:"events"`
+	Message string      `json:"message,omitempty"`
 }
 
 type eventEntry struct {
@@ -65,7 +67,8 @@ func newEventsCmd() *cobra.Command {
 
 The events command reads the durable decision ledger instead of raw daemon
 JSONL logs. Use --path to focus on one path, --since with a decision cursor to
-resume polling, and --watch to stream appended decisions until interrupted.`,
+resume polling, and --watch to stream appended decisions until interrupted.
+With --watch and no --since, events prints only decisions appended after watch starts.`,
 		Example: `  acd events
   acd events --path internal/state/schema.go
   acd events --since 42 --limit 100
@@ -86,7 +89,7 @@ resume polling, and --watch to stream appended decisions until interrupted.`,
 	cmd.Flags().StringVar(&path, "path", "", "Only show decisions for this repo-relative path")
 	cmd.Flags().Int64Var(&since, "since", 0, "Only show decisions after this decision cursor ID")
 	cmd.Flags().IntVar(&limit, "limit", defaultEventsLimit, "Maximum decisions to print per query")
-	cmd.Flags().BoolVar(&watch, "watch", false, "Poll for appended decisions until interrupted")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Poll for appended decisions until interrupted; without --since, start at the current ledger tail")
 	cmd.Flags().DurationVar(&interval, "interval", defaultEventsWatchInterval, "Poll interval for --watch (Go duration)")
 	return cmd
 }
@@ -105,30 +108,138 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 	if err != nil {
 		return err
 	}
-	db, err := state.Open(ctx, rec.StateDB)
+	db, err := openStateDBReadOnly(ctx, rec.StateDB)
 	if err != nil {
-		return fmt.Errorf("acd events: open state.db for repo %s: %w", rec.Path, err)
+		return fmt.Errorf("acd events: open state.db read-only for repo %s: %w", rec.Path, err)
 	}
 	defer db.Close()
 
-	rows, err := loadDecisionEvents(ctx, db, path, since, limit)
+	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
-		return err
+		return fmt.Errorf("acd events: decision table check: %w", err)
 	}
-	cursor := maxDecisionCursor(rows, since)
-	if !watch && since == 0 && cursor == 0 {
-		cursor, err = state.LatestDecisionID(ctx, db)
+	if !hasLedger {
+		return renderEvents(out, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
+	}
+
+	var rows []state.DecisionRecord
+	cursor := since
+	if watch && since == 0 {
+		cursor, err = latestDecisionIDSQL(ctx, db)
 		if err != nil {
 			return fmt.Errorf("acd events: latest cursor: %w", err)
 		}
+	} else {
+		rows, err = loadDecisionEvents(ctx, db, path, since, limit)
+		if err != nil {
+			return err
+		}
+		cursor = maxDecisionCursor(rows, since)
+		if !watch && since == 0 && cursor == 0 {
+			cursor, err = latestDecisionIDSQL(ctx, db)
+			if err != nil {
+				return fmt.Errorf("acd events: latest cursor: %w", err)
+			}
+		}
 	}
-	if err := renderEvents(out, rec.Path, rows, cursor, jsonOut, !watch); err != nil {
-		return err
+	if len(rows) > 0 || !watch {
+		if err := renderEvents(out, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
+			return err
+		}
 	}
 	if !watch {
 		return nil
 	}
 	return followEvents(ctx, out, db, rec.Path, path, cursor, limit, interval, jsonOut)
+}
+
+const missingDecisionLedgerMessage = "Decision ledger is not available in this state.db yet; start or restart acd with a current version to record product decisions."
+
+func loadDecisionEvents(ctx context.Context, db *sql.DB, path string, since int64, limit int) ([]state.DecisionRecord, error) {
+	var (
+		rows []state.DecisionRecord
+		err  error
+	)
+	switch {
+	case path != "" && since > 0:
+		rows, err = queryDecisionRecordsSQL(ctx, db, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+WHERE path = ? AND id > ?
+ORDER BY id ASC
+LIMIT ?`, path, since, limit)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query path decisions since cursor: %w", err)
+		}
+	case path != "":
+		rows, err = queryDecisionRecordsSQL(ctx, db, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+WHERE path = ?
+ORDER BY id DESC
+LIMIT ?`, path, limit)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query path decisions: %w", err)
+		}
+	case since > 0:
+		rows, err = queryDecisionRecordsSQL(ctx, db, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+WHERE id > ?
+ORDER BY id ASC
+LIMIT ?`, since, limit)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query decisions since cursor: %w", err)
+		}
+	default:
+		rows, err = queryDecisionRecordsSQL(ctx, db, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+ORDER BY id DESC
+LIMIT ?`, limit)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query recent decisions: %w", err)
+		}
+	}
+	return rows, nil
+}
+
+func queryDecisionRecordsSQL(ctx context.Context, db *sql.DB, q string, args ...any) ([]state.DecisionRecord, error) {
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []state.DecisionRecord
+	for rows.Next() {
+		var rec state.DecisionRecord
+		if err := rows.Scan(&rec.ID, &rec.DecisionTS, &rec.Kind, &rec.Path, &rec.Reason,
+			&rec.EventSeq, &rec.HeadSHA, &rec.CommitOID, &rec.BranchRef,
+			&rec.BranchGeneration, &rec.ActionTaken, &rec.UserMessage); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func latestDecisionIDSQL(ctx context.Context, db *sql.DB) (int64, error) {
+	var id sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(id) FROM decision_records`).Scan(&id); err != nil {
+		return 0, err
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
 }
 
 func eventsRepoRecord(repo string) (central.RepoRecord, error) {
@@ -154,36 +265,7 @@ func eventsRepoRecord(repo string) (central.RepoRecord, error) {
 	return rec, nil
 }
 
-func loadDecisionEvents(ctx context.Context, db *state.DB, path string, since int64, limit int) ([]state.DecisionRecord, error) {
-	switch {
-	case path != "" && since > 0:
-		rows, err := state.DecisionsForPathSince(ctx, db, path, since, limit)
-		if err != nil {
-			return nil, fmt.Errorf("acd events: query path decisions since cursor: %w", err)
-		}
-		return rows, nil
-	case path != "":
-		rows, err := state.DecisionsForPath(ctx, db, path, limit)
-		if err != nil {
-			return nil, fmt.Errorf("acd events: query path decisions: %w", err)
-		}
-		return rows, nil
-	case since > 0:
-		rows, err := state.DecisionsSince(ctx, db, since, limit)
-		if err != nil {
-			return nil, fmt.Errorf("acd events: query decisions since cursor: %w", err)
-		}
-		return rows, nil
-	default:
-		rows, err := state.RecentDecisions(ctx, db, limit)
-		if err != nil {
-			return nil, fmt.Errorf("acd events: query recent decisions: %w", err)
-		}
-		return rows, nil
-	}
-}
-
-func followEvents(ctx context.Context, out io.Writer, db *state.DB, repo, path string, cursor int64, limit int, interval time.Duration, jsonOut bool) error {
+func followEvents(ctx context.Context, out io.Writer, db *sql.DB, repo, path string, cursor int64, limit int, interval time.Duration, jsonOut bool) error {
 	if interval <= 0 {
 		return fmt.Errorf("acd events: --interval must be positive")
 	}
@@ -208,13 +290,13 @@ func followEvents(ctx context.Context, out io.Writer, db *state.DB, repo, path s
 			continue
 		}
 		cursor = maxDecisionCursor(rows, cursor)
-		if err := renderEvents(out, repo, rows, cursor, jsonOut, false); err != nil {
+		if err := renderEvents(out, repo, rows, cursor, jsonOut, false, ""); err != nil {
 			return err
 		}
 	}
 }
 
-func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool) error {
+func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
 	entries := make([]eventEntry, 0, len(rows))
 	for _, row := range rows {
 		entries = append(entries, decisionEntry(row))
@@ -223,7 +305,7 @@ func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, curso
 		enc := json.NewEncoder(out)
 		if includeEnvelope {
 			enc.SetIndent("", "  ")
-			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor, Events: entries})
+			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor, Events: entries, Message: message})
 		}
 		for _, entry := range entries {
 			if err := enc.Encode(entry); err != nil {
@@ -236,7 +318,10 @@ func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, curso
 		fmt.Fprintf(out, "Repo: %s\n", repo)
 		fmt.Fprintf(out, "Cursor: %d\n\n", cursor)
 		if len(entries) == 0 {
-			_, err := fmt.Fprintln(out, "No decisions recorded yet.")
+			if message == "" {
+				message = "No decisions recorded yet."
+			}
+			_, err := fmt.Fprintln(out, message)
 			return err
 		}
 	}
