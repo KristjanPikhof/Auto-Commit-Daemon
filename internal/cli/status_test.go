@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +188,62 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 	}
 }
 
+func TestStatus_FailedBarrierGuidance(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "bad.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "bad.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append failed event: %v", err)
+	}
+	if err := state.MarkEventPublished(ctx, d, seq, state.EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowFloat()); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "later.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "later.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending successor: %v", err)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	human := humanOut.String()
+	for _, want := range []string{"Failed terminal events: 1", "Failed barriers blocking pending replay: 1", "acd fix --dry-run"} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("status human missing %q in:\n%s", want, human)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal status: %v\n%s", err, jsonOut.String())
+	}
+	if rep.FailedEvents != 1 || rep.FailedBlockingPending != 1 {
+		t.Fatalf("failed fields = events %d blocking %d, want 1/1", rep.FailedEvents, rep.FailedBlockingPending)
+	}
+}
+
 func TestStatus_BodyRendersPauseSection(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -227,6 +284,106 @@ func TestStatus_BodyRendersPauseSection(t *testing.T) {
 	}
 	if !rep.Paused || rep.Pause == nil || rep.Pause.Source != "manual" || rep.Pause.Reason != "deploy window" {
 		t.Fatalf("unexpected pause JSON: %+v", rep.Pause)
+	}
+}
+
+func TestStatus_DecisionSummary(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	firstID, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  10,
+		Kind:        state.DecisionKindProtected,
+		Path:        sqlNullStr("secrets.env"),
+		Reason:      sqlNullStr("sensitive"),
+		ActionTaken: sqlNullStr("no_delete_generated"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision protected: %v", err)
+	}
+	secondID, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  11,
+		Kind:        state.DecisionKindHandledExternal,
+		Path:        sqlNullStr("src/app.go"),
+		Reason:      sqlNullStr("already_published_by_external_committer"),
+		ActionTaken: sqlNullStr("marked_published"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision handled: %v", err)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	human := humanOut.String()
+	for _, want := range []string{
+		"Decisions: protected=1 handled_external=1",
+		"Recent decisions:",
+		"#" + strconv.FormatInt(secondID, 10) + " handled_external src/app.go (marked_published)",
+		"#" + strconv.FormatInt(firstID, 10) + " protected secrets.env (no_delete_generated)",
+		"acd explain --path FILE",
+		"acd events --watch",
+	} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("status output missing %q in:\n%s", want, human)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.DecisionCursor != secondID {
+		t.Fatalf("DecisionCursor = %d, want %d", rep.DecisionCursor, secondID)
+	}
+	if rep.DecisionCounts[state.DecisionKindProtected] != 1 || rep.DecisionCounts[state.DecisionKindHandledExternal] != 1 {
+		t.Fatalf("DecisionCounts = %#v, want protected=1 handled_external=1", rep.DecisionCounts)
+	}
+	if len(rep.RecentDecisions) != 2 || rep.RecentDecisions[0].ID != secondID || rep.RecentDecisions[1].ID != firstID {
+		t.Fatalf("RecentDecisions = %#v, want newest first", rep.RecentDecisions)
+	}
+}
+
+func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `DROP TABLE decision_records`); err != nil {
+		t.Fatalf("drop decision_records: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runStatus should tolerate missing decision_records: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "Decisions:") {
+		t.Fatalf("pre-v5 status rendered decisions unexpectedly:\n%s", out.String())
+	}
+}
+
+func TestStatusWatchRejectsNonPositiveInterval(t *testing.T) {
+	var out bytes.Buffer
+	if err := runStatusWatch(context.Background(), &out, ".", 0); err == nil {
+		t.Fatal("runStatusWatch with zero interval succeeded")
 	}
 }
 

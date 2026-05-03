@@ -2,14 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- Explainable ACD history: `acd events`, `acd explain`, and richer
+  `status`/`diagnose`/`doctor` output now show why work was captured,
+  committed, skipped, protected, blocked, or handled by external history.
+- `acd fix` can plan and apply safe recovery for blocked or failed replay rows,
+  stale external-work cases, expired manual pause markers, and drained
+  backpressure.
+
+### Changed
+
+- Read-only observability commands no longer migrate old repo databases just to
+  inspect them. If a decision ledger is missing, they return an empty history
+  instead of changing the DB.
+- `acd events --watch` now follows decisions appended after watch starts unless
+  `--since` is provided.
+- Docs now cover explainable history, failed replay barriers, safe-ignore
+  restart requirements, and the current status JSON fields.
+
 ### Fixed
 
+- Decision records keep their original event sequence after old capture events
+  are pruned, so historical explanations stay useful.
+- Replay no longer marks work as `superseded_external` unless history, `HEAD`,
+  and the live worktree prove the queued change is already obsolete. The
+  history probe is bounded by the per-event timeout.
+- Deleted tracked files under skipped generated or gitignored directories are
+  captured as deletes instead of being hidden by the parent directory skip.
 - Same-branch fast-forwards, such as `git checkout main && git pull`, now
   refresh ACD's shadow baseline from the new `HEAD` instead of replaying stale
   work captured before the pull.
 - Manual pause/resume now preserves self-heal behavior when an external commit
   lands during the pause, so the resumed daemon can mark matching work as
   already published instead of treating it like upstream-only content.
+- Branch-transition settling avoids treating a ref move and its worktree update
+  as separate local edits.
 
 ## v2026-05-03
 

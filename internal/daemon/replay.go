@@ -383,7 +383,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			}
 			if alreadyPublished {
 				sourceHead := parent
-				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID); err != nil {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, sourceHead, headOID,
+					state.DecisionKindHandledExternal, "already_published_by_external_committer",
+				); err != nil {
 					return sum, err
 				}
 				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -426,15 +428,53 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Per-event timeout. write-tree, commit-tree, and update-ref are
-		// the heavy git ops in this loop; a pathological worktree (giant
-		// rename, GC contention, network alternates) could otherwise stall
-		// a single event for minutes and starve flush_requests / shutdown
-		// signals waiting on the run loop. Each event gets a 60s budget
-		// inherited from the caller's ctx; on timeout the event is marked
-		// failed and the batch halts so the next pass starts fresh. Tests
-		// override the budget via replayPerEventTimeoutForTest.
+		// Per-event timeout. The external-history superseded probe, write-tree,
+		// commit-tree, and update-ref are the heavy git ops in this loop; a
+		// pathological history/worktree (giant path history, giant rename, GC
+		// contention, network alternates) could otherwise stall a single event
+		// for minutes and starve flush_requests / shutdown signals waiting on
+		// the run loop. Each event gets a 60s budget inherited from the caller's
+		// ctx; on timeout the event is marked failed and the batch halts so the
+		// next pass starts fresh. Tests override the budget via
+		// replayPerEventTimeoutOverride.
 		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+
+		if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, parent, ev, ops); err != nil {
+			cancelEvent()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				if markErr := markFailed(ctx, db, ev, replayIssue{
+					ErrorClass: replayErrorCommitBuildFailure,
+					Message:    err.Error(),
+					Ref:        activeCtx.BranchRef,
+					Path:       ev.Path,
+				}); markErr != nil {
+					return sum, markErr
+				}
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+				sum.Failed++
+				return sum, nil
+			}
+			return sum, err
+		} else if superseded {
+			cancelEvent()
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent,
+				state.DecisionKindSupersededExternal, reason,
+			); err != nil {
+				return sum, err
+			}
+			if err := git.ReadTree(ctx, repoRoot, indexFile, parent); err != nil {
+				return sum, fmt.Errorf("daemon: replay reseed index after superseded external: %w", err)
+			}
+			activeCtx.BaseHead = parent
+			sum.BaseHead = parent
+			sum.Published++
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, reason, map[string]any{
+				"commit": parent,
+				"parent": parent,
+			})
+			continue
+		}
+
 		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
 			cancelEvent()
@@ -463,7 +503,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// row in the steady state.
 		if parentTree != "" && treeOID == parentTree {
 			cancelEvent()
-			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent); err != nil {
+			if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, parent,
+				state.DecisionKindHandledExternal, "already_published_no_op_tree",
+			); err != nil {
 				return sum, err
 			}
 			reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -531,7 +573,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			}
 			if alreadyPublished {
 				cancelEvent()
-				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID); err != nil {
+				if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, headOID,
+					state.DecisionKindHandledExternal, "already_published_after_cas_exhaustion",
+				); err != nil {
 					return sum, err
 				}
 				reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -591,7 +635,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 
 		// Settle the event row + publish_state.
 		cancelEvent()
-		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID); err != nil {
+		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID,
+			state.DecisionKindCommitted, "event published",
+		); err != nil {
 			return sum, err
 		}
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
@@ -1312,7 +1358,152 @@ func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error
 	return tree, nil
 }
 
-func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID string) error {
+func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (bool, string, error) {
+	if parent == "" || ev.BaseHead == "" || parent == ev.BaseHead || len(ops) == 0 {
+		return false, "", nil
+	}
+	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if err != nil {
+		return false, "", fmt.Errorf("superseded ancestry probe %s..%s: %w", ev.BaseHead, parent, err)
+	}
+	if !ok {
+		return false, "", nil
+	}
+	paths := make([]string, 0, len(ops))
+	for _, op := range ops {
+		if op.Op == "rename" {
+			return false, "", nil
+		}
+		if op.Path == "" {
+			return false, "", nil
+		}
+		paths = append(paths, op.Path)
+	}
+	changed, err := pathsTouchedBetweenFn(ctx, repoRoot, ev.BaseHead, parent, paths)
+	if err != nil {
+		return false, "", err
+	}
+	if !changed {
+		return false, "", nil
+	}
+	for _, op := range ops {
+		matches, err := treeMatchesCapturedBefore(ctx, repoRoot, parent, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !matches {
+			return false, "", nil
+		}
+		baseMatches, err := treeMatchesCapturedBefore(ctx, repoRoot, ev.BaseHead, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !baseMatches {
+			return false, "", nil
+		}
+		liveMatches, err := liveWorktreeMatchesCapturedBefore(ctx, repoRoot, op)
+		if err != nil {
+			return false, "", err
+		}
+		if !liveMatches {
+			return false, "", nil
+		}
+	}
+	return true, "superseded_external_current_head_matches_captured_before_state", nil
+}
+
+var pathsTouchedBetweenFn = pathsTouchedBetween
+
+func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
+	if len(paths) == 0 {
+		return false, nil
+	}
+	args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
+	args = append(args, paths...)
+	_, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, args...)
+	if err != nil {
+		var gerr *git.Error
+		if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("diff touched paths %s..%s: %w", before, after, err)
+	}
+	// Endpoint diff is silent for "changed then reverted" history. Keep the
+	// fallback bounded to one commit OID instead of buffering path names for
+	// the whole range.
+	args = []string{"rev-list", "--max-count=1", before + ".." + after, "--"}
+	args = append(args, paths...)
+	out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, 64, args...)
+	if err != nil {
+		return false, fmt.Errorf("rev-list touched paths %s..%s: %w", before, after, err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+func liveWorktreeMatchesCapturedBefore(ctx context.Context, repoRoot string, op state.CaptureOp) (bool, error) {
+	if op.Path == "" {
+		return false, nil
+	}
+	full := filepath.Join(repoRoot, filepath.FromSlash(op.Path))
+	if op.Op == "create" {
+		if _, err := os.Lstat(full); err == nil {
+			return false, nil
+		} else if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		return false, nil
+	}
+	if !op.BeforeOID.Valid || op.BeforeOID.String == "" || !op.BeforeMode.Valid || op.BeforeMode.String == "" {
+		return false, nil
+	}
+	fi, err := os.Lstat(full)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		return false, nil
+	}
+	entry, ok, _, err := hashCandidate(ctx, repoRoot, candidateLike{
+		rel:  op.Path,
+		full: full,
+		fi:   fi,
+	}, walkOpts{maxBytes: DefaultMaxFileBytes})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false, err
+		}
+		return false, nil
+	}
+	if !ok {
+		return false, nil
+	}
+	return entry.OID == op.BeforeOID.String && entry.Mode == op.BeforeMode.String, nil
+}
+
+func treeMatchesCapturedBefore(ctx context.Context, repoRoot, commit string, op state.CaptureOp) (bool, error) {
+	if op.Op == "create" {
+		absent, err := isPathAbsentInTree(ctx, repoRoot, commit, op.Path)
+		if err != nil {
+			return false, err
+		}
+		return absent, nil
+	}
+	if !op.BeforeOID.Valid || op.BeforeOID.String == "" || !op.BeforeMode.Valid || op.BeforeMode.String == "" {
+		return false, nil
+	}
+	entries, err := git.LsTree(ctx, repoRoot, commit, false, op.Path)
+	if err != nil {
+		return false, fmt.Errorf("ls-tree before-state %s: %w", op.Path, err)
+	}
+	for _, entry := range entries {
+		if entry.Path == op.Path && entry.Type == "blob" {
+			return entry.OID == op.BeforeOID.String && entry.Mode == op.BeforeMode.String, nil
+		}
+	}
+	return false, nil
+}
+
+func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason string) error {
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	if err := state.MarkEventPublished(ctx, db,
 		ev.Seq, state.EventStatePublished,
@@ -1337,7 +1528,73 @@ func settlePublishedEvent(ctx context.Context, db *state.DB, ev state.CaptureEve
 		slog.Default().Warn("save publish_state after MarkEventPublished",
 			"seq", ev.Seq, "commit", commitOID, "err", err.Error())
 	}
+	if decisionKind != "" {
+		recordReplayDecision(ctx, db, ev, cctx, nowSec, decisionKind, decisionReason, commitOID)
+	}
 	return nil
+}
+
+func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, ts float64, kind, reason, commitOID string) {
+	action := "published"
+	switch kind {
+	case state.DecisionKindHandledExternal:
+		action = "handled externally"
+	case state.DecisionKindSupersededExternal:
+		action = "superseded externally"
+	case state.DecisionKindCommitted:
+		action = "committed"
+	case state.DecisionKindBlocked:
+		action = "blocked_conflict"
+	}
+	message := replayDecisionMessage(kind, ev.Path, commitOID)
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:       ts,
+		Kind:             kind,
+		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: ev.Seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		CommitOID:        sql.NullString{String: commitOID, Valid: commitOID != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: true},
+		UserMessage:      sql.NullString{String: message, Valid: message != ""},
+	}); err != nil {
+		slog.Default().Warn("append replay decision",
+			"seq", ev.Seq, "kind", kind, "commit", commitOID, "err", err.Error())
+	}
+}
+
+func replayDecisionMessage(kind, path, commitOID string) string {
+	shortCommit := commitOID
+	if len(shortCommit) > 12 {
+		shortCommit = shortCommit[:12]
+	}
+	switch kind {
+	case state.DecisionKindHandledExternal:
+		if path != "" {
+			return fmt.Sprintf("External commit already contains %s.", path)
+		}
+		return "External commit already contains this change."
+	case state.DecisionKindSupersededExternal:
+		if path != "" {
+			return fmt.Sprintf("External history superseded queued change for %s.", path)
+		}
+		return "External history superseded this queued change."
+	case state.DecisionKindCommitted:
+		if path != "" && shortCommit != "" {
+			return fmt.Sprintf("Committed %s as %s.", path, shortCommit)
+		}
+		if shortCommit != "" {
+			return fmt.Sprintf("Committed queued change as %s.", shortCommit)
+		}
+	case state.DecisionKindBlocked:
+		if path != "" {
+			return fmt.Sprintf("Blocked replay for %s.", path)
+		}
+		return "Blocked replay for queued change."
+	}
+	return ""
 }
 
 // state-mutation seams for tests. Production wires straight through to the
@@ -1407,6 +1664,7 @@ func recordConflict(ctx context.Context, db *state.DB, ev state.CaptureEvent, is
 	); err != nil {
 		return fmt.Errorf("daemon: mark blocked seq=%d: %w", ev.Seq, err)
 	}
+	recordReplayDecision(ctx, db, ev, cctx, nowSec, state.DecisionKindBlocked, issue.Message, "")
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1860,7 +1861,24 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 		t.Fatalf("count capture_events: %v", err)
 	}
 	if events != 0 {
-		t.Fatalf("external fast-forward captured %d upstream events, want 0", events)
+		rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq, operation, path, state, base_head FROM capture_events ORDER BY seq`)
+		if err != nil {
+			t.Fatalf("external fast-forward captured %d upstream events, want 0; query events: %v", events, err)
+		}
+		defer rows.Close()
+		var details []string
+		for rows.Next() {
+			var seq int64
+			var operation, path, stateName, baseHead string
+			if err := rows.Scan(&seq, &operation, &path, &stateName, &baseHead); err != nil {
+				t.Fatalf("scan captured event: %v", err)
+			}
+			details = append(details, fmt.Sprintf("seq=%d op=%s path=%s state=%s base=%s", seq, operation, path, stateName, baseHead))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate captured events: %v", err)
+		}
+		t.Fatalf("external fast-forward captured %d upstream events, want 0: %s", events, strings.Join(details, "; "))
 	}
 
 	cancel()

@@ -8,6 +8,10 @@ const rootHelpTemplate = `{{if eq .CommandPath "acd"}}{{with (or .Long .Short)}}
 Common workflow:
   acd start                         Register this session and ensure the repo daemon is running
   acd status                        Show daemon, branch, and client state for the current repo
+  acd events                        Show recent product decisions for the current repo
+  acd events --watch                Stream appended product decisions
+  acd explain --path FILE           Explain why ACD did or did not commit a path
+  acd fix --dry-run                 Plan safe remediation for a stuck repo
   acd list                          List known repo daemons
   acd list --watch --interval 5s     Watch known repo daemons live
   acd logs --lines 200              Tail the current repo daemon log as raw JSONL

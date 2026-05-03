@@ -889,6 +889,7 @@ func TestReplay_IdempotentPublishWhenParallelCommitterAlreadyLanded(t *testing.T
 	if !commitOID.Valid || commitOID.String != external {
 		t.Fatalf("commit_oid=%v want %s", commitOID, external)
 	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindHandledExternal, "already_published_by_external_committer")
 
 	var reasons int
 	for _, ev := range trace.Events() {
@@ -971,6 +972,260 @@ func TestReplay_IdempotentPublishWhenParallelDeleteAlreadyLanded(t *testing.T) {
 	}
 	if !commitOID.Valid || commitOID.String != external {
 		t.Fatalf("commit_oid=%v want %s", commitOID, external)
+	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindHandledExternal, "already_published_by_external_committer")
+}
+
+func TestReplay_SupersedesQueuedModifyAfterExternalRevert(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "reverted.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "reverted.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", afterBlob, "external after", base)
+	revert := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", beforeBlob, "external revert", external)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, revert, base); err != nil {
+		t.Fatalf("update-ref revert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "reverted.txt"), []byte("before\n"), 0o644); err != nil {
+		t.Fatalf("write live before-state: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = revert
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; superseded event should not create a commit", beforeCount, got)
+	}
+	headBlob, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "reverted.txt")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD: %v", err)
+	}
+	if headBlob != beforeBlob {
+		t.Fatalf("HEAD blob=%s want before blob %s", headBlob, beforeBlob)
+	}
+
+	var stateName string
+	var commitOID sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &commitOID); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStatePublished {
+		t.Fatalf("state=%q want published", stateName)
+	}
+	if !commitOID.Valid || commitOID.String != revert {
+		t.Fatalf("commit_oid=%v want %s", commitOID, revert)
+	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindSupersededExternal, "superseded_external_current_head_matches_captured_before_state")
+}
+
+func TestReplay_DoesNotSupersedeExternalRevertWhenWorktreeStillChanged(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "reverted.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "reverted.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", afterBlob, "external after", base)
+	revert := commitSingleFileTree(t, ctx, f.dir, "reverted.txt", beforeBlob, "external revert", external)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, revert, base); err != nil {
+		t.Fatalf("update-ref revert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "reverted.txt"), []byte("after\n"), 0o644); err != nil {
+		t.Fatalf("write live after-state: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = revert
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount+1 {
+		t.Fatalf("commit count=%d want %d; live after-state must be committed", got, beforeCount+1)
+	}
+	headBlob, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "reverted.txt")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD: %v", err)
+	}
+	if headBlob != afterBlob {
+		t.Fatalf("HEAD blob=%s want after blob %s", headBlob, afterBlob)
+	}
+
+	var stateName string
+	var commitOID sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&stateName, &commitOID); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if stateName != state.EventStatePublished {
+		t.Fatalf("state=%q want published", stateName)
+	}
+	if !commitOID.Valid || commitOID.String == revert {
+		t.Fatalf("commit_oid=%v must be a new replay commit, not superseded revert %s", commitOID, revert)
+	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindCommitted, "event published")
+}
+
+func TestReplay_SupersededHistoryProbeUsesPerEventTimeout(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+
+	base := commitSingleFileTree(t, ctx, f.dir, "slow-revert.txt", beforeBlob, "seed before")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "slow-revert.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "slow-revert.txt",
+		BeforeOID:  sql.NullString{String: beforeBlob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterBlob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	if _, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op}); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	external := commitSingleFileTree(t, ctx, f.dir, "slow-revert.txt", afterBlob, "external after", base)
+	revert := commitSingleFileTree(t, ctx, f.dir, "slow-revert.txt", beforeBlob, "external revert", external)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, revert, base); err != nil {
+		t.Fatalf("update-ref revert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "slow-revert.txt"), []byte("before\n"), 0o644); err != nil {
+		t.Fatalf("write live before-state: %v", err)
+	}
+	cctx := f.cctx
+	cctx.BaseHead = revert
+
+	replayPerEventTimeoutOverride.Store(int64(50 * time.Millisecond))
+	t.Cleanup(func() { replayPerEventTimeoutOverride.Store(0) })
+	origPathsTouched := pathsTouchedBetweenFn
+	pathsTouchedBetweenFn = func(ctx context.Context, repoRoot, before, after string, paths []string) (bool, error) {
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+	t.Cleanup(func() { pathsTouchedBetweenFn = origPathsTouched })
+
+	start := time.Now()
+	sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{GitDir: f.gitDir, Limit: 1})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Replay returned err=%v; superseded probe timeout should be handled inside the loop", err)
+	}
+	if sum.Failed != 1 || sum.Published != 0 || sum.Conflicts != 0 {
+		t.Fatalf("unexpected summary after probe timeout: %+v", sum)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Replay took %v; superseded probe did not honor per-event timeout", elapsed)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d after timeout; want terminal event", len(pending))
 	}
 }
 
@@ -1180,6 +1435,56 @@ func TestReplay_ParallelCreate_NoEmptyCommit(t *testing.T) {
 			t.Fatalf("no idempotent publish trace decision fired; events=%+v", trace.Events())
 		}
 	}
+}
+
+func TestReplay_NoOpTreeRecordsHandledExternalDecision(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("same\n"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "same.txt", blob, "seed same")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	ev := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "modify",
+		Path:             "same.txt",
+		Fidelity:         "rescan",
+	}
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "same.txt",
+		BeforeOID:  sql.NullString{String: blob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, ev, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	beforeCount := revListCount(t, ctx, f.dir, "HEAD")
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != beforeCount {
+		t.Fatalf("commit count changed from %d to %d; no-op tree should not create a commit", beforeCount, got)
+	}
+	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindHandledExternal, "already_published_no_op_tree")
 }
 
 // TestReplay_DeleteIdempotent_PathReplacedByDirectory_StillBlocks
@@ -2468,6 +2773,29 @@ func TestReplay_CASRetry_ExternalLandedSameContent(t *testing.T) {
 	if blocked != 0 {
 		t.Fatalf("blocked_conflict count=%d want 0; CAS exhaustion should settle idempotently", blocked)
 	}
+	published, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(published) != 0 {
+		t.Fatalf("pending events remain after CAS idempotent settle: %+v", published)
+	}
+	decisions, err := state.DecisionsForPath(ctx, f.db, filename, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPath: %v", err)
+	}
+	foundDecision := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindHandledExternal &&
+			decision.Reason.Valid &&
+			decision.Reason.String == "already_published_after_cas_exhaustion" {
+			foundDecision = true
+			break
+		}
+	}
+	if !foundDecision {
+		t.Fatalf("missing CAS handled_external decision for %s: %+v", filename, decisions)
+	}
 
 	idempotentTraceFired := false
 	for _, ev := range trace.Events() {
@@ -2838,6 +3166,30 @@ func commitSingleFileTree(t *testing.T, ctx context.Context, repoDir, path, blob
 	return commit
 }
 
+func assertReplayDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64, kind, reason string) {
+	t.Helper()
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind != kind {
+			continue
+		}
+		if reason != "" && (!decision.Reason.Valid || decision.Reason.String != reason) {
+			continue
+		}
+		if !decision.Path.Valid || decision.Path.String == "" {
+			t.Fatalf("decision for seq %d missing path: %+v", seq, decision)
+		}
+		if !decision.CommitOID.Valid || decision.CommitOID.String == "" {
+			t.Fatalf("decision for seq %d missing commit oid: %+v", seq, decision)
+		}
+		return
+	}
+	t.Fatalf("missing replay decision kind=%q reason=%q for seq %d: %+v", kind, reason, seq, decisions)
+}
+
 func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
 	t.Helper()
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "rev-list", "--count", rev)
@@ -2849,6 +3201,44 @@ func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {
 		t.Fatalf("parse rev-list count %q: %v", out, err)
 	}
 	return n
+}
+
+func TestPathsTouchedBetween_QuietDiffExitCodesAndCancellation(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	afterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "touched.txt", beforeBlob, "base")
+	after := commitSingleFileTree(t, ctx, f.dir, "touched.txt", afterBlob, "after", base)
+
+	touched, err := pathsTouchedBetween(ctx, f.dir, base, after, []string{"touched.txt"})
+	if err != nil {
+		t.Fatalf("pathsTouchedBetween changed path: %v", err)
+	}
+	if !touched {
+		t.Fatal("changed path reported untouched")
+	}
+
+	touched, err = pathsTouchedBetween(ctx, f.dir, base, after, []string{"other.txt"})
+	if err != nil {
+		t.Fatalf("pathsTouchedBetween unrelated path: %v", err)
+	}
+	if touched {
+		t.Fatal("unrelated path reported touched")
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := pathsTouchedBetween(cancelled, f.dir, base, after, []string{"touched.txt"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pathsTouchedBetween canceled err=%v want context.Canceled", err)
+	}
 }
 
 // -----------------------------------------------------------------------------

@@ -23,8 +23,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -56,9 +54,14 @@ type doctorRepoReport struct {
 	LastCaptureError       string   `json:"last_capture_error,omitempty"`
 	PendingEvents          int      `json:"pending_events"`
 	BlockedConflicts       int      `json:"blocked_conflicts"`
+	FailedEvents           int      `json:"failed_events"`
+	FailedBlockingPending  int      `json:"failed_blocking_pending"`
 	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS    int64    `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath  string   `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr   string   `json:"last_replay_failure_error,omitempty"`
 	Notes                  []string `json:"notes,omitempty"`
 }
 
@@ -109,16 +112,18 @@ type doctorReport struct {
 func newDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Run install + runtime diagnostics; optionally bundle as zip",
-		Long: `Run broad install and runtime diagnostics across acd state.
+		Short: "Collect install/runtime diagnostics and support bundles",
+		Long: `Collect broad install and runtime diagnostics across acd state.
 
 Doctor checks the central registry, daemon liveness, harness installs, AI provider settings, safe-ignore and sensitive-glob configuration, fsnotify status, and recent daemon log tails. Use --bundle to write a zip with sanitized diagnostic files for sharing.
 
-Use acd diagnose for focused replay/branch blockers in the current repo.`,
+Doctor is the support/health command, not the daily "why" view. Use acd status for the current repo snapshot, acd events to follow product decisions, acd explain for path or commit answers, and acd diagnose for focused replay/branch blockers.`,
 		Example: `  acd doctor
   acd doctor --json
   acd doctor --bundle
-  acd doctor --bundle --output /tmp`,
+  acd doctor --bundle --output /tmp
+  acd explain --path internal/state/schema.go
+  acd events --watch`,
 		RunE: func(c *cobra.Command, args []string) error {
 			jsonOut, _ := c.Flags().GetBool("json")
 			bundle, _ := c.Flags().GetBool("bundle")
@@ -385,81 +390,87 @@ func findDaemonProcesses(ctx context.Context, repo string) []int {
 // readRepoState opens the per-repo DB read-only and fills the report fields
 // we can derive from daemon_state, daemon_clients and daemon_meta.
 func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath string) bool {
-	d, err := state.Open(ctx, dbPath)
+	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
 		rr.Notes = append(rr.Notes, "state.db open failed: "+err.Error())
 		return false
 	}
-	defer d.Close()
+	defer conn.Close()
 
-	st, _, err := state.LoadDaemonState(ctx, d)
-	if err != nil {
+	var pid int
+	var mode string
+	var heartbeatTS sql.NullFloat64
+	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts FROM daemon_state WHERE id = 1`)
+	if err := row.Scan(&pid, &mode, &heartbeatTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		rr.Notes = append(rr.Notes, "daemon_state read failed: "+err.Error())
 		return true
-	}
-	rr.DaemonPID = st.PID
-	rr.DaemonMode = st.Mode
-	rr.DaemonAlive = st.PID > 0 && identity.Alive(st.PID)
-	if st.HeartbeatTS > 0 {
-		rr.HeartbeatTS = int64(st.HeartbeatTS)
-		age := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
-		rr.HeartbeatAgeS = int64(age.Seconds())
-		if age > clientTTL() {
-			rr.HeartbeatStale = true
+	} else if err == nil {
+		rr.DaemonPID = pid
+		rr.DaemonMode = mode
+		rr.DaemonAlive = pid > 0 && identity.Alive(pid)
+		if heartbeatTS.Valid && heartbeatTS.Float64 > 0 {
+			rr.HeartbeatTS = int64(heartbeatTS.Float64)
+			age := time.Since(time.Unix(int64(heartbeatTS.Float64), 0))
+			rr.HeartbeatAgeS = int64(age.Seconds())
+			if age > clientTTL() {
+				rr.HeartbeatStale = true
+			}
 		}
 	}
-	if n, err := state.CountClients(ctx, d); err == nil {
+	if n, err := countDoctorClients(ctx, conn); err == nil {
 		rr.Clients = n
 	}
 
 	// fsnotify diagnostics — defensive: missing keys mean "not yet
 	// recorded by the fsnotify lane". We do not invent values.
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.mode"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.mode"); ok {
 		rr.FsnotifyMode = v
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.watch_count"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.watch_count"); ok {
 		if n, perr := strconv.Atoi(v); perr == nil {
 			rr.FsnotifyWatches = n
 		}
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.dropped_events"); ok {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.dropped_events"); ok {
 		if n, perr := strconv.Atoi(v); perr == nil {
 			rr.FsnotifyDropped = n
 		}
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "fsnotify.fallback_reason"); ok && v != "" {
+	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.fallback_reason"); ok && v != "" {
 		rr.FsnotifyFallbackReason = v
 	}
-	if v, ok, _ := state.MetaGet(ctx, d, "last_capture_error"); ok && v != "" {
+	if v, ok, _ := metaLookup(ctx, conn, "last_capture_error"); ok && v != "" {
 		rr.LastCaptureError = v
-	}
-	if head, err := git.RevParse(ctx, repoPath, "HEAD"); err == nil {
-		if plan, err := daemon.PlanPublishedLiveIndexRepair(ctx, repoPath, d, head, daemon.DefaultLiveIndexRepairLimit); err == nil {
-			if plan.Candidates > 0 || len(plan.Skipped) > 0 {
-				rr.Notes = append(rr.Notes, fmt.Sprintf("live-index repair candidates=%d skipped=%d; run acd recover --repo %s --auto --dry-run",
-					plan.Candidates, len(plan.Skipped), repoPath))
-			}
-		}
 	}
 
 	// Pending FIFO depth + terminal blocked-conflict count.
 	// Best-effort: a missing capture_events table (older schema) yields a
 	// note rather than failing the whole doctor run.
-	if n, err := state.CountEventsByState(ctx, d, state.EventStatePending); err == nil {
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStatePending); err == nil {
 		rr.PendingEvents = n
 	} else {
 		rr.Notes = append(rr.Notes, "pending events count failed: "+err.Error())
 	}
-	if n, err := state.CountEventsByState(ctx, d, state.EventStateBlockedConflict); err == nil {
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateBlockedConflict); err == nil {
 		rr.BlockedConflicts = n
 	} else {
 		rr.Notes = append(rr.Notes, "blocked conflicts count failed: "+err.Error())
+	}
+	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateFailed); err == nil {
+		rr.FailedEvents = n
+	} else {
+		rr.Notes = append(rr.Notes, "failed events count failed: "+err.Error())
+	}
+	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err == nil {
+		rr.FailedBlockingPending = n
+	} else {
+		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
 	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
 	if rr.BlockedConflicts > 0 {
-		row := d.SQL().QueryRowContext(ctx,
+		row := conn.QueryRowContext(ctx,
 			`SELECT path, published_ts, error FROM capture_events
 			 WHERE state = ?
 			 ORDER BY seq DESC LIMIT 1`, state.EventStateBlockedConflict)
@@ -478,8 +489,45 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 			rr.Notes = append(rr.Notes, "last replay conflict lookup failed: "+err.Error())
 		}
 	}
+	if rr.FailedEvents > 0 {
+		row := conn.QueryRowContext(ctx,
+			`SELECT path, published_ts, error FROM capture_events
+			 WHERE state = ?
+			 ORDER BY seq DESC LIMIT 1`, state.EventStateFailed)
+		var path string
+		var ts sql.NullFloat64
+		var errMsg sql.NullString
+		if err := row.Scan(&path, &ts, &errMsg); err == nil {
+			rr.LastReplayFailurePath = path
+			if ts.Valid {
+				rr.LastReplayFailureTS = int64(ts.Float64)
+			}
+			if errMsg.Valid {
+				rr.LastReplayFailureErr = errMsg.String
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			rr.Notes = append(rr.Notes, "last replay failure lookup failed: "+err.Error())
+		}
+	}
 
 	return true
+}
+
+func countDoctorClients(ctx context.Context, conn *sql.DB) (int, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func countEventsByStateSQL(ctx context.Context, conn *sql.DB, stateName string) (int, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, stateName).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // tailLogLines returns the last n lines of path. Best-effort: errors yield
@@ -586,6 +634,23 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayConflictErr))
 				}
 				fmt.Fprintf(out, "      last conflict : %s\n", strings.Join(bits, " "))
+			}
+		}
+		if rr.FailedEvents > 0 {
+			fmt.Fprintf(out, "      failed     : %d\n", rr.FailedEvents)
+			if rr.FailedBlockingPending > 0 {
+				fmt.Fprintf(out, "      failed blockers : %d pending successors; run acd fix --dry-run\n", rr.FailedBlockingPending)
+			}
+			if rr.LastReplayFailurePath != "" {
+				bits := []string{rr.LastReplayFailurePath}
+				if rr.LastReplayFailureTS > 0 {
+					age := time.Since(time.Unix(rr.LastReplayFailureTS, 0))
+					bits = append(bits, formatDurationCompact(age)+" ago")
+				}
+				if rr.LastReplayFailureErr != "" {
+					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayFailureErr))
+				}
+				fmt.Fprintf(out, "      last failure : %s\n", strings.Join(bits, " "))
 			}
 		}
 		if rr.FsnotifyMode != "" {
@@ -774,11 +839,11 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 // writeRepoBundleFiles dumps state-schema.txt + daemon-{state,clients,meta}
 // from the per-repo state.db into the zip under base.
 func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath string, files *int) error {
-	d, err := state.Open(ctx, dbPath)
+	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	defer d.Close()
+	defer conn.Close()
 
 	add := func(name string, body []byte) error {
 		w, err := zw.Create(name)
@@ -793,8 +858,9 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// state-schema.txt
-	uv, _ := d.UserVersion(ctx)
-	rows, err := d.SQL().QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
+	uv := 0
+	_ = conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&uv)
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
 	tables := []string{}
 	if err == nil {
 		for rows.Next() {
@@ -814,13 +880,16 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-state.json
-	st, _, err := state.LoadDaemonState(ctx, d)
-	if err == nil {
+	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts, updated_ts FROM daemon_state WHERE id = 1`)
+	var pid int
+	var mode string
+	var heartbeatTS, updatedTS sql.NullFloat64
+	if err := row.Scan(&pid, &mode, &heartbeatTS, &updatedTS); err == nil {
 		dsObj := map[string]any{
-			"pid":          st.PID,
-			"mode":         st.Mode,
-			"heartbeat_ts": st.HeartbeatTS,
-			"updated_ts":   st.UpdatedTS,
+			"pid":          pid,
+			"mode":         mode,
+			"heartbeat_ts": nullableFloat64(heartbeatTS),
+			"updated_ts":   nullableFloat64(updatedTS),
 		}
 		body, _ := json.MarshalIndent(dsObj, "", "  ")
 		if err := add(base+"daemon-state.json", body); err != nil {
@@ -829,18 +898,27 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-clients.json
-	clients, err := state.ListClients(ctx, d)
+	crows, err := conn.QueryContext(ctx,
+		`SELECT session_id, harness, watch_pid, registered_ts, last_seen_ts
+		 FROM daemon_clients ORDER BY last_seen_ts DESC`)
 	if err == nil {
-		entries := make([]map[string]any, 0, len(clients))
-		for _, c := range clients {
+		entries := []map[string]any{}
+		for crows.Next() {
+			var sessionID, harness string
+			var watchPID sql.NullInt64
+			var registeredTS, lastSeenTS float64
+			if err := crows.Scan(&sessionID, &harness, &watchPID, &registeredTS, &lastSeenTS); err != nil {
+				continue
+			}
 			entries = append(entries, map[string]any{
-				"session_id":    c.SessionID,
-				"harness":       c.Harness,
-				"watch_pid":     c.WatchPID.Int64,
-				"registered_ts": c.RegisteredTS,
-				"last_seen_ts":  c.LastSeenTS,
+				"session_id":    sessionID,
+				"harness":       harness,
+				"watch_pid":     nullableInt64(watchPID),
+				"registered_ts": registeredTS,
+				"last_seen_ts":  lastSeenTS,
 			})
 		}
+		crows.Close()
 		body, _ := json.MarshalIndent(entries, "", "  ")
 		if err := add(base+"daemon-clients.json", body); err != nil {
 			return err
@@ -848,7 +926,7 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 	}
 
 	// daemon-meta.json
-	mrows, err := d.SQL().QueryContext(ctx, `SELECT key, value FROM daemon_meta ORDER BY key`)
+	mrows, err := conn.QueryContext(ctx, `SELECT key, value FROM daemon_meta ORDER BY key`)
 	if err == nil {
 		meta := map[string]string{}
 		for mrows.Next() {
@@ -864,6 +942,20 @@ func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath stri
 		}
 	}
 	return nil
+}
+
+func nullableFloat64(v sql.NullFloat64) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Float64
+}
+
+func nullableInt64(v sql.NullInt64) any {
+	if !v.Valid {
+		return nil
+	}
+	return v.Int64
 }
 
 // sanitizeReport replaces $HOME prefixes inside the report's path strings

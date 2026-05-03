@@ -163,7 +163,7 @@ func headAndWorktreeMatchAfter(ctx context.Context, repoRoot, path, oid, mode st
 		}
 		return false, err
 	}
-	entry, ok, err := hashCandidate(ctx, repoRoot, candidateLike{
+	entry, ok, _, err := hashCandidate(ctx, repoRoot, candidateLike{
 		rel:  path,
 		full: filepath.Join(repoRoot, path),
 		fi:   fi,

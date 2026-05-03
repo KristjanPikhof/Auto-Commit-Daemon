@@ -20,11 +20,13 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -608,7 +610,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	}
 	maxBytes := resolveMaxFileBytes(opts.MaxFileBytes)
 
-	live, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
+	live, protectedSkips, walkSummary, err := walkLive(ctx, repoRoot, walkOpts{
 		matcher:       matcher,
 		safeIgnore:    safeIgnore,
 		ignoreChecker: opts.IgnoreChecker,
@@ -632,6 +634,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	if err != nil {
 		return summary, fmt.Errorf("daemon: load shadow: %w", err)
 	}
+	protectedSkipCount := protectShadowFromSkippedPresent(ctx, repoRoot, db, cctx, shadow, protectedSkips)
 
 	ops := Classify(shadow, live)
 	recordTrace(opts.Trace, acdtrace.Event{
@@ -646,6 +649,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			"walked_files": summary.WalkedFiles,
 			"oversize":     summary.Oversize,
 			"errors":       summary.Errors,
+			"protected":    protectedSkipCount,
 		},
 		Generation: cctx.BranchGeneration,
 	})
@@ -734,6 +738,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		if err != nil {
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
+		recordCapturedDecision(ctx, db, cctx, seq, op)
 		summary.EventsAppended++
 		if pendingCap > 0 {
 			pending++
@@ -808,6 +813,142 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
+func protectShadowFromSkippedPresent(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, shadow map[string]ShadowEntry, protected map[string]skippedPresent) int {
+	if len(shadow) == 0 || len(protected) == 0 {
+		return 0
+	}
+	index := newProtectedSkipIndex(protected)
+	count := 0
+	for path := range shadow {
+		reason, ok, needsPresenceCheck := index.reasonForPath(path)
+		if !ok {
+			continue
+		}
+		if needsPresenceCheck && !shadowPathPresentOrIndeterminate(repoRoot, path) {
+			continue
+		}
+		delete(shadow, path)
+		count++
+		recordProtectedSkipDecision(ctx, db, cctx, path, reason)
+	}
+	return count
+}
+
+func protectedReasonForPath(path string, protected map[string]skippedPresent) (string, bool) {
+	reason, ok, _ := newProtectedSkipIndex(protected).reasonForPath(path)
+	return reason, ok
+}
+
+type protectedSkipIndex struct {
+	exact map[string]string
+	dirs  []protectedDirPrefix
+}
+
+type protectedDirPrefix struct {
+	path   string
+	reason string
+}
+
+func newProtectedSkipIndex(protected map[string]skippedPresent) protectedSkipIndex {
+	index := protectedSkipIndex{
+		exact: make(map[string]string, len(protected)),
+	}
+	for path, skip := range protected {
+		if path == "" || skip.Reason == "" {
+			continue
+		}
+		if skip.Dir {
+			index.dirs = append(index.dirs, protectedDirPrefix{path: path, reason: skip.Reason})
+			continue
+		}
+		index.exact[path] = skip.Reason
+	}
+	sort.Slice(index.dirs, func(i, j int) bool {
+		return len(index.dirs[i].path) > len(index.dirs[j].path)
+	})
+	return index
+}
+
+func (index protectedSkipIndex) reasonForPath(path string) (reason string, ok bool, needsPresenceCheck bool) {
+	if reason, ok := index.exact[path]; ok {
+		return reason, true, false
+	}
+	for _, prefix := range index.dirs {
+		if path == prefix.path || strings.HasPrefix(path, prefix.path+"/") {
+			return prefix.reason, true, true
+		}
+	}
+	return "", false, false
+}
+
+func shadowPathPresentOrIndeterminate(repoRoot, path string) bool {
+	_, err := os.Lstat(filepath.Join(repoRoot, filepath.FromSlash(path)))
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, os.ErrNotExist)
+}
+
+func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx CaptureContext, path, reason string) {
+	if db == nil || path == "" {
+		return
+	}
+	kind := skippedDecisionKind(reason)
+	if latest, err := state.DecisionsForPath(ctx, db, path, 1); err == nil && len(latest) == 1 {
+		d := latest[0]
+		if d.Kind == kind &&
+			d.Reason.Valid && d.Reason.String == reason &&
+			d.ActionTaken.Valid && d.ActionTaken.String == "no_delete_generated" &&
+			d.HeadSHA.Valid && d.HeadSHA.String == cctx.BaseHead &&
+			d.BranchRef.Valid && d.BranchRef.String == cctx.BranchRef &&
+			d.BranchGeneration.Valid && d.BranchGeneration.Int64 == cctx.BranchGeneration {
+			return
+		}
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:             kind,
+		Path:             sql.NullString{String: path, Valid: true},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: "no_delete_generated", Valid: true},
+		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped present protected path %s without generating a delete.", path), Valid: true},
+	}); err != nil {
+		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
+	}
+}
+
+func skippedDecisionKind(reason string) string {
+	switch reason {
+	case "sensitive", "safe_ignore", "gitignore":
+		return state.DecisionKindProtected
+	default:
+		return state.DecisionKindSkipped
+	}
+}
+
+func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureContext, seq int64, op ClassifiedOp) {
+	if db == nil || op.Path == "" {
+		return
+	}
+	action := "queued"
+	message := fmt.Sprintf("Captured %s for %s and queued it for replay.", op.Op, op.Path)
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		Kind:             state.DecisionKindCaptured,
+		Path:             sql.NullString{String: op.Path, Valid: true},
+		Reason:           sql.NullString{String: op.Fidelity, Valid: op.Fidelity != ""},
+		EventSeq:         sql.NullInt64{Int64: seq, Valid: seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: true},
+		UserMessage:      sql.NullString{String: message, Valid: true},
+	}); err != nil {
+		slog.Default().Warn("append capture decision", "path", op.Path, "seq", seq, "err", err.Error())
+	}
+}
+
 // walkOpts bundles inputs to walkLive so the function signature stays
 // readable.
 type walkOpts struct {
@@ -817,6 +958,11 @@ type walkOpts struct {
 	submodules    map[string]bool
 	maxBytes      int64
 	db            *state.DB
+}
+
+type skippedPresent struct {
+	Reason string
+	Dir    bool
 }
 
 // ignoreCheckBatchSize caps how many paths walkLive sends per
@@ -871,9 +1017,16 @@ func classifyIgnoredBatched(ctx context.Context, ig *git.IgnoreChecker, paths []
 //   - Sensitive + ignore checks short-circuit before O_NOFOLLOW + read.
 //   - All errors except context cancellation are soft: the daemon must keep
 //     running across permission errors or file races.
-func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]LiveEntry, CaptureSummary, error) {
+func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]LiveEntry, map[string]skippedPresent, CaptureSummary, error) {
 	live := map[string]LiveEntry{}
+	protected := map[string]skippedPresent{}
 	var summary CaptureSummary
+	markProtected := func(rel, reason string, dir bool) {
+		if rel == "" || reason == "" {
+			return
+		}
+		protected[rel] = skippedPresent{Reason: reason, Dir: dir}
+	}
 
 	// First pass: BFS the worktree, collecting (a) regular-file + symlink
 	// candidates that survived the cheap filters and (b) the directory
@@ -895,7 +1048,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 	for len(frontier) > 0 {
 		if err := ctx.Err(); err != nil {
-			return nil, summary, err
+			return nil, protected, summary, err
 		}
 
 		var nextDirs []dirEntry
@@ -922,6 +1075,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			children, err := os.ReadDir(parent.full)
 			if err != nil {
 				// Soft error: the directory vanished or is unreadable.
+				markProtected(parent.rel, "unreadable", true)
 				bumpLayerError()
 				continue
 			}
@@ -935,6 +1089,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				}
 				if hasControlPathChar(childRel) {
 					recordInvalidPath(ctx, opts.db, childRel, "control_chars")
+					markProtected(childRel, "invalid_path", false)
 					bumpLayerError()
 					continue
 				}
@@ -960,6 +1115,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				childFull := filepath.Join(parent.full, name)
 				fi, lstatErr := os.Lstat(childFull)
 				if lstatErr != nil {
+					markProtected(childRel, "lstat_error", false)
 					bumpLayerError()
 					continue
 				}
@@ -968,9 +1124,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				// Symlinks: capture as 120000 candidate, never descend.
 				if mode&os.ModeSymlink != 0 {
 					if opts.matcher != nil && opts.matcher.Match(childRel) {
+						markProtected(childRel, "sensitive", false)
 						continue
 					}
 					if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
+						markProtected(childRel, "safe_ignore", false)
 						continue
 					}
 					fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -987,9 +1145,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 						continue
 					}
 					if opts.matcher != nil && opts.matcher.MatchDirectory(childRel) {
+						markProtected(childRel, "sensitive", true)
 						continue
 					}
 					if opts.safeIgnore != nil && opts.safeIgnore.MatchDirectory(childRel) {
+						markProtected(childRel, "safe_ignore", true)
 						continue
 					}
 					nextDirs = append(nextDirs, dirEntry{rel: childRel, full: childFull})
@@ -1001,9 +1161,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 					continue
 				}
 				if opts.matcher != nil && opts.matcher.Match(childRel) {
+					markProtected(childRel, "sensitive", false)
 					continue
 				}
 				if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
+					markProtected(childRel, "safe_ignore", false)
 					continue
 				}
 				fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -1030,12 +1192,13 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				// Fail-closed: if check-ignore is busted, abort the pass
 				// rather than silently committing files git considers
 				// ignored.
-				return nil, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
+				return nil, protected, summary, fmt.Errorf("daemon: check-ignore: %w", ierr)
 			}
 
 			survivorDirs := make([]dirEntry, 0, len(nextDirs))
 			for i, e := range nextDirs {
 				if results[i] {
+					markProtected(e.rel, "gitignore", true)
 					continue
 				}
 				survivorDirs = append(survivorDirs, e)
@@ -1045,6 +1208,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 			survivorFiles := make([]candidate, 0, len(fileCands))
 			for j, c := range fileCands {
 				if results[origDirCount+j] {
+					markProtected(c.rel, "gitignore", false)
 					continue
 				}
 				survivorFiles = append(survivorFiles, c)
@@ -1057,27 +1221,29 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, summary, err
+		return nil, protected, summary, err
 	}
 
 	for _, c := range pending {
 		if err := ctx.Err(); err != nil {
-			return nil, summary, err
+			return nil, protected, summary, err
 		}
 		summary.WalkedFiles++
-		entry, ok, err := hashCandidate(ctx, repoRoot, c, opts)
+		entry, ok, reason, err := hashCandidate(ctx, repoRoot, c, opts)
 		if err != nil {
+			markProtected(c.rel, "unreadable", false)
 			summary.Errors++
 			continue
 		}
 		if !ok {
+			markProtected(c.rel, reason, false)
 			summary.Oversize++
 			continue
 		}
 		live[c.rel] = entry
 	}
 
-	return live, summary, nil
+	return live, protected, summary, nil
 }
 
 // hashCandidate hashes one candidate path into the git object store. For
@@ -1086,65 +1252,65 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 // size cap (recording oversize via daemon_meta), then hash via stdin.
 //
 // Returns:
-//   - (entry, true,  nil) — captured ok.
-//   - (zero,  false, nil) — skipped (oversize, vanished, type changed).
-//   - (zero,  _,     err) — hard error worth recording in summary.
-func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, error) {
+//   - (entry, true,  "",     nil) — captured ok.
+//   - (zero,  false, reason, nil) — skipped (oversize, vanished, type changed).
+//   - (zero,  _,     "",     err) — hard error worth recording in summary.
+func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, string, error) {
 	mode := c.fi.Mode()
 	if mode&os.ModeSymlink != 0 {
 		target, rerr := os.Readlink(c.full)
 		if rerr != nil {
-			return LiveEntry{}, false, rerr
+			return LiveEntry{}, false, "", rerr
 		}
 		oid, _, herr := git.HashSymlinkBlob(ctx, repoRoot, target)
 		if herr != nil {
-			return LiveEntry{}, false, herr
+			return LiveEntry{}, false, "", herr
 		}
-		return LiveEntry{Path: c.rel, Mode: git.SymlinkMode, OID: oid}, true, nil
+		return LiveEntry{Path: c.rel, Mode: git.SymlinkMode, OID: oid}, true, "", nil
 	}
 
 	// Regular file: O_NOFOLLOW + verify ino/dev/mode (TOCTOU defense).
 	flags := os.O_RDONLY | syscall.O_NOFOLLOW
 	f, err := os.OpenFile(c.full, flags, 0)
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	defer f.Close()
 
 	post, err := f.Stat()
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	if !sameFile(c.fi, post) {
 		// Swapped between lstat and open — discard.
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "unstable", nil
 	}
 	if !post.Mode().IsRegular() {
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "non_regular", nil
 	}
 	if post.Size() > opts.maxBytes {
 		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "oversize", nil
 	}
 	// Read up to maxBytes+1 to detect truncation/grow during read; if we
 	// exceed, record oversize and discard.
 	buf, err := io.ReadAll(f)
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
 	if int64(len(buf)) > opts.maxBytes {
 		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
-		return LiveEntry{}, false, nil
+		return LiveEntry{}, false, "oversize", nil
 	}
 	oid, herr := git.HashObjectStdin(ctx, repoRoot, buf)
 	if herr != nil {
-		return LiveEntry{}, false, herr
+		return LiveEntry{}, false, "", herr
 	}
 	return LiveEntry{
 		Path: c.rel,
 		Mode: gitModeFor(post.Mode()),
 		OID:  oid,
-	}, true, nil
+	}, true, "", nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the

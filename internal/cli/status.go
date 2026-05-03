@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -34,48 +36,69 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                 string         `json:"repo"`
-	RepoHash             string         `json:"repo_hash"`
-	Daemon               string         `json:"daemon"`
-	Stale                bool           `json:"stale"`
-	PID                  int            `json:"pid"`
-	StartedTS            int64          `json:"started_ts,omitempty"`
-	UptimeSeconds        int64          `json:"uptime_seconds,omitempty"`
-	HeartbeatTS          int64          `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds  int64          `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef            string         `json:"branch_ref,omitempty"`
-	BranchGenToken       string         `json:"branch_generation_token,omitempty"`
-	Clients              []statusClient `json:"clients"`
-	PendingEvents        int            `json:"pending_events"`
-	BlockedConflicts     int            `json:"blocked_conflicts"`
-	LastCommitOID        string         `json:"last_commit_oid,omitempty"`
-	LastCommitTS         int64          `json:"last_commit_ts,omitempty"`
-	LastCommitMessage    string         `json:"last_commit_message,omitempty"`
-	CaptureErrors        int            `json:"capture_errors"`
-	Paused               bool           `json:"paused,omitempty"`
-	Pause                *pauseInfo     `json:"pause,omitempty"`
-	BackpressurePaused   bool           `json:"backpressure_paused,omitempty"`
-	BackpressurePausedAt string         `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal   int64          `json:"events_dropped_total,omitempty"`
+	Repo                  string         `json:"repo"`
+	RepoHash              string         `json:"repo_hash"`
+	Daemon                string         `json:"daemon"`
+	Stale                 bool           `json:"stale"`
+	PID                   int            `json:"pid"`
+	StartedTS             int64          `json:"started_ts,omitempty"`
+	UptimeSeconds         int64          `json:"uptime_seconds,omitempty"`
+	HeartbeatTS           int64          `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds   int64          `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef             string         `json:"branch_ref,omitempty"`
+	BranchGenToken        string         `json:"branch_generation_token,omitempty"`
+	Clients               []statusClient `json:"clients"`
+	PendingEvents         int            `json:"pending_events"`
+	BlockedConflicts      int            `json:"blocked_conflicts"`
+	FailedEvents          int            `json:"failed_events"`
+	FailedBlockingPending int            `json:"failed_blocking_pending"`
+	LastCommitOID         string         `json:"last_commit_oid,omitempty"`
+	LastCommitTS          int64          `json:"last_commit_ts,omitempty"`
+	LastCommitMessage     string         `json:"last_commit_message,omitempty"`
+	CaptureErrors         int            `json:"capture_errors"`
+	Paused                bool           `json:"paused,omitempty"`
+	Pause                 *pauseInfo     `json:"pause,omitempty"`
+	BackpressurePaused    bool           `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt  string         `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal    int64          `json:"events_dropped_total,omitempty"`
+	DecisionCounts        map[string]int `json:"decision_counts,omitempty"`
+	RecentDecisions       []eventEntry   `json:"recent_decisions,omitempty"`
+	DecisionCursor        int64          `json:"decision_cursor,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
+	var watch bool
+	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print current daemon + clients for one repo (default: cwd)",
-		Long: `Print daemon, client, queue, pause, and branch state for one registered repo.
+		Long: `Print daemon, client, queue, pause, branch, and recent decision state for one registered repo.
 
-The default repo is the current working directory. Use --json for automation. For all registered repos, use acd list; for replay blockers and recovery hints, use acd diagnose.`,
+The default repo is the current working directory. Use --watch to refresh the
+same repo until interrupted. Use --json for automation. For all registered
+repos, use acd list; for why/how questions, use acd explain and acd events.`,
 		Example: `  acd status
+  acd status --watch
   acd status --repo /path/to/repo
   acd status --json
+  acd explain --path internal/state/schema.go
   acd diagnose --repo . --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if watch {
+				if jsonOut {
+					return fmt.Errorf("acd status: --watch does not support --json")
+				}
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+				defer stop()
+				return runStatusWatch(ctx, cmd.OutOrStdout(), repo, interval)
+			}
 			return runStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
 		},
 	}
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh status output until interrupted")
+	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
 	return cmd
 }
 
@@ -234,6 +257,16 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		state.EventStateBlockedConflict).Scan(&report.BlockedConflicts); err != nil {
 		return report, fmt.Errorf("blocked conflicts: %w", err)
 	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
+		return report, fmt.Errorf("failed events: %w", err)
+	}
+	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
+		return report, fmt.Errorf("failed blocking pending: %w", err)
+	} else {
+		report.FailedBlockingPending = n
+	}
 
 	// Last commit (latest seq with commit_oid).
 	var lastOID sql.NullString
@@ -283,8 +316,125 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		report.Paused = true
 		report.Pause = info
 	}
+	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
+		return report, err
+	}
 
 	return report, nil
+}
+
+func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("acd status: --interval must be positive")
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		fmt.Fprint(out, "\033[2J\033[H")
+		fmt.Fprintf(out, "Updated: %s\n\n", time.Now().Format(time.RFC3339))
+		if err := runStatus(ctx, out, repo, false); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func statusDecisionSummary(ctx context.Context, conn *sql.DB, report *statusReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fmt.Errorf("decision table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT kind, COUNT(*) FROM decision_records GROUP BY kind`)
+	if err != nil {
+		return fmt.Errorf("decision counts: %w", err)
+	}
+	counts := map[string]int{}
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan decision counts: %w", err)
+		}
+		counts[kind] = n
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iter decision counts: %w", err)
+	}
+	rows.Close()
+	if len(counts) > 0 {
+		report.DecisionCounts = counts
+	}
+
+	recentRows, err := conn.QueryContext(ctx, `
+SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+       branch_ref, branch_generation, action_taken, user_message
+FROM decision_records
+ORDER BY id DESC
+LIMIT 3`)
+	if err != nil {
+		return fmt.Errorf("recent decisions: %w", err)
+	}
+	defer recentRows.Close()
+	for recentRows.Next() {
+		var row state.DecisionRecord
+		if err := recentRows.Scan(&row.ID, &row.DecisionTS, &row.Kind, &row.Path, &row.Reason,
+			&row.EventSeq, &row.HeadSHA, &row.CommitOID, &row.BranchRef,
+			&row.BranchGeneration, &row.ActionTaken, &row.UserMessage); err != nil {
+			return fmt.Errorf("scan recent decision: %w", err)
+		}
+		report.RecentDecisions = append(report.RecentDecisions, decisionEntry(row))
+		if row.ID > report.DecisionCursor {
+			report.DecisionCursor = row.ID
+		}
+	}
+	if err := recentRows.Err(); err != nil {
+		return fmt.Errorf("iter recent decisions: %w", err)
+	}
+	return nil
+}
+
+func sqliteTableExists(ctx context.Context, conn *sql.DB, name string) (bool, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name,
+	).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func countBlockingTerminalEvents(ctx context.Context, conn *sql.DB, terminalState string) (int, error) {
+	var n int
+	err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events e
+WHERE e.state = ?
+  AND EXISTS (
+      SELECT 1
+      FROM capture_events pending
+      WHERE pending.branch_ref = e.branch_ref
+        AND pending.branch_generation = e.branch_generation
+        AND pending.seq > e.seq
+        AND pending.state = ?
+  )`, terminalState, state.EventStatePending).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // metaLookup is the read-only equivalent of state.MetaGet against a raw
@@ -343,6 +493,13 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	if r.BlockedConflicts > 0 {
 		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
 	}
+	if r.FailedEvents > 0 {
+		fmt.Fprintf(out, "Failed terminal events: %d\n", r.FailedEvents)
+		if r.FailedBlockingPending > 0 {
+			fmt.Fprintf(out, "Failed barriers blocking pending replay: %d (inspect with `acd diagnose`; preview cleanup with `acd fix --dry-run`)\n",
+				r.FailedBlockingPending)
+		}
+	}
 	if r.BackpressurePaused {
 		stamp := r.BackpressurePausedAt
 		if stamp == "" {
@@ -394,10 +551,58 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		}
 	}
 
+	if len(r.DecisionCounts) > 0 {
+		fmt.Fprintf(out, "Decisions: %s\n", formatDecisionCounts(r.DecisionCounts))
+		if len(r.RecentDecisions) > 0 {
+			fmt.Fprintln(out, "Recent decisions:")
+			for _, ev := range r.RecentDecisions {
+				fmt.Fprintf(out, "  - #%d %s", ev.ID, ev.Kind)
+				if ev.Path != "" {
+					fmt.Fprintf(out, " %s", ev.Path)
+				}
+				if ev.ActionTaken != "" {
+					fmt.Fprintf(out, " (%s)", ev.ActionTaken)
+				} else if ev.Reason != "" {
+					fmt.Fprintf(out, " (%s)", ev.Reason)
+				}
+				fmt.Fprintln(out)
+			}
+		}
+		fmt.Fprintln(out, "Explain: acd explain --path FILE; stream: acd events --watch")
+	}
+
 	if r.BranchGenToken != "" {
 		fmt.Fprintf(out, "Branch generation: %s\n", r.BranchGenToken)
 	}
 	return nil
+}
+
+func formatDecisionCounts(counts map[string]int) string {
+	order := []string{
+		state.DecisionKindProtected,
+		state.DecisionKindHandledExternal,
+		state.DecisionKindSupersededExternal,
+		state.DecisionKindBlocked,
+		state.DecisionKindCommitted,
+		state.DecisionKindCaptured,
+		state.DecisionKindSkipped,
+		state.DecisionKindPaused,
+		state.DecisionKindResumed,
+	}
+	seen := make(map[string]bool, len(counts))
+	var parts []string
+	for _, kind := range order {
+		if n, ok := counts[kind]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
+			seen[kind] = true
+		}
+	}
+	for kind, n := range counts {
+		if !seen[kind] {
+			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // joinParens renders ["running", "pid 123", "heartbeat 2s ago"] as

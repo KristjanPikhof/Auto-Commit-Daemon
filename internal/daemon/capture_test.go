@@ -135,6 +135,41 @@ func pendingOps(t *testing.T, db *state.DB) []struct{ Op, Path string } {
 	return out
 }
 
+func assertProtectedDecision(t *testing.T, db *state.DB, path, reason string) {
+	t.Helper()
+	decisions, err := state.DecisionsForPath(context.Background(), db, path, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPath: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindProtected &&
+			decision.Reason.Valid &&
+			decision.Reason.String == reason &&
+			decision.ActionTaken.Valid &&
+			decision.ActionTaken.String == "no_delete_generated" {
+			return
+		}
+	}
+	t.Fatalf("missing protected decision path=%q reason=%q: %+v", path, reason, decisions)
+}
+
+func assertNoProtectedDecision(t *testing.T, db *state.DB, path, reason string) {
+	t.Helper()
+	decisions, err := state.DecisionsForPath(context.Background(), db, path, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPath: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindProtected &&
+			decision.Reason.Valid &&
+			decision.Reason.String == reason &&
+			decision.ActionTaken.Valid &&
+			decision.ActionTaken.String == "no_delete_generated" {
+			t.Fatalf("unexpected protected decision path=%q reason=%q: %+v", path, reason, decisions)
+		}
+	}
+}
+
 // TestCapture_SymlinkDirNotRecursed: the legacy regression. A symlink to a
 // directory must capture as mode 120000 with no descent into the link
 // target. The contained file MUST NOT appear in capture_events.
@@ -257,6 +292,215 @@ func TestCapture_TrackedEnvExampleIsNotPhantomDelete(t *testing.T) {
 
 	if ops := pendingOps(t, f.db); len(ops) != 0 {
 		t.Fatalf("tracked .env.example should not be captured as a change, got %+v", ops)
+	}
+}
+
+func TestCapture_TrackedSensitivePresentIsProtectedFromDelete(t *testing.T) {
+	t.Setenv(state.EnvSensitiveGlobs, "") // explicit empty -> defaults
+	f := newCaptureFixture(t)
+	f.matcher = state.NewSensitiveMatcher()
+	ctx := context.Background()
+
+	envPath := filepath.Join(f.dir, ".env")
+	if err := os.WriteFile(envPath, []byte("SECRET=1\n"), 0o600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", ".env"); err != nil {
+		t.Fatalf("git add env: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "track env"); err != nil {
+		t.Fatalf("git commit env: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if ops := pendingOps(t, f.db); len(ops) != 0 {
+		t.Fatalf("tracked present .env should be protected, got ops %+v", ops)
+	}
+	assertProtectedDecision(t, f.db, ".env", "sensitive")
+}
+
+func TestCapture_TrackedSafeIgnorePresentIsProtectedFromDelete(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	tracked := filepath.Join(f.dir, "node_modules", "pkg", "index.js")
+	if err := os.MkdirAll(filepath.Dir(tracked), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(tracked, []byte("module.exports = 1\n"), 0o644); err != nil {
+		t.Fatalf("write tracked: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "-f", "node_modules/pkg/index.js"); err != nil {
+		t.Fatalf("git add tracked safe-ignore: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "track generated file"); err != nil {
+		t.Fatalf("git commit tracked safe-ignore: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	if ops := pendingOps(t, f.db); len(ops) != 0 {
+		t.Fatalf("tracked present safe-ignore file should be protected, got ops %+v", ops)
+	}
+	assertProtectedDecision(t, f.db, "node_modules/pkg/index.js", "safe_ignore")
+}
+
+func TestCapture_TrackedSafeIgnoreDeletedChildEmitsDelete(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	trackedRel := "node_modules/pkg/index.js"
+	tracked := filepath.Join(f.dir, filepath.FromSlash(trackedRel))
+	if err := os.MkdirAll(filepath.Dir(tracked), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(tracked, []byte("module.exports = 1\n"), 0o644); err != nil {
+		t.Fatalf("write tracked: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "-f", trackedRel); err != nil {
+		t.Fatalf("git add tracked safe-ignore: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "track generated file"); err != nil {
+		t.Fatalf("git commit tracked safe-ignore: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+	if err := os.Remove(tracked); err != nil {
+		t.Fatalf("remove tracked: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+
+	ops := pendingOps(t, f.db)
+	if len(ops) != 1 || ops[0].Op != "delete" || ops[0].Path != trackedRel {
+		t.Fatalf("deleted child under safe-ignore dir ops=%+v, want one delete", ops)
+	}
+	assertNoProtectedDecision(t, f.db, trackedRel, "safe_ignore")
+}
+
+func TestCapture_TrackedGitignoredDeletedChildEmitsDelete(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	gitignore := filepath.Join(f.dir, ".gitignore")
+	if err := os.WriteFile(gitignore, []byte("ignored.txt\nbuild/\n"), 0o644); err != nil {
+		t.Fatalf("rewrite .gitignore: %v", err)
+	}
+	trackedRel := "build/keep.txt"
+	tracked := filepath.Join(f.dir, filepath.FromSlash(trackedRel))
+	if err := os.MkdirAll(filepath.Dir(tracked), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(tracked, []byte("tracked despite ignore\n"), 0o644); err != nil {
+		t.Fatalf("write tracked: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", ".gitignore"); err != nil {
+		t.Fatalf("git add .gitignore: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "-f", trackedRel); err != nil {
+		t.Fatalf("git add tracked ignored child: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "track ignored child"); err != nil {
+		t.Fatalf("git commit tracked ignored child: %v", err)
+	}
+	f.ig.Invalidate()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+	if err := os.Remove(tracked); err != nil {
+		t.Fatalf("remove tracked: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+
+	ops := pendingOps(t, f.db)
+	if len(ops) != 1 || ops[0].Op != "delete" || ops[0].Path != trackedRel {
+		t.Fatalf("deleted child under gitignored dir ops=%+v, want one delete", ops)
+	}
+	assertNoProtectedDecision(t, f.db, trackedRel, "gitignore")
+}
+
+func TestCapture_TrackedAbsentFileStillDeletes(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	tracked := filepath.Join(f.dir, "tracked.txt")
+	if err := os.WriteFile(tracked, []byte("tracked\n"), 0o644); err != nil {
+		t.Fatalf("write tracked: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "tracked.txt"); err != nil {
+		t.Fatalf("git add tracked: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "track file"); err != nil {
+		t.Fatalf("git commit tracked: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = head
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+	if err := os.Remove(tracked); err != nil {
+		t.Fatalf("remove tracked: %v", err)
+	}
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	ops := pendingOps(t, f.db)
+	if len(ops) != 1 || ops[0].Op != "delete" || ops[0].Path != "tracked.txt" {
+		t.Fatalf("absent tracked file ops=%+v, want one delete", ops)
 	}
 }
 

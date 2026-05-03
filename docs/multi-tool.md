@@ -52,8 +52,9 @@ branch *before* `acd`'s next replay tick. Typical sequence:
                    → event marked published (no new commit)
 ```
 
-The net result is the same commit history you would get from `acd` alone —
-the Claude Code hook just gets there first. `acd status` will show
+The net result is the same file state without a duplicate ACD commit. `acd`
+marks the event published against the external commit, so author, message, and
+timing come from the tool that committed first. `acd status` will show
 `pending_events: 0` within one tick after the hook runs.
 
 ---
@@ -84,18 +85,27 @@ matches the captured intent. The following scenarios bypass it and become
 Resolve `blocked_conflict` rows with the standard workflow:
 
 ~~~bash
+acd status
+acd events --watch
+acd explain --path path/to/file
 acd diagnose --repo .
-acd recover --repo . --auto --dry-run
-acd recover --repo . --auto --yes
+acd fix --dry-run
+acd fix --yes
 ~~~
 
-Or delete terminal barriers and replay the clean portion:
+Use `recover` or `purge-events` only as advanced fallbacks when `diagnose` or
+`fix --dry-run` points at stale branch anchors, obsolete terminal barriers, or
+failed terminal barriers that are blocking later pending replay:
 
 ~~~bash
+acd recover --repo . --auto --dry-run
 acd purge-events --repo . --blocked --dry-run
-acd purge-events --repo . --blocked --yes
 acd wake --session-id "$ACD_SESSION_ID"
 ~~~
+
+`wake` requires a non-empty session id. Use it from harness shells that set
+`ACD_SESSION_ID`; otherwise wait for the next daemon tick after applying a safe
+plan.
 
 ---
 
@@ -117,7 +127,18 @@ acd init codex   # wake hook only — no separate commit hook
 
 Run both hooks simultaneously. The idempotent publish probe absorbs the
 parallel committer's commits silently. Watch `acd status` to confirm
-`blocked_conflicts` stays at `0`. Enable trace logging to audit decisions:
+`blocked_conflicts` stays at `0` and no failed terminal barrier is blocking
+pending replay, or stream the decision ledger:
+
+~~~bash
+acd events --watch
+acd explain --commit HEAD
+~~~
+
+`acd events --watch` starts at the current ledger tail when `--since` is
+omitted, so it prints only decisions appended after watch starts.
+
+Enable trace logging only when you need internal replay decisions:
 
 ~~~bash
 ACD_TRACE=1 acd start --repo . --session-id debug --harness claude-code
@@ -135,6 +156,8 @@ grep already_published .git/acd/trace/*.jsonl | python3 -c \
 
 ## See also
 
+- [User workflows](user-workflows.md) — daily status, events, explain, fix, and
+  support diagnostics workflows.
 - [Revert workflows](capture-replay.md#revert-workflows) — git revert, reset,
   and rebase with ACD running.
 - [Replay mechanics](capture-replay.md#replay-how-a-pending-event-becomes-a-commit)
