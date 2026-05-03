@@ -180,6 +180,64 @@ func TestEventsErrorsAndCommandHelp(t *testing.T) {
 	}
 }
 
+func TestEventsMissingDecisionLedgerIsReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	preparePreDecisionLedgerDB(t, db, dbPath)
+
+	before := mustSHA256(t, dbPath)
+	versionBefore := readUserVersionReadOnly(t, dbPath)
+
+	var out bytes.Buffer
+	if err := runEvents(context.Background(), &out, repo, "", 0, 10, false, time.Millisecond, true); err != nil {
+		t.Fatalf("runEvents missing ledger: %v\n%s", err, out.String())
+	}
+	var rep eventsReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode events: %v\n%s", err, out.String())
+	}
+	if len(rep.Events) != 0 || !strings.Contains(rep.Message, "Decision ledger is not available") {
+		t.Fatalf("unexpected events report: %+v", rep)
+	}
+	if after := mustSHA256(t, dbPath); after != before {
+		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
+	}
+	if got := readUserVersionReadOnly(t, dbPath); got != versionBefore {
+		t.Fatalf("user_version changed: before=%d after=%d", versionBefore, got)
+	}
+}
+
+func preparePreDecisionLedgerDB(t *testing.T, db *state.DB, dbPath string) {
+	t.Helper()
+	if _, err := db.SQL().ExecContext(context.Background(), `DROP TABLE decision_records`); err != nil {
+		t.Fatalf("drop decision_records: %v", err)
+	}
+	if _, err := db.SQL().ExecContext(context.Background(), `PRAGMA user_version = 4`); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	if _, err := db.SQL().ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+}
+
+func readUserVersionReadOnly(t *testing.T, dbPath string) int {
+	t.Helper()
+	conn, err := openStateDBReadOnly(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer conn.Close()
+	var version int
+	if err := conn.QueryRowContext(context.Background(), `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	return version
+}
+
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
