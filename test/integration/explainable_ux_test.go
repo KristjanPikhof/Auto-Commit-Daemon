@@ -284,7 +284,13 @@ done
 	waitMode(t, repo, "running", 5*time.Second)
 	wakeSession(t, ctx, env, repo, "ux-superseded-resume")
 	waitForEventState(t, dbPath, "aaa-slow.txt", "published", 12*time.Second)
-	waitForEventState(t, dbPath, "zzz-reverted.txt", "published", 12*time.Second)
+	if !eventStateBecomes(dbPath, "zzz-reverted.txt", "published", 20*time.Second) {
+		dump := sqliteScalar(t, dbPath,
+			"SELECT group_concat(seq || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = 'zzz-reverted.txt' ORDER BY seq")
+		decisions := sqliteScalar(t, dbPath,
+			"SELECT group_concat(kind || ':' || COALESCE(reason, ''), char(10)) FROM decision_records WHERE path = 'zzz-reverted.txt' ORDER BY id")
+		t.Fatalf("zzz-reverted.txt did not publish after restart\nrows:\n%s\ndecisions:\n%s", dump, decisions)
+	}
 	waitForDecision(t, dbPath, "zzz-reverted.txt", "superseded_external", "superseded_external_current_head_matches_captured_before_state", 8*time.Second)
 
 	if out, err := runGit(repo, "cat-file", "-e", "HEAD:zzz-reverted.txt"); err != nil {
