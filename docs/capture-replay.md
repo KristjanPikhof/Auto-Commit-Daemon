@@ -1,7 +1,8 @@
 # Capture, Replay, and Conflict Resolution
 
 This document explains how `acd` stores changes, turns them into commits, and
-how to diagnose and fix a stalled queue.
+why replay sometimes blocks. For task-oriented daily recovery commands, start
+with [user-workflows.md](user-workflows.md).
 
 ---
 
@@ -38,6 +39,28 @@ counted but never retried automatically. A terminal `blocked_conflict` or
 generation: later pending rows stay held until the operator deletes or otherwise
 resolves the terminal predecessor. The retention pruner can delete old terminal
 rows only after they no longer act as the active barrier.
+
+### Product decision ledger
+
+The user-facing `acd status`, `acd events`, and `acd explain` commands read an
+append-only decision ledger. It is separate from raw daemon JSONL logs and uses
+product terms:
+
+| Decision | Meaning |
+|---|---|
+| `captured` | A worktree change was queued for replay. |
+| `committed` | ACD published the queued event as a git commit. |
+| `skipped` | ACD intentionally left a path uncommitted. |
+| `protected` | A sensitive or generated path was protected without synthesizing a delete. |
+| `handled_external` | Another commit already contains the captured after-state. |
+| `superseded_external` | External history made queued work obsolete. |
+| `blocked` | Replay stopped because applying the event was not provably safe. |
+| `paused` / `resumed` | Capture or replay paused/resumed because of manual pause, rewind grace, or git operation state. |
+
+Use `acd events --watch` to stream new decisions, `acd explain --path FILE` to
+answer why one path was or was not committed, and `acd explain --commit HEAD` to
+explain a commit. See [user-workflows.md](user-workflows.md) for complete daily
+flows.
 
 ---
 
@@ -234,8 +257,13 @@ until the operator resolves the conflict or deletes the row intentionally.
 ### Inspect the queue
 
 ~~~bash
-acd status              # pending_events + blocked_conflicts count for cwd repo
+acd status              # daemon, queue, pause, branch, and recent decisions
+acd status --watch      # refresh the same repo until Ctrl-C
 acd status --json       # machine-readable version
+acd events              # durable product decision ledger
+acd events --watch      # stream appended decisions until Ctrl-C
+acd explain --path FILE # explain why a path was captured, skipped, or blocked
+acd explain --commit HEAD # explain decisions linked to a commit
 acd list                # PENDING + BLOCKED columns across all repos
 acd list --watch        # refresh the repo table until Ctrl-C
 acd list --watch --interval 5s
@@ -250,13 +278,17 @@ acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue repor
 
 ~~~bash
 acd diagnose --repo . --json
+acd fix --dry-run
+acd fix --yes
 acd recover --repo . --auto --dry-run
 acd purge-events --repo . --blocked --pending --dry-run
 acd pause --repo . --reason "manual reset" --yes
 acd resume --repo . --yes
 ~~~
 
-Review dry-run output before applying recovery or purge plans with `--yes`.
+Review dry-run output before applying fix, recovery, or purge plans with
+`--yes`. Prefer `acd fix --dry-run` for common stuck states; use `recover` and
+`purge-events` as advanced tools when focused diagnostics point there.
 
 `acd list --watch` redraws plain table frames on the requested interval; it is
 for watching daemon liveness and queue counts, not an interactive TUI. `acd
@@ -448,12 +480,14 @@ Does not touch the git object database.
 
 ## Diagnosing a stalled queue
 
-Use this checklist when commits stop appearing:
+Use this checklist when commits stop appearing. The shorter, task-oriented
+version lives in [user-workflows.md](user-workflows.md).
 
 1. **Check the counts.**
 
    ~~~bash
    acd status
+   acd events
    ~~~
 
    - `Pending events: 0` and `Blocked conflicts: 0` → the queue is empty;
@@ -485,10 +519,23 @@ Use this checklist when commits stop appearing:
    `acd doctor` still includes bundled diagnostics and log tail snippets; prefer
    it for issue reports or when you need sanitized, summarized context.
 
-3. **Check for stale live-index repair candidates.**
+3. **Ask why one path or commit behaved that way.**
+
+   ~~~bash
+   acd explain --path path/to/file
+   acd explain --commit HEAD
+   ~~~
+
+   `explain` summarizes recent decisions and recommends the next command. For
+   example, `handled_external` means another commit already contained the
+   captured after-state, while `protected` means a sensitive or generated path
+   was intentionally left alone.
+
+4. **Check for stale live-index repair candidates.**
 
    ~~~bash
    acd doctor
+   acd fix --dry-run
    acd recover --repo . --auto --dry-run
    ~~~
 
@@ -499,7 +546,7 @@ Use this checklist when commits stop appearing:
    worktree content. Ambiguous same-path staged work is skipped; use normal git
    inspection to decide whether it is user intent.
 
-4. **Resolve blocked conflicts.**
+5. **Resolve blocked conflicts.**
 
    ~~~bash
    acd doctor      # last conflict: <path> <age> "<error>"
@@ -510,19 +557,21 @@ Use this checklist when commits stop appearing:
 
    ~~~bash
    acd diagnose --repo .
+   acd fix --dry-run
    acd recover --repo . --auto --dry-run
    acd purge-events --repo . --blocked --pending --dry-run
    ~~~
 
    If the dry-run plan is correct, rerun the chosen command with `--yes`.
-   `recover` retargets stale generation rows after branch surgery. `purge-events`
-   deletes terminal barriers and, when selected, obsolete pending rows behind
-   them.
+   `fix` handles common safe cleanup, including externally handled decisions and
+   obsolete barriers. `recover` retargets stale generation rows after branch
+   surgery. `purge-events` deletes terminal barriers and, when selected,
+   obsolete pending rows behind them.
 
    After clearing the blockers, trigger a replay:
    `acd wake --session-id "$ACD_SESSION_ID"`.
 
-4. **Check fsnotify mode.**
+6. **Check fsnotify mode.**
 
    ~~~bash
    acd doctor --json | python3 -c "import json,sys; [print(r['path'], r.get('fsnotify_mode'), r.get('fsnotify_fallback_reason')) for r in json.load(sys.stdin)['repos']]"
@@ -533,7 +582,7 @@ Use this checklist when commits stop appearing:
    why native watching was unavailable (Linux: check `inotify_max_user_watches`
    via `acd doctor`).
 
-5. **Check AI provider status.**
+7. **Check AI provider status.**
 
    If commits are appearing but messages look generic, the AI provider may be
    falling back to deterministic. Set `ACD_AI_PROVIDER=deterministic` explicitly
