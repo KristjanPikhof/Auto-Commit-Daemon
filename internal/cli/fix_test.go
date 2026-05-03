@@ -194,20 +194,39 @@ func TestFix_ApplyRefusesWhenPlanHasUnsafeReasons(t *testing.T) {
 func TestFix_ApplyMarksDecisionLedExternalRowPublished(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "external.txt"), []byte("landed outside acd\n"), 0o644); err != nil {
+		t.Fatalf("write external: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "external.txt"); err != nil {
+		t.Fatalf("git add external: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid", "commit", "-m", "external"); err != nil {
+		t.Fatalf("git commit external: %v", err)
+	}
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
+	}
+	afterOID, err := git.LsTreeBlobOID(ctx, repo, head, "external.txt")
+	if err != nil {
+		t.Fatalf("ls-tree external: %v", err)
 	}
 	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
 		BaseHead:         head,
-		Operation:        "modify",
+		Operation:        "create",
 		Path:             "external.txt",
 		Fidelity:         "exact",
 		State:            state.EventStateBlockedConflict,
 		Error:            sql.NullString{String: "before-state mismatch", Valid: true},
-	}, nil)
+	}, []state.CaptureOp{{
+		Op:        "create",
+		Path:      "external.txt",
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: "100644", Valid: true},
+		Fidelity:  "exact",
+	}})
 	if err != nil {
 		t.Fatalf("AppendCaptureEvent: %v", err)
 	}
