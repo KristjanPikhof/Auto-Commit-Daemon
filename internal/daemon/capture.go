@@ -847,9 +847,10 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 	if db == nil || path == "" {
 		return
 	}
+	kind := skippedDecisionKind(reason)
 	if latest, err := state.DecisionsForPath(ctx, db, path, 1); err == nil && len(latest) == 1 {
 		d := latest[0]
-		if d.Kind == state.DecisionKindProtected &&
+		if d.Kind == kind &&
 			d.Reason.Valid && d.Reason.String == reason &&
 			d.ActionTaken.Valid && d.ActionTaken.String == "no_delete_generated" &&
 			d.HeadSHA.Valid && d.HeadSHA.String == cctx.BaseHead &&
@@ -859,7 +860,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 		}
 	}
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
-		Kind:             state.DecisionKindProtected,
+		Kind:             kind,
 		Path:             sql.NullString{String: path, Valid: true},
 		Reason:           sql.NullString{String: reason, Valid: reason != ""},
 		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
@@ -869,6 +870,15 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped present protected path %s without generating a delete.", path), Valid: true},
 	}); err != nil {
 		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
+	}
+}
+
+func skippedDecisionKind(reason string) string {
+	switch reason {
+	case "sensitive", "safe_ignore", "gitignore":
+		return state.DecisionKindProtected
+	default:
+		return state.DecisionKindSkipped
 	}
 }
 
