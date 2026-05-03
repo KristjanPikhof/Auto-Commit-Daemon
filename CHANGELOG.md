@@ -25,7 +25,7 @@
 
 - AI provider docs now include setup profiles for compatibility mode,
   reviewer-friendly intent grouping, metadata-only private repos, self-hosted
-  providers, explicit diff egress, and guarded strict-message builds.
+  providers, explicit diff egress, and subprocess intent-planner plugins.
 - Read-only observability commands no longer migrate old repo databases just to
   inspect them. If a decision ledger is missing, they return an empty history
   instead of changing the DB.
