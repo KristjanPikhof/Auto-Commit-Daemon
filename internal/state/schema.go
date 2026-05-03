@@ -159,37 +159,6 @@ CREATE TABLE IF NOT EXISTS decision_records(
     user_message        TEXT
 );
 
--- v6: decision_records.event_seq is a durable historical cursor. Rebuild the
--- table when bootstrapping older databases so v5's ON DELETE SET NULL foreign
--- key cannot erase the event identity when capture_events rows are pruned.
-CREATE TABLE IF NOT EXISTS decision_records_v6(
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    decision_ts          REAL NOT NULL,
-    kind                TEXT NOT NULL,
-    path                TEXT,
-    reason              TEXT,
-    event_seq           INTEGER,
-    head_sha            TEXT,
-    commit_oid          TEXT,
-    branch_ref          TEXT,
-    branch_generation   INTEGER,
-    action_taken        TEXT,
-    user_message        TEXT
-);
-
-INSERT OR IGNORE INTO decision_records_v6(
-    id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-    branch_ref, branch_generation, action_taken, user_message
-)
-SELECT
-    id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-    branch_ref, branch_generation, action_taken, user_message
-FROM decision_records;
-
-DROP TABLE decision_records;
-
-ALTER TABLE decision_records_v6 RENAME TO decision_records;
-
 CREATE INDEX IF NOT EXISTS idx_decision_records_ts_id
     ON decision_records(decision_ts, id);
 
