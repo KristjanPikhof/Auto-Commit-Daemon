@@ -75,7 +75,6 @@ func TestSelfHeal_ManualPauseAndResume(t *testing.T) {
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
-	testEnv := envWith(env, "ACD_REWIND_GRACE_SECONDS=2", "ACD_FSNOTIFY_ENABLED=0")
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -114,6 +113,7 @@ func TestSelfHeal_PauseSurvivesDaemonRestart(t *testing.T) {
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
+	testEnv := envWith(env, "ACD_REWIND_GRACE_SECONDS=2", "ACD_FSNOTIFY_ENABLED=0")
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
