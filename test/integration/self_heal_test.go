@@ -325,7 +325,10 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 
 	// HEAD must still equal H2 — no extra commits beyond the reseeded baseline.
 	if head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); head != h2 {
-		t.Fatalf("HEAD=%s want H2 %s after grace expired", head, h2)
+		log := runGitOK(t, repo, "log", "--oneline", "--decorate", "--name-status", "-5")
+		rows := sqliteScalar(t, dbPath,
+			"SELECT group_concat(seq || ':' || operation || ':' || path || ':' || state || ':' || coalesce(substr(commit_oid,1,8),''), char(10)) FROM capture_events ORDER BY seq")
+		t.Fatalf("HEAD=%s want H2 %s after grace expired\nlog:\n%s\nevents:\n%s", head, h2, log, rows)
 	}
 	// No phantom pending rows for the FF-restored file.
 	if n := selfHealCount(t, dbPath, "path = 'ff-grace.txt' AND state = 'pending'"); n != 0 {
