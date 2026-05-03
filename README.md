@@ -44,7 +44,7 @@ acd list --watch --interval 5s
 acd status              # current repo daemon, queue, pause, and recent decisions
 acd status --watch      # refresh the same repo until Ctrl-C
 acd events              # show the durable product decision ledger
-acd events --watch      # stream appended decisions until Ctrl-C
+acd events --watch      # stream decisions appended after watch starts
 acd explain --path FILE # explain why a path was captured, skipped, or blocked
 acd explain --commit HEAD # explain decisions linked to a commit
 acd fix --dry-run       # plan safe remediation for a stuck repo
@@ -53,7 +53,7 @@ acd logs                # tail the current repo daemon log as raw JSONL
 acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
 acd stats --since 7d    # last week's commits
-acd doctor              # pending : N, blocked : N, last conflict path + age + error
+acd doctor              # health/support diagnostics, including queue blockers
 acd doctor --bundle     # diagnostics zip with bundled/tail diagnostics for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
 acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
@@ -117,11 +117,15 @@ acd explain --commit HEAD
 acd fix --dry-run
 ~~~
 
-`status` shows daemon health, queue counts, pause state, and recent decision
-counts. `events` streams the durable decision ledger. `explain` answers why ACD
-captured, skipped, committed, treated work as externally handled, or blocked a
-path or commit. `fix --dry-run` plans conservative cleanup for common stuck
-states; apply only after reading the plan:
+`status` shows daemon health, queue counts, pause state, failed terminal
+barriers, and recent decision counts. `status --json` includes the decision
+cursor plus recent decision records, and includes `failed_events` /
+`failed_blocking_pending` when failed rows are holding pending replay behind a
+terminal barrier. `events --watch` starts at the current decision-ledger tail
+unless `--since` is provided, so it prints only decisions appended after watch
+starts. `explain` answers why ACD captured, skipped, committed, treated work as
+externally handled, or blocked a path or commit. `fix --dry-run` plans
+conservative cleanup for common stuck states; apply only after reading the plan:
 
 ~~~bash
 acd fix --yes
@@ -135,9 +139,9 @@ acd diagnose --repo . --json
 ~~~
 
 It reports the current git `HEAD` branch, the daemon's persisted branch anchor,
-blocked-conflict counts by `error_class`, and the five most recent blocked
-events. If the daemon is stopped and the plan looks right, recover a stale
-anchor with an automatic backup:
+blocked-conflict counts by `error_class`, failed terminal barriers, and the
+five most recent blocked or failed events. If the daemon is stopped and the
+plan looks right, recover a stale anchor with an automatic backup:
 
 ~~~bash
 acd recover --repo . --auto --dry-run
@@ -216,6 +220,8 @@ not gitignored them: `node_modules/`, `target/`, `.venv/`, `venv/`,
 `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and
 `.gradle/`. This does not edit `.gitignore`; it only prunes ACD capture and
 watcher work. Use `acd doctor` to inspect the active safe-ignore pattern list.
+`ACD_SAFE_IGNORE` and `ACD_SAFE_IGNORE_EXTRA` are read when the daemon starts;
+stop and restart an existing daemon before expecting those changes to apply.
 
 ## Docs
 
