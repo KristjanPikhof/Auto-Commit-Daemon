@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -137,6 +138,30 @@ type ReplayOpts struct {
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
+
+	// CommitStrategy selects one-event replay or intent-grouped replay. Empty
+	// resolves from ACD_COMMIT_STRATEGY, preserving event replay by default.
+	CommitStrategy ai.CommitStrategy
+
+	// IntentPlanner chooses selected/deferred capture groups when
+	// CommitStrategy is intent. Nil falls back to the env-selected AI provider,
+	// and then deterministic planning if that provider is unavailable.
+	IntentPlanner ai.IntentPlanner
+
+	// IntentWindow caps the normal planning window. Zero resolves from env.
+	IntentWindow int
+
+	// IntentRecentCommits caps recent history context supplied to the planner.
+	// Zero resolves from env.
+	IntentRecentCommits int
+
+	// IntentDeferLimit controls forced-aging windows. Zero resolves from env;
+	// use a negative value in tests to force zero.
+	IntentDeferLimit int
+
+	// IntentIncludeDiffs permits captured diffs in planner requests. Production
+	// callers should leave this false unless diff egress is explicitly enabled.
+	IntentIncludeDiffs bool
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
