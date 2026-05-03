@@ -1085,10 +1085,11 @@ func aiCommitSummary(commit git.CommitSummary) *ai.CommitSummary {
 	}
 }
 
-func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, ts float64) (ai.IntentPlan, error) {
+func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
 	if planner == nil {
 		planner = ai.DeterministicProvider{}
 	}
+	var validationFailure string
 	plan, err := planner.PlanIntent(ctx, req)
 	if err == nil {
 		err = ai.ValidateIntentPlan(req, plan)
@@ -1097,22 +1098,26 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		err = validateIntentSelectionSafety(items, plan)
 	}
 	if err == nil {
-		return plan, nil
+		return plan, "", nil
 	}
+	validationFailure = err.Error()
 	for _, item := range items {
 		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, err.Error()); recErr != nil {
-			return ai.IntentPlan{}, recErr
+			return ai.IntentPlan{}, validationFailure, recErr
+		}
+		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, err.Error(), "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
+			return ai.IntentPlan{}, validationFailure, recErr
 		}
 	}
 	fallback := ai.DeterministicProvider{}
 	plan, err = fallback.PlanIntent(ctx, req)
 	if err != nil {
-		return ai.IntentPlan{}, err
+		return ai.IntentPlan{}, validationFailure, err
 	}
 	if err := validateIntentSelectionSafety(items, plan); err != nil {
-		return ai.IntentPlan{}, err
+		return ai.IntentPlan{}, validationFailure, err
 	}
-	return plan, nil
+	return plan, validationFailure, nil
 }
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
