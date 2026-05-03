@@ -105,6 +105,79 @@ func TestExplainCommitAndDefaultJSON(t *testing.T) {
 	}
 }
 
+func TestExplainSinceSummarizesNewestPostCursorDecision(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, _, db := makeExplainRepo(t, roots)
+	ctx := context.Background()
+
+	cursor, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS: 10,
+		Kind:       state.DecisionKindCaptured,
+		Path:       sqlNullStr("old.go"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision cursor: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:  11,
+		Kind:        state.DecisionKindCaptured,
+		Path:        sqlNullStr("first.go"),
+		UserMessage: sqlNullStr("first post-cursor decision"),
+	}); err != nil {
+		t.Fatalf("AppendDecision first post-cursor: %v", err)
+	}
+	newestID, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:  12,
+		Kind:        state.DecisionKindCommitted,
+		Path:        sqlNullStr("newest.go"),
+		UserMessage: sqlNullStr("newest post-cursor decision"),
+	})
+	if err != nil {
+		t.Fatalf("AppendDecision newest post-cursor: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runExplain(ctx, &out, repo, "", "", false, cursor, 10, true); err != nil {
+		t.Fatalf("runExplain since: %v", err)
+	}
+	var rep explainReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode explain since: %v\n%s", err, out.String())
+	}
+	if rep.DecisionCursor != newestID {
+		t.Fatalf("DecisionCursor=%d want %d", rep.DecisionCursor, newestID)
+	}
+	if rep.Explanation != "newest post-cursor decision" {
+		t.Fatalf("Explanation=%q want newest post-cursor decision; decisions=%+v", rep.Explanation, rep.Decisions)
+	}
+}
+
+func TestExplainMissingDecisionLedgerIsReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeExplainRepo(t, roots)
+	preparePreDecisionLedgerDB(t, db, dbPath)
+	before := mustSHA256(t, dbPath)
+	versionBefore := readUserVersionReadOnly(t, dbPath)
+
+	var out bytes.Buffer
+	if err := runExplain(context.Background(), &out, repo, "", "", false, 0, 10, true); err != nil {
+		t.Fatalf("runExplain missing ledger: %v\n%s", err, out.String())
+	}
+	var rep explainReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode explain: %v\n%s", err, out.String())
+	}
+	if rep.DecisionLedgerAvailable || !strings.Contains(rep.Explanation, "Decision ledger is not available") {
+		t.Fatalf("unexpected explain report: %+v", rep)
+	}
+	if after := mustSHA256(t, dbPath); after != before {
+		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
+	}
+	if got := readUserVersionReadOnly(t, dbPath); got != versionBefore {
+		t.Fatalf("user_version changed: before=%d after=%d", versionBefore, got)
+	}
+}
+
 func TestExplainValidationAndHelp(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo, _, _ := makeExplainRepo(t, roots)
