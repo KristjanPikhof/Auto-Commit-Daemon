@@ -2566,6 +2566,128 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	}
 }
 
+func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeOID, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	childOID, err := git.HashObjectStdin(ctx, f.dir, []byte("child\n"))
+	if err != nil {
+		t.Fatalf("hash child: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "foo", beforeOID, "seed foo file")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	deleteEvent := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "delete",
+		Path:             "foo",
+		Fidelity:         "rescan",
+	}
+	deleteOp := state.CaptureOp{
+		Op:         "delete",
+		Path:       "foo",
+		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	deleteSeq, err := state.AppendCaptureEvent(ctx, f.db, deleteEvent, []state.CaptureOp{deleteOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent delete: %v", err)
+	}
+
+	createEvent := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "create",
+		Path:             "foo/bar",
+		Fidelity:         "rescan",
+	}
+	createOp := state.CaptureOp{
+		Op:        "create",
+		Path:      "foo/bar",
+		AfterOID:  sql.NullString{String: childOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	createSeq, err := state.AppendCaptureEvent(ctx, f.db, createEvent, []state.CaptureOp{createOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent create: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{createSeq},
+			DeferredSeqs:   []int64{deleteSeq},
+			Subject:        "Create nested file first",
+			GroupingReason: "unsafe planner ordering",
+			DeferredReasons: []ai.DeferredReason{
+				{Seq: deleteSeq, Reason: "later"},
+			},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     2,
+		IntentDeferLimit: 2,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want fallback publish of the earlier delete only", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+
+	var deleteState, createState string
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, deleteSeq).Scan(&deleteState); err != nil {
+		t.Fatalf("query delete state: %v", err)
+	}
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, createSeq).Scan(&createState); err != nil {
+		t.Fatalf("query create state: %v", err)
+	}
+	if deleteState != state.EventStatePublished {
+		t.Fatalf("delete state=%q want published", deleteState)
+	}
+	if createState != state.EventStatePending {
+		t.Fatalf("create state=%q want pending after fallback deferred it", createState)
+	}
+	if oid, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "foo"); err != nil {
+		t.Fatalf("ls-tree HEAD foo: %v", err)
+	} else if oid != "" {
+		t.Fatalf("HEAD still contains deleted foo blob %s", oid)
+	}
+	if entries, err := git.LsTree(ctx, f.dir, "HEAD", true, "foo/bar"); err != nil {
+		t.Fatalf("ls-tree HEAD foo/bar: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("HEAD published nested create before delete dependency was accepted: %+v", entries)
+	}
+
+	assertIntentPlannerErrorDecision(t, ctx, f.db, deleteSeq, "selected seq")
+	assertIntentPlannerErrorDecision(t, ctx, f.db, createSeq, "deferred earlier seq")
+	ps, ok, err := state.PlannerStateForEvent(ctx, f.db, createSeq)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent create: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 1 || !ps.LastDeferReason.Valid || ps.LastDeferReason.String != "deferred by deterministic fallback" {
+		t.Fatalf("create planner state=%+v want fallback deferral recorded", ps)
+	}
+}
+
 func TestReplay_DefaultIndexIsPerPassTempfile(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
