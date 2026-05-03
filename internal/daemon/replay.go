@@ -2445,12 +2445,12 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 	if len(paths) == 0 {
 		return false, nil
 	}
-		pathspecs := git.LiteralPathspecs(paths)
-		if len(pathspecs) == 0 {
-			return false, nil
-		}
-		args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
-		args = append(args, pathspecs...)
+	pathspecs := git.LiteralPathspecs(paths)
+	if len(pathspecs) == 0 {
+		return false, nil
+	}
+	args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
+	args = append(args, pathspecs...)
 	_, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, args...)
 	if err != nil {
 		var gerr *git.Error
