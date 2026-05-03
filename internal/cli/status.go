@@ -337,6 +337,13 @@ func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval ti
 }
 
 func statusDecisionSummary(ctx context.Context, conn *sql.DB, report *statusReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fmt.Errorf("decision table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
 	rows, err := conn.QueryContext(ctx, `SELECT kind, COUNT(*) FROM decision_records GROUP BY kind`)
 	if err != nil {
 		return fmt.Errorf("decision counts: %w", err)
@@ -386,6 +393,16 @@ LIMIT 3`)
 		return fmt.Errorf("iter recent decisions: %w", err)
 	}
 	return nil
+}
+
+func sqliteTableExists(ctx context.Context, conn *sql.DB, name string) (bool, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name,
+	).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // metaLookup is the read-only equivalent of state.MetaGet against a raw
