@@ -16,10 +16,11 @@ acd explain --commit HEAD
 ~~~
 
 `acd status` is the current snapshot: daemon liveness, queue counts, pause
-state, branch generation, and recent decision counts. `acd events` is the
-durable decision ledger. It tells you what ACD captured, skipped, committed,
-blocked, or treated as already handled by another committer. `acd explain`
-turns those decisions into a path or commit answer.
+state, branch generation, active commit strategy, and recent decision counts.
+`acd events` is the durable decision ledger. It tells you what ACD captured,
+skipped, committed, deferred, grouped, blocked, or treated as already handled by
+another committer. `acd explain` turns those decisions into a path or commit
+answer.
 
 `acd events --watch` follows new ledger rows. Without `--since`, it starts at
 the current ledger tail and prints only decisions appended after watch starts.
@@ -95,6 +96,32 @@ acd fix --yes
 `fix --yes` refuses unsafe mutations and backs up `state.db` first. Stop the
 daemon before applying a plan if the command tells you a live daemon owns the
 state database.
+
+## Intent grouping deferred or forced a change
+
+When `ACD_COMMIT_STRATEGY=intent` is enabled, ACD may publish several related
+captures as one commit, choose exactly one capture, or defer unrelated captures
+for a later planning window. Deferrals are normal. They mean the planner did not
+have enough evidence to group that capture with the current selected set.
+
+~~~bash
+acd status
+acd events --watch
+acd explain --path path/to/file
+~~~
+
+Look for:
+
+| Decision | Meaning |
+|---|---|
+| `intent_deferred` | The planner left this pending for a later window. |
+| `intent_forced` | ACD forced an over-deferred capture into a one-item planning window. |
+| `intent_planner_error` | The planner returned an invalid plan or failed; ACD fell back to a safe one-capture plan. |
+
+`status` and `diagnose --json` show deferred counts, forced-aging readiness, and
+the latest planner error. If deferrals keep growing, reduce
+`ACD_INTENT_WINDOW`, check provider health, or temporarily return to
+`ACD_COMMIT_STRATEGY=event`.
 
 ## Manual revert or superseded queued work
 
@@ -278,6 +305,9 @@ artifact for issue reports.
 |---|---|
 | `captured` | ACD noticed a change and queued it for replay. |
 | `committed` | ACD published the queued change as a commit. |
+| `intent_deferred` | Intent planning left the capture pending for a later commit. |
+| `intent_forced` | ACD forced an over-deferred capture through a one-item planning window. |
+| `intent_planner_error` | The planner failed validation; ACD used a safe fallback plan. |
 | `skipped` | ACD intentionally left a path uncommitted, usually due to ignore or policy. |
 | `protected` | ACD protected a sensitive or generated path and did not synthesize a delete. |
 | `handled_external` | Another commit already contains the captured after-state. |
