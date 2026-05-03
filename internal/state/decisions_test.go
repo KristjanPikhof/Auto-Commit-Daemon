@@ -99,6 +99,21 @@ func TestDecisionRecordsRoundTripAndQueries(t *testing.T) {
 	if len(since) != 1 || since[0].ID != secondID {
 		t.Fatalf("since query = %+v, want only second row", since)
 	}
+
+	pathSince, err := DecisionsForPathSince(ctx, d, "src/app.go", firstID, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForPathSince: %v", err)
+	}
+	if len(pathSince) != 1 || pathSince[0].ID != secondID {
+		t.Fatalf("path since query = %+v, want only second row", pathSince)
+	}
+	latest, err := LatestDecisionID(ctx, d)
+	if err != nil {
+		t.Fatalf("LatestDecisionID: %v", err)
+	}
+	if latest != secondID {
+		t.Fatalf("latest decision id = %d, want %d", latest, secondID)
+	}
 }
 
 func TestDecisionRecordsValidateAndClamp(t *testing.T) {
@@ -111,6 +126,12 @@ func TestDecisionRecordsValidateAndClamp(t *testing.T) {
 	}
 	if _, err := DecisionsForPath(ctx, d, "", 1); err == nil {
 		t.Fatalf("DecisionsForPath with empty path succeeded")
+	}
+	if _, err := DecisionsForPathSince(ctx, d, "", 0, 1); err == nil {
+		t.Fatalf("DecisionsForPathSince with empty path succeeded")
+	}
+	if _, err := DecisionsForPathSince(ctx, d, "x", -1, 1); err == nil {
+		t.Fatalf("DecisionsForPathSince with negative cursor succeeded")
 	}
 	if _, err := DecisionsForEvent(ctx, d, 0, 1); err == nil {
 		t.Fatalf("DecisionsForEvent with zero seq succeeded")
