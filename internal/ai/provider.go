@@ -116,7 +116,7 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 	}
 	if primary, ok := c.primary.(IntentPlanner); ok {
 		plan, err := primary.PlanIntent(ctx, req)
-		if err == nil && len(plan.SelectedSeqs) > 0 {
+		if err == nil && ValidateIntentPlan(req, plan) == nil {
 			if plan.Source == "" {
 				plan.Source = c.primary.Name()
 			}
