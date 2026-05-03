@@ -1185,6 +1185,146 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 	return nil
 }
 
+func recordIntentForcedDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, deferLimit int) error {
+	if len(items) != 1 {
+		return nil
+	}
+	item := items[0]
+	reason := fmt.Sprintf("defer_count %d reached limit %d", item.deferCount, deferLimit)
+	return appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentForced, reason, "forced one-item planning window", "Forced this capture into a one-item intent planning window after repeated deferrals.")
+}
+
+func appendIntentPlannerDecision(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, ts float64, kind, reason, action, message string) error {
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:       ts,
+		Kind:             kind,
+		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: ev.Seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: action != ""},
+		UserMessage:      sql.NullString{String: message, Valid: message != ""},
+	}); err != nil {
+		return fmt.Errorf("daemon: append intent planner decision seq=%d kind=%s: %w", ev.Seq, kind, err)
+	}
+	return nil
+}
+
+func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, req ai.IntentPlanRequest, cfg intentReplayConfig) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.input",
+		Decision:   "plan",
+		Reason:     "intent planner input summary",
+		Input: map[string]any{
+			"offered":                  intentTraceOffered(items),
+			"forced_aging":             req.ForcedAging,
+			"include_captured_diffs":   cfg.includeDiffs,
+			"latest_commit_present":    req.LatestCommit != nil,
+			"path_commit_context_count": len(req.PathCommitContext),
+			"window":                   cfg.window,
+			"recent_commits":           cfg.recent,
+			"defer_limit":              cfg.deferLimit,
+		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentForcedAging(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, deferLimit int) {
+	if logger == nil || len(items) != 1 {
+		return
+	}
+	item := items[0]
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.forced_aging",
+		Decision:   "force",
+		Reason:     "deferred capture reached forced-aging limit",
+		Input: map[string]any{
+			"seq":         item.event.Seq,
+			"path":        item.event.Path,
+			"defer_count": item.deferCount,
+			"defer_limit": deferLimit,
+		},
+		Seq:        item.event.Seq,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentPlannerValidationFailure(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, errMsg string) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.validation_failed",
+		Decision:   "fallback",
+		Reason:     "planner output failed validation",
+		Input: map[string]any{
+			"offered_seqs": intentItemSeqs(items),
+		},
+		Error:      errMsg,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, plan ai.IntentPlan) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.output",
+		Decision:   "selected",
+		Reason:     plan.GroupingReason,
+		Input: map[string]any{
+			"offered_seqs": intentItemSeqs(items),
+		},
+		Output: map[string]any{
+			"selected_seqs": plan.SelectedSeqs,
+			"deferred_seqs": plan.DeferredSeqs,
+			"source":        plan.Source,
+		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func intentTraceOffered(items []intentReplayItem) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"seq":         item.event.Seq,
+			"path":        item.event.Path,
+			"operation":   item.event.Operation,
+			"fidelity":    item.event.Fidelity,
+			"defer_count": item.deferCount,
+			"ops":         len(item.ops),
+		})
+	}
+	return out
+}
+
+func intentItemSeqs(items []intentReplayItem) []int64 {
+	seqs := make([]int64, 0, len(items))
+	for _, item := range items {
+		seqs = append(seqs, item.event.Seq)
+	}
+	return seqs
+}
+
 func selectedIntentItems(items []intentReplayItem, seqs []int64) ([]intentReplayItem, error) {
 	bySeq := make(map[int64]intentReplayItem, len(items))
 	for _, item := range items {
