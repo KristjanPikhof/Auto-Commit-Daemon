@@ -46,6 +46,7 @@ func TestRegressions(t *testing.T) {
 	t.Run("OfflineResetRestartNoPhantomEvents", regOfflineResetRestartNoPhantomEvents)
 	t.Run("ConcurrentSessionStartsRegisterAllClients", regConcurrentSessionStartsRegisterAllClients)
 	t.Run("DaemonSelfTerminatesOnEmptySweeps", regDaemonSelfTerminatesOnEmptySweeps)
+	t.Run("TrackedChildDeleteUnderSafeIgnoredDir", regTrackedChildDeleteUnderSafeIgnoredDir)
 	t.Run("RepeatedEditsPublishOrderedCommits", regRepeatedEditsPublishOrderedCommits)
 	t.Run("BlockedConflictTerminalAcrossPolls", regBlockedConflictTerminalAcrossPolls)
 	t.Run("BlockedConflictPreventsLeapfrogPublish", regBlockedConflictPreventsLeapfrogPublish)
@@ -773,6 +774,45 @@ func regDaemonSelfTerminatesOnEmptySweeps(t *testing.T) {
 	// Wait up to 60s for the self-terminate path. BootGrace=30s +
 	// ClientSweepInterval=5s × 2 = 40s is the floor.
 	waitMode(t, repo, "stopped", 70*time.Second)
+}
+
+func regTrackedChildDeleteUnderSafeIgnoredDir(t *testing.T) {
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	tracked := filepath.Join(repo, "node_modules", "pkg", "generated.txt")
+	writeFile(t, tracked, "tracked generated child\n")
+	runGitOK(t, repo, "add", "-f", "node_modules/pkg/generated.txt")
+	runGitOK(t, repo, "commit", "-q", "-m", "track generated child under safe ignored dir")
+
+	startSession(t, ctx, env, repo, "safe-delete-1", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	if err := os.Remove(tracked); err != nil {
+		t.Fatalf("remove tracked child: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatalf("keep safe-ignored parent dir present: %v", err)
+	}
+	wakeSession(t, ctx, env, repo, "safe-delete-1")
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitForEventState(t, dbPath, "node_modules/pkg/generated.txt", "published", 8*time.Second)
+	if got := sqliteScalar(t, dbPath,
+		"SELECT operation FROM capture_events WHERE path = 'node_modules/pkg/generated.txt' ORDER BY seq DESC LIMIT 1"); got != "delete" {
+		t.Fatalf("operation=%q want delete for tracked child under safe-ignored dir", got)
+	}
+	if out, err := runGit(repo, "cat-file", "-e", "HEAD:node_modules/pkg/generated.txt"); err == nil {
+		t.Fatalf("tracked child still exists at HEAD after delete replay\n%s", out)
+	}
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM decision_records WHERE path = 'node_modules/pkg/generated.txt' AND kind = 'protected'"); got != "0" {
+		t.Fatalf("delete was incorrectly protected under safe-ignored parent; protected decisions=%s", got)
+	}
 }
 
 // sqliteScalar runs `sqlite3 db -- "SELECT ..."` and returns the trimmed
