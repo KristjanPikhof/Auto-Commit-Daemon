@@ -452,7 +452,3 @@ func fileSHA256(t *testing.T, path string) string {
 	}
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
-
-func sqliteQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
