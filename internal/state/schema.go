@@ -14,8 +14,9 @@ package state
 // long-running pauses fan capture_events into tens of thousands of rows;
 // v4 adds idx_flush_requests_status_id so ClaimNextFlushRequest's
 // `status='pending' ORDER BY id ASC` lookup stays O(log n) after the queue
-// accumulates completed/acknowledged rows over a long uptime.
-const SchemaVersion = 4
+// accumulates completed/acknowledged rows over a long uptime; v5 adds
+// append-only product decision records for explainable capture/replay/CLI UX.
+const SchemaVersion = 5
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -124,6 +125,34 @@ CREATE TABLE IF NOT EXISTS flush_requests(
 -- long uptime accumulates acknowledged/completed/failed rows.
 CREATE INDEX IF NOT EXISTS idx_flush_requests_status_id
     ON flush_requests(status, id);
+
+CREATE TABLE IF NOT EXISTS decision_records(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          REAL NOT NULL,
+    kind                TEXT NOT NULL,
+    path                TEXT,
+    reason              TEXT,
+    event_seq           INTEGER,
+    head_sha            TEXT,
+    commit_oid          TEXT,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    action_taken        TEXT,
+    user_message        TEXT,
+    FOREIGN KEY (event_seq) REFERENCES capture_events(seq) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_records_ts_id
+    ON decision_records(decision_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_decision_records_path_id
+    ON decision_records(path, id);
+
+CREATE INDEX IF NOT EXISTS idx_decision_records_event_seq_id
+    ON decision_records(event_seq, id);
+
+CREATE INDEX IF NOT EXISTS idx_decision_records_commit_oid_id
+    ON decision_records(commit_oid, id);
 
 CREATE TABLE IF NOT EXISTS publish_state(
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
