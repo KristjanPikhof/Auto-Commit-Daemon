@@ -314,6 +314,19 @@ ON CONFLICT(event_seq) DO UPDATE SET
 	return nil
 }
 
+// ClearPlannerState removes durable planning bookkeeping for an event once the
+// event leaves the pending queue. Missing rows are harmless.
+func ClearPlannerState(ctx context.Context, d *DB, eventSeq int64) error {
+	if eventSeq <= 0 {
+		return fmt.Errorf("state: ClearPlannerState: event_seq must be positive")
+	}
+	if _, err := d.conn.ExecContext(ctx,
+		`DELETE FROM planner_state WHERE event_seq = ?`, eventSeq); err != nil {
+		return fmt.Errorf("state: clear planner state: %w", err)
+	}
+	return nil
+}
+
 // OldestOverduePlannerEvent returns the oldest pending event whose defer_count
 // has reached deferLimit. Ties are resolved by event_seq for deterministic
 // planner behavior.
