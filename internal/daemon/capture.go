@@ -20,11 +20,13 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -632,7 +634,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	if err != nil {
 		return summary, fmt.Errorf("daemon: load shadow: %w", err)
 	}
-	protectedSkipCount := protectShadowFromSkippedPresent(ctx, db, cctx, shadow, protectedSkips)
+	protectedSkipCount := protectShadowFromSkippedPresent(ctx, repoRoot, db, cctx, shadow, protectedSkips)
 
 	ops := Classify(shadow, live)
 	recordTrace(opts.Trace, acdtrace.Event{
@@ -811,14 +813,18 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
-func protectShadowFromSkippedPresent(ctx context.Context, db *state.DB, cctx CaptureContext, shadow map[string]ShadowEntry, protected map[string]skippedPresent) int {
+func protectShadowFromSkippedPresent(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, shadow map[string]ShadowEntry, protected map[string]skippedPresent) int {
 	if len(shadow) == 0 || len(protected) == 0 {
 		return 0
 	}
+	index := newProtectedSkipIndex(protected)
 	count := 0
 	for path := range shadow {
-		reason, ok := protectedReasonForPath(path, protected)
+		reason, ok, needsPresenceCheck := index.reasonForPath(path)
 		if !ok {
+			continue
+		}
+		if needsPresenceCheck && !shadowPathPresentOrIndeterminate(repoRoot, path) {
 			continue
 		}
 		delete(shadow, path)
@@ -829,18 +835,58 @@ func protectShadowFromSkippedPresent(ctx context.Context, db *state.DB, cctx Cap
 }
 
 func protectedReasonForPath(path string, protected map[string]skippedPresent) (string, bool) {
-	if skip, ok := protected[path]; ok {
-		return skip.Reason, true
+	reason, ok, _ := newProtectedSkipIndex(protected).reasonForPath(path)
+	return reason, ok
+}
+
+type protectedSkipIndex struct {
+	exact map[string]string
+	dirs  []protectedDirPrefix
+}
+
+type protectedDirPrefix struct {
+	path   string
+	reason string
+}
+
+func newProtectedSkipIndex(protected map[string]skippedPresent) protectedSkipIndex {
+	index := protectedSkipIndex{
+		exact: make(map[string]string, len(protected)),
 	}
-	for prefix, skip := range protected {
-		if !skip.Dir {
+	for path, skip := range protected {
+		if path == "" || skip.Reason == "" {
 			continue
 		}
-		if path == prefix || strings.HasPrefix(path, prefix+"/") {
-			return skip.Reason, true
+		if skip.Dir {
+			index.dirs = append(index.dirs, protectedDirPrefix{path: path, reason: skip.Reason})
+			continue
+		}
+		index.exact[path] = skip.Reason
+	}
+	sort.Slice(index.dirs, func(i, j int) bool {
+		return len(index.dirs[i].path) > len(index.dirs[j].path)
+	})
+	return index
+}
+
+func (index protectedSkipIndex) reasonForPath(path string) (reason string, ok bool, needsPresenceCheck bool) {
+	if reason, ok := index.exact[path]; ok {
+		return reason, true, false
+	}
+	for _, prefix := range index.dirs {
+		if path == prefix.path || strings.HasPrefix(path, prefix.path+"/") {
+			return prefix.reason, true, true
 		}
 	}
-	return "", false
+	return "", false, false
+}
+
+func shadowPathPresentOrIndeterminate(repoRoot, path string) bool {
+	_, err := os.Lstat(filepath.Join(repoRoot, filepath.FromSlash(path)))
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx CaptureContext, path, reason string) {
