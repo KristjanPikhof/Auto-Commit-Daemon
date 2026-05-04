@@ -333,6 +333,8 @@ func Run(ctx context.Context, opts Options) error {
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
 		"commit.strategy":       string(providerCfg.CommitStrategy),
 		"intent.window":         strconv.Itoa(providerCfg.IntentWindow),
+		"intent.min_pending":    strconv.Itoa(providerCfg.IntentMinPending),
+		"intent.max_pending_age": providerCfg.IntentMaxPendingAge.String(),
 		"intent.recent_commits": strconv.Itoa(providerCfg.IntentRecentCommits),
 		"intent.defer_limit":    strconv.Itoa(providerCfg.IntentDeferLimit),
 		"intent.diff_egress":    strconv.FormatBool(diffEgressOptIn()),
