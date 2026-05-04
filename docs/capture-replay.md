@@ -277,8 +277,8 @@ Intent-specific observability:
   seqs, batch-wait skips, and validation failures without writing captured
   source diffs, full AI prompts, or provider request envelopes.
 - `ACD_AI_PROMPT_TRACE=1` records the actual provider prompt/request diagnostics
-  under `<gitDir>/acd/prompt-trace/`. These records are local and post-redaction
-  / truncation, but may still contain source code; inspect them with
+  under `<gitDir>/acd/prompt-trace/`. These records are local and
+  post-redaction/truncation, but may still contain source code; inspect them with
   `acd prompt --last` or `acd prompt --seq <seq>`.
 
 ---
