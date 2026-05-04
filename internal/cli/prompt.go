@@ -202,11 +202,15 @@ func groupPromptRecords(records []prompttrace.Record) []*promptGroup {
 func samePromptKey(a, b prompttrace.Record) bool {
 	return a.Strategy == b.Strategy &&
 		a.Provider == b.Provider &&
-		a.Model == b.Model &&
+		promptFieldCompatible(a.Model, b.Model) &&
 		a.Seq == b.Seq &&
 		int64SlicesEqual(a.OfferedSeqs, b.OfferedSeqs) &&
 		a.BranchRef == b.BranchRef &&
 		a.Generation == b.Generation
+}
+
+func promptFieldCompatible(a, b string) bool {
+	return a == b || a == "" || b == ""
 }
 
 func latestPromptGroup(groups []*promptGroup) *promptGroup {
