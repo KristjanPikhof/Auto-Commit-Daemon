@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // IntentPlanner chooses which captured events belong in the next commit.
@@ -46,10 +48,11 @@ type OfferedCapture struct {
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible
 // providers and subprocess plugins.
 type IntentPlanRequest struct {
-	LatestCommit      *CommitSummary      `json:"latest_commit,omitempty"`
-	PathCommitContext []PathCommitContext `json:"path_commit_context,omitempty"`
-	OfferedCaptures   []OfferedCapture    `json:"offered_captures"`
-	ForcedAging       bool                `json:"forced_aging,omitempty"`
+	LatestCommit          *CommitSummary                 `json:"latest_commit,omitempty"`
+	PathCommitContext     []PathCommitContext            `json:"path_commit_context,omitempty"`
+	OfferedCaptures       []OfferedCapture               `json:"offered_captures"`
+	ForcedAging           bool                           `json:"forced_aging,omitempty"`
+	CapturedDiffTransform prompttrace.TransformMetadata `json:"-"`
 }
 
 // IntentPlanRequestOptions carries raw captured diffs before the request is
@@ -79,7 +82,10 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 	for _, offered := range opts.OfferedCaptures {
 		cp := offered
 		if opts.IncludeCapturedDiffs {
-			cp.CapturedDiff = Truncate(RedactDiffSecrets(cp.CapturedDiff), DiffCap)
+			input := cp.CapturedDiff
+			redacted := RedactDiffSecrets(input)
+			cp.CapturedDiff = Truncate(redacted, DiffCap)
+			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))
 		} else {
 			cp.CapturedDiff = ""
 		}

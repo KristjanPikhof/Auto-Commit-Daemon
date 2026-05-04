@@ -105,7 +105,7 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs. Off by default; metadata-only payload otherwise. Has no effect for `deterministic`. |
-| `ACD_AI_PROMPT_TRACE` | unset | Truthy (`1`/`true`/`yes`) writes local AI prompt diagnostics to `<gitDir>/acd/prompt-trace/`. Treat as sensitive: records are post-redaction/truncation but may still contain source text. |
+| `ACD_AI_PROMPT_TRACE` | unset | Truthy (`1`/`true`/`yes`) writes local AI prompt diagnostics to `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a request. Treat as sensitive: records are post-redaction/truncation but may still contain source text. |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
 
@@ -192,6 +192,8 @@ Troubleshooting:
 Prompt tracing is off by default. Enable it only while debugging AI behavior:
 
 ~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
 acd prompt --last
 acd prompt --seq 42 --json
@@ -200,8 +202,12 @@ acd prompt --seq 42 --json
 In `event` mode, the trace shows the commit-message request for one captured
 event: strategy, provider, model, seq, redaction/truncation metadata, system
 prompt, user prompt, request envelope, response, and any fallback reason.
+The default deterministic provider does not send an AI request, so it emits no
+prompt trace.
 
 ~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
 acd prompt --last
 acd prompt --seq 42
@@ -217,8 +223,10 @@ They are captured after ACD redacts and truncates outbound payloads, but they
 may still contain source code, private paths, prompt text, tool schemas, request
 envelopes, provider responses, and fallback metadata. Do not enable
 `ACD_AI_PROMPT_TRACE` on sensitive repos unless the local diagnostic value is
-worth that risk. Remove the prompt-trace directory after sharing-safe evidence
-has been collected.
+worth that risk. Files are grouped by UTC day and are not pruned automatically;
+the async writer buffers up to 256 pending records and drops the oldest buffered
+record if it falls behind. Remove the prompt-trace directory after
+sharing-safe evidence has been collected.
 
 ---
 
@@ -433,10 +441,14 @@ The `deterministic` provider never fails. It always produces a message and is th
 ### Prompt traces stay local but can contain code
 
 - `ACD_AI_PROMPT_TRACE=1` persists prompt request and response diagnostics under
-  `<gitDir>/acd/prompt-trace/`; there is no automatic upload.
+  `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a
+  request; there is no automatic upload.
 - Records are written after ACD redaction/truncation, but the prompt may still
   include source code, private paths, diffs allowed by `ACD_AI_DIFF_EGRESS`, and
   provider responses.
+- Files are daily JSONL logs with no automatic pruning. ACD buffers 256 pending
+  prompt-trace records in memory and drops the oldest buffered record under
+  sustained writer backpressure.
 - Treat prompt traces like raw logs from a private repository. Review or delete
   them before sharing a repo archive, support bundle, or debug artifact.
 
