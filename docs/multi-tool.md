@@ -125,8 +125,8 @@ a clean before-state.
 
 ~~~bash
 # Claude Code: remove or disable the Automatic Atomic Commits plugin
-# Codex: do not install a separate auto-commit hook alongside acd init codex
-acd init codex   # wake hook only — no separate commit hook
+# Codex: do not install a separate auto-commit hook alongside acd setup codex
+acd setup codex   # wake hook only — no separate commit hook
 ~~~
 
 ### Option B — accept idempotent settle as the steady state
