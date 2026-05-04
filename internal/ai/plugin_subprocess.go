@@ -53,6 +53,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // DefaultSubprocessTimeout is the per-request default per spec §10.3.
@@ -181,6 +183,15 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	if !cc.Now.IsZero() {
 		req.Now = cc.Now.UTC().Format(time.RFC3339Nano)
 	}
+	requestBody, transform, err := marshalSubprocessPromptRequest(req, cc.DiffText, req.Diff)
+	if err != nil {
+		return Result{}, err
+	}
+	p.recordSubprocessRequest(ctx, requestBody, transform, prompttrace.Metadata{
+		Strategy:     "event",
+		DiffIncluded: req.Diff != "",
+		DiffCap:      DiffCap,
+	})
 
 	// Per-request timeout layered on top of the caller's ctx.
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
@@ -191,32 +202,36 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	// exactly once. A second crash on the fresh process surfaces as an
 	// error so Compose() falls back to deterministic.
 	var resp subprocessResponse
-	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		var session *pluginSession
 		session, err = p.acquire()
 		if err != nil {
+			p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
 			return Result{}, err
 		}
-		resp, err = session.exchange(reqCtx, req)
+		resp, err = session.exchangeBytes(reqCtx, requestBody)
 		if err == nil {
 			break
 		}
 		// Context errors are not the plugin's fault; never retry.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			p.markCrashed(session)
+			p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
 			return Result{}, err
 		}
 		p.markCrashed(session)
 		// Loop and retry once with a fresh process.
 	}
 	if err != nil {
+		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
 		return Result{}, err
 	}
 	if strings.TrimSpace(resp.Error) != "" {
 		// Soft fail: plugin is healthy, just couldn't satisfy this
 		// particular request. Compose() will fall back.
-		return Result{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
+		return Result{}, err
 	}
 
 	composed := resp.Subject
@@ -226,16 +241,19 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	cleaned := SanitizeMessage(composed)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
 	subj := parts[0]
-	var body string
+	var bodyOut string
 	if len(parts) == 2 {
-		body = parts[1]
+		bodyOut = parts[1]
 	}
 	if strings.TrimSpace(subj) == "" {
-		return Result{}, fmt.Errorf("subprocess:%s: empty subject after sanitize", p.name)
+		err := fmt.Errorf("subprocess:%s: empty subject after sanitize", p.name)
+		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
+		return Result{}, err
 	}
+	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
-		Body:    body,
+		Body:    bodyOut,
 		Source:  p.Name(),
 	}, nil
 }
@@ -256,33 +274,47 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		RequestType:    "intent_plan",
 		PlannerRequest: &plannerReq,
 	}
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return IntentPlan{}, err
+	}
+	p.recordSubprocessRequest(ctx, body, plannerReq.CapturedDiffTransform, prompttrace.Metadata{
+		Strategy:     "intent",
+		OfferedSeqs:  offeredSeqs(plannerReq),
+		DiffIncluded: intentDiffIncluded(plannerReq),
+		DiffCap:      DiffCap,
+	})
 
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	var resp subprocessResponse
-	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		var session *pluginSession
 		session, err = p.acquire()
 		if err != nil {
+			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
 			return IntentPlan{}, err
 		}
-		resp, err = session.exchange(reqCtx, req)
+		resp, err = session.exchangeBytes(reqCtx, body)
 		if err == nil {
 			break
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			p.markCrashed(session)
+			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
 			return IntentPlan{}, err
 		}
 		p.markCrashed(session)
 	}
 	if err != nil {
+		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
 		return IntentPlan{}, err
 	}
 	if strings.TrimSpace(resp.Error) != "" {
-		return IntentPlan{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
+		return IntentPlan{}, err
 	}
 
 	plan := IntentPlan{
@@ -295,7 +327,9 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		Source:          p.Name(),
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
-		return IntentPlan{}, fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+		err := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
+		return IntentPlan{}, err
 	}
 	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
@@ -307,8 +341,16 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	}
 	plan = NormalizeIntentPlanReasons(plan)
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
+		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
+	p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{
+		Subject:        plan.Subject,
+		Body:           plan.Body,
+		SelectedSeqs:   plan.SelectedSeqs,
+		DeferredSeqs:   plan.DeferredSeqs,
+		GroupingReason: plan.GroupingReason,
+	})
 	return plan, nil
 }
 
@@ -366,6 +408,62 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 	p.mu.Unlock()
 	// shutdown is safe to call multiple times.
 	_ = session.shutdown(0)
+}
+
+func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = fallback.Strategy
+	}
+	if len(meta.OfferedSeqs) == 0 {
+		meta.OfferedSeqs = append([]int64(nil), fallback.OfferedSeqs...)
+	}
+	if meta.DiffCap == 0 {
+		meta.DiffCap = fallback.DiffCap
+	}
+	meta.DiffIncluded = meta.DiffIncluded || fallback.DiffIncluded
+	meta = promptTraceMetadata(meta, p.Name(), "")
+	logger.Record(prompttrace.Record{
+		Stage:              "request",
+		Strategy:           meta.Strategy,
+		Provider:           meta.Provider,
+		Model:              meta.Model,
+		Seq:                meta.Seq,
+		OfferedSeqs:        append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:          meta.BranchRef,
+		Generation:         meta.Generation,
+		DiffIncluded:       meta.DiffIncluded,
+		DiffCap:            meta.DiffCap,
+		Transform:          transform,
+		SubprocessEnvelope: append([]byte(nil), body...),
+	})
+}
+
+func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strategy string, response prompttrace.Response) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = strategy
+	}
+	meta = promptTraceMetadata(meta, p.Name(), "")
+	logger.Record(prompttrace.Record{
+		Stage:        "response",
+		Strategy:     meta.Strategy,
+		Provider:     meta.Provider,
+		Model:        meta.Model,
+		Seq:          meta.Seq,
+		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:    meta.BranchRef,
+		Generation:   meta.Generation,
+		DiffIncluded: meta.DiffIncluded,
+		DiffCap:      meta.DiffCap,
+		Response:     &response,
+	})
 }
 
 // subprocessRequest is the JSONL request envelope. Field tags fix the wire
@@ -610,17 +708,14 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 // arrives we kill the process — this guarantees the next request gets a
 // fresh plugin rather than waiting on a stuck one.
 func (s *pluginSession) exchange(ctx context.Context, req subprocessRequest) (subprocessResponse, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalSubprocessRequest(req)
 	if err != nil {
-		return subprocessResponse{}, fmt.Errorf("encode request: %w", err)
+		return subprocessResponse{}, err
 	}
-	if bytesContainNewline(body) {
-		// JSON encoding never produces a literal newline by default,
-		// but defense-in-depth: a future struct field with a custom
-		// marshaller could. JSONL framing breaks the moment a request
-		// straddles two lines.
-		return subprocessResponse{}, errors.New("subprocess: encoded request contains newline")
-	}
+	return s.exchangeBytes(ctx, body)
+}
+
+func (s *pluginSession) exchangeBytes(ctx context.Context, body []byte) (subprocessResponse, error) {
 	reply := make(chan pluginReply, 1)
 	pr := pluginRequest{bytes: body, reply: reply}
 
@@ -640,6 +735,30 @@ func (s *pluginSession) exchange(ctx context.Context, req subprocessRequest) (su
 		s.kill()
 		return subprocessResponse{}, ctx.Err()
 	}
+}
+
+func marshalSubprocessPromptRequest(req subprocessRequest, inputDiff, outputDiff string) ([]byte, prompttrace.TransformMetadata, error) {
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return nil, prompttrace.TransformMetadata{}, err
+	}
+	redacted := RedactDiffSecrets(inputDiff)
+	return body, promptTransformMetadata(inputDiff, redacted, outputDiff), nil
+}
+
+func marshalSubprocessRequest(req subprocessRequest) ([]byte, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	if bytesContainNewline(body) {
+		// JSON encoding never produces a literal newline by default,
+		// but defense-in-depth: a future struct field with a custom
+		// marshaller could. JSONL framing breaks the moment a request
+		// straddles two lines.
+		return nil, errors.New("subprocess: encoded request contains newline")
+	}
+	return body, nil
 }
 
 // bytesContainNewline reports whether b includes a literal LF byte.

@@ -162,7 +162,7 @@ func TestLogsCommandRegisteredWithHelp(t *testing.T) {
 		t.Fatalf("execute help: %v\nstderr:\n%s", err, errOut.String())
 	}
 	help := out.String()
-	for _, want := range []string{"Print the current repo daemon log tail", "--lines", "--follow"} {
+	for _, want := range []string{"Print the current repo daemon log tail", "--lines", "--follow", "Full AI prompt traces are stored separately"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("logs help missing %q:\n%s", want, help)
 		}

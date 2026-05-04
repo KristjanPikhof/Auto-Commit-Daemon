@@ -50,6 +50,8 @@ acd events              # show the durable product decision ledger
 acd events --watch      # stream decisions appended after watch starts
 acd explain --path FILE # explain why a path was captured, skipped, or blocked
 acd explain --commit HEAD # explain decisions linked to a commit
+acd prompt              # inspect the last opt-in AI prompt trace
+acd prompt --seq 42 --json # inspect an event or offered intent seq as JSON
 acd fix --dry-run       # plan safe remediation for a stuck repo
 acd fix --yes           # apply the safe plan after reading it
 acd logs                # tail the current repo daemon log as raw JSONL
@@ -93,8 +95,10 @@ For daily "what happened?" questions, start with
 `acd status`, `acd events`, and `acd explain --path FILE`; use
 `acd fix --dry-run` before applying any safe remediation. `acd logs` reads the
 daemon's per-repo JSONL log directly. It does not pretty print, summarize, or
-sanitize the stream; use `acd doctor --bundle` when you want bundled
-diagnostics with tail snippets and safe metadata for reports.
+sanitize the stream, and it does not include full AI prompt traces. Use
+`acd prompt` for opt-in prompt-trace inspection, and use `acd doctor --bundle`
+when you want bundled diagnostics with tail snippets and safe metadata for
+reports.
 
 See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
 for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
@@ -207,7 +211,33 @@ Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 `ACD_TRACE_DIR` is set. Each record includes `ts`, `repo`, `branch_ref`,
 `head_sha`, `event_class`, `decision`, `reason`, `input`, `output`, `error`,
 `seq`, and `generation`. See [docs/capture-replay.md](docs/capture-replay.md#trace-event-classes)
-for the full `event_class` enumeration.
+for the full `event_class` enumeration. These decision traces summarize daemon
+behavior; they do not store full AI prompts or provider request envelopes.
+
+Enable AI prompt tracing only when you need to inspect exactly what an AI
+provider or intent planner saw. The default deterministic provider does not
+send an AI request, so `ACD_AI_PROMPT_TRACE=1` alone will not create prompt
+records. Use a non-deterministic provider when you expect prompt traces:
+
+~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
+acd prompt --last
+
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
+acd prompt --seq 42 --json
+~~~
+
+Prompt traces are local JSONL diagnostics under `<gitDir>/acd/prompt-trace/`.
+They are written after ACD's redaction and truncation steps, but they may still
+contain source code, paths, request envelopes, provider responses, and fallback
+metadata. Files are grouped by UTC day and are not pruned automatically; the
+async writer buffers up to 256 pending records and drops the oldest buffered
+record if it falls behind. Treat the directory as sensitive and delete it when
+the investigation is complete.
 
 ## Environment
 
@@ -215,6 +245,7 @@ for the full `event_class` enumeration.
 |---|---:|---|
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
+| `ACD_AI_PROMPT_TRACE` | unset | Truthy values `1`, `true`, `yes` persist local AI request/response diagnostics under `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a request; sensitive even after redaction/truncation. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SAFE_IGNORE` | enabled | Set to `0`, `false`, `no`, or `off` to disable ACD's internal generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated patterns appended to the safe-ignore defaults, for example `dist/,build/`. |
@@ -222,6 +253,8 @@ for the full `event_class` enumeration.
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
 | `ACD_COMMIT_STRATEGY` | `event` | `event` preserves one captured event per commit. `intent` asks the AI planner to select one or more pending captures for the next commit. |
 | `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the intent planner in one normal planning pass. |
+| `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal intent planning pass starts. |
+| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact planner context. |
 | `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before ACD forces the overdue capture into a one-item planning window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
@@ -272,8 +305,13 @@ export ACD_AI_DIFF_EGRESS=1
 Use `event` for CI smoke runs and compatibility-sensitive shared branches.
 Use `intent` when review quality matters and the AI endpoint is trusted. Intent
 planning may group related captures, choose exactly one capture, or defer
-unrelated captures. Over-deferred captures are forced through a one-capture
-planner window so they cannot starve.
+unrelated captures. `ACD_INTENT_WINDOW` is the maximum offered to a normal
+planner pass, `ACD_INTENT_MIN_PENDING` is the preferred count trigger, and
+`ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch for sparse queues. Explicit
+flushes from `acd wake` bypass only the batch wait, so the daemon plans the
+currently visible pending captures immediately. Over-deferred captures are
+forced through a one-capture planner window so they cannot starve; ordered
+same-path or nested-path barriers still land first.
 
 ## Docs
 

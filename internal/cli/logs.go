@@ -32,7 +32,9 @@ func newLogsCmd() *cobra.Command {
 The default repo is the current working directory. By default acd logs prints
 the last 100 raw log lines and exits. Use --lines to choose the initial tail
 length, or --follow to keep streaming appended lines until interrupted. For
-bundled diagnostics and sanitized tails, use acd doctor or acd doctor --bundle.`,
+bundled diagnostics and sanitized tails, use acd doctor or acd doctor --bundle.
+Full AI prompt traces are stored separately and require ACD_AI_PROMPT_TRACE=1
+plus acd prompt.`,
 		Example: `  acd logs
   acd logs --lines 200
   acd logs --follow

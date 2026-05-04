@@ -100,9 +100,12 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
 | `ACD_COMMIT_STRATEGY` | `event` | `event` keeps one captured event per commit. `intent` asks the AI planner to select one or more offered captures for the next commit. |
 | `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the planner in a normal window. |
+| `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal planner window starts. |
+| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs. Off by default; metadata-only payload otherwise. Has no effect for `deterministic`. |
+| `ACD_AI_PROMPT_TRACE` | unset | Truthy (`1`/`true`/`yes`) writes local AI prompt diagnostics to `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a request. Treat as sensitive: records are post-redaction/truncation but may still contain source text. |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
 
@@ -113,17 +116,35 @@ Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning 
 `ACD_COMMIT_STRATEGY=event` is the compatibility default. Replay drains pending
 captures in FIFO order and keeps the current one-event commit behavior.
 
-`ACD_COMMIT_STRATEGY=intent` changes only replay grouping. ACD offers the next
+`ACD_COMMIT_STRATEGY=intent` changes only replay grouping. ACD offers a bounded
 pending window to the configured AI provider as structured `capture_intent_plan`
-input. The planner must classify every offered seq as selected or deferred. It
-may select exactly one capture, select any larger non-empty subset, or defer
-unrelated captures. ACD validates the plan before touching git, applies selected
-captures in seq order through the same scratch-index path, writes one commit,
-and marks all selected events with the same `commit_oid`.
+input. `ACD_INTENT_WINDOW` is the maximum offered, `ACD_INTENT_MIN_PENDING` is
+the preferred normal trigger, and `ACD_INTENT_MAX_PENDING_AGE` bounds how long a
+sparse queue waits before planning anyway. The planner must classify every
+offered seq as selected or deferred. It may select exactly one capture, select
+any larger non-empty subset, or defer unrelated captures. ACD validates the plan
+before touching git, applies selected captures in seq order through the same
+scratch-index path, writes one commit, and marks all selected events with the
+same `commit_oid`.
 
 If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
 containing only that overdue capture. That keeps intent grouping from starving
 small or hard-to-name edits.
+
+Batching behavior is deliberately bounded:
+
+- `ACD_INTENT_WINDOW` is a ceiling, not a target. A normal pass offers at most
+  that many visible pending captures.
+- `ACD_INTENT_MIN_PENDING` is the preferred count trigger. Until the visible
+  queue reaches it, intent replay usually waits for a better grouping window.
+- `ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch. Sparse repos publish
+  when the oldest visible pending capture reaches that age even if the count
+  trigger was not met.
+- `acd wake` and other explicit flush requests bypass only the batch wait. They
+  do not bypass planner validation, ordering checks, terminal replay barriers,
+  or the forced-aging rules.
+- Forced aging can still select a one-capture window after repeated deferrals;
+  if an earlier related-path capture must land first, ACD preserves that order.
 
 Setup choices:
 
@@ -152,6 +173,9 @@ Troubleshooting:
 
 - `acd status` and `acd diagnose --json` show active strategy, deferred count,
   forced-aging readiness, and the last planner error.
+- When commits are waiting for a larger batch, `acd status`, `acd diagnose`,
+  and `acd doctor` show visible pending count, `min_pending`, oldest pending
+  age, `max_pending_age`, and the age-trigger countdown.
 - `acd events --watch` shows grouped seqs, deferrals, forced-aging decisions,
   and planner validation failures from the decision ledger.
 - If the AI provider fails or returns an invalid plan, ACD records the planner
@@ -160,6 +184,49 @@ Troubleshooting:
 - Recovery remains the same: inspect with `acd diagnose --json`, preview with
   `acd recover --auto --dry-run --json`, then apply recovery only when the
   daemon is stopped.
+
+---
+
+## Prompt tracing and `acd prompt`
+
+Prompt tracing is off by default. Enable it only while debugging AI behavior:
+
+~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
+acd prompt --last
+acd prompt --seq 42 --json
+~~~
+
+In `event` mode, the trace shows the commit-message request for one captured
+event: strategy, provider, model, seq, redaction/truncation metadata, system
+prompt, user prompt, request envelope, response, and any fallback reason.
+The default deterministic provider does not send an AI request, so it emits no
+prompt trace.
+
+~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
+acd prompt --last
+acd prompt --seq 42
+~~~
+
+In `intent` mode, `--seq` matches either the event seq or any offered seq in an
+intent planner window. The trace shows `offered_seqs`, selected/deferred seqs,
+grouping reason, validation errors, and deterministic fallback records when the
+planner output cannot be trusted.
+
+Trace files are stored locally as JSONL under `<gitDir>/acd/prompt-trace/`.
+They are captured after ACD redacts and truncates outbound payloads, but they
+may still contain source code, private paths, prompt text, tool schemas, request
+envelopes, provider responses, and fallback metadata. Do not enable
+`ACD_AI_PROMPT_TRACE` on sensitive repos unless the local diagnostic value is
+worth that risk. Files are grouped by UTC day and are not pruned automatically;
+the async writer buffers up to 256 pending records and drops the oldest buffered
+record if it falls behind. Remove the prompt-trace directory after
+sharing-safe evidence has been collected.
 
 ---
 
@@ -370,6 +437,20 @@ The `deterministic` provider never fails. It always produces a message and is th
 - **Do not enable `ACD_AI_DIFF_EGRESS` on private or sensitive repositories without explicit consent and a verified endpoint or plugin.** If you run a local proxy or self-hosted model, set `ACD_AI_BASE_URL` to that endpoint and verify it does not forward requests upstream.
 - `ACD_AI_BASE_URL` must be an absolute `https://` URL. Plain HTTP and relative URLs are rejected before the OpenAI-compatible provider is built.
 - The default HTTP client refuses 3xx redirects to prevent the bearer token from being steered to a different host by a hostile network.
+
+### Prompt traces stay local but can contain code
+
+- `ACD_AI_PROMPT_TRACE=1` persists prompt request and response diagnostics under
+  `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a
+  request; there is no automatic upload.
+- Records are written after ACD redaction/truncation, but the prompt may still
+  include source code, private paths, diffs allowed by `ACD_AI_DIFF_EGRESS`, and
+  provider responses.
+- Files are daily JSONL logs with no automatic pruning. ACD buffers 256 pending
+  prompt-trace records in memory and drops the oldest buffered record under
+  sustained writer backpressure.
+- Treat prompt traces like raw logs from a private repository. Review or delete
+  them before sharing a repo archive, support bundle, or debug artifact.
 
 ---
 

@@ -18,6 +18,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"fix", []string{"acd fix --dry-run", "requires --yes", "safe remediation"}},
 		{"list", []string{"acd list --watch --interval 5s", "--watch", "--interval"}},
 		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
+		{"prompt", []string{"ACD_AI_PROMPT_TRACE", "acd prompt --seq 42 --json", "--last"}},
 		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
 		{"diagnose", []string{"state read-only", "acd recover --repo . --auto --dry-run --json"}},
 		{"recover", []string{"acd recover --auto --dry-run", "requires --yes", "--clear-pause"}},

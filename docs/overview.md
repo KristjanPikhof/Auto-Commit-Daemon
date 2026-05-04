@@ -27,12 +27,14 @@ captures into one reviewable commit without changing capture durability.
    `after_oid` blob OIDs.
 
 2. **Replay.** A background loop drains `pending` events. In `event` strategy it
-   publishes one event at a time. In `intent` strategy it offers a bounded
-   pending window to the AI planner, then publishes the selected captures as one
-   commit. Both paths apply ops against an isolated scratch index, write a tree,
-   create a commit, and advance the branch ref atomically with `git update-ref`.
-   Unsafe events become `blocked_conflict`; replay-build failures become
-   `failed`. Both are terminal barriers when later pending work is waiting.
+   publishes one event at a time. In `intent` strategy it waits for
+   `ACD_INTENT_MIN_PENDING` pending captures, `ACD_INTENT_MAX_PENDING_AGE`, or
+   an explicit flush, then offers at most `ACD_INTENT_WINDOW` visible captures
+   to the AI planner and publishes the selected captures as one commit. Both
+   paths apply ops against an isolated scratch index, write a tree, create a
+   commit, and advance the branch ref atomically with `git update-ref`. Unsafe
+   events become `blocked_conflict`; replay-build failures become `failed`.
+   Both are terminal barriers when later pending work is waiting.
 
 3. **AI messages and planning.** Commit subjects, and optional intent grouping,
    come from the configured AI provider or deterministic fallback. Diff context

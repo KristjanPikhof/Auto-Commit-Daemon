@@ -29,6 +29,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -138,6 +139,9 @@ type ReplayOpts struct {
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
+	// PromptTrace receives opt-in provider prompt records. Nil disables prompt
+	// persistence.
+	PromptTrace prompttrace.Logger
 
 	// CommitStrategy selects one-event replay or intent-grouped replay. Empty
 	// resolves from ACD_COMMIT_STRATEGY, preserving event replay by default.
@@ -151,6 +155,14 @@ type ReplayOpts struct {
 	// IntentWindow caps the normal planning window. Zero resolves from env.
 	IntentWindow int
 
+	// IntentMinPending is the preferred pending-count gate before intent
+	// planning starts. Zero resolves from env.
+	IntentMinPending int
+
+	// IntentMaxPendingAge is the bounded wait escape hatch for sparse pending
+	// queues that have not reached IntentMinPending. Zero resolves from env.
+	IntentMaxPendingAge time.Duration
+
 	// IntentRecentCommits caps recent history context supplied to the planner.
 	// Zero resolves from env.
 	IntentRecentCommits int
@@ -162,6 +174,11 @@ type ReplayOpts struct {
 	// IntentIncludeDiffs permits captured diffs in planner requests. Production
 	// callers should leave this false unless diff egress is explicitly enabled.
 	IntentIncludeDiffs bool
+
+	// IntentBypassBatchWait lets explicit flush requests plan the currently
+	// visible pending window without waiting for IntentMinPending or
+	// IntentMaxPendingAge.
+	IntentBypassBatchWait bool
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -177,7 +194,11 @@ type ReplaySummary struct {
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
-	Skipped   bool // replay drain was intentionally skipped before reading events
+	Skipped   bool // replay drain was intentionally skipped without publishing
+	// SkippedReason distinguishes intentional no-op passes from an empty
+	// pending queue. Empty means replay was not skipped or the legacy pause
+	// skip path set only Skipped.
+	SkippedReason string
 	// HasMore is true when ReplayOpts.Limit capped the batch and at least one
 	// additional pending event was visible beyond the cap. The run loop uses
 	// this to schedule an immediate follow-up replay pass without waiting for
@@ -269,20 +290,30 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		_ = os.Remove(indexFile)
 	}
 
-	// Per-pass batch budget. When opts.Limit > 0 we query one extra row so the
-	// "is there more queued behind this batch?" question can be answered
-	// without a follow-up COUNT — sum.HasMore tells the run loop to schedule
-	// an immediate next pass instead of waiting for the poll tick.
-	queryLimit := opts.Limit
+	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
+	if err != nil {
+		return sum, err
+	}
+	if closeIntentPlanner != nil {
+		defer closeIntentPlanner()
+	}
+
+	// Per-pass batch budget. When bounded, query one extra row so the "is
+	// there more queued behind this batch?" question can be answered without a
+	// follow-up COUNT. Intent replay uses its own visible-window budget so a
+	// small ReplayOpts.Limit cannot make the min-pending gate see an artificial
+	// short queue.
+	batchLimit := replayPendingBatchLimit(opts, intentCfg)
+	queryLimit := batchLimit
 	if queryLimit > 0 {
-		queryLimit = opts.Limit + 1
+		queryLimit++
 	}
 	pending, err := state.PendingEvents(ctx, db, queryLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
 	}
-	if opts.Limit > 0 && len(pending) > opts.Limit {
-		pending = pending[:opts.Limit]
+	if batchLimit > 0 && len(pending) > batchLimit {
+		pending = pending[:batchLimit]
 		sum.HasMore = true
 	}
 	if len(pending) == 0 {
@@ -321,13 +352,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		return sum, err
 	}
 
-	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
-	if err != nil {
-		return sum, err
-	}
-	if closeIntentPlanner != nil {
-		defer closeIntentPlanner()
-	}
 	if intentCfg.enabled {
 		return replayIntentBatch(ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile, pending, parent, parentTree, sum)
 	}
@@ -697,13 +721,27 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	return sum, nil
 }
 
+func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
+	if !cfg.enabled {
+		return opts.Limit
+	}
+	limit := cfg.window
+	if cfg.minPending > limit {
+		limit = cfg.minPending
+	}
+	return limit
+}
+
 type intentReplayConfig struct {
-	enabled      bool
-	planner      ai.IntentPlanner
-	window       int
-	recent       int
-	deferLimit   int
-	includeDiffs bool
+	enabled         bool
+	planner         ai.IntentPlanner
+	window          int
+	minPending      int
+	maxPendingAge   time.Duration
+	recent          int
+	deferLimit      int
+	includeDiffs    bool
+	bypassBatchWait bool
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -721,14 +759,23 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 
 	out := intentReplayConfig{
-		enabled:      true,
-		window:       cfg.IntentWindow,
-		recent:       cfg.IntentRecentCommits,
-		deferLimit:   cfg.IntentDeferLimit,
-		includeDiffs: opts.IntentIncludeDiffs,
+		enabled:         true,
+		window:          cfg.IntentWindow,
+		minPending:      cfg.IntentMinPending,
+		maxPendingAge:   cfg.IntentMaxPendingAge,
+		recent:          cfg.IntentRecentCommits,
+		deferLimit:      cfg.IntentDeferLimit,
+		includeDiffs:    opts.IntentIncludeDiffs,
+		bypassBatchWait: opts.IntentBypassBatchWait,
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
+	}
+	if opts.IntentMinPending > 0 {
+		out.minPending = opts.IntentMinPending
+	}
+	if opts.IntentMaxPendingAge > 0 {
+		out.maxPendingAge = opts.IntentMaxPendingAge
 	}
 	if opts.IntentRecentCommits > 0 {
 		out.recent = opts.IntentRecentCommits
@@ -740,6 +787,12 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 	if out.window <= 0 {
 		out.window = ai.DefaultIntentWindow
+	}
+	if out.minPending <= 0 {
+		out.minPending = ai.DefaultIntentMinPending
+	}
+	if out.maxPendingAge <= 0 {
+		out.maxPendingAge = ai.DefaultIntentMaxPendingAge
 	}
 	if out.recent < 0 {
 		out.recent = 0
@@ -803,11 +856,17 @@ func replayIntentBatch(
 	parentTree string,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
-	window, forced, err := selectIntentWindow(ctx, db, pending, cfg)
+	window, forced, waitReason, err := selectIntentWindow(ctx, db, pending, cfg)
 	if err != nil {
 		return sum, err
 	}
 	if len(window) == 0 {
+		if waitReason != "" {
+			sum.Skipped = true
+			sum.SkippedReason = waitReason
+			sum.HasMore = false
+			traceIntentBatchWait(opts.Trace, repoRoot, activeCtx, pending, cfg, waitReason)
+		}
 		return sum, nil
 	}
 	preflight := intentPreflightEvents(pending, window, forced)
@@ -836,7 +895,19 @@ func replayIntentBatch(
 		}
 	}
 
-	plan, validationFailure, err := planIntentWithFallback(ctx, db, cfg.planner, req, items, activeCtx, nowSec)
+	plannerCtx := ctx
+	if opts.PromptTrace != nil {
+		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
+			Strategy:     string(ai.CommitStrategyIntent),
+			Provider:     cfg.planner.Name(),
+			OfferedSeqs:  intentOfferedSeqs(req),
+			BranchRef:    activeCtx.BranchRef,
+			Generation:   activeCtx.BranchGeneration,
+			DiffIncluded: intentRequestIncludesDiff(req),
+			DiffCap:      ai.DiffCap,
+		})
+	}
+	plan, validationFailure, err := planIntentWithFallback(plannerCtx, db, cfg.planner, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
@@ -895,9 +966,9 @@ func rejectInvalidIntentWindowEvents(
 	return sum, false, nil
 }
 
-func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, error) {
+func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, string, error) {
 	if len(pending) == 0 {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 	var (
 		forcedEvent state.CaptureEvent
@@ -907,7 +978,7 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	for _, ev := range pending {
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 		if !ok || ps.DeferCount < cfg.deferLimit {
 			continue
@@ -926,15 +997,27 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 			if n > len(pending) {
 				n = len(pending)
 			}
-			return pending[:n], false, nil
+			return pending[:n], false, "", nil
 		}
-		return []state.CaptureEvent{forcedEvent}, true, nil
+		return []state.CaptureEvent{forcedEvent}, true, "", nil
+	}
+	if !cfg.bypassBatchWait && intentBatchShouldWait(pending, cfg, time.Now()) {
+		return nil, false, "skipped_due_intent_batch_wait", nil
 	}
 	n := cfg.window
 	if n > len(pending) {
 		n = len(pending)
 	}
-	return pending[:n], false, nil
+	return pending[:n], false, "", nil
+}
+
+func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
+	if len(pending) == 0 || len(pending) >= cfg.minPending {
+		return false
+	}
+	oldest := pending[0]
+	oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
+	return oldestAge < cfg.maxPendingAge
 }
 
 func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
@@ -1053,6 +1136,26 @@ func buildIntentPlanRequest(
 	return items, req, nil
 }
 
+func intentOfferedSeqs(req ai.IntentPlanRequest) []int64 {
+	if len(req.OfferedCaptures) == 0 {
+		return nil
+	}
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return seqs
+}
+
+func intentRequestIncludesDiff(req ai.IntentPlanRequest) bool {
+	for _, capture := range req.OfferedCaptures {
+		if capture.CapturedDiff != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func buildIntentPathContext(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, limit int) []ai.PathCommitContext {
 	if len(paths) == 0 || limit <= 0 {
 		return nil
@@ -1101,6 +1204,7 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		return plan, "", nil
 	}
 	validationFailure = err.Error()
+	recordIntentPromptFallback(ctx, planner, validationFailure)
 	for _, item := range items {
 		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, err.Error()); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
@@ -1118,6 +1222,35 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		return ai.IntentPlan{}, validationFailure, err
 	}
 	return plan, validationFailure, nil
+}
+
+func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, reason string) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	provider := ""
+	if planner != nil {
+		provider = ai.PrimaryProviderName(planner)
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = string(ai.CommitStrategyIntent)
+	}
+	logger.Record(prompttrace.Record{
+		Stage:        "fallback",
+		Strategy:     meta.Strategy,
+		Provider:     provider,
+		Model:        meta.Model,
+		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:    meta.BranchRef,
+		Generation:   meta.Generation,
+		DiffIncluded: meta.DiffIncluded,
+		DiffCap:      meta.DiffCap,
+		Response: &prompttrace.Response{
+			FallbackProvider: ai.DeterministicProvider{}.Name(),
+			FallbackReason:   reason,
+		},
+	})
 }
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
@@ -1252,9 +1385,37 @@ func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx Captu
 			"latest_commit_present":     req.LatestCommit != nil,
 			"path_commit_context_count": len(req.PathCommitContext),
 			"window":                    cfg.window,
+			"min_pending":               cfg.minPending,
+			"max_pending_age_seconds":   cfg.maxPendingAge.Seconds(),
 			"recent_commits":            cfg.recent,
 			"defer_limit":               cfg.deferLimit,
 		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, pending []state.CaptureEvent, cfg intentReplayConfig, reason string) {
+	if logger == nil || len(pending) == 0 {
+		return
+	}
+	oldest := pending[0]
+	oldestAgeSeconds := time.Now().Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second)))).Seconds()
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.batch_wait",
+		Decision:   "skipped",
+		Reason:     reason,
+		Input: map[string]any{
+			"visible_pending":         len(pending),
+			"min_pending":             cfg.minPending,
+			"oldest_seq":              oldest.Seq,
+			"oldest_age_seconds":      oldestAgeSeconds,
+			"max_pending_age_seconds": cfg.maxPendingAge.Seconds(),
+			"window":                  cfg.window,
+		},
+		Seq:        oldest.Seq,
 		Generation: cctx.BranchGeneration,
 	})
 }

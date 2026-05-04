@@ -47,6 +47,8 @@ const (
 	EnvCAFile              = "ACD_AI_CA_FILE"
 	EnvCommitStrategy      = "ACD_COMMIT_STRATEGY"
 	EnvIntentWindow        = "ACD_INTENT_WINDOW"
+	EnvIntentMinPending    = "ACD_INTENT_MIN_PENDING"
+	EnvIntentMaxPendingAge = "ACD_INTENT_MAX_PENDING_AGE"
 	EnvIntentRecentCommits = "ACD_INTENT_RECENT_COMMITS"
 	EnvIntentDeferLimit    = "ACD_INTENT_DEFER_LIMIT"
 )
@@ -57,6 +59,8 @@ const DefaultProviderTimeout = 30 * time.Second
 
 const (
 	DefaultIntentWindow        = 10
+	DefaultIntentMinPending    = 10
+	DefaultIntentMaxPendingAge = 5 * time.Minute
 	DefaultIntentRecentCommits = 5
 	DefaultIntentDeferLimit    = 2
 )
@@ -109,6 +113,14 @@ type ProviderConfig struct {
 	// consider at once.
 	IntentWindow int
 
+	// IntentMinPending is the preferred pending-count gate before a normal
+	// intent planning pass starts.
+	IntentMinPending int
+
+	// IntentMaxPendingAge is the bounded wait escape hatch for sparse
+	// pending queues that have not reached IntentMinPending.
+	IntentMaxPendingAge time.Duration
+
 	// IntentRecentCommits caps recent commit context supplied to intent
 	// planning.
 	IntentRecentCommits int
@@ -136,6 +148,8 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		CAFile:              strings.TrimSpace(os.Getenv(EnvCAFile)),
 		CommitStrategy:      normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
 		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
+		IntentMinPending:    parsePositiveIntEnv(EnvIntentMinPending, DefaultIntentMinPending),
+		IntentMaxPendingAge: parsePositiveDurationEnv(EnvIntentMaxPendingAge, DefaultIntentMaxPendingAge),
 		IntentRecentCommits: parsePositiveIntEnv(EnvIntentRecentCommits, DefaultIntentRecentCommits),
 		IntentDeferLimit:    parseNonNegativeIntEnv(EnvIntentDeferLimit, DefaultIntentDeferLimit),
 	}
@@ -191,6 +205,18 @@ func parseNonNegativeIntEnv(name string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parsePositiveDurationEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // normalizeMode trims whitespace, lowercases the prefix (the part before

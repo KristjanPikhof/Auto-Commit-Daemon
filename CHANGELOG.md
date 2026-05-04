@@ -8,9 +8,14 @@
   configured AI provider to group related pending captures into one reviewable
   commit while keeping the existing `event` strategy as the default.
 - Intent planning controls: `ACD_INTENT_WINDOW`,
+  `ACD_INTENT_MIN_PENDING`, `ACD_INTENT_MAX_PENDING_AGE`,
   `ACD_INTENT_RECENT_COMMITS`, and `ACD_INTENT_DEFER_LIMIT` tune planner
-  context, offered capture windows, and starvation protection for deferred
-  work.
+  context, offered capture windows, sparse-queue waits, and starvation
+  protection for deferred work.
+- Opt-in prompt tracing: `ACD_AI_PROMPT_TRACE=1` plus `acd prompt` lets
+  operators inspect local event and intent-planner request diagnostics after
+  redaction/truncation, with explicit privacy warnings because traces may still
+  contain source code.
 - Intent grouping observability in `status`, `diagnose`, `doctor`, `events`,
   and `explain`, including grouped event sequences, deferral reasons,
   forced-aging decisions, and planner validation failures.
@@ -32,7 +37,8 @@
 - `acd events --watch` now follows decisions appended after watch starts unless
   `--since` is provided.
 - Docs now cover explainable history, failed replay barriers, safe-ignore
-  restart requirements, and the current status JSON fields.
+  restart requirements, intent batch-wait troubleshooting, prompt-trace
+  provider setup, local retention behavior, and the current status JSON fields.
 
 ### Fixed
 

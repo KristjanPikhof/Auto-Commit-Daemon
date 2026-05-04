@@ -2381,9 +2381,11 @@ func TestReplay_EventStrategyIgnoresIntentPlanner(t *testing.T) {
 		},
 	}
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
-		GitDir:         f.gitDir,
-		CommitStrategy: ai.CommitStrategyEvent,
-		IntentPlanner:  planner,
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyEvent,
+		IntentPlanner:       planner,
+		IntentMinPending:    99,
+		IntentMaxPendingAge: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
@@ -2396,6 +2398,331 @@ func TestReplay_EventStrategyIgnoresIntentPlanner(t *testing.T) {
 	}
 	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
 		t.Fatalf("commit count=%d want seed+2 event commits", got)
+	}
+}
+
+func TestReplay_IntentStrategyWaitsBelowMinPendingBeforeMaxAge(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "wait-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "wait-b.txt", "b\n")
+
+	planner := &recordingIntentPlanner{}
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Trace:               trace,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 while batch gate waits", planner.calls)
+	}
+	if sum.Published != 0 || !sum.Skipped || sum.SkippedReason != "skipped_due_intent_batch_wait" {
+		t.Fatalf("summary=%+v want skipped_due_intent_batch_wait with no publish", sum)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2 after wait", len(pending))
+	}
+	events := traceEventsByClass(trace.Events(), "intent.batch_wait")
+	if len(events) != 1 || events[0].Reason != "skipped_due_intent_batch_wait" {
+		t.Fatalf("intent.batch_wait trace=%+v want skipped_due_intent_batch_wait", events)
+	}
+}
+
+func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "min-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "min-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "min-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq},
+			Subject:        "Group min pending",
+			GroupingReason: "min pending reached",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 3 || sum.Skipped {
+		t.Fatalf("summary=%+v want 3 published without skip", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 3 {
+		t.Fatalf("offered=%d want 3", len(got))
+	}
+}
+
+func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "limit-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "limit-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "limit-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Group visible pending",
+			GroupingReason: "min pending reached beyond replay limit",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Limit:               1,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want 2 published without batch wait", sum)
+	}
+	if !sum.HasMore {
+		t.Fatalf("HasMore=false want true with pending beyond offered window; summary=%+v", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 2 || got[0].Seq != pending[0].Seq || got[1].Seq != pending[1].Seq {
+		t.Fatalf("offered captures=%+v want first two pending only", got)
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents after replay: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Seq != pending[2].Seq {
+		t.Fatalf("remaining pending=%+v want only third capture", remaining)
+	}
+}
+
+func TestReplay_IntentStrategyPlansWhenOldestPendingReachesMaxAge(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "age-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "age-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	setCaptureEventTimestamp(t, ctx, f.db, pending[0].Seq, time.Now().Add(-2*time.Hour))
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Group aged pending",
+			GroupingReason: "max pending age reached",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want aged partial window published", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 2 {
+		t.Fatalf("offered=%d want visible partial window of 2", len(got))
+	}
+}
+
+func TestReplay_IntentStrategyFlushBypassesBatchWait(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "flush-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "flush-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Flush pending intent",
+			GroupingReason: "explicit flush",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:                f.gitDir,
+		CommitStrategy:        ai.CommitStrategyIntent,
+		IntentPlanner:         planner,
+		IntentWindow:          10,
+		IntentMinPending:      3,
+		IntentMaxPendingAge:   time.Hour,
+		IntentBypassBatchWait: true,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want flush bypass to publish visible pending", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 2 {
+		t.Fatalf("offered=%d want 2", len(got))
+	}
+}
+
+func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "forced-wait.txt", "a\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, pending[0].Seq, 1, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "Publish overdue capture",
+			GroupingReason: "forced aging",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Skipped {
+		t.Fatalf("summary=%+v want forced aging publish despite batch wait", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if !planner.requests[0].ForcedAging {
+		t.Fatal("ForcedAging=false want true")
+	}
+}
+
+func TestReplay_IntentStrategyBatchWaitSeesOnlyBarrierVisiblePending(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "barrier-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "barrier-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2 before barrier", len(pending))
+	}
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET state = ?, error = ? WHERE seq = ?`,
+		state.EventStateFailed, "test terminal barrier", pending[0].Seq); err != nil {
+		t.Fatalf("mark terminal barrier: %v", err)
+	}
+	visible, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents after barrier: %v", err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("visible pending=%d want 0 behind terminal barrier", len(visible))
+	}
+
+	planner := &recordingIntentPlanner{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    1,
+		IntentMaxPendingAge: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 because terminal barrier hides later rows", planner.calls)
+	}
+	if sum.Skipped || sum.SkippedReason != "" || sum.Published != 0 {
+		t.Fatalf("summary=%+v want ordinary no-pending no-op", sum)
 	}
 }
 
@@ -2425,10 +2752,11 @@ func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T)
 	}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
-		GitDir:         f.gitDir,
-		CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner:  planner,
-		IntentWindow:   10,
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 2,
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
@@ -2518,6 +2846,7 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     2,
+		IntentMinPending: 2,
 		IntentDeferLimit: 1,
 	})
 	if err != nil {
@@ -2544,6 +2873,7 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     3,
+		IntentMinPending: 2,
 		IntentDeferLimit: 1,
 	})
 	if err != nil {
@@ -2641,6 +2971,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     2,
+		IntentMinPending: 2,
 		IntentDeferLimit: 2,
 	})
 	if err != nil {
@@ -3458,6 +3789,16 @@ func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture,
 		t.Fatal("expected at least one pending event")
 	}
 	return len(pending)
+}
+
+func setCaptureEventTimestamp(t *testing.T, ctx context.Context, db *state.DB, seq int64, ts time.Time) {
+	t.Helper()
+	capturedTS := float64(ts.UnixNano()) / float64(time.Second)
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET captured_ts = ? WHERE seq = ?`,
+		capturedTS, seq); err != nil {
+		t.Fatalf("set capture timestamp seq=%d: %v", seq, err)
+	}
 }
 
 func gitStatusPorcelain(t *testing.T, ctx context.Context, repoDir string) string {

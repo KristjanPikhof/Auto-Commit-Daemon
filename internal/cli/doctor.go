@@ -469,6 +469,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	}
 	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
 		rr.IntentStrategy = intentStrategy
+		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy)...)
 	} else {
 		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
 	}
@@ -517,6 +518,23 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	}
 
 	return true
+}
+
+func doctorIntentStrategyNotes(r intentStrategyReport) []string {
+	if !r.BatchWaitActive {
+		return nil
+	}
+	wait := formatDurationCompact(time.Duration(r.AgeTriggerInSeconds) * time.Second)
+	need := r.MinPending - r.VisiblePendingEvents
+	if need < 0 {
+		need = 0
+	}
+	return []string{
+		fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining)", need, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), wait),
+		"to publish now, run acd wake for the active session or request a flush; explicit flushes bypass intent batch wait",
+		"for sparse repos, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE and restart acd",
+		"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
+	}
 }
 
 func countDoctorClients(ctx context.Context, conn *sql.DB) (int, error) {
@@ -662,6 +680,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		if rr.IntentStrategy.Active || rr.IntentStrategy.DeferredEvents > 0 || rr.IntentStrategy.LastPlannerError != "" {
 			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
 				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
+			if rr.IntentStrategy.BatchWaitActive {
+				fmt.Fprintf(out, "      batch wait : pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+					rr.IntentStrategy.VisiblePendingEvents,
+					rr.IntentStrategy.MinPending,
+					formatDurationCompact(time.Duration(rr.IntentStrategy.OldestPendingAgeSeconds)*time.Second),
+					formatDurationCompact(time.Duration(rr.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
+					formatDurationCompact(time.Duration(rr.IntentStrategy.AgeTriggerInSeconds)*time.Second))
+			}
 			if rr.IntentStrategy.LastPlannerError != "" {
 				fmt.Fprintf(out, "      planner err: seq %d %s\n",
 					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)

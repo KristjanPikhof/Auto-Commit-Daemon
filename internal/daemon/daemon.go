@@ -27,6 +27,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -280,6 +281,17 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("close trace writer", "err", err.Error())
 		}
 	}()
+	promptTracer, err := prompttrace.NewFromEnv(opts.RepoPath, opts.GitDir)
+	if err != nil {
+		logger.Warn("initialize prompt trace writer", "err", err.Error())
+	}
+	if promptTracer != nil {
+		defer func() {
+			if err := promptTracer.Close(); err != nil {
+				logger.Warn("close prompt trace writer", "err", err.Error())
+			}
+		}()
+	}
 	// MessageFn precedence: explicit MessageFn > injected MessageProvider
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
@@ -331,11 +343,13 @@ func Run(ctx context.Context, opts Options) error {
 	providerCfg := ai.LoadProviderConfigFromEnv()
 	providerCfg.Logger = logger
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
-		"commit.strategy":       string(providerCfg.CommitStrategy),
-		"intent.window":         strconv.Itoa(providerCfg.IntentWindow),
-		"intent.recent_commits": strconv.Itoa(providerCfg.IntentRecentCommits),
-		"intent.defer_limit":    strconv.Itoa(providerCfg.IntentDeferLimit),
-		"intent.diff_egress":    strconv.FormatBool(diffEgressOptIn()),
+		"commit.strategy":        string(providerCfg.CommitStrategy),
+		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
+		"intent.min_pending":     strconv.Itoa(providerCfg.IntentMinPending),
+		"intent.max_pending_age": providerCfg.IntentMaxPendingAge.String(),
+		"intent.recent_commits":  strconv.Itoa(providerCfg.IntentRecentCommits),
+		"intent.defer_limit":     strconv.Itoa(providerCfg.IntentDeferLimit),
+		"intent.diff_egress":     strconv.FormatBool(diffEgressOptIn()),
 	}); err != nil {
 		logger.Warn("stamp commit strategy metadata", "err", err.Error())
 	}
@@ -373,7 +387,7 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("AI provider supports diff context but ACD_AI_DIFF_EGRESS=1 is not set; sending metadata only",
 				"provider", provider.Name())
 		}
-		msgFn = providerMessageFn(provider, effectiveRepoRoot)
+		msgFn = providerMessageFnWithPromptTrace(provider, effectiveRepoRoot, promptTracer)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
@@ -1538,14 +1552,18 @@ func Run(ctx context.Context, opts Options) error {
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn:           msgFn,
-				GitDir:              opts.GitDir,
-				Trace:               tracer,
-				Limit:               DefaultReplayLimit,
-				CommitStrategy:      providerCfg.CommitStrategy,
-				IntentWindow:        providerCfg.IntentWindow,
-				IntentRecentCommits: providerCfg.IntentRecentCommits,
-				IntentDeferLimit:    providerCfg.IntentDeferLimit,
+				MessageFn:             msgFn,
+				GitDir:                opts.GitDir,
+				Trace:                 tracer,
+				PromptTrace:           promptTracer,
+				Limit:                 DefaultReplayLimit,
+				CommitStrategy:        providerCfg.CommitStrategy,
+				IntentWindow:          providerCfg.IntentWindow,
+				IntentMinPending:      providerCfg.IntentMinPending,
+				IntentMaxPendingAge:   providerCfg.IntentMaxPendingAge,
+				IntentRecentCommits:   providerCfg.IntentRecentCommits,
+				IntentDeferLimit:      providerCfg.IntentDeferLimit,
+				IntentBypassBatchWait: flushed > 0,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
