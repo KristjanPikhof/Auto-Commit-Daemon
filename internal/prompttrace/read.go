@@ -24,61 +24,72 @@ type ReadOptions struct {
 	Dir    string
 }
 
-// Read reads prompt trace JSONL records from disk without creating files or
-// mutating repo state. Missing trace directories are treated as empty traces.
-func Read(ctx context.Context, opts ReadOptions) ([]Record, error) {
+// Walk streams prompt trace JSONL records without accumulating them in memory.
+// Missing trace directories are treated as empty traces.
+func Walk(ctx context.Context, opts ReadOptions, fn func(Record) error) error {
+	if fn == nil {
+		return fmt.Errorf("prompttrace: nil walk function")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	dir := opts.Dir
 	if dir == "" {
 		if opts.GitDir == "" {
-			return nil, fmt.Errorf("prompttrace: Dir or GitDir required")
+			return fmt.Errorf("prompttrace: Dir or GitDir required")
 		}
 		dir = Dir(opts.GitDir)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil
 		}
-		return nil, fmt.Errorf("prompttrace: read dir: %w", err)
+		return fmt.Errorf("prompttrace: read dir: %w", err)
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
 
-	var records []Record
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
-		fileRecords, err := readFile(ctx, path)
-		if err != nil {
-			return nil, err
+		if err := walkFile(ctx, filepath.Join(dir, entry.Name()), fn); err != nil {
+			return err
 		}
-		records = append(records, fileRecords...)
+	}
+	return nil
+}
+
+// Read reads prompt trace JSONL records from disk without creating files or
+// mutating repo state. Missing trace directories are treated as empty traces.
+func Read(ctx context.Context, opts ReadOptions) ([]Record, error) {
+	var records []Record
+	if err := Walk(ctx, opts, func(rec Record) error {
+		records = append(records, rec)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return records, nil
 }
 
-func readFile(ctx context.Context, path string) ([]Record, error) {
+func walkFile(ctx context.Context, path string, fn func(Record) error) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("prompttrace: open %s: %w", path, err)
+		return fmt.Errorf("prompttrace: open %s: %w", path, err)
 	}
 	defer f.Close()
 
-	var records []Record
 	reader := bufio.NewReader(f)
 	lineNo := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -87,18 +98,20 @@ func readFile(ctx context.Context, path string) ([]Record, error) {
 			if len(line) > 0 {
 				rec, derr := decodeRecord(line)
 				if derr != nil {
-					return nil, fmt.Errorf("prompttrace: decode %s:%d: %w", path, lineNo, derr)
+					return fmt.Errorf("prompttrace: decode %s:%d: %w", path, lineNo, derr)
 				}
-				records = append(records, rec)
+				if err := fn(rec); err != nil {
+					return err
+				}
 			}
 		}
 		if err == nil {
 			continue
 		}
 		if errors.Is(err, io.EOF) {
-			return records, nil
+			return nil
 		}
-		return nil, fmt.Errorf("prompttrace: read %s: %w", path, err)
+		return fmt.Errorf("prompttrace: read %s: %w", path, err)
 	}
 }
 

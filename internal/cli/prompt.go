@@ -61,6 +61,8 @@ type promptGroup struct {
 	fallback *prompttrace.Record
 }
 
+const maxPromptGroupsInMemory = 1024
+
 func newPromptCmd() *cobra.Command {
 	var (
 		last bool
@@ -110,11 +112,11 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 	}
 	gitDir := gitDirFromStateDB(rec.StateDB)
 	traceDir := prompttrace.Dir(gitDir)
-	records, err := prompttrace.Read(ctx, prompttrace.ReadOptions{Dir: traceDir})
+	group, hasTraces, err := selectPromptGroup(ctx, traceDir, last, seq)
 	if err != nil {
 		return fmt.Errorf("acd prompt: read prompt trace: %w", err)
 	}
-	report := buildPromptReport(rec.Path, traceDir, records, last, seq)
+	report := buildPromptReport(rec.Path, traceDir, group, hasTraces, last, seq)
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
@@ -136,72 +138,134 @@ type repoRecord struct {
 	StateDB string
 }
 
-func buildPromptReport(repo, traceDir string, records []prompttrace.Record, last bool, seq int64) promptReport {
+func buildPromptReport(repo, traceDir string, group *promptGroup, hasTraces bool, last bool, seq int64) promptReport {
 	report := promptReport{
 		Repo:     repo,
 		TraceDir: traceDir,
 		Query:    promptQuery{Last: last, Seq: seq},
 	}
-	groups := groupPromptRecords(records)
-	if len(groups) == 0 {
+	if !hasTraces {
 		report.Message = fmt.Sprintf("No prompt traces found in %s. Start acd with ACD_AI_PROMPT_TRACE=1 to record AI requests.", traceDir)
 		return report
 	}
-
-	var selected *promptGroup
-	if last {
-		selected = latestPromptGroup(groups)
-	} else {
-		selected = latestPromptGroupForSeq(groups, seq)
-	}
-	if selected == nil {
+	if group == nil {
 		report.Message = fmt.Sprintf("No prompt trace found for seq %d in %s.", seq, traceDir)
 		return report
 	}
 	report.Found = true
-	view := promptGroupView(selected)
+	view := promptGroupView(group)
 	report.Trace = &view
 	return report
 }
 
-func groupPromptRecords(records []prompttrace.Record) []*promptGroup {
-	groups := make([]*promptGroup, 0, len(records))
-	for i := range records {
-		rec := records[i]
-		if rec.Stage == "request" {
-			recCopy := rec
-			g := &promptGroup{records: []prompttrace.Record{rec}, request: &recCopy}
-			groups = append(groups, g)
-			continue
+func selectPromptGroup(ctx context.Context, traceDir string, last bool, seq int64) (*promptGroup, bool, error) {
+	selector := newPromptGroupSelector(last, seq)
+	err := prompttrace.Walk(ctx, prompttrace.ReadOptions{Dir: traceDir}, func(rec prompttrace.Record) error {
+		selector.add(rec)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return selector.selected(), selector.hasTraces, nil
+}
+
+type promptGroupSelector struct {
+	last      bool
+	seq       int64
+	hasTraces bool
+	latest    *promptGroup
+	matching  *promptGroup
+	recent    []*promptGroup
+}
+
+func newPromptGroupSelector(last bool, seq int64) *promptGroupSelector {
+	return &promptGroupSelector{last: last, seq: seq}
+}
+
+func (s *promptGroupSelector) add(rec prompttrace.Record) {
+	s.hasTraces = true
+	if s.last {
+		group := s.addRecent(rec)
+		if s.latest == nil || groupLatestTS(group).After(groupLatestTS(s.latest)) {
+			s.latest = group
 		}
-		var match *promptGroup
-		for j := len(groups) - 1; j >= 0; j-- {
-			if groups[j].request != nil && samePromptKey(*groups[j].request, rec) {
-				match = groups[j]
-				break
-			}
+		return
+	}
+	if !recordContainsSeq(rec, s.seq) && (s.matching == nil || !samePromptKeyFromGroup(s.matching, rec)) {
+		return
+	}
+	if s.matching == nil || !samePromptKeyFromGroup(s.matching, rec) {
+		s.matching = newPromptGroup(rec)
+		return
+	}
+	addPromptRecord(s.matching, rec)
+}
+
+func (s *promptGroupSelector) addRecent(rec prompttrace.Record) *promptGroup {
+	if rec.Stage == "request" {
+		group := newPromptGroup(rec)
+		s.recent = append(s.recent, group)
+		if len(s.recent) > maxPromptGroupsInMemory {
+			s.recent = s.recent[1:]
 		}
-		if match == nil {
-			recCopy := rec
-			match = &promptGroup{records: []prompttrace.Record{recCopy}}
-			groups = append(groups, match)
-		} else {
-			match.records = append(match.records, rec)
-		}
-		recCopy := rec
-		switch rec.Stage {
-		case "response":
-			match.response = &recCopy
-		case "fallback":
-			match.fallback = &recCopy
+		return group
+	}
+	for i := len(s.recent) - 1; i >= 0; i-- {
+		if samePromptKeyFromGroup(s.recent[i], rec) {
+			addPromptRecord(s.recent[i], rec)
+			return s.recent[i]
 		}
 	}
-	return groups
+	group := newPromptGroup(rec)
+	s.recent = append(s.recent, group)
+	if len(s.recent) > maxPromptGroupsInMemory {
+		s.recent = s.recent[1:]
+	}
+	return group
+}
+
+func (s *promptGroupSelector) selected() *promptGroup {
+	if s.last {
+		return s.latest
+	}
+	return s.matching
+}
+
+func newPromptGroup(rec prompttrace.Record) *promptGroup {
+	group := &promptGroup{}
+	addPromptRecord(group, rec)
+	return group
+}
+
+func addPromptRecord(group *promptGroup, rec prompttrace.Record) {
+	group.records = append(group.records, rec)
+	recCopy := rec
+	switch rec.Stage {
+	case "request":
+		group.request = &recCopy
+	case "response":
+		group.response = &recCopy
+	case "fallback":
+		group.fallback = &recCopy
+	}
+}
+
+func samePromptKeyFromGroup(group *promptGroup, rec prompttrace.Record) bool {
+	if group.request != nil {
+		return samePromptKey(*group.request, rec)
+	}
+	for _, existing := range group.records {
+		if samePromptKey(existing, rec) {
+			return true
+		}
+	}
+	return false
 }
 
 func samePromptKey(a, b prompttrace.Record) bool {
 	return a.Strategy == b.Strategy &&
-		a.Provider == b.Provider &&
+		promptProviderCompatible(a.Provider, b.Provider) &&
 		promptFieldCompatible(a.Model, b.Model) &&
 		a.Seq == b.Seq &&
 		int64SlicesEqual(a.OfferedSeqs, b.OfferedSeqs) &&
@@ -213,38 +277,19 @@ func promptFieldCompatible(a, b string) bool {
 	return a == b || a == "" || b == ""
 }
 
-func latestPromptGroup(groups []*promptGroup) *promptGroup {
-	var selected *promptGroup
-	for _, group := range groups {
-		if selected == nil || groupLatestTS(group).After(groupLatestTS(selected)) {
-			selected = group
-		}
-	}
-	return selected
+func promptProviderCompatible(a, b string) bool {
+	return promptFieldCompatible(a, b) ||
+		strings.HasPrefix(a, b+"+") ||
+		strings.HasPrefix(b, a+"+")
 }
 
-func latestPromptGroupForSeq(groups []*promptGroup, seq int64) *promptGroup {
-	var selected *promptGroup
-	for _, group := range groups {
-		if !groupContainsSeq(group, seq) {
-			continue
-		}
-		if selected == nil || groupLatestTS(group).After(groupLatestTS(selected)) {
-			selected = group
-		}
+func recordContainsSeq(rec prompttrace.Record, seq int64) bool {
+	if rec.Seq == seq {
+		return true
 	}
-	return selected
-}
-
-func groupContainsSeq(group *promptGroup, seq int64) bool {
-	for _, rec := range group.records {
-		if rec.Seq == seq {
+	for _, offered := range rec.OfferedSeqs {
+		if offered == seq {
 			return true
-		}
-		for _, offered := range rec.OfferedSeqs {
-			if offered == seq {
-				return true
-			}
 		}
 	}
 	return false
