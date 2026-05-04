@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -125,7 +126,7 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 func promptRepoRecord(repo string) (repoRecord, error) {
 	rec, err := eventsRepoRecord(repo)
 	if err != nil {
-		return repoRecord{}, fmt.Errorf("%s", strings.Replace(err.Error(), "acd events:", "acd prompt:", 1))
+		return repoRecord{}, errors.New(strings.Replace(err.Error(), "acd events:", "acd prompt:", 1))
 	}
 	return repoRecord{Path: rec.Path, StateDB: rec.StateDB}, nil
 }
