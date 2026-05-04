@@ -1,6 +1,6 @@
 package cli
 
-// Tests for §7.9 — acd init <harness>.
+// Tests for §7.9 — acd setup <harness>.
 
 import (
 	"bytes"
@@ -15,13 +15,13 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
-// runInitCmd is a test helper that drives newInitCmd() through its cobra
+// runSetupCmd is a test helper that drives newSetupCmd() through its cobra
 // RunE and captures stdout + stderr. It returns the captured output and
 // any error the command returned.
-func runInitCmd(t *testing.T, args ...string) (stdout, stderr string, err error) {
+func runSetupCmd(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	var outBuf, errBuf bytes.Buffer
-	cmd := newInitCmd()
+	cmd := newSetupCmd()
 	cmd.SetOut(&outBuf)
 	cmd.SetErr(&errBuf)
 	cmd.SetArgs(args)
@@ -44,23 +44,23 @@ func snippetBody(t *testing.T, path string) string {
 
 // --- per-harness happy-path tests ------------------------------------------
 
-func TestInit_ClaudeCode_ExitsZero(t *testing.T) {
-	out, _, err := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "claude-code")
 	if err != nil {
 		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
 	}
 }
 
-func TestInit_ClaudeCode_ContainsSnippet(t *testing.T) {
-	out, _, _ := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_ContainsSnippet(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
 	want := snippetBody(t, "claude-code/settings.snippet.json")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
 		t.Errorf("snippet body not found in output.\nwant substring:\n%s\ngot:\n%s", want, out)
 	}
 }
 
-func TestInit_ClaudeCode_ValidJSON(t *testing.T) {
-	out, _, _ := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_ValidJSON(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
 	// Extract the JSON block: everything between the first '{' and the last '}'.
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -74,29 +74,29 @@ func TestInit_ClaudeCode_ValidJSON(t *testing.T) {
 	}
 }
 
-func TestInit_ClaudeCode_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
 	if !strings.Contains(out, `"_acd_managed": true`) {
 		t.Errorf("acd-managed marker not found in output:\n%s", out)
 	}
 }
 
-func TestInit_ClaudeCode_FooterInstructions(t *testing.T) {
-	out, _, _ := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
 	// README says "Merge the printed JSON into ~/.claude/settings.json"
 	if !strings.Contains(out, "settings.json") {
 		t.Errorf("footer instructions missing 'settings.json' in output:\n%s", out)
 	}
 }
 
-// TestInit_ClaudeCode_HasCanonicalHookSchema guards against schema drift in
+// TestSetup_ClaudeCode_HasCanonicalHookSchema guards against schema drift in
 // templates/claude-code/settings.snippet.json. Claude Code rejects entries
 // that lack a nested "hooks" array of {type:"command", command:"…"} handlers
 // — the surface symptom is "hooks: Expected array, but received undefined"
 // at startup. Earlier snippets used a flat {matcher, command} shape; this
 // test exists so that regression cannot ship again.
-func TestInit_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
-	out, _, _ := runInitCmd(t, "claude-code")
+func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
 	if start == -1 || end == -1 || end <= start {
@@ -140,31 +140,31 @@ func TestInit_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 
 // --- codex ------------------------------------------------------------------
 
-func TestInit_Codex_ExitsZero(t *testing.T) {
-	out, _, err := runInitCmd(t, "codex")
+func TestSetup_Codex_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "codex")
 	if err != nil {
 		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
 	}
 }
 
-func TestInit_Codex_ContainsSnippet(t *testing.T) {
-	out, _, _ := runInitCmd(t, "codex")
+func TestSetup_Codex_ContainsSnippet(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "codex")
 	want := snippetBody(t, "codex/config.snippet.toml")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
 		t.Errorf("codex snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
 	}
 }
 
-func TestInit_Codex_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runInitCmd(t, "codex")
+func TestSetup_Codex_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "codex")
 	// TOML uses "# acd-managed: true" comment line.
 	if !strings.Contains(out, "acd-managed: true") {
 		t.Errorf("acd-managed marker not found in codex output:\n%s", out)
 	}
 }
 
-func TestInit_Codex_FooterInstructions(t *testing.T) {
-	out, _, _ := runInitCmd(t, "codex")
+func TestSetup_Codex_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "codex")
 	// README says "config.toml"
 	if !strings.Contains(out, "config.toml") {
 		t.Errorf("footer missing 'config.toml' in output:\n%s", out)
@@ -173,30 +173,30 @@ func TestInit_Codex_FooterInstructions(t *testing.T) {
 
 // --- opencode ---------------------------------------------------------------
 
-func TestInit_OpenCode_ExitsZero(t *testing.T) {
-	out, _, err := runInitCmd(t, "opencode")
+func TestSetup_OpenCode_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "opencode")
 	if err != nil {
 		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
 	}
 }
 
-func TestInit_OpenCode_ContainsSnippet(t *testing.T) {
-	out, _, _ := runInitCmd(t, "opencode")
+func TestSetup_OpenCode_ContainsSnippet(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "opencode")
 	want := snippetBody(t, "opencode/hooks.snippet.yaml")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
 		t.Errorf("opencode snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
 	}
 }
 
-func TestInit_OpenCode_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runInitCmd(t, "opencode")
+func TestSetup_OpenCode_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "opencode")
 	if !strings.Contains(out, "acd-managed: true") {
 		t.Errorf("acd-managed marker not found in opencode output:\n%s", out)
 	}
 }
 
-func TestInit_OpenCode_FooterInstructions(t *testing.T) {
-	out, _, _ := runInitCmd(t, "opencode")
+func TestSetup_OpenCode_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "opencode")
 	// README says "hooks.yaml"
 	if !strings.Contains(out, "hooks.yaml") {
 		t.Errorf("footer missing 'hooks.yaml' in output:\n%s", out)
@@ -205,30 +205,30 @@ func TestInit_OpenCode_FooterInstructions(t *testing.T) {
 
 // --- pi ---------------------------------------------------------------------
 
-func TestInit_Pi_ExitsZero(t *testing.T) {
-	out, _, err := runInitCmd(t, "pi")
+func TestSetup_Pi_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "pi")
 	if err != nil {
 		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
 	}
 }
 
-func TestInit_Pi_ContainsSnippet(t *testing.T) {
-	out, _, _ := runInitCmd(t, "pi")
+func TestSetup_Pi_ContainsSnippet(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "pi")
 	want := snippetBody(t, "pi/hooks.snippet.yaml")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
 		t.Errorf("pi snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
 	}
 }
 
-func TestInit_Pi_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runInitCmd(t, "pi")
+func TestSetup_Pi_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "pi")
 	if !strings.Contains(out, "acd-managed: true") {
 		t.Errorf("acd-managed marker not found in pi output:\n%s", out)
 	}
 }
 
-func TestInit_Pi_FooterInstructions(t *testing.T) {
-	out, _, _ := runInitCmd(t, "pi")
+func TestSetup_Pi_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "pi")
 	// README says ".pi/hook/hooks.yaml"
 	if !strings.Contains(out, ".pi/hook/hooks.yaml") {
 		t.Errorf("footer missing '.pi/hook/hooks.yaml' in output:\n%s", out)
@@ -237,15 +237,15 @@ func TestInit_Pi_FooterInstructions(t *testing.T) {
 
 // --- shell ------------------------------------------------------------------
 
-func TestInit_Shell_ExitsZero(t *testing.T) {
-	out, _, err := runInitCmd(t, "shell")
+func TestSetup_Shell_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "shell")
 	if err != nil {
 		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
 	}
 }
 
-func TestInit_Shell_ContainsBothSnippets(t *testing.T) {
-	out, _, _ := runInitCmd(t, "shell")
+func TestSetup_Shell_ContainsBothSnippets(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "shell")
 
 	wantDirenv := snippetBody(t, "shell/direnv.envrc.snippet")
 	if !strings.Contains(out, strings.TrimSpace(wantDirenv)) {
@@ -258,22 +258,22 @@ func TestInit_Shell_ContainsBothSnippets(t *testing.T) {
 	}
 }
 
-func TestInit_Shell_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runInitCmd(t, "shell")
+func TestSetup_Shell_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "shell")
 	if !strings.Contains(out, "acd-managed: true") {
 		t.Errorf("acd-managed marker not found in shell output:\n%s", out)
 	}
 }
 
-func TestInit_Shell_FooterInstructions(t *testing.T) {
-	out, _, _ := runInitCmd(t, "shell")
+func TestSetup_Shell_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "shell")
 	// README mentions "direnv" and "zsh"
 	if !strings.Contains(out, "direnv") {
 		t.Errorf("footer missing 'direnv' in shell output:\n%s", out)
 	}
 }
 
-func TestInit_Shell_BashSyntaxCheck(t *testing.T) {
+func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
 		t.Skip("bash not on PATH; skipping syntax check")
@@ -296,8 +296,8 @@ func TestInit_Shell_BashSyntaxCheck(t *testing.T) {
 
 // --- error cases ------------------------------------------------------------
 
-func TestInit_UnknownHarness_NonZeroExit(t *testing.T) {
-	_, stderr, err := runInitCmd(t, "unknown")
+func TestSetup_UnknownHarness_NonZeroExit(t *testing.T) {
+	_, stderr, err := runSetupCmd(t, "unknown")
 	if err == nil {
 		t.Fatal("expected non-zero exit for unknown harness, got nil")
 	}
@@ -312,8 +312,8 @@ func TestInit_UnknownHarness_NonZeroExit(t *testing.T) {
 	}
 }
 
-func TestInit_ApplyFlag_NonZero(t *testing.T) {
-	out, stderr, err := runInitCmd(t, "claude-code", "--apply")
+func TestSetup_ApplyFlag_NonZero(t *testing.T) {
+	out, stderr, err := runSetupCmd(t, "claude-code", "--apply")
 	if err == nil {
 		t.Fatalf("--apply should fail, got nil\nstdout:\n%s", out)
 	}
@@ -325,7 +325,7 @@ func TestInit_ApplyFlag_NonZero(t *testing.T) {
 	}
 }
 
-func TestInit_NoArg_AutoDetectsSingleHarness(t *testing.T) {
+func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -337,17 +337,17 @@ func TestInit_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 		t.Fatalf("write settings: %v", err)
 	}
 
-	out, stderr, err := runInitCmd(t)
+	out, stderr, err := runSetupCmd(t)
 	if err != nil {
-		t.Fatalf("expected auto-detected init to exit 0, got: %v\nstderr:\n%s", err, stderr)
+		t.Fatalf("expected auto-detected setup to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
 	want := snippetBody(t, "claude-code/settings.snippet.json")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("auto-detected init did not render claude-code snippet.\nwant:\n%s\ngot:\n%s", want, out)
+		t.Errorf("auto-detected setup did not render claude-code snippet.\nwant:\n%s\ngot:\n%s", want, out)
 	}
 }
 
-func TestInit_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
+func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -364,7 +364,7 @@ func TestInit_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 		}
 	}
 
-	out, stderr, err := runInitCmd(t)
+	out, stderr, err := runSetupCmd(t)
 	if err == nil {
 		t.Fatalf("expected multiple detected harnesses to fail, got nil\nstdout:\n%s", out)
 	}
@@ -375,5 +375,74 @@ func TestInit_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("multi-detect stderr missing %q: %q", want, stderr)
 		}
+	}
+}
+
+// --- alias tests ------------------------------------------------------------
+
+// TestSetup_InitAliasStillWorks verifies that invoking the command via the
+// "init" alias still produces the snippet on stdout and emits a deprecation
+// warning on stderr.
+func TestSetup_InitAliasStillWorks(t *testing.T) {
+	var outBuf, errBuf bytes.Buffer
+	cmd := newSetupCmd()
+	cmd.SetOut(&outBuf)
+	cmd.SetErr(&errBuf)
+	// Simulate the user running: acd init claude-code
+	// CalledAs() only returns the alias name when cobra routes via the alias,
+	// which requires the command to be added to a parent. Build a minimal
+	// parent so Cobra resolves "init" as an alias.
+	root := newRootCmd()
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"init", "claude-code"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("expected exit 0 via init alias, got: %v\nstdout:\n%s\nstderr:\n%s",
+			err, outBuf.String(), errBuf.String())
+	}
+
+	stdout := outBuf.String()
+	stderr := errBuf.String()
+
+	// The snippet must appear in stdout.
+	want := snippetBody(t, "claude-code/settings.snippet.json")
+	if !strings.Contains(stdout, strings.TrimSpace(want)) {
+		t.Errorf("init alias did not render claude-code snippet.\nwant substring:\n%s\ngot stdout:\n%s", want, stdout)
+	}
+
+	// A deprecation warning must appear in stderr.
+	if !strings.Contains(stderr, "deprecated") {
+		t.Errorf("init alias did not emit deprecation warning on stderr.\ngot stderr: %q", stderr)
+	}
+}
+
+// TestSetup_HelpHidesInitAlias verifies that the root --help output contains
+// "acd setup" in the Setup section and does not list "acd init" as a separate
+// visible command row.
+//
+// Design note: Cobra includes aliases in per-command help (e.g. "acd setup
+// --help" will show "Aliases: init"), but the root help is rendered via our
+// custom rootHelpTemplate which hard-codes the Setup table — so the alias
+// cannot appear there as a separate row. This test guards that invariant.
+func TestSetup_HelpHidesInitAlias(t *testing.T) {
+	root := newRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"--help"})
+	// Execute returns ErrNoCommand; that's expected for root --help.
+	_ = root.Execute()
+
+	got := outBuf.String()
+
+	// The Setup section must mention "acd setup".
+	if !strings.Contains(got, "acd setup") {
+		t.Errorf("root help missing 'acd setup' in Setup section:\n%s", got)
+	}
+
+	// There must be no standalone "acd init   Print harness install snippets"
+	// row — the alias must not appear as a separate entry in the Setup table.
+	if strings.Contains(got, "acd init   ") {
+		t.Errorf("root help contains a standalone 'acd init' row; alias should be hidden from root help listing:\n%s", got)
 	}
 }
