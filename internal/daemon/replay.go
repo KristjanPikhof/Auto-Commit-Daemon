@@ -1069,6 +1069,26 @@ func buildIntentPlanRequest(
 	return items, req, nil
 }
 
+func intentOfferedSeqs(req ai.IntentPlanRequest) []int64 {
+	if len(req.OfferedCaptures) == 0 {
+		return nil
+	}
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return seqs
+}
+
+func intentRequestIncludesDiff(req ai.IntentPlanRequest) bool {
+	for _, capture := range req.OfferedCaptures {
+		if capture.CapturedDiff != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func buildIntentPathContext(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, limit int) []ai.PathCommitContext {
 	if len(paths) == 0 || limit <= 0 {
 		return nil
