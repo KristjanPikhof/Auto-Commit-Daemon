@@ -349,6 +349,85 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	return plan, nil
 }
 
+func (p *OpenAIProvider) recordPromptRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = fallback.Strategy
+	}
+	if len(meta.OfferedSeqs) == 0 {
+		meta.OfferedSeqs = append([]int64(nil), fallback.OfferedSeqs...)
+	}
+	if meta.DiffCap == 0 {
+		meta.DiffCap = fallback.DiffCap
+	}
+	meta.DiffIncluded = meta.DiffIncluded || fallback.DiffIncluded
+	meta = promptTraceMetadata(meta, p.Name(), p.resolvedModel())
+	rec, err := openAITraceRequest(body, transform)
+	if err != nil {
+		logger.Record(prompttrace.Record{
+			Stage:        "request",
+			Strategy:     meta.Strategy,
+			Provider:     meta.Provider,
+			Model:        meta.Model,
+			Seq:          meta.Seq,
+			OfferedSeqs:  meta.OfferedSeqs,
+			BranchRef:    meta.BranchRef,
+			Generation:   meta.Generation,
+			DiffIncluded: meta.DiffIncluded,
+			DiffCap:      meta.DiffCap,
+			Error:        err.Error(),
+		})
+		return
+	}
+	rec.Strategy = meta.Strategy
+	rec.Provider = meta.Provider
+	rec.Model = meta.Model
+	rec.Seq = meta.Seq
+	rec.OfferedSeqs = append([]int64(nil), meta.OfferedSeqs...)
+	rec.BranchRef = meta.BranchRef
+	rec.Generation = meta.Generation
+	rec.DiffIncluded = meta.DiffIncluded
+	rec.DiffCap = meta.DiffCap
+	logger.Record(rec)
+}
+
+func (p *OpenAIProvider) recordPromptResponse(ctx context.Context, model, strategy string, response prompttrace.Response) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = strategy
+	}
+	if meta.Model == "" {
+		meta.Model = model
+	}
+	meta = promptTraceMetadata(meta, p.Name(), meta.Model)
+	logger.Record(prompttrace.Record{
+		Stage:        "response",
+		Strategy:     meta.Strategy,
+		Provider:     meta.Provider,
+		Model:        meta.Model,
+		Seq:          meta.Seq,
+		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:    meta.BranchRef,
+		Generation:   meta.Generation,
+		DiffIncluded: meta.DiffIncluded,
+		DiffCap:      meta.DiffCap,
+		Response:     &response,
+	})
+}
+
+func (p *OpenAIProvider) resolvedModel() string {
+	if p.Model != "" {
+		return p.Model
+	}
+	return DefaultOpenAIModel
+}
+
 func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
 	base := strings.TrimRight(strings.TrimSpace(raw), "/")
 	if base == "" {
