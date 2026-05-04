@@ -326,7 +326,11 @@ func TestPromptRepeatedSameKeyAttemptsDoNotHybridize(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			if err := runPrompt(context.Background(), &out, repo, tc.last, 42, true); err != nil {
+			seq := int64(42)
+			if tc.last {
+				seq = 0
+			}
+			if err := runPrompt(context.Background(), &out, repo, tc.last, seq, true); err != nil {
 				t.Fatalf("runPrompt: %v", err)
 			}
 			var report promptReport
