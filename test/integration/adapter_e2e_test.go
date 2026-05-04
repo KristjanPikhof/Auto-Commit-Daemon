@@ -48,14 +48,14 @@ func TestAdapterE2E(t *testing.T) {
 	bin := buildAcdBinary(t)
 	for _, h := range []string{"claude-code", "codex", "opencode", "pi", "shell"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		out := runAcd(t, ctx, os.Environ(), "init", h)
+		out := runAcd(t, ctx, os.Environ(), "setup", h)
 		cancel()
 		if out.ExitCode != 0 {
-			t.Fatalf("acd init %s exit=%d\nstdout=%s\nstderr=%s",
+			t.Fatalf("acd setup %s exit=%d\nstdout=%s\nstderr=%s",
 				h, out.ExitCode, out.Stdout, out.Stderr)
 		}
 		if len(strings.TrimSpace(out.Stdout)) == 0 {
-			t.Fatalf("acd init %s emitted empty stdout", h)
+			t.Fatalf("acd setup %s emitted empty stdout", h)
 		}
 	}
 
