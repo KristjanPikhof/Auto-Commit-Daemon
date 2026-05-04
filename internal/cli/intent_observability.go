@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -17,6 +18,16 @@ type intentStrategyReport struct {
 	Window                   int    `json:"window,omitempty"`
 	RecentCommits            int    `json:"recent_commits,omitempty"`
 	DeferLimit               int    `json:"defer_limit,omitempty"`
+	MinPending               int    `json:"min_pending,omitempty"`
+	MaxPendingAgeSeconds     int64  `json:"max_pending_age_seconds,omitempty"`
+	VisiblePendingEvents     int    `json:"visible_pending_events,omitempty"`
+	OldestPendingEventSeq    int64  `json:"oldest_pending_event_seq,omitempty"`
+	OldestPendingPath        string `json:"oldest_pending_path,omitempty"`
+	OldestPendingAgeSeconds  int64  `json:"oldest_pending_age_seconds,omitempty"`
+	AgeTriggerTS             int64  `json:"age_trigger_ts,omitempty"`
+	AgeTriggerInSeconds      int64  `json:"age_trigger_in_seconds,omitempty"`
+	BatchWaitActive          bool   `json:"batch_wait_active,omitempty"`
+	BatchWaitReason          string `json:"batch_wait_reason,omitempty"`
 	DeferredEvents           int    `json:"deferred_events,omitempty"`
 	MaxDeferCount            int    `json:"max_defer_count,omitempty"`
 	ForcedAgingReady         int    `json:"forced_aging_ready,omitempty"`
@@ -34,10 +45,18 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		status = r.Strategy
 	}
 	if r.Active {
-		fmt.Fprintf(out, "Commit strategy: %s (window %d, recent commits %d, defer limit %d)\n",
-			status, r.Window, r.RecentCommits, r.DeferLimit)
+		fmt.Fprintf(out, "Commit strategy: %s (window %d, min pending %d, max age %s, recent commits %d, defer limit %d)\n",
+			status, r.Window, r.MinPending, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
 	} else {
 		fmt.Fprintf(out, "Commit strategy: %s\n", status)
+	}
+	if r.BatchWaitActive {
+		fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+			r.VisiblePendingEvents,
+			r.MinPending,
+			formatDurationCompact(time.Duration(r.OldestPendingAgeSeconds)*time.Second),
+			formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second),
+			formatDurationCompact(time.Duration(r.AgeTriggerInSeconds)*time.Second))
 	}
 	if r.DeferredEvents > 0 || r.ForcedAgingReady > 0 || r.LastPlannerError != "" {
 		fmt.Fprintf(out, "Intent planner: deferred=%d max_defer=%d forced_ready=%d\n",
@@ -61,6 +80,10 @@ func intentStrategyFromEnv() intentStrategyReport {
 		Window:        cfg.IntentWindow,
 		RecentCommits: cfg.IntentRecentCommits,
 		DeferLimit:    cfg.IntentDeferLimit,
+		MinPending:    cfg.IntentMinPending,
+		MaxPendingAgeSeconds: int64(
+			cfg.IntentMaxPendingAge / time.Second,
+		),
 	}
 }
 
@@ -90,7 +113,20 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	} else if ok {
 		report.DeferLimit = parseIntentMetaInt(v, report.DeferLimit)
 	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.min_pending"); err != nil {
+		return report, fmt.Errorf("intent.min_pending: %w", err)
+	} else if ok {
+		report.MinPending = parseIntentMetaInt(v, report.MinPending)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.max_pending_age"); err != nil {
+		return report, fmt.Errorf("intent.max_pending_age: %w", err)
+	} else if ok {
+		report.MaxPendingAgeSeconds = parseIntentMetaDurationSeconds(v, report.MaxPendingAgeSeconds)
+	}
 	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
 		return report, err
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
@@ -194,10 +230,86 @@ LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPa
 	return nil
 }
 
+func loadIntentBatchWait(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "capture_events")
+	if err != nil {
+		return fmt.Errorf("capture_events table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	var oldestSeq sql.NullInt64
+	var oldestPath sql.NullString
+	var oldestCaptured sql.NullFloat64
+	if err := conn.QueryRowContext(ctx, `
+WITH barriers AS (
+    SELECT branch_ref, branch_generation, MIN(seq) AS first_seq
+    FROM capture_events
+    WHERE state IN (?, ?)
+    GROUP BY branch_ref, branch_generation
+), visible_pending AS (
+    SELECT e.seq, e.path, e.captured_ts
+    FROM capture_events e
+    LEFT JOIN barriers b
+           ON b.branch_ref = e.branch_ref
+          AND b.branch_generation = e.branch_generation
+    WHERE e.state = ?
+      AND (b.first_seq IS NULL OR e.seq < b.first_seq)
+)
+SELECT COUNT(*), MIN(seq), (
+    SELECT path FROM visible_pending ORDER BY seq ASC LIMIT 1
+), (
+    SELECT captured_ts FROM visible_pending ORDER BY seq ASC LIMIT 1
+)
+FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending).Scan(
+		&report.VisiblePendingEvents,
+		&oldestSeq,
+		&oldestPath,
+		&oldestCaptured,
+	); err != nil {
+		return fmt.Errorf("intent batch wait summary: %w", err)
+	}
+	if oldestSeq.Valid {
+		report.OldestPendingEventSeq = oldestSeq.Int64
+	}
+	if oldestPath.Valid {
+		report.OldestPendingPath = oldestPath.String
+	}
+	if !oldestCaptured.Valid || report.VisiblePendingEvents == 0 || report.MaxPendingAgeSeconds <= 0 {
+		return nil
+	}
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	ageSeconds := int64(nowSec - oldestCaptured.Float64)
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	report.OldestPendingAgeSeconds = ageSeconds
+	report.AgeTriggerTS = int64(oldestCaptured.Float64) + report.MaxPendingAgeSeconds
+	if remaining := report.AgeTriggerTS - int64(nowSec); remaining > 0 {
+		report.AgeTriggerInSeconds = remaining
+	}
+	if report.Active &&
+		report.ForcedAgingReady == 0 &&
+		report.VisiblePendingEvents < report.MinPending &&
+		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds {
+		report.BatchWaitActive = true
+		report.BatchWaitReason = "skipped_due_intent_batch_wait"
+	}
+	return nil
+}
+
 func parseIntentMetaInt(raw string, fallback int) int {
 	n, err := strconv.Atoi(raw)
 	if err != nil {
 		return fallback
 	}
 	return n
+}
+
+func parseIntentMetaDurationSeconds(raw string, fallback int64) int64 {
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return int64(d / time.Second)
 }
