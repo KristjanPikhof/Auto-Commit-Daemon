@@ -16,10 +16,12 @@ import (
 
 // touchResult is the JSON payload returned by `acd touch --json`.
 type touchResult struct {
-	OK         bool    `json:"ok"`
-	LastSeenTS float64 `json:"last_seen_ts"`
-	Repo       string  `json:"repo"`
-	SessionID  string  `json:"session_id"`
+	OK            bool    `json:"ok"`
+	LastSeenTS    float64 `json:"last_seen_ts"`
+	Skipped       bool    `json:"skipped,omitempty"`
+	SkippedReason string  `json:"skipped_reason,omitempty"`
+	Repo          string  `json:"repo"`
+	SessionID     string  `json:"session_id"`
 }
 
 func newTouchCmd() *cobra.Command {
