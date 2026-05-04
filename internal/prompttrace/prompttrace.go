@@ -1,3 +1,8 @@
+// Package prompttrace persists opt-in AI provider request diagnostics under
+// repo-local ACD state. Records are written only when ACD_AI_PROMPT_TRACE is
+// enabled; request payloads are captured after provider redaction/truncation,
+// but may still contain source text and should be treated as sensitive local
+// diagnostics.
 package prompttrace
 
 import (
