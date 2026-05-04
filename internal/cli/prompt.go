@@ -31,27 +31,27 @@ type promptQuery struct {
 }
 
 type promptView struct {
-	Timestamp          string                         `json:"timestamp"`
-	Strategy           string                         `json:"strategy,omitempty"`
-	Provider           string                         `json:"provider,omitempty"`
-	Model              string                         `json:"model,omitempty"`
-	Seq                int64                          `json:"seq,omitempty"`
-	OfferedSeqs        []int64                        `json:"offered_seqs,omitempty"`
-	BranchRef          string                         `json:"branch_ref,omitempty"`
-	Generation         int64                          `json:"generation,omitempty"`
-	DiffIncluded       bool                           `json:"diff_included"`
-	DiffCap            int                            `json:"diff_cap,omitempty"`
-	Transform          prompttrace.TransformMetadata  `json:"transform,omitempty"`
-	SystemPrompt       string                         `json:"system_prompt,omitempty"`
-	UserPrompt         string                         `json:"user_prompt,omitempty"`
-	ToolSchema         any                            `json:"tool_schema,omitempty"`
-	Request            json.RawMessage                `json:"request,omitempty"`
-	SubprocessEnvelope json.RawMessage                `json:"subprocess_envelope,omitempty"`
-	Response           *prompttrace.Response          `json:"response,omitempty"`
-	Fallback           *prompttrace.Response          `json:"fallback,omitempty"`
-	ValidationState    string                         `json:"validation_state"`
-	Stages             []string                       `json:"stages"`
-	Errors             []string                       `json:"errors,omitempty"`
+	Timestamp          string                        `json:"timestamp"`
+	Strategy           string                        `json:"strategy,omitempty"`
+	Provider           string                        `json:"provider,omitempty"`
+	Model              string                        `json:"model,omitempty"`
+	Seq                int64                         `json:"seq,omitempty"`
+	OfferedSeqs        []int64                       `json:"offered_seqs,omitempty"`
+	BranchRef          string                        `json:"branch_ref,omitempty"`
+	Generation         int64                         `json:"generation,omitempty"`
+	DiffIncluded       bool                          `json:"diff_included"`
+	DiffCap            int                           `json:"diff_cap,omitempty"`
+	Transform          prompttrace.TransformMetadata `json:"transform,omitempty"`
+	SystemPrompt       string                        `json:"system_prompt,omitempty"`
+	UserPrompt         string                        `json:"user_prompt,omitempty"`
+	ToolSchema         any                           `json:"tool_schema,omitempty"`
+	Request            json.RawMessage               `json:"request,omitempty"`
+	SubprocessEnvelope json.RawMessage               `json:"subprocess_envelope,omitempty"`
+	Response           *prompttrace.Response         `json:"response,omitempty"`
+	Fallback           *prompttrace.Response         `json:"fallback,omitempty"`
+	ValidationState    string                        `json:"validation_state"`
+	Stages             []string                      `json:"stages"`
+	Errors             []string                      `json:"errors,omitempty"`
 }
 
 type promptGroup struct {
