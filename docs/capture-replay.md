@@ -232,6 +232,15 @@ provider for a structured plan. `ACD_INTENT_WINDOW` is the maximum offered,
 The plan can select exactly one capture or any larger non-empty subset. Every
 offered seq must be either selected or deferred.
 
+Intent planning waits for a real grouping window before calling the planner:
+if the visible pending queue is below `ACD_INTENT_MIN_PENDING` and the oldest
+visible capture is younger than `ACD_INTENT_MAX_PENDING_AGE`, replay records a
+`skipped_due_intent_batch_wait` no-op instead of planning. Reaching the count
+trigger offers up to `ACD_INTENT_WINDOW`; reaching the age trigger offers the
+currently visible pending rows up to that same window. Explicit `acd wake` /
+flush requests bypass only this wait, so a user-requested flush plans whatever
+is visible immediately.
+
 ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
 omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
 events that would leapfrog an earlier same-path or nested-path dependency
@@ -255,7 +264,8 @@ Intent-specific observability:
   forced-aging windows, and planner validation failures from
   `decision_records`.
 - `ACD_TRACE=1` records planner input/output summaries, selected seqs, deferred
-  seqs, and validation failures without writing captured source diffs.
+  seqs, batch-wait skips, and validation failures without writing captured
+  source diffs.
 
 ---
 
