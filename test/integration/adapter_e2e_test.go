@@ -4,7 +4,7 @@
 package integration_test
 
 // adapter_e2e_test.go — §7.9 / §9 end-to-end coverage. Each subtest renders a
-// harness's snippet via `acd init <harness>`, executes the start-equivalent
+// harness's snippet via `acd setup <harness>`, executes the start-equivalent
 // command(s) under a fake harness env (mock CLAUDE_PROJECT_DIR /
 // OPENCODE_SESSION_ID / PI_SESSION_ID / etc.), and asserts the daemon's
 // per-repo state.db has the expected daemon_clients row (session_id + harness).
