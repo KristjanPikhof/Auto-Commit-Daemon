@@ -94,6 +94,16 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 	return req, nil
 }
 
+func mergePromptTransformMetadata(a, b prompttrace.TransformMetadata) prompttrace.TransformMetadata {
+	return prompttrace.TransformMetadata{
+		RedactionApplied: a.RedactionApplied || b.RedactionApplied,
+		Truncated:        a.Truncated || b.Truncated,
+		InputBytes:       a.InputBytes + b.InputBytes,
+		RedactedBytes:    a.RedactedBytes + b.RedactedBytes,
+		OutputBytes:      a.OutputBytes + b.OutputBytes,
+	}
+}
+
 func cloneCommitSummary(in *CommitSummary) *CommitSummary {
 	if in == nil {
 		return nil

@@ -636,7 +636,7 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 		Temperature: 0.2,
 	}
 	raw, err := json.Marshal(body)
-	return raw, prompttrace.TransformMetadata{}, err
+	return raw, plannerReq.CapturedDiffTransform, err
 }
 
 // parseToolCall extracts subject + body from a chat-completion response

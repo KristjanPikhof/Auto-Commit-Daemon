@@ -274,11 +274,11 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		RequestType:    "intent_plan",
 		PlannerRequest: &plannerReq,
 	}
-	body, transform, err := marshalSubprocessPromptRequest(req, "", "")
+	body, err := marshalSubprocessRequest(req)
 	if err != nil {
 		return IntentPlan{}, err
 	}
-	p.recordSubprocessRequest(ctx, body, transform, prompttrace.Metadata{
+	p.recordSubprocessRequest(ctx, body, plannerReq.CapturedDiffTransform, prompttrace.Metadata{
 		Strategy:     "intent",
 		OfferedSeqs:  offeredSeqs(plannerReq),
 		DiffIncluded: intentDiffIncluded(plannerReq),
