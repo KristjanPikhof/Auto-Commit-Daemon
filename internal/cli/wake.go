@@ -89,6 +89,27 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 
 	clock, err := daemon.AcquireControlLock(gitDir)
 	if err != nil {
+		if errors.Is(err, daemon.ErrControlLockHeld) {
+			// Another short-lived control caller (wake/touch/start/stop) is
+			// already in flight. Wake is best-effort: the in-flight caller
+			// would do equivalent work, and the daemon will reconcile on
+			// its next tick. Exit cleanly so harness hooks (PreToolUse /
+			// PostToolUse) don't surface a spurious failure to the user.
+			res := wakeResult{
+				OK:            true,
+				Skipped:       true,
+				SkippedReason: "control_lock_held",
+				Repo:          repo,
+				SessionID:     sessionID,
+			}
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(res)
+			}
+			fmt.Fprintf(out, "acd wake: skipped (control.lock held; another control caller in flight)\n")
+			return nil
+		}
 		return fmt.Errorf("acd wake: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()
