@@ -290,20 +290,30 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		_ = os.Remove(indexFile)
 	}
 
-	// Per-pass batch budget. When opts.Limit > 0 we query one extra row so the
-	// "is there more queued behind this batch?" question can be answered
-	// without a follow-up COUNT — sum.HasMore tells the run loop to schedule
-	// an immediate next pass instead of waiting for the poll tick.
-	queryLimit := opts.Limit
+	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
+	if err != nil {
+		return sum, err
+	}
+	if closeIntentPlanner != nil {
+		defer closeIntentPlanner()
+	}
+
+	// Per-pass batch budget. When bounded, query one extra row so the "is
+	// there more queued behind this batch?" question can be answered without a
+	// follow-up COUNT. Intent replay uses its own visible-window budget so a
+	// small ReplayOpts.Limit cannot make the min-pending gate see an artificial
+	// short queue.
+	batchLimit := replayPendingBatchLimit(opts, intentCfg)
+	queryLimit := batchLimit
 	if queryLimit > 0 {
-		queryLimit = opts.Limit + 1
+		queryLimit++
 	}
 	pending, err := state.PendingEvents(ctx, db, queryLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
 	}
-	if opts.Limit > 0 && len(pending) > opts.Limit {
-		pending = pending[:opts.Limit]
+	if batchLimit > 0 && len(pending) > batchLimit {
+		pending = pending[:batchLimit]
 		sum.HasMore = true
 	}
 	if len(pending) == 0 {
@@ -342,13 +352,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		return sum, err
 	}
 
-	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
-	if err != nil {
-		return sum, err
-	}
-	if closeIntentPlanner != nil {
-		defer closeIntentPlanner()
-	}
 	if intentCfg.enabled {
 		return replayIntentBatch(ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile, pending, parent, parentTree, sum)
 	}
@@ -716,6 +719,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	return sum, nil
+}
+
+func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
+	if !cfg.enabled {
+		return opts.Limit
+	}
+	limit := cfg.window
+	if cfg.minPending > limit {
+		limit = cfg.minPending
+	}
+	return limit
 }
 
 type intentReplayConfig struct {
