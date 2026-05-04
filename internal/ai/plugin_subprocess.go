@@ -411,6 +411,62 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 	_ = session.shutdown(0)
 }
 
+func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = fallback.Strategy
+	}
+	if len(meta.OfferedSeqs) == 0 {
+		meta.OfferedSeqs = append([]int64(nil), fallback.OfferedSeqs...)
+	}
+	if meta.DiffCap == 0 {
+		meta.DiffCap = fallback.DiffCap
+	}
+	meta.DiffIncluded = meta.DiffIncluded || fallback.DiffIncluded
+	meta = promptTraceMetadata(meta, p.Name(), "")
+	logger.Record(prompttrace.Record{
+		Stage:              "request",
+		Strategy:           meta.Strategy,
+		Provider:           meta.Provider,
+		Model:              meta.Model,
+		Seq:                meta.Seq,
+		OfferedSeqs:        append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:          meta.BranchRef,
+		Generation:         meta.Generation,
+		DiffIncluded:       meta.DiffIncluded,
+		DiffCap:            meta.DiffCap,
+		Transform:          transform,
+		SubprocessEnvelope: append([]byte(nil), body...),
+	})
+}
+
+func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strategy string, response prompttrace.Response) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = strategy
+	}
+	meta = promptTraceMetadata(meta, p.Name(), "")
+	logger.Record(prompttrace.Record{
+		Stage:        "response",
+		Strategy:     meta.Strategy,
+		Provider:     meta.Provider,
+		Model:        meta.Model,
+		Seq:          meta.Seq,
+		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:    meta.BranchRef,
+		Generation:   meta.Generation,
+		DiffIncluded: meta.DiffIncluded,
+		DiffCap:      meta.DiffCap,
+		Response:     &response,
+	})
+}
+
 // subprocessRequest is the JSONL request envelope. Field tags fix the wire
 // names so the JSON shape matches the contract regardless of struct
 // renames.
@@ -653,17 +709,14 @@ func readLine(r *bufio.Reader) ([]byte, error) {
 // arrives we kill the process — this guarantees the next request gets a
 // fresh plugin rather than waiting on a stuck one.
 func (s *pluginSession) exchange(ctx context.Context, req subprocessRequest) (subprocessResponse, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalSubprocessRequest(req)
 	if err != nil {
-		return subprocessResponse{}, fmt.Errorf("encode request: %w", err)
+		return subprocessResponse{}, err
 	}
-	if bytesContainNewline(body) {
-		// JSON encoding never produces a literal newline by default,
-		// but defense-in-depth: a future struct field with a custom
-		// marshaller could. JSONL framing breaks the moment a request
-		// straddles two lines.
-		return subprocessResponse{}, errors.New("subprocess: encoded request contains newline")
-	}
+	return s.exchangeBytes(ctx, body)
+}
+
+func (s *pluginSession) exchangeBytes(ctx context.Context, body []byte) (subprocessResponse, error) {
 	reply := make(chan pluginReply, 1)
 	pr := pluginRequest{bytes: body, reply: reply}
 
@@ -683,6 +736,30 @@ func (s *pluginSession) exchange(ctx context.Context, req subprocessRequest) (su
 		s.kill()
 		return subprocessResponse{}, ctx.Err()
 	}
+}
+
+func marshalSubprocessPromptRequest(req subprocessRequest, inputDiff, outputDiff string) ([]byte, prompttrace.TransformMetadata, error) {
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return nil, prompttrace.TransformMetadata{}, err
+	}
+	redacted := RedactDiffSecrets(inputDiff)
+	return body, promptTransformMetadata(inputDiff, redacted, outputDiff), nil
+}
+
+func marshalSubprocessRequest(req subprocessRequest) ([]byte, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	if bytesContainNewline(body) {
+		// JSON encoding never produces a literal newline by default,
+		// but defense-in-depth: a future struct field with a custom
+		// marshaller could. JSONL framing breaks the moment a request
+		// straddles two lines.
+		return nil, errors.New("subprocess: encoded request contains newline")
+	}
+	return body, nil
 }
 
 // bytesContainNewline reports whether b includes a literal LF byte.
