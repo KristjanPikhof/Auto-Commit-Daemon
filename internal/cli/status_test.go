@@ -730,3 +730,16 @@ func TestStatus_JSONShape(t *testing.T) {
 		t.Fatalf("daemon = %q, want running", rep.Daemon)
 	}
 }
+
+func appendIntentPendingEvent(t *testing.T, ctx context.Context, d *state.DB, path string, capturedTS float64) int64 {
+	t.Helper()
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: path,
+		Fidelity: "exact", CapturedTS: capturedTS,
+	}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+	return seq
+}
