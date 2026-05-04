@@ -340,14 +340,20 @@ type hookSpec struct {
 }
 
 // parseClaudeCodeSnippet parses templates/claude-code/settings.snippet.json
-// and returns one hookSpec per event/command pair. The matcher field is not
-// used here — every command is exercised through the same fake stdin payload.
+// and returns one hookSpec per event/command pair. Claude Code's schema is
+// nested: each event holds matcher groups, and each matcher group holds a
+// `hooks` array of {type:"command", command:"…"} handlers. The matcher field
+// is not used here — every command is exercised through the same fake stdin
+// payload.
 func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	var doc struct {
 		Hooks map[string][]struct {
 			Matcher string `json:"matcher"`
-			Command string `json:"command"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
 		} `json:"hooks"`
 	}
 	if err := json.Unmarshal([]byte(body), &doc); err != nil {
@@ -356,7 +362,9 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	var out []hookSpec
 	for _, event := range []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"} {
 		for _, e := range doc.Hooks[event] {
-			out = append(out, hookSpec{Event: event, Command: e.Command})
+			for _, h := range e.Hooks {
+				out = append(out, hookSpec{Event: event, Command: h.Command})
+			}
 		}
 	}
 	if len(out) == 0 {
