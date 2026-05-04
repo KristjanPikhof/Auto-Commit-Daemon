@@ -269,49 +269,71 @@ stop and restart an existing daemon before expecting those changes to apply.
 
 ### Commit strategy profiles
 
-Compatibility default:
+Two strategies. Pick one. Both can use AI for commit messages; only `intent`
+calls the planner to group captures.
+
+#### Event-driven (one commit per change)
+
+Every captured edit becomes its own commit. Planner is never called. AI is used
+only to write the commit message for the single change. Best for CI smoke runs,
+shared branches with strict review, or when you want one-to-one traceability
+between an edit and a commit.
 
 ~~~bash
-export ACD_COMMIT_STRATEGY=event
+# AI provider — used for commit message generation only
+export ACD_AI_PROVIDER=openai-compat            # openai-compat | deterministic | subprocess:<name>
+export ACD_AI_API_KEY=$YOUR_API_KEY             # provider key; omit for deterministic
+export ACD_AI_BASE_URL=https://ai.example.internal/v1  # provider endpoint
+export ACD_AI_MODEL="gpt-5.4-mini"              # model id passed to provider
+export ACD_AI_TIMEOUT=30s                       # per-request budget; replay backs off on timeout
+export ACD_AI_DIFF_EGRESS=1                     # opt-in: send redacted diffs to provider for richer messages
+
+# Strategy
+export ACD_COMMIT_STRATEGY=event                # one captured event = one commit; planner not called
 ~~~
 
-Reviewer-friendly local work:
+Notes:
+- Intent knobs (`ACD_INTENT_*`) are inert in this mode.
+- Leave `ACD_AI_DIFF_EGRESS` unset to send metadata only when the endpoint is
+  not trusted; messages will be coarser but no diff bytes leave the machine.
+- For a fully offline setup use `ACD_AI_PROVIDER=deterministic` and drop the
+  network knobs.
+
+#### Intent-driven (AI groups related changes)
+
+Pending captures are offered to an AI planner, which selects one or more
+related captures to land in the next commit. Other captures stay pending or get
+deferred. Best for local development where reviewer-friendly, semantically
+grouped commits matter.
 
 ~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=...
-~~~
-
-Private-code metadata-only setup:
-
-~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=...
-# Leave ACD_AI_DIFF_EGRESS unset.
-~~~
-
-Self-hosted AI with explicit diff egress:
-
-~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=...
+# AI provider — used for both planner decisions and commit messages
+export ACD_AI_PROVIDER=openai-compat            # network providers required; deterministic does not plan
+export ACD_AI_API_KEY=$YOUR_API_KEY
 export ACD_AI_BASE_URL=https://ai.example.internal/v1
-export ACD_AI_DIFF_EGRESS=1
+export ACD_AI_MODEL="gpt-5.4-mini"
+export ACD_AI_TIMEOUT=30s
+export ACD_AI_DIFF_EGRESS=1                     # strongly recommended for intent: planner groups better with diff context
+
+# Strategy
+export ACD_COMMIT_STRATEGY=intent               # planner picks one or more captures per commit
+export ACD_INTENT_WINDOW=10                     # max pending captures offered to one planner pass
+export ACD_INTENT_MIN_PENDING=4                 # preferred count gate before a normal planner pass starts (lower for sparse repos)
+export ACD_INTENT_MAX_PENDING_AGE=5m            # age escape hatch when pending count never reaches MIN_PENDING
+export ACD_INTENT_RECENT_COMMITS=5              # recent branch/path commits sent to planner as context
+export ACD_INTENT_DEFER_LIMIT=2                 # deferrals allowed before the overdue capture is forced into a one-item commit
 ~~~
 
-Use `event` for CI smoke runs and compatibility-sensitive shared branches.
-Use `intent` when review quality matters and the AI endpoint is trusted. Intent
-planning may group related captures, choose exactly one capture, or defer
-unrelated captures. `ACD_INTENT_WINDOW` is the maximum offered to a normal
-planner pass, `ACD_INTENT_MIN_PENDING` is the preferred count trigger, and
-`ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch for sparse queues. Explicit
-flushes from `acd wake` bypass only the batch wait, so the daemon plans the
-currently visible pending captures immediately. Over-deferred captures are
-forced through a one-capture planner window so they cannot starve; ordered
-same-path or nested-path barriers still land first.
+Notes:
+- Without `ACD_AI_DIFF_EGRESS=1` the planner sees metadata only; grouping
+  quality drops. Use only when the endpoint is trusted.
+- `acd wake` bypasses the batch wait and plans currently visible captures
+  immediately.
+- Over-deferred captures are forced through a one-item planning window so they
+  cannot starve. Same-path and nested-path ordering barriers still land first.
+- For sparse repos lower `ACD_INTENT_MIN_PENDING` (e.g. `2`-`4`); for heavy
+  edit bursts raise `ACD_INTENT_WINDOW` so the planner sees more candidates
+  per pass at the cost of more tokens per call.
 
 ## Docs
 
