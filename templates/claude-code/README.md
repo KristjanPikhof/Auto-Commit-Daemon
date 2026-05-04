@@ -3,7 +3,7 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Generate snippet: `acd init claude-code`
+2. Generate snippet: `acd setup claude-code`
 3. Merge the printed JSON into `~/.claude/settings.json` under the `hooks` key
 4. Restart Claude Code
 
