@@ -89,6 +89,55 @@ func TestInit_ClaudeCode_FooterInstructions(t *testing.T) {
 	}
 }
 
+// TestInit_ClaudeCode_HasCanonicalHookSchema guards against schema drift in
+// templates/claude-code/settings.snippet.json. Claude Code rejects entries
+// that lack a nested "hooks" array of {type:"command", command:"…"} handlers
+// — the surface symptom is "hooks: Expected array, but received undefined"
+// at startup. Earlier snippets used a flat {matcher, command} shape; this
+// test exists so that regression cannot ship again.
+func TestInit_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
+	out, _, _ := runInitCmd(t, "claude-code")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Matcher *string `json:"matcher,omitempty"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v\nblock:\n%s", err, out[start:end+1])
+	}
+	required := []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"}
+	for _, ev := range required {
+		entries, ok := settings.Hooks[ev]
+		if !ok || len(entries) == 0 {
+			t.Errorf("event %q missing or has no entries", ev)
+			continue
+		}
+		for i, entry := range entries {
+			if len(entry.Hooks) == 0 {
+				t.Errorf("event %q entry %d: nested 'hooks' array missing or empty (Claude Code requires {matcher, hooks:[{type, command}]})", ev, i)
+				continue
+			}
+			for j, h := range entry.Hooks {
+				if h.Type != "command" {
+					t.Errorf("event %q entry %d hook %d: type=%q, want %q", ev, i, j, h.Type, "command")
+				}
+				if h.Command == "" {
+					t.Errorf("event %q entry %d hook %d: command is empty", ev, i, j)
+				}
+			}
+		}
+	}
+}
+
 // --- codex ------------------------------------------------------------------
 
 func TestInit_Codex_ExitsZero(t *testing.T) {
