@@ -13,6 +13,7 @@ acd events
 acd events --watch
 acd explain --path path/to/file
 acd explain --commit HEAD
+acd prompt --last
 ~~~
 
 `acd status` is the current snapshot: daemon liveness, queue counts, pause
@@ -21,6 +22,10 @@ state, branch generation, active commit strategy, and recent decision counts.
 skipped, committed, deferred, grouped, blocked, or treated as already handled by
 another committer. `acd explain` turns those decisions into a path or commit
 answer.
+
+Use `acd prompt` only when you enabled prompt tracing with
+`ACD_AI_PROMPT_TRACE=1`. It reads local prompt-trace JSONL files and does not
+open or migrate `state.db`.
 
 `acd events --watch` follows new ledger rows. Without `--since`, it starts at
 the current ledger tail and prints only decisions appended after watch starts.
@@ -119,9 +124,66 @@ Look for:
 | `intent_planner_error` | The planner returned an invalid plan or failed; ACD fell back to a safe one-capture plan. |
 
 `status` and `diagnose --json` show deferred counts, forced-aging readiness, and
-the latest planner error. If deferrals keep growing, reduce
-`ACD_INTENT_WINDOW`, check provider health, or temporarily return to
-`ACD_COMMIT_STRATEGY=event`.
+the latest planner error.
+
+If commits are waiting before any planner request appears, check the batch wait
+state:
+
+~~~bash
+acd status
+acd diagnose
+acd doctor
+~~~
+
+`ACD_INTENT_WINDOW` is the maximum offered to a normal planner pass,
+`ACD_INTENT_MIN_PENDING` is the preferred count trigger, and
+`ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch for sparse queues. When the
+visible pending count is below `min_pending` and the oldest pending capture is
+younger than `max_pending_age`, ACD waits instead of asking the planner. The
+status, diagnose, and doctor reports show how many more captures are needed or
+how long remains until the age trigger. To publish the current visible batch
+now, run `acd wake --repo . --session-id "$ACD_SESSION_ID"` from a harness shell
+or otherwise request a flush; that bypasses only the batch wait, not validation
+or replay safety checks.
+
+If deferrals keep growing after planning starts, reduce the batching thresholds,
+check provider health, or temporarily return to `ACD_COMMIT_STRATEGY=event`.
+When a capture reaches `ACD_INTENT_DEFER_LIMIT`, ACD forces it through a
+one-item planning window unless an earlier related-path capture must land first.
+
+## Inspect an AI prompt
+
+Prompt tracing is opt-in because it records the actual payload sent to an AI
+provider or subprocess plugin. The trace is stored locally under
+`<gitDir>/acd/prompt-trace/`. Records are written after ACD redacts and
+truncates outbound payloads, but they may still contain source code, private
+paths, request envelopes, tool schemas, provider responses, and fallback
+metadata. Treat prompt traces as sensitive local diagnostics.
+
+Event-mode inspection:
+
+~~~bash
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
+# make or capture a change
+acd prompt --last
+acd prompt --seq 42 --json
+~~~
+
+Intent-mode inspection:
+
+~~~bash
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
+# make enough changes for a batch, or use acd wake to flush the visible queue
+acd prompt --last
+acd prompt --seq 42
+~~~
+
+In event mode, `--seq` selects the commit-message prompt for that captured
+event. In intent mode, `--seq` also matches planner windows where that seq was
+offered, so you can see the offered seqs, selected/deferred seqs, grouping
+reason, validation error, and fallback provider. If no trace is found, restart
+the daemon with `ACD_AI_PROMPT_TRACE=1`; `acd prompt` never creates traces by
+itself.
 
 ## Manual revert or superseded queued work
 

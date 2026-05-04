@@ -237,9 +237,11 @@ if the visible pending queue is below `ACD_INTENT_MIN_PENDING` and the oldest
 visible capture is younger than `ACD_INTENT_MAX_PENDING_AGE`, replay records a
 `skipped_due_intent_batch_wait` no-op instead of planning. Reaching the count
 trigger offers up to `ACD_INTENT_WINDOW`; reaching the age trigger offers the
-currently visible pending rows up to that same window. Explicit `acd wake` /
+currently visible pending rows up to that same maximum. Explicit `acd wake` /
 flush requests bypass only this wait, so a user-requested flush plans whatever
-is visible immediately.
+is visible immediately. Flush does not bypass planner validation, terminal
+barriers, safe ordering checks, or the forced-aging path for captures that were
+already deferred too many times.
 
 `acd status`, `acd diagnose`, and `acd doctor` surface this wait state when
 intent mode is active. The reports include the visible pending count,
@@ -274,6 +276,10 @@ Intent-specific observability:
 - `ACD_TRACE=1` records planner input/output summaries, selected seqs, deferred
   seqs, batch-wait skips, and validation failures without writing captured
   source diffs.
+- `ACD_AI_PROMPT_TRACE=1` records the actual provider prompt/request diagnostics
+  under `<gitDir>/acd/prompt-trace/`. These records are local and post-redaction
+  / truncation, but may still contain source code; inspect them with
+  `acd prompt --last` or `acd prompt --seq <seq>`.
 
 ---
 
@@ -870,6 +876,15 @@ classes:
 `capture.pause` and `replay.pause` are emitted once per daemon poll cycle while
 the pause is active; they share the same output shape as the `pause` object in
 `acd status --json` and `acd list --json`.
+
+`ACD_TRACE` and `ACD_AI_PROMPT_TRACE` are separate diagnostics. `ACD_TRACE`
+writes daemon decision summaries to `<gitDir>/acd/trace/` and intentionally
+avoids captured source diffs. `ACD_AI_PROMPT_TRACE` writes local AI
+prompt/request records to `<gitDir>/acd/prompt-trace/`; those records are
+post-redaction/truncation but may still contain source code and provider
+responses. Use `acd prompt --last` for the newest request, or
+`acd prompt --seq <seq>` to inspect either an event prompt or an intent planner
+window that offered that seq.
 
 ---
 

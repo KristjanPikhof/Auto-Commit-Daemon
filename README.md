@@ -50,6 +50,8 @@ acd events              # show the durable product decision ledger
 acd events --watch      # stream decisions appended after watch starts
 acd explain --path FILE # explain why a path was captured, skipped, or blocked
 acd explain --commit HEAD # explain decisions linked to a commit
+acd prompt              # inspect the last opt-in AI prompt trace
+acd prompt --seq 42 --json # inspect an event or offered intent seq as JSON
 acd fix --dry-run       # plan safe remediation for a stuck repo
 acd fix --yes           # apply the safe plan after reading it
 acd logs                # tail the current repo daemon log as raw JSONL
@@ -209,12 +211,30 @@ Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 `seq`, and `generation`. See [docs/capture-replay.md](docs/capture-replay.md#trace-event-classes)
 for the full `event_class` enumeration.
 
+Enable AI prompt tracing only when you need to inspect exactly what an AI
+provider or intent planner saw:
+
+~~~bash
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
+acd prompt --last
+
+ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
+acd prompt --seq 42 --json
+~~~
+
+Prompt traces are local JSONL diagnostics under `<gitDir>/acd/prompt-trace/`.
+They are written after ACD's redaction and truncation steps, but they may still
+contain source code, paths, request envelopes, provider responses, and fallback
+metadata. Treat them as sensitive and delete the prompt-trace directory when
+the investigation is complete.
+
 ## Environment
 
 | Variable | Default | Effect |
 |---|---:|---|
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
+| `ACD_AI_PROMPT_TRACE` | unset | Truthy values `1`, `true`, `yes` persist local AI request/response diagnostics under `<gitDir>/acd/prompt-trace/`; sensitive even after redaction/truncation. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SAFE_IGNORE` | enabled | Set to `0`, `false`, `no`, or `off` to disable ACD's internal generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated patterns appended to the safe-ignore defaults, for example `dist/,build/`. |
@@ -274,8 +294,13 @@ export ACD_AI_DIFF_EGRESS=1
 Use `event` for CI smoke runs and compatibility-sensitive shared branches.
 Use `intent` when review quality matters and the AI endpoint is trusted. Intent
 planning may group related captures, choose exactly one capture, or defer
-unrelated captures. Over-deferred captures are forced through a one-capture
-planner window so they cannot starve.
+unrelated captures. `ACD_INTENT_WINDOW` is the maximum offered to a normal
+planner pass, `ACD_INTENT_MIN_PENDING` is the preferred count trigger, and
+`ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch for sparse queues. Explicit
+flushes from `acd wake` bypass only the batch wait, so the daemon plans the
+currently visible pending captures immediately. Over-deferred captures are
+forced through a one-capture planner window so they cannot starve; ordered
+same-path or nested-path barriers still land first.
 
 ## Docs
 
