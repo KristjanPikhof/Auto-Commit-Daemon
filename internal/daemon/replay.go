@@ -155,6 +155,14 @@ type ReplayOpts struct {
 	// IntentWindow caps the normal planning window. Zero resolves from env.
 	IntentWindow int
 
+	// IntentMinPending is the preferred pending-count gate before intent
+	// planning starts. Zero resolves from env.
+	IntentMinPending int
+
+	// IntentMaxPendingAge is the bounded wait escape hatch for sparse pending
+	// queues that have not reached IntentMinPending. Zero resolves from env.
+	IntentMaxPendingAge time.Duration
+
 	// IntentRecentCommits caps recent history context supplied to the planner.
 	// Zero resolves from env.
 	IntentRecentCommits int
@@ -166,6 +174,11 @@ type ReplayOpts struct {
 	// IntentIncludeDiffs permits captured diffs in planner requests. Production
 	// callers should leave this false unless diff egress is explicitly enabled.
 	IntentIncludeDiffs bool
+
+	// IntentBypassBatchWait lets explicit flush requests plan the currently
+	// visible pending window without waiting for IntentMinPending or
+	// IntentMaxPendingAge.
+	IntentBypassBatchWait bool
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -182,6 +195,10 @@ type ReplaySummary struct {
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
 	Skipped   bool // replay drain was intentionally skipped before reading events
+	// SkippedReason distinguishes intentional no-op passes from an empty
+	// pending queue. Empty means replay was not skipped or the legacy pause
+	// skip path set only Skipped.
+	SkippedReason string
 	// HasMore is true when ReplayOpts.Limit capped the batch and at least one
 	// additional pending event was visible beyond the cap. The run loop uses
 	// this to schedule an immediate follow-up replay pass without waiting for
@@ -702,12 +719,15 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 }
 
 type intentReplayConfig struct {
-	enabled      bool
-	planner      ai.IntentPlanner
-	window       int
-	recent       int
-	deferLimit   int
-	includeDiffs bool
+	enabled         bool
+	planner         ai.IntentPlanner
+	window          int
+	minPending      int
+	maxPendingAge   time.Duration
+	recent          int
+	deferLimit      int
+	includeDiffs    bool
+	bypassBatchWait bool
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -725,14 +745,23 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 
 	out := intentReplayConfig{
-		enabled:      true,
-		window:       cfg.IntentWindow,
-		recent:       cfg.IntentRecentCommits,
-		deferLimit:   cfg.IntentDeferLimit,
-		includeDiffs: opts.IntentIncludeDiffs,
+		enabled:         true,
+		window:          cfg.IntentWindow,
+		minPending:      cfg.IntentMinPending,
+		maxPendingAge:   cfg.IntentMaxPendingAge,
+		recent:          cfg.IntentRecentCommits,
+		deferLimit:      cfg.IntentDeferLimit,
+		includeDiffs:    opts.IntentIncludeDiffs,
+		bypassBatchWait: opts.IntentBypassBatchWait,
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
+	}
+	if opts.IntentMinPending > 0 {
+		out.minPending = opts.IntentMinPending
+	}
+	if opts.IntentMaxPendingAge > 0 {
+		out.maxPendingAge = opts.IntentMaxPendingAge
 	}
 	if opts.IntentRecentCommits > 0 {
 		out.recent = opts.IntentRecentCommits
@@ -744,6 +773,12 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 	if out.window <= 0 {
 		out.window = ai.DefaultIntentWindow
+	}
+	if out.minPending <= 0 {
+		out.minPending = ai.DefaultIntentMinPending
+	}
+	if out.maxPendingAge <= 0 {
+		out.maxPendingAge = ai.DefaultIntentMaxPendingAge
 	}
 	if out.recent < 0 {
 		out.recent = 0
@@ -807,11 +842,17 @@ func replayIntentBatch(
 	parentTree string,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
-	window, forced, err := selectIntentWindow(ctx, db, pending, cfg)
+	window, forced, waitReason, err := selectIntentWindow(ctx, db, pending, cfg)
 	if err != nil {
 		return sum, err
 	}
 	if len(window) == 0 {
+		if waitReason != "" {
+			sum.Skipped = true
+			sum.SkippedReason = waitReason
+			sum.HasMore = false
+			traceIntentBatchWait(opts.Trace, repoRoot, activeCtx, pending, cfg, waitReason)
+		}
 		return sum, nil
 	}
 	preflight := intentPreflightEvents(pending, window, forced)
@@ -911,9 +952,9 @@ func rejectInvalidIntentWindowEvents(
 	return sum, false, nil
 }
 
-func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, error) {
+func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, string, error) {
 	if len(pending) == 0 {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 	var (
 		forcedEvent state.CaptureEvent
@@ -923,7 +964,7 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	for _, ev := range pending {
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 		if !ok || ps.DeferCount < cfg.deferLimit {
 			continue
@@ -942,15 +983,27 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 			if n > len(pending) {
 				n = len(pending)
 			}
-			return pending[:n], false, nil
+			return pending[:n], false, "", nil
 		}
-		return []state.CaptureEvent{forcedEvent}, true, nil
+		return []state.CaptureEvent{forcedEvent}, true, "", nil
+	}
+	if !cfg.bypassBatchWait && intentBatchShouldWait(pending, cfg, time.Now()) {
+		return nil, false, "skipped_due_intent_batch_wait", nil
 	}
 	n := cfg.window
 	if n > len(pending) {
 		n = len(pending)
 	}
-	return pending[:n], false, nil
+	return pending[:n], false, "", nil
+}
+
+func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
+	if len(pending) == 0 || len(pending) >= cfg.minPending {
+		return false
+	}
+	oldest := pending[0]
+	oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
+	return oldestAge < cfg.maxPendingAge
 }
 
 func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
