@@ -320,7 +320,8 @@ func renderPromptHuman(out io.Writer, report promptReport) error {
 	if report.Query.Seq > 0 {
 		fmt.Fprintf(out, "Query: seq %d\n\n", report.Query.Seq)
 	} else {
-		fmt.Fprintln(out, "Query: last\n")
+		fmt.Fprintln(out, "Query: last")
+		fmt.Fprintln(out)
 	}
 	if !report.Found || report.Trace == nil {
 		_, err := fmt.Fprintln(out, report.Message)
@@ -380,7 +381,8 @@ func renderPromptHuman(out io.Writer, report promptReport) error {
 func printPromptBlock(out io.Writer, label, body string) {
 	fmt.Fprintf(out, "%s:\n", label)
 	if body == "" {
-		fmt.Fprintln(out, "  (empty)\n")
+		fmt.Fprintln(out, "  (empty)")
+		fmt.Fprintln(out)
 		return
 	}
 	for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
