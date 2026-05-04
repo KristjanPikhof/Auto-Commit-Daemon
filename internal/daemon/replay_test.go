@@ -2488,6 +2488,61 @@ func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "limit-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "limit-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "limit-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Group visible pending",
+			GroupingReason: "min pending reached beyond replay limit",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Limit:               1,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want 2 published without batch wait", sum)
+	}
+	if !sum.HasMore {
+		t.Fatalf("HasMore=false want true with pending beyond offered window; summary=%+v", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 2 || got[0].Seq != pending[0].Seq || got[1].Seq != pending[1].Seq {
+		t.Fatalf("offered captures=%+v want first two pending only", got)
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents after replay: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Seq != pending[2].Seq {
+		t.Fatalf("remaining pending=%+v want only third capture", remaining)
+	}
+}
+
 func TestReplay_IntentStrategyPlansWhenOldestPendingReachesMaxAge(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
