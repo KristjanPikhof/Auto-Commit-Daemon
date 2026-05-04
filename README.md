@@ -215,12 +215,18 @@ for the full `event_class` enumeration. These decision traces summarize daemon
 behavior; they do not store full AI prompts or provider request envelopes.
 
 Enable AI prompt tracing only when you need to inspect exactly what an AI
-provider or intent planner saw:
+provider or intent planner saw. The default deterministic provider does not
+send an AI request, so `ACD_AI_PROMPT_TRACE=1` alone will not create prompt
+records. Use a non-deterministic provider when you expect prompt traces:
 
 ~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
 acd prompt --last
 
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
 acd prompt --seq 42 --json
 ~~~
@@ -228,7 +234,9 @@ acd prompt --seq 42 --json
 Prompt traces are local JSONL diagnostics under `<gitDir>/acd/prompt-trace/`.
 They are written after ACD's redaction and truncation steps, but they may still
 contain source code, paths, request envelopes, provider responses, and fallback
-metadata. Treat them as sensitive and delete the prompt-trace directory when
+metadata. Files are grouped by UTC day and are not pruned automatically; the
+async writer buffers up to 256 pending records and drops the oldest buffered
+record if it falls behind. Treat the directory as sensitive and delete it when
 the investigation is complete.
 
 ## Environment
@@ -237,7 +245,7 @@ the investigation is complete.
 |---|---:|---|
 | `ACD_TRACE` | unset | Truthy values `1`, `true`, `yes` enable best-effort JSONL trace logging. |
 | `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Overrides trace output location. |
-| `ACD_AI_PROMPT_TRACE` | unset | Truthy values `1`, `true`, `yes` persist local AI request/response diagnostics under `<gitDir>/acd/prompt-trace/`; sensitive even after redaction/truncation. |
+| `ACD_AI_PROMPT_TRACE` | unset | Truthy values `1`, `true`, `yes` persist local AI request/response diagnostics under `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a request; sensitive even after redaction/truncation. |
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps the default deny-list. |
 | `ACD_SAFE_IGNORE` | enabled | Set to `0`, `false`, `no`, or `off` to disable ACD's internal generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated patterns appended to the safe-ignore defaults, for example `dist/,build/`. |
