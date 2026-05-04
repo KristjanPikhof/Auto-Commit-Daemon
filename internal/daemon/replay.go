@@ -1371,9 +1371,37 @@ func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx Captu
 			"latest_commit_present":     req.LatestCommit != nil,
 			"path_commit_context_count": len(req.PathCommitContext),
 			"window":                    cfg.window,
+			"min_pending":               cfg.minPending,
+			"max_pending_age_seconds":   cfg.maxPendingAge.Seconds(),
 			"recent_commits":            cfg.recent,
 			"defer_limit":               cfg.deferLimit,
 		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, pending []state.CaptureEvent, cfg intentReplayConfig, reason string) {
+	if logger == nil || len(pending) == 0 {
+		return
+	}
+	oldest := pending[0]
+	oldestAgeSeconds := time.Now().Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second)))).Seconds()
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.batch_wait",
+		Decision:   "skipped",
+		Reason:     reason,
+		Input: map[string]any{
+			"visible_pending":         len(pending),
+			"min_pending":             cfg.minPending,
+			"oldest_seq":              oldest.Seq,
+			"oldest_age_seconds":      oldestAgeSeconds,
+			"max_pending_age_seconds": cfg.maxPendingAge.Seconds(),
+			"window":                  cfg.window,
+		},
+		Seq:        oldest.Seq,
 		Generation: cctx.BranchGeneration,
 	})
 }
