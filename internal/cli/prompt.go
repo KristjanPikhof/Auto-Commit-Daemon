@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -126,7 +125,7 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 func promptRepoRecord(repo string) (repoRecord, error) {
 	rec, err := eventsRepoRecord(repo)
 	if err != nil {
-		return repoRecord{}, strings.Replace(err.Error(), "acd events:", "acd prompt:", 1)
+		return repoRecord{}, fmt.Errorf("%s", strings.Replace(err.Error(), "acd events:", "acd prompt:", 1))
 	}
 	return repoRecord{Path: rec.Path, StateDB: rec.StateDB}, nil
 }
@@ -433,8 +432,4 @@ func int64SlicesEqual(a, b []int64) bool {
 		}
 	}
 	return true
-}
-
-func promptTracePathForTest(stateDB string) string {
-	return filepath.Join(gitDirFromStateDB(stateDB), "acd", "prompt-trace", "2026-05-04.jsonl")
 }
