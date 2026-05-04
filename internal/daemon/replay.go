@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -137,6 +138,30 @@ type ReplayOpts struct {
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
+
+	// CommitStrategy selects one-event replay or intent-grouped replay. Empty
+	// resolves from ACD_COMMIT_STRATEGY, preserving event replay by default.
+	CommitStrategy ai.CommitStrategy
+
+	// IntentPlanner chooses selected/deferred capture groups when
+	// CommitStrategy is intent. Nil falls back to the env-selected AI provider,
+	// and then deterministic planning if that provider is unavailable.
+	IntentPlanner ai.IntentPlanner
+
+	// IntentWindow caps the normal planning window. Zero resolves from env.
+	IntentWindow int
+
+	// IntentRecentCommits caps recent history context supplied to the planner.
+	// Zero resolves from env.
+	IntentRecentCommits int
+
+	// IntentDeferLimit controls forced-aging windows. Zero resolves from env;
+	// use a negative value in tests to force zero.
+	IntentDeferLimit int
+
+	// IntentIncludeDiffs permits captured diffs in planner requests. Production
+	// callers should leave this false unless diff egress is explicitly enabled.
+	IntentIncludeDiffs bool
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -294,6 +319,17 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	parentTree, err := resolveTreeOID(ctx, repoRoot, parent)
 	if err != nil {
 		return sum, err
+	}
+
+	intentCfg, closeIntentPlanner, err := resolveIntentReplayConfig(opts)
+	if err != nil {
+		return sum, err
+	}
+	if closeIntentPlanner != nil {
+		defer closeIntentPlanner()
+	}
+	if intentCfg.enabled {
+		return replayIntentBatch(ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile, pending, parent, parentTree, sum)
 	}
 
 	for _, ev := range pending {
@@ -659,6 +695,997 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	return sum, nil
+}
+
+type intentReplayConfig struct {
+	enabled      bool
+	planner      ai.IntentPlanner
+	window       int
+	recent       int
+	deferLimit   int
+	includeDiffs bool
+}
+
+func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
+	cfg := ai.LoadProviderConfigFromEnv()
+	strategy := opts.CommitStrategy
+	if strategy == "" {
+		if opts.IntentPlanner != nil {
+			strategy = ai.CommitStrategyIntent
+		} else {
+			strategy = cfg.CommitStrategy
+		}
+	}
+	if strategy != ai.CommitStrategyIntent {
+		return intentReplayConfig{}, nil, nil
+	}
+
+	out := intentReplayConfig{
+		enabled:      true,
+		window:       cfg.IntentWindow,
+		recent:       cfg.IntentRecentCommits,
+		deferLimit:   cfg.IntentDeferLimit,
+		includeDiffs: opts.IntentIncludeDiffs,
+	}
+	if opts.IntentWindow > 0 {
+		out.window = opts.IntentWindow
+	}
+	if opts.IntentRecentCommits > 0 {
+		out.recent = opts.IntentRecentCommits
+	}
+	if opts.IntentDeferLimit > 0 {
+		out.deferLimit = opts.IntentDeferLimit
+	} else if opts.IntentDeferLimit < 0 {
+		out.deferLimit = 0
+	}
+	if out.window <= 0 {
+		out.window = ai.DefaultIntentWindow
+	}
+	if out.recent < 0 {
+		out.recent = 0
+	}
+
+	if opts.IntentPlanner != nil {
+		out.planner = opts.IntentPlanner
+		return out, nil, nil
+	}
+
+	providerCfg := cfg
+	provider, closer, err := ai.BuildProvider(providerCfg)
+	if err != nil {
+		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
+		out.planner = ai.DeterministicProvider{}
+		return out, nil, nil
+	}
+	planner, ok := provider.(ai.IntentPlanner)
+	if !ok {
+		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
+		out.planner = ai.DeterministicProvider{}
+		if closer != nil {
+			return out, func() {
+				if err := closer.Close(); err != nil {
+					slog.Default().Warn("close unused intent planner provider", "err", err.Error())
+				}
+			}, nil
+		}
+		return out, nil, nil
+	}
+	out.planner = planner
+	if ai.ProviderNeedsDiff(provider) && diffEgressOptIn() {
+		out.includeDiffs = true
+	}
+	if closer != nil {
+		return out, func() {
+			if err := closer.Close(); err != nil {
+				slog.Default().Warn("close intent planner provider", "err", err.Error())
+			}
+		}, nil
+	}
+	return out, nil, nil
+}
+
+type intentReplayItem struct {
+	event      state.CaptureEvent
+	ops        []state.CaptureOp
+	deferCount int
+}
+
+func replayIntentBatch(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	cfg intentReplayConfig,
+	indexFile string,
+	pending []state.CaptureEvent,
+	parent string,
+	parentTree string,
+	sum ReplaySummary,
+) (ReplaySummary, error) {
+	window, forced, err := selectIntentWindow(ctx, db, pending, cfg)
+	if err != nil {
+		return sum, err
+	}
+	if len(window) == 0 {
+		return sum, nil
+	}
+	preflight := intentPreflightEvents(pending, window, forced)
+	if updated, halted, err := rejectInvalidIntentWindowEvents(ctx, repoRoot, db, activeCtx, opts, parent, preflight, sum); halted || err != nil {
+		return updated, err
+	}
+	if len(pending) > len(window) {
+		sum.HasMore = true
+	}
+
+	items, req, err := buildIntentPlanRequest(ctx, repoRoot, db, activeCtx, window, forced, cfg)
+	if err != nil {
+		return sum, err
+	}
+	traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	if forced {
+		if err := recordIntentForcedDecision(ctx, db, items, activeCtx, nowSec, cfg.deferLimit); err != nil {
+			return sum, err
+		}
+		traceIntentForcedAging(opts.Trace, repoRoot, activeCtx, items, cfg.deferLimit)
+	}
+	for _, item := range items {
+		if err := state.RecordPlannerOffer(ctx, db, item.event.Seq, nowSec); err != nil {
+			return sum, err
+		}
+	}
+
+	plan, validationFailure, err := planIntentWithFallback(ctx, db, cfg.planner, req, items, activeCtx, nowSec)
+	if err != nil {
+		return sum, err
+	}
+	if validationFailure != "" {
+		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
+	}
+	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if err := recordIntentDeferrals(ctx, db, plan, items, activeCtx, nowSec); err != nil {
+		return sum, err
+	}
+
+	selected, err := selectedIntentItems(items, plan.SelectedSeqs)
+	if err != nil {
+		return sum, err
+	}
+	sort.Slice(selected, func(i, j int) bool {
+		return selected[i].event.Seq < selected[j].event.Seq
+	})
+	return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+}
+
+func rejectInvalidIntentWindowEvents(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	parent string,
+	events []state.CaptureEvent,
+	sum ReplaySummary,
+) (ReplaySummary, bool, error) {
+	for _, ev := range events {
+		reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx)
+		if err != nil {
+			return sum, false, err
+		}
+		if reason == "" {
+			continue
+		}
+		errorClass := replayErrorValidation
+		if strings.Contains(reason, "branch ref mismatch") {
+			errorClass = replayErrorRefMissing
+		}
+		if err := recordConflict(ctx, db, ev, replayIssue{
+			ErrorClass: errorClass,
+			Message:    reason,
+			Ref:        activeCtx.BranchRef,
+			Path:       ev.Path,
+		}, activeCtx); err != nil {
+			return sum, true, err
+		}
+		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
+		sum.Conflicts++
+		return sum, true, nil
+	}
+	return sum, false, nil
+}
+
+func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, cfg intentReplayConfig) ([]state.CaptureEvent, bool, error) {
+	if len(pending) == 0 {
+		return nil, false, nil
+	}
+	var (
+		forcedEvent state.CaptureEvent
+		forcedState state.PlannerState
+		forcedOK    bool
+	)
+	for _, ev := range pending {
+		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok || ps.DeferCount < cfg.deferLimit {
+			continue
+		}
+		if !forcedOK ||
+			ps.LastPlannedTS < forcedState.LastPlannedTS ||
+			(ps.LastPlannedTS == forcedState.LastPlannedTS && ev.Seq < forcedEvent.Seq) {
+			forcedEvent = ev
+			forcedState = ps
+			forcedOK = true
+		}
+	}
+	if forcedOK {
+		if hasEarlierPotentialPathDependency(pending, forcedEvent) {
+			n := cfg.window
+			if n > len(pending) {
+				n = len(pending)
+			}
+			return pending[:n], false, nil
+		}
+		return []state.CaptureEvent{forcedEvent}, true, nil
+	}
+	n := cfg.window
+	if n > len(pending) {
+		n = len(pending)
+	}
+	return pending[:n], false, nil
+}
+
+func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
+	if !forced || len(window) == 0 {
+		return window
+	}
+	for i, ev := range pending {
+		if ev.Seq == window[0].Seq {
+			return pending[:i+1]
+		}
+	}
+	return window
+}
+
+func hasEarlierPotentialPathDependency(pending []state.CaptureEvent, forced state.CaptureEvent) bool {
+	for _, ev := range pending {
+		if ev.Seq >= forced.Seq {
+			return false
+		}
+		if captureEventsMayTouchSamePath(ev, forced) {
+			return true
+		}
+	}
+	return false
+}
+
+func captureEventsMayTouchSamePath(a, b state.CaptureEvent) bool {
+	aPaths := captureEventPathSet(a)
+	for path := range captureEventPathSet(b) {
+		if _, ok := aPaths[path]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func captureEventPathSet(ev state.CaptureEvent) map[string]struct{} {
+	out := map[string]struct{}{}
+	if ev.Path != "" {
+		out[ev.Path] = struct{}{}
+	}
+	if ev.OldPath.Valid && ev.OldPath.String != "" {
+		out[ev.OldPath.String] = struct{}{}
+	}
+	return out
+}
+
+func buildIntentPlanRequest(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	cctx CaptureContext,
+	events []state.CaptureEvent,
+	forced bool,
+	cfg intentReplayConfig,
+) ([]intentReplayItem, ai.IntentPlanRequest, error) {
+	items := make([]intentReplayItem, 0, len(events))
+	offered := make([]ai.OfferedCapture, 0, len(events))
+	paths := map[string]struct{}{}
+	for _, ev := range events {
+		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
+		if err != nil {
+			return nil, ai.IntentPlanRequest{}, fmt.Errorf("daemon: load ops seq=%d for intent planning: %w", ev.Seq, err)
+		}
+		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
+		if err != nil {
+			return nil, ai.IntentPlanRequest{}, err
+		}
+		deferCount := 0
+		if ok {
+			deferCount = ps.DeferCount
+		}
+		opName := ev.Operation
+		if len(ops) == 1 && ops[0].Op != "" {
+			opName = ops[0].Op
+		}
+		diff := ""
+		if cfg.includeDiffs {
+			if rendered, err := BuildOpsDiff(ctx, repoRoot, ops); err == nil {
+				diff = rendered
+			}
+		}
+		items = append(items, intentReplayItem{event: ev, ops: ops, deferCount: deferCount})
+		offered = append(offered, ai.OfferedCapture{
+			Seq:          ev.Seq,
+			Path:         ev.Path,
+			Op:           opName,
+			Timestamp:    time.Unix(0, int64(ev.CapturedTS*1e9)).UTC(),
+			Fidelity:     ev.Fidelity,
+			DeferCount:   deferCount,
+			CapturedDiff: diff,
+		})
+		for _, path := range touchedPaths(ops) {
+			paths[path] = struct{}{}
+		}
+		if ev.Path != "" {
+			paths[ev.Path] = struct{}{}
+		}
+	}
+
+	var latest *ai.CommitSummary
+	if commits, err := git.LatestBranchCommitSummaries(ctx, repoRoot, cctx.BaseHead, 1); err == nil && len(commits) > 0 {
+		latest = aiCommitSummary(commits[0])
+	}
+	pathContext := buildIntentPathContext(ctx, repoRoot, cctx.BaseHead, paths, cfg.recent)
+	req, err := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{
+		LatestCommit:         latest,
+		PathCommitContext:    pathContext,
+		OfferedCaptures:      offered,
+		ForcedAging:          forced,
+		IncludeCapturedDiffs: cfg.includeDiffs,
+	})
+	if err != nil {
+		return nil, ai.IntentPlanRequest{}, err
+	}
+	return items, req, nil
+}
+
+func buildIntentPathContext(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, limit int) []ai.PathCommitContext {
+	if len(paths) == 0 || limit <= 0 {
+		return nil
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	out := make([]ai.PathCommitContext, 0, len(ordered))
+	for _, path := range ordered {
+		commits, err := git.LatestPathCommitSummaries(ctx, repoRoot, ref, []string{path}, limit)
+		if err != nil || len(commits) == 0 {
+			continue
+		}
+		item := ai.PathCommitContext{Path: path, Commits: make([]ai.CommitSummary, 0, len(commits))}
+		for _, commit := range commits {
+			item.Commits = append(item.Commits, *aiCommitSummary(commit))
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func aiCommitSummary(commit git.CommitSummary) *ai.CommitSummary {
+	return &ai.CommitSummary{
+		OID:     commit.ShortOID,
+		Subject: commit.Subject,
+		Paths:   append([]string(nil), commit.TouchedPaths...),
+	}
+}
+
+func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
+	if planner == nil {
+		planner = ai.DeterministicProvider{}
+	}
+	var validationFailure string
+	plan, err := planner.PlanIntent(ctx, req)
+	if err == nil {
+		err = ai.ValidateIntentPlan(req, plan)
+	}
+	if err == nil {
+		err = validateIntentSelectionSafety(items, plan)
+	}
+	if err == nil {
+		return plan, "", nil
+	}
+	validationFailure = err.Error()
+	for _, item := range items {
+		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, err.Error()); recErr != nil {
+			return ai.IntentPlan{}, validationFailure, recErr
+		}
+		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, err.Error(), "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
+			return ai.IntentPlan{}, validationFailure, recErr
+		}
+	}
+	fallback := ai.DeterministicProvider{}
+	plan, err = fallback.PlanIntent(ctx, req)
+	if err != nil {
+		return ai.IntentPlan{}, validationFailure, err
+	}
+	if err := validateIntentSelectionSafety(items, plan); err != nil {
+		return ai.IntentPlan{}, validationFailure, err
+	}
+	return plan, validationFailure, nil
+}
+
+func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
+	selected := map[int64]struct{}{}
+	for _, seq := range plan.SelectedSeqs {
+		selected[seq] = struct{}{}
+	}
+	for i, item := range items {
+		if _, ok := selected[item.event.Seq]; !ok {
+			continue
+		}
+		for j := 0; j < i; j++ {
+			prior := items[j]
+			if _, priorSelected := selected[prior.event.Seq]; priorSelected {
+				continue
+			}
+			if pathsRelatedForIntent(touchedPaths(item.ops), touchedPaths(prior.ops)) {
+				return fmt.Errorf("intent planner: selected seq %d depends on deferred earlier seq %d for the same path", item.event.Seq, prior.event.Seq)
+			}
+		}
+	}
+	return nil
+}
+
+func pathsRelatedForIntent(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	for _, left := range a {
+		for _, right := range b {
+			if sameOrNestedRepoPath(left, right) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameOrNestedRepoPath(a, b string) bool {
+	a = normalizeIntentDependencyPath(a)
+	b = normalizeIntentDependencyPath(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) < len(b) {
+		return strings.HasPrefix(b, a+"/")
+	}
+	return strings.HasPrefix(a, b+"/")
+}
+
+func normalizeIntentDependencyPath(path string) string {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	path = strings.TrimPrefix(path, "./")
+	for strings.HasSuffix(path, "/") {
+		path = strings.TrimSuffix(path, "/")
+	}
+	return path
+}
+
+func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan, items []intentReplayItem, cctx CaptureContext, ts float64) error {
+	reasons := make(map[int64]string, len(plan.DeferredReasons))
+	for _, item := range plan.DeferredReasons {
+		reasons[item.Seq] = item.Reason
+	}
+	events := make(map[int64]state.CaptureEvent, len(items))
+	for _, item := range items {
+		events[item.event.Seq] = item.event
+	}
+	for _, seq := range plan.DeferredSeqs {
+		reason := reasons[seq]
+		if err := state.RecordPlannerDefer(ctx, db, seq, ts, reason); err != nil {
+			return err
+		}
+		if ev, ok := events[seq]; ok {
+			msgReason := strings.TrimSpace(reason)
+			if msgReason == "" {
+				msgReason = "planner selected a different capture group"
+			}
+			if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts, state.DecisionKindIntentDeferred, reason, "deferred", "Deferred from this intent planning window: "+msgReason+"."); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func recordIntentForcedDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, deferLimit int) error {
+	if len(items) != 1 {
+		return nil
+	}
+	item := items[0]
+	reason := fmt.Sprintf("defer_count %d reached limit %d", item.deferCount, deferLimit)
+	return appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentForced, reason, "forced one-item planning window", "Forced this capture into a one-item intent planning window after repeated deferrals.")
+}
+
+func appendIntentPlannerDecision(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, ts float64, kind, reason, action, message string) error {
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:       ts,
+		Kind:             kind,
+		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
+		Reason:           sql.NullString{String: reason, Valid: reason != ""},
+		EventSeq:         sql.NullInt64{Int64: ev.Seq, Valid: ev.Seq > 0},
+		HeadSHA:          sql.NullString{String: cctx.BaseHead, Valid: cctx.BaseHead != ""},
+		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
+		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
+		ActionTaken:      sql.NullString{String: action, Valid: action != ""},
+		UserMessage:      sql.NullString{String: message, Valid: message != ""},
+	}); err != nil {
+		return fmt.Errorf("daemon: append intent planner decision seq=%d kind=%s: %w", ev.Seq, kind, err)
+	}
+	return nil
+}
+
+func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, req ai.IntentPlanRequest, cfg intentReplayConfig) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.input",
+		Decision:   "plan",
+		Reason:     "intent planner input summary",
+		Input: map[string]any{
+			"offered":                   intentTraceOffered(items),
+			"forced_aging":              req.ForcedAging,
+			"include_captured_diffs":    cfg.includeDiffs,
+			"latest_commit_present":     req.LatestCommit != nil,
+			"path_commit_context_count": len(req.PathCommitContext),
+			"window":                    cfg.window,
+			"recent_commits":            cfg.recent,
+			"defer_limit":               cfg.deferLimit,
+		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentForcedAging(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, deferLimit int) {
+	if logger == nil || len(items) != 1 {
+		return
+	}
+	item := items[0]
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.forced_aging",
+		Decision:   "force",
+		Reason:     "deferred capture reached forced-aging limit",
+		Input: map[string]any{
+			"seq":         item.event.Seq,
+			"path":        item.event.Path,
+			"defer_count": item.deferCount,
+			"defer_limit": deferLimit,
+		},
+		Seq:        item.event.Seq,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentPlannerValidationFailure(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, errMsg string) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.validation_failed",
+		Decision:   "fallback",
+		Reason:     "planner output failed validation",
+		Input: map[string]any{
+			"offered_seqs": intentItemSeqs(items),
+		},
+		Error:      errMsg,
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, items []intentReplayItem, plan ai.IntentPlan) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "intent.planner.output",
+		Decision:   "selected",
+		Reason:     plan.GroupingReason,
+		Input: map[string]any{
+			"offered_seqs": intentItemSeqs(items),
+		},
+		Output: map[string]any{
+			"selected_seqs": plan.SelectedSeqs,
+			"deferred_seqs": plan.DeferredSeqs,
+			"source":        plan.Source,
+		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func intentTraceOffered(items []intentReplayItem) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"seq":         item.event.Seq,
+			"path":        item.event.Path,
+			"operation":   item.event.Operation,
+			"fidelity":    item.event.Fidelity,
+			"defer_count": item.deferCount,
+			"ops":         len(item.ops),
+		})
+	}
+	return out
+}
+
+func intentItemSeqs(items []intentReplayItem) []int64 {
+	seqs := make([]int64, 0, len(items))
+	for _, item := range items {
+		seqs = append(seqs, item.event.Seq)
+	}
+	return seqs
+}
+
+func selectedIntentItems(items []intentReplayItem, seqs []int64) ([]intentReplayItem, error) {
+	bySeq := make(map[int64]intentReplayItem, len(items))
+	for _, item := range items {
+		bySeq[item.event.Seq] = item
+	}
+	out := make([]intentReplayItem, 0, len(seqs))
+	for _, seq := range seqs {
+		item, ok := bySeq[seq]
+		if !ok {
+			return nil, fmt.Errorf("intent planner: selected seq %d not offered", seq)
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func publishIntentSelection(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	indexFile string,
+	selected []intentReplayItem,
+	plan ai.IntentPlan,
+	parent string,
+	parentTree string,
+	sum ReplaySummary,
+) (ReplaySummary, error) {
+	if len(selected) == 0 {
+		return sum, nil
+	}
+	sourceHead := parent
+	allOps := flattenIntentOps(selected)
+	groupMessage := intentPlanMessage(plan)
+	treeOID := parentTree
+	firstEvent := selected[0].event
+
+	for _, item := range selected {
+		ev := item.event
+		if err := ctx.Err(); err != nil {
+			return sum, err
+		}
+		if reason, err := checkEventGeneration(ctx, repoRoot, sourceHead, ev, activeCtx); err != nil {
+			return sum, err
+		} else if reason != "" {
+			errorClass := replayErrorValidation
+			if strings.Contains(reason, "branch ref mismatch") {
+				errorClass = replayErrorRefMissing
+			}
+			if err := recordConflict(ctx, db, ev, replayIssue{
+				ErrorClass: errorClass,
+				Message:    reason,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}, activeCtx); err != nil {
+				return sum, err
+			}
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
+			sum.Conflicts++
+			return sum, nil
+		}
+		if len(item.ops) == 0 {
+			if err := markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorValidation,
+				Message:    "no ops attached",
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}); err != nil {
+				return sum, err
+			}
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, "no ops attached", nil)
+			sum.Failed++
+			return sum, nil
+		}
+		if msg := validateOps(item.ops); msg != "" {
+			if err := markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorValidation,
+				Message:    msg,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}); err != nil {
+				return sum, err
+			}
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, msg, nil)
+			sum.Failed++
+			return sum, nil
+		}
+
+		if reason, err := detectConflict(ctx, repoRoot, indexFile, item.ops); err != nil {
+			return sum, err
+		} else if reason != "" {
+			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, sourceHead, allOps)
+			if err != nil {
+				return sum, err
+			}
+			if alreadyPublished {
+				if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, headOID,
+					state.DecisionKindHandledExternal, "already_published_by_external_committer", groupMessage); err != nil {
+					return sum, err
+				}
+				reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
+				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after grouped idempotent publish: %w", err)
+				}
+				sum.Published += len(selected)
+				sum.BaseHead = headOID
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
+					"commit": headOID,
+					"parent": sourceHead,
+					"group":  true,
+				})
+				return sum, nil
+			}
+			if err := recordConflict(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorBeforeStateMismatch,
+				Message:    reason,
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}, activeCtx); err != nil {
+				return sum, err
+			}
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.conflict", state.EventStateBlockedConflict, reason, nil)
+			sum.Conflicts++
+			return sum, nil
+		}
+
+		eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+		if len(selected) == 1 {
+			if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, sourceHead, ev, item.ops); err != nil {
+				cancelEvent()
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					if markErr := markFailed(ctx, db, ev, replayIssue{
+						ErrorClass: replayErrorCommitBuildFailure,
+						Message:    err.Error(),
+						Ref:        activeCtx.BranchRef,
+						Path:       ev.Path,
+					}); markErr != nil {
+						return sum, markErr
+					}
+					traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+					sum.Failed++
+					return sum, nil
+				}
+				return sum, err
+			} else if superseded {
+				cancelEvent()
+				if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, sourceHead,
+					state.DecisionKindSupersededExternal, reason, groupMessage); err != nil {
+					return sum, err
+				}
+				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
+					return sum, fmt.Errorf("daemon: replay reseed index after grouped superseded external: %w", err)
+				}
+				sum.Published++
+				sum.BaseHead = sourceHead
+				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, reason, map[string]any{
+					"commit": sourceHead,
+					"parent": sourceHead,
+					"group":  true,
+				})
+				return sum, nil
+			}
+		}
+		var err error
+		treeOID, err = applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, item.ops)
+		cancelEvent()
+		if err != nil {
+			if markErr := markFailed(ctx, db, ev, replayIssue{
+				ErrorClass: replayErrorCommitBuildFailure,
+				Message:    err.Error(),
+				Ref:        activeCtx.BranchRef,
+				Path:       ev.Path,
+			}); markErr != nil {
+				return sum, markErr
+			}
+			traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
+			sum.Failed++
+			return sum, nil
+		}
+	}
+
+	if parentTree != "" && treeOID == parentTree {
+		if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, sourceHead,
+			state.DecisionKindHandledExternal, "already_published_no_op_tree", groupMessage); err != nil {
+			return sum, err
+		}
+		reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
+		if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
+			return sum, fmt.Errorf("daemon: replay reseed index after grouped no-op tree: %w", err)
+		}
+		sum.Published += len(selected)
+		sum.BaseHead = sourceHead
+		traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_no_op_tree", map[string]any{
+			"commit": sourceHead,
+			"parent": sourceHead,
+			"tree":   treeOID,
+			"group":  true,
+		})
+		return sum, nil
+	}
+
+	eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
+	commitOID, err := commitTreeWithMessage(eventCtx, repoRoot, treeOID, parent, groupMessage)
+	if err != nil {
+		cancelEvent()
+		if markErr := markFailed(ctx, db, firstEvent, replayIssue{
+			ErrorClass: replayErrorCommitBuildFailure,
+			Message:    err.Error(),
+			Ref:        activeCtx.BranchRef,
+			Path:       firstEvent.Path,
+		}); markErr != nil {
+			return sum, markErr
+		}
+		traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.failed", state.EventStateFailed, err.Error(), nil)
+		sum.Failed++
+		return sum, nil
+	}
+	oldOID := parent
+	if activeCtx.BaseHead == "" {
+		oldOID = ""
+	}
+	if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, firstEvent); err != nil {
+		headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, sourceHead, allOps)
+		if probeErr != nil {
+			cancelEvent()
+			return sum, probeErr
+		}
+		if alreadyPublished {
+			cancelEvent()
+			if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, headOID,
+				state.DecisionKindHandledExternal, "already_published_after_cas_exhaustion", groupMessage); err != nil {
+				return sum, err
+			}
+			reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
+			if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
+				return sum, fmt.Errorf("daemon: replay reseed index after grouped cas idempotent publish: %w", err)
+			}
+			sum.Published += len(selected)
+			sum.BaseHead = headOID
+			traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_after_cas_exhaustion", map[string]any{
+				"commit": headOID,
+				"parent": oldOID,
+				"group":  true,
+			})
+			return sum, nil
+		}
+		reason := "update-ref CAS failed: " + err.Error()
+		actual, expected := parseUpdateRefCASReason(reason)
+		if expected == "" {
+			expected = oldOID
+		}
+		cancelEvent()
+		if recErr := recordConflict(ctx, db, firstEvent, replayIssue{
+			ErrorClass: replayErrorCASFail,
+			Expected:   expected,
+			Actual:     actual,
+			Message:    reason,
+			Ref:        activeCtx.BranchRef,
+			Path:       firstEvent.Path,
+		}, activeCtx); recErr != nil {
+			return sum, recErr
+		}
+		traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.conflict", state.EventStateBlockedConflict, reason, map[string]any{
+			"expected_sha": expected,
+			"actual_sha":   actual,
+			"group":        true,
+		})
+		sum.Conflicts++
+		return sum, nil
+	}
+	cancelEvent()
+
+	if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, commitOID,
+		state.DecisionKindCommitted, "intent_group: "+plan.GroupingReason, groupMessage); err != nil {
+		return sum, err
+	}
+	reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
+	sum.Published += len(selected)
+	sum.BaseHead = commitOID
+	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
+		"commit": commitOID,
+		"parent": oldOID,
+		"group":  true,
+		"events": len(selected),
+	})
+	return sum, nil
+}
+
+func flattenIntentOps(items []intentReplayItem) []state.CaptureOp {
+	var out []state.CaptureOp
+	for _, item := range items {
+		out = append(out, item.ops...)
+	}
+	return out
+}
+
+func intentPlanMessage(plan ai.IntentPlan) string {
+	msg := strings.TrimSpace(plan.Subject)
+	if body := strings.TrimSpace(plan.Body); body != "" {
+		msg += "\n\n" + body
+	}
+	return ai.SanitizeMessage(msg)
+}
+
+func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg string) (string, error) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		msg = "Update files"
+	}
+	var parents []string
+	if parent != "" {
+		parents = []string{parent}
+	}
+	commitOID, err := git.CommitTree(ctx, repoRoot, treeOID, msg, parents...)
+	if err != nil {
+		return "", fmt.Errorf("commit-tree: %w", err)
+	}
+	return commitOID, nil
+}
+
+func settleIntentPublished(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason, message string) error {
+	for _, item := range items {
+		ev := item.event
+		ev.Message = sql.NullString{String: message, Valid: message != ""}
+		if err := settlePublishedEvent(ctx, db, ev, cctx, sourceHead, commitOID, decisionKind, decisionReason); err != nil {
+			return err
+		}
+		if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
+			slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
+		}
+	}
+	return nil
+}
+
+func reconcileIntentLiveIndex(ctx context.Context, repoRoot string, logger acdtrace.Logger, cctx CaptureContext, items []intentReplayItem) {
+	for _, item := range items {
+		reconcileLiveIndexAfterPublish(ctx, repoRoot, logger, cctx, item.event, item.ops)
+	}
 }
 
 var (
@@ -1418,8 +2445,12 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 	if len(paths) == 0 {
 		return false, nil
 	}
+	pathspecs := git.LiteralPathspecs(paths)
+	if len(pathspecs) == 0 {
+		return false, nil
+	}
 	args := []string{"diff", "--quiet", "--no-ext-diff", before, after, "--"}
-	args = append(args, paths...)
+	args = append(args, pathspecs...)
 	_, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, args...)
 	if err != nil {
 		var gerr *git.Error
@@ -1432,7 +2463,7 @@ func pathsTouchedBetween(ctx context.Context, repoRoot, before, after string, pa
 	// fallback bounded to one commit OID instead of buffering path names for
 	// the whole range.
 	args = []string{"rev-list", "--max-count=1", before + ".." + after, "--"}
-	args = append(args, paths...)
+	args = append(args, pathspecs...)
 	out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, 64, args...)
 	if err != nil {
 		return false, fmt.Errorf("rev-list touched paths %s..%s: %w", before, after, err)
@@ -1543,10 +2574,16 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 		action = "superseded externally"
 	case state.DecisionKindCommitted:
 		action = "committed"
+		if strings.HasPrefix(reason, "intent_group:") {
+			action = "intent_group_committed"
+		}
 	case state.DecisionKindBlocked:
 		action = "blocked_conflict"
 	}
 	message := replayDecisionMessage(kind, ev.Path, commitOID)
+	if kind == state.DecisionKindCommitted && strings.HasPrefix(reason, "intent_group:") && message != "" {
+		message = strings.TrimSuffix(message, ".") + " in an intent group."
+	}
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
 		DecisionTS:       ts,
 		Kind:             kind,

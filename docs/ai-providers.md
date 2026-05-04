@@ -98,9 +98,68 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_MODEL` | `gpt-4o-mini` | openai-compat only |
 | `ACD_AI_TIMEOUT` | `30s` | per-request hard timeout; applies to subprocess and openai-compat; accepts Go duration (`30s`) or plain seconds (`30`) |
 | `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
+| `ACD_COMMIT_STRATEGY` | `event` | `event` keeps one captured event per commit. `intent` asks the AI planner to select one or more offered captures for the next commit. |
+| `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the planner in a normal window. |
+| `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact context. |
+| `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs. Off by default; metadata-only payload otherwise. Has no effect for `deterministic`. |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
+
+---
+
+## Intent commit strategy
+
+`ACD_COMMIT_STRATEGY=event` is the compatibility default. Replay drains pending
+captures in FIFO order and keeps the current one-event commit behavior.
+
+`ACD_COMMIT_STRATEGY=intent` changes only replay grouping. ACD offers the next
+pending window to the configured AI provider as structured `capture_intent_plan`
+input. The planner must classify every offered seq as selected or deferred. It
+may select exactly one capture, select any larger non-empty subset, or defer
+unrelated captures. ACD validates the plan before touching git, applies selected
+captures in seq order through the same scratch-index path, writes one commit,
+and marks all selected events with the same `commit_oid`.
+
+If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
+containing only that overdue capture. That keeps intent grouping from starving
+small or hard-to-name edits.
+
+Setup choices:
+
+~~~bash
+# Safe default for CI, shared branches, and compatibility-sensitive repos.
+export ACD_COMMIT_STRATEGY=event
+~~~
+
+~~~bash
+# Reviewer-friendly local work, metadata only.
+export ACD_COMMIT_STRATEGY=intent
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+~~~
+
+~~~bash
+# Private/self-hosted endpoint with explicit diff egress.
+export ACD_COMMIT_STRATEGY=intent
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
+export ACD_AI_BASE_URL=https://ai.example.internal/v1
+export ACD_AI_DIFF_EGRESS=1
+~~~
+
+Troubleshooting:
+
+- `acd status` and `acd diagnose --json` show active strategy, deferred count,
+  forced-aging readiness, and the last planner error.
+- `acd events --watch` shows grouped seqs, deferrals, forced-aging decisions,
+  and planner validation failures from the decision ledger.
+- If the AI provider fails or returns an invalid plan, ACD records the planner
+  error and falls back to a deterministic one-capture plan rather than
+  corrupting queue order.
+- Recovery remains the same: inspect with `acd diagnose --json`, preview with
+  `acd recover --auto --dry-run --json`, then apply recovery only when the
+  daemon is stopped.
 
 ---
 
@@ -114,7 +173,7 @@ Subprocess plugins are external binaries on `$PATH` named `acd-provider-<name>`.
 
 One JSON object per line in both directions (JSONL). The `version` field exists for future negotiation without breaking older plugins.
 
-**Request (daemon → plugin, one line per commit event):**
+**Commit-message request (daemon → plugin, one line per commit event):**
 
 ```json
 {
@@ -136,7 +195,7 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 `multi_op` is present when one daemon event covers more than one file.  
 `diff` is empty unless **both** the selected provider declares `NeedsDiff=true` and the operator has set `ACD_AI_DIFF_EGRESS=1`. When both signals are set, it is a unified diff built from captured `before_oid`/`after_oid` blobs stored in SQLite — not from the live worktree — so it accurately reflects the change at capture time even if the file has been modified since. Secret-like values are redacted before the diff is capped at 4000 bytes (`DiffCap` in `internal/ai/prompt.go`).
 
-**Response (plugin → daemon, one line per request):**
+**Commit-message response (plugin → daemon, one line per request):**
 
 ```json
 {
@@ -148,6 +207,51 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 ```
 
 `subject` must be non-empty for a successful response. `body` may be empty. Set `error` to a non-empty string to signal a soft error (see lifecycle below).
+
+**Intent-planner request (daemon → plugin, one line per planning window):**
+
+When `ACD_COMMIT_STRATEGY=intent` is active, the same subprocess can also
+receive planning requests. The envelope has `request_type: "intent_plan"` and a
+`planner_request` payload. The payload includes the offered captures, recent
+commit context, branch/repo metadata, and whether the window is forced aging.
+
+```json
+{
+  "version": 1,
+  "request_type": "intent_plan",
+  "planner_request": {
+    "repo_root": "/abs/path/to/repo",
+    "branch": "refs/heads/main",
+    "forced_aging": false,
+    "offered_captures": [
+      {"seq": 101, "path": "src/auth.go", "op": "modify"}
+    ],
+    "recent_commits": [
+      {"oid": "abc123", "subject": "Update auth flow"}
+    ]
+  }
+}
+```
+
+**Intent-planner response (plugin → daemon):**
+
+```json
+{
+  "version": 1,
+  "selected_seqs": [101],
+  "deferred_seqs": [],
+  "subject": "Update auth flow",
+  "body": "",
+  "grouping_reason": "single focused auth change",
+  "deferred_reasons": [],
+  "error": ""
+}
+```
+
+Every offered seq must appear in either `selected_seqs` or `deferred_seqs`.
+`selected_seqs` must be non-empty. Add one `{ "seq": <id>, "reason": "..." }`
+entry to `deferred_reasons` for every deferred seq. Invalid responses are
+recorded as planner errors and fall back to safe one-capture planning.
 
 ### Lifecycle
 
@@ -162,7 +266,10 @@ One JSON object per line in both directions (JSONL). The `version` field exists 
 
 ## Example plugin: bash skeleton
 
-The following script is a minimal but runnable subprocess provider. It requires `jq` for JSON parsing; see the note below if `jq` is not available.
+The following script is a minimal commit-message provider. It requires `jq` for
+JSON parsing. It does not implement `request_type: "intent_plan"`; if you use it
+with `ACD_COMMIT_STRATEGY=intent`, ACD falls back to deterministic intent
+planning while still using the plugin for commit-message requests.
 
 ```bash
 #!/usr/bin/env bash
@@ -191,6 +298,24 @@ import json, sys, os
 
 for line in sys.stdin:
     req = json.loads(line)
+    if req.get("request_type") == "intent_plan":
+        offered = req["planner_request"]["offered_captures"]
+        first = offered[0]
+        sys.stdout.write(json.dumps({
+            "version": 1,
+            "selected_seqs": [first["seq"]],
+            "deferred_seqs": [c["seq"] for c in offered[1:]],
+            "subject": f"{first['op']} {os.path.basename(first['path'])}",
+            "body": "",
+            "grouping_reason": "choose the first focused capture",
+            "deferred_reasons": [
+                {"seq": c["seq"], "reason": "separate follow-up capture"}
+                for c in offered[1:]
+            ],
+            "error": "",
+        }) + "\n")
+        sys.stdout.flush()
+        continue
     path = req.get("path", "")
     op   = req.get("op", "modify")
     subject = f"{op} {os.path.basename(path)}"

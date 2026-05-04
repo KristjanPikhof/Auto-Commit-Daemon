@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -2362,6 +2363,331 @@ func TestReplay_ModifyChain_OrderedReplay(t *testing.T) {
 	}
 }
 
+func TestReplay_EventStrategyIgnoresIntentPlanner(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "event-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "event-b.txt", "b\n")
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{1},
+			Subject:        "Should not be used",
+			GroupingReason: "event strategy bypasses planning",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:         f.gitDir,
+		CommitStrategy: ai.CommitStrategyEvent,
+		IntentPlanner:  planner,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("intent planner calls=%d want 0 for event strategy", planner.calls)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		t.Fatalf("commit count=%d want seed+2 event commits", got)
+	}
+}
+
+func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "intent-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "intent-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[1].Seq, pending[0].Seq}, // replay must apply sorted by seq.
+			Subject:        "Group related files",
+			Body:           "Publish both captures in one commit.",
+			GroupingReason: "same user intent",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:         f.gitDir,
+		CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner:  planner,
+		IntentWindow:   10,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+		t.Fatalf("commit count=%d want seed+1 grouped commit", got)
+	}
+	rows, err := f.db.SQL().QueryContext(ctx,
+		`SELECT state, commit_oid, message FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var commitOID string
+	for rows.Next() {
+		var st string
+		var oid, msg sql.NullString
+		if err := rows.Scan(&st, &oid, &msg); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if st != state.EventStatePublished {
+			t.Fatalf("state=%q want published", st)
+		}
+		if !oid.Valid || oid.String == "" {
+			t.Fatal("published event missing commit_oid")
+		}
+		if commitOID == "" {
+			commitOID = oid.String
+		} else if oid.String != commitOID {
+			t.Fatalf("commit_oid=%s want grouped commit %s", oid.String, commitOID)
+		}
+		if !msg.Valid || !strings.Contains(msg.String, "Group related files") {
+			t.Fatalf("message=%q missing grouped subject", msg.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: same user intent")
+	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: same user intent")
+}
+
+func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "defer-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "defer-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "defer-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3", len(pending))
+	}
+
+	planner := &recordingIntentPlanner{
+		plans: []ai.IntentPlan{
+			{
+				SelectedSeqs:   []int64{pending[0].Seq},
+				DeferredSeqs:   []int64{pending[1].Seq},
+				Subject:        "Publish first capture",
+				GroupingReason: "first capture ready",
+				DeferredReasons: []ai.DeferredReason{
+					{Seq: pending[1].Seq, Reason: "waiting for related edit"},
+				},
+			},
+			{
+				SelectedSeqs:   []int64{pending[1].Seq},
+				Subject:        "Publish aged capture",
+				GroupingReason: "forced aging",
+			},
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     2,
+		IntentDeferLimit: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay 1: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary 1=%+v want 1 published", sum)
+	}
+	ps, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[1].Seq)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent deferred: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 1 || !ps.LastDeferReason.Valid || ps.LastDeferReason.String != "waiting for related edit" {
+		t.Fatalf("planner state=%+v want one recorded defer", ps)
+	}
+
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD after first replay: %v", err)
+	}
+	f.cctx.BaseHead = head
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     3,
+		IntentDeferLimit: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay 2: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary 2=%+v want forced publish", sum)
+	}
+	if planner.calls != 2 {
+		t.Fatalf("planner calls=%d want 2", planner.calls)
+	}
+	if !planner.requests[1].ForcedAging {
+		t.Fatalf("second request ForcedAging=false want true")
+	}
+	if got := planner.requests[1].OfferedCaptures; len(got) != 1 || got[0].Seq != pending[1].Seq {
+		t.Fatalf("forced window offered=%+v want only seq %d", got, pending[1].Seq)
+	}
+	if _, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[1].Seq); err != nil || ok {
+		t.Fatalf("selected planner state after publish ok=%v err=%v, want cleared", ok, err)
+	}
+}
+
+func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	beforeOID, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	childOID, err := git.HashObjectStdin(ctx, f.dir, []byte("child\n"))
+	if err != nil {
+		t.Fatalf("hash child: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "foo", beforeOID, "seed foo file")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update-ref base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	deleteEvent := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "delete",
+		Path:             "foo",
+		Fidelity:         "rescan",
+	}
+	deleteOp := state.CaptureOp{
+		Op:         "delete",
+		Path:       "foo",
+		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+	deleteSeq, err := state.AppendCaptureEvent(ctx, f.db, deleteEvent, []state.CaptureOp{deleteOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent delete: %v", err)
+	}
+
+	createEvent := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         base,
+		Operation:        "create",
+		Path:             "foo/bar",
+		Fidelity:         "rescan",
+	}
+	createOp := state.CaptureOp{
+		Op:        "create",
+		Path:      "foo/bar",
+		AfterOID:  sql.NullString{String: childOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:  "rescan",
+	}
+	createSeq, err := state.AppendCaptureEvent(ctx, f.db, createEvent, []state.CaptureOp{createOp})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent create: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{createSeq},
+			DeferredSeqs:   []int64{deleteSeq},
+			Subject:        "Create nested file first",
+			GroupingReason: "unsafe planner ordering",
+			DeferredReasons: []ai.DeferredReason{
+				{Seq: deleteSeq, Reason: "later"},
+			},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     2,
+		IntentDeferLimit: 2,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want fallback publish of the earlier delete only", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+
+	var deleteState, createState string
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, deleteSeq).Scan(&deleteState); err != nil {
+		t.Fatalf("query delete state: %v", err)
+	}
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, createSeq).Scan(&createState); err != nil {
+		t.Fatalf("query create state: %v", err)
+	}
+	if deleteState != state.EventStatePublished {
+		t.Fatalf("delete state=%q want published", deleteState)
+	}
+	if createState != state.EventStatePending {
+		t.Fatalf("create state=%q want pending after fallback deferred it", createState)
+	}
+	if oid, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "foo"); err != nil {
+		t.Fatalf("ls-tree HEAD foo: %v", err)
+	} else if oid != "" {
+		t.Fatalf("HEAD still contains deleted foo blob %s", oid)
+	}
+	if entries, err := git.LsTree(ctx, f.dir, "HEAD", true, "foo/bar"); err != nil {
+		t.Fatalf("ls-tree HEAD foo/bar: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("HEAD published nested create before delete dependency was accepted: %+v", entries)
+	}
+
+	assertIntentPlannerErrorDecision(t, ctx, f.db, deleteSeq, "selected seq")
+	assertIntentPlannerErrorDecision(t, ctx, f.db, createSeq, "deferred earlier seq")
+	ps, ok, err := state.PlannerStateForEvent(ctx, f.db, createSeq)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent create: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 1 || !ps.LastDeferReason.Valid || ps.LastDeferReason.String != "deferred by deterministic fallback" {
+		t.Fatalf("create planner state=%+v want fallback deferral recorded", ps)
+	}
+}
+
 func TestReplay_DefaultIndexIsPerPassTempfile(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -3029,6 +3355,39 @@ func restoreReplayRefSeams(t *testing.T) {
 	})
 }
 
+type recordingIntentPlanner struct {
+	name     string
+	plan     ai.IntentPlan
+	plans    []ai.IntentPlan
+	err      error
+	calls    int
+	requests []ai.IntentPlanRequest
+}
+
+func (p *recordingIntentPlanner) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "recording-intent-planner"
+}
+
+func (p *recordingIntentPlanner) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return ai.IntentPlan{}, err
+	}
+	p.calls++
+	p.requests = append(p.requests, req)
+	if p.err != nil {
+		return ai.IntentPlan{}, p.err
+	}
+	if len(p.plans) > 0 {
+		plan := p.plans[0]
+		p.plans = p.plans[1:]
+		return plan, nil
+	}
+	return p.plan, nil
+}
+
 type memoryTraceLogger struct {
 	mu     sync.Mutex
 	events []acdtrace.Event
@@ -3188,6 +3547,27 @@ func assertReplayDecision(t *testing.T, ctx context.Context, db *state.DB, seq i
 		return
 	}
 	t.Fatalf("missing replay decision kind=%q reason=%q for seq %d: %+v", kind, reason, seq, decisions)
+}
+
+func assertIntentPlannerErrorDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64, reasonContains string) {
+	t.Helper()
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind != state.DecisionKindIntentPlannerError {
+			continue
+		}
+		if reasonContains != "" && (!decision.Reason.Valid || !strings.Contains(decision.Reason.String, reasonContains)) {
+			continue
+		}
+		if !decision.Path.Valid || decision.Path.String == "" {
+			t.Fatalf("planner error decision for seq %d missing path: %+v", seq, decision)
+		}
+		return
+	}
+	t.Fatalf("missing planner error decision containing %q for seq %d: %+v", reasonContains, seq, decisions)
 }
 
 func revListCount(t *testing.T, ctx context.Context, repoDir, rev string) int {

@@ -356,6 +356,161 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	}
 }
 
+func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	for k, v := range map[string]string{
+		"commit.strategy":       "intent",
+		"intent.window":         "7",
+		"intent.recent_commits": "3",
+		"intent.defer_limit":    "1",
+	} {
+		if err := state.MetaSet(ctx, d, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+
+	t.Setenv("ACD_COMMIT_STRATEGY", "event")
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if !rep.IntentStrategy.Active || rep.IntentStrategy.Strategy != "intent" ||
+		rep.IntentStrategy.Window != 7 || rep.IntentStrategy.RecentCommits != 3 ||
+		rep.IntentStrategy.DeferLimit != 1 {
+		t.Fatalf("intent strategy = %+v, want daemon metadata", rep.IntentStrategy)
+	}
+}
+
+func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
+		t.Fatalf("set commit.strategy: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  20,
+		Kind:        state.DecisionKindIntentPlannerError,
+		Path:        sqlNullStr("src/app.go"),
+		Reason:      sqlNullStr("planner returned unsafe seq"),
+		EventSeq:    sql.NullInt64{Int64: 42, Valid: true},
+		ActionTaken: sqlNullStr("planner validation failed"),
+		UserMessage: sqlNullStr("fallback used"),
+	}); err != nil {
+		t.Fatalf("AppendDecision planner error: %v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `DROP TABLE planner_state`); err != nil {
+		t.Fatalf("drop planner_state: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.IntentStrategy.LastPlannerErrorEventSeq != 42 ||
+		rep.IntentStrategy.LastPlannerErrorPath != "src/app.go" ||
+		rep.IntentStrategy.LastPlannerError != "planner returned unsafe seq" {
+		t.Fatalf("last planner error = %+v, want durable decision_records error", rep.IntentStrategy)
+	}
+}
+
+func TestStatus_IntentStrategyPlannerSummaryIsBarrierAware(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	for k, v := range map[string]string{
+		"commit.strategy":    "intent",
+		"intent.defer_limit": "2",
+	} {
+		if err := state.MetaSet(ctx, d, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+
+	barrierSeq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "blocked.go", Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "blocked.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append barrier event: %v", err)
+	}
+	if err := state.MarkEventPublished(ctx, d, barrierSeq, state.EventStateFailed,
+		sql.NullString{}, sqlNullStr("commit failed"), sql.NullString{}, nowFloat()); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	hiddenSeq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "hidden.go", Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "hidden.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append hidden event: %v", err)
+	}
+	visibleSeq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 2,
+		BaseHead: "feedface", Operation: "modify", Path: "visible.go", Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "visible.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append visible event: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := state.RecordPlannerDefer(ctx, d, hiddenSeq, 100+float64(i), "hidden behind barrier"); err != nil {
+			t.Fatalf("defer hidden %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := state.RecordPlannerDefer(ctx, d, visibleSeq, 50+float64(i), "visible defer"); err != nil {
+			t.Fatalf("defer visible %d: %v", i, err)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.IntentStrategy.DeferredEvents != 1 ||
+		rep.IntentStrategy.MaxDeferCount != 2 ||
+		rep.IntentStrategy.ForcedAgingReady != 1 ||
+		rep.IntentStrategy.LastDeferredEventSeq != visibleSeq ||
+		rep.IntentStrategy.LastDeferredPath != "visible.go" {
+		t.Fatalf("intent strategy = %+v, want only visible pending planner row", rep.IntentStrategy)
+	}
+}
+
 func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

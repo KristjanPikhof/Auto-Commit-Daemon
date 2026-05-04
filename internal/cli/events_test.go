@@ -208,6 +208,47 @@ func TestEventsMissingDecisionLedgerIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestEventsJSONGroupedSeqsDoNotImplyIntentGroup(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	ctx := context.Background()
+
+	for _, seq := range []int64{1, 2} {
+		if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+			DecisionTS:  30 + float64(seq),
+			Kind:        state.DecisionKindCommitted,
+			Path:        sqlNullStr("src/app.go"),
+			EventSeq:    sql.NullInt64{Int64: seq, Valid: true},
+			CommitOID:   sqlNullStr("commit123"),
+			ActionTaken: sqlNullStr("committed"),
+			UserMessage: sqlNullStr("committed"),
+		}); err != nil {
+			t.Fatalf("AppendDecision seq %d: %v", seq, err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := runEvents(ctx, &out, repo, "", 0, 10, false, time.Millisecond, true); err != nil {
+		t.Fatalf("runEvents json: %v", err)
+	}
+	var rep eventsReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode events: %v\n%s", err, out.String())
+	}
+	if len(rep.Events) != 2 {
+		t.Fatalf("events len = %d, want 2: %+v", len(rep.Events), rep.Events)
+	}
+	for _, event := range rep.Events {
+		if event.GroupSize != 2 || len(event.GroupedSeqs) != 2 {
+			t.Fatalf("event %+v missing grouped seq enrichment", event)
+		}
+		if event.IntentGroup {
+			t.Fatalf("event %+v set intent_group for a non-intent multi-seq commit", event)
+		}
+	}
+}
+
 func preparePreDecisionLedgerDB(t *testing.T, db *state.DB, dbPath string) {
 	t.Helper()
 	if _, err := db.SQL().ExecContext(context.Background(), `DROP TABLE decision_records`); err != nil {

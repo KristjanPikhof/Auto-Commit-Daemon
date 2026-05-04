@@ -54,6 +54,10 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvModel, "  gpt-4.1-mini  ")
 	t.Setenv(EnvTimeout, "45s")
 	t.Setenv(EnvCAFile, "  /tmp/acd-test-ca.pem  ")
+	t.Setenv(EnvCommitStrategy, "  intent  ")
+	t.Setenv(EnvIntentWindow, "25")
+	t.Setenv(EnvIntentRecentCommits, "8")
+	t.Setenv(EnvIntentDeferLimit, "4")
 
 	cfg := LoadProviderConfigFromEnv()
 
@@ -75,6 +79,18 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	if cfg.CAFile != "/tmp/acd-test-ca.pem" {
 		t.Fatalf("CAFile=%q", cfg.CAFile)
 	}
+	if cfg.CommitStrategy != CommitStrategyIntent {
+		t.Fatalf("CommitStrategy=%q want intent", cfg.CommitStrategy)
+	}
+	if cfg.IntentWindow != 25 {
+		t.Fatalf("IntentWindow=%d want 25", cfg.IntentWindow)
+	}
+	if cfg.IntentRecentCommits != 8 {
+		t.Fatalf("IntentRecentCommits=%d want 8", cfg.IntentRecentCommits)
+	}
+	if cfg.IntentDeferLimit != 4 {
+		t.Fatalf("IntentDeferLimit=%d want 4", cfg.IntentDeferLimit)
+	}
 }
 
 // TestLoadProviderConfigFromEnv_Defaults: an empty env yields the
@@ -85,6 +101,10 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	t.Setenv(EnvAPIKey, "")
 	t.Setenv(EnvModel, "")
 	t.Setenv(EnvTimeout, "")
+	t.Setenv(EnvCommitStrategy, "")
+	t.Setenv(EnvIntentWindow, "")
+	t.Setenv(EnvIntentRecentCommits, "")
+	t.Setenv(EnvIntentDeferLimit, "")
 
 	cfg := LoadProviderConfigFromEnv()
 	if cfg.Mode != "" {
@@ -99,6 +119,18 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	if cfg.Timeout != DefaultProviderTimeout {
 		t.Fatalf("Timeout=%v want default", cfg.Timeout)
 	}
+	if cfg.CommitStrategy != CommitStrategyEvent {
+		t.Fatalf("CommitStrategy=%q want event", cfg.CommitStrategy)
+	}
+	if cfg.IntentWindow != DefaultIntentWindow {
+		t.Fatalf("IntentWindow=%d want %d", cfg.IntentWindow, DefaultIntentWindow)
+	}
+	if cfg.IntentRecentCommits != DefaultIntentRecentCommits {
+		t.Fatalf("IntentRecentCommits=%d want %d", cfg.IntentRecentCommits, DefaultIntentRecentCommits)
+	}
+	if cfg.IntentDeferLimit != DefaultIntentDeferLimit {
+		t.Fatalf("IntentDeferLimit=%d want %d", cfg.IntentDeferLimit, DefaultIntentDeferLimit)
+	}
 }
 
 // TestLoadProviderConfigFromEnv_TimeoutSeconds: a bare integer is parsed
@@ -110,6 +142,53 @@ func TestLoadProviderConfigFromEnv_TimeoutSeconds(t *testing.T) {
 	want := time.Duration(12.5 * float64(time.Second))
 	if cfg.Timeout != want {
 		t.Fatalf("Timeout=%v want %v", cfg.Timeout, want)
+	}
+}
+
+func TestLoadProviderConfigFromEnv_CommitStrategy(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want CommitStrategy
+	}{
+		{raw: "", want: CommitStrategyEvent},
+		{raw: "event", want: CommitStrategyEvent},
+		{raw: " EVENT ", want: CommitStrategyEvent},
+		{raw: "intent", want: CommitStrategyIntent},
+		{raw: " INTENT ", want: CommitStrategyIntent},
+		{raw: "unknown", want: CommitStrategyEvent},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv(EnvCommitStrategy, tc.raw)
+			cfg := LoadProviderConfigFromEnv()
+			if cfg.CommitStrategy != tc.want {
+				t.Fatalf("CommitStrategy=%q want %q", cfg.CommitStrategy, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadProviderConfigFromEnv_InvalidIntentNumbersFallBack(t *testing.T) {
+	t.Setenv(EnvIntentWindow, "0")
+	t.Setenv(EnvIntentRecentCommits, "not-a-number")
+	t.Setenv(EnvIntentDeferLimit, "-1")
+
+	cfg := LoadProviderConfigFromEnv()
+	if cfg.IntentWindow != DefaultIntentWindow {
+		t.Fatalf("IntentWindow=%d want %d", cfg.IntentWindow, DefaultIntentWindow)
+	}
+	if cfg.IntentRecentCommits != DefaultIntentRecentCommits {
+		t.Fatalf("IntentRecentCommits=%d want %d", cfg.IntentRecentCommits, DefaultIntentRecentCommits)
+	}
+	if cfg.IntentDeferLimit != DefaultIntentDeferLimit {
+		t.Fatalf("IntentDeferLimit=%d want %d", cfg.IntentDeferLimit, DefaultIntentDeferLimit)
+	}
+}
+
+func TestLoadProviderConfigFromEnv_ZeroIntentDeferLimitAllowed(t *testing.T) {
+	t.Setenv(EnvIntentDeferLimit, "0")
+	cfg := LoadProviderConfigFromEnv()
+	if cfg.IntentDeferLimit != 0 {
+		t.Fatalf("IntentDeferLimit=%d want 0", cfg.IntentDeferLimit)
 	}
 }
 

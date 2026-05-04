@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 )
 
 const (
@@ -16,6 +17,9 @@ const (
 	DecisionKindBlocked            = "blocked"
 	DecisionKindPaused             = "paused"
 	DecisionKindResumed            = "resumed"
+	DecisionKindIntentDeferred     = "intent_deferred"
+	DecisionKindIntentForced       = "intent_forced"
+	DecisionKindIntentPlannerError = "intent_planner_error"
 )
 
 const (
@@ -38,6 +42,16 @@ type DecisionRecord struct {
 	BranchGeneration sql.NullInt64
 	ActionTaken      sql.NullString
 	UserMessage      sql.NullString
+}
+
+// DecisionCommitGroup summarizes all decision rows attached to a commit. It is
+// intentionally derived from decision_records instead of capture_events so it
+// still works after historical capture rows are pruned.
+type DecisionCommitGroup struct {
+	CommitOID string
+	EventSeqs []int64
+	Paths     []string
+	Count     int
 }
 
 // AppendDecision inserts a decision row and returns its monotonic cursor ID.
@@ -136,6 +150,40 @@ FROM decision_records
 WHERE commit_oid = ?
 ORDER BY id DESC
 LIMIT ?`, commitOID, clampDecisionLimit(limit))
+}
+
+// DecisionGroupForCommit returns the unique event seqs and paths attached to a
+// commit decision. Rows are loaded through the append-only ledger so callers can
+// explain grouped commits even after capture_events pruning.
+func DecisionGroupForCommit(ctx context.Context, d *DB, commitOID string, limit int) (DecisionCommitGroup, error) {
+	rows, err := DecisionsForCommit(ctx, d, commitOID, limit)
+	if err != nil {
+		return DecisionCommitGroup{}, err
+	}
+	group := DecisionCommitGroup{CommitOID: commitOID, Count: len(rows)}
+	seqs := map[int64]struct{}{}
+	paths := map[string]struct{}{}
+	for _, row := range rows {
+		if row.EventSeq.Valid {
+			seqs[row.EventSeq.Int64] = struct{}{}
+		}
+		if row.Path.Valid && row.Path.String != "" {
+			paths[row.Path.String] = struct{}{}
+		}
+	}
+	group.EventSeqs = make([]int64, 0, len(seqs))
+	for seq := range seqs {
+		group.EventSeqs = append(group.EventSeqs, seq)
+	}
+	sort.Slice(group.EventSeqs, func(i, j int) bool {
+		return group.EventSeqs[i] < group.EventSeqs[j]
+	})
+	group.Paths = make([]string, 0, len(paths))
+	for path := range paths {
+		group.Paths = append(group.Paths, path)
+	}
+	sort.Strings(group.Paths)
+	return group, nil
 }
 
 // DecisionsSince returns decisions with id greater than cursorID in insertion

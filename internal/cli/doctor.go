@@ -31,38 +31,39 @@ import (
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
-	Path                   string   `json:"path"`
-	RepoHash               string   `json:"repo_hash"`
-	StateDB                string   `json:"state_db"`
-	StateDBReadable        bool     `json:"state_db_readable"`
-	DaemonPID              int      `json:"daemon_pid"`
-	DaemonAlive            bool     `json:"daemon_alive"`
-	DaemonProcessCount     int      `json:"daemon_process_count,omitempty"`
-	DaemonProcessPIDs      []int    `json:"daemon_process_pids,omitempty"`
-	DaemonMode             string   `json:"daemon_mode"`
-	HeartbeatTS            int64    `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeS          int64    `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale         bool     `json:"heartbeat_stale"`
-	Clients                int      `json:"client_count"`
-	Harnesses              []string `json:"harnesses,omitempty"`
-	LogPath                string   `json:"log_path"`
-	LogLines               []string `json:"log_tail,omitempty"`
-	FsnotifyMode           string   `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches        int      `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped        int      `json:"fsnotify_dropped,omitempty"`
-	FsnotifyFallbackReason string   `json:"fsnotify_fallback_reason,omitempty"`
-	LastCaptureError       string   `json:"last_capture_error,omitempty"`
-	PendingEvents          int      `json:"pending_events"`
-	BlockedConflicts       int      `json:"blocked_conflicts"`
-	FailedEvents           int      `json:"failed_events"`
-	FailedBlockingPending  int      `json:"failed_blocking_pending"`
-	LastReplayConflictTS   int64    `json:"last_replay_conflict_ts,omitempty"`
-	LastReplayConflictPath string   `json:"last_replay_conflict_path,omitempty"`
-	LastReplayConflictErr  string   `json:"last_replay_conflict_error,omitempty"`
-	LastReplayFailureTS    int64    `json:"last_replay_failure_ts,omitempty"`
-	LastReplayFailurePath  string   `json:"last_replay_failure_path,omitempty"`
-	LastReplayFailureErr   string   `json:"last_replay_failure_error,omitempty"`
-	Notes                  []string `json:"notes,omitempty"`
+	Path                   string               `json:"path"`
+	RepoHash               string               `json:"repo_hash"`
+	StateDB                string               `json:"state_db"`
+	StateDBReadable        bool                 `json:"state_db_readable"`
+	DaemonPID              int                  `json:"daemon_pid"`
+	DaemonAlive            bool                 `json:"daemon_alive"`
+	DaemonProcessCount     int                  `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs      []int                `json:"daemon_process_pids,omitempty"`
+	DaemonMode             string               `json:"daemon_mode"`
+	HeartbeatTS            int64                `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeS          int64                `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale         bool                 `json:"heartbeat_stale"`
+	Clients                int                  `json:"client_count"`
+	Harnesses              []string             `json:"harnesses,omitempty"`
+	LogPath                string               `json:"log_path"`
+	LogLines               []string             `json:"log_tail,omitempty"`
+	FsnotifyMode           string               `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches        int                  `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped        int                  `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason string               `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError       string               `json:"last_capture_error,omitempty"`
+	PendingEvents          int                  `json:"pending_events"`
+	BlockedConflicts       int                  `json:"blocked_conflicts"`
+	FailedEvents           int                  `json:"failed_events"`
+	FailedBlockingPending  int                  `json:"failed_blocking_pending"`
+	IntentStrategy         intentStrategyReport `json:"intent_strategy"`
+	LastReplayConflictTS   int64                `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath string               `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr  string               `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS    int64                `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath  string               `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr   string               `json:"last_replay_failure_error,omitempty"`
+	Notes                  []string             `json:"notes,omitempty"`
 }
 
 type doctorHarnessReport struct {
@@ -466,6 +467,11 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	} else {
 		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
 	}
+	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
+		rr.IntentStrategy = intentStrategy
+	} else {
+		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
+	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
@@ -651,6 +657,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 					bits = append(bits, fmt.Sprintf("%q", rr.LastReplayFailureErr))
 				}
 				fmt.Fprintf(out, "      last failure : %s\n", strings.Join(bits, " "))
+			}
+		}
+		if rr.IntentStrategy.Active || rr.IntentStrategy.DeferredEvents > 0 || rr.IntentStrategy.LastPlannerError != "" {
+			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
+				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
+			if rr.IntentStrategy.LastPlannerError != "" {
+				fmt.Fprintf(out, "      planner err: seq %d %s\n",
+					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
 			}
 		}
 		if rr.FsnotifyMode != "" {

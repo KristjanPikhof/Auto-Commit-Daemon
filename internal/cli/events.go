@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -49,6 +50,12 @@ type eventEntry struct {
 	ActionTaken      string  `json:"action_taken,omitempty"`
 	UserMessage      string  `json:"user_message,omitempty"`
 	DecisionTS       float64 `json:"decision_ts"`
+	GroupedSeqs      []int64 `json:"grouped_seqs,omitempty"`
+	GroupSize        int     `json:"group_size,omitempty"`
+	IntentGroup      bool    `json:"intent_group,omitempty"`
+	Deferred         bool    `json:"deferred,omitempty"`
+	ForcedAging      bool    `json:"forced_aging,omitempty"`
+	PlannerError     bool    `json:"planner_error,omitempty"`
 }
 
 func newEventsCmd() *cobra.Command {
@@ -119,7 +126,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 		return fmt.Errorf("acd events: decision table check: %w", err)
 	}
 	if !hasLedger {
-		return renderEvents(out, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
+		return renderEvents(ctx, out, db, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
 	}
 
 	var rows []state.DecisionRecord
@@ -143,7 +150,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 		}
 	}
 	if len(rows) > 0 || !watch {
-		if err := renderEvents(out, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
+		if err := renderEvents(ctx, out, db, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
 			return err
 		}
 	}
@@ -290,16 +297,21 @@ func followEvents(ctx context.Context, out io.Writer, db *sql.DB, repo, path str
 			continue
 		}
 		cursor = maxDecisionCursor(rows, cursor)
-		if err := renderEvents(out, repo, rows, cursor, jsonOut, false, ""); err != nil {
+		if err := renderEvents(ctx, out, db, repo, rows, cursor, jsonOut, false, ""); err != nil {
 			return err
 		}
 	}
 }
 
-func renderEvents(out io.Writer, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
+func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
 	entries := make([]eventEntry, 0, len(rows))
 	for _, row := range rows {
 		entries = append(entries, decisionEntry(row))
+	}
+	if db != nil {
+		if err := enrichEventEntries(ctx, db, entries); err != nil {
+			return err
+		}
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -347,6 +359,9 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 		if message == "" {
 			message = "-"
 		}
+		if len(entry.GroupedSeqs) > 1 {
+			message = fmt.Sprintf("%s seqs=%s", message, formatSeqs(entry.GroupedSeqs))
+		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
 			entry.ID, entry.Time, entry.Kind, path, action, message)
 	}
@@ -354,6 +369,17 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 		return fmt.Errorf("acd events: flush output: %w", err)
 	}
 	return nil
+}
+
+func formatSeqs(seqs []int64) string {
+	if len(seqs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(seqs))
+	for _, seq := range seqs {
+		parts = append(parts, strconv.FormatInt(seq, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func decisionEntry(row state.DecisionRecord) eventEntry {
@@ -392,7 +418,78 @@ func decisionEntry(row state.DecisionRecord) eventEntry {
 	if row.UserMessage.Valid {
 		entry.UserMessage = row.UserMessage.String
 	}
+	entry.IntentGroup = entry.ActionTaken == "intent_group_committed" || strings.HasPrefix(entry.Reason, "intent_group:")
+	entry.Deferred = row.Kind == state.DecisionKindIntentDeferred
+	entry.ForcedAging = row.Kind == state.DecisionKindIntentForced
+	entry.PlannerError = row.Kind == state.DecisionKindIntentPlannerError
 	return entry
+}
+
+func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) error {
+	if len(entries) == 0 || db == nil {
+		return nil
+	}
+	cache := map[string]decisionCommitSummary{}
+	for i := range entries {
+		commit := entries[i].CommitOID
+		if commit == "" {
+			continue
+		}
+		summary, ok := cache[commit]
+		if !ok {
+			var err error
+			summary, err = decisionCommitSummarySQL(ctx, db, commit)
+			if err != nil {
+				return err
+			}
+			cache[commit] = summary
+		}
+		if len(summary.Seqs) > 1 {
+			entries[i].GroupedSeqs = append([]int64(nil), summary.Seqs...)
+			entries[i].GroupSize = len(summary.Seqs)
+		}
+		if summary.IntentGroup {
+			entries[i].IntentGroup = true
+		}
+	}
+	return nil
+}
+
+type decisionCommitSummary struct {
+	Seqs        []int64
+	IntentGroup bool
+}
+
+func decisionCommitSummarySQL(ctx context.Context, db *sql.DB, commitOID string) (decisionCommitSummary, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT event_seq, action_taken, reason
+FROM decision_records
+WHERE commit_oid = ? AND event_seq IS NOT NULL
+ORDER BY event_seq ASC`, commitOID)
+	if err != nil {
+		return decisionCommitSummary{}, fmt.Errorf("acd events: query commit grouped seqs: %w", err)
+	}
+	defer rows.Close()
+	var summary decisionCommitSummary
+	seen := map[int64]struct{}{}
+	for rows.Next() {
+		var seq int64
+		var action, reason sql.NullString
+		if err := rows.Scan(&seq, &action, &reason); err != nil {
+			return decisionCommitSummary{}, fmt.Errorf("acd events: scan commit grouped seq: %w", err)
+		}
+		if _, ok := seen[seq]; !ok {
+			summary.Seqs = append(summary.Seqs, seq)
+			seen[seq] = struct{}{}
+		}
+		if action.String == "intent_group_committed" || strings.HasPrefix(reason.String, "intent_group:") {
+			summary.IntentGroup = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return decisionCommitSummary{}, fmt.Errorf("acd events: iter commit grouped seqs: %w", err)
+	}
+	return summary, nil
 }
 
 func maxDecisionCursor(rows []state.DecisionRecord, fallback int64) int64 {

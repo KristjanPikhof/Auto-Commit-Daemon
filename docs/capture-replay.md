@@ -217,6 +217,45 @@ not enough by itself; without `ACD_AI_DIFF_EGRESS=1`, ACD sends metadata only.
 
 ---
 
+## Commit strategy
+
+`ACD_COMMIT_STRATEGY=event` is the default replay strategy. It preserves the
+original invariant that every pending capture event is considered separately
+and, when published, produces at most one commit.
+
+`ACD_COMMIT_STRATEGY=intent` keeps capture durability unchanged but changes how
+pending events are offered to replay. ACD builds a bounded window of pending
+captures, adds recent branch and path-aware commit context, and asks the AI
+provider for a structured plan. The plan can select exactly one capture or any
+larger non-empty subset. Every offered seq must be either selected or deferred.
+
+ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
+omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
+events that would leapfrog an earlier same-path or nested-path dependency
+(`foo` before `foo/bar`, including rename sources). Selected captures are sorted
+by seq, applied through the scratch index in order, written as one tree,
+committed once, and settled with a shared `commit_oid`. Deferred captures stay
+pending and get durable `planner_state` with `defer_count`, `last_planned_ts`,
+and `last_defer_reason`.
+
+When `defer_count >= ACD_INTENT_DEFER_LIMIT`, the oldest overdue capture is
+forced through a one-item planning window unless an earlier pending related-path
+capture must land first. This prevents starvation while preserving ordered
+path-dependent replay.
+
+Intent-specific observability:
+
+- `acd status` shows the active commit strategy and planner deferral summary.
+- `acd diagnose --json` reports deferred count, forced-aging readiness, and the
+  last planner error without mutating state.
+- `acd events` and `acd explain` expose grouped seqs, deferral reasons,
+  forced-aging windows, and planner validation failures from
+  `decision_records`.
+- `ACD_TRACE=1` records planner input/output summaries, selected seqs, deferred
+  seqs, and validation failures without writing captured source diffs.
+
+---
+
 ## `blocked_conflict`: terminal state, operator action required
 
 A `blocked_conflict` event will never be retried automatically. It signals that
@@ -352,9 +391,20 @@ pruning.
   "last_commit_ts": 1746000250,
   "last_commit_message": "modify auth.go",
   "capture_errors": 0,
+  "intent_strategy": {
+    "strategy": "intent",
+    "active": true,
+    "window": 10,
+    "recent_commits": 5,
+    "defer_limit": 2,
+    "deferred_events": 1,
+    "max_defer_count": 1,
+    "forced_aging_ready": 0
+  },
   "decision_counts": {
     "captured": 8,
     "committed": 7,
+    "intent_deferred": 1,
     "blocked": 1
   },
   "recent_decisions": [
@@ -396,6 +446,11 @@ with `acd fix --dry-run`.
 the decision ledger exists and has rows. `recent_decisions` uses the same entry
 shape as `acd events --json`; `decision_cursor` is the newest decision ID in
 that recent set and can be passed to `acd events --since`.
+
+`intent_strategy` is always present. In `event` mode it reports
+`{"strategy":"event","active":false}` plus resolved planner defaults. In
+`intent` mode it includes active window settings, pending deferral counts,
+forced-aging readiness, and last planner error fields when available.
 
 `paused` and `pause` are omitted when replay is not paused. The `pause` object fields:
 
@@ -627,12 +682,20 @@ version lives in [user-workflows.md](user-workflows.md).
    why native watching was unavailable (Linux: check `inotify_max_user_watches`
    via `acd doctor`).
 
-7. **Check AI provider status.**
+7. **Check AI provider and intent-planner status.**
 
    If commits are appearing but messages look generic, the AI provider may be
-   falling back to deterministic. Set `ACD_AI_PROVIDER=deterministic` explicitly
-   if you want the default behavior, or check `ACD_AI_API_KEY` / network
-   connectivity and restart the daemon.
+   falling back to deterministic. If `ACD_COMMIT_STRATEGY=intent` is active and
+   groups are not forming, inspect planner deferrals and errors:
+
+   ~~~bash
+   acd status --json
+   acd events --watch
+   ~~~
+
+   Set `ACD_AI_PROVIDER=deterministic` explicitly if you want the default
+   behavior, or check `ACD_AI_API_KEY` / network connectivity and restart the
+   daemon.
 
 ---
 

@@ -22,6 +22,8 @@
 package ai
 
 import (
+	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -71,6 +73,15 @@ const BodyWrap = 72
 // handing a unified diff to a network-bound provider.
 const DiffCap = 4000
 
+const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
+	"Return only the structured capture_intent_plan tool output. " +
+	"You may select exactly one capture or any larger non-empty subset. " +
+	"You may defer any offered capture. " +
+	"You must return every offered seq as either selected or deferred. " +
+	"Do not group unrelated captures. " +
+	"Do not invent intent beyond the supplied evidence. " +
+	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture."
+
 var (
 	// reBulletPrefix strips a leading `-` / `*` plus whitespace from a
 	// subject candidate (e.g. when the model returned a bulleted line).
@@ -82,6 +93,21 @@ var (
 	// into the commit log.
 	reControl = regexp.MustCompile(`[\x00-\x08\x0B-\x1F\x7F]`)
 )
+
+// IntentPlannerSystemPrompt returns the stable system instructions used by
+// network and plugin planner providers.
+func IntentPlannerSystemPrompt() string {
+	return intentPlannerSystemPrompt
+}
+
+// BuildIntentPlanUserPrompt serializes req into the planner user message.
+func BuildIntentPlanUserPrompt(req IntentPlanRequest) (string, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("intent planner: marshal request: %w", err)
+	}
+	return "Plan the next commit intent for these offered captures:\n" + string(body), nil
+}
 
 // Truncate caps a unified diff to `max` bytes. Mirrors the legacy 4000-char
 // cutoff; tries to preserve the header block at the top so a downstream

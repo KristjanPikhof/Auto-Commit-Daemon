@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -81,7 +82,7 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	// Confirm every §6.1 table exists.
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
-		"capture_events", "capture_ops", "flush_requests",
+		"capture_events", "capture_ops", "planner_state", "flush_requests",
 		"decision_records", "publish_state", "daemon_meta", "daily_rollups",
 	}
 	for _, table := range tables {
@@ -319,6 +320,371 @@ func TestEventsAppendAndPending(t *testing.T) {
 	loadedOps, err := LoadCaptureOps(ctx, d, seq)
 	if err != nil || len(loadedOps) != 1 {
 		t.Fatalf("load ops: len=%d err=%v", len(loadedOps), err)
+	}
+}
+
+func TestPlannerStateCRUDAndOldestOverdue(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, path string, stateName string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			State:            stateName,
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	first := appendEvent("refs/heads/main", 1, "first.txt", EventStatePending)
+	second := appendEvent("refs/heads/main", 1, "second.txt", EventStatePending)
+	otherBranch := appendEvent("refs/heads/feature", 1, "feature.txt", EventStatePending)
+	published := appendEvent("refs/heads/main", 1, "published.txt", EventStatePublished)
+
+	if err := RecordPlannerOffer(ctx, d, first, 20); err != nil {
+		t.Fatalf("RecordPlannerOffer: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, first, 30, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer first 1: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, first, 40, "still waiting"); err != nil {
+		t.Fatalf("RecordPlannerDefer first 2: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, second, 10, "newer seq but older plan"); err != nil {
+		t.Fatalf("RecordPlannerDefer second: %v", err)
+	}
+	if err := RecordPlannerError(ctx, d, second, 15, "planner parse failed"); err != nil {
+		t.Fatalf("RecordPlannerError: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, otherBranch, 1, "other branch"); err != nil {
+		t.Fatalf("RecordPlannerDefer other branch: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, published, 1, "terminal event"); err != nil {
+		t.Fatalf("RecordPlannerDefer published: %v", err)
+	}
+
+	ps, ok, err := PlannerStateForEvent(ctx, d, first)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent first: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 2 || ps.LastPlannedTS != 40 {
+		t.Fatalf("first planner state = %+v, want defer_count=2 last_planned_ts=40", ps)
+	}
+	if !ps.LastDeferReason.Valid || ps.LastDeferReason.String != "still waiting" {
+		t.Fatalf("first LastDeferReason = %+v", ps.LastDeferReason)
+	}
+	if ps.LastPlanError.Valid {
+		t.Fatalf("first LastPlanError valid after defer: %+v", ps.LastPlanError)
+	}
+
+	ps, ok, err = PlannerStateForEvent(ctx, d, second)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent second: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != 1 || !ps.LastPlanError.Valid || ps.LastPlanError.String != "planner parse failed" {
+		t.Fatalf("second planner state = %+v", ps)
+	}
+
+	ev, overdue, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != second || overdue.EventSeq != second {
+		t.Fatalf("oldest overdue seq = event %d planner %d, want second %d", ev.Seq, overdue.EventSeq, second)
+	}
+
+	ev, overdue, ok, err = OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 2)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent limit 2: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != first || overdue.DeferCount != 2 {
+		t.Fatalf("limit 2 overdue = event %+v planner %+v, want first defer_count=2", ev, overdue)
+	}
+
+	if _, _, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 3); err != nil || ok {
+		t.Fatalf("OldestOverduePlannerEvent limit 3: ok=%v err=%v, want not found", ok, err)
+	}
+}
+
+func TestOldestOverduePlannerEventStopsAfterTerminalPredecessor(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+		}
+		return seq
+	}
+
+	visibleSeq := appendEvent("visible.txt")
+	barrierSeq := appendEvent("barrier.txt")
+	hiddenSeq := appendEvent("hidden.txt")
+
+	if err := MarkEventPublished(ctx, d, barrierSeq, EventStateFailed,
+		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
+		sql.NullString{}, nowSeconds(),
+	); err != nil {
+		t.Fatalf("MarkEventPublished failed: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, hiddenSeq, 1, "oldest but behind barrier"); err != nil {
+		t.Fatalf("RecordPlannerDefer hidden: %v", err)
+	}
+	if err := RecordPlannerDefer(ctx, d, visibleSeq, 30, "visible before barrier"); err != nil {
+		t.Fatalf("RecordPlannerDefer visible: %v", err)
+	}
+
+	ev, ps, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1)
+	if err != nil || !ok {
+		t.Fatalf("OldestOverduePlannerEvent: ok=%v err=%v", ok, err)
+	}
+	if ev.Seq != visibleSeq || ps.EventSeq != visibleSeq {
+		t.Fatalf("oldest overdue = event %d planner %d, want visible %d before barrier %d; hidden %d must be held",
+			ev.Seq, ps.EventSeq, visibleSeq, barrierSeq, hiddenSeq)
+	}
+
+	if err := MarkEventPublished(ctx, d, visibleSeq, EventStatePublished,
+		sql.NullString{String: "abc123", Valid: true}, sql.NullString{},
+		sql.NullString{}, nowSeconds(),
+	); err != nil {
+		t.Fatalf("MarkEventPublished visible: %v", err)
+	}
+	if _, _, ok, err := OldestOverduePlannerEvent(ctx, d, "refs/heads/main", 1, 1); err != nil || ok {
+		t.Fatalf("OldestOverduePlannerEvent behind barrier only: ok=%v err=%v, want not found", ok, err)
+	}
+}
+
+func TestPlannerStateConcurrentDefersAndMissingEvent(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "deadbeef",
+		Operation:        "modify",
+		Path:             "race.txt",
+		Fidelity:         "exact",
+	}, []CaptureOp{{Op: "modify", Path: "race.txt", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- RecordPlannerDefer(ctx, d, seq, float64(i+1), "concurrent defer")
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("RecordPlannerDefer concurrent: %v", err)
+		}
+	}
+
+	ps, ok, err := PlannerStateForEvent(ctx, d, seq)
+	if err != nil || !ok {
+		t.Fatalf("PlannerStateForEvent: ok=%v err=%v", ok, err)
+	}
+	if ps.DeferCount != workers {
+		t.Fatalf("DeferCount=%d want %d", ps.DeferCount, workers)
+	}
+
+	if err := RecordPlannerOffer(ctx, d, seq+1000, 1); err == nil {
+		t.Fatalf("RecordPlannerOffer for missing event returned nil error")
+	}
+	if _, ok, err := PlannerStateForEvent(ctx, d, seq+1000); err != nil || ok {
+		t.Fatalf("PlannerStateForEvent missing = ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
+func TestPlannerStateSchemaMigratesFromV6WithoutDataLoss(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+CREATE TABLE capture_events(
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_ref       TEXT NOT NULL,
+    branch_generation INTEGER NOT NULL,
+    base_head        TEXT NOT NULL,
+    operation        TEXT NOT NULL,
+    path             TEXT NOT NULL,
+    old_path         TEXT,
+    fidelity         TEXT NOT NULL,
+    captured_ts      REAL NOT NULL,
+    published_ts     REAL,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    commit_oid       TEXT,
+    error            TEXT,
+    message          TEXT
+);
+INSERT INTO capture_events(
+    seq, branch_ref, branch_generation, base_head, operation, path, fidelity,
+    captured_ts, state
+) VALUES (
+    42, 'refs/heads/main', 3, 'abc123', 'modify', 'keep.txt', 'exact',
+    12.5, 'pending'
+);
+PRAGMA user_version = 6;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v6 db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v6: %v", err)
+	}
+	defer d.Close()
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("user_version = %d, want %d", uv, SchemaVersion)
+	}
+
+	var path string
+	if err := d.SQL().QueryRowContext(ctx, `SELECT path FROM capture_events WHERE seq = 42`).Scan(&path); err != nil {
+		t.Fatalf("query migrated event: %v", err)
+	}
+	if path != "keep.txt" {
+		t.Fatalf("migrated path=%q want keep.txt", path)
+	}
+	if err := RecordPlannerDefer(ctx, d, 42, 22, "migrated event"); err != nil {
+		t.Fatalf("RecordPlannerDefer migrated event: %v", err)
+	}
+	ps, ok, err := PlannerStateForEvent(ctx, d, 42)
+	if err != nil || !ok || ps.DeferCount != 1 {
+		t.Fatalf("PlannerStateForEvent migrated = %+v ok=%v err=%v, want defer_count=1", ps, ok, err)
+	}
+}
+
+func TestPlannerStateMigrationFromV6DoesNotRebuildDecisionRecords(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+CREATE TABLE decision_records(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_ts          REAL NOT NULL,
+    kind                TEXT NOT NULL,
+    path                TEXT,
+    reason              TEXT,
+    event_seq           INTEGER,
+    head_sha            TEXT,
+    commit_oid          TEXT,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    action_taken        TEXT,
+    user_message        TEXT
+);
+CREATE INDEX custom_decision_records_kind ON decision_records(kind);
+INSERT INTO decision_records(
+    id, decision_ts, kind, path, event_seq, commit_oid, branch_ref,
+    branch_generation, action_taken
+) VALUES (
+    5, 30, 'committed', 'src/app.go', 7, 'def456', 'refs/heads/main',
+    1, 'committed'
+);
+PRAGMA user_version = 6;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v6 db: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v6: %v", err)
+	}
+	defer d.Close()
+
+	var customIndex string
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'decision_records' AND name = 'custom_decision_records_kind'`).Scan(&customIndex); err != nil {
+		t.Fatalf("custom decision_records index missing after v6->v7 migration: %v", err)
+	}
+	if customIndex != "custom_decision_records_kind" {
+		t.Fatalf("custom index name=%q want custom_decision_records_kind", customIndex)
+	}
+
+	got, err := DecisionsForEvent(ctx, d, 7, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != 5 {
+		t.Fatalf("decisions after v6->v7 migration = %+v, want id 5", got)
+	}
+}
+
+func TestPlannerStateIndexesExist(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	for _, idx := range []string{
+		"idx_planner_state_defer_count_planned",
+		"idx_planner_state_last_planned",
+	} {
+		var name string
+		err := d.SQL().QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'planner_state' AND name = ?`, idx).Scan(&name)
+		if err != nil {
+			t.Fatalf("planner_state index %q missing: %v", idx, err)
+		}
+		if name != idx {
+			t.Fatalf("planner_state index name=%q want %q", name, idx)
+		}
 	}
 }
 

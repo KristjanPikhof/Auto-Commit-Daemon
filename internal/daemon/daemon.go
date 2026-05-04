@@ -328,13 +328,23 @@ func Run(ctx context.Context, opts Options) error {
 			slog.String("env", "ACD_AI_SEND_DIFF"))
 	}
 
+	providerCfg := ai.LoadProviderConfigFromEnv()
+	providerCfg.Logger = logger
+	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
+		"commit.strategy":       string(providerCfg.CommitStrategy),
+		"intent.window":         strconv.Itoa(providerCfg.IntentWindow),
+		"intent.recent_commits": strconv.Itoa(providerCfg.IntentRecentCommits),
+		"intent.defer_limit":    strconv.Itoa(providerCfg.IntentDeferLimit),
+		"intent.diff_egress":    strconv.FormatBool(diffEgressOptIn()),
+	}); err != nil {
+		logger.Warn("stamp commit strategy metadata", "err", err.Error())
+	}
+
 	msgFn := opts.MessageFn
 	if msgFn == nil {
 		provider := opts.MessageProvider
 		if provider == nil {
-			cfg := ai.LoadProviderConfigFromEnv()
-			cfg.Logger = logger
-			built, closer, err := ai.BuildProvider(cfg)
+			built, closer, err := ai.BuildProvider(providerCfg)
 			if err != nil {
 				logger.Warn("build ai provider; falling back to deterministic",
 					"err", err.Error())
@@ -345,7 +355,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			logger.Info("ai provider selected",
 				"provider", provider.Name(),
-				"mode", cfg.Mode)
+				"mode", providerCfg.Mode)
 		} else if opts.MessageProviderCloser != nil {
 			providerCloser = opts.MessageProviderCloser
 		}
@@ -1528,10 +1538,14 @@ func Run(ctx context.Context, opts Options) error {
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn: msgFn,
-				GitDir:    opts.GitDir,
-				Trace:     tracer,
-				Limit:     DefaultReplayLimit,
+				MessageFn:           msgFn,
+				GitDir:              opts.GitDir,
+				Trace:               tracer,
+				Limit:               DefaultReplayLimit,
+				CommitStrategy:      providerCfg.CommitStrategy,
+				IntentWindow:        providerCfg.IntentWindow,
+				IntentRecentCommits: providerCfg.IntentRecentCommits,
+				IntentDeferLimit:    providerCfg.IntentDeferLimit,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.

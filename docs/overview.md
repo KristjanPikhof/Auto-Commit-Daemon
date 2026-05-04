@@ -1,10 +1,10 @@
 # acd: overview
 
-`acd` (Auto-Commit-Daemon) watches a git worktree, captures every meaningful
-file change as a snapshot event, and replays those events as atomic commits on
-the current branch. It is designed to run alongside AI coding assistants
-(Claude Code, Codex, OpenCode, Pi, or any shell-hook capable harness) and
-produce a faithful, chronological commit history without operator intervention.
+`acd` (Auto-Commit-Daemon) watches a git worktree, captures meaningful file
+changes as durable snapshot events, and replays those events as commits on the
+current branch. The default replay strategy publishes one captured event per
+commit. The optional intent strategy lets an AI planner group related pending
+captures into one reviewable commit without changing capture durability.
 
 ## How it works
 
@@ -26,19 +26,18 @@ produce a faithful, chronological commit history without operator intervention.
    (`create`/`modify`/`delete`/`rename`/`mode`), and the `before_oid` /
    `after_oid` blob OIDs.
 
-2. **Replay.** A background loop drains `pending` events one at a time. For
-   each event the daemon applies ops against an isolated scratch index (seeded
-   from `BaseHead`), writes a tree with `git write-tree`, creates a commit with
-   `git commit-tree`, and advances the branch ref atomically with
-   `git update-ref`. Events that fail conflict checks become
-   `blocked_conflict`; events that fail before a safe commit can be built become
-   `failed`. Both are terminal barriers when they have later pending successors,
-   and `acd status`, `acd diagnose`, `acd doctor`, and `acd fix --dry-run`
-   guide operator recovery.
+2. **Replay.** A background loop drains `pending` events. In `event` strategy it
+   publishes one event at a time. In `intent` strategy it offers a bounded
+   pending window to the AI planner, then publishes the selected captures as one
+   commit. Both paths apply ops against an isolated scratch index, write a tree,
+   create a commit, and advance the branch ref atomically with `git update-ref`.
+   Unsafe events become `blocked_conflict`; replay-build failures become
+   `failed`. Both are terminal barriers when later pending work is waiting.
 
-3. **AI messages.** Commit subjects come from the configured AI provider (or the
-   deterministic rule-based fallback). The diff handed to AI providers is
-   reconstructed from captured blobs — never from the live worktree.
+3. **AI messages and planning.** Commit subjects, and optional intent grouping,
+   come from the configured AI provider or deterministic fallback. Diff context
+   is reconstructed from captured blobs, never from the live worktree, and only
+   leaves the machine when `ACD_AI_DIFF_EGRESS=1` is set.
 
 For a detailed walkthrough of the storage model, replay index semantics,
 branch-generation safety, and conflict resolution, see

@@ -36,34 +36,35 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                  string         `json:"repo"`
-	RepoHash              string         `json:"repo_hash"`
-	Daemon                string         `json:"daemon"`
-	Stale                 bool           `json:"stale"`
-	PID                   int            `json:"pid"`
-	StartedTS             int64          `json:"started_ts,omitempty"`
-	UptimeSeconds         int64          `json:"uptime_seconds,omitempty"`
-	HeartbeatTS           int64          `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds   int64          `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef             string         `json:"branch_ref,omitempty"`
-	BranchGenToken        string         `json:"branch_generation_token,omitempty"`
-	Clients               []statusClient `json:"clients"`
-	PendingEvents         int            `json:"pending_events"`
-	BlockedConflicts      int            `json:"blocked_conflicts"`
-	FailedEvents          int            `json:"failed_events"`
-	FailedBlockingPending int            `json:"failed_blocking_pending"`
-	LastCommitOID         string         `json:"last_commit_oid,omitempty"`
-	LastCommitTS          int64          `json:"last_commit_ts,omitempty"`
-	LastCommitMessage     string         `json:"last_commit_message,omitempty"`
-	CaptureErrors         int            `json:"capture_errors"`
-	Paused                bool           `json:"paused,omitempty"`
-	Pause                 *pauseInfo     `json:"pause,omitempty"`
-	BackpressurePaused    bool           `json:"backpressure_paused,omitempty"`
-	BackpressurePausedAt  string         `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal    int64          `json:"events_dropped_total,omitempty"`
-	DecisionCounts        map[string]int `json:"decision_counts,omitempty"`
-	RecentDecisions       []eventEntry   `json:"recent_decisions,omitempty"`
-	DecisionCursor        int64          `json:"decision_cursor,omitempty"`
+	Repo                  string               `json:"repo"`
+	RepoHash              string               `json:"repo_hash"`
+	Daemon                string               `json:"daemon"`
+	Stale                 bool                 `json:"stale"`
+	PID                   int                  `json:"pid"`
+	StartedTS             int64                `json:"started_ts,omitempty"`
+	UptimeSeconds         int64                `json:"uptime_seconds,omitempty"`
+	HeartbeatTS           int64                `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds   int64                `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef             string               `json:"branch_ref,omitempty"`
+	BranchGenToken        string               `json:"branch_generation_token,omitempty"`
+	Clients               []statusClient       `json:"clients"`
+	PendingEvents         int                  `json:"pending_events"`
+	BlockedConflicts      int                  `json:"blocked_conflicts"`
+	FailedEvents          int                  `json:"failed_events"`
+	FailedBlockingPending int                  `json:"failed_blocking_pending"`
+	LastCommitOID         string               `json:"last_commit_oid,omitempty"`
+	LastCommitTS          int64                `json:"last_commit_ts,omitempty"`
+	LastCommitMessage     string               `json:"last_commit_message,omitempty"`
+	CaptureErrors         int                  `json:"capture_errors"`
+	Paused                bool                 `json:"paused,omitempty"`
+	Pause                 *pauseInfo           `json:"pause,omitempty"`
+	BackpressurePaused    bool                 `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt  string               `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal    int64                `json:"events_dropped_total,omitempty"`
+	DecisionCounts        map[string]int       `json:"decision_counts,omitempty"`
+	RecentDecisions       []eventEntry         `json:"recent_decisions,omitempty"`
+	DecisionCursor        int64                `json:"decision_cursor,omitempty"`
+	IntentStrategy        intentStrategyReport `json:"intent_strategy"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -316,6 +317,11 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		report.Paused = true
 		report.Pause = info
 	}
+	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
+		return report, fmt.Errorf("intent strategy: %w", err)
+	} else {
+		report.IntentStrategy = intentStrategy
+	}
 	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
 		return report, err
 	}
@@ -403,6 +409,9 @@ LIMIT 3`)
 	}
 	if err := recentRows.Err(); err != nil {
 		return fmt.Errorf("iter recent decisions: %w", err)
+	}
+	if err := enrichEventEntries(ctx, conn, report.RecentDecisions); err != nil {
+		return fmt.Errorf("enrich recent decisions: %w", err)
 	}
 	return nil
 }
@@ -551,6 +560,8 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		}
 	}
 
+	renderIntentStrategyHuman(out, r.IntentStrategy)
+
 	if len(r.DecisionCounts) > 0 {
 		fmt.Fprintf(out, "Decisions: %s\n", formatDecisionCounts(r.DecisionCounts))
 		if len(r.RecentDecisions) > 0 {
@@ -564,6 +575,9 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 					fmt.Fprintf(out, " (%s)", ev.ActionTaken)
 				} else if ev.Reason != "" {
 					fmt.Fprintf(out, " (%s)", ev.Reason)
+				}
+				if len(ev.GroupedSeqs) > 1 {
+					fmt.Fprintf(out, " seqs=%s", formatSeqs(ev.GroupedSeqs))
 				}
 				fmt.Fprintln(out)
 			}
@@ -588,6 +602,9 @@ func formatDecisionCounts(counts map[string]int) string {
 		state.DecisionKindSkipped,
 		state.DecisionKindPaused,
 		state.DecisionKindResumed,
+		state.DecisionKindIntentDeferred,
+		state.DecisionKindIntentForced,
+		state.DecisionKindIntentPlannerError,
 	}
 	seen := make(map[string]bool, len(counts))
 	var parts []string
