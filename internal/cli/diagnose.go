@@ -504,6 +504,18 @@ func diagnoseRemediation(report diagnoseReport) []string {
 			fmt.Sprintf("%d pending capture(s) reached the intent defer limit and are eligible for forced one-item planning windows.",
 				report.IntentStrategy.ForcedAgingReady))
 	}
+	if report.IntentStrategy.BatchWaitActive {
+		wait := formatDurationCompact(time.Duration(report.IntentStrategy.AgeTriggerInSeconds) * time.Second)
+		need := report.IntentStrategy.MinPending - report.IntentStrategy.VisiblePendingEvents
+		if need < 0 {
+			need = 0
+		}
+		remediation = append(remediation,
+			fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd wake` / flush to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
+				need,
+				formatDurationCompact(time.Duration(report.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
+				wait))
+	}
 	if report.StaleOperationMarker {
 		remediation = append(remediation,
 			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
