@@ -34,7 +34,7 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"acd diagnose",
 		"acd recover",
 		"acd doctor",
-		"acd init",
+		"acd setup",
 		"--repo string",
 		"--json",
 		"--quiet",
