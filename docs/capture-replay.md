@@ -241,6 +241,14 @@ currently visible pending rows up to that same window. Explicit `acd wake` /
 flush requests bypass only this wait, so a user-requested flush plans whatever
 is visible immediately.
 
+`acd status`, `acd diagnose`, and `acd doctor` surface this wait state when
+intent mode is active. The reports include the visible pending count,
+`min_pending`, oldest visible pending age, `max_pending_age`, and the estimated
+age-trigger countdown when available. `doctor` also suggests the operational
+choices: wait for another capture or the age trigger, flush/wake to publish the
+current visible batch, lower the intent batching thresholds for sparse repos, or
+switch back to `ACD_COMMIT_STRATEGY=event` for immediate one-event commits.
+
 ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
 omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
 events that would leapfrog an earlier same-path or nested-path dependency
