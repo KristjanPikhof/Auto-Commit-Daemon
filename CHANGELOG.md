@@ -37,8 +37,8 @@
 - `acd events --watch` now follows decisions appended after watch starts unless
   `--since` is provided.
 - Docs now cover explainable history, failed replay barriers, safe-ignore
-  restart requirements, intent batch-wait troubleshooting, prompt-trace privacy,
-  and the current status JSON fields.
+  restart requirements, intent batch-wait troubleshooting, prompt-trace
+  provider setup, local retention behavior, and the current status JSON fields.
 
 ### Fixed
 

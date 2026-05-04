@@ -161,11 +161,17 @@ provider or subprocess plugin. The trace is stored locally under
 `<gitDir>/acd/prompt-trace/`. Records are written after ACD redacts and
 truncates outbound payloads, but they may still contain source code, private
 paths, request envelopes, tool schemas, provider responses, and fallback
-metadata. Treat prompt traces as sensitive local diagnostics.
+metadata. The default deterministic provider sends no AI request, so it creates
+no prompt trace. Trace files are daily JSONL logs with no automatic pruning;
+ACD buffers 256 pending prompt-trace records in memory and drops the oldest
+buffered record if the writer falls behind. Treat prompt traces as sensitive
+local diagnostics.
 
 Event-mode inspection:
 
 ~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=event acd start
 # make or capture a change
 acd prompt --last
@@ -175,6 +181,8 @@ acd prompt --seq 42 --json
 Intent-mode inspection:
 
 ~~~bash
+export ACD_AI_PROVIDER=openai-compat
+export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
 # make enough changes for a batch, or use acd wake to flush the visible queue
 acd prompt --last
