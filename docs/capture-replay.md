@@ -363,10 +363,10 @@ Review dry-run output before applying fix, recovery, or purge plans with
 for watching daemon liveness and queue counts, not an interactive TUI. `acd
 logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
 file. It does not include full AI prompt traces; those are written only when
-`ACD_AI_PROMPT_TRACE=1` is enabled and are inspected with `acd prompt`. Use
-`acd doctor` or `acd doctor --bundle` when you need the bundled diagnostics
-view, sanitized paths, safe-ignore details, and log tail snippets for issue
-reports.
+`ACD_AI_PROMPT_TRACE=1` is enabled and a non-deterministic provider sends a
+request. Inspect them with `acd prompt`. Use `acd doctor` or
+`acd doctor --bundle` when you need the bundled diagnostics view, sanitized
+paths, safe-ignore details, and log tail snippets for issue reports.
 
 `acd doctor` human output includes:
 

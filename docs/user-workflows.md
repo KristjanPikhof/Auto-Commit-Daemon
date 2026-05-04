@@ -193,8 +193,8 @@ In event mode, `--seq` selects the commit-message prompt for that captured
 event. In intent mode, `--seq` also matches planner windows where that seq was
 offered, so you can see the offered seqs, selected/deferred seqs, grouping
 reason, validation error, and fallback provider. If no trace is found, restart
-the daemon with `ACD_AI_PROMPT_TRACE=1`; `acd prompt` never creates traces by
-itself.
+the daemon with `ACD_AI_PROMPT_TRACE=1` and a non-deterministic provider;
+`acd prompt` never creates traces by itself.
 
 ## Manual revert or superseded queued work
 

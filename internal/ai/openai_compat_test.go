@@ -654,6 +654,15 @@ func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
 	if got.BranchRef != "refs/heads/main" || got.Generation != 11 {
 		t.Fatalf("branch metadata = %q generation %d", got.BranchRef, got.Generation)
 	}
+	if !got.DiffIncluded {
+		t.Fatal("DiffIncluded=false want true for captured diffs")
+	}
+	if got.Transform.InputBytes == 0 || got.Transform.RedactedBytes == 0 || got.Transform.OutputBytes == 0 {
+		t.Fatalf("transform byte counts=%+v want captured diff metadata", got.Transform)
+	}
+	if !got.Transform.RedactionApplied {
+		t.Fatalf("redaction_applied=false want true for captured secret diff: %+v", got.Transform)
+	}
 	if string(got.Request) != string(last.rawBody) {
 		t.Fatalf("trace request differs from sent body\ntrace=%s\nsent=%s", got.Request, last.rawBody)
 	}
