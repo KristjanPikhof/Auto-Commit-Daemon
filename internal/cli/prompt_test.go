@@ -121,6 +121,57 @@ func TestPromptEventTraceHumanShowsRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestPromptReadsTraceWhenRegisteredStateDBIsMissing(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, stateDB, db := makeRepoStateDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	registerRepo(t, roots, repo, stateDB, "test")
+	writePromptTrace(t, stateDB,
+		map[string]any{
+			"ts":             "2026-05-04T12:00:00Z",
+			"stage":          "request",
+			"strategy":       "event",
+			"provider":       "deterministic",
+			"seq":            42,
+			"system_message": "system prompt",
+			"user_message":   "user prompt",
+		},
+		map[string]any{
+			"ts":       "2026-05-04T12:00:01Z",
+			"stage":    "response",
+			"strategy": "event",
+			"provider": "deterministic",
+			"seq":      42,
+			"response": map[string]any{
+				"subject": "Trace without state db",
+			},
+		},
+	)
+	if err := os.Remove(stateDB); err != nil {
+		t.Fatalf("remove state.db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runPrompt(context.Background(), &out, repo, false, 42, true); err != nil {
+		t.Fatalf("runPrompt: %v", err)
+	}
+	var report promptReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("json output invalid: %v\n%s", err, out.String())
+	}
+	if !report.Found || report.Trace == nil || report.Trace.Response == nil {
+		t.Fatalf("missing-state trace not found: %+v", report)
+	}
+	if report.Trace.Response.Subject != "Trace without state db" {
+		t.Fatalf("response subject=%q", report.Trace.Response.Subject)
+	}
+	if _, err := os.Stat(stateDB); !os.IsNotExist(err) {
+		t.Fatalf("state.db stat err=%v, want still missing", err)
+	}
+}
+
 func TestPromptIntentTraceJSONShowsOfferedSeqAndFallback(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo, stateDB, db := makeRepoStateDB(t)
@@ -202,6 +253,102 @@ func TestPromptIntentTraceJSONShowsOfferedSeqAndFallback(t *testing.T) {
 	}
 	if trace.Fallback == nil || trace.Fallback.FallbackProvider != "deterministic" {
 		t.Fatalf("fallback = %+v", trace.Fallback)
+	}
+}
+
+func TestPromptRepeatedSameKeyAttemptsDoNotHybridize(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, stateDB, db := makeRepoStateDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	registerRepo(t, roots, repo, stateDB, "test")
+	writePromptTrace(t, stateDB,
+		map[string]any{
+			"ts":             "2026-05-04T14:00:00Z",
+			"stage":          "request",
+			"strategy":       "event",
+			"provider":       "openai-compatible",
+			"model":          "gpt-4o-mini",
+			"seq":            42,
+			"branch_ref":     "refs/heads/main",
+			"generation":     1,
+			"system_message": "first system",
+			"user_message":   "first attempt",
+		},
+		map[string]any{
+			"ts":         "2026-05-04T14:00:01Z",
+			"stage":      "response",
+			"strategy":   "event",
+			"provider":   "openai-compatible",
+			"model":      "gpt-4o-mini",
+			"seq":        42,
+			"branch_ref": "refs/heads/main",
+			"generation": 1,
+			"response": map[string]any{
+				"subject": "First attempt response",
+			},
+		},
+		map[string]any{
+			"ts":             "2026-05-04T14:00:02Z",
+			"stage":          "request",
+			"strategy":       "event",
+			"provider":       "openai-compatible",
+			"model":          "gpt-4o-mini",
+			"seq":            42,
+			"branch_ref":     "refs/heads/main",
+			"generation":     1,
+			"system_message": "second system",
+			"user_message":   "second attempt",
+		},
+		map[string]any{
+			"ts":         "2026-05-04T14:00:03Z",
+			"stage":      "fallback",
+			"strategy":   "event",
+			"provider":   "openai-compatible",
+			"model":      "gpt-4o-mini",
+			"seq":        42,
+			"branch_ref": "refs/heads/main",
+			"generation": 1,
+			"response": map[string]any{
+				"fallback_provider": "deterministic",
+				"fallback_reason":   "second attempt failed",
+			},
+		},
+	)
+
+	for _, tc := range []struct {
+		name string
+		last bool
+	}{
+		{name: "seq", last: false},
+		{name: "last", last: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runPrompt(context.Background(), &out, repo, tc.last, 42, true); err != nil {
+				t.Fatalf("runPrompt: %v", err)
+			}
+			var report promptReport
+			if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+				t.Fatalf("json output invalid: %v\n%s", err, out.String())
+			}
+			if !report.Found || report.Trace == nil {
+				t.Fatalf("trace not found: %+v", report)
+			}
+			if report.Trace.UserPrompt != "second attempt" {
+				t.Fatalf("user prompt=%q", report.Trace.UserPrompt)
+			}
+			if report.Trace.Response != nil {
+				t.Fatalf("unexpected first-attempt response in latest attempt: %+v", report.Trace.Response)
+			}
+			if report.Trace.Fallback == nil || report.Trace.Fallback.FallbackReason != "second attempt failed" {
+				t.Fatalf("fallback=%+v", report.Trace.Fallback)
+			}
+			if got := strings.Join(report.Trace.Stages, ","); got != "request,fallback" {
+				t.Fatalf("stages=%s", got)
+			}
+		})
 	}
 }
 
