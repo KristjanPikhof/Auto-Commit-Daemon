@@ -275,7 +275,7 @@ Intent-specific observability:
   `decision_records`.
 - `ACD_TRACE=1` records planner input/output summaries, selected seqs, deferred
   seqs, batch-wait skips, and validation failures without writing captured
-  source diffs.
+  source diffs, full AI prompts, or provider request envelopes.
 - `ACD_AI_PROMPT_TRACE=1` records the actual provider prompt/request diagnostics
   under `<gitDir>/acd/prompt-trace/`. These records are local and post-redaction
   / truncation, but may still contain source code; inspect them with
@@ -360,9 +360,11 @@ Review dry-run output before applying fix, recovery, or purge plans with
 `acd list --watch` redraws plain table frames on the requested interval; it is
 for watching daemon liveness and queue counts, not an interactive TUI. `acd
 logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
-file. Use `acd doctor` or `acd doctor --bundle` when you need the bundled
-diagnostics view, sanitized paths, safe-ignore details, and log tail snippets
-for issue reports.
+file. It does not include full AI prompt traces; those are written only when
+`ACD_AI_PROMPT_TRACE=1` is enabled and are inspected with `acd prompt`. Use
+`acd doctor` or `acd doctor --bundle` when you need the bundled diagnostics
+view, sanitized paths, safe-ignore details, and log tail snippets for issue
+reports.
 
 `acd doctor` human output includes:
 
@@ -870,6 +872,11 @@ classes:
 | `replay.update_ref` | Each `git update-ref` attempt during commit publish (per-retry) | — | `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha`, `actual_sha` |
 | `replay.live_index` | Path-scoped live-index reconciliation after publish or startup repair | `operation`, `path` | `decision`, `reason` |
 | `replay.pause` | Replay drain skipped because paused (manual or rewind grace) | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
+| `intent.batch_wait` | Intent replay skips planning while waiting for more pending captures or the age trigger | — | `pending`, `min_pending`, `oldest_age_seconds`, `max_pending_age_seconds`, `age_trigger_in_seconds` |
+| `intent.planner.input` | A normal or forced intent window is about to be offered to the planner | `offered`, `recent_commit_count`, `forced_aging`, `diff_included` | — |
+| `intent.planner.output` | The planner returned a syntactically valid plan | — | `offered_seqs`, `selected_seqs`, `deferred_seqs`, `subject`, `grouping_reason` |
+| `intent.planner.validation_failed` | A planner result failed safety validation before git was touched | — | `offered_seqs`, `error` |
+| `intent.forced_aging` | A repeatedly deferred capture is forced through a one-item planning window | `defer_limit` | `forced_seqs` |
 | `branch_token.transition` | HEAD movement classified at startup or per poll tick | `previous`, `current` | `prev_generation`, `new_generation`, `dropped_pending` |
 | `daemon.pause` | Git operation in progress (rebase, merge, cherry-pick, bisect) detected (decision `paused`) or cleared (decision `resumed`) | `operation` | — |
 
@@ -879,7 +886,8 @@ the pause is active; they share the same output shape as the `pause` object in
 
 `ACD_TRACE` and `ACD_AI_PROMPT_TRACE` are separate diagnostics. `ACD_TRACE`
 writes daemon decision summaries to `<gitDir>/acd/trace/` and intentionally
-avoids captured source diffs. `ACD_AI_PROMPT_TRACE` writes local AI
+avoids captured source diffs, full AI prompts, and provider request envelopes.
+`ACD_AI_PROMPT_TRACE` writes local AI
 prompt/request records to `<gitDir>/acd/prompt-trace/`; those records are
 post-redaction/truncation but may still contain source code and provider
 responses. Use `acd prompt --last` for the newest request, or

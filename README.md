@@ -95,8 +95,10 @@ For daily "what happened?" questions, start with
 `acd status`, `acd events`, and `acd explain --path FILE`; use
 `acd fix --dry-run` before applying any safe remediation. `acd logs` reads the
 daemon's per-repo JSONL log directly. It does not pretty print, summarize, or
-sanitize the stream; use `acd doctor --bundle` when you want bundled
-diagnostics with tail snippets and safe metadata for reports.
+sanitize the stream, and it does not include full AI prompt traces. Use
+`acd prompt` for opt-in prompt-trace inspection, and use `acd doctor --bundle`
+when you want bundled diagnostics with tail snippets and safe metadata for
+reports.
 
 See [docs/capture-replay.md#revert-workflows](docs/capture-replay.md#revert-workflows)
 for how `acd` handles `git revert`, `git reset --soft/--mixed/--hard`, and
@@ -209,7 +211,8 @@ Trace files are daily JSONL logs under `<gitDir>/acd/trace/` unless
 `ACD_TRACE_DIR` is set. Each record includes `ts`, `repo`, `branch_ref`,
 `head_sha`, `event_class`, `decision`, `reason`, `input`, `output`, `error`,
 `seq`, and `generation`. See [docs/capture-replay.md](docs/capture-replay.md#trace-event-classes)
-for the full `event_class` enumeration.
+for the full `event_class` enumeration. These decision traces summarize daemon
+behavior; they do not store full AI prompts or provider request envelopes.
 
 Enable AI prompt tracing only when you need to inspect exactly what an AI
 provider or intent planner saw:

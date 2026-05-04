@@ -40,7 +40,10 @@ acd logs --follow
 ~~~
 
 For support reports, prefer `acd doctor --bundle`; it sanitizes and bundles the
-useful diagnostics instead of asking someone to read raw JSONL.
+useful diagnostics instead of asking someone to read raw JSONL. `acd logs`
+does not contain full AI prompts; prompt traces live separately under
+`<gitDir>/acd/prompt-trace/` and are visible only after you opt in with
+`ACD_AI_PROMPT_TRACE=1`.
 
 ## File was not committed
 
