@@ -194,7 +194,7 @@ type ReplaySummary struct {
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
 	BaseHead  string
-	Skipped   bool // replay drain was intentionally skipped before reading events
+	Skipped   bool // replay drain was intentionally skipped without publishing
 	// SkippedReason distinguishes intentional no-op passes from an empty
 	// pending queue. Empty means replay was not skipped or the legacy pause
 	// skip path set only Skipped.

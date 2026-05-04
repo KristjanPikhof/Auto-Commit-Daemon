@@ -1554,8 +1554,11 @@ func Run(ctx context.Context, opts Options) error {
 				Limit:               DefaultReplayLimit,
 				CommitStrategy:      providerCfg.CommitStrategy,
 				IntentWindow:        providerCfg.IntentWindow,
+				IntentMinPending:    providerCfg.IntentMinPending,
+				IntentMaxPendingAge: providerCfg.IntentMaxPendingAge,
 				IntentRecentCommits: providerCfg.IntentRecentCommits,
 				IntentDeferLimit:    providerCfg.IntentDeferLimit,
+				IntentBypassBatchWait: flushed > 0,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
