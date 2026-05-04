@@ -100,6 +100,8 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_AI_CA_FILE` | (none) | openai-compat only; optional PEM CA bundle for private HTTPS gateways |
 | `ACD_COMMIT_STRATEGY` | `event` | `event` keeps one captured event per commit. `intent` asks the AI planner to select one or more offered captures for the next commit. |
 | `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the planner in a normal window. |
+| `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal planner window starts. |
+| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs. Off by default; metadata-only payload otherwise. Has no effect for `deterministic`. |
@@ -113,13 +115,16 @@ Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning 
 `ACD_COMMIT_STRATEGY=event` is the compatibility default. Replay drains pending
 captures in FIFO order and keeps the current one-event commit behavior.
 
-`ACD_COMMIT_STRATEGY=intent` changes only replay grouping. ACD offers the next
+`ACD_COMMIT_STRATEGY=intent` changes only replay grouping. ACD offers a bounded
 pending window to the configured AI provider as structured `capture_intent_plan`
-input. The planner must classify every offered seq as selected or deferred. It
-may select exactly one capture, select any larger non-empty subset, or defer
-unrelated captures. ACD validates the plan before touching git, applies selected
-captures in seq order through the same scratch-index path, writes one commit,
-and marks all selected events with the same `commit_oid`.
+input. `ACD_INTENT_WINDOW` is the maximum offered, `ACD_INTENT_MIN_PENDING` is
+the preferred normal trigger, and `ACD_INTENT_MAX_PENDING_AGE` bounds how long a
+sparse queue waits before planning anyway. The planner must classify every
+offered seq as selected or deferred. It may select exactly one capture, select
+any larger non-empty subset, or defer unrelated captures. ACD validates the plan
+before touching git, applies selected captures in seq order through the same
+scratch-index path, writes one commit, and marks all selected events with the
+same `commit_oid`.
 
 If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
 containing only that overdue capture. That keeps intent grouping from starving
