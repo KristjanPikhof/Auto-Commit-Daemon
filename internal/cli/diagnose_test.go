@@ -564,6 +564,61 @@ func TestDiagnose_CapacityRemediation_FiresOnDepthAlone(t *testing.T) {
 	}
 }
 
+func TestDiagnose_IntentBatchWaitUsesDefaultsWithoutNewMetadata(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running", BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
+		t.Fatalf("set commit.strategy: %v", err)
+	}
+	appendIntentPendingEvent(t, ctx, d, "sparse.go", nowFloat()-30)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if !rep.IntentStrategy.BatchWaitActive ||
+		rep.IntentStrategy.MinPending != 10 ||
+		rep.IntentStrategy.MaxPendingAgeSeconds != 300 ||
+		rep.IntentStrategy.VisiblePendingEvents != 1 {
+		t.Fatalf("intent strategy = %+v, want defaulted active batch wait", rep.IntentStrategy)
+	}
+	var sawHint bool
+	for _, item := range rep.Remediation {
+		if strings.Contains(item, "intent replay is waiting") &&
+			strings.Contains(item, "ACD_INTENT_MIN_PENDING") &&
+			strings.Contains(item, "ACD_COMMIT_STRATEGY=event") {
+			sawHint = true
+			break
+		}
+	}
+	if !sawHint {
+		t.Fatalf("remediation lacks intent batch wait hint: %v", rep.Remediation)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runDiagnose(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runDiagnose human: %v", err)
+	}
+	if !strings.Contains(humanOut.String(), "Intent batch wait: pending=1 min_pending=10") {
+		t.Fatalf("diagnose human missing batch wait line:\n%s", humanOut.String())
+	}
+}
+
 func makeDiagnoseRepo(t *testing.T, roots paths.Roots) (repoDir, dbPath string, d *state.DB) {
 	t.Helper()
 	ctx := context.Background()
