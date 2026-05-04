@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -113,14 +114,19 @@ func EnabledFromEnv() bool {
 }
 
 func FromEnv(repo, gitDir string) Logger {
+	l, _ := NewFromEnv(repo, gitDir)
+	return l
+}
+
+func NewFromEnv(repo, gitDir string) (Logger, error) {
 	if !EnabledFromEnv() {
-		return Noop{}
+		return nil, nil
 	}
 	w, err := New(Options{Repo: repo, GitDir: gitDir})
 	if err != nil {
-		return Noop{}
+		return nil, err
 	}
-	return w
+	return w, nil
 }
 
 func New(opts Options) (*Writer, error) {
@@ -131,8 +137,8 @@ func New(opts Options) (*Writer, error) {
 		}
 		dir = filepath.Join(opts.GitDir, "acd", "prompt-trace")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("prompttrace: mkdir trace dir: %w", err)
+	if err := ensureTraceDir(dir); err != nil {
+		return nil, err
 	}
 	capacity := opts.Capacity
 	if capacity <= 0 {
@@ -247,11 +253,11 @@ func (w *Writer) run() {
 				w.rememberErr(active.Close())
 				active = nil
 			}
-			if err := os.MkdirAll(w.dir, 0o700); err != nil {
+			if err := ensureTraceDir(w.dir); err != nil {
 				w.rememberErr(err)
 				return
 			}
-			f, err := os.OpenFile(filepath.Join(w.dir, day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			f, err := openRegularNoFollow(filepath.Join(w.dir, day+".jsonl"), syscall.O_APPEND|syscall.O_CREAT|syscall.O_WRONLY, 0o600)
 			if err != nil {
 				w.rememberErr(err)
 				return
@@ -290,6 +296,56 @@ func (w *Writer) rememberErr(err error) {
 	if err != nil && w.closeErr == nil {
 		w.closeErr = err
 	}
+}
+
+func ensureTraceDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("prompttrace: mkdir trace dir: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("prompttrace: stat trace dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("prompttrace: trace dir must not be a symlink: %s", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("prompttrace: trace dir is not a directory: %s", dir)
+	}
+	return nil
+}
+
+func openRegularNoFollow(path string, flags int, perm uint32) (*os.File, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("prompttrace: trace file must not be a symlink: %s", path)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("prompttrace: trace file is not regular: %s", path)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("prompttrace: stat trace file: %w", err)
+	}
+
+	fd, err := syscall.Open(path, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
+	if err != nil {
+		return nil, fmt.Errorf("prompttrace: open trace file: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("prompttrace: open trace file: invalid fd")
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("prompttrace: stat opened trace file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("prompttrace: opened trace file is not regular: %s", path)
+	}
+	return f, nil
 }
 
 type jsonRecord struct {
@@ -351,7 +407,7 @@ type Context struct {
 }
 
 func With(ctx context.Context, logger Logger, meta Metadata) context.Context {
-	if logger == nil {
+	if loggerDisabled(logger) {
 		return ctx
 	}
 	return context.WithValue(ctx, contextKey{}, Context{Logger: logger, Meta: meta})
@@ -359,8 +415,20 @@ func With(ctx context.Context, logger Logger, meta Metadata) context.Context {
 
 func From(ctx context.Context) (Logger, Metadata, bool) {
 	v, ok := ctx.Value(contextKey{}).(Context)
-	if !ok || v.Logger == nil {
+	if !ok || loggerDisabled(v.Logger) {
 		return nil, Metadata{}, false
 	}
 	return v.Logger, v.Meta, true
+}
+
+func loggerDisabled(logger Logger) bool {
+	if logger == nil {
+		return true
+	}
+	switch logger.(type) {
+	case Noop, *Noop:
+		return true
+	default:
+		return false
+	}
 }
