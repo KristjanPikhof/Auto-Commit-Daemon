@@ -10,6 +10,7 @@ Common workflow:
   acd status                        Show daemon, branch, and client state for the current repo
   acd events                        Show recent product decisions for the current repo
   acd events --watch                Stream appended product decisions
+  acd prompt --last                 Inspect the last recorded AI prompt request
   acd explain --path FILE           Explain why ACD did or did not commit a path
   acd fix --dry-run                 Plan safe remediation for a stuck repo
   acd list                          List known repo daemons
