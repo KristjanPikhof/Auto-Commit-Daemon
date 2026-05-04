@@ -2,6 +2,7 @@ package prompttrace
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,19 @@ func Walk(ctx context.Context, opts ReadOptions, fn func(Record) error) error {
 		}
 		dir = Dir(opts.GitDir)
 	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("prompttrace: stat dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("prompttrace: trace dir must not be a symlink: %s", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("prompttrace: trace dir is not a directory: %s", dir)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -55,7 +69,7 @@ func Walk(ctx context.Context, opts ReadOptions, fn func(Record) error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		if err := walkFile(ctx, filepath.Join(dir, entry.Name()), fn); err != nil {
@@ -79,7 +93,7 @@ func Read(ctx context.Context, opts ReadOptions) ([]Record, error) {
 }
 
 func walkFile(ctx context.Context, path string, fn func(Record) error) error {
-	f, err := os.Open(path)
+	f, err := openRegularNoFollow(path, os.O_RDONLY, 0)
 	if err != nil {
 		return fmt.Errorf("prompttrace: open %s: %w", path, err)
 	}
@@ -94,11 +108,11 @@ func walkFile(ctx context.Context, path string, fn func(Record) error) error {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			lineNo++
-			line = []byte(strings.TrimSpace(string(line)))
+			line = bytes.TrimSpace(line)
 			if len(line) > 0 {
 				rec, derr := decodeRecord(line)
 				if derr != nil {
-					return fmt.Errorf("prompttrace: decode %s:%d: %w", path, lineNo, derr)
+					continue
 				}
 				if err := fn(rec); err != nil {
 					return err
