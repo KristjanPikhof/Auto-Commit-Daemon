@@ -226,8 +226,11 @@ and, when published, produces at most one commit.
 `ACD_COMMIT_STRATEGY=intent` keeps capture durability unchanged but changes how
 pending events are offered to replay. ACD builds a bounded window of pending
 captures, adds recent branch and path-aware commit context, and asks the AI
-provider for a structured plan. The plan can select exactly one capture or any
-larger non-empty subset. Every offered seq must be either selected or deferred.
+provider for a structured plan. `ACD_INTENT_WINDOW` is the maximum offered,
+`ACD_INTENT_MIN_PENDING` is the preferred pending-count trigger, and
+`ACD_INTENT_MAX_PENDING_AGE` is the bounded wait escape hatch for sparse queues.
+The plan can select exactly one capture or any larger non-empty subset. Every
+offered seq must be either selected or deferred.
 
 ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
 omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
