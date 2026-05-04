@@ -1,6 +1,6 @@
 package cli
 
-// §7.9 — `acd init <harness>` print-only command.
+// §7.9 — `acd setup <harness>` print-only command.
 //
 // Reads embedded templates/<harness>/* via the templates package's FS and
 // emits the canonical snippet body plus a copy-paste instructions footer.
@@ -44,34 +44,38 @@ func readmeFile(harness string) string {
 	return harness + "/README.md"
 }
 
-func newInitCmd() *cobra.Command {
+func newSetupCmd() *cobra.Command {
 	var applyFlag bool
 
 	cmd := &cobra.Command{
-		Use:   "init [harness]",
-		Short: "Print install snippet for a harness adapter",
+		Use:     "setup [harness]",
+		Aliases: []string{"init"},
+		Short:   "Print install snippet for a harness adapter",
 		Long: `Print the install snippet for a supported harness adapter.
 
 When no harness is provided, acd tries to detect one installed acd-managed harness. Otherwise pass a harness name explicitly. This command prints snippets only; --apply is reserved for a future version and is hidden.
 
 Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
-		Example: `  acd init codex
-  acd init claude-code
-  acd init opencode
-  acd init shell`,
+		Example: `  acd setup codex
+  acd setup claude-code
+  acd setup opencode
+  acd setup shell`,
 		Args:         cobra.RangeArgs(0, 1),
 		ValidArgs:    supportedHarnesses,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.CalledAs() == "init" {
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning: acd init is deprecated and will be removed in a future release; use acd setup")
+			}
 			if applyFlag {
-				fmt.Fprintln(cmd.ErrOrStderr(), "acd init: --apply is not implemented")
-				return fmt.Errorf("acd init: --apply is not implemented")
+				fmt.Fprintln(cmd.ErrOrStderr(), "acd setup: --apply is not implemented")
+				return fmt.Errorf("acd setup: --apply is not implemented")
 			}
 			harness := ""
 			if len(args) == 1 {
 				harness = args[0]
 			}
-			return runInit(cmd, harness)
+			return runSetup(cmd, harness)
 		},
 	}
 	cmd.Flags().BoolVar(&applyFlag, "apply", false, "Automatically apply snippet (deferred to v0.2)")
@@ -79,15 +83,15 @@ Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
 	return cmd
 }
 
-func runInit(cmd *cobra.Command, harness string) error {
+func runSetup(cmd *cobra.Command, harness string) error {
 	if harness == "" {
 		detected := adapter.DetectInstalled()
 		switch len(detected) {
 		case 0:
 			fmt.Fprintf(cmd.ErrOrStderr(),
-				"acd init: no harness specified and no acd-managed harness install was detected\nSupported harnesses: %s\n",
+				"acd setup: no harness specified and no acd-managed harness install was detected\nSupported harnesses: %s\n",
 				strings.Join(supportedHarnesses, ", "))
-			return fmt.Errorf("acd init: no harness specified")
+			return fmt.Errorf("acd setup: no harness specified")
 		case 1:
 			harness = detected[0].Name()
 		default:
@@ -96,17 +100,17 @@ func runInit(cmd *cobra.Command, harness string) error {
 				names = append(names, h.Name())
 			}
 			fmt.Fprintf(cmd.ErrOrStderr(),
-				"acd init: multiple acd-managed harness installs detected: %s\nRun acd init <harness> with one of the detected harnesses.\n",
+				"acd setup: multiple acd-managed harness installs detected: %s\nRun acd setup <harness> with one of the detected harnesses.\n",
 				strings.Join(names, ", "))
-			return fmt.Errorf("acd init: multiple harnesses detected")
+			return fmt.Errorf("acd setup: multiple harnesses detected")
 		}
 	}
 
 	if _, known := adapter.Lookup(harness); !known {
 		fmt.Fprintf(cmd.ErrOrStderr(),
-			"acd init: unknown harness %q\nSupported harnesses: %s\n",
+			"acd setup: unknown harness %q\nSupported harnesses: %s\n",
 			harness, strings.Join(supportedHarnesses, ", "))
-		return fmt.Errorf("acd init: unknown harness %q", harness)
+		return fmt.Errorf("acd setup: unknown harness %q", harness)
 	}
 
 	meta := harnessSnippets[harness]
@@ -116,7 +120,7 @@ func runInit(cmd *cobra.Command, harness string) error {
 	out := cmd.OutOrStdout()
 
 	// Header.
-	fmt.Fprintf(out, "%s acd init %s — copy the snippet below into your harness config\n", cp, harness)
+	fmt.Fprintf(out, "%s acd setup %s — copy the snippet below into your harness config\n", cp, harness)
 	fmt.Fprintf(out, "%s ─────────────────────────────────────────────────────────────\n", cp)
 
 	if harness == "shell" {
@@ -164,7 +168,7 @@ func runInit(cmd *cobra.Command, harness string) error {
 func printSnippet(out interface{ Write([]byte) (int, error) }, embeddedFS fs.FS, path string) error {
 	body, err := fs.ReadFile(embeddedFS, path)
 	if err != nil {
-		return fmt.Errorf("acd init: read template %s: %w", path, err)
+		return fmt.Errorf("acd setup: read template %s: %w", path, err)
 	}
 	_, err = out.Write(body)
 	return err
