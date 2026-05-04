@@ -1137,6 +1137,7 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		return plan, "", nil
 	}
 	validationFailure = err.Error()
+	recordIntentPromptFallback(ctx, planner, validationFailure)
 	for _, item := range items {
 		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, err.Error()); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
@@ -1154,6 +1155,35 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		return ai.IntentPlan{}, validationFailure, err
 	}
 	return plan, validationFailure, nil
+}
+
+func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, reason string) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return
+	}
+	provider := ""
+	if planner != nil {
+		provider = planner.Name()
+	}
+	if meta.Strategy == "" {
+		meta.Strategy = string(ai.CommitStrategyIntent)
+	}
+	logger.Record(prompttrace.Record{
+		Stage:        "fallback",
+		Strategy:     meta.Strategy,
+		Provider:     provider,
+		Model:        meta.Model,
+		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:    meta.BranchRef,
+		Generation:   meta.Generation,
+		DiffIncluded: meta.DiffIncluded,
+		DiffCap:      meta.DiffCap,
+		Response: &prompttrace.Response{
+			FallbackProvider: ai.DeterministicProvider{}.Name(),
+			FallbackReason:   reason,
+		},
+	})
 }
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
