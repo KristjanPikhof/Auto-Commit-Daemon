@@ -472,6 +472,63 @@ func TestDoctor_BlockedConflictSurfaced(t *testing.T) {
 	}
 }
 
+func TestDoctor_IntentBatchWaitAddsOperationalNotes(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
+		t.Fatalf("set commit.strategy: %v", err)
+	}
+	appendIntentPendingEvent(t, ctx, d, "sparse.go", nowFloat()-30)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(rep.Repos) != 1 {
+		t.Fatalf("repos=%d want 1", len(rep.Repos))
+	}
+	rr := rep.Repos[0]
+	if !rr.IntentStrategy.BatchWaitActive ||
+		rr.IntentStrategy.MinPending != 10 ||
+		rr.IntentStrategy.MaxPendingAgeSeconds != 300 {
+		t.Fatalf("intent strategy = %+v, want defaulted active batch wait", rr.IntentStrategy)
+	}
+	notes := strings.Join(rr.Notes, "\n")
+	for _, want := range []string{
+		"intent replay is waiting",
+		"explicit flushes bypass intent batch wait",
+		"lower ACD_INTENT_MIN_PENDING",
+		"ACD_COMMIT_STRATEGY=event",
+	} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("doctor notes missing %q: %v", want, rr.Notes)
+		}
+	}
+
+	var humanOut bytes.Buffer
+	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
+		t.Fatalf("runDoctor human: %v", err)
+	}
+	if !strings.Contains(humanOut.String(), "batch wait : pending=1 min_pending=10") {
+		t.Fatalf("doctor human missing batch wait line:\n%s", humanOut.String())
+	}
+}
+
 func TestDoctor_FailedBarrierSurfaced(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
