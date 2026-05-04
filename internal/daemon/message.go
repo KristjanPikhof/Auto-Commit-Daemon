@@ -55,6 +55,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -114,12 +115,27 @@ func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) 
 // deterministic provider tolerates an empty DiffText, and AI providers
 // will simply receive an empty diff field).
 func providerMessageFn(p ai.Provider, repoRoot string) MessageFn {
+	return providerMessageFnWithPromptTrace(p, repoRoot, nil)
+}
+
+func providerMessageFnWithPromptTrace(p ai.Provider, repoRoot string, promptLogger prompttrace.Logger) MessageFn {
 	return func(ctx context.Context, ec EventContext) (string, error) {
 		effectiveRepoRoot := repoRoot
 		if !ai.ProviderNeedsDiff(p) {
 			effectiveRepoRoot = ""
 		}
 		cc := commitContextFromEvent(ctx, ec, effectiveRepoRoot)
+		if promptLogger != nil {
+			ctx = prompttrace.With(ctx, promptLogger, prompttrace.Metadata{
+				Strategy:     string(ai.CommitStrategyEvent),
+				Provider:     p.Name(),
+				Seq:          ec.Event.Seq,
+				BranchRef:    ec.Event.BranchRef,
+				Generation:   ec.Event.BranchGeneration,
+				DiffIncluded: cc.DiffText != "",
+				DiffCap:      ai.DiffCap,
+			})
+		}
 		r, err := p.Generate(ctx, cc)
 		if err != nil {
 			return "", err
