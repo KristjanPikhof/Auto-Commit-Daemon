@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
@@ -126,9 +127,21 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 }
 
 func promptRepoRecord(repo string) (repoRecord, error) {
-	rec, err := eventsRepoRecord(repo)
+	abs, err := resolveRepo(repo)
 	if err != nil {
-		return repoRecord{}, errors.New(strings.Replace(err.Error(), "acd events:", "acd prompt:", 1))
+		return repoRecord{}, err
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		return repoRecord{}, fmt.Errorf("acd prompt: resolve paths: %w", err)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		return repoRecord{}, fmt.Errorf("acd prompt: load registry: %w", err)
+	}
+	rec, ok := findRepo(reg, abs)
+	if !ok {
+		return repoRecord{}, fmt.Errorf("acd prompt: repo %s is not registered (try `acd start --repo %s`)", abs, abs)
 	}
 	return repoRecord{Path: rec.Path, StateDB: rec.StateDB}, nil
 }
@@ -189,6 +202,12 @@ func (s *promptGroupSelector) add(rec prompttrace.Record) {
 		group := s.addRecent(rec)
 		if s.latest == nil || groupLatestTS(group).After(groupLatestTS(s.latest)) {
 			s.latest = group
+		}
+		return
+	}
+	if rec.Stage == "request" {
+		if recordContainsSeq(rec, s.seq) {
+			s.matching = newPromptGroup(rec)
 		}
 		return
 	}
