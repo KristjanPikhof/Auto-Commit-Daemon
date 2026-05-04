@@ -20,7 +20,7 @@ func TestPromptNoTraceHumanAndJSONAreReadOnly(t *testing.T) {
 
 	var human bytes.Buffer
 	if err := runPrompt(context.Background(), &human, repo, true, 0, false); err != nil {
-		t.Fatalf("runPrompt human: %v")
+		t.Fatalf("runPrompt human: %v", err)
 	}
 	if got := human.String(); !strings.Contains(got, "No prompt traces found") ||
 		!strings.Contains(got, "ACD_AI_PROMPT_TRACE=1") {
