@@ -75,6 +75,19 @@ func (c *composed) Name() string {
 	return c.primary.Name() + "+" + c.fallback.Name()
 }
 
+// PrimaryProviderName returns the provider that receives the first request in a
+// composed chain. It is useful for diagnostics that need to associate fallback
+// records with the original provider request.
+func PrimaryProviderName(p interface{ Name() string }) string {
+	if p == nil {
+		return ""
+	}
+	if c, ok := p.(*composed); ok && c.primary != nil {
+		return c.primary.Name()
+	}
+	return p.Name()
+}
+
 // NeedsDiff is true when either side of the fallback chain can consume diff
 // text. A primary AI provider still needs the diff even when the fallback is
 // deterministic.

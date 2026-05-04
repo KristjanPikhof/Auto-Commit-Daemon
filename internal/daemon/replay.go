@@ -1217,7 +1217,7 @@ func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, r
 	}
 	provider := ""
 	if planner != nil {
-		provider = planner.Name()
+		provider = ai.PrimaryProviderName(planner)
 	}
 	if meta.Strategy == "" {
 		meta.Strategy = string(ai.CommitStrategyIntent)

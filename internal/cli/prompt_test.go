@@ -162,14 +162,14 @@ func TestPromptIntentTraceJSONShowsOfferedSeqAndFallback(t *testing.T) {
 				"validation_error": "selected stale seq",
 			},
 		},
-		map[string]any{
-			"ts":            "2026-05-04T13:00:02Z",
-			"stage":         "fallback",
-			"strategy":      "intent",
-			"provider":      "openai-compatible",
-			"model":         "gpt-4o-mini",
-			"offered_seqs":  []int64{100, 101},
-			"branch_ref":    "refs/heads/main",
+			map[string]any{
+				"ts":            "2026-05-04T13:00:02Z",
+				"stage":         "fallback",
+				"strategy":      "intent",
+				"provider":      "openai-compatible+deterministic",
+				"model":         "gpt-4o-mini",
+				"offered_seqs":  []int64{100, 101},
+				"branch_ref":    "refs/heads/main",
 			"generation":    2,
 			"diff_included": false,
 			"response": map[string]any{
