@@ -126,14 +126,14 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
 		return report, err
 	}
-	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
-		return report, err
-	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {
 		return report, fmt.Errorf("planner_state table check: %w", err)
 	}
 	if !ok {
+		if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
+			return report, err
+		}
 		return report, nil
 	}
 	if err := conn.QueryRowContext(ctx, `
@@ -194,6 +194,9 @@ LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlock
 	}
 	if lastDeferredReason.Valid {
 		report.LastDeferredReason = lastDeferredReason.String
+	}
+	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
+		return report, err
 	}
 
 	return report, nil
