@@ -28,6 +28,7 @@
 
 ### Changed
 
+- Renamed `acd init <harness>` to `acd setup <harness>` for clarity. `acd init` kept as hidden alias for one release with stderr deprecation warning; reserved `acd init` for future repo-state initialization.
 - AI provider docs now include setup profiles for compatibility mode,
   reviewer-friendly intent grouping, metadata-only private repos, self-hosted
   providers, explicit diff egress, and subprocess intent-planner plugins.
