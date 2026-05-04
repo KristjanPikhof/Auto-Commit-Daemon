@@ -222,6 +222,8 @@ for the full `event_class` enumeration.
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Seconds to pause replay after a same-branch rewind. `0` disables the grace. |
 | `ACD_COMMIT_STRATEGY` | `event` | `event` preserves one captured event per commit. `intent` asks the AI planner to select one or more pending captures for the next commit. |
 | `ACD_INTENT_WINDOW` | `10` | Maximum pending captures offered to the intent planner in one normal planning pass. |
+| `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal intent planning pass starts. |
+| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact planner context. |
 | `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before ACD forces the overdue capture into a one-item planning window. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
