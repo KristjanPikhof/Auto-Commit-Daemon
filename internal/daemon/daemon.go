@@ -27,6 +27,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -280,6 +281,12 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("close trace writer", "err", err.Error())
 		}
 	}()
+	promptTracer := prompttrace.FromEnv(opts.RepoPath, opts.GitDir)
+	defer func() {
+		if err := promptTracer.Close(); err != nil {
+			logger.Warn("close prompt trace writer", "err", err.Error())
+		}
+	}()
 	// MessageFn precedence: explicit MessageFn > injected MessageProvider
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
@@ -375,7 +382,7 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("AI provider supports diff context but ACD_AI_DIFF_EGRESS=1 is not set; sending metadata only",
 				"provider", provider.Name())
 		}
-		msgFn = providerMessageFn(provider, effectiveRepoRoot)
+		msgFn = providerMessageFnWithPromptTrace(provider, effectiveRepoRoot, promptTracer)
 	}
 	bootGrace := opts.BootGrace
 	if bootGrace <= 0 {
@@ -1543,6 +1550,7 @@ func Run(ctx context.Context, opts Options) error {
 				MessageFn:           msgFn,
 				GitDir:              opts.GitDir,
 				Trace:               tracer,
+				PromptTrace:         promptTracer,
 				Limit:               DefaultReplayLimit,
 				CommitStrategy:      providerCfg.CommitStrategy,
 				IntentWindow:        providerCfg.IntentWindow,
