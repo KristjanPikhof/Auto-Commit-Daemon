@@ -48,10 +48,10 @@ type OfferedCapture struct {
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible
 // providers and subprocess plugins.
 type IntentPlanRequest struct {
-	LatestCommit          *CommitSummary                 `json:"latest_commit,omitempty"`
-	PathCommitContext     []PathCommitContext            `json:"path_commit_context,omitempty"`
-	OfferedCaptures       []OfferedCapture               `json:"offered_captures"`
-	ForcedAging           bool                           `json:"forced_aging,omitempty"`
+	LatestCommit          *CommitSummary                `json:"latest_commit,omitempty"`
+	PathCommitContext     []PathCommitContext           `json:"path_commit_context,omitempty"`
+	OfferedCaptures       []OfferedCapture              `json:"offered_captures"`
+	ForcedAging           bool                          `json:"forced_aging,omitempty"`
 	CapturedDiffTransform prompttrace.TransformMetadata `json:"-"`
 }
 
