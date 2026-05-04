@@ -28,6 +28,7 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"Setup:",
 		"Advanced:",
 		"acd logs",
+		"acd prompt --last",
 		"acd fix --dry-run",
 		"acd list --watch",
 		"acd diagnose",
