@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // writePluginScript drops a bash script into dir under the canonical
@@ -130,6 +132,53 @@ done
 	}
 	if plan.Source != "subprocess:test" {
 		t.Fatalf("source=%q", plan.Source)
+	}
+}
+
+func TestSubprocess_PromptTraceRecordsIntentCapturedDiffTransform(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"intent_plan"'*'"planner_request"'*)
+      printf '%s\n' '{"version":1,"selected_seqs":[101],"deferred_seqs":[102],"subject":"Update checkout flow","body":"","grouping_reason":"single focused checkout change","deferred_reasons":[{"seq":102,"reason":"separate documentation change"}],"error":""}'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing planner request"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{
+		Strategy:     string(CommitStrategyIntent),
+		OfferedSeqs:  []int64{101, 102},
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+	if _, err := p.PlanIntent(ctx, sampleIntentPlanRequest(t)); err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	got := promptTraceRecordByStage(t, records(), "request")
+	if got.Provider != "subprocess:test" || got.Strategy != string(CommitStrategyIntent) {
+		t.Fatalf("metadata strategy/provider = %q/%q", got.Strategy, got.Provider)
+	}
+	if !got.DiffIncluded {
+		t.Fatal("DiffIncluded=false want true for captured diffs")
+	}
+	if got.Transform.InputBytes == 0 || got.Transform.RedactedBytes == 0 || got.Transform.OutputBytes == 0 {
+		t.Fatalf("transform byte counts=%+v want captured diff metadata", got.Transform)
+	}
+	if !got.Transform.RedactionApplied {
+		t.Fatalf("redaction_applied=false want true for captured secret diff: %+v", got.Transform)
 	}
 }
 
