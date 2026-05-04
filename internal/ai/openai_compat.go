@@ -56,6 +56,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // DefaultOpenAIBaseURL is the canonical OpenAI v1 endpoint root.
@@ -182,10 +184,15 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		httpClient = defaultOpenAIClient()
 	}
 
-	body, err := buildOpenAIRequest(model, cc, diffCap)
+	body, transform, err := buildOpenAIRequestWithTrace(model, cc, diffCap)
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
 	}
+	p.recordPromptRequest(ctx, body, transform, prompttrace.Metadata{
+		Strategy:     "event",
+		DiffIncluded: cc.DiffText != "",
+		DiffCap:      diffCap,
+	})
 
 	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
 	if err != nil {
@@ -201,19 +208,24 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{Error: err.Error()})
 		return Result{}, fmt.Errorf("openai-compat: http: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB cap
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Result{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
+		return Result{}, err
 	}
 
 	subject, body2, err := parseToolCall(raw)
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return Result{}, err
 	}
 	composed := subject
@@ -228,8 +240,11 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		bodyOut = parts[1]
 	}
 	if strings.TrimSpace(subj) == "" {
-		return Result{}, errors.New("openai-compat: empty subject after sanitize")
+		err := errors.New("openai-compat: empty subject after sanitize")
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return Result{}, err
 	}
+	p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
 		Body:    bodyOut,
@@ -259,10 +274,16 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		httpClient = defaultOpenAIClient()
 	}
 
-	body, err := buildOpenAIIntentPlanRequest(model, plannerReq)
+	body, transform, err := buildOpenAIIntentPlanRequestWithTrace(model, plannerReq)
 	if err != nil {
 		return IntentPlan{}, fmt.Errorf("openai-compat: build intent plan request: %w", err)
 	}
+	p.recordPromptRequest(ctx, body, transform, prompttrace.Metadata{
+		Strategy:     "intent",
+		OfferedSeqs:  offeredSeqs(plannerReq),
+		DiffIncluded: intentDiffIncluded(plannerReq),
+		DiffCap:      DiffCap,
+	})
 
 	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
 	if err != nil {
@@ -278,23 +299,30 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{Error: err.Error()})
 		return IntentPlan{}, fmt.Errorf("openai-compat: http: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return IntentPlan{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return IntentPlan{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
+		return IntentPlan{}, err
 	}
 
 	plan, err := parseIntentPlanToolCall(raw)
 	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
-		return IntentPlan{}, errors.New("openai-compat: intent plan returned empty subject")
+		err := errors.New("openai-compat: intent plan returned empty subject")
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return IntentPlan{}, err
 	}
 	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
@@ -307,8 +335,17 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	plan = NormalizeIntentPlanReasons(plan)
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
+		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
+	p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{
+		StatusCode:     resp.StatusCode,
+		Subject:        plan.Subject,
+		Body:           plan.Body,
+		SelectedSeqs:   plan.SelectedSeqs,
+		DeferredSeqs:   plan.DeferredSeqs,
+		GroupingReason: plan.GroupingReason,
+	})
 	return plan, nil
 }
 
@@ -365,7 +402,14 @@ func truncateForError(s string) string {
 // truncation so secrets near either end of a large diff cannot survive
 // provider serialization.
 func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, error) {
-	diff := Truncate(RedactDiffSecrets(cc.DiffText), diffCap)
+	body, _, err := buildOpenAIRequestWithTrace(model, cc, diffCap)
+	return body, err
+}
+
+func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([]byte, prompttrace.TransformMetadata, error) {
+	redacted := RedactDiffSecrets(cc.DiffText)
+	diff := Truncate(redacted, diffCap)
+	transform := promptTransformMetadata(cc.DiffText, redacted, diff)
 
 	type op struct {
 		Path    string `json:"path"`
@@ -398,7 +442,7 @@ func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, er
 
 	userJSON, err := json.Marshal(up)
 	if err != nil {
-		return nil, err
+		return nil, prompttrace.TransformMetadata{}, err
 	}
 
 	type message struct {
@@ -449,13 +493,19 @@ func buildOpenAIRequest(model string, cc CommitContext, diffCap int) ([]byte, er
 		},
 		Temperature: 0.3,
 	}
-	return json.Marshal(body)
+	raw, err := json.Marshal(body)
+	return raw, transform, err
 }
 
 func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([]byte, error) {
+	body, _, err := buildOpenAIIntentPlanRequestWithTrace(model, plannerReq)
+	return body, err
+}
+
+func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRequest) ([]byte, prompttrace.TransformMetadata, error) {
 	userPrompt, err := BuildIntentPlanUserPrompt(plannerReq)
 	if err != nil {
-		return nil, err
+		return nil, prompttrace.TransformMetadata{}, err
 	}
 
 	type message struct {
@@ -506,7 +556,8 @@ func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([
 		},
 		Temperature: 0.2,
 	}
-	return json.Marshal(body)
+	raw, err := json.Marshal(body)
+	return raw, prompttrace.TransformMetadata{}, err
 }
 
 // parseToolCall extracts subject + body from a chat-completion response
