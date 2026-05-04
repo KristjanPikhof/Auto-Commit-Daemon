@@ -680,6 +680,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		if rr.IntentStrategy.Active || rr.IntentStrategy.DeferredEvents > 0 || rr.IntentStrategy.LastPlannerError != "" {
 			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
 				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
+			if rr.IntentStrategy.BatchWaitActive {
+				fmt.Fprintf(out, "      batch wait : pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+					rr.IntentStrategy.VisiblePendingEvents,
+					rr.IntentStrategy.MinPending,
+					formatDurationCompact(time.Duration(rr.IntentStrategy.OldestPendingAgeSeconds)*time.Second),
+					formatDurationCompact(time.Duration(rr.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
+					formatDurationCompact(time.Duration(rr.IntentStrategy.AgeTriggerInSeconds)*time.Second))
+			}
 			if rr.IntentStrategy.LastPlannerError != "" {
 				fmt.Fprintf(out, "      planner err: seq %d %s\n",
 					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
