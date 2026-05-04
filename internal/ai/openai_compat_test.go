@@ -6,9 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // helper: spin up a mock OpenAI server. handler receives the parsed
@@ -129,6 +134,75 @@ func TestOpenAI_HappyPath(t *testing.T) {
 	}
 	if last.auth != "Bearer test-key" {
 		t.Fatalf("auth=%q", last.auth)
+	}
+}
+
+func TestOpenAI_PromptTraceDisabledWritesNothing(t *testing.T) {
+	t.Setenv(prompttrace.EnvTrace, "")
+	gitDir := t.TempDir()
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedToolCall("Update auth", "")
+	})
+	ctx := prompttrace.With(context.Background(), prompttrace.FromEnv("/repo", gitDir), prompttrace.Metadata{
+		Strategy:     string(CommitStrategyEvent),
+		Seq:          7,
+		BranchRef:    "refs/heads/main",
+		Generation:   3,
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+	if _, err := p.Generate(ctx, CommitContext{
+		Op:       "modify",
+		Path:     "auth.go",
+		DiffText: "diff --git a/auth.go b/auth.go\n@@\n-password=secret\n+password=secret2\n",
+		Branch:   "refs/heads/main",
+	}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "acd", "prompt-trace")); !os.IsNotExist(err) {
+		t.Fatalf("prompt trace dir exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestOpenAI_PromptTraceRecordsExactEventRequest(t *testing.T) {
+	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedToolCall("Update auth", "- rotate token validation")
+	})
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{
+		Strategy:     string(CommitStrategyEvent),
+		Seq:          42,
+		BranchRef:    "refs/heads/main",
+		Generation:   9,
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+	if _, err := p.Generate(ctx, CommitContext{
+		Op:       "modify",
+		Path:     "auth.go",
+		DiffText: strings.Repeat("token=secret\n", 500),
+		Branch:   "refs/heads/main",
+	}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	got := promptTraceRecordByStage(t, records(), "request")
+	if got.Strategy != string(CommitStrategyEvent) || got.Provider != "openai-compat" || got.Model != "test-model" {
+		t.Fatalf("metadata strategy/provider/model = %q/%q/%q", got.Strategy, got.Provider, got.Model)
+	}
+	if got.Seq != 42 || got.BranchRef != "refs/heads/main" || got.Generation != 9 {
+		t.Fatalf("event metadata = seq %d branch %q generation %d", got.Seq, got.BranchRef, got.Generation)
+	}
+	if string(got.Request) != string(last.rawBody) {
+		t.Fatalf("trace request differs from sent body\ntrace=%s\nsent=%s", got.Request, last.rawBody)
+	}
+	if !strings.Contains(got.SystemMessage, "git commit message generator") {
+		t.Fatalf("system message not recorded: %q", got.SystemMessage)
+	}
+	if !strings.Contains(got.UserMessage, "Generate a commit message") {
+		t.Fatalf("user message not recorded: %q", got.UserMessage)
+	}
+	if got.Transform.InputBytes == 0 || got.Transform.OutputBytes == 0 {
+		t.Fatalf("transform metadata missing: %+v", got.Transform)
 	}
 }
 
