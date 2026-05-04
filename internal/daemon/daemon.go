@@ -1547,17 +1547,17 @@ func Run(ctx context.Context, opts Options) error {
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
 			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn:           msgFn,
-				GitDir:              opts.GitDir,
-				Trace:               tracer,
-				PromptTrace:         promptTracer,
-				Limit:               DefaultReplayLimit,
-				CommitStrategy:      providerCfg.CommitStrategy,
-				IntentWindow:        providerCfg.IntentWindow,
-				IntentMinPending:    providerCfg.IntentMinPending,
-				IntentMaxPendingAge: providerCfg.IntentMaxPendingAge,
-				IntentRecentCommits: providerCfg.IntentRecentCommits,
-				IntentDeferLimit:    providerCfg.IntentDeferLimit,
+				MessageFn:             msgFn,
+				GitDir:                opts.GitDir,
+				Trace:                 tracer,
+				PromptTrace:           promptTracer,
+				Limit:                 DefaultReplayLimit,
+				CommitStrategy:        providerCfg.CommitStrategy,
+				IntentWindow:          providerCfg.IntentWindow,
+				IntentMinPending:      providerCfg.IntentMinPending,
+				IntentMaxPendingAge:   providerCfg.IntentMaxPendingAge,
+				IntentRecentCommits:   providerCfg.IntentRecentCommits,
+				IntentDeferLimit:      providerCfg.IntentDeferLimit,
 				IntentBypassBatchWait: flushed > 0,
 			})
 			if repErr == nil && repSum.Published > 0 {

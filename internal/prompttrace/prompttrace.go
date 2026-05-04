@@ -47,16 +47,16 @@ type TransformMetadata struct {
 }
 
 type Response struct {
-	StatusCode      int    `json:"status_code,omitempty"`
-	Subject         string `json:"subject,omitempty"`
-	Body            string `json:"body,omitempty"`
-	SelectedSeqs    []int64 `json:"selected_seqs,omitempty"`
-	DeferredSeqs    []int64 `json:"deferred_seqs,omitempty"`
-	GroupingReason  string `json:"grouping_reason,omitempty"`
-	ValidationError string `json:"validation_error,omitempty"`
-	Error           string `json:"error,omitempty"`
-	FallbackProvider string `json:"fallback_provider,omitempty"`
-	FallbackReason  string `json:"fallback_reason,omitempty"`
+	StatusCode       int     `json:"status_code,omitempty"`
+	Subject          string  `json:"subject,omitempty"`
+	Body             string  `json:"body,omitempty"`
+	SelectedSeqs     []int64 `json:"selected_seqs,omitempty"`
+	DeferredSeqs     []int64 `json:"deferred_seqs,omitempty"`
+	GroupingReason   string  `json:"grouping_reason,omitempty"`
+	ValidationError  string  `json:"validation_error,omitempty"`
+	Error            string  `json:"error,omitempty"`
+	FallbackProvider string  `json:"fallback_provider,omitempty"`
+	FallbackReason   string  `json:"fallback_reason,omitempty"`
 }
 
 type Record struct {
@@ -94,7 +94,7 @@ type Options struct {
 
 type Noop struct{}
 
-func (Noop) Record(Record)    {}
+func (Noop) Record(Record)   {}
 func (Noop) Close() error    { return nil }
 func (Noop) Dropped() uint64 { return 0 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -616,6 +617,58 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 	}
 }
 
+func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{101},
+			DeferredSeqs:   []int64{102},
+			Subject:        "Update checkout flow",
+			Body:           "- apply checkout validation",
+			GroupingReason: "single focused checkout change",
+			DeferredReasons: []DeferredReason{{
+				Seq:    102,
+				Reason: "documentation should commit separately",
+			}},
+		})
+	})
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{
+		Strategy:     string(CommitStrategyIntent),
+		OfferedSeqs:  []int64{101, 102},
+		BranchRef:    "refs/heads/main",
+		Generation:   11,
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+	if _, err := p.PlanIntent(ctx, req); err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	got := promptTraceRecordByStage(t, records(), "request")
+	if got.Strategy != string(CommitStrategyIntent) || got.Provider != "openai-compat" || got.Model != "test-model" {
+		t.Fatalf("metadata strategy/provider/model = %q/%q/%q", got.Strategy, got.Provider, got.Model)
+	}
+	if strings.Join(int64sToStrings(got.OfferedSeqs), ",") != "101,102" {
+		t.Fatalf("offered seqs=%v", got.OfferedSeqs)
+	}
+	if got.BranchRef != "refs/heads/main" || got.Generation != 11 {
+		t.Fatalf("branch metadata = %q generation %d", got.BranchRef, got.Generation)
+	}
+	if string(got.Request) != string(last.rawBody) {
+		t.Fatalf("trace request differs from sent body\ntrace=%s\nsent=%s", got.Request, last.rawBody)
+	}
+	if !strings.Contains(got.SystemMessage, "intent planner") {
+		t.Fatalf("system message not recorded: %q", got.SystemMessage)
+	}
+	if !strings.Contains(got.UserMessage, "Plan the next commit intent") {
+		t.Fatalf("user message not recorded: %q", got.UserMessage)
+	}
+	schema, ok := got.ToolSchema.(map[string]any)
+	if !ok || schema["type"] != "object" {
+		t.Fatalf("tool schema not recorded: %#v", got.ToolSchema)
+	}
+}
+
 func TestOpenAIIntentPlan_InvalidPlanReturnsErrorWhenComposed(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
@@ -638,4 +691,81 @@ func TestOpenAIIntentPlan_InvalidPlanReturnsErrorWhenComposed(t *testing.T) {
 	if !strings.Contains(err.Error(), "selected seq 999 outside offered window") {
 		t.Fatalf("error=%v", err)
 	}
+}
+
+func newPromptTraceTestWriter(t *testing.T) (*prompttrace.Writer, func() []promptTraceJSONRecord) {
+	t.Helper()
+	dir := t.TempDir()
+	writer, err := prompttrace.New(prompttrace.Options{
+		Repo: "/repo",
+		Dir:  dir,
+		Now: func() time.Time {
+			return time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+		},
+	})
+	if err != nil {
+		t.Fatalf("prompttrace.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close prompt trace: %v", err)
+		}
+	})
+	return writer, func() []promptTraceJSONRecord {
+		t.Helper()
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close prompt trace: %v", err)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "2026-05-04.jsonl"))
+		if err != nil {
+			t.Fatalf("read prompt trace: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		out := make([]promptTraceJSONRecord, 0, len(lines))
+		for _, line := range lines {
+			var rec promptTraceJSONRecord
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("decode prompt trace %q: %v", line, err)
+			}
+			out = append(out, rec)
+		}
+		return out
+	}
+}
+
+type promptTraceJSONRecord struct {
+	Stage         string                        `json:"stage"`
+	Strategy      string                        `json:"strategy"`
+	Provider      string                        `json:"provider"`
+	Model         string                        `json:"model"`
+	Seq           int64                         `json:"seq"`
+	OfferedSeqs   []int64                       `json:"offered_seqs"`
+	BranchRef     string                        `json:"branch_ref"`
+	Generation    int64                         `json:"generation"`
+	DiffIncluded  bool                          `json:"diff_included"`
+	DiffCap       int                           `json:"diff_cap"`
+	Transform     prompttrace.TransformMetadata `json:"transform"`
+	SystemMessage string                        `json:"system_message"`
+	UserMessage   string                        `json:"user_message"`
+	ToolSchema    any                           `json:"tool_schema"`
+	Request       json.RawMessage               `json:"request"`
+}
+
+func promptTraceRecordByStage(t *testing.T, records []promptTraceJSONRecord, stage string) promptTraceJSONRecord {
+	t.Helper()
+	for _, rec := range records {
+		if rec.Stage == stage {
+			return rec
+		}
+	}
+	t.Fatalf("no prompt trace record with stage %q in %+v", stage, records)
+	return promptTraceJSONRecord{}
+}
+
+func int64sToStrings(in []int64) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		out = append(out, strconv.FormatInt(v, 10))
+	}
+	return out
 }
