@@ -183,11 +183,11 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	if !cc.Now.IsZero() {
 		req.Now = cc.Now.UTC().Format(time.RFC3339Nano)
 	}
-	body, transform, err := marshalSubprocessPromptRequest(req, cc.DiffText, req.Diff)
+	requestBody, transform, err := marshalSubprocessPromptRequest(req, cc.DiffText, req.Diff)
 	if err != nil {
 		return Result{}, err
 	}
-	p.recordSubprocessRequest(ctx, body, transform, prompttrace.Metadata{
+	p.recordSubprocessRequest(ctx, requestBody, transform, prompttrace.Metadata{
 		Strategy:     "event",
 		DiffIncluded: req.Diff != "",
 		DiffCap:      DiffCap,
@@ -202,7 +202,6 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	// exactly once. A second crash on the fresh process surfaces as an
 	// error so Compose() falls back to deterministic.
 	var resp subprocessResponse
-	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		var session *pluginSession
 		session, err = p.acquire()
@@ -210,7 +209,7 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 			p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
 			return Result{}, err
 		}
-		resp, err = session.exchangeBytes(reqCtx, body)
+		resp, err = session.exchangeBytes(reqCtx, requestBody)
 		if err == nil {
 			break
 		}
@@ -242,19 +241,19 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	cleaned := SanitizeMessage(composed)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
 	subj := parts[0]
-	var body string
+	var bodyOut string
 	if len(parts) == 2 {
-		body = parts[1]
+		bodyOut = parts[1]
 	}
 	if strings.TrimSpace(subj) == "" {
 		err := fmt.Errorf("subprocess:%s: empty subject after sanitize", p.name)
 		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
 		return Result{}, err
 	}
-	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: body})
+	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
-		Body:    body,
+		Body:    bodyOut,
 		Source:  p.Name(),
 	}, nil
 }
