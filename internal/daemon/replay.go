@@ -29,6 +29,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
@@ -138,6 +139,9 @@ type ReplayOpts struct {
 	Limit int
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
+	// PromptTrace receives opt-in provider prompt records. Nil disables prompt
+	// persistence.
+	PromptTrace prompttrace.Logger
 
 	// CommitStrategy selects one-event replay or intent-grouped replay. Empty
 	// resolves from ACD_COMMIT_STRATEGY, preserving event replay by default.
