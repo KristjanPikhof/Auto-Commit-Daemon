@@ -840,7 +840,19 @@ func replayIntentBatch(
 		}
 	}
 
-	plan, validationFailure, err := planIntentWithFallback(ctx, db, cfg.planner, req, items, activeCtx, nowSec)
+	plannerCtx := ctx
+	if opts.PromptTrace != nil {
+		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
+			Strategy:     string(ai.CommitStrategyIntent),
+			Provider:     cfg.planner.Name(),
+			OfferedSeqs:  intentOfferedSeqs(req),
+			BranchRef:    activeCtx.BranchRef,
+			Generation:   activeCtx.BranchGeneration,
+			DiffIncluded: intentRequestIncludesDiff(req),
+			DiffCap:      ai.DiffCap,
+		})
+	}
+	plan, validationFailure, err := planIntentWithFallback(plannerCtx, db, cfg.planner, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
