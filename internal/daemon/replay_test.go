@@ -2791,6 +2791,7 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     2,
+		IntentMinPending: 2,
 		IntentDeferLimit: 1,
 	})
 	if err != nil {
@@ -2817,6 +2818,7 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     3,
+		IntentMinPending: 2,
 		IntentDeferLimit: 1,
 	})
 	if err != nil {
@@ -2914,6 +2916,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 		CommitStrategy:   ai.CommitStrategyIntent,
 		IntentPlanner:    planner,
 		IntentWindow:     2,
+		IntentMinPending: 2,
 		IntentDeferLimit: 2,
 	})
 	if err != nil {
@@ -3731,6 +3734,16 @@ func captureOnePendingFile(t *testing.T, ctx context.Context, f *captureFixture,
 		t.Fatal("expected at least one pending event")
 	}
 	return len(pending)
+}
+
+func setCaptureEventTimestamp(t *testing.T, ctx context.Context, db *state.DB, seq int64, ts time.Time) {
+	t.Helper()
+	capturedTS := float64(ts.UnixNano()) / float64(time.Second)
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET captured_ts = ? WHERE seq = ?`,
+		capturedTS, seq); err != nil {
+		t.Fatalf("set capture timestamp seq=%d: %v", seq, err)
+	}
 }
 
 func gitStatusPorcelain(t *testing.T, ctx context.Context, repoDir string) string {
