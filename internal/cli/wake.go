@@ -20,11 +20,13 @@ import (
 
 // wakeResult is the JSON payload returned by `acd wake --json`.
 type wakeResult struct {
-	OK         bool   `json:"ok"`
-	DaemonPID  int    `json:"daemon_pid,omitempty"`
-	SentSignal bool   `json:"sent_signal"`
-	Repo       string `json:"repo"`
-	SessionID  string `json:"session_id"`
+	OK            bool   `json:"ok"`
+	DaemonPID     int    `json:"daemon_pid,omitempty"`
+	SentSignal    bool   `json:"sent_signal"`
+	Skipped       bool   `json:"skipped,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	Repo          string `json:"repo"`
+	SessionID     string `json:"session_id"`
 }
 
 // signalProcess is the injection point used by tests to verify that wake
