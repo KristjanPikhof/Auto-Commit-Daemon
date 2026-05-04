@@ -281,12 +281,17 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("close trace writer", "err", err.Error())
 		}
 	}()
-	promptTracer := prompttrace.FromEnv(opts.RepoPath, opts.GitDir)
-	defer func() {
-		if err := promptTracer.Close(); err != nil {
-			logger.Warn("close prompt trace writer", "err", err.Error())
-		}
-	}()
+	promptTracer, err := prompttrace.NewFromEnv(opts.RepoPath, opts.GitDir)
+	if err != nil {
+		logger.Warn("initialize prompt trace writer", "err", err.Error())
+	}
+	if promptTracer != nil {
+		defer func() {
+			if err := promptTracer.Close(); err != nil {
+				logger.Warn("close prompt trace writer", "err", err.Error())
+			}
+		}()
+	}
 	// MessageFn precedence: explicit MessageFn > injected MessageProvider
 	// > env-driven ai.BuildProvider > deterministic. The closer returned
 	// by ai.BuildProvider (only non-nil for subprocess plugins) is owned
