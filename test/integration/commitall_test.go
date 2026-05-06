@@ -37,32 +37,9 @@ func commitAllFixture(t *testing.T) (string, []string) {
 	// Defensive: lex-sort regardless of source ordering.
 	sort.Strings(files)
 	for i, rel := range files {
-		writeFile(t, filepath.Join(repo, rel), "// "+rel+"\n// content "+itoa(i)+"\n")
+		writeFile(t, filepath.Join(repo, rel), "// "+rel+"\n// content "+strconv.Itoa(i)+"\n")
 	}
 	return repo, files
-}
-
-func itoa(i int) string {
-	const digits = "0123456789"
-	if i == 0 {
-		return "0"
-	}
-	negative := i < 0
-	if negative {
-		i = -i
-	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = digits[i%10]
-		i /= 10
-	}
-	if negative {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }
 
 // commitsTouchingPath returns commit OIDs (oldest-first) that touched path.
