@@ -486,6 +486,16 @@ func previewIntentDryRun(
 		res.Notes = append(res.Notes, "dry-run: provider does not implement intent planning; would fall back to deterministic single-event grouping")
 		return
 	}
+	// Refuse to call a network provider during dry-run. Users reasonably
+	// expect --dry-run to be airgapped; the planner request still leaks
+	// captured paths/ops to the configured AI endpoint even though no
+	// diff egress is involved. Skip the planner peek when the provider
+	// declares NeedsDiff (network-bound) or is anything other than the
+	// always-local deterministic provider.
+	if ai.ProviderNeedsDiff(provider) || cfg.Provider != ai.ProviderDeterministic {
+		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner peek skipped (network provider %q; would call out otherwise)", ai.PrimaryProviderName(provider)))
+		return
+	}
 	pending, err := state.PendingEvents(ctx, db, cfg.IntentWindow)
 	if err != nil || len(pending) == 0 {
 		return
