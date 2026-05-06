@@ -204,11 +204,10 @@ Proceed? [y/N]: y
 commit-all complete for /path/to/repo (refs/heads/main)
 Strategy: event (provider deterministic)
 Pending: before=42 after=0
-Commits: 42 (singletons=42 grouped=0)
+Commits: 42 (drained=42)
 HEAD: abc123456789 -> def456789012
+- shadow reseeded from HEAD
 Duration: 3.2s
-Notes:
-  - shadow reseeded from HEAD
 ~~~
 
 Skip the prompt with `--yes`, or combine with `--json` for scripting:
