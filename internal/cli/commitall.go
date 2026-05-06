@@ -125,6 +125,12 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		return fmt.Errorf("acd commit-all: refusing while manual pause marker is present at %s; run `acd resume` first", pausepkg.Path(gitDir))
 	}
 
+	// daemon.lock acquire is the live-daemon refusal gate: if the daemon
+	// owns the lock our acquire fails with ErrDaemonLockHeld. We hold it
+	// across the entire run so a daemon that starts mid-flight cannot
+	// race the capture/replay loop. The previous control.lock
+	// acquire+release dance was no-op (released before any work) and has
+	// been dropped — daemon.lock already covers the only real exclusion.
 	dlock, err := daemon.AcquireDaemonLock(gitDir)
 	if err != nil {
 		if errors.Is(err, daemon.ErrDaemonLockHeld) {
@@ -134,23 +140,22 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 	}
 	defer func() { _ = dlock.Release() }()
 
-	clock, err := daemon.AcquireControlLock(gitDir)
-	if err != nil {
-		return fmt.Errorf("acd commit-all: acquire control.lock: %w", err)
-	}
-
 	dbPath := state.DBPathFromGitDir(gitDir)
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
-		_ = clock.Release()
 		return fmt.Errorf("acd commit-all: open state.db: %w", err)
 	}
 	defer func() { _ = db.Close() }()
-	_ = clock.Release()
 
 	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
+	if err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return errors.New("acd commit-all: no commits on branch yet; create the initial commit first")
+		}
 		return fmt.Errorf("acd commit-all: resolve HEAD: %w", err)
+	}
+	if strings.TrimSpace(head) == "" {
+		return errors.New("acd commit-all: no commits on branch yet; create the initial commit first")
 	}
 	gen, err := loadCommitAllGeneration(ctx, db)
 	if err != nil {
@@ -166,22 +171,23 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		return fmt.Errorf("acd commit-all: bootstrap shadow: %w", err)
 	}
 
-	// Cold-start dirty trees can otherwise trip the mid-pass pending cap.
-	if err := os.Setenv("ACD_MAX_PENDING_EVENTS", "0"); err != nil {
-		return fmt.Errorf("acd commit-all: set pending cap: %w", err)
-	}
-
 	checker := git.NewIgnoreChecker(repo)
 	defer func() { _ = checker.Close() }()
 	sensitive := state.NewSensitiveMatcher()
 	safeIgnore := state.NewSafeIgnoreMatcher()
 
+	// DisablePendingCap (NOT os.Setenv) lifts the pending-depth cap for
+	// this single Capture call. Cold-start dirty trees can otherwise trip
+	// the mid-pass cap; using a typed CaptureOpts field keeps the daemon's
+	// process-wide invariant (DefaultMaxPendingEvents) untouched and
+	// avoids racing the env with concurrent goroutines.
 	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
 		IgnoreChecker:     checker,
 		SensitiveMatcher:  sensitive,
 		SafeIgnoreMatcher: safeIgnore,
 		GitDir:            gitDir,
 		SortByPath:        true,
+		DisablePendingCap: true,
 	}); err != nil {
 		return fmt.Errorf("acd commit-all: capture: %w", err)
 	}
