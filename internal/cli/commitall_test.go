@@ -527,6 +527,122 @@ func TestCommitAll_DryRunWithPendingPreservesHEAD(t *testing.T) {
 	}
 }
 
+// TestCommitAll_ReseedsStaleShadowAndDropsStalePending exercises the
+// real-world bug: the daemon previously captured edits into shadow_paths
+// without successful replay, so the bootstrap marker is set AND the shadow
+// already mirrors live worktree. A stale pending event from that session is
+// also still on disk. Without the fix, commit-all skipped reseed (marker
+// present) and Capture saw zero diff -> "0 pending, no commits". With the
+// fix, commit-all force-reseeds shadow from HEAD, drops the stale pending
+// row, then captures a real diff against HEAD. We assert dry-run reports
+// dropped_stale_pending > 0 and pending_before > 0.
+func TestCommitAll_ReseedsStaleShadowAndDropsStalePending(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+
+	// Drop two dirty files so a real reseed-then-capture would see them.
+	if err := os.WriteFile(filepath.Join(repo, "dirty-a.txt"), []byte("aa\n"), 0o644); err != nil {
+		t.Fatalf("write dirty-a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "dirty-b.txt"), []byte("bb\n"), 0o644); err != nil {
+		t.Fatalf("write dirty-b: %v", err)
+	}
+
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	branchRef := "refs/heads/main"
+	gen := int64(1)
+
+	// Simulate a poisoned shadow: write rows that already mirror live
+	// worktree blobs, plus the bootstrap completion marker. This is what a
+	// previous daemon capture pass + failed replay leaves behind.
+	hashAndStage := func(path, content string) string {
+		t.Helper()
+		// Use git hash-object to compute the OID the same way bootstrap
+		// would after a successful capture absorbed the edit.
+		out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "hash-object", "-w", path)
+		if err != nil {
+			t.Fatalf("hash-object %s: %v", path, err)
+		}
+		_ = content
+		return strings.TrimSpace(out)
+	}
+	for _, p := range []string{"dirty-a.txt", "dirty-b.txt"} {
+		oid := hashAndStage(p, "")
+		if err := state.UpsertShadowPath(ctx, db, state.ShadowPath{
+			BranchRef:        branchRef,
+			BranchGeneration: gen,
+			Path:             p,
+			Operation:        "create",
+			Mode:             sql.NullString{String: "100644", Valid: true},
+			OID:              sql.NullString{String: oid, Valid: true},
+			BaseHead:         head,
+			Fidelity:         "full",
+		}); err != nil {
+			t.Fatalf("UpsertShadowPath %s: %v", p, err)
+		}
+	}
+	// Mark the (branch_ref, gen) pair as fully bootstrapped — this is the
+	// idempotency gate that BootstrapShadow checks. Without ReseedShadowFromHead
+	// the daemon helper short-circuits here.
+	if err := state.MetaSet(ctx, db, daemon.ShadowBootstrappedKey(branchRef, gen), "1"); err != nil {
+		t.Fatalf("set bootstrap marker: %v", err)
+	}
+	// Seed a stale pending event from a "previous session".
+	staleSeq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        branchRef,
+		BranchGeneration: gen,
+		BaseHead:         "stale-base",
+		Operation:        "modify",
+		Path:             "stale-pending.txt",
+		Fidelity:         "full",
+	}, []state.CaptureOp{{Op: "modify", Path: "stale-pending.txt", Fidelity: "full"}})
+	if err != nil {
+		t.Fatalf("seed stale pending: %v", err)
+	}
+	if staleSeq <= 0 {
+		t.Fatalf("staleSeq=%d", staleSeq)
+	}
+	// Close the test handle before runCommitAll opens its own.
+	_ = db.Close()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, true, true, true); err != nil {
+		t.Fatalf("runCommitAll dry-run: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+
+	// Without the fix, PendingBefore would be 0 (bug behavior). With the
+	// fix, ReseedShadowFromHead nukes the stale shadow, DeletePendingForBranchGeneration
+	// drops the stale pending row, and Capture re-classifies the dirty
+	// files as new pending events.
+	if got.PendingBefore == 0 {
+		t.Fatalf("PendingBefore=0 reproduces the bug; want >=2 after reseed.\nresult=%+v\nout=%s", got, out.String())
+	}
+	if got.PendingBefore < 2 {
+		t.Fatalf("PendingBefore=%d, want >=2 (two dirty files)", got.PendingBefore)
+	}
+	if got.DroppedStalePending < 1 {
+		t.Fatalf("DroppedStalePending=%d, want >=1 (stale pending row should have been dropped)", got.DroppedStalePending)
+	}
+	// The "shadow reseeded" note must be present so users see what happened.
+	gotReseedNote := false
+	for _, n := range got.Notes {
+		if strings.Contains(n, "shadow reseeded from HEAD") {
+			gotReseedNote = true
+			break
+		}
+	}
+	if !gotReseedNote {
+		t.Fatalf("expected 'shadow reseeded from HEAD' note; got: %+v", got.Notes)
+	}
+}
+
 // errOnReadReader is an io.Reader whose Read always returns an error, used
 // to detect any accidental stdin consumption in commit-all paths that are
 // supposed to skip the prompt.
