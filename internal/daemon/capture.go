@@ -180,6 +180,13 @@ type CaptureOpts struct {
 	// flag avoids a double-trace. Direct callers (tests, future CLI
 	// wrappers) leave it false to honor the gate.
 	SkipPauseCheck bool
+	// SortByPath, when true, reorders the slice returned by Classify into
+	// lexicographic ascending Path order before the AppendCaptureEvent
+	// insert loop so capture_events.seq matches path order. Daemon
+	// run-loop callers leave this false; the live walk's iteration order
+	// is preserved exactly as before. Used by tests and tooling that need
+	// deterministic seq ordering across passes.
+	SortByPath bool
 }
 
 // resolveMaxFileBytes consults EnvMaxFileBytes, falls back to default.
