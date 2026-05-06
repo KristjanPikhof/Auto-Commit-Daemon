@@ -299,6 +299,13 @@ land in adjacent commits. With `ACD_COMMIT_STRATEGY=intent`, the intent planner
 receives coherent windows of related siblings, which improves grouping quality
 even without historical timing information.
 
+Sort order interacts with the pending-depth cap (`ACD_MAX_PENDING_EVENTS`).
+`SortByPath` reorders ops BEFORE the cap is applied, so events that overflow
+the cap mid-pass are the lex-largest paths, not the most recently edited.
+`acd commit-all` sets `DisablePendingCap: true` for its single capture call,
+so the cap does not affect commit-all in practice; the daemon run loop
+leaves `SortByPath` false and relies on the live walk's iteration order.
+
 ---
 
 ## `blocked_conflict`: terminal state, operator action required
