@@ -1,0 +1,497 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+)
+
+// commitAllResult is the JSON payload returned by `acd commit-all --json`.
+type commitAllResult struct {
+	OK             bool     `json:"ok"`
+	Repo           string   `json:"repo"`
+	BranchRef      string   `json:"branch_ref"`
+	HeadBefore     string   `json:"head_before"`
+	HeadAfter      string   `json:"head_after,omitempty"`
+	Strategy       string   `json:"strategy"`
+	Provider       string   `json:"provider"`
+	IntentWindow   int      `json:"intent_window,omitempty"`
+	IntentDeferLim int      `json:"intent_defer_limit,omitempty"`
+	PendingBefore  int      `json:"pending_before"`
+	PendingAfter   int      `json:"pending_after"`
+	EstimatedPass  int      `json:"estimated_passes"`
+	Commits        int      `json:"commits"`
+	Singletons     int      `json:"singletons"`
+	Grouped        int      `json:"grouped"`
+	Conflicts      int      `json:"conflicts,omitempty"`
+	Failed         int      `json:"failed,omitempty"`
+	DryRun         bool     `json:"dry_run,omitempty"`
+	Confirmed      bool     `json:"confirmed,omitempty"`
+	DurationMillis int64    `json:"duration_ms"`
+	Notes          []string `json:"notes,omitempty"`
+}
+
+func newCommitAllCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "commit-all",
+		Short: "Commit every uncommitted file in this worktree (one-shot)",
+		Long: `Commit each uncommitted file even when the daemon was off, ordered by
+lexicographic path so the planner sees coherent sibling windows.
+
+The active commit strategy is read from existing config (daemon meta first,
+then ACD_COMMIT_STRATEGY env, then the canonical default). There is no
+--strategy override: commit-all matches what the daemon would do on its own.
+
+Refuses to run on detached HEAD, while a git operation is in progress
+(rebase/merge/cherry-pick/bisect), while a manual pause marker is present,
+or while the per-repo daemon is alive.`,
+		Example: `  acd commit-all --dry-run
+  acd commit-all --yes
+  acd commit-all --repo /path/to/repo --yes --json`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repo, _ := cmd.Flags().GetString("repo")
+			yes, _ := cmd.Flags().GetBool("yes")
+			dryRun, _ := cmd.Flags().GetBool("dry-run")
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			return runCommitAll(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), repo, yes, dryRun, jsonOut)
+		},
+	}
+	cmd.Flags().Bool("yes", false, "Skip the interactive confirmation prompt")
+	cmd.Flags().Bool("dry-run", false, "Plan and show summary without committing")
+	return cmd
+}
+
+const commitAllZeroProgressLimit = 3
+
+func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag string, yes, dryRun, jsonOut bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	start := time.Now()
+
+	repo, err := resolveRepo(repoFlag)
+	if err != nil {
+		return err
+	}
+	gitDir, err := resolveGitDir(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: resolve git dir: %w", err)
+	}
+
+	branchRef, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: resolve HEAD branch: %w", err)
+	}
+	if branchRef == "" {
+		return errors.New("acd commit-all: detached HEAD; checkout a branch before running commit-all")
+	}
+	if name, active := daemon.GitOperationInProgress(gitDir); active {
+		return fmt.Errorf("acd commit-all: refusing while git operation %q is in progress", name)
+	}
+	if _, present, err := pausepkg.Read(gitDir); err != nil {
+		return fmt.Errorf("acd commit-all: read pause marker: %w", err)
+	} else if present {
+		return fmt.Errorf("acd commit-all: refusing while manual pause marker is present at %s; run `acd resume` first", pausepkg.Path(gitDir))
+	}
+
+	dlock, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return errors.New("acd commit-all: refusing while the per-repo daemon is alive (stop it first with `acd stop`)")
+		}
+		return fmt.Errorf("acd commit-all: acquire daemon.lock: %w", err)
+	}
+	defer func() { _ = dlock.Release() }()
+
+	clock, err := daemon.AcquireControlLock(gitDir)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: acquire control.lock: %w", err)
+	}
+
+	dbPath := state.DBPathFromGitDir(gitDir)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		_ = clock.Release()
+		return fmt.Errorf("acd commit-all: open state.db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	_ = clock.Release()
+
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
+		return fmt.Errorf("acd commit-all: resolve HEAD: %w", err)
+	}
+	gen, err := loadCommitAllGeneration(ctx, db)
+	if err != nil {
+		return err
+	}
+	cctx := daemon.CaptureContext{
+		BranchRef:        branchRef,
+		BranchGeneration: gen,
+		BaseHead:         head,
+	}
+
+	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
+		return fmt.Errorf("acd commit-all: bootstrap shadow: %w", err)
+	}
+
+	// Cold-start dirty trees can otherwise trip the mid-pass pending cap.
+	if err := os.Setenv("ACD_MAX_PENDING_EVENTS", "0"); err != nil {
+		return fmt.Errorf("acd commit-all: set pending cap: %w", err)
+	}
+
+	checker := git.NewIgnoreChecker(repo)
+	defer func() { _ = checker.Close() }()
+	sensitive := state.NewSensitiveMatcher()
+	safeIgnore := state.NewSafeIgnoreMatcher()
+
+	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
+		IgnoreChecker:     checker,
+		SensitiveMatcher:  sensitive,
+		SafeIgnoreMatcher: safeIgnore,
+		GitDir:            gitDir,
+		SortByPath:        true,
+	}); err != nil {
+		return fmt.Errorf("acd commit-all: capture: %w", err)
+	}
+
+	pending, err := state.PendingEvents(ctx, db, 0)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: count pending: %w", err)
+	}
+	pendingCount := len(pending)
+
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, db.SQL())
+	if err != nil {
+		return fmt.Errorf("acd commit-all: resolve strategy: %w", err)
+	}
+	cfg := ai.LoadProviderConfigFromEnv()
+	cfg.CommitStrategy = strategy
+	provider, providerCloser, err := ai.BuildProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: build provider: %w", err)
+	}
+	if providerCloser != nil {
+		defer func() { _ = providerCloser.Close() }()
+	}
+
+	estimated := commitAllEstimatePasses(strategy, pendingCount, cfg.IntentWindow)
+
+	res := commitAllResult{
+		OK:             true,
+		Repo:           repo,
+		BranchRef:      branchRef,
+		HeadBefore:     head,
+		Strategy:       string(strategy),
+		Provider:       ai.PrimaryProviderName(provider),
+		IntentWindow:   cfg.IntentWindow,
+		IntentDeferLim: cfg.IntentDeferLimit,
+		PendingBefore:  pendingCount,
+		EstimatedPass:  estimated,
+		DryRun:         dryRun,
+	}
+
+	if pendingCount == 0 {
+		res.Notes = append(res.Notes, "no pending events; worktree already clean")
+		res.DurationMillis = time.Since(start).Milliseconds()
+		return renderCommitAll(out, res, jsonOut)
+	}
+
+	if dryRun {
+		previewIntentDryRun(ctx, repo, db, cctx, strategy, cfg, provider, &res)
+		res.DurationMillis = time.Since(start).Milliseconds()
+		return renderCommitAll(out, res, jsonOut)
+	}
+
+	if !yes {
+		if jsonOut {
+			return errors.New("acd commit-all: --json requires --yes (no interactive prompt available)")
+		}
+		ok, err := promptCommitAllConfirm(out, in, res)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			res.Notes = append(res.Notes, "aborted by user")
+			res.OK = false
+			res.DurationMillis = time.Since(start).Milliseconds()
+			return renderCommitAll(out, res, jsonOut)
+		}
+	}
+	res.Confirmed = true
+
+	commits, singletons, grouped, conflicts, failed, after, err := commitAllReplayLoop(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, pendingCount)
+	if err != nil {
+		return err
+	}
+	res.Commits = commits
+	res.Singletons = singletons
+	res.Grouped = grouped
+	res.Conflicts = conflicts
+	res.Failed = failed
+	res.PendingAfter = after
+	if newHead, herr := git.RevParse(ctx, repo, "HEAD"); herr == nil {
+		res.HeadAfter = newHead
+	}
+	res.DurationMillis = time.Since(start).Milliseconds()
+	return renderCommitAll(out, res, jsonOut)
+}
+
+func loadCommitAllGeneration(ctx context.Context, db *state.DB) (int64, error) {
+	v, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyBranchGeneration)
+	if err != nil {
+		return 0, fmt.Errorf("acd commit-all: load branch generation: %w", err)
+	}
+	if !ok || strings.TrimSpace(v) == "" {
+		return 1, nil
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 1, nil
+	}
+	return parsed, nil
+}
+
+func commitAllEstimatePasses(strategy ai.CommitStrategy, pending, window int) int {
+	if pending <= 0 {
+		return 0
+	}
+	if strategy == ai.CommitStrategyIntent && window > 0 {
+		return int(math.Ceil(float64(pending) / float64(window)))
+	}
+	return pending
+}
+
+func promptCommitAllConfirm(out io.Writer, in io.Reader, res commitAllResult) (bool, error) {
+	renderCommitAllConfirmation(out, res)
+	fmt.Fprint(out, "Proceed? [y/N]: ")
+	if in == nil {
+		in = os.Stdin
+	}
+	reader := bufio.NewReader(in)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("acd commit-all: read confirmation: %w", err)
+	}
+	answer := strings.TrimSpace(strings.ToLower(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+func renderCommitAllConfirmation(out io.Writer, res commitAllResult) {
+	fmt.Fprintf(out, "Repo: %s (%s @ %s)\n", res.Repo, res.BranchRef, shortenSHA(res.HeadBefore))
+	fmt.Fprintf(out, "Pending events: %d\n", res.PendingBefore)
+	fmt.Fprintf(out, "Strategy: %s (provider %s)\n", res.Strategy, valueOrUnset(res.Provider))
+	if res.Strategy == string(ai.CommitStrategyIntent) {
+		fmt.Fprintf(out, "Intent window: %d, defer limit: %d\n", res.IntentWindow, res.IntentDeferLim)
+	}
+	fmt.Fprintf(out, "Estimated passes: %d\n", res.EstimatedPass)
+}
+
+func commitAllReplayLoop(
+	ctx context.Context,
+	repo, gitDir string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	strategy ai.CommitStrategy,
+	cfg ai.ProviderConfig,
+	provider ai.Provider,
+	startingPending int,
+) (commits, singletons, grouped, conflicts, failed, after int, err error) {
+	zeroProgress := 0
+	prevHead := cctx.BaseHead
+
+	var msgFn daemon.MessageFn
+	if provider != nil {
+		msgFn = func(ctx context.Context, ec daemon.EventContext) (string, error) {
+			return daemon.DeterministicMessage(ctx, ec)
+		}
+	}
+
+	var planner ai.IntentPlanner
+	if strategy == ai.CommitStrategyIntent {
+		if p, ok := provider.(ai.IntentPlanner); ok {
+			planner = p
+		}
+	}
+
+	for {
+		opts := daemon.ReplayOpts{
+			GitDir:                gitDir,
+			Limit:                 daemon.DefaultReplayLimit,
+			MessageFn:             msgFn,
+			CommitStrategy:        strategy,
+			IntentPlanner:         planner,
+			IntentWindow:          cfg.IntentWindow,
+			IntentMinPending:      cfg.IntentMinPending,
+			IntentMaxPendingAge:   cfg.IntentMaxPendingAge,
+			IntentRecentCommits:   cfg.IntentRecentCommits,
+			IntentDeferLimit:      cfg.IntentDeferLimit,
+			IntentBypassBatchWait: true,
+		}
+		sum, rerr := daemon.Replay(ctx, repo, db, cctx, opts)
+		if rerr != nil {
+			err = fmt.Errorf("acd commit-all: replay: %w", rerr)
+			return
+		}
+		commits += sum.Published
+		conflicts += sum.Conflicts
+		failed += sum.Failed
+		// Refresh BaseHead so the next pass sees the just-committed HEAD.
+		if newHead, herr := git.RevParse(ctx, repo, "HEAD"); herr == nil {
+			cctx.BaseHead = newHead
+		}
+
+		remaining, perr := state.PendingEvents(ctx, db, 0)
+		if perr != nil {
+			err = fmt.Errorf("acd commit-all: count pending after pass: %w", perr)
+			return
+		}
+		after = len(remaining)
+
+		if sum.Published == 0 && cctx.BaseHead == prevHead {
+			zeroProgress++
+		} else {
+			zeroProgress = 0
+		}
+		prevHead = cctx.BaseHead
+
+		if after == 0 {
+			break
+		}
+		if zeroProgress >= commitAllZeroProgressLimit {
+			break
+		}
+		if sum.Conflicts > 0 || sum.Failed > 0 {
+			break
+		}
+	}
+	if startingPending > 0 {
+		// Heuristic: with intent strategy, group/singleton split is approximated
+		// by comparing commits to events drained.
+		drained := startingPending - after
+		if drained < 0 {
+			drained = 0
+		}
+		if commits >= drained {
+			singletons = commits
+		} else {
+			grouped = commits
+			singletons = 0
+		}
+	}
+	return
+}
+
+func previewIntentDryRun(
+	ctx context.Context,
+	repo string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	strategy ai.CommitStrategy,
+	cfg ai.ProviderConfig,
+	provider ai.Provider,
+	res *commitAllResult,
+) {
+	res.Notes = append(res.Notes, fmt.Sprintf("dry-run: %d events would be processed", res.PendingBefore))
+	if strategy != ai.CommitStrategyIntent {
+		return
+	}
+	planner, ok := provider.(ai.IntentPlanner)
+	if !ok {
+		res.Notes = append(res.Notes, "dry-run: provider does not implement intent planning; would fall back to deterministic single-event grouping")
+		return
+	}
+	pending, err := state.PendingEvents(ctx, db, cfg.IntentWindow)
+	if err != nil || len(pending) == 0 {
+		return
+	}
+	offered := make([]ai.OfferedCapture, 0, len(pending))
+	for _, ev := range pending {
+		offered = append(offered, ai.OfferedCapture{
+			Seq:       ev.Seq,
+			Path:      ev.Path,
+			Op:        string(ev.Operation),
+			Timestamp: time.Unix(0, int64(ev.CapturedTS*1e9)),
+			Fidelity:  string(ev.Fidelity),
+		})
+	}
+	req, rerr := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{OfferedCaptures: offered})
+	if rerr != nil {
+		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: build planner request: %v", rerr))
+		return
+	}
+	plan, perr := planner.PlanIntent(ctx, req)
+	if perr != nil {
+		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner preview failed: %v", perr))
+		return
+	}
+	if len(plan.SelectedSeqs) > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner would select %d capture(s) for the next commit", len(plan.SelectedSeqs)))
+	}
+	if len(plan.DeferredSeqs) > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner would defer %d capture(s)", len(plan.DeferredSeqs)))
+	}
+	if subj := strings.TrimSpace(plan.Subject); subj != "" {
+		res.Notes = append(res.Notes, "dry-run: planner subject preview: "+subj)
+	}
+}
+
+func renderCommitAll(out io.Writer, res commitAllResult, jsonOut bool) error {
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	}
+	if res.DryRun {
+		fmt.Fprintf(out, "commit-all DRY RUN for %s (%s @ %s)\n", res.Repo, res.BranchRef, shortenSHA(res.HeadBefore))
+	} else {
+		fmt.Fprintf(out, "commit-all complete for %s (%s)\n", res.Repo, res.BranchRef)
+	}
+	fmt.Fprintf(out, "Strategy: %s (provider %s)\n", res.Strategy, valueOrUnset(res.Provider))
+	fmt.Fprintf(out, "Pending: before=%d after=%d\n", res.PendingBefore, res.PendingAfter)
+	if !res.DryRun {
+		fmt.Fprintf(out, "Commits: %d (singletons=%d grouped=%d)\n", res.Commits, res.Singletons, res.Grouped)
+		if res.Conflicts > 0 || res.Failed > 0 {
+			fmt.Fprintf(out, "Issues: conflicts=%d failed=%d (use `acd diagnose` to inspect)\n", res.Conflicts, res.Failed)
+		}
+		if res.HeadAfter != "" && res.HeadAfter != res.HeadBefore {
+			fmt.Fprintf(out, "HEAD: %s -> %s\n", shortenSHA(res.HeadBefore), shortenSHA(res.HeadAfter))
+		}
+	}
+	for _, note := range res.Notes {
+		fmt.Fprintf(out, "- %s\n", note)
+	}
+	fmt.Fprintf(out, "Duration: %s\n", formatDurationCompact(time.Duration(res.DurationMillis)*time.Millisecond))
+	return nil
+}
+
+func shortenSHA(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(none)"
+	}
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+// keep filepath import in case future callers need to derive sub-paths.
+var _ = filepath.Join
