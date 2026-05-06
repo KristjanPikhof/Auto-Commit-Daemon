@@ -306,6 +306,19 @@ the cap mid-pass are the lex-largest paths, not the most recently edited.
 so the cap does not affect commit-all in practice; the daemon run loop
 leaves `SortByPath` false and relies on the live walk's iteration order.
 
+**Reseed before capture.** Unlike the live daemon, `commit-all` calls
+`ReseedShadowFromHead` before capture rather than the idempotent
+`BootstrapShadow`. The reseed deletes any existing shadow rows for the
+active `(branch_ref, branch_generation)`, removes the bootstrap completion
+marker, and re-bootstraps from `HEAD`'s tree. It also drops any stale
+`pending` capture events for that branch+generation via
+`state.DeletePendingForBranchGeneration`. This guarantees the diff vs HEAD
+is what `commit-all` ends up committing, even when an earlier daemon
+session absorbed worktree edits into shadow without successfully replaying
+them. Without the reseed, the bootstrap marker is honored, the poisoned
+shadow already mirrors live state, and Capture sees zero diff — the user
+would observe "0 pending, no commits" while the worktree was still dirty.
+
 ---
 
 ## `blocked_conflict`: terminal state, operator action required
