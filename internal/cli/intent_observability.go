@@ -76,9 +76,10 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 
 // ResolveEffectiveCommitStrategy returns the commit strategy currently in
 // effect for a repo. When conn is nil, the result reflects only env
-// (ACD_COMMIT_STRATEGY) and the canonical default. When conn is non-nil and
-// daemon_meta carries a daemon-stamped commit.strategy, that overlay wins so
-// CLI tooling reports the value the running daemon actually uses.
+// (ACD_COMMIT_STRATEGY) and the canonical default. When daemon_meta
+// carries a *recognized* commit.strategy value, that overlay wins;
+// unrecognized values are loud (slog.Warn) and the env-derived value is
+// used so corrupt meta cannot silently override the operator's intent.
 func ResolveEffectiveCommitStrategy(ctx context.Context, conn *sql.DB) (ai.CommitStrategy, error) {
 	cfg := ai.LoadProviderConfigFromEnv()
 	strategy := cfg.CommitStrategy
@@ -101,6 +102,15 @@ func ResolveEffectiveCommitStrategy(ctx context.Context, conn *sql.DB) (ai.Commi
 	case string(ai.CommitStrategyIntent):
 		return ai.CommitStrategyIntent, nil
 	default:
+		// Daemon meta carries a value but it is not one of the known
+		// commit strategies. Silently demoting to the env-derived
+		// value would hide daemon misconfiguration; log a warning and
+		// preserve the existing fallback so callers don't crash.
+		slog.Default().Warn(
+			"daemon meta commit.strategy has unrecognized value; falling back to env-derived strategy",
+			slog.String("commit.strategy", raw),
+			slog.String("fallback", string(strategy)),
+		)
 		return strategy, nil
 	}
 }
