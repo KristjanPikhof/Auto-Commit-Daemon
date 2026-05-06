@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- `acd commit-all`: one-shot command that captures every uncommitted file in
+  the worktree and replays them as commits without starting the persistent
+  daemon. Useful for cold starts, dirty repos after the daemon was off, and
+  onboarding an existing worktree into ACD history. Files are sorted
+  lexicographically by path so sibling files cluster together in the commit
+  sequence and the intent planner sees coherent windows of related siblings.
+  The active commit strategy is read from existing config; there is no
+  `--strategy` override. Flags: `--dry-run` (plan without committing),
+  `--yes` (skip confirmation), `--json` (machine-readable output, requires
+  `--yes`), `--repo`. Refuses to run on detached HEAD, during active git
+  operations (rebase, merge, cherry-pick, bisect), while a manual pause marker
+  is present, or while the per-repo daemon is running.
+
 ## v2026-05-06
 
 ### Added
