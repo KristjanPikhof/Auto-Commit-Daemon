@@ -644,6 +644,9 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	protectedSkipCount := protectShadowFromSkippedPresent(ctx, repoRoot, db, cctx, shadow, protectedSkips)
 
 	ops := Classify(shadow, live)
+	if opts.SortByPath {
+		sort.SliceStable(ops, func(i, j int) bool { return ops[i].Path < ops[j].Path })
+	}
 	recordTrace(opts.Trace, acdtrace.Event{
 		Repo:       repoRoot,
 		BranchRef:  cctx.BranchRef,
