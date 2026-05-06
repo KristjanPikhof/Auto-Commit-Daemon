@@ -104,6 +104,20 @@ func DeterministicMessage(ctx context.Context, ec EventContext) (string, error) 
 	return providerMessageFn(ai.DeterministicProvider{}, "")(ctx, ec)
 }
 
+// ProviderMessageFn adapts an ai.Provider into the daemon's MessageFn
+// signature for direct (non-run-loop) callers like `acd commit-all`. It
+// is a thin exported wrapper over the internal providerMessageFn so
+// command-mode tooling can route per-event messages through the same
+// provider the daemon itself would use.
+//
+// repoRoot is used to reconstruct the unified diff from captured blob
+// OIDs; pass "" when the caller cannot supply a repo root (the
+// deterministic provider tolerates an empty DiffText, and AI providers
+// will simply receive an empty diff field).
+func ProviderMessageFn(p ai.Provider, repoRoot string) MessageFn {
+	return providerMessageFn(p, repoRoot)
+}
+
 // providerMessageFn adapts an ai.Provider into the daemon's MessageFn
 // signature. Subject + Body are joined with a blank line so the run
 // loop's commit-tree call gets a single string. Errors propagate so
