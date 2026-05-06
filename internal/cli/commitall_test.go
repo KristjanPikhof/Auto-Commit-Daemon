@@ -618,13 +618,13 @@ func (p *fakePlannerProvider) Generate(ctx context.Context, cc ai.CommitContext)
 	p.genCalls++
 	return ai.Result{Subject: "fake: " + cc.Path}, nil
 }
-func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlanResult, error) {
+func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
 	p.planCalls++
 	seqs := make([]int64, 0, len(req.OfferedCaptures))
 	for _, c := range req.OfferedCaptures {
 		seqs = append(seqs, c.Seq)
 	}
-	return ai.IntentPlanResult{SelectedSeqs: seqs, Subject: p.planSubject}, nil
+	return ai.IntentPlan{SelectedSeqs: seqs, Subject: p.planSubject}, nil
 }
 
 // TestPreviewIntentDryRun_SkipsNetworkPlanner covers P1-5: dry-run must
