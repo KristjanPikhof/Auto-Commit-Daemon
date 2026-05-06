@@ -492,5 +492,3 @@ func shortenSHA(s string) string {
 	return s
 }
 
-// keep filepath import in case future callers need to derive sub-paths.
-var _ = filepath.Join
