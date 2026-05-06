@@ -427,9 +427,9 @@ func previewIntentDryRun(
 		offered = append(offered, ai.OfferedCapture{
 			Seq:       ev.Seq,
 			Path:      ev.Path,
-			Op:        string(ev.Operation),
+			Op:        ev.Operation,
 			Timestamp: time.Unix(0, int64(ev.CapturedTS*1e9)),
-			Fidelity:  string(ev.Fidelity),
+			Fidelity:  ev.Fidelity,
 		})
 	}
 	req, rerr := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{OfferedCaptures: offered})
