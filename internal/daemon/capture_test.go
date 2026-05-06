@@ -1390,3 +1390,102 @@ func TestCapture_NTPStepBackwardDoesNotSilenceWarn(t *testing.T) {
 		t.Fatal("interval throttling broken after clamp")
 	}
 }
+
+// TestCapture_SortByPathOrdersSeqLexicographically confirms that with
+// SortByPath=true, the capture_events.seq order matches Path ascending —
+// even when Classify groups ops by category (renames, live-order
+// create/modify/mode, then deletes) and would otherwise yield a non-lex
+// order across categories. The setup mixes one delete (early-letter path)
+// with one create (late-letter path); without sort the create appears
+// first because Classify walks live paths before plain deletes.
+func TestCapture_SortByPathOrdersSeqLexicographically(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Seed shadow with aaa.txt so the next pass can produce a delete for it.
+	if err := os.WriteFile(filepath.Join(f.dir, "aaa.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write aaa.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	// Mutate: delete aaa.txt, create zzz.txt. Classify emits creates before
+	// deletes within its own category passes, so unsorted order is
+	// [zzz create, aaa delete].
+	if err := os.Remove(filepath.Join(f.dir, "aaa.txt")); err != nil {
+		t.Fatalf("remove aaa.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "zzz.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write zzz.txt: %v", err)
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		SortByPath:       true,
+	}); err != nil {
+		t.Fatalf("Capture SortByPath=true: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 2 {
+		t.Fatalf("expected 2 ops in second pass, got %d (%+v)", len(pass), pass)
+	}
+	// With SortByPath=true, lexicographic Path order: aaa.txt before zzz.txt.
+	if pass[0].Path != "aaa.txt" || pass[0].Op != "delete" {
+		t.Fatalf("op[0] = %+v, want {delete aaa.txt}", pass[0])
+	}
+	if pass[1].Path != "zzz.txt" || pass[1].Op != "create" {
+		t.Fatalf("op[1] = %+v, want {create zzz.txt}", pass[1])
+	}
+	// Defensive: the slice is non-decreasing by Path.
+	for i := 1; i < len(pass); i++ {
+		if pass[i-1].Path > pass[i].Path {
+			t.Fatalf("seq order not lexicographic: %+v", pass)
+		}
+	}
+}
+
+// TestCapture_SortByPathDefaultPreservesClassifyOrder confirms that with
+// SortByPath=false (the daemon run-loop default) the seq order matches
+// Classify's native ordering: live-order create/modify/mode first, then
+// plain deletes. Same fixture as the sorted variant, so the only
+// difference between the two tests is the SortByPath flag.
+func TestCapture_SortByPathDefaultPreservesClassifyOrder(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "aaa.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write aaa.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	if err := os.Remove(filepath.Join(f.dir, "aaa.txt")); err != nil {
+		t.Fatalf("remove aaa.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "zzz.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write zzz.txt: %v", err)
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		// SortByPath omitted — defaults to false.
+	}); err != nil {
+		t.Fatalf("Capture default: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 2 {
+		t.Fatalf("expected 2 ops in second pass, got %d (%+v)", len(pass), pass)
+	}
+	// Classify order: creates from the live walk pass come BEFORE plain
+	// deletes from the third pass, so seq is [zzz create, aaa delete].
+	if pass[0].Path != "zzz.txt" || pass[0].Op != "create" {
+		t.Fatalf("op[0] = %+v, want {create zzz.txt}; SortByPath=false must preserve Classify order", pass[0])
+	}
+	if pass[1].Path != "aaa.txt" || pass[1].Op != "delete" {
+		t.Fatalf("op[1] = %+v, want {delete aaa.txt}; SortByPath=false must preserve Classify order", pass[1])
+	}
+}
