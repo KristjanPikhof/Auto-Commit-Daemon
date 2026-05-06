@@ -820,6 +820,97 @@ func TestDeleteStaleUnpublishedForBranchGeneration(t *testing.T) {
 	}
 }
 
+// TestDeletePendingForBranchGeneration pins the branch-scoped pending wipe
+// used by `acd commit-all` to clear stale rows before forcing a shadow reseed.
+// Must scope by (branch_ref, branch_generation) AND must never delete terminal
+// rows (published, failed, blocked_conflict).
+func TestDeletePendingForBranchGeneration(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	appendEvent := func(branch string, generation int64, stateName, path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef:        branch,
+			BranchGeneration: generation,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             path,
+			Fidelity:         "exact",
+			State:            stateName,
+		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+
+	// Target rows (branch=main, gen=1, state=pending) — must be deleted.
+	targetA := appendEvent("refs/heads/main", 1, EventStatePending, "target-a.txt")
+	targetB := appendEvent("refs/heads/main", 1, EventStatePending, "target-b.txt")
+
+	// Same branch+gen but terminal — must survive.
+	keepPublished := appendEvent("refs/heads/main", 1, EventStatePublished, "keep-published.txt")
+	keepFailed := appendEvent("refs/heads/main", 1, EventStateFailed, "keep-failed.txt")
+	keepBlocked := appendEvent("refs/heads/main", 1, EventStateBlockedConflict, "keep-blocked.txt")
+
+	// Different branch (same gen number) — must survive.
+	otherBranch := appendEvent("refs/heads/feature", 1, EventStatePending, "other-branch.txt")
+	// Different gen (same branch) — must survive.
+	otherGen := appendEvent("refs/heads/main", 2, EventStatePending, "other-gen.txt")
+
+	n, err := DeletePendingForBranchGeneration(ctx, d, "refs/heads/main", 1)
+	if err != nil {
+		t.Fatalf("DeletePendingForBranchGeneration: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("deleted=%d want 2 (only the two target pending rows)", n)
+	}
+
+	// Verify the survivors and casualties.
+	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
+	if err != nil {
+		t.Fatalf("query remaining: %v", err)
+	}
+	defer rows.Close()
+	remaining := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		remaining[seq] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iter: %v", err)
+	}
+	for _, seq := range []int64{targetA, targetB} {
+		if remaining[seq] {
+			t.Fatalf("target seq %d survived; remaining=%v", seq, remaining)
+		}
+	}
+	for _, seq := range []int64{keepPublished, keepFailed, keepBlocked, otherBranch, otherGen} {
+		if !remaining[seq] {
+			t.Fatalf("seq %d wrongly deleted; remaining=%v", seq, remaining)
+		}
+	}
+
+	// Empty branch_ref must error rather than nuking everything.
+	if _, err := DeletePendingForBranchGeneration(ctx, d, "", 1); err == nil {
+		t.Fatalf("empty branch_ref must error")
+	}
+
+	// Idempotent: a second call deletes zero.
+	n2, err := DeletePendingForBranchGeneration(ctx, d, "refs/heads/main", 1)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("second call deleted=%d want 0", n2)
+	}
+}
+
 func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
