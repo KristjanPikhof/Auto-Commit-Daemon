@@ -91,6 +91,90 @@ func TestWake_RefreshesAndSignals(t *testing.T) {
 	}
 }
 
+// TestWake_SkipsWhenControlLockHeld covers the best-effort hook path: when a
+// concurrent control caller holds control.lock, wake must return success with
+// Skipped=true, must not signal any process, and must not enqueue a flush.
+// The daemon's next tick reconciles state.
+func TestWake_SkipsWhenControlLockHeld(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	if err := state.RegisterClient(ctx, db, state.Client{
+		SessionID: "s1", Harness: "claude-code",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = db.Close()
+
+	count, _, restore := installFakeSignal(t)
+	defer restore()
+
+	held, err := daemon.AcquireControlLock(repoDir + "/.git")
+	if err != nil {
+		t.Fatalf("pre-acquire control.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runWake(ctx, &out, repoDir, "s1", true); err != nil {
+		t.Fatalf("runWake must not error on control.lock contention, got: %v", err)
+	}
+
+	if count.Load() != 0 {
+		t.Fatalf("contended wake must not signal, got %d signal calls", count.Load())
+	}
+
+	var got wakeResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.OK || !got.Skipped || got.SkippedReason != "control_lock_held" || got.SentSignal {
+		t.Fatalf("expected ok+skipped+reason=control_lock_held, got %+v", got)
+	}
+
+	// No flush_request should be queued — the contended path returns before
+	// opening state.db.
+	d2, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if _, ok, err := state.ClaimNextFlushRequest(ctx, d2); err != nil {
+		t.Fatalf("claim: %v", err)
+	} else if ok {
+		t.Fatalf("contended wake must not enqueue flush_request")
+	}
+}
+
+// TestWake_PropagatesUnexpectedLockError ensures we only swallow the specific
+// contention sentinel — any other lock-acquisition failure (e.g. permission
+// or filesystem error) must still surface as an error.
+func TestWake_PropagatesUnexpectedLockError(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	_ = db.Close()
+	_, _, restore := installFakeSignal(t)
+	defer restore()
+
+	// Point the resolver at a path that doesn't exist on disk so the
+	// underlying open call inside resolveGitDir fails. Use a clearly bogus
+	// repo to keep the test focused.
+	var out bytes.Buffer
+	err := runWake(ctx, &out, repoDir+"/does-not-exist", "s1", true)
+	if err == nil {
+		t.Fatalf("expected error for missing repo, got nil")
+	}
+	if errors.Is(err, daemon.ErrControlLockHeld) {
+		t.Fatalf("error must not be ErrControlLockHeld: %v", err)
+	}
+}
+
 func TestWake_LazyRegisterIdempotent(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()

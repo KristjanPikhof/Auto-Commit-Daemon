@@ -5,7 +5,7 @@ For [`KristjanPikhof/OpenCode-Hooks`](https://github.com/KristjanPikhof/OpenCode
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Generate snippet: `acd init opencode`
+2. Generate snippet: `acd setup opencode`
 3. Merge the printed YAML into your OpenCode-Hooks `hooks.yaml`
 4. Restart OpenCode
 

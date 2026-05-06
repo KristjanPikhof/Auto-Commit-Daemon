@@ -24,7 +24,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"recover", []string{"acd recover --auto --dry-run", "requires --yes", "--clear-pause"}},
 		{"pause", []string{"acd pause --ttl 1h", "acd resume", "acd status"}},
 		{"resume", []string{"acd resume --repo /path/to/repo --yes", "--accept-overflow", "acd status"}},
-		{"init", []string{"acd init codex", "Supported harnesses", "prints snippets only"}},
+		{"setup", []string{"acd setup codex", "Supported harnesses", "prints snippets only"}},
 		{"wake", []string{"acd wake --session-id", "acd touch", "current working directory"}},
 		{"stats", []string{"acd stats --since 30d", "all registered repos", "--json"}},
 		{"gc", []string{"acd gc --json", "30 days", "acd list"}},

@@ -4,7 +4,7 @@
 package integration_test
 
 // adapter_e2e_test.go — §7.9 / §9 end-to-end coverage. Each subtest renders a
-// harness's snippet via `acd init <harness>`, executes the start-equivalent
+// harness's snippet via `acd setup <harness>`, executes the start-equivalent
 // command(s) under a fake harness env (mock CLAUDE_PROJECT_DIR /
 // OPENCODE_SESSION_ID / PI_SESSION_ID / etc.), and asserts the daemon's
 // per-repo state.db has the expected daemon_clients row (session_id + harness).
@@ -48,14 +48,14 @@ func TestAdapterE2E(t *testing.T) {
 	bin := buildAcdBinary(t)
 	for _, h := range []string{"claude-code", "codex", "opencode", "pi", "shell"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		out := runAcd(t, ctx, os.Environ(), "init", h)
+		out := runAcd(t, ctx, os.Environ(), "setup", h)
 		cancel()
 		if out.ExitCode != 0 {
-			t.Fatalf("acd init %s exit=%d\nstdout=%s\nstderr=%s",
+			t.Fatalf("acd setup %s exit=%d\nstdout=%s\nstderr=%s",
 				h, out.ExitCode, out.Stdout, out.Stderr)
 		}
 		if len(strings.TrimSpace(out.Stdout)) == 0 {
-			t.Fatalf("acd init %s emitted empty stdout", h)
+			t.Fatalf("acd setup %s emitted empty stdout", h)
 		}
 	}
 
@@ -340,14 +340,20 @@ type hookSpec struct {
 }
 
 // parseClaudeCodeSnippet parses templates/claude-code/settings.snippet.json
-// and returns one hookSpec per event/command pair. The matcher field is not
-// used here — every command is exercised through the same fake stdin payload.
+// and returns one hookSpec per event/command pair. Claude Code's schema is
+// nested: each event holds matcher groups, and each matcher group holds a
+// `hooks` array of {type:"command", command:"…"} handlers. The matcher field
+// is not used here — every command is exercised through the same fake stdin
+// payload.
 func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	var doc struct {
 		Hooks map[string][]struct {
 			Matcher string `json:"matcher"`
-			Command string `json:"command"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
 		} `json:"hooks"`
 	}
 	if err := json.Unmarshal([]byte(body), &doc); err != nil {
@@ -356,7 +362,9 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	var out []hookSpec
 	for _, event := range []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"} {
 		for _, e := range doc.Hooks[event] {
-			out = append(out, hookSpec{Event: event, Command: e.Command})
+			for _, h := range e.Hooks {
+				out = append(out, hookSpec{Event: event, Command: h.Command})
+			}
 		}
 	}
 	if len(out) == 0 {

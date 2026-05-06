@@ -27,11 +27,11 @@ go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest
 ## Wire your harness
 
 ~~~bash
-acd init claude-code   # paste output into ~/.claude/settings.json
-acd init codex         # paste output into ~/.config/codex/config.toml
-acd init opencode      # paste output into your OpenCode-Hooks hooks.yaml
-acd init pi            # paste output into your .pi/hook/hooks.yaml
-acd init shell         # universal direnv / zshrc fallback
+acd setup claude-code   # paste output into ~/.claude/settings.json
+acd setup codex         # paste output into ~/.config/codex/config.toml
+acd setup opencode      # paste output into your OpenCode-Hooks hooks.yaml
+acd setup pi            # paste output into your .pi/hook/hooks.yaml
+acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
 ## Use it

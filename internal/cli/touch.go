@@ -16,10 +16,12 @@ import (
 
 // touchResult is the JSON payload returned by `acd touch --json`.
 type touchResult struct {
-	OK         bool    `json:"ok"`
-	LastSeenTS float64 `json:"last_seen_ts"`
-	Repo       string  `json:"repo"`
-	SessionID  string  `json:"session_id"`
+	OK            bool    `json:"ok"`
+	LastSeenTS    float64 `json:"last_seen_ts"`
+	Skipped       bool    `json:"skipped,omitempty"`
+	SkippedReason string  `json:"skipped_reason,omitempty"`
+	Repo          string  `json:"repo"`
+	SessionID     string  `json:"session_id"`
 }
 
 func newTouchCmd() *cobra.Command {
@@ -54,6 +56,25 @@ func runTouch(ctx context.Context, out io.Writer, repoFlag, sessionID string, js
 	}
 	clock, err := daemon.AcquireControlLock(gitDir)
 	if err != nil {
+		if errors.Is(err, daemon.ErrControlLockHeld) {
+			// Best-effort heartbeat: another control caller is in flight and
+			// will refresh state. Skip cleanly rather than surfacing a hook
+			// error to the harness.
+			res := touchResult{
+				OK:            true,
+				Skipped:       true,
+				SkippedReason: "control_lock_held",
+				Repo:          repo,
+				SessionID:     sessionID,
+			}
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(res)
+			}
+			fmt.Fprintf(out, "acd touch: skipped (control.lock held; another control caller in flight)\n")
+			return nil
+		}
 		return fmt.Errorf("acd touch: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()

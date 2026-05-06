@@ -72,7 +72,7 @@ echo "Installed acd $VERSION to $INSTALL_DIR/acd"
 echo
 echo "Next:"
 echo "  1) Make sure $INSTALL_DIR is on your PATH"
-echo "  2) Run: acd init <claude-code|codex|opencode|pi|shell>"
+echo "  2) Run: acd setup <claude-code|codex|opencode|pi|shell>"
 echo "  3) Follow the printed snippet to wire up your harness"
 echo
 echo "Tip: set ACD_VERSION=vYYYY-MM-DD to install a specific release."

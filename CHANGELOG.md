@@ -28,6 +28,19 @@
 
 ### Changed
 
+- Renamed `acd init <harness>` to `acd setup <harness>` for clarity. `acd init` kept as hidden alias for one release with stderr deprecation warning; reserved `acd init` for future repo-state initialization.
+- Claude Code harness snippet now uses the canonical nested hook schema
+  (`hooks: [{type: "command", command: "..."}]` per event, with `matcher: ""`
+  on `PreToolUse`/`PostToolUse`). Required by the current Claude Code hooks
+  engine; the previous flat `command` shape no longer registers. Re-run
+  `acd setup claude-code` and replace the old `hooks` block in
+  `~/.claude/settings.json`.
+- `acd wake` and `acd touch` now exit cleanly when another short-lived control
+  caller already holds `control.lock`, instead of failing the harness hook.
+  JSON output adds `skipped: true` and `skipped_reason: "control_lock_held"`
+  so callers can distinguish a no-op from a real heartbeat or signal. The
+  in-flight caller does the equivalent work and the daemon reconciles on its
+  next tick.
 - AI provider docs now include setup profiles for compatibility mode,
   reviewer-friendly intent grouping, metadata-only private repos, self-hosted
   providers, explicit diff egress, and subprocess intent-planner plugins.

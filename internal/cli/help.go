@@ -29,7 +29,7 @@ Diagnostics and recovery:
   acd purge-events Delete non-published queued events
 
 Setup:
-  acd init         Print harness install snippets
+  acd setup        Print harness install snippets
   acd version      Print version and build info
 
 Advanced:
