@@ -283,6 +283,42 @@ Intent-specific observability:
   still contain source code; inspect them with `acd prompt --last` or
   `acd prompt --seq <seq>`.
 
+### One-shot path-sorted capture (`acd commit-all`)
+
+`acd commit-all` uses the same capture pipeline as the live daemon but passes
+`SortByPath: true` to the capture options. This causes captured events to be
+ordered lexicographically by file path before they are inserted into the replay
+queue. The live daemon does not use this option; it relies on fsnotify and poll
+timestamps instead.
+
+Path sorting matters because `commit-all` runs against a repo that may have
+accumulated many changes while the daemon was off and has no reliable mtime
+ordering. By emitting events in path order, sibling files in the same directory
+cluster together in the commit sequence — for example, all `pkg/a/*.go` files
+land in adjacent commits. With `ACD_COMMIT_STRATEGY=intent`, the intent planner
+receives coherent windows of related siblings, which improves grouping quality
+even without historical timing information.
+
+Sort order interacts with the pending-depth cap (`ACD_MAX_PENDING_EVENTS`).
+`SortByPath` reorders ops BEFORE the cap is applied, so events that overflow
+the cap mid-pass are the lex-largest paths, not the most recently edited.
+`acd commit-all` sets `DisablePendingCap: true` for its single capture call,
+so the cap does not affect commit-all in practice; the daemon run loop
+leaves `SortByPath` false and relies on the live walk's iteration order.
+
+**Reseed before capture.** Unlike the live daemon, `commit-all` calls
+`ReseedShadowFromHead` before capture rather than the idempotent
+`BootstrapShadow`. The reseed deletes any existing shadow rows for the
+active `(branch_ref, branch_generation)`, removes the bootstrap completion
+marker, and re-bootstraps from `HEAD`'s tree. It also drops any stale
+`pending` capture events for that branch+generation via
+`state.DeletePendingForBranchGeneration`. This guarantees the diff vs HEAD
+is what `commit-all` ends up committing, even when an earlier daemon
+session absorbed worktree edits into shadow without successfully replaying
+them. Without the reseed, the bootstrap marker is honored, the poisoned
+shadow already mirrors live state, and Capture sees zero diff — the user
+would observe "0 pending, no commits" while the worktree was still dirty.
+
 ---
 
 ## `blocked_conflict`: terminal state, operator action required

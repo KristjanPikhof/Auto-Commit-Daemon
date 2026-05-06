@@ -45,6 +45,13 @@ For a detailed walkthrough of the storage model, replay index semantics,
 branch-generation safety, and conflict resolution, see
 [capture-replay.md](capture-replay.md).
 
+For one-shot cleanup of a dirty worktree after the daemon was off, use
+`acd commit-all`. It captures all uncommitted files, sorts them by path for
+coherent sibling clustering, replays them using the configured commit strategy,
+and exits without starting the persistent daemon. See the
+[cold start commit cleanup](user-workflows.md#cold-start-commit-cleanup)
+workflow for usage details and flag reference.
+
 For day-to-day troubleshooting with `acd status`, `acd events`,
 `acd explain`, `acd fix`, `acd diagnose`, and `acd doctor --bundle`, see
 [user-workflows.md](user-workflows.md).

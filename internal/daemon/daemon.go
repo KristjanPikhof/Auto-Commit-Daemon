@@ -1736,6 +1736,14 @@ func resolveBranch(ctx context.Context, repoDir string, logger *slog.Logger) (st
 	return branch, head
 }
 
+// GitOperationInProgress is the exported wrapper around gitOperationInProgress
+// used by CLI helpers that need to refuse running while a git operation is
+// active in <gitDir>. Returns the human-readable marker name (e.g. "merge",
+// "rebase-merge") and true when a marker is present.
+func GitOperationInProgress(gitDir string) (string, bool) {
+	return gitOperationInProgress(gitDir)
+}
+
 func gitOperationInProgress(gitDir string) (string, bool) {
 	for _, marker := range []struct {
 		path string

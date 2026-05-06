@@ -545,6 +545,31 @@ func DeletePendingForGeneration(ctx context.Context, d *DB, branchGeneration int
 	return int(n), nil
 }
 
+// DeletePendingForBranchGeneration is the branch-scoped variant of
+// DeletePendingForGeneration: it deletes queued, unpublished events restricted
+// to (branch_ref, branch_generation). Used by `acd commit-all` to clear stale
+// pending rows for the active branch before forcing a shadow reseed; the broad
+// generation-only variant would also nuke rows on co-existing refs that happen
+// to share the generation number. Terminal rows (`published`, `failed`,
+// `blocked_conflict`) are never touched — operators inspect those.
+func DeletePendingForBranchGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: DeletePendingForBranchGeneration: empty branch_ref")
+	}
+	res, err := d.conn.ExecContext(ctx,
+		`DELETE FROM capture_events WHERE state = ? AND branch_ref = ? AND branch_generation = ?`,
+		EventStatePending, branchRef, branchGeneration,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete pending branch %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: delete pending branch generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // DeleteStaleUnpublishedForBranchGeneration deletes queued/unpublished rows for
 // the active branch generation whose base_head no longer matches the current
 // branch head. This is used after an external same-branch fast-forward: the

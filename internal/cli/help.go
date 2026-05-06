@@ -18,6 +18,7 @@ Common workflow:
   acd logs --lines 200              Tail the current repo daemon log as raw JSONL
   acd logs --follow                 Stream appended raw JSONL daemon log lines
   acd wake                          Refresh heartbeat and nudge replay
+  acd commit-all                    One-shot: commit every uncommitted file (daemon must be off)
   acd stop                          Stop the repo daemon or deregister a session
 
 Diagnostics and recovery:

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -72,6 +74,47 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 	}
 }
 
+// ResolveEffectiveCommitStrategy returns the commit strategy currently in
+// effect for a repo. When conn is nil, the result reflects only env
+// (ACD_COMMIT_STRATEGY) and the canonical default. When daemon_meta
+// carries a *recognized* commit.strategy value, that overlay wins;
+// unrecognized values are loud (slog.Warn) and the env-derived value is
+// used so corrupt meta cannot silently override the operator's intent.
+func ResolveEffectiveCommitStrategy(ctx context.Context, conn *sql.DB) (ai.CommitStrategy, error) {
+	cfg := ai.LoadProviderConfigFromEnv()
+	strategy := cfg.CommitStrategy
+	if conn == nil {
+		return strategy, nil
+	}
+	raw, ok, err := metaLookup(ctx, conn, "commit.strategy")
+	if err != nil {
+		return strategy, fmt.Errorf("commit.strategy: %w", err)
+	}
+	if !ok {
+		return strategy, nil
+	}
+	trimmed := strings.TrimSpace(strings.ToLower(raw))
+	switch trimmed {
+	case "":
+		return strategy, nil
+	case string(ai.CommitStrategyEvent):
+		return ai.CommitStrategyEvent, nil
+	case string(ai.CommitStrategyIntent):
+		return ai.CommitStrategyIntent, nil
+	default:
+		// Daemon meta carries a value but it is not one of the known
+		// commit strategies. Silently demoting to the env-derived
+		// value would hide daemon misconfiguration; log a warning and
+		// preserve the existing fallback so callers don't crash.
+		slog.Default().Warn(
+			"daemon meta commit.strategy has unrecognized value; falling back to env-derived strategy",
+			slog.String("commit.strategy", raw),
+			slog.String("fallback", string(strategy)),
+		)
+		return strategy, nil
+	}
+}
+
 func intentStrategyFromEnv() intentStrategyReport {
 	cfg := ai.LoadProviderConfigFromEnv()
 	return intentStrategyReport{
@@ -92,12 +135,12 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	if conn == nil {
 		return report, nil
 	}
-	if strategy, ok, err := metaLookup(ctx, conn, "commit.strategy"); err != nil {
-		return report, fmt.Errorf("commit.strategy: %w", err)
-	} else if ok && strategy != "" {
-		report.Strategy = strategy
-		report.Active = strategy == string(ai.CommitStrategyIntent)
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, conn)
+	if err != nil {
+		return report, err
 	}
+	report.Strategy = string(strategy)
+	report.Active = strategy == ai.CommitStrategyIntent
 	if v, ok, err := metaLookup(ctx, conn, "intent.window"); err != nil {
 		return report, fmt.Errorf("intent.window: %w", err)
 	} else if ok {

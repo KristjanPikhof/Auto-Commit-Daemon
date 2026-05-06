@@ -129,6 +129,13 @@ Look for:
 `status` and `diagnose --json` show deferred counts, forced-aging readiness, and
 the latest planner error.
 
+The `intent_strategy.strategy` field reflects the *effective* commit strategy:
+ACD reads `commit.strategy` from daemon meta first, then falls back to the
+`ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
+values do not leak into the report — they emit a slog warning and the
+env-derived strategy is shown instead. `commit-all` uses the same resolution
+so a one-shot run matches what the live daemon would do.
+
 If commits are waiting before any planner request appears, check the batch wait
 state:
 
@@ -387,6 +394,114 @@ artifact for issue reports.
 | `superseded_external` | External history made the queued work obsolete. |
 | `blocked` | Replay stopped because applying the event was not provably safe. |
 | `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
+
+## Cold start commit cleanup
+
+Use `acd commit-all` when the daemon was off for a while and your worktree
+contains many uncommitted files. It performs a one-shot capture and replay cycle
+without starting the persistent daemon, then exits.
+
+Typical situations where `commit-all` helps:
+
+- You opened a repo, made edits, and forgot to start ACD first.
+- You paused ACD during a large merge and now have a dirty worktree.
+- You want to bring a brand-new clone into a committed baseline before enabling
+  the live daemon.
+
+`commit-all` reads the active commit strategy from existing config — daemon meta
+first, then the `ACD_COMMIT_STRATEGY` env, then the canonical default. There is
+no `--strategy` override flag; the one-shot run matches exactly what the daemon
+would do on its own.
+
+**Reseed before capture.** `commit-all` always force-reseeds `shadow_paths`
+from `HEAD`'s tree before it captures, and drops any stale `pending`
+capture events for the active `(branch_ref, branch_generation)` pair. This
+guarantees the diff that drives commit decisions is "live worktree vs
+HEAD", not "live worktree vs whatever shadow happens to remain from an
+earlier daemon session". Without the reseed, a daemon that captured edits
+into shadow but failed to replay them would leave a poisoned shadow
+mirroring live state — the next `commit-all` would see zero diff and
+report `Commits: 0` while the worktree was still dirty. The JSON output
+includes a `dropped_stale_pending` count and a `shadow reseeded from
+HEAD` note for visibility.
+
+**Ordering.** Because ACD has no historical modification times, files are sorted
+lexicographically by path. Sibling files in the same directory cluster together
+in the commit history, so directories like `pkg/a/*.go` land adjacent.
+With `ACD_COMMIT_STRATEGY=intent`, the planner receives coherent windows of
+path-sorted siblings, which improves grouping quality even without mtime
+ordering.
+
+**Confirmation flow.** Without `--yes`, `commit-all` prints a summary and asks
+before writing any commit:
+
+~~~
+Repo: /path/to/repo (refs/heads/main @ abc123456789)
+Pending events: 42
+Strategy: event (provider deterministic)
+Estimated passes: 42
+Proceed? [y/N]:
+~~~
+
+With `intent` strategy the summary also shows intent window and defer limit:
+
+~~~
+Repo: /path/to/repo (refs/heads/main @ abc123456789)
+Pending events: 12
+Strategy: intent (provider openai-compat)
+Intent window: 10, defer limit: 2
+Estimated passes: 2
+Proceed? [y/N]:
+~~~
+
+**Flags.**
+
+~~~bash
+acd commit-all --dry-run          # plan and show summary; no commits written
+acd commit-all --yes              # skip the interactive confirmation prompt
+acd commit-all --yes --json       # machine-readable JSON output (requires --yes)
+acd commit-all --repo /path/to/repo --yes
+~~~
+
+`--dry-run` shows the pending count and estimated passes without writing
+anything. With `ACD_COMMIT_STRATEGY=intent`, it also calls the planner and
+prints how many captures would be selected or deferred in the first window.
+
+**Refusal cases.** `commit-all` refuses to run when:
+
+- `HEAD` is detached — check out a branch first.
+- A git operation is in progress: rebase, merge, cherry-pick, or bisect.
+- A manual pause marker is present — run `acd resume --yes` first.
+- The per-repo daemon is already running — stop it first with `acd stop`.
+
+**Intent strategy and deferred files.** When `ACD_COMMIT_STRATEGY=intent`, the
+planner sees at most `ACD_INTENT_WINDOW` files per pass. Files that are deferred
+`ACD_INTENT_DEFER_LIMIT` times are forced into a one-item commit so they cannot
+starve. For a large dirty worktree, estimated passes equals
+`ceil(pending / ACD_INTENT_WINDOW)`, and each pass makes real calls to the
+configured AI provider.
+
+**Non-interactive use.**
+
+~~~bash
+acd commit-all --yes --json | jq '.commits'
+~~~
+
+`--json` requires `--yes` because no interactive prompt is available. The JSON
+payload includes `ok`, `repo`, `branch_ref`, `head_before`, `head_after`,
+`strategy`, `provider`, `intent_window`, `intent_defer_limit`,
+`pending_before`, `pending_after`, `estimated_passes`, `commits`, `drained`,
+`confirmed`, `duration_ms`, and `notes`. When the pre-capture reseed drops
+stale pending rows, the payload also carries `dropped_stale_pending` and a
+`shadow reseeded from HEAD; N stale pending events dropped` entry in
+`notes`.
+
+After `commit-all` finishes, start the live daemon normally:
+
+~~~bash
+acd start
+acd status
+~~~
 
 ## See also
 

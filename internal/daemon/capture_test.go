@@ -1390,3 +1390,261 @@ func TestCapture_NTPStepBackwardDoesNotSilenceWarn(t *testing.T) {
 		t.Fatal("interval throttling broken after clamp")
 	}
 }
+
+// TestCapture_SortByPathOrdersSeqLexicographically confirms that with
+// SortByPath=true, the capture_events.seq order matches Path ascending —
+// even when Classify groups ops by category (renames, live-order
+// create/modify/mode, then deletes) and would otherwise yield a non-lex
+// order across categories. The setup mixes one delete (early-letter path)
+// with one create (late-letter path); without sort the create appears
+// first because Classify walks live paths before plain deletes.
+func TestCapture_SortByPathOrdersSeqLexicographically(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Seed shadow with aaa.txt so the next pass can produce a delete for it.
+	if err := os.WriteFile(filepath.Join(f.dir, "aaa.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write aaa.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	// Mutate: delete aaa.txt, create zzz.txt. Classify emits creates before
+	// deletes within its own category passes, so unsorted order is
+	// [zzz create, aaa delete].
+	if err := os.Remove(filepath.Join(f.dir, "aaa.txt")); err != nil {
+		t.Fatalf("remove aaa.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "zzz.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write zzz.txt: %v", err)
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		SortByPath:       true,
+	}); err != nil {
+		t.Fatalf("Capture SortByPath=true: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 2 {
+		t.Fatalf("expected 2 ops in second pass, got %d (%+v)", len(pass), pass)
+	}
+	// With SortByPath=true, lexicographic Path order: aaa.txt before zzz.txt.
+	if pass[0].Path != "aaa.txt" || pass[0].Op != "delete" {
+		t.Fatalf("op[0] = %+v, want {delete aaa.txt}", pass[0])
+	}
+	if pass[1].Path != "zzz.txt" || pass[1].Op != "create" {
+		t.Fatalf("op[1] = %+v, want {create zzz.txt}", pass[1])
+	}
+	// Defensive: the slice is non-decreasing by Path.
+	for i := 1; i < len(pass); i++ {
+		if pass[i-1].Path > pass[i].Path {
+			t.Fatalf("seq order not lexicographic: %+v", pass)
+		}
+	}
+}
+
+// TestCapture_SortByPathDefaultPreservesClassifyOrder confirms that with
+// SortByPath=false (the daemon run-loop default) the seq order matches
+// Classify's native ordering: live-order create/modify/mode first, then
+// plain deletes. Same fixture as the sorted variant, so the only
+// difference between the two tests is the SortByPath flag.
+func TestCapture_SortByPathDefaultPreservesClassifyOrder(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "aaa.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write aaa.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	if err := os.Remove(filepath.Join(f.dir, "aaa.txt")); err != nil {
+		t.Fatalf("remove aaa.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "zzz.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatalf("write zzz.txt: %v", err)
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		// SortByPath omitted — defaults to false.
+	}); err != nil {
+		t.Fatalf("Capture default: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 2 {
+		t.Fatalf("expected 2 ops in second pass, got %d (%+v)", len(pass), pass)
+	}
+	// Classify order: creates from the live walk pass come BEFORE plain
+	// deletes from the third pass, so seq is [zzz create, aaa delete].
+	if pass[0].Path != "zzz.txt" || pass[0].Op != "create" {
+		t.Fatalf("op[0] = %+v, want {create zzz.txt}; SortByPath=false must preserve Classify order", pass[0])
+	}
+	if pass[1].Path != "aaa.txt" || pass[1].Op != "delete" {
+		t.Fatalf("op[1] = %+v, want {delete aaa.txt}; SortByPath=false must preserve Classify order", pass[1])
+	}
+}
+
+// TestCapture_SortByPathShuffledMultiDirOrdering confirms SortByPath=true
+// produces strict lexicographic seq order even when the live tree spans
+// multiple sibling-cluster directories whose walk order would otherwise
+// interleave with Classify's create/delete category passes. The fixture
+// touches 6+ paths across 3 directories, mixing creates and a delete so
+// Classify's natural order is provably non-lex.
+func TestCapture_SortByPathShuffledMultiDirOrdering(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Seed shadow with one file we'll later delete (a/zzz.txt) so the
+	// second pass yields a delete in directory "a/" alongside creates
+	// in "b/" and "c/".
+	if err := os.MkdirAll(filepath.Join(f.dir, "a"), 0o755); err != nil {
+		t.Fatalf("mkdir a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "a", "zzz.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write a/zzz.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	// Mutate: delete a/zzz.txt and create a shuffled set of files spanning
+	// 3 directories. We deliberately interleave directories and use names
+	// whose lex order differs from creation order.
+	if err := os.Remove(filepath.Join(f.dir, "a", "zzz.txt")); err != nil {
+		t.Fatalf("remove a/zzz.txt: %v", err)
+	}
+	for _, dir := range []string{"b", "c"} {
+		if err := os.MkdirAll(filepath.Join(f.dir, dir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	// Creation order is intentionally NOT lex order:
+	// c/2.txt, a/1.txt, b/3.txt, c/1.txt, a/2.txt, b/1.txt
+	creates := []string{
+		"c/2.txt",
+		"a/1.txt",
+		"b/3.txt",
+		"c/1.txt",
+		"a/2.txt",
+		"b/1.txt",
+	}
+	for _, p := range creates {
+		if err := os.WriteFile(filepath.Join(f.dir, p), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		SortByPath:       true,
+	}); err != nil {
+		t.Fatalf("Capture SortByPath=true: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 7 {
+		t.Fatalf("expected 7 ops in second pass (1 delete + 6 creates), got %d (%+v)", len(pass), pass)
+	}
+
+	// Strict lex order over all 7 paths. With SortByPath=true the delete
+	// for a/zzz.txt should land AFTER a/2.txt but BEFORE b/* despite
+	// Classify normally putting plain deletes after live-pass creates.
+	want := []string{
+		"a/1.txt",
+		"a/2.txt",
+		"a/zzz.txt",
+		"b/1.txt",
+		"b/3.txt",
+		"c/1.txt",
+		"c/2.txt",
+	}
+	for i, w := range want {
+		if pass[i].Path != w {
+			t.Fatalf("seq[%d].Path = %q, want %q (full pass: %+v)", i, pass[i].Path, w, pass)
+		}
+	}
+	for i := 1; i < len(pass); i++ {
+		if pass[i-1].Path > pass[i].Path {
+			t.Fatalf("seq order not strictly lexicographic at i=%d: %+v", i, pass)
+		}
+	}
+
+	// And the delete must still classify as a delete, not as a phantom
+	// create — sort must not mutate Op.
+	for _, op := range pass {
+		if op.Path == "a/zzz.txt" && op.Op != "delete" {
+			t.Fatalf("a/zzz.txt op = %q, want delete", op.Op)
+		}
+	}
+}
+
+// TestCapture_DisablePendingCapOptOverride confirms that
+// CaptureOpts.DisablePendingCap=true skips the pending-depth cap for that
+// call only, even when EnvMaxPendingEvents would otherwise constrain it.
+// This is the typed plumb that `acd commit-all` uses in place of the
+// removed os.Setenv mutation; the daemon run loop leaves the field false
+// so the documented invariant still holds for production.
+func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "5")
+	resetPendingCapWarnForTest(t, 1)
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:     f.ig,
+		SensitiveMatcher:  f.matcher,
+		SortByPath:        true,
+		DisablePendingCap: true,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsDropped != 0 {
+		t.Fatalf("EventsDropped=%d with DisablePendingCap=true; want 0; summary=%+v", sum.EventsDropped, sum)
+	}
+	if sum.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=true with DisablePendingCap=true; want false; summary=%+v", sum)
+	}
+	if sum.EventsAppended < 12 {
+		t.Fatalf("EventsAppended=%d, want >=12 with DisablePendingCap=true; summary=%+v", sum.EventsAppended, sum)
+	}
+}
+
+// TestCapture_MaxPendingEventsOverrideTakesPrecedence confirms that a
+// strictly-positive MaxPendingEventsOverride overrides the env value but
+// still enforces a cap (unlike DisablePendingCap which removes it).
+func TestCapture_MaxPendingEventsOverrideTakesPrecedence(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "5")
+	resetPendingCapWarnForTest(t, 1)
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:            f.ig,
+		SensitiveMatcher:         f.matcher,
+		SortByPath:               true,
+		MaxPendingEventsOverride: 8,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsAppended != 8 {
+		t.Fatalf("EventsAppended=%d with override=8; want 8; summary=%+v", sum.EventsAppended, sum)
+	}
+}
