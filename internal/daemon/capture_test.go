@@ -1489,3 +1489,97 @@ func TestCapture_SortByPathDefaultPreservesClassifyOrder(t *testing.T) {
 		t.Fatalf("op[1] = %+v, want {delete aaa.txt}; SortByPath=false must preserve Classify order", pass[1])
 	}
 }
+
+// TestCapture_SortByPathShuffledMultiDirOrdering confirms SortByPath=true
+// produces strict lexicographic seq order even when the live tree spans
+// multiple sibling-cluster directories whose walk order would otherwise
+// interleave with Classify's create/delete category passes. The fixture
+// touches 6+ paths across 3 directories, mixing creates and a delete so
+// Classify's natural order is provably non-lex.
+func TestCapture_SortByPathShuffledMultiDirOrdering(t *testing.T) {
+	f := newCaptureFixture(t)
+
+	// Seed shadow with one file we'll later delete (a/zzz.txt) so the
+	// second pass yields a delete in directory "a/" alongside creates
+	// in "b/" and "c/".
+	if err := os.MkdirAll(filepath.Join(f.dir, "a"), 0o755); err != nil {
+		t.Fatalf("mkdir a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "a", "zzz.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatalf("write a/zzz.txt: %v", err)
+	}
+	f.firstCapture(t)
+	firstCount := len(pendingOps(t, f.db))
+
+	// Mutate: delete a/zzz.txt and create a shuffled set of files spanning
+	// 3 directories. We deliberately interleave directories and use names
+	// whose lex order differs from creation order.
+	if err := os.Remove(filepath.Join(f.dir, "a", "zzz.txt")); err != nil {
+		t.Fatalf("remove a/zzz.txt: %v", err)
+	}
+	for _, dir := range []string{"b", "c"} {
+		if err := os.MkdirAll(filepath.Join(f.dir, dir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	// Creation order is intentionally NOT lex order:
+	// c/2.txt, a/1.txt, b/3.txt, c/1.txt, a/2.txt, b/1.txt
+	creates := []string{
+		"c/2.txt",
+		"a/1.txt",
+		"b/3.txt",
+		"c/1.txt",
+		"a/2.txt",
+		"b/1.txt",
+	}
+	for _, p := range creates {
+		if err := os.WriteFile(filepath.Join(f.dir, p), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	if _, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		SortByPath:       true,
+	}); err != nil {
+		t.Fatalf("Capture SortByPath=true: %v", err)
+	}
+
+	all := pendingOps(t, f.db)
+	pass := all[firstCount:]
+	if len(pass) != 7 {
+		t.Fatalf("expected 7 ops in second pass (1 delete + 6 creates), got %d (%+v)", len(pass), pass)
+	}
+
+	// Strict lex order over all 7 paths. With SortByPath=true the delete
+	// for a/zzz.txt should land AFTER a/2.txt but BEFORE b/* despite
+	// Classify normally putting plain deletes after live-pass creates.
+	want := []string{
+		"a/1.txt",
+		"a/2.txt",
+		"a/zzz.txt",
+		"b/1.txt",
+		"b/3.txt",
+		"c/1.txt",
+		"c/2.txt",
+	}
+	for i, w := range want {
+		if pass[i].Path != w {
+			t.Fatalf("seq[%d].Path = %q, want %q (full pass: %+v)", i, pass[i].Path, w, pass)
+		}
+	}
+	for i := 1; i < len(pass); i++ {
+		if pass[i-1].Path > pass[i].Path {
+			t.Fatalf("seq order not strictly lexicographic at i=%d: %+v", i, pass)
+		}
+	}
+
+	// And the delete must still classify as a delete, not as a phantom
+	// create — sort must not mutate Op.
+	for _, op := range pass {
+		if op.Path == "a/zzz.txt" && op.Op != "delete" {
+			t.Fatalf("a/zzz.txt op = %q, want delete", op.Op)
+		}
+	}
+}
