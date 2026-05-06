@@ -535,7 +535,7 @@ func renderCommitAll(out io.Writer, res commitAllResult, jsonOut bool) error {
 	fmt.Fprintf(out, "Strategy: %s (provider %s)\n", res.Strategy, valueOrUnset(res.Provider))
 	fmt.Fprintf(out, "Pending: before=%d after=%d\n", res.PendingBefore, res.PendingAfter)
 	if !res.DryRun {
-		fmt.Fprintf(out, "Commits: %d (singletons=%d grouped=%d)\n", res.Commits, res.Singletons, res.Grouped)
+		fmt.Fprintf(out, "Commits: %d (drained=%d)\n", res.Commits, res.Drained)
 		if res.Conflicts > 0 || res.Failed > 0 {
 			fmt.Fprintf(out, "Issues: conflicts=%d failed=%d (use `acd diagnose` to inspect)\n", res.Conflicts, res.Failed)
 		}
