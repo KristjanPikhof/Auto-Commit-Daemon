@@ -541,3 +541,285 @@ func (e *errOnReadReader) Read(p []byte) (int, error) {
 
 // errStdinUnexpected is a sentinel returned by errOnReadReader.
 var errStdinUnexpected = errors.New("stdin must not be read on this path")
+
+// TestCommitAll_RefusesOrphanBranch covers P1-2: an empty repo with a
+// branch ref pointing to no commits (orphan branch) used to silently
+// produce empty BaseHead and crash deep in replay. We now refuse with a
+// clear message before doing any state work.
+func TestCommitAll_RefusesOrphanBranch(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref: %v", err)
+	}
+	registerRepo(t, roots, repo, stateDB, "test")
+	// Drop a dirty file so the orphan refusal triggers in the rev-parse
+	// stage (NOT the clean-worktree no-op short-circuit).
+	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty: %v", err)
+	}
+
+	var out bytes.Buffer
+	err := runCommitAll(ctx, &out, nil, repo, true, false, true)
+	if err == nil {
+		t.Fatalf("expected refusal on orphan branch, got nil")
+	}
+	if !strings.Contains(err.Error(), "no commits on branch yet") {
+		t.Fatalf("expected orphan refusal message, got: %v", err)
+	}
+}
+
+// TestCommitAll_UserDeclineExitsNonZero covers P1-3: when the interactive
+// prompt receives "no" the renderer must still emit a payload, but the
+// caller must observe a non-nil sentinel error so cobra exits non-zero.
+func TestCommitAll_UserDeclineExitsNonZero(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty: %v", err)
+	}
+
+	var out bytes.Buffer
+	in := strings.NewReader("n\n")
+	err := runCommitAll(ctx, &out, in, repo, false, false, false)
+	if err == nil {
+		t.Fatalf("expected non-nil error on user decline; got nil")
+	}
+	if !errors.Is(err, errCommitAllAborted) {
+		t.Fatalf("expected errCommitAllAborted sentinel, got: %v", err)
+	}
+	// The renderer must still have written a "aborted by user" line so
+	// the user sees what happened on stdout.
+	if !strings.Contains(out.String(), "aborted by user") {
+		t.Fatalf("decline output missing aborted note: %q", out.String())
+	}
+}
+
+// fakePlannerProvider is an ai.Provider + IntentPlanner whose calls are
+// recorded so the dry-run-airgap test can assert PlanIntent is NEVER
+// invoked when the provider is network-bound.
+type fakePlannerProvider struct {
+	name        string
+	needsDiff   bool
+	planCalls   int
+	genCalls    int
+	planSubject string
+}
+
+func (p *fakePlannerProvider) Name() string    { return p.name }
+func (p *fakePlannerProvider) NeedsDiff() bool { return p.needsDiff }
+func (p *fakePlannerProvider) Generate(ctx context.Context, cc ai.CommitContext) (ai.Result, error) {
+	p.genCalls++
+	return ai.Result{Subject: "fake: " + cc.Path}, nil
+}
+func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlanResult, error) {
+	p.planCalls++
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, c := range req.OfferedCaptures {
+		seqs = append(seqs, c.Seq)
+	}
+	return ai.IntentPlanResult{SelectedSeqs: seqs, Subject: p.planSubject}, nil
+}
+
+// TestPreviewIntentDryRun_SkipsNetworkPlanner covers P1-5: dry-run must
+// never fan out a planner request to a network-bound provider.
+func TestPreviewIntentDryRun_SkipsNetworkPlanner(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("write dirty: %v", err)
+	}
+	gitDir := filepath.Join(repo, ".git")
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
+	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	checker := git.NewIgnoreChecker(repo)
+	defer func() { _ = checker.Close() }()
+	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
+		IgnoreChecker:    checker,
+		SensitiveMatcher: state.NewSensitiveMatcher(),
+		GitDir:           gitDir,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	cfg := ai.LoadProviderConfigFromEnv()
+	cfg.Mode = "openai-compat" // pretend a network provider was wired up
+	provider := &fakePlannerProvider{name: "fake-network", needsDiff: true}
+	res := commitAllResult{PendingBefore: 1, Strategy: string(ai.CommitStrategyIntent)}
+	previewIntentDryRun(ctx, repo, db, cctx, ai.CommitStrategyIntent, cfg, provider, &res)
+	if provider.planCalls != 0 {
+		t.Fatalf("network provider PlanIntent called %d times during dry-run; want 0", provider.planCalls)
+	}
+	// The note must explain why the planner peek was skipped.
+	found := false
+	for _, n := range res.Notes {
+		if strings.Contains(n, "planner peek skipped") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected 'planner peek skipped' note; got: %+v", res.Notes)
+	}
+}
+
+// fakeProviderForReplay implements ai.Provider with NeedsDiff=false so
+// commitAllReplayLoopWith builds a real msgFn but no diff egress.
+// Generate counts how many times it is called from the per-event
+// MessageFn — proving the provider closure is wired up rather than
+// hard-coded to DeterministicMessage.
+type fakeProviderForReplay struct {
+	name      string
+	genCalls  int
+	subject   string
+	needsDiff bool
+}
+
+func (p *fakeProviderForReplay) Name() string    { return p.name }
+func (p *fakeProviderForReplay) NeedsDiff() bool { return p.needsDiff }
+func (p *fakeProviderForReplay) Generate(ctx context.Context, cc ai.CommitContext) (ai.Result, error) {
+	p.genCalls++
+	subj := p.subject
+	if subj == "" {
+		subj = "fake: " + cc.Path
+	}
+	return ai.Result{Subject: subj}, nil
+}
+
+// TestCommitAllReplayLoop_UsesProviderMessageFn covers P1-1: the loop
+// must build a provider-driven MessageFn (via daemon.ProviderMessageFn)
+// instead of hard-coding daemon.DeterministicMessage. We inject a fake
+// replayer that drives a single event through the real msgFn so the
+// fake provider records a Generate call.
+func TestCommitAllReplayLoop_UsesProviderMessageFn(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProviderForReplay{name: "fake-replay"}
+
+	// Stub Replay: invoke the supplied MessageFn once with a synthetic
+	// EventContext so Generate is observed, then return a summary that
+	// terminates the loop (Published=1, no pending left).
+	replayCalls := 0
+	stub := func(ctx context.Context, repo string, db *state.DB, cctx daemon.CaptureContext, opts daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		replayCalls++
+		if opts.MessageFn != nil {
+			ec := daemon.EventContext{
+				Event: state.CaptureEvent{
+					Seq:       1,
+					BranchRef: cctx.BranchRef,
+					Path:      "fake/path.txt",
+					Operation: "create",
+				},
+				Ops: []state.CaptureOp{{Op: "create", Path: "fake/path.txt"}},
+			}
+			if _, err := opts.MessageFn(ctx, ec); err != nil {
+				return daemon.ReplaySummary{}, err
+			}
+		}
+		// Terminate the loop after one pass.
+		return daemon.ReplaySummary{Published: 1}, nil
+	}
+
+	// Use a real but minimal repo so git.RevParse(HEAD) between passes
+	// can resolve. We rely on the fixture's seed commit; PendingEvents
+	// will return zero rows and the loop exits after one pass.
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db
+	cctx := daemon.CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "0000000000000000000000000000000000000000",
+	}
+	cfg := ai.LoadProviderConfigFromEnv()
+	commits, drained, conflicts, failed, after, err := commitAllReplayLoopWith(
+		ctx, repo, filepath.Join(repo, ".git"), db, cctx,
+		ai.CommitStrategyEvent, cfg, provider, 1, stub, nil)
+	if err != nil {
+		t.Fatalf("commitAllReplayLoopWith: %v", err)
+	}
+	if provider.genCalls < 1 {
+		t.Fatalf("provider Generate not called; want >=1 (msgFn must wire through provider). genCalls=%d", provider.genCalls)
+	}
+	if commits != 1 {
+		t.Fatalf("commits=%d, want 1", commits)
+	}
+	_ = drained
+	_ = conflicts
+	_ = failed
+	_ = after
+	_ = replayCalls
+}
+
+// TestCommitAllReplayLoop_ZeroProgressEscape covers P2-6: when Replay
+// reports Published=0 with pending still present, the loop must exit
+// after exactly commitAllZeroProgressLimit (3) consecutive zero-progress
+// passes and emit a clear note explaining the escape.
+func TestCommitAllReplayLoop_ZeroProgressEscape(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeProviderForReplay{name: "fake-zero"}
+
+	// Force PendingEvents to keep returning >0 rows. The simplest way
+	// without touching the schema is to seed one pending capture_events
+	// row in the fixture DB and let the stub keep Published at 0.
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "deadbeef",
+		Operation:        "create",
+		Path:             "stuck.txt",
+		Fidelity:         "full",
+	}, []state.CaptureOp{{Op: "create", Path: "stuck.txt", Fidelity: "full"}}); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+
+	passCount := 0
+	stub := func(ctx context.Context, repo string, db *state.DB, cctx daemon.CaptureContext, opts daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		passCount++
+		return daemon.ReplaySummary{Published: 0}, nil
+	}
+
+	cctx := daemon.CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "deadbeef",
+	}
+	cfg := ai.LoadProviderConfigFromEnv()
+	var notes []string
+	commits, _, _, _, after, err := commitAllReplayLoopWith(
+		ctx, repo, filepath.Join(repo, ".git"), db, cctx,
+		ai.CommitStrategyEvent, cfg, provider, 1, stub, &notes)
+	if err != nil {
+		t.Fatalf("commitAllReplayLoopWith: %v", err)
+	}
+	if passCount != commitAllZeroProgressLimit {
+		t.Fatalf("passCount=%d, want exactly %d zero-progress passes", passCount, commitAllZeroProgressLimit)
+	}
+	if commits != 0 {
+		t.Fatalf("commits=%d, want 0 on zero-progress escape", commits)
+	}
+	if after < 1 {
+		t.Fatalf("after=%d, want >=1 pending row remaining", after)
+	}
+	gotNote := false
+	for _, n := range notes {
+		if strings.Contains(n, "made no progress") && strings.Contains(n, "stopping") {
+			gotNote = true
+			break
+		}
+	}
+	if !gotNote {
+		t.Fatalf("expected zero-progress escape note, got: %+v", notes)
+	}
+}
