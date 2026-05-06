@@ -491,4 +491,3 @@ func shortenSHA(s string) string {
 	}
 	return s
 }
-
