@@ -406,6 +406,18 @@ first, then the `ACD_COMMIT_STRATEGY` env, then the canonical default. There is
 no `--strategy` override flag; the one-shot run matches exactly what the daemon
 would do on its own.
 
+**Reseed before capture.** `commit-all` always force-reseeds `shadow_paths`
+from `HEAD`'s tree before it captures, and drops any stale `pending`
+capture events for the active `(branch_ref, branch_generation)` pair. This
+guarantees the diff that drives commit decisions is "live worktree vs
+HEAD", not "live worktree vs whatever shadow happens to remain from an
+earlier daemon session". Without the reseed, a daemon that captured edits
+into shadow but failed to replay them would leave a poisoned shadow
+mirroring live state — the next `commit-all` would see zero diff and
+report `Commits: 0` while the worktree was still dirty. The JSON output
+includes a `dropped_stale_pending` count and a `shadow reseeded from
+HEAD` note for visibility.
+
 **Ordering.** Because ACD has no historical modification times, files are sorted
 lexicographically by path. Sibling files in the same directory cluster together
 in the commit history, so directories like `pkg/a/*.go` land adjacent.
