@@ -168,8 +168,30 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		BaseHead:         head,
 	}
 
-	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
-		return fmt.Errorf("acd commit-all: bootstrap shadow: %w", err)
+	// commit-all is the "cold start, dirty repo, daemon was off" entrypoint.
+	// Users expect the captured events to reflect a diff of live worktree
+	// vs HEAD, not a diff vs whatever stale shadow happens to remain from a
+	// previous (potentially failed) daemon session. BootstrapShadow is
+	// idempotent on the (branch_ref, branch_generation) marker — if a prior
+	// capture pass absorbed those edits into shadow without successful
+	// replay, the marker is still present and BootstrapShadow returns 0,
+	// leaving the next Capture to compare live worktree against a shadow
+	// that already mirrors live state and emit zero events. Force a reseed
+	// so the diff is always vs HEAD's tree.
+	if _, err := daemon.ReseedShadowFromHead(ctx, repo, db, cctx); err != nil {
+		return fmt.Errorf("acd commit-all: reseed shadow from HEAD: %w", err)
+	}
+	// Stale pending rows from earlier daemon runs reference an outdated
+	// baseline. Per the replay model, blocked_conflict and failed are
+	// terminal seq barriers and PendingEvents hides later pending rows
+	// behind prior terminal rows for the same (branch_ref, generation). If
+	// these stale pending rows replay first as blocked/failed, they will
+	// stop our newly captured events from making progress. Drop them up
+	// front, scoped to the active branch+generation (not generation-only,
+	// which would also nuke rows on co-existing refs).
+	dropped, err := state.DeletePendingForBranchGeneration(ctx, db, branchRef, gen)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: drop stale pending events: %w", err)
 	}
 
 	checker := git.NewIgnoreChecker(repo)
