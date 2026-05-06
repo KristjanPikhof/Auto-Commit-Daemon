@@ -207,6 +207,8 @@ Pending: before=42 after=0
 Commits: 42 (singletons=42 grouped=0)
 HEAD: abc123456789 -> def456789012
 Duration: 3.2s
+Notes:
+  - shadow reseeded from HEAD
 ~~~
 
 Skip the prompt with `--yes`, or combine with `--json` for scripting:
