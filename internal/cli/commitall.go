@@ -492,7 +492,8 @@ func previewIntentDryRun(
 	// diff egress is involved. Skip the planner peek when the provider
 	// declares NeedsDiff (network-bound) or is anything other than the
 	// always-local deterministic provider.
-	if ai.ProviderNeedsDiff(provider) || cfg.Provider != ai.ProviderDeterministic {
+	mode := strings.TrimSpace(strings.ToLower(cfg.Mode))
+	if ai.ProviderNeedsDiff(provider) || (mode != "" && mode != "deterministic") {
 		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner peek skipped (network provider %q; would call out otherwise)", ai.PrimaryProviderName(provider)))
 		return
 	}
