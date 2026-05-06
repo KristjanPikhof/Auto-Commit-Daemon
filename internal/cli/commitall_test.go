@@ -539,8 +539,4 @@ func (e *errOnReadReader) Read(p []byte) (int, error) {
 }
 
 // errStdinUnexpected is a sentinel returned by errOnReadReader.
-var errStdinUnexpected = &stdinReadError{msg: "stdin must not be read on this path"}
-
-type stdinReadError struct{ msg string }
-
-func (s *stdinReadError) Error() string { return s.msg }
+var errStdinUnexpected = errors.New("stdin must not be read on this path")
