@@ -177,6 +177,53 @@ for ACD-owned paths. It will not run broad `git reset`, `git checkout`, or
 `git read-tree` against your live index, and it skips same-path staged work
 that no longer matches the captured before-state.
 
+### Cold start: committing a dirty worktree
+
+Use `acd commit-all` when the daemon was off and files accumulated without
+being committed. It captures all uncommitted changes, sorts them by path for
+coherent sibling clustering, replays them with the configured strategy, and
+exits without starting the persistent daemon.
+
+~~~bash
+# Preview what would happen — no commits written
+acd commit-all --dry-run
+
+# Interactive flow (default): shows a confirmation prompt
+acd commit-all
+~~~
+
+Expected confirmation output:
+
+~~~
+Repo: /path/to/repo (refs/heads/main @ abc123456789)
+Pending events: 42
+Strategy: event (provider deterministic)
+Estimated passes: 42
+Proceed? [y/N]: y
+commit-all complete for /path/to/repo (refs/heads/main)
+Strategy: event (provider deterministic)
+Pending: before=42 after=0
+Commits: 42 (singletons=42 grouped=0)
+HEAD: abc123456789 -> def456789012
+Duration: 3.2s
+~~~
+
+Skip the prompt with `--yes`, or combine with `--json` for scripting:
+
+~~~bash
+acd commit-all --yes
+acd commit-all --yes --json | jq '.commits'
+~~~
+
+`commit-all` refuses to run on detached HEAD, while a git operation is in
+progress (rebase, merge, cherry-pick, bisect), while a manual pause marker is
+present, or while the per-repo daemon is alive. After it finishes, start the
+live daemon normally with `acd start`.
+
+For full flag reference and intent-strategy behavior, see the
+[cold start commit cleanup](docs/user-workflows.md#cold-start-commit-cleanup)
+workflow in the docs.
+
 Use a manual pause when you want to reset, rebase, inspect, or stage branch
 changes without replay racing you:
 
