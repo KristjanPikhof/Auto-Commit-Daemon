@@ -283,6 +283,22 @@ Intent-specific observability:
   still contain source code; inspect them with `acd prompt --last` or
   `acd prompt --seq <seq>`.
 
+### One-shot path-sorted capture (`acd commit-all`)
+
+`acd commit-all` uses the same capture pipeline as the live daemon but passes
+`SortByPath: true` to the capture options. This causes captured events to be
+ordered lexicographically by file path before they are inserted into the replay
+queue. The live daemon does not use this option; it relies on fsnotify and poll
+timestamps instead.
+
+Path sorting matters because `commit-all` runs against a repo that may have
+accumulated many changes while the daemon was off and has no reliable mtime
+ordering. By emitting events in path order, sibling files in the same directory
+cluster together in the commit sequence — for example, all `pkg/a/*.go` files
+land in adjacent commits. With `ACD_COMMIT_STRATEGY=intent`, the intent planner
+receives coherent windows of related siblings, which improves grouping quality
+even without historical timing information.
+
 ---
 
 ## `blocked_conflict`: terminal state, operator action required
