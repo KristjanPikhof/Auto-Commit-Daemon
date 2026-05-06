@@ -252,23 +252,31 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 			res.Notes = append(res.Notes, "aborted by user")
 			res.OK = false
 			res.DurationMillis = time.Since(start).Milliseconds()
-			return renderCommitAll(out, res, jsonOut)
+			if rerr := renderCommitAll(out, res, jsonOut); rerr != nil {
+				return rerr
+			}
+			// Return a sentinel error so cobra exits non-zero. Scripts
+			// can grep for "aborted by user" in JSON output and rely
+			// on the exit code matching the human signal.
+			return errCommitAllAborted
 		}
 	}
 	res.Confirmed = true
 
-	commits, singletons, grouped, conflicts, failed, after, err := commitAllReplayLoop(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, pendingCount)
+	commits, drained, conflicts, failed, after, err := commitAllReplayLoop(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, pendingCount)
 	if err != nil {
 		return err
 	}
 	res.Commits = commits
-	res.Singletons = singletons
-	res.Grouped = grouped
+	res.Drained = drained
 	res.Conflicts = conflicts
 	res.Failed = failed
 	res.PendingAfter = after
 	if newHead, herr := git.RevParse(ctx, repo, "HEAD"); herr == nil {
 		res.HeadAfter = newHead
+	} else {
+		slog.Default().Warn("acd commit-all: post-loop HEAD lookup failed", slog.String("err", herr.Error()))
+		res.Notes = append(res.Notes, fmt.Sprintf("post-loop HEAD lookup failed: %v", herr))
 	}
 	res.DurationMillis = time.Since(start).Milliseconds()
 	return renderCommitAll(out, res, jsonOut)
