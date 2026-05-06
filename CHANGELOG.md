@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-06
+
 ### Added
 
 - AI intent commit strategy: `ACD_COMMIT_STRATEGY=intent` can ask the
