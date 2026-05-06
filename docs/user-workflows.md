@@ -129,6 +129,13 @@ Look for:
 `status` and `diagnose --json` show deferred counts, forced-aging readiness, and
 the latest planner error.
 
+The `intent_strategy.strategy` field reflects the *effective* commit strategy:
+ACD reads `commit.strategy` from daemon meta first, then falls back to the
+`ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
+values do not leak into the report — they emit a slog warning and the
+env-derived strategy is shown instead. `commit-all` uses the same resolution
+so a one-shot run matches what the live daemon would do.
+
 If commits are waiting before any planner request appears, check the batch wait
 state:
 
