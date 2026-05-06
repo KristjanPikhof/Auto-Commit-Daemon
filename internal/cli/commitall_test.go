@@ -439,7 +439,11 @@ func TestPreviewIntentDryRun_EventStrategyAddsBaseNoteOnly(t *testing.T) {
 		t.Fatalf("write dirty: %v", err)
 	}
 	gitDir := filepath.Join(repo, ".git")
-	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
 	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
