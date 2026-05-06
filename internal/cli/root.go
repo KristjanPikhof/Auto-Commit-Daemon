@@ -68,6 +68,7 @@ func newRootCmd() *cobra.Command {
 		newHookStdinExtractCmd(),
 		newDoctorCmd(),
 		newGCCmd(),
+		newCommitAllCmd(),
 		newDaemonCmd(),
 	)
 
