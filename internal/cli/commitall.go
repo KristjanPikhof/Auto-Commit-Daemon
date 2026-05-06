@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
@@ -21,6 +22,12 @@ import (
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// errCommitAllAborted is returned by runCommitAll when the user declines
+// the interactive confirmation prompt. cobra's RunE maps any non-nil
+// error to a non-zero exit code, so callers can distinguish "user said
+// no" from "ran successfully with nothing to do".
+var errCommitAllAborted = errors.New("acd commit-all: aborted by user")
 
 // commitAllResult is the JSON payload returned by `acd commit-all --json`.
 type commitAllResult struct {
