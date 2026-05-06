@@ -287,12 +287,20 @@ func loadCommitAllGeneration(ctx context.Context, db *state.DB) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("acd commit-all: load branch generation: %w", err)
 	}
+	// Genuinely absent meta = fresh DB; default to generation 1.
 	if !ok || strings.TrimSpace(v) == "" {
 		return 1, nil
 	}
+	// Meta is present but unparseable / non-positive: refuse rather than
+	// silently fabricating generation=1. The daemon may have advanced the
+	// generation past 1 (rebase, divergence, ref switch) and overwriting
+	// it would build a parallel shadow the daemon will not consume.
 	parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-	if err != nil || parsed <= 0 {
-		return 1, nil
+	if err != nil {
+		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is not a valid integer; run `acd recover --auto` to repair state", v)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is non-positive; run `acd recover --auto` to repair state", v)
 	}
 	return parsed, nil
 }
