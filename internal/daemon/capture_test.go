@@ -1583,3 +1583,68 @@ func TestCapture_SortByPathShuffledMultiDirOrdering(t *testing.T) {
 		}
 	}
 }
+
+// TestCapture_DisablePendingCapOptOverride confirms that
+// CaptureOpts.DisablePendingCap=true skips the pending-depth cap for that
+// call only, even when EnvMaxPendingEvents would otherwise constrain it.
+// This is the typed plumb that `acd commit-all` uses in place of the
+// removed os.Setenv mutation; the daemon run loop leaves the field false
+// so the documented invariant still holds for production.
+func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "5")
+	resetPendingCapWarnForTest(t, 1)
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:     f.ig,
+		SensitiveMatcher:  f.matcher,
+		SortByPath:        true,
+		DisablePendingCap: true,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsDropped != 0 {
+		t.Fatalf("EventsDropped=%d with DisablePendingCap=true; want 0; summary=%+v", sum.EventsDropped, sum)
+	}
+	if sum.BackpressurePaused {
+		t.Fatalf("BackpressurePaused=true with DisablePendingCap=true; want false; summary=%+v", sum)
+	}
+	if sum.EventsAppended < 12 {
+		t.Fatalf("EventsAppended=%d, want >=12 with DisablePendingCap=true; summary=%+v", sum.EventsAppended, sum)
+	}
+}
+
+// TestCapture_MaxPendingEventsOverrideTakesPrecedence confirms that a
+// strictly-positive MaxPendingEventsOverride overrides the env value but
+// still enforces a cap (unlike DisablePendingCap which removes it).
+func TestCapture_MaxPendingEventsOverrideTakesPrecedence(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "5")
+	resetPendingCapWarnForTest(t, 1)
+	f := newCaptureFixture(t)
+	for i := 0; i < 12; i++ {
+		name := fmt.Sprintf("file-%02d.txt", i)
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte("hello"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:            f.ig,
+		SensitiveMatcher:         f.matcher,
+		SortByPath:               true,
+		MaxPendingEventsOverride: 8,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsAppended != 8 {
+		t.Fatalf("EventsAppended=%d with override=8; want 8; summary=%+v", sum.EventsAppended, sum)
+	}
+}
