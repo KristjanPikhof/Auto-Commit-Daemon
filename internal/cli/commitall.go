@@ -75,7 +75,16 @@ or while the per-repo daemon is alive.`,
 			yes, _ := cmd.Flags().GetBool("yes")
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runCommitAll(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), repo, yes, dryRun, jsonOut)
+			err := runCommitAll(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), repo, yes, dryRun, jsonOut)
+			if errors.Is(err, errCommitAllAborted) {
+				// The JSON / human payload has already been rendered by
+				// runCommitAll; suppress cobra's secondary "Error:"
+				// banner but keep the non-zero exit code so scripts
+				// can distinguish a decline from a clean no-op.
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+			return err
 		},
 	}
 	cmd.Flags().Bool("yes", false, "Skip the interactive confirmation prompt")
