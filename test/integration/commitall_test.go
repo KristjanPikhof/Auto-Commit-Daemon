@@ -336,7 +336,7 @@ func TestCommitAllReseedsStaleShadow(t *testing.T) {
 	}
 	// Stamp the bootstrap completion marker so BootstrapShadow would skip.
 	markerKey := "shadow.bootstrapped:" + branchRef + ":" + strconv.FormatInt(gen, 10)
-	markerStmt := "INSERT OR REPLACE INTO daemon_meta(key, value) VALUES ('" + markerKey + "', '1');"
+	markerStmt := "INSERT OR REPLACE INTO daemon_meta(key, value, updated_ts) VALUES ('" + markerKey + "', '1', strftime('%s','now'));"
 	if out, err := exec.Command("sqlite3", dbPath, markerStmt).CombinedOutput(); err != nil {
 		t.Fatalf("sqlite stamp marker: %v\n%s", err, out)
 	}
