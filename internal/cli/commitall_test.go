@@ -790,10 +790,16 @@ func TestCommitAllReplayLoop_ZeroProgressEscape(t *testing.T) {
 		return daemon.ReplaySummary{Published: 0}, nil
 	}
 
+	// Use the real seed-commit HEAD so the post-pass RevParse doesn't
+	// flip BaseHead and reset the zero-progress counter prematurely.
+	realHead, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
 	cctx := daemon.CaptureContext{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
-		BaseHead:         "deadbeef",
+		BaseHead:         realHead,
 	}
 	cfg := ai.LoadProviderConfigFromEnv()
 	var notes []string
