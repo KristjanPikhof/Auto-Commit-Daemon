@@ -488,8 +488,13 @@ acd commit-all --yes --json | jq '.commits'
 ~~~
 
 `--json` requires `--yes` because no interactive prompt is available. The JSON
-payload includes `ok`, `strategy`, `provider`, `pending_before`,
-`pending_after`, `commits`, `head_before`, `head_after`, and `duration_ms`.
+payload includes `ok`, `repo`, `branch_ref`, `head_before`, `head_after`,
+`strategy`, `provider`, `intent_window`, `intent_defer_limit`,
+`pending_before`, `pending_after`, `estimated_passes`, `commits`, `drained`,
+`confirmed`, `duration_ms`, and `notes`. When the pre-capture reseed drops
+stale pending rows, the payload also carries `dropped_stale_pending` and a
+`shadow reseeded from HEAD; N stale pending events dropped` entry in
+`notes`.
 
 After `commit-all` finishes, start the live daemon normally:
 
