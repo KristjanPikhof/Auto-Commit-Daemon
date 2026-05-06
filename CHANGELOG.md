@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed
+
+- `acd commit-all` now force-reseeds `shadow_paths` from `HEAD` and drops
+  stale `pending` capture events for the active `(branch_ref,
+  branch_generation)` before capturing. Previously, when a prior daemon
+  session had absorbed worktree edits into shadow without successfully
+  replaying them, the bootstrap marker was already set; `commit-all` saw a
+  shadow that mirrored live state, captured zero events, and reported
+  `Commits: 0; no pending events; worktree already clean` while the
+  worktree was still dirty. The fix exposes a new
+  `state.DeletePendingForBranchGeneration` helper, switches `commit-all`
+  to `daemon.ReseedShadowFromHead`, and surfaces a `dropped_stale_pending`
+  count plus a `shadow reseeded from HEAD` note in the JSON and human
+  output.
+
 ### Added
 
 - `acd commit-all`: one-shot command that captures every uncommitted file in
