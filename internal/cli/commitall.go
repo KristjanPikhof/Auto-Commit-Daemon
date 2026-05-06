@@ -44,8 +44,7 @@ type commitAllResult struct {
 	PendingAfter   int      `json:"pending_after"`
 	EstimatedPass  int      `json:"estimated_passes"`
 	Commits        int      `json:"commits"`
-	Singletons     int      `json:"singletons"`
-	Grouped        int      `json:"grouped"`
+	Drained        int      `json:"drained"`
 	Conflicts      int      `json:"conflicts,omitempty"`
 	Failed         int      `json:"failed,omitempty"`
 	DryRun         bool     `json:"dry_run,omitempty"`
