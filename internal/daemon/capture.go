@@ -181,12 +181,33 @@ type CaptureOpts struct {
 	// wrappers) leave it false to honor the gate.
 	SkipPauseCheck bool
 	// SortByPath, when true, reorders the slice returned by Classify into
-	// lexicographic ascending Path order before the AppendCaptureEvent
-	// insert loop so capture_events.seq matches path order. Daemon
-	// run-loop callers leave this false; the live walk's iteration order
-	// is preserved exactly as before. Used by tests and tooling that need
-	// deterministic seq ordering across passes.
+	// lexicographic ascending Path order BEFORE the per-op
+	// AppendCaptureEvent insert loop runs and BEFORE the pending-depth
+	// cap is applied; events that overflow the cap mid-pass are
+	// therefore the lex-largest paths, not the most recently edited.
+	// Daemon run-loop callers leave this false; the live walk's iteration
+	// order is preserved exactly as before. Used by tests and tooling
+	// (`acd commit-all`) that need deterministic seq ordering across passes.
 	SortByPath bool
+
+	// DisablePendingCap, when true, disables the per-generation
+	// pending-depth cap (EnvMaxPendingEvents) for THIS Capture call only.
+	// Daemon run-loop callers leave this false so the documented
+	// backpressure invariant holds. Single-shot tools like
+	// `acd commit-all` set it true so a cold-start dirty worktree can
+	// drain in one pass without the mid-walk drop fence kicking in.
+	// Mutually exclusive with MaxPendingEventsOverride: when both are
+	// set, DisablePendingCap wins. The process-wide env var is NOT
+	// touched.
+	DisablePendingCap bool
+
+	// MaxPendingEventsOverride overrides the per-generation pending-depth
+	// cap for this Capture call only when > 0. -1 (or any negative value)
+	// is treated as unset and falls back to resolveMaxPendingEvents().
+	// Zero falls through to the env-derived default; use
+	// DisablePendingCap to actually turn the cap off. The process-wide
+	// env var is NOT touched.
+	MaxPendingEventsOverride int64
 }
 
 // resolveMaxFileBytes consults EnvMaxFileBytes, falls back to default.
@@ -462,7 +483,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	// active until either replay drains pending below
 	// CaptureBackpressureClearRatio*cap, or the operator explicitly
 	// accepts the loss via `acd resume --accept-overflow`.
-	pendingCap := resolveMaxPendingEvents()
+	pendingCap := resolveCaptureMaxPending(opts)
 	var summary CaptureSummary
 	pending := -1
 	if pendingCap > 0 {
