@@ -238,17 +238,23 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 	estimated := commitAllEstimatePasses(strategy, pendingCount, cfg.IntentWindow)
 
 	res := commitAllResult{
-		OK:             true,
-		Repo:           repo,
-		BranchRef:      branchRef,
-		HeadBefore:     head,
-		Strategy:       string(strategy),
-		Provider:       ai.PrimaryProviderName(provider),
-		IntentWindow:   cfg.IntentWindow,
-		IntentDeferLim: cfg.IntentDeferLimit,
-		PendingBefore:  pendingCount,
-		EstimatedPass:  estimated,
-		DryRun:         dryRun,
+		OK:                  true,
+		Repo:                repo,
+		BranchRef:           branchRef,
+		HeadBefore:          head,
+		Strategy:            string(strategy),
+		Provider:            ai.PrimaryProviderName(provider),
+		IntentWindow:        cfg.IntentWindow,
+		IntentDeferLim:      cfg.IntentDeferLimit,
+		PendingBefore:       pendingCount,
+		EstimatedPass:       estimated,
+		DryRun:              dryRun,
+		DroppedStalePending: dropped,
+	}
+	if dropped > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf("shadow reseeded from HEAD; %d stale pending events dropped", dropped))
+	} else {
+		res.Notes = append(res.Notes, "shadow reseeded from HEAD")
 	}
 
 	if pendingCount == 0 {
