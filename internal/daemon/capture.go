@@ -681,6 +681,13 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 
 	ops := Classify(shadow, live)
 	if opts.SortByPath {
+		// Reorder ops in lexicographic ascending Path order BEFORE the
+		// per-op AppendCaptureEvent loop runs and BEFORE the
+		// pending-depth cap is applied. If the cap drops a tail mid-pass
+		// (see below), the events that overflow are therefore the
+		// lex-LARGEST paths, not the most recently edited ones. Tooling
+		// that wants newest-first drop semantics must leave SortByPath
+		// false and rely on the live walk's iteration order.
 		sort.SliceStable(ops, func(i, j int) bool { return ops[i].Path < ops[j].Path })
 	}
 	recordTrace(opts.Trace, acdtrace.Event{
