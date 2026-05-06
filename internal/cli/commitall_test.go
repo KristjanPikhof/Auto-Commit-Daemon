@@ -568,7 +568,7 @@ func TestCommitAll_ReseedsStaleShadowAndDropsStalePending(t *testing.T) {
 			t.Fatalf("hash-object %s: %v", path, err)
 		}
 		_ = content
-		return strings.TrimSpace(out)
+		return strings.TrimSpace(string(out))
 	}
 	for _, p := range []string{"dirty-a.txt", "dirty-b.txt"} {
 		oid := hashAndStage(p, "")
