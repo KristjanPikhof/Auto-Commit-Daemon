@@ -31,26 +31,27 @@ var errCommitAllAborted = errors.New("acd commit-all: aborted by user")
 
 // commitAllResult is the JSON payload returned by `acd commit-all --json`.
 type commitAllResult struct {
-	OK             bool     `json:"ok"`
-	Repo           string   `json:"repo"`
-	BranchRef      string   `json:"branch_ref"`
-	HeadBefore     string   `json:"head_before"`
-	HeadAfter      string   `json:"head_after,omitempty"`
-	Strategy       string   `json:"strategy"`
-	Provider       string   `json:"provider"`
-	IntentWindow   int      `json:"intent_window,omitempty"`
-	IntentDeferLim int      `json:"intent_defer_limit,omitempty"`
-	PendingBefore  int      `json:"pending_before"`
-	PendingAfter   int      `json:"pending_after"`
-	EstimatedPass  int      `json:"estimated_passes"`
-	Commits        int      `json:"commits"`
-	Drained        int      `json:"drained"`
-	Conflicts      int      `json:"conflicts,omitempty"`
-	Failed         int      `json:"failed,omitempty"`
-	DryRun         bool     `json:"dry_run,omitempty"`
-	Confirmed      bool     `json:"confirmed,omitempty"`
-	DurationMillis int64    `json:"duration_ms"`
-	Notes          []string `json:"notes,omitempty"`
+	OK                  bool     `json:"ok"`
+	Repo                string   `json:"repo"`
+	BranchRef           string   `json:"branch_ref"`
+	HeadBefore          string   `json:"head_before"`
+	HeadAfter           string   `json:"head_after,omitempty"`
+	Strategy            string   `json:"strategy"`
+	Provider            string   `json:"provider"`
+	IntentWindow        int      `json:"intent_window,omitempty"`
+	IntentDeferLim      int      `json:"intent_defer_limit,omitempty"`
+	PendingBefore       int      `json:"pending_before"`
+	PendingAfter        int      `json:"pending_after"`
+	EstimatedPass       int      `json:"estimated_passes"`
+	Commits             int      `json:"commits"`
+	Drained             int      `json:"drained"`
+	Conflicts           int      `json:"conflicts,omitempty"`
+	Failed              int      `json:"failed,omitempty"`
+	DryRun              bool     `json:"dry_run,omitempty"`
+	Confirmed           bool     `json:"confirmed,omitempty"`
+	DroppedStalePending int      `json:"dropped_stale_pending,omitempty"`
+	DurationMillis      int64    `json:"duration_ms"`
+	Notes               []string `json:"notes,omitempty"`
 }
 
 func newCommitAllCmd() *cobra.Command {
