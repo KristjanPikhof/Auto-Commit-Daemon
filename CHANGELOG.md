@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
+  commit strategy by resolving daemon `commit.strategy` meta first, then the
+  `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
+  values no longer leak into the report; they emit a slog warning and the
+  env-derived strategy is shown instead. New helper
+  `cli.ResolveEffectiveCommitStrategy` centralizes this resolution so
+  `commit-all`, intent observability, and any future read-only consumers
+  agree on what is active.
+
 ### Fixed
 
 - `acd commit-all` now force-reseeds `shadow_paths` from `HEAD` and drops
