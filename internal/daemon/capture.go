@@ -223,6 +223,21 @@ func resolveMaxFileBytes(opt int64) int64 {
 	return DefaultMaxFileBytes
 }
 
+// resolveCaptureMaxPending honours the per-call CaptureOpts override
+// chain ahead of the process-wide env var. DisablePendingCap forces the
+// cap off; a strictly-positive MaxPendingEventsOverride wins next; any
+// other case falls through to the documented env/default behavior in
+// resolveMaxPendingEvents.
+func resolveCaptureMaxPending(opts CaptureOpts) int64 {
+	if opts.DisablePendingCap {
+		return 0
+	}
+	if opts.MaxPendingEventsOverride > 0 {
+		return opts.MaxPendingEventsOverride
+	}
+	return resolveMaxPendingEvents()
+}
+
 // resolveMaxPendingEvents consults EnvMaxPendingEvents and returns the
 // effective cap. Negative values are clamped to 0 (disabled).
 //
