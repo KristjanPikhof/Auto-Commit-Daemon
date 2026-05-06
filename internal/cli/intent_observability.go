@@ -123,12 +123,12 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	if conn == nil {
 		return report, nil
 	}
-	if strategy, ok, err := metaLookup(ctx, conn, "commit.strategy"); err != nil {
-		return report, fmt.Errorf("commit.strategy: %w", err)
-	} else if ok && strategy != "" {
-		report.Strategy = strategy
-		report.Active = strategy == string(ai.CommitStrategyIntent)
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, conn)
+	if err != nil {
+		return report, err
 	}
+	report.Strategy = string(strategy)
+	report.Active = strategy == ai.CommitStrategyIntent
 	if v, ok, err := metaLookup(ctx, conn, "intent.window"); err != nil {
 		return report, fmt.Errorf("intent.window: %w", err)
 	} else if ok {
