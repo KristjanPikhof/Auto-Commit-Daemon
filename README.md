@@ -73,6 +73,7 @@ acd commit-all          # one-shot: commit every uncommitted file (daemon must b
 acd commit-all --dry-run           # plan and show summary; no commits written
 acd commit-all --yes               # skip interactive confirmation
 acd commit-all --yes --json        # machine-readable JSON output
+acd commit-all --repo /path/to/repo --yes   # target a repo other than $PWD
 ~~~
 
 Use the no-flag lifecycle commands when you are driving ACD from a terminal.
