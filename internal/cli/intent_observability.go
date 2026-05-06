@@ -72,6 +72,37 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 	}
 }
 
+// ResolveEffectiveCommitStrategy returns the commit strategy currently in
+// effect for a repo. When conn is nil, the result reflects only env
+// (ACD_COMMIT_STRATEGY) and the canonical default. When conn is non-nil and
+// daemon_meta carries a daemon-stamped commit.strategy, that overlay wins so
+// CLI tooling reports the value the running daemon actually uses.
+func ResolveEffectiveCommitStrategy(ctx context.Context, conn *sql.DB) (ai.CommitStrategy, error) {
+	cfg := ai.LoadProviderConfigFromEnv()
+	strategy := cfg.CommitStrategy
+	if conn == nil {
+		return strategy, nil
+	}
+	raw, ok, err := metaLookup(ctx, conn, "commit.strategy")
+	if err != nil {
+		return strategy, fmt.Errorf("commit.strategy: %w", err)
+	}
+	if !ok {
+		return strategy, nil
+	}
+	trimmed := strings.TrimSpace(strings.ToLower(raw))
+	switch trimmed {
+	case "":
+		return strategy, nil
+	case string(ai.CommitStrategyEvent):
+		return ai.CommitStrategyEvent, nil
+	case string(ai.CommitStrategyIntent):
+		return ai.CommitStrategyIntent, nil
+	default:
+		return strategy, nil
+	}
+}
+
 func intentStrategyFromEnv() intentStrategyReport {
 	cfg := ai.LoadProviderConfigFromEnv()
 	return intentStrategyReport{
