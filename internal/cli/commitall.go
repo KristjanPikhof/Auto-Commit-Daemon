@@ -340,6 +340,15 @@ func renderCommitAllConfirmation(out io.Writer, res commitAllResult) {
 	fmt.Fprintf(out, "Estimated passes: %d\n", res.EstimatedPass)
 }
 
+// commitAllReplayer abstracts daemon.Replay so unit tests can inject a
+// fake that controls the per-pass return without spinning a real git
+// repo. Production calls go through commitAllRunReplayDefault.
+type commitAllReplayer func(ctx context.Context, repo string, db *state.DB, cctx daemon.CaptureContext, opts daemon.ReplayOpts) (daemon.ReplaySummary, error)
+
+func commitAllRunReplayDefault(ctx context.Context, repo string, db *state.DB, cctx daemon.CaptureContext, opts daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+	return daemon.Replay(ctx, repo, db, cctx, opts)
+}
+
 func commitAllReplayLoop(
 	ctx context.Context,
 	repo, gitDir string,
@@ -349,15 +358,37 @@ func commitAllReplayLoop(
 	cfg ai.ProviderConfig,
 	provider ai.Provider,
 	startingPending int,
-) (commits, singletons, grouped, conflicts, failed, after int, err error) {
+) (commits, drained, conflicts, failed, after int, err error) {
+	return commitAllReplayLoopWith(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, startingPending, commitAllRunReplayDefault, nil)
+}
+
+// commitAllReplayLoopWith is the testable form of commitAllReplayLoop;
+// production code goes through the public signature above. `replayFn`
+// lets unit tests inject deterministic per-pass results; `noteSink`, if
+// non-nil, captures Notes appended during the loop (e.g. zero-progress
+// escape) so callers don't have to wrap.
+func commitAllReplayLoopWith(
+	ctx context.Context,
+	repo, gitDir string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	strategy ai.CommitStrategy,
+	cfg ai.ProviderConfig,
+	provider ai.Provider,
+	startingPending int,
+	replayFn commitAllReplayer,
+	noteSink *[]string,
+) (commits, drained, conflicts, failed, after int, err error) {
 	zeroProgress := 0
 	prevHead := cctx.BaseHead
 
+	// Provider-driven message fn matches what the daemon's run loop
+	// would do for any non-deterministic provider. The daemon's
+	// internal providerMessageFn is exposed via daemon.ProviderMessageFn
+	// so commit-all routes per-event subjects through the same path.
 	var msgFn daemon.MessageFn
 	if provider != nil {
-		msgFn = func(ctx context.Context, ec daemon.EventContext) (string, error) {
-			return daemon.DeterministicMessage(ctx, ec)
-		}
+		msgFn = daemon.ProviderMessageFn(provider, repo)
 	}
 
 	var planner ai.IntentPlanner
@@ -381,7 +412,7 @@ func commitAllReplayLoop(
 			IntentDeferLimit:      cfg.IntentDeferLimit,
 			IntentBypassBatchWait: true,
 		}
-		sum, rerr := daemon.Replay(ctx, repo, db, cctx, opts)
+		sum, rerr := replayFn(ctx, repo, db, cctx, opts)
 		if rerr != nil {
 			err = fmt.Errorf("acd commit-all: replay: %w", rerr)
 			return
@@ -390,9 +421,15 @@ func commitAllReplayLoop(
 		conflicts += sum.Conflicts
 		failed += sum.Failed
 		// Refresh BaseHead so the next pass sees the just-committed HEAD.
-		if newHead, herr := git.RevParse(ctx, repo, "HEAD"); herr == nil {
-			cctx.BaseHead = newHead
+		// A failure here is fatal: a stale BaseHead would target the
+		// wrong CAS base and produce spurious supersede / conflict
+		// outcomes on the next pass.
+		newHead, herr := git.RevParse(ctx, repo, "HEAD")
+		if herr != nil {
+			err = fmt.Errorf("acd commit-all: refresh HEAD between passes: %w", herr)
+			return
 		}
+		cctx.BaseHead = newHead
 
 		remaining, perr := state.PendingEvents(ctx, db, 0)
 		if perr != nil {
@@ -412,6 +449,9 @@ func commitAllReplayLoop(
 			break
 		}
 		if zeroProgress >= commitAllZeroProgressLimit {
+			if noteSink != nil {
+				*noteSink = append(*noteSink, fmt.Sprintf("replay made no progress for %d consecutive passes; stopping with %d pending", commitAllZeroProgressLimit, after))
+			}
 			break
 		}
 		if sum.Conflicts > 0 || sum.Failed > 0 {
@@ -419,17 +459,9 @@ func commitAllReplayLoop(
 		}
 	}
 	if startingPending > 0 {
-		// Heuristic: with intent strategy, group/singleton split is approximated
-		// by comparing commits to events drained.
-		drained := startingPending - after
+		drained = startingPending - after
 		if drained < 0 {
 			drained = 0
-		}
-		if commits >= drained {
-			singletons = commits
-		} else {
-			grouped = commits
-			singletons = 0
 		}
 	}
 	return
