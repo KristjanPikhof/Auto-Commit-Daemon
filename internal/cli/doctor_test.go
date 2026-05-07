@@ -707,6 +707,77 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	}
 }
 
+func TestDoctor_CodexInstalledWhenPrimaryHooksJSONUnmanagedButLegacyTOMLManaged(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write unmanaged hooks.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed from alternate config path: %+v", codex)
+	}
+	if codex.MarkerFound {
+		t.Fatalf("primary unmanaged hooks.json should not set MarkerFound: %+v", codex)
+	}
+	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "alternate config path") {
+		t.Fatalf("codex alternate-path note missing: %+v", codex)
+	}
+}
+
+func TestDoctor_CodexShadowWarningWithConfigHomeLegacyTOML(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".config", "codex"), 0o700); err != nil {
+		t.Fatalf("mkdir config codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".config", "codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+		t.Fatalf("codex duplicate-hook warning missing for ~/.config/codex/config.toml: %+v", codex)
+	}
+}
+
 func TestDoctor_NoCodexShadowWhenOnlyOneFile(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()

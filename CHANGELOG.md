@@ -14,12 +14,11 @@
   mirroring the claude-code pattern so the daemon survives end-of-turn
   while replay drains. `_acd_managed: true` at the top level is the
   managed-install marker. `cwd` is sourced from the JSON `cwd` field on
-  stdin via `acd hook-stdin-extract session_id cwd <&0`;
+  stdin via `acd hook-stdin-extract session_id cwd? <&0`;
   `CODEX_PROJECT_DIR` is no longer required, and `printf "{}\n"` is gone.
   Adapter detection now matches per path (JSON markers for `hooks.json`,
-  TOML markers for `config.toml`), and includes repo-local
-  `<repo>/.codex/hooks.json` and `<repo>/.codex/config.toml`. `acd doctor`
-  warns when both `~/.codex/hooks.json` and `~/.codex/config.toml` carry
+  TOML markers for `config.toml`) across user-scoped Codex config paths. `acd doctor`
+  warns when both `~/.codex/hooks.json` and a legacy Codex TOML config carry
   acd markers. Codex actually merges every hook source it finds, so
   leaving both files installed fires every event twice; `acd doctor`
   surfaces this as "Codex merges all hook sources and will fire each
@@ -34,9 +33,9 @@
   `[features].codex_hooks = true` in favor of `[features].hooks = true`;
   `hooks.json` does not need a `[features]` block, but legacy TOML
   users should rename the flag.
-  `acd hook-stdin-extract` now accepts multiple field arguments and
-  emits one scalar per line in argument order; the single-arg form is
-  unchanged.
+  `acd hook-stdin-extract` now accepts multiple field arguments, emits one scalar
+  per line in argument order, and supports optional fields with a `?` suffix; the
+  single-arg form is unchanged.
 - `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
   commit strategy by resolving daemon `commit.strategy` meta first, then the
   `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta

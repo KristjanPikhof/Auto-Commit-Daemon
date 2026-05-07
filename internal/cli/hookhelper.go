@@ -25,16 +25,17 @@ func newHookStdinExtractCmd() *cobra.Command {
 
 // runHookStdinExtract decodes a JSON object from stdin and prints each
 // requested top-level field as a newline-terminated scalar in argument order.
-// Fields are emitted as soon as they are produced, so a missing or non-scalar
-// field at position N still leaves fields 1..N-1 on stdout. Hook bash bodies
-// rely on this contract: they pair `read SID; read CWD` with `|| exit 0`, so
-// a trailing missing field never wipes out earlier successful values.
+// A field name ending in ? is optional; missing optional fields emit an empty
+// line so hook bodies can keep their positional reads while falling back.
+// Required fields are emitted as soon as they are produced, so a missing or
+// non-scalar field at position N still leaves fields 1..N-1 on stdout.
 func runHookStdinExtract(in io.Reader, out io.Writer, fields ...string) error {
 	if len(fields) == 0 {
 		return errors.New("acd hook-stdin-extract: at least one field is required")
 	}
 	for i, f := range fields {
-		if strings.TrimSpace(f) == "" {
+		key := strings.TrimSuffix(strings.TrimSpace(f), "?")
+		if key == "" {
 			return fmt.Errorf("acd hook-stdin-extract: field at position %d is empty", i)
 		}
 	}
@@ -45,9 +46,17 @@ func runHookStdinExtract(in io.Reader, out io.Writer, fields ...string) error {
 		return fmt.Errorf("acd hook-stdin-extract: decode stdin JSON: %w", err)
 	}
 	for _, field := range fields {
-		key := strings.TrimSpace(field)
+		raw := strings.TrimSpace(field)
+		optional := strings.HasSuffix(raw, "?")
+		key := strings.TrimSuffix(raw, "?")
 		v, ok := payload[key]
 		if !ok || v == nil {
+			if optional {
+				if _, err := fmt.Fprintln(out); err != nil {
+					return err
+				}
+				continue
+			}
 			return fmt.Errorf("acd hook-stdin-extract: field %q not found", key)
 		}
 		var s string

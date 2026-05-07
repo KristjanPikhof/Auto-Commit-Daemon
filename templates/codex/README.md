@@ -8,11 +8,12 @@
 4. **Approve the hooks.** Codex flags every newly-added hook entry as "review required" and refuses to run them until you approve. On first launch you will see `5 hooks need review before they can run. Open /hooks to review them.` Run `/hooks` inside Codex and approve all five (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`). Until you approve, the daemon never starts and `acd status` will show no Codex client.
 
 If you previously installed the legacy TOML snippet, delete the
-`# acd-managed: true` block from `~/.codex/config.toml`. Codex merges every
-hook source it finds (`hooks.json` and inline `[hooks]` in `config.toml` both
-fire), so leaving the legacy block in place causes every event to fire
-twice — doubled `acd start`/`acd wake`/`acd touch` per turn. `acd doctor`
-warns when both files carry an acd marker.
+`# acd-managed: true` block from `~/.codex/config.toml` or
+`~/.config/codex/config.toml`. Codex merges every hook source it finds
+(`hooks.json` and inline `[hooks]` in `config.toml` both fire), so leaving the
+legacy block in place causes every event to fire twice — doubled
+`acd start`/`acd wake`/`acd touch` per turn. `acd doctor` warns when the JSON
+file and a legacy TOML config both carry an acd marker.
 
 Note: Codex deprecated `[features].codex_hooks = true` in favor of
 `[features].hooks = true`. The new `hooks.json` install does not need a
@@ -34,7 +35,7 @@ not killed mid-replay drain. The refcount sweep on the `watch_pid` still
 cleans up once Codex exits.
 
 The repo path is read from the JSON `cwd` field on stdin (consumed in one
-pass via `acd hook-stdin-extract session_id cwd`). When `cwd` is missing,
+pass via `acd hook-stdin-extract session_id cwd?`). When `cwd` is missing,
 the hook falls back to the hook process working directory; `CODEX_PROJECT_DIR`
 is no longer required.
 

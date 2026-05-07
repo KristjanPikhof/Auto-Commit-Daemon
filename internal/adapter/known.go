@@ -123,6 +123,8 @@ func CodexInstalls() (jsonInstalled, legacyTOMLInstalled bool) {
 		return false, false
 	}
 	jsonInstalled = fileContainsAny(filepath.Join(home, ".codex", "hooks.json"), jsonAcdManagedMarkers)
-	legacyTOMLInstalled = fileContainsAny(filepath.Join(home, ".codex", "config.toml"), tomlAcdManagedMarkers)
+	legacyTOMLInstalled =
+		fileContainsAny(filepath.Join(home, ".codex", "config.toml"), tomlAcdManagedMarkers) ||
+			fileContainsAny(filepath.Join(home, ".config", "codex", "config.toml"), tomlAcdManagedMarkers)
 	return
 }

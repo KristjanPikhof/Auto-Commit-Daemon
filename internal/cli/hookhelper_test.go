@@ -107,6 +107,21 @@ func TestHookStdinExtract_MultiFieldStopsOnMissing(t *testing.T) {
 	}
 }
 
+func TestHookStdinExtract_OptionalMissingFieldEmitsBlankLine(t *testing.T) {
+	var out bytes.Buffer
+	err := runHookStdinExtract(
+		strings.NewReader(`{"session_id":"sess-7"}`),
+		&out,
+		"session_id", "cwd?",
+	)
+	if err != nil {
+		t.Fatalf("runHookStdinExtract: %v", err)
+	}
+	if got := out.String(); got != "sess-7\n\n" {
+		t.Fatalf("output=%q want session_id then blank cwd line", got)
+	}
+}
+
 func TestHookStdinExtract_MultiFieldNonScalarErrors(t *testing.T) {
 	var out bytes.Buffer
 	err := runHookStdinExtract(

@@ -151,6 +151,29 @@ func TestCodexInstalls_BothShadow(t *testing.T) {
 	}
 }
 
+func TestCodexInstalls_BothShadowWithConfigHomeLegacyTOML(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".config", "codex"), 0o700); err != nil {
+		t.Fatalf("mkdir config codex dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".config", "codex", "config.toml"), []byte("# acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	jsonOK, tomlOK := CodexInstalls()
+	if !jsonOK || !tomlOK {
+		t.Fatalf("CodexInstalls jsonOK=%v tomlOK=%v, want both true", jsonOK, tomlOK)
+	}
+}
+
 func TestCodexInstalls_NeitherFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
