@@ -37,6 +37,12 @@
   `acd hook-stdin-extract` now accepts multiple field arguments, emits one scalar
   per line in argument order, and supports optional fields with a `?` suffix; the
   single-arg form is unchanged.
+- Claude Code, OpenCode, and Pi active hooks now match Codex's self-healing
+  pattern: tool/prompt activity runs idempotent `acd start` before `acd wake`,
+  so ACD restarts after a manual `acd stop` without waiting for a brand-new
+  harness session. Their end-session hooks still deregister with
+  `acd stop --session-id`; Codex keeps `Stop -> acd touch` to avoid stopping
+  mid-replay drain.
 - `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
   commit strategy by resolving daemon `commit.strategy` meta first, then the
   `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
