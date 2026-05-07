@@ -656,6 +656,25 @@ func runCodexE2E(t *testing.T, bin string) {
 			upRes.ExitCode, upRes.Stdout, upRes.Stderr)
 	}
 
+	// If the daemon was manually stopped inside an already-open Codex session,
+	// the next active hook must re-run idempotent start before wake.
+	selfHealStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
+	if selfHealStop.ExitCode != 0 {
+		t.Fatalf("codex self-heal pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			selfHealStop.ExitCode, selfHealStop.Stdout, selfHealStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, "codex daemon stopped before self-heal", repo)
+	if healRes := runBash(t, ctx, env, stdin, upHook.Command); healRes.ExitCode != 0 {
+		t.Fatalf("codex UserPromptSubmit self-heal exit=%d\nstdout=%s\nstderr=%s",
+			healRes.ExitCode, healRes.Stdout, healRes.Stderr)
+	}
+	waitFor(t, "codex daemon mode==running after self-heal", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
+
 	// PreToolUse -> acd wake (matcher path).
 	preHook := pickHookByEvent(t, hooks, "PreToolUse")
 	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {

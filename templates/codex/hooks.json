@@ -18,7 +18,7 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
           }
         ]
       }
@@ -30,7 +30,7 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
           }
         ]
       }
@@ -42,7 +42,7 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; mkdir -p \"$(dirname \"$LOG\")\"; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"; acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
           }
         ]
       }

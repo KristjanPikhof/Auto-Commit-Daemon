@@ -158,7 +158,7 @@ acd status --repo .
 ## Harness/templates
 
 - Codex template: `templates/codex/hooks.json` (v2). Codex now reads `~/.codex/hooks.json` before `~/.codex/config.toml`, so the JSON file wins discovery; the legacy TOML snippet was removed.
-- Wired Codex events: `SessionStart` (`acd start`, timeout 15s), `UserPromptSubmit` (`acd wake`, 5s), `PreToolUse` and `PostToolUse` (`acd wake`, matcher `apply_patch|Edit|Write|Bash`, 5s), `Stop` (`acd touch`, 5s — mirrors claude-code so replay drain finishes before refcount sweep cleans up).
+- Wired Codex events: `SessionStart` (`acd start`, timeout 15s), `UserPromptSubmit` (idempotent `acd start`, then `acd wake`, 5s), `PreToolUse` and `PostToolUse` (idempotent `acd start`, then `acd wake`, matcher `apply_patch|Edit|Write|Bash`, 5s), `Stop` (`acd touch`, 5s — mirrors claude-code so replay drain finishes before refcount sweep cleans up).
 - Marker is `_acd_managed: true` at the JSON top level (parity with claude-code). Per-path adapter detection: hooks.json paths match JSON markers, config.toml paths match the legacy TOML comment marker; cross-format strings do not count.
 - `acd doctor` warns when `~/.codex/hooks.json` and a legacy Codex TOML config both carry acd markers. Codex MERGES every hook source (it does not shadow), so leaving both installed fires every event twice. User must delete the TOML acd block.
 - Codex flags every newly-added hook entry as "review required"; users must run `/hooks` inside Codex once after `acd setup codex --raw > ~/.codex/hooks.json` to approve all 5 entries before the daemon will start. Until approved, `SessionStart` never fires and `acd status` shows no Codex client. Documented in templates/codex/README.md and CHANGELOG.

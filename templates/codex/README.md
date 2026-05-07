@@ -25,14 +25,17 @@ rename the feature flag to silence the deprecation warning.
 `hooks.json` registers all five Codex hook events:
 
 - `SessionStart` -> `acd start` (timeout 15s)
-- `UserPromptSubmit` -> `acd wake` (timeout 5s)
-- `PreToolUse` -> `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
-- `PostToolUse` -> `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
+- `UserPromptSubmit` -> idempotent `acd start`, then `acd wake` (timeout 5s)
+- `PreToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
+- `PostToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
 - `Stop` -> `acd touch` (timeout 5s)
 
 `Stop` calls `acd touch` (mirrors the claude-code adapter) so the daemon is
 not killed mid-replay drain. The refcount sweep on the `watch_pid` still
 cleans up once Codex exits.
+
+The active wake hooks call `acd start` first so a later prompt or tool event can
+recover if you manually ran `acd stop` while the Codex session stayed open.
 
 The repo path is read from the JSON `cwd` field on stdin (consumed in one
 pass via `acd hook-stdin-extract session_id cwd?`). When `cwd` is missing,
