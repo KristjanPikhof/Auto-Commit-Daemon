@@ -65,7 +65,6 @@ func TestAdapterE2E(t *testing.T) {
 	t.Run("codex", func(t *testing.T) {
 		runCodexE2E(t, bin)
 		runCodexMissingAcdWritesHookLog(t)
-		runCodexLegacyTOMLAutoDetect(t, bin)
 	})
 	t.Run("opencode", func(t *testing.T) {
 		runOpencodeE2E(t, bin)
@@ -374,43 +373,62 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	return out
 }
 
-// parseCodexHooksJSON walks the codex hooks.json snippet and returns one
-// hookSpec per registered command. The schema mirrors claude-code:
-// hooks.<EventName> is an array of entries, each with optional matcher and a
-// hooks array of {type, timeout, command} handlers.
-func parseCodexHooksJSON(t *testing.T, body string) []hookSpec {
+// parseCodexSnippet walks the codex TOML snippet (avoids a TOML dependency).
+// Codex schema: [[hooks.<EventName>]] is a matcher group, and the runnable
+// handler lives in [[hooks.<EventName>.hooks]] with `type` and `command`. The
+// outer [[hooks.X]] establishes Event; the inner [[hooks.X.hooks]] block
+// supplies the `command` we exec.
+func parseCodexSnippet(t *testing.T, body string) []hookSpec {
 	t.Helper()
-	var doc struct {
-		Hooks map[string][]struct {
-			Matcher *string `json:"matcher,omitempty"`
-			Hooks   []struct {
-				Type    string `json:"type"`
-				Timeout int    `json:"timeout"`
-				Command string `json:"command"`
-			} `json:"hooks"`
-		} `json:"hooks"`
-	}
-	if err := json.Unmarshal([]byte(body), &doc); err != nil {
-		t.Fatalf("parse codex hooks.json: %v\nbody:\n%s", err, body)
-	}
+	lines := strings.Split(body, "\n")
 	var hooks []hookSpec
-	for ev, entries := range doc.Hooks {
-		for _, entry := range entries {
-			for _, h := range entry.Hooks {
-				if h.Command == "" {
-					continue
-				}
-				hooks = append(hooks, hookSpec{
-					Event:   ev,
-					Command: h.Command,
-				})
-			}
+	var curEvent string
+	var cur hookSpec
+	flush := func() {
+		if cur.Command != "" {
+			hooks = append(hooks, cur)
+		}
+		cur = hookSpec{}
+	}
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, ".hooks]]"):
+			// Inner handler block; closes any in-flight handler under the same event.
+			flush()
+			cur.Event = curEvent
+		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, "]]"):
+			// Outer matcher block: [[hooks.SessionStart]] etc. Capture event name.
+			flush()
+			inner := strings.TrimSuffix(strings.TrimPrefix(line, "[[hooks."), "]]")
+			curEvent = inner
+		case strings.HasPrefix(line, "command"):
+			cur.Command = stripTOMLValue(line)
 		}
 	}
+	flush()
 	if len(hooks) == 0 {
-		t.Fatalf("codex hooks.json snippet contained no handlers:\n%s", body)
+		t.Fatalf("codex snippet contained no hook handlers:\n%s", body)
 	}
 	return hooks
+}
+
+// stripTOMLValue extracts the quoted value of `key = "value"`.
+func stripTOMLValue(line string) string {
+	if i := strings.Index(line, "="); i >= 0 {
+		v := strings.TrimSpace(line[i+1:])
+		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+			// Re-interpret the TOML escape vocabulary we actually use:
+			// the snippets only escape \" and \\ — Go's strconv.Unquote
+			// handles both correctly when the body is a valid Go literal.
+			out := v[1 : len(v)-1]
+			out = strings.ReplaceAll(out, `\"`, `"`)
+			out = strings.ReplaceAll(out, `\\`, `\`)
+			return out
+		}
+		return v
+	}
+	return ""
 }
 
 // parseYAMLBashBlocks extracts every `bash: |` heredoc block from an
@@ -599,18 +617,18 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 }
 
 func runCodexE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "codex/hooks.json")
-	hooks := parseCodexHooksJSON(t, body)
+	body := readSnippet(t, "codex/config.snippet.toml")
+	hooks := parseCodexSnippet(t, body)
 
 	repo := tempRepo(t)
 	binDir := filepath.Dir(bin)
 	sessionID := "e2e-codex"
-	// Codex hooks v2: cwd comes from stdin, not CODEX_PROJECT_DIR.
-	stdin := fmt.Sprintf(`{"session_id":"%s","cwd":"%s"}`, sessionID, repo)
+	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
 
-	// Run the bash subprocess outside the repo so the snippet must source the
-	// repo path from the stdin cwd field rather than $PWD.
-	env := adapterEnv(t, binDir)
+	// Codex provides the project directory separately from the hook process
+	// cwd; keep the bash subprocess outside repo to prove the snippet honors it.
+	env := adapterEnv(t, binDir, "CODEX_PROJECT_DIR="+repo)
+	env = addFailingJQ(t, env)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -625,86 +643,22 @@ func runCodexE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
 
-	// UserPromptSubmit -> acd wake.
-	upHook := pickHookByEvent(t, hooks, "UserPromptSubmit")
-	if upRes := runBash(t, ctx, env, stdin, upHook.Command); upRes.ExitCode != 0 {
-		t.Fatalf("codex UserPromptSubmit exit=%d\nstdout=%s\nstderr=%s",
-			upRes.ExitCode, upRes.Stdout, upRes.Stderr)
-	}
-
-	// PreToolUse -> acd wake (matcher path).
-	preHook := pickHookByEvent(t, hooks, "PreToolUse")
-	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {
-		t.Fatalf("codex PreToolUse exit=%d\nstdout=%s\nstderr=%s",
-			preRes.ExitCode, preRes.Stdout, preRes.Stderr)
-	}
-
-	// Stop -> acd touch. Daemon must remain alive (mirrors claude-code Stop)
-	// because PostToolUse replay can still be draining when Stop fires.
-	stopHook := pickHookByEvent(t, hooks, "Stop")
-	if stopRes := runBash(t, ctx, env, stdin, stopHook.Command); stopRes.ExitCode != 0 {
-		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-	}
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("codex daemon mode after Stop=%q, want running (Stop must touch, not stop)", mode)
-	}
-
+	// Codex template intentionally omits the Stop hook (race vs PostToolUse).
 	// Production cleanup relies on watch_pid death + refcount sweep; in the
 	// test we drive shutdown explicitly with `acd stop --force`.
-	tearDown := runBash(t, ctx, env, "",
+	stopRes := runBash(t, ctx, env, "",
 		"acd stop --session-id "+shellQuote(sessionID)+
 			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if tearDown.ExitCode != 0 {
+	if stopRes.ExitCode != 0 {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
-			tearDown.ExitCode, tearDown.Stdout, tearDown.Stderr)
+			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
 	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
 }
 
-// runCodexLegacyTOMLAutoDetect ensures `acd setup` with no harness arg still
-// resolves to codex when only the legacy `~/.codex/config.toml` carries the
-// acd marker (hooks.json absent). Codex hooks v2 added hooks.json discovery
-// but must keep the legacy TOML install detectable.
-func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
-	binDir := filepath.Dir(bin)
-	base := withIsolatedHome(t)
-	home := ""
-	for _, kv := range base {
-		if strings.HasPrefix(kv, "HOME=") {
-			home = strings.TrimPrefix(kv, "HOME=")
-			break
-		}
-	}
-	if home == "" {
-		t.Fatal("isolated HOME missing from env")
-	}
-	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
-		t.Fatalf("mkdir codex: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"),
-		[]byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
-		t.Fatalf("write legacy config.toml: %v", err)
-	}
-
-	env := envWith(base,
-		"PATH="+binDir+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
-	)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	res := runAcd(t, ctx, env, "setup")
-	if res.ExitCode != 0 {
-		t.Fatalf("acd setup auto-detect with legacy codex TOML exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	if !strings.Contains(res.Stdout, "acd setup codex") {
-		t.Fatalf("auto-detect should pick codex; output:\n%s", res.Stdout)
-	}
-}
-
 func runCodexMissingAcdWritesHookLog(t *testing.T) {
-	body := readSnippet(t, "codex/hooks.json")
-	hooks := parseCodexHooksJSON(t, body)
+	body := readSnippet(t, "codex/config.snippet.toml")
+	hooks := parseCodexSnippet(t, body)
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 
 	fakeBin := t.TempDir()
@@ -723,17 +677,17 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 
 	env := envWith(base,
 		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
+		"CODEX_PROJECT_DIR="+t.TempDir(),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	stdin := fmt.Sprintf(`{"session_id":"e2e-codex-missing-acd","cwd":"%s"}`, t.TempDir())
-	// Codex hooks v2: hook bodies use `|| exit 0` after acd hook-stdin-extract
-	// fails so missing/broken acd never blocks the user. The hook log still
-	// captures the stderr from the failed extract attempt.
+	stdin := `{"session_id":"e2e-codex-missing-acd"}`
 	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("codex SessionStart without acd should still exit 0, got=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
+	if res.ExitCode == 0 {
+		t.Fatalf("codex SessionStart without acd should fail\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
+	}
+	if strings.TrimSpace(res.Stdout) != "{}" {
+		t.Fatalf("codex failure path should still emit JSON stdout, got %q", res.Stdout)
 	}
 
 	logPath := filepath.Join(home, ".local", "state", "acd", "codex-hook.log")

@@ -157,12 +157,11 @@ acd status --repo .
 
 ## Harness/templates
 
-- Codex template: `templates/codex/hooks.json` (v2). Codex now reads `~/.codex/hooks.json` before `~/.codex/config.toml`, so the JSON file wins discovery; the legacy TOML snippet was removed.
-- Wired Codex events: `SessionStart` (`acd start`, timeout 15s), `UserPromptSubmit` (`acd wake`, 5s), `PreToolUse` and `PostToolUse` (`acd wake`, matcher `apply_patch|Edit|Write|Bash`, 5s), `Stop` (`acd touch`, 5s — mirrors claude-code so replay drain finishes before refcount sweep cleans up).
-- Marker is `_acd_managed: true` at the JSON top level (parity with claude-code). Per-path adapter detection: hooks.json paths match JSON markers, config.toml paths match the legacy TOML comment marker; cross-format strings do not count.
-- `acd doctor` warns when `~/.codex/hooks.json` and `~/.codex/config.toml` both carry acd markers (legacy TOML shadows new hooks.json; user must delete the TOML acd block).
-- `cwd` comes from stdin (`acd hook-stdin-extract session_id cwd <&0`); falls back to `$PWD` only when the helper exits non-zero. `CODEX_PROJECT_DIR` is no longer required. `printf "{}\n"` is no longer required; bash bodies rely on `exit 0` and use `|| exit 0` after the helper so a missing `acd` never blocks the hook.
-- Templates use `acd hook-stdin-extract <field> [field...]` (multi-arg) instead of `jq`; keep `internal/cli/hookhelper.go` and AdapterE2E coverage.
+- Codex template: `templates/codex/config.snippet.toml`.
+- Codex hooks require `[features] codex_hooks = true`, `[[hooks.<EventName>]]`, then nested `[[hooks.<EventName>.hooks]]`; flat `[[hooks]]` fails.
+- Hook stdout must be valid JSON; snippet redirects `acd` output to `/dev/null` and emits `printf "{}\n"`. No `Stop` hook; it races replay drain.
+- Codex can auto-load `~/.codex/hooks.json` and `~/.codex/config.toml`; delete old `hooks.json` after installing toml snippet.
+- Templates use `acd hook-stdin-extract <field>` instead of `jq`; keep `internal/cli/hookhelper.go` and AdapterE2E coverage.
 
 ## Env knobs
 

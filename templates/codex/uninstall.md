@@ -1,20 +1,17 @@
 # Uninstall acd from Codex
 
-1. Delete `~/.codex/hooks.json` (the acd-managed install written by `acd setup codex`).
-2. If you still have the legacy TOML install, remove the `# acd-managed: true` block from `~/.codex/config.toml`.
-3. The daemon shuts down on its own once Codex exits and the refcount sweep clears the `watch_pid` row. Force-stop any survivors with:
+1. Remove the `# acd-managed: true` block from your Codex config (`~/.codex/config.toml` or the path your Codex install uses).
+2. Stop any running daemons:
    ~~~bash
    acd stop --all
    ~~~
-4. (Optional) Remove the acd binary:
+3. (Optional) Remove the acd binary:
    ~~~bash
    rm ~/.local/bin/acd
    # or
    brew uninstall acd
    ~~~
-5. (Optional) Remove all acd state and logs:
+4. (Optional) Remove all acd state:
    ~~~bash
    rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
    ~~~
-
-The hook log lives at `~/.local/state/acd/codex-hook.log`; remove it if you want a fully clean slate.

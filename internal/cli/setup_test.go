@@ -149,7 +149,7 @@ func TestSetup_Codex_ExitsZero(t *testing.T) {
 
 func TestSetup_Codex_ContainsSnippet(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	want := snippetBody(t, "codex/hooks.json")
+	want := snippetBody(t, "codex/config.snippet.toml")
 	if !strings.Contains(out, strings.TrimSpace(want)) {
 		t.Errorf("codex snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
 	}
@@ -157,82 +157,17 @@ func TestSetup_Codex_ContainsSnippet(t *testing.T) {
 
 func TestSetup_Codex_AcdManagedMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	if !strings.Contains(out, `"_acd_managed": true`) {
+	// TOML uses "# acd-managed: true" comment line.
+	if !strings.Contains(out, "acd-managed: true") {
 		t.Errorf("acd-managed marker not found in codex output:\n%s", out)
 	}
 }
 
 func TestSetup_Codex_FooterInstructions(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	if !strings.Contains(out, "hooks.json") {
-		t.Errorf("footer missing 'hooks.json' in output:\n%s", out)
-	}
-}
-
-func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "codex")
-	// Strip the leading "// " comment prefix from each line so the embedded
-	// JSON snippet parses as a single block. The output starts and ends
-	// with header/footer comment lines and the snippet body sits in
-	// between as raw JSON, so locate the JSON block by braces.
-	start := strings.Index(out, "{")
-	end := strings.LastIndex(out, "}")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("no JSON block found in codex output:\n%s", out)
-	}
-	var settings struct {
-		ACDManaged bool `json:"_acd_managed"`
-		Hooks      map[string][]struct {
-			Matcher *string `json:"matcher,omitempty"`
-			Hooks   []struct {
-				Type    string `json:"type"`
-				Timeout int    `json:"timeout"`
-				Command string `json:"command"`
-			} `json:"hooks"`
-		} `json:"hooks"`
-	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
-		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, out[start:end+1])
-	}
-	if !settings.ACDManaged {
-		t.Errorf("_acd_managed not true at top level")
-	}
-	required := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
-	for _, ev := range required {
-		entries, ok := settings.Hooks[ev]
-		if !ok || len(entries) == 0 {
-			t.Errorf("event %q missing or has no entries", ev)
-			continue
-		}
-		for i, entry := range entries {
-			if (ev == "PreToolUse" || ev == "PostToolUse") && (entry.Matcher == nil || *entry.Matcher == "") {
-				t.Errorf("event %q entry %d: matcher must be set on tool-use hooks", ev, i)
-			}
-			if len(entry.Hooks) == 0 {
-				t.Errorf("event %q entry %d: nested hooks array empty", ev, i)
-				continue
-			}
-			for j, h := range entry.Hooks {
-				if h.Type != "command" {
-					t.Errorf("event %q entry %d hook %d: type=%q want command", ev, i, j, h.Type)
-				}
-				if h.Command == "" {
-					t.Errorf("event %q entry %d hook %d: command empty", ev, i, j)
-				}
-				if h.Timeout <= 0 {
-					t.Errorf("event %q entry %d hook %d: timeout must be positive, got %d", ev, i, j, h.Timeout)
-				}
-				if !strings.Contains(h.Command, "acd hook-stdin-extract session_id cwd") {
-					t.Errorf("event %q entry %d hook %d: command missing multi-arg hook-stdin-extract: %s", ev, i, j, h.Command)
-				}
-			}
-		}
-	}
-	// Stop must call acd touch (mirrors claude-code).
-	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
-		if !strings.Contains(stop[0].Hooks[0].Command, "acd touch") {
-			t.Errorf("Stop hook must call acd touch: %s", stop[0].Hooks[0].Command)
-		}
+	// README says "config.toml"
+	if !strings.Contains(out, "config.toml") {
+		t.Errorf("footer missing 'config.toml' in output:\n%s", out)
 	}
 }
 
