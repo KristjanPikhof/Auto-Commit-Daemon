@@ -98,11 +98,11 @@ func Lookup(name string) (Harness, bool) {
 // JSON acd marker and whether the legacy ~/.codex/config.toml still carries
 // the TOML acd marker. Used by `acd doctor` to warn about shadowed installs.
 func CodexInstalls() (jsonInstalled, legacyTOMLInstalled bool) {
-	home, err := osUserHomeDir()
+	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return false, false
 	}
-	jsonInstalled = fileContainsAny(filepathJoin(home, ".codex", "hooks.json"), jsonAcdManagedMarkers)
-	legacyTOMLInstalled = fileContainsAny(filepathJoin(home, ".codex", "config.toml"), tomlAcdManagedMarkers)
+	jsonInstalled = fileContainsAny(filepath.Join(home, ".codex", "hooks.json"), jsonAcdManagedMarkers)
+	legacyTOMLInstalled = fileContainsAny(filepath.Join(home, ".codex", "config.toml"), tomlAcdManagedMarkers)
 	return
 }
