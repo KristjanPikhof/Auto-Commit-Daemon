@@ -2,8 +2,8 @@
 
 ## Basics
 
-- `acd`: static Go CLI/daemon. MIT. macOS/Linux `arm64`/`amd64`. No Windows v1.
-- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`. Go `1.22`. `modernc.org/sqlite v1.36.0`. Tags `vYYYY-MM-DD`.
+- Static Go CLI/daemon. MIT. macOS/Linux `arm64`/`amd64`. No Windows v1.
+- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`. Go 1.22. `modernc.org/sqlite v1.36.0`. Tags `vYYYY-MM-DD`.
 
 ```bash
 make build      # static bin/acd, CGO_ENABLED=0, -tags=netgo,osusergo
