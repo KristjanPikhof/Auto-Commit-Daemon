@@ -34,6 +34,18 @@ acd setup pi            # paste output into your .pi/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
+### Supported harnesses
+
+| Harness | Hook engine | Source |
+|---|---|---|
+| `claude-code` | Claude Code native hooks (`~/.claude/settings.json`) | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
+| `codex` | Codex hooks v2 (`~/.codex/hooks.json`; legacy `~/.codex/config.toml` still detected) | OpenAI Codex |
+| `opencode` | OpenCode-Hooks YAML engine (`~/.config/opencode/hook/hooks.yaml`) | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
+| `pi` | Pi-YAML-Hooks YAML engine (`~/.pi/agent/hook/hooks.yaml`) | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
+| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` fallback | n/a (no harness required) |
+
+Install the hook engine first (Codex, Claude Code, OpenCode-Hooks, Pi-YAML-Hooks), then run the matching `acd setup …` to wire `acd` into it.
+
 ## Use it
 
 Open your harness. Edit files. Commits land automatically.
