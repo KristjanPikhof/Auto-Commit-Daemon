@@ -17,38 +17,32 @@ type Harness interface {
 }
 
 type knownHarness struct {
-	name  string
-	paths []pathSpec
+	name        string
+	configPath  string
+	extraPaths  []string
+	markerTexts []string
 }
 
 func (h knownHarness) Name() string {
 	return h.name
 }
 
-// ConfigPath returns the primary candidate path for this harness with `~`
-// expanded. Repo-local relative paths are returned verbatim.
 func (h knownHarness) ConfigPath() string {
-	if len(h.paths) == 0 {
-		return ""
-	}
-	return expandHome(h.paths[0].path)
+	return expandHome(h.configPath)
 }
 
 func (h knownHarness) IsInstalled() bool {
 	return h.HasMarker()
 }
 
-// HasMarker returns true when any candidate path contains a marker
-// registered for that path. Markers are checked per-path so JSON files do
-// not match TOML markers and vice versa.
 func (h knownHarness) HasMarker() bool {
-	for _, p := range h.paths {
-		body, err := os.ReadFile(expandHome(p.path))
+	for _, path := range h.allPaths() {
+		body, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 		text := string(body)
-		for _, marker := range p.markers {
+		for _, marker := range h.markerTexts {
 			if strings.Contains(text, marker) {
 				return true
 			}
@@ -57,11 +51,11 @@ func (h knownHarness) HasMarker() bool {
 	return false
 }
 
-// allPaths returns every candidate path for this harness with `~` expanded.
 func (h knownHarness) allPaths() []string {
-	paths := make([]string, 0, len(h.paths))
-	for _, p := range h.paths {
-		paths = append(paths, expandHome(p.path))
+	paths := make([]string, 0, 1+len(h.extraPaths))
+	paths = append(paths, h.ConfigPath())
+	for _, path := range h.extraPaths {
+		paths = append(paths, expandHome(path))
 	}
 	return paths
 }

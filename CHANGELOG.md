@@ -4,28 +4,6 @@
 
 ### Changed
 
-- **Codex hooks v2 (breaking).** `acd setup codex` now emits
-  `~/.codex/hooks.json` instead of the legacy `[[hooks.*]]` TOML snippet,
-  matching the order Codex now uses for hook discovery (`hooks.json` wins
-  over `config.toml`). All five Codex hook events are wired:
-  `SessionStart -> acd start` (timeout 15s), `UserPromptSubmit -> acd wake`
-  (5s), `PreToolUse` and `PostToolUse -> acd wake` (matcher
-  `apply_patch|Edit|Write|Bash`, 5s each), and `Stop -> acd touch` (5s)
-  mirroring the claude-code pattern so the daemon survives end-of-turn
-  while replay drains. `_acd_managed: true` at the top level is the
-  managed-install marker. `cwd` is sourced from the JSON `cwd` field on
-  stdin via `acd hook-stdin-extract session_id cwd <&0`;
-  `CODEX_PROJECT_DIR` is no longer required, and `printf "{}\n"` is gone.
-  Adapter detection now matches per path (JSON markers for `hooks.json`,
-  TOML markers for `config.toml`), and includes repo-local
-  `<repo>/.codex/hooks.json` and `<repo>/.codex/config.toml`. `acd doctor`
-  warns when both `~/.codex/hooks.json` and `~/.codex/config.toml` carry
-  acd markers (legacy TOML shadows the new file). **Migration:** run
-  `acd setup codex`, save the output to `~/.codex/hooks.json`, then
-  delete the `# acd-managed: true` block from `~/.codex/config.toml`.
-  `acd hook-stdin-extract` now accepts multiple field arguments and
-  emits one scalar per line in argument order; the single-arg form is
-  unchanged.
 - `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
   commit strategy by resolving daemon `commit.strategy` meta first, then the
   `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta

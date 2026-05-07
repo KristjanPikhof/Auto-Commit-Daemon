@@ -67,14 +67,11 @@ timing come from the tool that committed first. `acd status` will show
 
 ## Codex ACD hook
 
-The Codex harness (`acd setup codex`) installs `~/.codex/hooks.json` (Codex
-hooks v2) wiring `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, and `Stop`. `PreToolUse` and `PostToolUse` call `acd wake`,
-nudging `acd` to replay immediately after each Codex tool event; `Stop` calls
-`acd touch` (mirrors claude-code) so the daemon survives end-of-turn until the
-refcount sweep cleans up after Codex exits. If Codex itself also has an
-auto-commit plugin active, the same idempotent publish logic applies: `acd`
-detects the already-landed commit and settles without creating a duplicate.
+The Codex harness (`acd setup codex`) installs a `PostToolUse` hook that calls
+`acd wake`, nudging `acd` to replay immediately after each Codex tool event.
+If Codex itself also has an auto-commit plugin active, the same idempotent
+publish logic applies: `acd` detects the already-landed commit and settles
+without creating a duplicate.
 
 ---
 
