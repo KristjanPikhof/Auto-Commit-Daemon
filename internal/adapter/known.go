@@ -1,31 +1,57 @@
 package adapter
 
+// pathSpec binds a config path candidate to the marker strings that prove
+// acd installed it. Different paths for the same harness can use different
+// marker syntaxes (e.g., codex JSON vs TOML).
+type pathSpec struct {
+	path    string
+	markers []string
+}
+
+var (
+	jsonAcdManagedMarkers = []string{`"_acd_managed": true`, `"_acd_managed":true`}
+	tomlAcdManagedMarkers = []string{"acd-managed: true"}
+	yamlAcdManagedMarkers = []string{"acd-managed: true"}
+)
+
 var knownHarnesses = []knownHarness{
 	{
-		name:        "claude-code",
-		configPath:  "~/.claude/settings.json",
-		markerTexts: []string{`"_acd_managed": true`, `"_acd_managed":true`},
+		name: "claude-code",
+		paths: []pathSpec{
+			{path: "~/.claude/settings.json", markers: jsonAcdManagedMarkers},
+		},
 	},
 	{
-		name:        "codex",
-		configPath:  "~/.codex/config.toml",
-		extraPaths:  []string{"~/.config/codex/config.toml"},
-		markerTexts: []string{"acd-managed: true"},
+		name: "codex",
+		// hooks.json wins Codex discovery order over config.toml; primary
+		// path is the JSON file. config.toml stays in the candidate set
+		// for legacy installs and triggers the doctor shadow warning when
+		// both files carry acd markers.
+		paths: []pathSpec{
+			{path: "~/.codex/hooks.json", markers: jsonAcdManagedMarkers},
+			{path: "~/.codex/config.toml", markers: tomlAcdManagedMarkers},
+			{path: "~/.config/codex/config.toml", markers: tomlAcdManagedMarkers},
+			{path: ".codex/hooks.json", markers: jsonAcdManagedMarkers},
+			{path: ".codex/config.toml", markers: tomlAcdManagedMarkers},
+		},
 	},
 	{
-		name:        "opencode",
-		configPath:  "~/.config/opencode/hooks.yaml",
-		markerTexts: []string{"acd-managed: true"},
+		name: "opencode",
+		paths: []pathSpec{
+			{path: "~/.config/opencode/hooks.yaml", markers: yamlAcdManagedMarkers},
+		},
 	},
 	{
-		name:        "pi",
-		configPath:  "~/.pi/hook/hooks.yaml",
-		markerTexts: []string{"acd-managed: true"},
+		name: "pi",
+		paths: []pathSpec{
+			{path: "~/.pi/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+		},
 	},
 	{
-		name:        "shell",
-		configPath:  "~/.zshrc",
-		markerTexts: []string{"acd-managed: true"},
+		name: "shell",
+		paths: []pathSpec{
+			{path: "~/.zshrc", markers: yamlAcdManagedMarkers},
+		},
 	},
 }
 
