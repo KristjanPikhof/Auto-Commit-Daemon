@@ -598,18 +598,18 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 }
 
 func runCodexE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "codex/config.snippet.toml")
-	hooks := parseCodexSnippet(t, body)
+	body := readSnippet(t, "codex/hooks.json")
+	hooks := parseCodexHooksJSON(t, body)
 
 	repo := tempRepo(t)
 	binDir := filepath.Dir(bin)
 	sessionID := "e2e-codex"
-	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
+	// Codex hooks v2: cwd comes from stdin, not CODEX_PROJECT_DIR.
+	stdin := fmt.Sprintf(`{"session_id":"%s","cwd":"%s"}`, sessionID, repo)
 
-	// Codex provides the project directory separately from the hook process
-	// cwd; keep the bash subprocess outside repo to prove the snippet honors it.
-	env := adapterEnv(t, binDir, "CODEX_PROJECT_DIR="+repo)
-	env = addFailingJQ(t, env)
+	// Run the bash subprocess outside the repo so the snippet must source the
+	// repo path from the stdin cwd field rather than $PWD.
+	env := adapterEnv(t, binDir)
 
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -624,22 +624,46 @@ func runCodexE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
 
-	// Codex template intentionally omits the Stop hook (race vs PostToolUse).
+	// UserPromptSubmit -> acd wake.
+	upHook := pickHookByEvent(t, hooks, "UserPromptSubmit")
+	if upRes := runBash(t, ctx, env, stdin, upHook.Command); upRes.ExitCode != 0 {
+		t.Fatalf("codex UserPromptSubmit exit=%d\nstdout=%s\nstderr=%s",
+			upRes.ExitCode, upRes.Stdout, upRes.Stderr)
+	}
+
+	// PreToolUse -> acd wake (matcher path).
+	preHook := pickHookByEvent(t, hooks, "PreToolUse")
+	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {
+		t.Fatalf("codex PreToolUse exit=%d\nstdout=%s\nstderr=%s",
+			preRes.ExitCode, preRes.Stdout, preRes.Stderr)
+	}
+
+	// Stop -> acd touch. Daemon must remain alive (mirrors claude-code Stop)
+	// because PostToolUse replay can still be draining when Stop fires.
+	stopHook := pickHookByEvent(t, hooks, "Stop")
+	if stopRes := runBash(t, ctx, env, stdin, stopHook.Command); stopRes.ExitCode != 0 {
+		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
+			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("codex daemon mode after Stop=%q, want running (Stop must touch, not stop)", mode)
+	}
+
 	// Production cleanup relies on watch_pid death + refcount sweep; in the
 	// test we drive shutdown explicitly with `acd stop --force`.
-	stopRes := runBash(t, ctx, env, "",
+	tearDown := runBash(t, ctx, env, "",
 		"acd stop --session-id "+shellQuote(sessionID)+
 			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if stopRes.ExitCode != 0 {
+	if tearDown.ExitCode != 0 {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
+			tearDown.ExitCode, tearDown.Stdout, tearDown.Stderr)
 	}
 	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
 }
 
 func runCodexMissingAcdWritesHookLog(t *testing.T) {
-	body := readSnippet(t, "codex/config.snippet.toml")
-	hooks := parseCodexSnippet(t, body)
+	body := readSnippet(t, "codex/hooks.json")
+	hooks := parseCodexHooksJSON(t, body)
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
 
 	fakeBin := t.TempDir()
@@ -658,17 +682,17 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 
 	env := envWith(base,
 		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
-		"CODEX_PROJECT_DIR="+t.TempDir(),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	stdin := `{"session_id":"e2e-codex-missing-acd"}`
+	stdin := fmt.Sprintf(`{"session_id":"e2e-codex-missing-acd","cwd":"%s"}`, t.TempDir())
+	// Codex hooks v2: hook bodies use `|| exit 0` after acd hook-stdin-extract
+	// fails so missing/broken acd never blocks the user. The hook log still
+	// captures the stderr from the failed extract attempt.
 	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode == 0 {
-		t.Fatalf("codex SessionStart without acd should fail\nstdout=%s\nstderr=%s", res.Stdout, res.Stderr)
-	}
-	if strings.TrimSpace(res.Stdout) != "{}" {
-		t.Fatalf("codex failure path should still emit JSON stdout, got %q", res.Stdout)
+	if res.ExitCode != 0 {
+		t.Fatalf("codex SessionStart without acd should still exit 0, got=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
 	}
 
 	logPath := filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
