@@ -546,6 +546,26 @@ func shutdownDaemon(t *testing.T, env []string, repo, sessionID string) {
 	waitDaemonStoppedOrKill(t, "post-cleanup daemon stopped", repo)
 }
 
+func assertActiveHookSelfHeals(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
+	t.Helper()
+	selfHealStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
+	if selfHealStop.ExitCode != 0 {
+		t.Fatalf("%s self-heal pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			label, selfHealStop.ExitCode, selfHealStop.Stdout, selfHealStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, label+" daemon stopped before self-heal", repo)
+	if healRes := runBash(t, ctx, env, stdin, hook.Command); healRes.ExitCode != 0 {
+		t.Fatalf("%s active-hook self-heal exit=%d\nstdout=%s\nstderr=%s",
+			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
+	}
+	waitFor(t, label+" daemon mode==running after self-heal", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
+}
+
 // -----------------------------------------------------------------------------
 // per-harness flows
 // -----------------------------------------------------------------------------
@@ -586,6 +606,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 		t.Fatalf("claude-code PreToolUse exit=%d\nstdout=%s\nstderr=%s",
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
+	assertActiveHookSelfHeals(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
 
 	// SessionEnd → acd stop. The daemon should shut down because this is
 	// the only registered session.
@@ -656,24 +677,7 @@ func runCodexE2E(t *testing.T, bin string) {
 			upRes.ExitCode, upRes.Stdout, upRes.Stderr)
 	}
 
-	// If the daemon was manually stopped inside an already-open Codex session,
-	// the next active hook must re-run idempotent start before wake.
-	selfHealStop := runBash(t, ctx, env, "",
-		"acd stop --session-id "+shellQuote(sessionID)+
-			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if selfHealStop.ExitCode != 0 {
-		t.Fatalf("codex self-heal pre-stop exit=%d\nstdout=%s\nstderr=%s",
-			selfHealStop.ExitCode, selfHealStop.Stdout, selfHealStop.Stderr)
-	}
-	waitDaemonStoppedOrKill(t, "codex daemon stopped before self-heal", repo)
-	if healRes := runBash(t, ctx, env, stdin, upHook.Command); healRes.ExitCode != 0 {
-		t.Fatalf("codex UserPromptSubmit self-heal exit=%d\nstdout=%s\nstderr=%s",
-			healRes.ExitCode, healRes.Stdout, healRes.Stderr)
-	}
-	waitFor(t, "codex daemon mode==running after self-heal", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
+	assertActiveHookSelfHeals(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
 
 	// PreToolUse -> acd wake (matcher path).
 	preHook := pickHookByEvent(t, hooks, "PreToolUse")
@@ -814,6 +818,14 @@ func runOpencodeE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "opencode", 5*time.Second)
 
+	wakeHook := pickHookByEvent(t, hooks, "acd-wake-tool-before")
+	wakeRes := runBash(t, ctx, env, "", wakeHook.Command)
+	if wakeRes.ExitCode != 0 {
+		t.Fatalf("opencode acd-wake-tool-before exit=%d\nstdout=%s\nstderr=%s",
+			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
+	}
+	assertActiveHookSelfHeals(t, "opencode", ctx, env, repo, sessionID, "opencode", wakeHook, "")
+
 	stopHook := pickHookByEvent(t, hooks, "acd-stop")
 	stopRes := runBash(t, ctx, env, "", stopHook.Command)
 	if stopRes.ExitCode != 0 {
@@ -847,6 +859,14 @@ func runPiE2E(t *testing.T, bin string) {
 		return readDaemonStateMode(repo) == "running"
 	})
 	assertClientRow(t, repo, sessionID, "pi", 5*time.Second)
+
+	wakeHook := pickHookByEvent(t, hooks, "acd-wake-tool-before")
+	wakeRes := runBash(t, ctx, env, "", wakeHook.Command)
+	if wakeRes.ExitCode != 0 {
+		t.Fatalf("pi acd-wake-tool-before exit=%d\nstdout=%s\nstderr=%s",
+			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
+	}
+	assertActiveHookSelfHeals(t, "pi", ctx, env, repo, sessionID, "pi", wakeHook, "")
 
 	stopHook := pickHookByEvent(t, hooks, "acd-stop")
 	stopRes := runBash(t, ctx, env, "", stopHook.Command)

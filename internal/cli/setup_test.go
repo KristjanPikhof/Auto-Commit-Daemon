@@ -133,6 +133,10 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 				if h.Command == "" {
 					t.Errorf("event %q entry %d hook %d: command is empty", ev, i, j)
 				}
+				if (ev == "PreToolUse" || ev == "PostToolUse") &&
+					(!strings.Contains(h.Command, "acd start") || !strings.Contains(h.Command, "acd wake")) {
+					t.Errorf("event %q entry %d hook %d: active hook must start before wake: %s", ev, i, j, h.Command)
+				}
 			}
 		}
 	}
@@ -284,6 +288,19 @@ func TestSetup_OpenCode_FooterInstructions(t *testing.T) {
 	}
 }
 
+func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
+	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
+		block := yamlHookBlock(t, body, id)
+		if !strings.Contains(block, "acd start") || !strings.Contains(block, "acd wake") {
+			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
+		}
+		if strings.Index(block, "acd start") > strings.Index(block, "acd wake") {
+			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
+		}
+	}
+}
+
 // --- pi ---------------------------------------------------------------------
 
 func TestSetup_Pi_ExitsZero(t *testing.T) {
@@ -313,6 +330,25 @@ func TestSetup_Pi_FooterInstructions(t *testing.T) {
 	// README says ".pi/hook/hooks.yaml"
 	if !strings.Contains(out, ".pi/hook/hooks.yaml") {
 		t.Errorf("footer missing '.pi/hook/hooks.yaml' in output:\n%s", out)
+	}
+}
+
+func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	if strings.Contains(body, "uuidgen") {
+		t.Fatalf("pi snippet must not create one-off session ids with uuidgen:\n%s", body)
+	}
+	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
+		block := yamlHookBlock(t, body, id)
+		if !strings.Contains(block, "acd start") || !strings.Contains(block, "acd wake") {
+			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
+		}
+		if strings.Index(block, "acd start") > strings.Index(block, "acd wake") {
+			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
+		}
+		if !strings.Contains(block, `SID="${PI_SESSION_ID:-unknown}"`) || !strings.Contains(block, `--session-id "$SID"`) {
+			t.Fatalf("%s must use the stable SID fallback:\n%s", id, block)
+		}
 	}
 }
 
@@ -373,6 +409,20 @@ func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	if out, err := cmd2.CombinedOutput(); err != nil {
 		t.Errorf("bash -n on zshrc snippet failed: %v\n%s", err, out)
 	}
+}
+
+func yamlHookBlock(t *testing.T, body, id string) string {
+	t.Helper()
+	start := strings.Index(body, "- id: "+id)
+	if start < 0 {
+		t.Fatalf("hook id %q not found in:\n%s", id, body)
+	}
+	rest := body[start+len("- id: "+id):]
+	next := strings.Index(rest, "\n  - id:")
+	if next >= 0 {
+		return rest[:next]
+	}
+	return rest
 }
 
 // --- error cases ------------------------------------------------------------
