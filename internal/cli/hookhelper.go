@@ -23,6 +23,12 @@ func newHookStdinExtractCmd() *cobra.Command {
 	return cmd
 }
 
+// runHookStdinExtract decodes a JSON object from stdin and prints each
+// requested top-level field as a newline-terminated scalar in argument order.
+// Fields are emitted as soon as they are produced, so a missing or non-scalar
+// field at position N still leaves fields 1..N-1 on stdout. Hook bash bodies
+// rely on this contract: they pair `read SID; read CWD` with `|| exit 0`, so
+// a trailing missing field never wipes out earlier successful values.
 func runHookStdinExtract(in io.Reader, out io.Writer, fields ...string) error {
 	if len(fields) == 0 {
 		return errors.New("acd hook-stdin-extract: at least one field is required")

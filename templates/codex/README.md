@@ -3,9 +3,8 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Generate snippet: `acd setup codex`
-3. Save the printed JSON to `~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`.
-4. Restart Codex.
+2. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
+3. Restart Codex.
 
 If you previously installed the legacy TOML snippet, delete the
 `# acd-managed: true` block from `~/.codex/config.toml` so it does not shadow

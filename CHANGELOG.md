@@ -21,8 +21,10 @@
   `<repo>/.codex/hooks.json` and `<repo>/.codex/config.toml`. `acd doctor`
   warns when both `~/.codex/hooks.json` and `~/.codex/config.toml` carry
   acd markers (legacy TOML shadows the new file). **Migration:** run
-  `acd setup codex`, save the output to `~/.codex/hooks.json`, then
-  delete the `# acd-managed: true` block from `~/.codex/config.toml`.
+  `acd setup codex --raw > ~/.codex/hooks.json` (the new `--raw` flag
+  emits the snippet without `// `-wrapped instructions, which JSON does
+  not allow), then delete the `# acd-managed: true` block from
+  `~/.codex/config.toml`.
   `acd hook-stdin-extract` now accepts multiple field arguments and
   emits one scalar per line in argument order; the single-arg form is
   unchanged.

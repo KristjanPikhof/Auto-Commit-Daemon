@@ -46,13 +46,14 @@ var knownHarnesses = []knownHarness{
 		// hooks.json wins Codex discovery order over config.toml; primary
 		// path is the JSON file. config.toml stays in the candidate set
 		// for legacy installs and triggers the doctor shadow warning when
-		// both files carry acd markers.
+		// both files carry acd markers. Repo-local detection is intentionally
+		// scoped out of DetectInstalled because it has no repo-root context;
+		// adding `.codex/*` entries here would resolve against process cwd
+		// and produce false positives in shared dirs.
 		paths: []pathSpec{
 			{path: "~/.codex/hooks.json", markers: jsonAcdManagedMarkers},
 			{path: "~/.codex/config.toml", markers: tomlAcdManagedMarkers},
 			{path: "~/.config/codex/config.toml", markers: tomlAcdManagedMarkers},
-			{path: ".codex/hooks.json", markers: jsonAcdManagedMarkers},
-			{path: ".codex/config.toml", markers: tomlAcdManagedMarkers},
 		},
 	},
 	{

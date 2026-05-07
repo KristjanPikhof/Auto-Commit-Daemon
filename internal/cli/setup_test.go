@@ -169,6 +169,22 @@ func TestSetup_Codex_FooterInstructions(t *testing.T) {
 	}
 }
 
+func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
+	out, _, err := runSetupCmd(t, "codex", "--raw")
+	if err != nil {
+		t.Fatalf("acd setup codex --raw exit=%v\nstdout=%s", err, out)
+	}
+	// Raw output must parse as JSON without any pre/post comment wrapping;
+	// users will redirect this directly into ~/.codex/hooks.json.
+	var v interface{}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
+	}
+	if strings.HasPrefix(strings.TrimSpace(out), "//") {
+		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
+	}
+}
+
 func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
 	// Strip the leading "// " comment prefix from each line so the embedded

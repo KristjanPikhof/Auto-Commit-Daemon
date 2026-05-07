@@ -46,6 +46,7 @@ func readmeFile(harness string) string {
 
 func newSetupCmd() *cobra.Command {
 	var applyFlag bool
+	var rawFlag bool
 
 	cmd := &cobra.Command{
 		Use:     "setup [harness]",
@@ -55,8 +56,10 @@ func newSetupCmd() *cobra.Command {
 
 When no harness is provided, acd tries to detect one installed acd-managed harness. Otherwise pass a harness name explicitly. This command prints snippets only; --apply is reserved for a future version and is hidden.
 
+Use --raw to emit only the snippet body (no comment-wrapped header, footer, or README). This is required when the snippet is strict JSON (e.g. acd setup codex --raw > ~/.codex/hooks.json) because JSON has no comment syntax.
+
 Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
-		Example: `  acd setup codex
+		Example: `  acd setup codex --raw > ~/.codex/hooks.json
   acd setup claude-code
   acd setup opencode
   acd setup shell`,
@@ -75,15 +78,16 @@ Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
 			if len(args) == 1 {
 				harness = args[0]
 			}
-			return runSetup(cmd, harness)
+			return runSetup(cmd, harness, rawFlag)
 		},
 	}
 	cmd.Flags().BoolVar(&applyFlag, "apply", false, "Automatically apply snippet (deferred to v0.2)")
+	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Emit only the snippet body (no comment-wrapped instructions); required for strict-JSON targets like ~/.codex/hooks.json")
 	_ = cmd.Flags().MarkHidden("apply")
 	return cmd
 }
 
-func runSetup(cmd *cobra.Command, harness string) error {
+func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 	if harness == "" {
 		detected := adapter.DetectInstalled()
 		switch len(detected) {
@@ -118,6 +122,21 @@ func runSetup(cmd *cobra.Command, harness string) error {
 	embeddedFS := templates.FS
 
 	out := cmd.OutOrStdout()
+
+	if raw {
+		// Raw mode: emit just the snippet body so the output can be redirected
+		// directly into a strict-JSON config (no comment syntax allowed).
+		if harness == "shell" {
+			if err := printSnippet(out, embeddedFS, meta.file); err != nil {
+				return err
+			}
+			if err := printSnippet(out, embeddedFS, shellZshrcSnippet); err != nil {
+				return err
+			}
+			return nil
+		}
+		return printSnippet(out, embeddedFS, meta.file)
+	}
 
 	// Header.
 	fmt.Fprintf(out, "%s acd setup %s — copy the snippet below into your harness config\n", cp, harness)
