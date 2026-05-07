@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'SID=$(acd hook-stdin-extract session_id <&0); acd wake --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+            "command": "bash -c 'SID=$(acd hook-stdin-extract session_id <&0); REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; acd start --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\"; acd wake --session-id \"$SID\" --repo \"$REPO\"'"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'SID=$(acd hook-stdin-extract session_id <&0); acd wake --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+            "command": "bash -c 'SID=$(acd hook-stdin-extract session_id <&0); REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; acd start --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\"; acd wake --session-id \"$SID\" --repo \"$REPO\"'"
           }
         ]
       }

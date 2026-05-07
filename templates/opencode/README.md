@@ -11,6 +11,11 @@ For [`KristjanPikhof/OpenCode-Hooks`](https://github.com/KristjanPikhof/OpenCode
 
 OpenCode exposes `OPENCODE_SESSION_ID` natively; no jq required.
 
+Tool hooks run idempotent `acd start` before `acd wake`, so later tool activity
+can recover if you manually ran `acd stop` while the OpenCode session stayed
+open. `session.deleted` still deregisters the session with
+`acd stop --session-id`.
+
 ## Verify
 
 - Open OpenCode in any git repo

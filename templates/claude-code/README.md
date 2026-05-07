@@ -13,6 +13,11 @@
 - From another shell, run `acd status`
 - The output should show one client with `harness=claude-code`
 
+`PreToolUse` and `PostToolUse` run idempotent `acd start` before `acd wake`,
+so later tool activity can recover if you manually ran `acd stop` while the
+Claude Code session stayed open. `SessionEnd` still deregisters the session
+with `acd stop --session-id`.
+
 ## Uninstall
 
 See [uninstall.md](uninstall.md).

@@ -9,6 +9,10 @@ For [`KristjanPikhof/pi-yaml-hooks`](https://github.com/KristjanPikhof/pi-yaml-h
 3. Merge the printed YAML into your `.pi/hook/hooks.yaml`
 4. Restart Pi
 
+Tool hooks run idempotent `acd start` before `acd wake`, so later tool activity
+can recover if you manually ran `acd stop` while the Pi session stayed open.
+`session.deleted` still deregisters the session with `acd stop --session-id`.
+
 ## Verify
 
 - Open Pi in any git repo

@@ -4,8 +4,9 @@ hooks:
     event: session.created
     actions:
       - bash: |
+          SID="${PI_SESSION_ID:-unknown}"
           acd start \
-            --session-id "${PI_SESSION_ID:-$(uuidgen)}" \
+            --session-id "$SID" \
             --harness pi \
             --watch-pid "$PPID" \
             --repo "$PI_PROJECT_DIR"
@@ -14,30 +15,44 @@ hooks:
     event: tool.before.*
     actions:
       - bash: |
+          SID="${PI_SESSION_ID:-unknown}"
+          acd start \
+            --session-id "$SID" \
+            --harness pi \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
           acd wake \
-            --session-id "${PI_SESSION_ID:-unknown}" \
+            --session-id "$SID" \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-wake-tool-after
     event: tool.after.*
     actions:
       - bash: |
+          SID="${PI_SESSION_ID:-unknown}"
+          acd start \
+            --session-id "$SID" \
+            --harness pi \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
           acd wake \
-            --session-id "${PI_SESSION_ID:-unknown}" \
+            --session-id "$SID" \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-touch-idle
     event: session.idle
     actions:
       - bash: |
+          SID="${PI_SESSION_ID:-unknown}"
           acd touch \
-            --session-id "${PI_SESSION_ID:-unknown}" \
+            --session-id "$SID" \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-stop
     event: session.deleted
     actions:
       - bash: |
+          SID="${PI_SESSION_ID:-unknown}"
           acd stop \
-            --session-id "${PI_SESSION_ID:-unknown}" \
+            --session-id "$SID" \
             --repo "$PI_PROJECT_DIR"

@@ -14,6 +14,11 @@ hooks:
     event: tool.before.*
     actions:
       - bash: |
+          acd start \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --harness opencode \
+            --watch-pid "$PPID" \
+            --repo "$OPENCODE_PROJECT_DIR"
           acd wake \
             --session-id "$OPENCODE_SESSION_ID" \
             --repo "$OPENCODE_PROJECT_DIR"
@@ -22,6 +27,11 @@ hooks:
     event: tool.after.*
     actions:
       - bash: |
+          acd start \
+            --session-id "$OPENCODE_SESSION_ID" \
+            --harness opencode \
+            --watch-pid "$PPID" \
+            --repo "$OPENCODE_PROJECT_DIR"
           acd wake \
             --session-id "$OPENCODE_SESSION_ID" \
             --repo "$OPENCODE_PROJECT_DIR"

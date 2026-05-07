@@ -67,15 +67,16 @@ timing come from the tool that committed first. `acd status` will show
 
 ## Codex ACD hook
 
-The Codex harness (`acd setup codex`) installs `~/.codex/hooks.json` (Codex
-hooks v2) wiring `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, and `Stop`. `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`
-run idempotent `acd start` before `acd wake`, so later activity can recover if
-the daemon was manually stopped inside an already-open Codex session. `Stop`
-calls `acd touch` (mirrors claude-code) so the daemon survives end-of-turn until
-the refcount sweep cleans up after Codex exits. If Codex itself also has an
-auto-commit plugin active, the same idempotent publish logic applies: `acd`
-detects the already-landed commit and settles without creating a duplicate.
+Harness active hooks (`UserPromptSubmit` / `PreToolUse` / `PostToolUse` /
+tool-before / tool-after, depending on the harness) run idempotent `acd start`
+before `acd wake`, so later activity can recover if the daemon was manually
+stopped inside an already-open session. End-session behavior remains
+harness-specific: Claude Code, OpenCode, and Pi deregister with
+`acd stop --session-id`; Codex `Stop` calls `acd touch` so the daemon survives
+end-of-turn until the refcount sweep cleans up after Codex exits. If Codex
+itself also has an auto-commit plugin active, the same idempotent publish logic
+applies: `acd` detects the already-landed commit and settles without creating a
+duplicate.
 
 ---
 
