@@ -1,11 +1,31 @@
 package adapter
 
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
 // pathSpec binds a config path candidate to the marker strings that prove
 // acd installed it. Different paths for the same harness can use different
 // marker syntaxes (e.g., codex JSON vs TOML).
 type pathSpec struct {
 	path    string
 	markers []string
+}
+
+func fileContainsAny(path string, markers []string) bool {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	text := string(body)
+	for _, m := range markers {
+		if strings.Contains(text, m) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
