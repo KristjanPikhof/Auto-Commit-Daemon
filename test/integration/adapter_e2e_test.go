@@ -373,62 +373,43 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	return out
 }
 
-// parseCodexSnippet walks the codex TOML snippet (avoids a TOML dependency).
-// Codex schema: [[hooks.<EventName>]] is a matcher group, and the runnable
-// handler lives in [[hooks.<EventName>.hooks]] with `type` and `command`. The
-// outer [[hooks.X]] establishes Event; the inner [[hooks.X.hooks]] block
-// supplies the `command` we exec.
-func parseCodexSnippet(t *testing.T, body string) []hookSpec {
+// parseCodexHooksJSON walks the codex hooks.json snippet and returns one
+// hookSpec per registered command. The schema mirrors claude-code:
+// hooks.<EventName> is an array of entries, each with optional matcher and a
+// hooks array of {type, timeout, command} handlers.
+func parseCodexHooksJSON(t *testing.T, body string) []hookSpec {
 	t.Helper()
-	lines := strings.Split(body, "\n")
+	var doc struct {
+		Hooks map[string][]struct {
+			Matcher *string `json:"matcher,omitempty"`
+			Hooks   []struct {
+				Type    string `json:"type"`
+				Timeout int    `json:"timeout"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("parse codex hooks.json: %v\nbody:\n%s", err, body)
+	}
 	var hooks []hookSpec
-	var curEvent string
-	var cur hookSpec
-	flush := func() {
-		if cur.Command != "" {
-			hooks = append(hooks, cur)
-		}
-		cur = hookSpec{}
-	}
-	for _, raw := range lines {
-		line := strings.TrimSpace(raw)
-		switch {
-		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, ".hooks]]"):
-			// Inner handler block; closes any in-flight handler under the same event.
-			flush()
-			cur.Event = curEvent
-		case strings.HasPrefix(line, "[[hooks.") && strings.HasSuffix(line, "]]"):
-			// Outer matcher block: [[hooks.SessionStart]] etc. Capture event name.
-			flush()
-			inner := strings.TrimSuffix(strings.TrimPrefix(line, "[[hooks."), "]]")
-			curEvent = inner
-		case strings.HasPrefix(line, "command"):
-			cur.Command = stripTOMLValue(line)
+	for ev, entries := range doc.Hooks {
+		for _, entry := range entries {
+			for _, h := range entry.Hooks {
+				if h.Command == "" {
+					continue
+				}
+				hooks = append(hooks, hookSpec{
+					Event:   ev,
+					Command: h.Command,
+				})
+			}
 		}
 	}
-	flush()
 	if len(hooks) == 0 {
-		t.Fatalf("codex snippet contained no hook handlers:\n%s", body)
+		t.Fatalf("codex hooks.json snippet contained no handlers:\n%s", body)
 	}
 	return hooks
-}
-
-// stripTOMLValue extracts the quoted value of `key = "value"`.
-func stripTOMLValue(line string) string {
-	if i := strings.Index(line, "="); i >= 0 {
-		v := strings.TrimSpace(line[i+1:])
-		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-			// Re-interpret the TOML escape vocabulary we actually use:
-			// the snippets only escape \" and \\ — Go's strconv.Unquote
-			// handles both correctly when the body is a valid Go literal.
-			out := v[1 : len(v)-1]
-			out = strings.ReplaceAll(out, `\"`, `"`)
-			out = strings.ReplaceAll(out, `\\`, `\`)
-			return out
-		}
-		return v
-	}
-	return ""
 }
 
 // parseYAMLBashBlocks extracts every `bash: |` heredoc block from an
