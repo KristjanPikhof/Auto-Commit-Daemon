@@ -94,6 +94,25 @@ func Lookup(name string) (Harness, bool) {
 	return nil, false
 }
 
+// PrimaryPathMatchesMarker reports whether `body` contains a marker
+// registered for the harness's primary candidate path. Doctor uses this to
+// avoid cross-format false positives (e.g., a TOML marker string inside a
+// JSON config).
+func PrimaryPathMatchesMarker(harnessName string, body []byte) bool {
+	for _, h := range knownHarnesses {
+		if h.name != harnessName || len(h.paths) == 0 {
+			continue
+		}
+		text := string(body)
+		for _, m := range h.paths[0].markers {
+			if strings.Contains(text, m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // CodexInstalls reports whether the user-scoped Codex hooks.json carries the
 // JSON acd marker and whether the legacy ~/.codex/config.toml still carries
 // the TOML acd marker. Used by `acd doctor` to warn about shadowed installs.
