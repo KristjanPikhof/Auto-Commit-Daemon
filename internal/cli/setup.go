@@ -29,7 +29,7 @@ type harnessSnippet struct {
 
 var harnessSnippets = map[string]harnessSnippet{
 	"claude-code": {"claude-code/settings.snippet.json", "//"},
-	"codex":       {"codex/config.snippet.toml", "#"},
+	"codex":       {"codex/hooks.json", "//"},
 	"opencode":    {"opencode/hooks.snippet.yaml", "#"},
 	"pi":          {"pi/hooks.snippet.yaml", "#"},
 	// shell prints both snippet files separated by a divider.

@@ -56,3 +56,121 @@ func TestNamesIncludesSupportedHarnessesInOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestDetectInstalled_CodexHooksJSONMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "codex" {
+		t.Fatalf("DetectInstalled=%#v, want codex only", got)
+	}
+	h, _ := Lookup("codex")
+	if path := h.ConfigPath(); path != hooks {
+		t.Fatalf("ConfigPath=%q, want %q", path, hooks)
+	}
+}
+
+func TestDetectInstalled_CodexLegacyTOMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(cfg, []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "codex" {
+		t.Fatalf("DetectInstalled=%#v, want codex only", got)
+	}
+}
+
+func TestDetectInstalled_CodexHooksJSONIgnoresTOMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"comment":"acd-managed: true"}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none (TOML marker must not match JSON path)", got)
+	}
+}
+
+func TestDetectInstalled_CodexConfigTOMLIgnoresJSONMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cfg := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(cfg, []byte(`note = "\"_acd_managed\": true"`), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none (JSON marker must not match TOML path)", got)
+	}
+}
+
+func TestCodexInstalls_BothShadow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+
+	jsonOK, tomlOK := CodexInstalls()
+	if !jsonOK || !tomlOK {
+		t.Fatalf("CodexInstalls jsonOK=%v tomlOK=%v, want both true", jsonOK, tomlOK)
+	}
+}
+
+func TestCodexInstalls_NeitherFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	jsonOK, tomlOK := CodexInstalls()
+	if jsonOK || tomlOK {
+		t.Fatalf("CodexInstalls jsonOK=%v tomlOK=%v, want both false", jsonOK, tomlOK)
+	}
+}
+
+func TestCodexInstalls_OnlyJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed":true}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	jsonOK, tomlOK := CodexInstalls()
+	if !jsonOK || tomlOK {
+		t.Fatalf("CodexInstalls jsonOK=%v tomlOK=%v, want jsonOK=true tomlOK=false", jsonOK, tomlOK)
+	}
+}
