@@ -13,7 +13,7 @@ make fmt
 make tidy
 ```
 
-Required gate before done/PR:
+Pre-PR gate:
 
 ```bash
 make lint
