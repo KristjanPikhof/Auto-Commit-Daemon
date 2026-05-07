@@ -28,7 +28,7 @@ go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest
 
 ~~~bash
 acd setup claude-code   # paste output into ~/.claude/settings.json
-acd setup codex         # paste output into ~/.config/codex/config.toml
+acd setup codex         # save output to ~/.codex/hooks.json
 acd setup opencode      # paste output into your OpenCode-Hooks hooks.yaml
 acd setup pi            # paste output into your .pi/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
