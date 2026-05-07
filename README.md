@@ -411,7 +411,7 @@ Notes:
 ## Status
 
 Active development. 
-- First tag: `v2026-04-28` - Last tag: `v2026-05-05-04`
+- First tag: `v2026-04-28` - Last tag: `v2026-05-08`
 
 ## License
 
