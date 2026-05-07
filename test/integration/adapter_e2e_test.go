@@ -662,6 +662,46 @@ func runCodexE2E(t *testing.T, bin string) {
 	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
 }
 
+// runCodexLegacyTOMLAutoDetect ensures `acd setup` with no harness arg still
+// resolves to codex when only the legacy `~/.codex/config.toml` carries the
+// acd marker (hooks.json absent). Codex hooks v2 added hooks.json discovery
+// but must keep the legacy TOML install detectable.
+func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
+	binDir := filepath.Dir(bin)
+	base := withIsolatedHome(t)
+	home := ""
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		t.Fatal("isolated HOME missing from env")
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"),
+		[]byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	env := envWith(base,
+		"PATH="+binDir+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res := runAcd(t, ctx, env, "setup")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd setup auto-detect with legacy codex TOML exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "acd setup codex") {
+		t.Fatalf("auto-detect should pick codex; output:\n%s", res.Stdout)
+	}
+}
+
 func runCodexMissingAcdWritesHookLog(t *testing.T) {
 	body := readSnippet(t, "codex/hooks.json")
 	hooks := parseCodexHooksJSON(t, body)
