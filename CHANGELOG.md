@@ -2,85 +2,40 @@
 
 ## Unreleased
 
+### Added
+
+- `acd commit-all` can capture and replay a dirty worktree without starting the
+  persistent daemon. It is meant for cold starts, repos where the daemon was off,
+  and onboarding existing work into ACD history. It supports `--dry-run`, `--yes`,
+  `--json`, and `--repo`, refuses unsafe git states, and uses the active commit
+  strategy instead of adding a separate strategy flag.
+
 ### Changed
 
-- **Codex hooks v2 (breaking).** `acd setup codex` now emits
-  `~/.codex/hooks.json` instead of the legacy `[[hooks.*]]` TOML snippet,
-  matching the order Codex now uses for hook discovery (`hooks.json` wins
-  over `config.toml`). All five Codex hook events are wired:
-  `SessionStart -> acd start` (timeout 15s), `UserPromptSubmit -> idempotent
-  acd start, then acd wake` (15s), `PreToolUse` and `PostToolUse -> idempotent
-  acd start, then acd wake` (matcher `apply_patch|Edit|Write|Bash`, 15s each),
-  and `Stop -> acd touch` (5s)
-  mirroring the claude-code pattern so the daemon survives end-of-turn
-  while replay drains. `_acd_managed: true` at the top level is the
-  managed-install marker. `cwd` is sourced from the JSON `cwd` field on
-  stdin via `acd hook-stdin-extract session_id cwd? <&0`;
-  `CODEX_PROJECT_DIR` is no longer required, and `printf "{}\n"` is gone.
-  Adapter detection now matches per path (JSON markers for `hooks.json`,
-  TOML markers for `config.toml`) across user-scoped Codex config paths. `acd doctor`
-  warns when both `~/.codex/hooks.json` and a legacy Codex TOML config carry
-  acd markers. Codex actually merges every hook source it finds, so
-  leaving both files installed fires every event twice; `acd doctor`
-  surfaces this as "Codex merges all hook sources and will fire each
-  event twice (doubled acd start/wake/touch)." **Migration:** run
-  `acd setup codex --raw > ~/.codex/hooks.json` (the new `--raw` flag
-  emits the snippet without `// `-wrapped instructions, which JSON does
-  not allow), delete the `# acd-managed: true` block from
-  `~/.codex/config.toml`, then run `/hooks` inside Codex to approve
-  the five newly-installed hook entries — Codex now flags every
-  newly-added hook as "review required" and refuses to run them until
-  the user approves. Codex also deprecated
-  `[features].codex_hooks = true` in favor of `[features].hooks = true`;
-  `hooks.json` does not need a `[features]` block, but legacy TOML
-  users should rename the flag.
-  `acd hook-stdin-extract` now accepts multiple field arguments, emits one scalar
-  per line in argument order, and supports optional fields with a `?` suffix; the
-  single-arg form is unchanged.
-- Claude Code, OpenCode, and Pi active hooks now match Codex's self-healing
-  pattern: tool/prompt activity runs idempotent `acd start` before `acd wake`,
-  so ACD restarts after a manual `acd stop` without waiting for a brand-new
-  harness session. Their end-session hooks still deregister with
-  `acd stop --session-id`; Codex keeps `Stop -> acd touch` to avoid stopping
-  mid-replay drain.
-- `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
-  commit strategy by resolving daemon `commit.strategy` meta first, then the
-  `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
-  values no longer leak into the report; they emit a slog warning and the
-  env-derived strategy is shown instead. New helper
-  `cli.ResolveEffectiveCommitStrategy` centralizes this resolution so
-  `commit-all`, intent observability, and any future read-only consumers
-  agree on what is active.
+- **Codex hooks v2 is a breaking setup change.** `acd setup codex` now writes
+  `~/.codex/hooks.json` instead of the legacy TOML hook snippet. To migrate,
+  run `acd setup codex --raw > ~/.codex/hooks.json`, remove the old
+  `# acd-managed: true` block from `~/.codex/config.toml`, then approve the new
+  hooks with `/hooks` inside Codex. `acd doctor` now warns when both old and new
+  Codex hook configs are installed, because Codex will run both.
+- Codex hooks now read `cwd` from hook stdin, no longer require
+  `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the
+  hook payload. The helper also supports multiple fields and optional fields.
+- Claude Code, Codex, OpenCode, and Pi active hooks now run idempotent
+  `acd start` before `acd wake`. ACD can recover after a manual `acd stop`
+  without waiting for a brand-new harness session.
+- `acd status`, `acd diagnose`, and `acd doctor` now report the effective commit
+  strategy from daemon metadata first, then `ACD_COMMIT_STRATEGY`, then the
+  default. Unknown daemon values fall back to the environment-derived strategy
+  and emit a warning instead of leaking into user output.
 
 ### Fixed
 
 - `acd commit-all` now force-reseeds `shadow_paths` from `HEAD` and drops
-  stale `pending` capture events for the active `(branch_ref,
-  branch_generation)` before capturing. Previously, when a prior daemon
-  session had absorbed worktree edits into shadow without successfully
-  replaying them, the bootstrap marker was already set; `commit-all` saw a
-  shadow that mirrored live state, captured zero events, and reported
-  `Commits: 0; no pending events; worktree already clean` while the
-  worktree was still dirty. The fix exposes a new
-  `state.DeletePendingForBranchGeneration` helper, switches `commit-all`
-  to `daemon.ReseedShadowFromHead`, and surfaces a `dropped_stale_pending`
-  count plus a `shadow reseeded from HEAD` note in the JSON and human
-  output.
-
-### Added
-
-- `acd commit-all`: one-shot command that captures every uncommitted file in
-  the worktree and replays them as commits without starting the persistent
-  daemon. Useful for cold starts, dirty repos after the daemon was off, and
-  onboarding an existing worktree into ACD history. Files are sorted
-  lexicographically by path so sibling files cluster together in the commit
-  sequence and the intent planner sees coherent windows of related siblings.
-  The active commit strategy is read from existing config; there is no
-  `--strategy` override. Flags: `--dry-run` (plan without committing),
-  `--yes` (skip confirmation), `--json` (machine-readable output, requires
-  `--yes`), `--repo`. Refuses to run on detached HEAD, during active git
-  operations (rebase, merge, cherry-pick, bisect), while a manual pause marker
-  is present, or while the per-repo daemon is running.
+  stale pending capture events before capture. It no longer reports a clean
+  worktree when an earlier daemon session had absorbed unreplayed edits into
+  shadow state. Human and JSON output now show the reseed note and
+  `dropped_stale_pending` count.
 
 ## v2026-05-06
 
