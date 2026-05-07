@@ -25,9 +25,9 @@ rename the feature flag to silence the deprecation warning.
 `hooks.json` registers all five Codex hook events:
 
 - `SessionStart` -> `acd start` (timeout 15s)
-- `UserPromptSubmit` -> idempotent `acd start`, then `acd wake` (timeout 5s)
-- `PreToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
-- `PostToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 5s)
+- `UserPromptSubmit` -> idempotent `acd start`, then `acd wake` (timeout 15s)
+- `PreToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 15s)
+- `PostToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 15s)
 - `Stop` -> `acd touch` (timeout 5s)
 
 `Stop` calls `acd touch` (mirrors the claude-code adapter) so the daemon is

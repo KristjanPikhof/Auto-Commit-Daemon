@@ -9,8 +9,8 @@
   matching the order Codex now uses for hook discovery (`hooks.json` wins
   over `config.toml`). All five Codex hook events are wired:
   `SessionStart -> acd start` (timeout 15s), `UserPromptSubmit -> idempotent
-  acd start, then acd wake` (5s), `PreToolUse` and `PostToolUse -> idempotent
-  acd start, then acd wake` (matcher `apply_patch|Edit|Write|Bash`, 5s each),
+  acd start, then acd wake` (15s), `PreToolUse` and `PostToolUse -> idempotent
+  acd start, then acd wake` (matcher `apply_patch|Edit|Write|Bash`, 15s each),
   and `Stop -> acd touch` (5s)
   mirroring the claude-code pattern so the daemon survives end-of-turn
   while replay drains. `_acd_managed: true` at the top level is the
