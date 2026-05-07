@@ -617,7 +617,7 @@ func TestDoctorBundleReadsPreDecisionLedgerDBReadOnly(t *testing.T) {
 	}
 }
 
-func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
+func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	t.Setenv(ai.EnvProvider, "")
@@ -633,8 +633,8 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"hooks":[]}`), 0o600); err != nil {
-		t.Fatalf("write legacy codex hooks: %v", err)
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
 	}
 
 	var jsonOut bytes.Buffer
@@ -650,11 +650,14 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
 		t.Fatalf("claude-code install report wrong: %+v", claude)
 	}
 	codex := findDoctorHarness(t, rep, "codex")
-	if codex.Installed || codex.MarkerFound {
-		t.Fatalf("codex should be absent when only hooks.json exists: %+v", codex)
+	if !codex.Installed || !codex.MarkerFound {
+		t.Fatalf("codex hooks.json install report wrong: %+v", codex)
 	}
-	if !strings.Contains(strings.Join(codex.Notes, "\n"), "legacy ~/.codex/hooks.json exists") {
-		t.Fatalf("codex legacy hooks warning missing: %+v", codex)
+	if !strings.HasSuffix(codex.ConfigPath, "/.codex/hooks.json") {
+		t.Fatalf("codex ConfigPath=%q, want ~/.codex/hooks.json", codex.ConfigPath)
+	}
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "legacy") {
+		t.Fatalf("codex should not show legacy warning when only hooks.json exists: %+v", codex)
 	}
 
 	var humanOut bytes.Buffer
@@ -662,10 +665,73 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexLegacy(t *testing.T) {
 		t.Fatalf("runDoctor human: %v", err)
 	}
 	body := humanOut.String()
-	for _, want := range []string{"Install", "claude-code : yes", "codex       : no", "legacy ~/.codex/hooks.json exists"} {
+	for _, want := range []string{"Install", "claude-code : yes", "codex       : yes"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("human doctor missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed: %+v", codex)
+	}
+	got := strings.Join(codex.Notes, "\n")
+	if !strings.Contains(got, "legacy ~/.codex/config.toml acd-managed block shadows new hooks.json") {
+		t.Fatalf("codex shadow warning missing: %+v", codex)
+	}
+}
+
+func TestDoctor_NoCodexShadowWhenOnlyOneFile(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "shadows new hooks.json") {
+		t.Fatalf("no shadow warning expected when only legacy config.toml exists: %+v", codex)
 	}
 }
 

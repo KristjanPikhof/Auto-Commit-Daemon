@@ -273,7 +273,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		case err == nil:
 			hr.ConfigPresent = true
 			hr.ConfigReadable = true
-			hr.MarkerFound = configHasACDMarker(body)
+			hr.MarkerFound = adapter.PrimaryPathMatchesMarker(name, body)
 			hr.Installed = hr.MarkerFound
 		case errors.Is(err, os.ErrNotExist):
 			if detected[name] {
@@ -286,22 +286,14 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		}
 
 		if name == "codex" {
-			home, _ := os.UserHomeDir()
-			legacyPath := filepath.Join(home, ".codex", "hooks.json")
-			if fileExists(legacyPath) {
-				hr.Notes = append(hr.Notes, "legacy ~/.codex/hooks.json exists; Codex also loads ~/.codex/config.toml, remove stale hooks.json after installing the toml snippet")
+			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
+			if jsonOK && legacyTOMLOK {
+				hr.Notes = append(hr.Notes, "legacy ~/.codex/config.toml acd-managed block shadows new hooks.json; remove the legacy block from config.toml")
 			}
 		}
 		reports = append(reports, hr)
 	}
 	return reports
-}
-
-func configHasACDMarker(body []byte) bool {
-	text := string(body)
-	return strings.Contains(text, `"_acd_managed": true`) ||
-		strings.Contains(text, `"_acd_managed":true`) ||
-		strings.Contains(text, "acd-managed: true")
 }
 
 func collectDoctorAI() doctorAIReport {
