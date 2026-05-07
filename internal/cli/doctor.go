@@ -288,7 +288,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		if name == "codex" {
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
-				hr.Notes = append(hr.Notes, "legacy ~/.codex/config.toml acd-managed block shadows new hooks.json; remove the legacy block from config.toml")
+				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and ~/.codex/config.toml carry acd markers; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
 			}
 		}
 		reports = append(reports, hr)

@@ -20,11 +20,20 @@
   TOML markers for `config.toml`), and includes repo-local
   `<repo>/.codex/hooks.json` and `<repo>/.codex/config.toml`. `acd doctor`
   warns when both `~/.codex/hooks.json` and `~/.codex/config.toml` carry
-  acd markers (legacy TOML shadows the new file). **Migration:** run
+  acd markers. Codex actually merges every hook source it finds, so
+  leaving both files installed fires every event twice; `acd doctor`
+  surfaces this as "Codex merges all hook sources and will fire each
+  event twice (doubled acd start/wake/touch)." **Migration:** run
   `acd setup codex --raw > ~/.codex/hooks.json` (the new `--raw` flag
   emits the snippet without `// `-wrapped instructions, which JSON does
-  not allow), then delete the `# acd-managed: true` block from
-  `~/.codex/config.toml`.
+  not allow), delete the `# acd-managed: true` block from
+  `~/.codex/config.toml`, then run `/hooks` inside Codex to approve
+  the five newly-installed hook entries — Codex now flags every
+  newly-added hook as "review required" and refuses to run them until
+  the user approves. Codex also deprecated
+  `[features].codex_hooks = true` in favor of `[features].hooks = true`;
+  `hooks.json` does not need a `[features]` block, but legacy TOML
+  users should rename the flag.
   `acd hook-stdin-extract` now accepts multiple field arguments and
   emits one scalar per line in argument order; the single-arg form is
   unchanged.

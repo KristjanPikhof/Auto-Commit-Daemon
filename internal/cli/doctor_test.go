@@ -702,8 +702,8 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 		t.Fatalf("codex should be installed: %+v", codex)
 	}
 	got := strings.Join(codex.Notes, "\n")
-	if !strings.Contains(got, "legacy ~/.codex/config.toml acd-managed block shadows new hooks.json") {
-		t.Fatalf("codex shadow warning missing: %+v", codex)
+	if !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+		t.Fatalf("codex duplicate-hook warning missing: %+v", codex)
 	}
 }
 
@@ -730,8 +730,8 @@ func TestDoctor_NoCodexShadowWhenOnlyOneFile(t *testing.T) {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
 	codex := findDoctorHarness(t, rep, "codex")
-	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "shadows new hooks.json") {
-		t.Fatalf("no shadow warning expected when only legacy config.toml exists: %+v", codex)
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "Codex merges all hook sources") {
+		t.Fatalf("no duplicate-hook warning expected when only legacy config.toml exists: %+v", codex)
 	}
 }
 
