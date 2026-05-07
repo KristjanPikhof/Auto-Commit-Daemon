@@ -625,6 +625,30 @@ func runCodexE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
 
+	// Missing cwd falls back to the hook process working directory rather than
+	// silently skipping the hook.
+	fallbackRepo := tempRepo(t)
+	fallbackSessionID := "e2e-codex-pwd-fallback"
+	fallbackStdin := fmt.Sprintf(`{"session_id":"%s"}`, fallbackSessionID)
+	fallbackCommand := "cd " + shellQuote(fallbackRepo) + " && " + startHook.Command
+	fallbackRes := runBash(t, ctx, env, fallbackStdin, fallbackCommand)
+	if fallbackRes.ExitCode != 0 {
+		t.Fatalf("codex SessionStart without cwd exit=%d\nstdout=%s\nstderr=%s",
+			fallbackRes.ExitCode, fallbackRes.Stdout, fallbackRes.Stderr)
+	}
+	waitFor(t, "codex daemon mode==running with pwd fallback", 10*time.Second, func() bool {
+		return readDaemonStateMode(fallbackRepo) == "running"
+	})
+	assertClientRow(t, fallbackRepo, fallbackSessionID, "codex", 5*time.Second)
+	fallbackStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(fallbackSessionID)+
+			" --repo "+shellQuote(fallbackRepo)+" --force >/dev/null 2>&1")
+	if fallbackStop.ExitCode != 0 {
+		t.Fatalf("codex fallback stop exit=%d\nstdout=%s\nstderr=%s",
+			fallbackStop.ExitCode, fallbackStop.Stdout, fallbackStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, "codex pwd-fallback daemon stopped", fallbackRepo)
+
 	// UserPromptSubmit -> acd wake.
 	upHook := pickHookByEvent(t, hooks, "UserPromptSubmit")
 	if upRes := runBash(t, ctx, env, stdin, upHook.Command); upRes.ExitCode != 0 {
