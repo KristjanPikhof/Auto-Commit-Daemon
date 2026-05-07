@@ -24,7 +24,7 @@ go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal
 
 Pre-existing main flakes (verify there before fixing): `TestReplay_*` skipped via `intent_batch_wait`; `TestDiagnose_IntentBatchWait*`; `TestDoctor_IntentBatchWait*`; `TestSelfHeal_ParallelCommitterDoesNotBlock`; `TestSelfHeal_ManualPauseAndResume`.
 
-Release smoke (ask before install):
+Release (ask first):
 
 ```bash
 make build && install -m 0755 ./bin/acd ~/.local/bin/acd
