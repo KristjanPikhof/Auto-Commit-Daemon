@@ -22,7 +22,7 @@ go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
 go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal/pause/... ./internal/cli/... -race -count=3 -timeout 10m
 ```
 
-Pre-existing flakes on main (verify before fixing): `TestReplay_*` skipped via `intent_batch_wait`, `TestDiagnose_IntentBatchWait*`, `TestDoctor_IntentBatchWait*`, `TestSelfHeal_ParallelCommitterDoesNotBlock`, `TestSelfHeal_ManualPauseAndResume`.
+Pre-existing main flakes (verify there before fixing): `TestReplay_*` skipped via `intent_batch_wait`; `TestDiagnose_IntentBatchWait*`; `TestDoctor_IntentBatchWait*`; `TestSelfHeal_ParallelCommitterDoesNotBlock`; `TestSelfHeal_ManualPauseAndResume`.
 
 Release smoke (ask before install):
 
