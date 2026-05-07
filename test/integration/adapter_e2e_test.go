@@ -65,6 +65,7 @@ func TestAdapterE2E(t *testing.T) {
 	t.Run("codex", func(t *testing.T) {
 		runCodexE2E(t, bin)
 		runCodexMissingAcdWritesHookLog(t)
+		runCodexLegacyTOMLAutoDetect(t, bin)
 	})
 	t.Run("opencode", func(t *testing.T) {
 		runOpencodeE2E(t, bin)
