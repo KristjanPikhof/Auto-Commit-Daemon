@@ -345,11 +345,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	clients, _ := state.CountClients(ctx, db)
 	if daemonPID > 0 {
 		var startTS, argvHash string
-		// Indirected through captureDaemonFingerprint so unit tests that
-		// stub the short-circuit reader's fingerprint stub also pin the
-		// cold-path writer's stamp; production callers leave it at the
-		// identity.CaptureContext default.
-		if fp, ferr := captureDaemonFingerprint(ctx, daemonPID); ferr == nil && !fp.Empty() {
+		if fp, ferr := identity.CaptureContext(ctx, daemonPID); ferr == nil && !fp.Empty() {
 			startTS = fp.StartTime
 			argvHash = fp.ArgvHash
 		}
