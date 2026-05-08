@@ -5,6 +5,12 @@
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
 2. Generate snippet: `acd setup claude-code`
 3. Merge the printed JSON into `~/.claude/settings.json` under the `hooks` key
+
+   **Overwrite warning:** if you redirect `acd setup claude-code --raw` straight
+   to `~/.claude/settings.json` with `>`, the entire file is replaced. If you
+   have other settings or non-acd hooks in that file, back it up first and merge
+   the acd JSON block in manually rather than using `>`.
+
 4. Restart Claude Code
 
 If you previously installed a snippet that predates the v2026-05-08 release,

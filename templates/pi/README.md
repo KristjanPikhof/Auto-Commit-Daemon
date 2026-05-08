@@ -7,6 +7,12 @@ For [`KristjanPikhof/pi-yaml-hooks`](https://github.com/KristjanPikhof/pi-yaml-h
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
 2. Generate snippet: `acd setup pi`
 3. Merge the printed YAML into `~/.pi/hook/hooks.yaml`
+
+   **Overwrite warning:** if you redirect `acd setup pi --raw` straight to
+   `~/.pi/hook/hooks.yaml` with `>`, the entire file is replaced. If you have
+   other hooks or settings in that file, back it up first and merge the acd YAML
+   block in manually rather than using `>`.
+
 4. Restart Pi
 
 If you previously installed a snippet that predates the v2026-05-08 release,
