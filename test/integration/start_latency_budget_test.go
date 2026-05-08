@@ -12,25 +12,32 @@ import (
 	"time"
 )
 
-// TestStartLatencyBudget_RepeatedActiveHooks asserts the perf-lane
-// short-circuit is actually wired: against an already-running daemon, five
-// sequential `acd start` invocations from the same session_id (the active-
-// hook pattern Claude Code, Codex, OpenCode, and Pi all emit) each
-// complete under the budget below.
+// TestStartLatencyBudget_RepeatedActiveHooks asserts that the registry-
+// read short-circuit is wired AND meaningfully faster than the cold
+// path. The test runs in two phases:
 //
-// Budget rationale: the cold path takes flock(control.lock) +
-// state.Open(SQLite) + 4-5 SQLite roundtrips + flock(registry) +
-// atomic-write(registry.json). On a quiet macOS box that lands at ~30-60ms
-// per call. The short-circuit replaces that with a single os.ReadFile,
-// a single central.Load (no flock), and a kill(pid, 0) — comfortably
-// under 5ms. We pick a budget of 1s per call so the test is robust on
-// noisy CI runners but still flags genuine regressions (a
-// 50ms-per-call regression across 5 hooks is 250ms aggregate, well
-// under budget; a regression that re-introduces the 30s control.lock
-// timeout would wedge a single call >>1s and fail loudly).
+//  1. Cold path: stop any prior daemon, then time `acd start` against an
+//     empty registry. This call performs flock(control.lock) +
+//     state.Open(SQLite) + RegisterClient + LoadDaemonState +
+//     spawnDaemon (fork/exec) + spawn-poll + central registry rewrite.
+//     We measure this so the hot path can be compared apples-to-apples
+//     under the same hardware/IO conditions.
 //
-// The first call is the cold path that writes the start-cache; calls 2-5
-// must be short-circuited and observably faster than the cold path.
+//  2. Hot path: 10 sequential `acd start` calls under the same
+//     session_id. Each must short-circuit (Started=false, Duplicate=true)
+//     and complete within `perCallBudget`. Aggregate must beat the
+//     `aggregateBudget`. Each individual hot call must also beat
+//     `cold / minSpeedupFactor`, pinning the documented 50ms-vs-1s
+//     budget claim.
+//
+// Budget rationale: cold path on a quiet macOS box is ~30-200ms (mostly
+// fork+exec). Hot path replaces all of that with one os.ReadFile, one
+// central.Load (no flock), one kill(0), one ps, and one TouchClient
+// UPDATE — comfortably under 50ms on the same hardware. We pick a
+// per-call budget of 200ms (4x measured) so the test is robust on noisy
+// CI runners but still flags genuine regressions, and require hot/cold
+// speedup of at least 1.5x so a regression that makes the hot path
+// equivalent to the cold path fails loudly.
 func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not found in PATH; required for daemon_state probes")
@@ -39,11 +46,25 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Cold path: spawn the daemon. This is NOT counted against the budget
-	// (it includes a fork+exec).
+	const (
+		hooks            = 10
+		perCallBudget    = 200 * time.Millisecond
+		aggregateBudget  = 1500 * time.Millisecond
+		minSpeedupFactor = 1.5 // hot < cold / minSpeedupFactor
+	)
+
+	// Phase 1: time the cold path. We force a real cold start by
+	// stopping any pre-existing daemon (none should exist in a fresh
+	// $HOME, but the call is idempotent) and timing a fresh `acd start`.
+	stopRes := runAcd(t, ctx, env, "stop", "--repo", repo, "--force", "--json")
+	if stopRes.ExitCode != 0 && !strings.Contains(stopRes.Stderr, "no daemon") {
+		t.Logf("pre-cold stop exit=%d (ignored): %s", stopRes.ExitCode, stopRes.Stderr)
+	}
+
+	coldStart := time.Now()
 	cold := runAcd(t, ctx, env,
 		"start",
 		"--session-id", "session-budget",
@@ -51,9 +72,10 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		"--harness", "claude-code",
 		"--json",
 	)
+	coldDuration := time.Since(coldStart)
 	if cold.ExitCode != 0 {
-		t.Fatalf("cold start exit=%d\nstdout=%s\nstderr=%s",
-			cold.ExitCode, cold.Stdout, cold.Stderr)
+		t.Fatalf("cold start exit=%d after %v\nstdout=%s\nstderr=%s",
+			cold.ExitCode, coldDuration, cold.Stdout, cold.Stderr)
 	}
 	var coldJSON struct {
 		Started   bool `json:"started"`
@@ -67,28 +89,18 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	}
 
 	// Wait until daemon_state.mode == "running" so the daemon is fully
-	// alive when we time the active-hook calls. (A short-circuit-ed call
-	// does not depend on this — the first call already succeeded — but
-	// a wedged daemon is an unrelated bug.)
+	// alive when we time the active-hook calls.
 	waitFor(t, "daemon mode=running", 5*time.Second, func() bool {
 		return readDaemonStateMode(repo) == "running"
 	})
 
-	// Five sequential active-hook style invocations. Each must complete
-	// under perCallBudget; aggregate must complete under aggregateBudget
-	// (a tighter check that catches "every call is just barely under
-	// budget but together they're slow" regressions).
-	const (
-		hooks            = 5
-		perCallBudget    = 1 * time.Second
-		aggregateBudget  = 3 * time.Second
-		minSpeedupFactor = 1.5 // each hot call should beat cold by ≥1.5x
-	)
-	coldDuration := time.Duration(0)
-	// Re-time the cold call by running one more cold-equivalent, but it's
-	// hard to reset to a true cold state without stopping/restarting the
-	// daemon; instead measure the FIRST short-circuited call as the
-	// "fast-path baseline" and require subsequent calls to be no slower.
+	// Phase 2: hot-path measurement. The first hot call exercises the
+	// full short-circuit path (cache read + central.Load + kill(0) + ps
+	// fingerprint + TouchClient UPDATE).
+	hotBudget := time.Duration(float64(coldDuration) / minSpeedupFactor)
+	t.Logf("cold path took %v; hot must be <= %v (cold/%g) AND <= %v (per-call cap)",
+		coldDuration, hotBudget, minSpeedupFactor, perCallBudget)
+
 	durations := make([]time.Duration, 0, hooks)
 	for i := 0; i < hooks; i++ {
 		start := time.Now()
@@ -104,7 +116,6 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 			t.Fatalf("hook %d exit=%d after %v\nstdout=%s\nstderr=%s",
 				i, res.ExitCode, dur, res.Stdout, res.Stderr)
 		}
-		// The short-circuit returns Duplicate=true with the cached pid.
 		var hot struct {
 			Started   bool `json:"started"`
 			Duplicate bool `json:"duplicate"`
@@ -124,7 +135,11 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 				i, hot.DaemonPID, coldJSON.DaemonPID)
 		}
 		if dur > perCallBudget {
-			t.Fatalf("hook %d took %v; budget is %v", i, dur, perCallBudget)
+			t.Fatalf("hook %d took %v; per-call budget is %v", i, dur, perCallBudget)
+		}
+		if dur > hotBudget {
+			t.Fatalf("hook %d took %v; cold-path was %v so hot must be <= %v (cold/%g)",
+				i, dur, coldDuration, hotBudget, minSpeedupFactor)
 		}
 		durations = append(durations, dur)
 	}
@@ -133,21 +148,12 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	for _, d := range durations {
 		total += d
 	}
-	t.Logf("five-hook latency: per-call=%v total=%v budget per=%v total=%v",
-		durations, total, perCallBudget, aggregateBudget)
+	t.Logf("ten-hook latency: cold=%v per-call=%v total=%v (caps: per=%v cold/%.1f=%v total=%v)",
+		coldDuration, durations, total, perCallBudget, minSpeedupFactor, hotBudget, aggregateBudget)
 	if total > aggregateBudget {
 		t.Fatalf("aggregate latency %v exceeds budget %v across %d hooks",
 			total, aggregateBudget, hooks)
 	}
-
-	// Sanity: the short-circuit must be observably cheaper than the cold
-	// fork+exec+flock+SQLite path. We don't have a reliable cold-path
-	// duration on the same daemon, so we use a coarse upper-bound check:
-	// individual hot-path calls should be well under 1s (already
-	// asserted) and aggregate should be well under 5x cold by
-	// inspection (logged above for triage).
-	_ = coldDuration
-	_ = minSpeedupFactor
 
 	// Cleanup: stop the daemon so we do not leak processes between tests.
 	stop := runAcd(t, ctx, env,
