@@ -319,6 +319,32 @@ func waitForStopped(ctx context.Context, db *state.DB, timeout time.Duration) bo
 	return false
 }
 
+// removeAllStartCaches deletes every per-session start-cache file under
+// <gitDir>/acd/. Called when the daemon is fully stopped so no subsequent
+// active hook can short-circuit onto a corpse. Errors are best-effort:
+// the cold path is still safe even if a stale cache lingers (a missing
+// daemon will fail the kill(0) probe and force escalation).
+func removeAllStartCaches(gitDir string) {
+	dir := filepath.Join(gitDir, "acd")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, startCacheFilenamePrefix) {
+			continue
+		}
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".json.tmp") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
 func writeStopResult(out io.Writer, res stopRepoResult, jsonOut bool) error {
 	if jsonOut {
 		enc := json.NewEncoder(out)
