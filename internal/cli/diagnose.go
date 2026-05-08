@@ -328,6 +328,48 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 	return nil
 }
 
+// diagnoseDeadBranchPrune surfaces the daemon-recorded "last non-empty
+// dead-branch prune action" via three meta keys stamped by
+// daemon.recordDeadBranchPruneMeta:
+//
+//   - dead_branch_prune.last_run_ts   unix seconds (string-encoded int)
+//   - dead_branch_prune.last_count    rows pruned (string-encoded int)
+//   - dead_branch_prune.last_refs     JSON-encoded []string of refs
+//
+// Missing keys default to zero / nil; the JSON omitempty on the report fields
+// drops them entirely from `acd diagnose --json` when the daemon has never
+// recorded a non-empty prune. Malformed values fail open: a parse error zeros
+// the affected field and we keep going (a corrupt JSON refs blob does not
+// abort diagnose).
+func diagnoseDeadBranchPrune(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_run_ts"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_run_ts: %w", err)
+	} else if ok && v != "" {
+		if ts, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.DeadBranchPruneLastRunTS = ts
+		}
+		// Parse error -> field stays at zero (omitempty drops it from JSON).
+	}
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_count"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_count: %w", err)
+	} else if ok && v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil {
+			report.DeadBranchPruneLastCount = n
+		}
+	}
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_refs"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_refs: %w", err)
+	} else if ok && v != "" {
+		var refs []string
+		if jerr := json.Unmarshal([]byte(v), &refs); jerr == nil {
+			report.DeadBranchPruneLastRefs = refs
+		}
+		// Malformed JSON -> leave nil; report stays consistent with "no
+		// refs recorded".
+	}
+	return nil
+}
+
 // diagnoseOperationMarker reports whether a git rebase / merge / cherry-pick
 // / bisect marker is currently making the daemon pause and how long it has
 // been doing so. The daemon never auto-clears these markers — operators are
