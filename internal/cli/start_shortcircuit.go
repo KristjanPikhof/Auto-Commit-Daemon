@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,12 +74,29 @@ var captureDaemonFingerprint = func(ctx context.Context, pid int) (identity.Fing
 // callers leave it at the default.
 var shortCircuitNow = func() time.Time { return time.Now() }
 
-// startCachePath returns the per-repo cache path under gitDir. It does NOT
-// create the parent directory — the full runStart path does that under
+// startCachePath returns the per-session cache path under gitDir. It does
+// NOT create the parent directory — the full runStart path does that under
 // control.lock; the short-circuit reader must tolerate a missing directory
 // (and treat that as "cold" / no cache).
-func startCachePath(gitDir string) string {
-	return filepath.Join(gitDir, "acd", startCacheFilename)
+//
+// The filename embeds a sha256 prefix of session_id so concurrent sessions
+// on the same repo never share a cache file. Empty sessionID is tolerated
+// (yields a fixed "empty" suffix) so manual `acd start` from a human can
+// also benefit from the cache; the human-session id is itself derived
+// from the repo hash so cross-session collisions are not possible.
+func startCachePath(gitDir, sessionID string) string {
+	return filepath.Join(gitDir, "acd", startCacheFilenamePrefix+sessionCacheSuffix(sessionID)+".json")
+}
+
+// sessionCacheSuffix is the 16-hex prefix of sha256(session_id). We only
+// take 16 hex chars (64 bits) which is enough to make accidental
+// collisions astronomically unlikely while keeping the filename short.
+func sessionCacheSuffix(sessionID string) string {
+	if sessionID == "" {
+		return "empty"
+	}
+	sum := sha256.Sum256([]byte(sessionID))
+	return hex.EncodeToString(sum[:8])
 }
 
 // readStartCache returns the cache payload or nil if the file is missing,
