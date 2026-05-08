@@ -4,17 +4,17 @@
 
 - Static Go CLI/daemon, MIT, macOS/Linux `arm64`/`amd64`; no Windows v1.
 - Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.22; `modernc.org/sqlite v1.36.0`; release tags `vYYYY-MM-DD`.
-- `AGENTS.md -> CLAUDE.md`; preserve the symlink.
+- `AGENTS.md -> CLAUDE.md`; preserve symlink.
 
 ```bash
 make build      # static bin/acd, CGO_ENABLED=0, -tags=netgo,osusergo
 make test       # go test ./... -race -count=1
-make lint       # go vet ./... + gofmt check
+make lint       # go vet ./... + gofmt
 make fmt        # gofmt -w .
 make tidy       # go mod tidy
 ```
 
-Final/pre-PR gate. Use `cleanenv` when local ACD env may leak into tests:
+Pre-PR gate. `cleanenv` strips local ACD env that leaks into tests:
 
 ```bash
 cleanenv() { env -u ACD_INTENT_MIN_PENDING -u ACD_INTENT_MAX_PENDING_AGE -u ACD_INTENT_WINDOW -u ACD_INTENT_RECENT_COMMITS -u ACD_INTENT_DEFER_LIMIT ACD_COMMIT_STRATEGY=event "$@"; }
@@ -24,7 +24,7 @@ cleanenv go test ./test/integration/... -tags=integration -race -count=1 -timeou
 cleanenv go test ./internal/daemon/... ./internal/git/... ./internal/state/... ./internal/pause/... ./internal/cli/... -race -count=3 -timeout 10m
 ```
 
-Release smoke updates active local ACD. Ask before install/tag:
+Release smoke (ask before install/tag):
 
 ```bash
 make build && install -m 0755 ./bin/acd ~/.local/bin/acd
@@ -38,98 +38,101 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | Path | Purpose |
 |---|---|
 | `cmd/acd/main.go` | entrypoint |
-| `internal/cli` | Cobra commands: setup/hookhelper/status/diagnose/doctor/recover/commit-all |
+| `internal/cli` | Cobra: setup/hookhelper/status/diagnose/doctor/recover/commit-all; `start_shortcircuit.go` registry-read fast path |
 | `internal/daemon` | run loop, capture/replay, intent grouping, branch tokens, shadow/bootstrap, fsnotify, refcount, live-index repair, trace |
-| `internal/state` | SQLite schema v7, events/ops, `decision_records`, `planner_state`, shadow/meta/clients/flush/safe-ignore/sensitive matchers |
+| `internal/state` | SQLite v7; events/ops, `decision_records`, `planner_state`, shadow/meta/clients/flush/safe-ignore/sensitive |
 | `internal/git` | bounded refs/tree/diff/blob/scratch-index/history/ignore helpers |
 | `internal/ai` | deterministic/openai-compat/subprocess providers; message + intent-planner contracts |
-| `internal/adapter` | harness detection and per-path markers; do not restore TODO stubs |
+| `internal/adapter` | harness detection; format-specific markers; do not restore TODO stubs |
 | `internal/{central,identity,logger,paths,pause,trace}` | registry/stats, fingerprints, logs, XDG, pause, trace |
-| `templates/{claude-code,codex,opencode,pi,shell}` | harness snippets; Codex uses `templates/codex/hooks.json`; legacy TOML snippet deleted |
-| `test/integration` | build-tagged lifecycle/adapter/recovery/ignored-tree/fallback/AI/explainable/self-heal/intent tests |
-| `README.md`, `docs/*`, `CHANGELOG.md` | user docs; use `~~~` for nested fences |
+| `templates/{claude-code,codex,opencode,pi,shell}` | harness snippets; Codex `templates/codex/hooks.json`; legacy TOML deleted |
+| `test/integration` | build-tagged lifecycle/adapter/recovery/AI/explainable/self-heal/intent/latency-budget |
+| `README.md`, `docs/*`, `CHANGELOG.md` | user docs; nested fences `~~~` |
 
-## Workflow Rules
+## Workflow
 
-- Keep changes scoped; prefer `rg`; never revert unrelated work.
-- After `git.Init`/`git init` in tests, run `git symbolic-ref HEAD refs/heads/main`.
-- Stubs must compile: `package <name>` plus `// TODO(phase N): <intent>`.
-- Treat races, panics, nil pointers, ordering failures, and CI flakes as bugs. Inspect/narrow before retrying.
-- Timing failures: focused `-count=10`; `GOMAXPROCS=1 -count=50` for ordering hazards.
+- Scope changes; prefer `rg`; never revert unrelated work.
+- After `git.Init`/`git init` in tests: `git symbolic-ref HEAD refs/heads/main`.
+- Stubs compile: `package <name>` plus `// TODO(phase N): <intent>`.
+- Races, panics, nil pointers, ordering failures, CI flakes are bugs. Inspect/narrow before retry.
+- Timing: focused `-count=10`; ordering hazards `GOMAXPROCS=1 -count=50`.
 - Broad-run-sensitive: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, repeated edits, external FF reseed, FF-in-grace self-heal.
-- HEAD-transition tests usually wait for `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
-- CLI changes need Cobra help/examples/root-help updates. Template changes need setup tests and AdapterE2E coverage.
+- HEAD-transition: `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
+- CLI changes need Cobra help/examples updates. Template changes need `setup_test.go` + AdapterE2E.
 - Changelog/release notes describe user impact, not file diffs.
-- Self-hosting hazard: ACD may auto-commit this repo. Before destructive git surgery: `acd pause --repo . --reason "..." --yes`; after: `acd resume --repo . --yes`.
-- If failures look tied to intent batch-wait or local intent env, rerun through `cleanenv` before treating them as product bugs. Verify suspected main flakes on `main`.
+- Self-hosting: ACD may auto-commit this repo. Before destructive surgery: `acd pause --repo . --reason "..." --yes`; after: `acd resume --repo . --yes`.
+- Failures tied to intent batch-wait/local intent env: rerun via `cleanenv` before declaring product bug. Verify suspected main flakes on `main`.
 
 ## State, Branch, Capture
 
-- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG state/share.
+- Repo DB `<gitDir>/acd/state.db`; central registry/stats use XDG state/share.
+- Start short-circuit cache: `<gitDir>/acd/start-cache.json` (schema v1). Read lock-free at top of `runStart`; written after cold-path success; removed by `acd stop`.
 - `SchemaVersion = 7`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`.
-- `shadow_paths` key `(branch_ref, branch_generation, path)`; read-heavy code uses `state.DB.ReadSQL()`.
-- Shadow bootstrap commits 5000-row chunks; set marker `shadow.bootstrapped:<branch_ref>:<generation>` only after all chunks commit; clean partial rows on failure.
-- Reseed prunes old generations via `ACD_SHADOW_RETENTION_GENERATIONS` (default 1 prior generation). Empty active shadow with marker means delete marker and re-bootstrap.
+- `shadow_paths` key `(branch_ref, branch_generation, path)`; read-heavy uses `state.DB.ReadSQL()`.
+- Shadow bootstrap: 5000-row chunks; set marker `shadow.bootstrapped:<branch_ref>:<generation>` only after all chunks commit; clean partial rows on failure.
+- Reseed prunes old generations via `ACD_SHADOW_RETENTION_GENERATIONS` (default 1). Empty active shadow with marker -> delete marker, re-bootstrap.
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Fast-forward keeps generation; reset/rebase/switch/same-SHA ref switch bumps; legacy bare rev upgraded to attached forces Diverged.
-- Detached HEAD pauses capture/replay; `acd start` refuses it. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
+- Detached HEAD pauses capture/replay; `acd start` refuses. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - Git-op markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`. Non-`ErrNotExist` stat errors fail open with warning.
 - Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins.
-- Diverged drops stale `pending` rows for previous generation only; keep `published`, `failed`, `blocked_conflict`. SQLite read errors in `daemonPauseState` fail closed.
-- Capture compares live worktree to shadow; stale/missing bootstrap can create phantom creates.
-- `walkLive` BFSes by directory layer, batches ignore checks (`ignoreCheckBatchSize=1000`), and prunes ignored/sensitive/safe-ignore dirs before readdir.
-- Never prune worktree-rooted `acd/`; `.git/acd` is daemon state. Symlinks are mode `120000`; never descend.
-- Empty `ACD_SENSITIVE_GLOBS` keeps defaults; typos must not disable defaults. Safe-ignore dirs prune descendants, not same-named files.
-- Safe-ignore defaults include dependency/cache dirs. `ACD_SAFE_IGNORE=0|false|no|off` disables; `ACD_SAFE_IGNORE_EXTRA=dist/,build/` appends. Restart daemon for env changes.
+- Diverged drops stale `pending` for prior generation only; keep `published`/`failed`/`blocked_conflict`. SQLite read errors in `daemonPauseState` fail closed.
+- Capture compares live worktree to shadow; stale/missing bootstrap creates phantom creates.
+- `walkLive` BFSes by directory layer; ignore checks batched (`ignoreCheckBatchSize=1000`); prunes ignored/sensitive/safe-ignore dirs before readdir.
+- Never prune worktree-rooted `acd/`; `.git/acd` is daemon state. Symlinks mode `120000`; never descend.
+- Empty `ACD_SENSITIVE_GLOBS` keeps defaults; typos must not disable defaults. Safe-ignore prunes descendants, not same-named files.
+- Safe-ignore defaults include dep/cache dirs. `ACD_SAFE_IGNORE=0|false|no|off` disables; `ACD_SAFE_IGNORE_EXTRA=dist/,build/` appends. Restart daemon for env changes.
 - `IgnoreChecker.Check`: long-lived `git check-ignore --stdin -z --non-matching --verbose`; stream stdin from writer goroutine while reading stdout. One large `stdin.Write` deadlocks on macOS 16 KiB pipes.
-- `IgnoreChecker.Close`: non-blocking atomic cancel, `killLocked`, bounded `cmd.Wait` at 2s.
+- `IgnoreChecker.Close`: non-blocking atomic cancel, `killLocked`, bounded `cmd.Wait` 2s.
 
 ## Replay and Intent
 
 - Default `ACD_COMMIT_STRATEGY=event`: one capture per commit; must not call planner.
 - `ACD_COMMIT_STRATEGY=intent`: offers pending captures to AI planner; capture durability unchanged.
 - Intent defaults: `ACD_INTENT_WINDOW=10`, `ACD_INTENT_MIN_PENDING=10`, `ACD_INTENT_MAX_PENDING_AGE=5m`, `ACD_INTENT_RECENT_COMMITS=5`, `ACD_INTENT_DEFER_LIMIT=2`.
-- Planner may select exactly one capture or any non-empty subset; every offered seq must be selected or deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to deterministic one-item planning.
-- Deferred captures stay pending in `planner_state`; at `defer_count >= ACD_INTENT_DEFER_LIMIT`, oldest overdue capture gets forced one-item planning.
+- Planner selects exactly one capture or any non-empty subset; every offered seq must be selected or deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to deterministic one-item planning.
+- Deferred stays pending in `planner_state`; at `defer_count >= ACD_INTENT_DEFER_LIMIT`, oldest overdue gets forced one-item planning.
 - Grouped publish marks selected events `published` with same `commit_oid`; ledger records grouped seqs, deferrals, forced aging, planner errors.
-- Per-pass scratch index `<gitDir>/acd/replay-*.index` is seeded from `cctx.BaseHead`; reads use `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)`.
-- CAS targets literal `HEAD` via `git.UpdateRef`; named refs still use `--no-deref`.
+- Per-pass scratch index `<gitDir>/acd/replay-*.index` seeded from `cctx.BaseHead`; reads via `git.LsFilesIndex(ctx, repoDir, indexFile, paths...)`.
+- CAS targets literal `HEAD` via `git.UpdateRef`; named refs use `--no-deref`.
 - `DefaultReplayLimit = 64`; query `Limit+1`, trim, set `ReplaySummary.HasMore`.
 - `DefaultReplayPerEventTimeout = 60s`; timeout/cancel in heavy git work marks event `failed` and stops batch.
-- `blocked_conflict` and `failed` are terminal seq barriers; `PendingEvents` hides later pending rows behind prior terminal rows for same branch/generation.
+- `blocked_conflict`/`failed` are terminal seq barriers; `PendingEvents` hides later pending behind prior terminal rows for same branch/generation.
 - Idempotent publish checks current `HEAD` before before-state blocking; if HEAD has desired final blob/mode/absence, mark published with `commit_oid=HEAD`.
-- `superseded_external` requires bounded history proof, parent/base tree match, and live worktree before-state match. Incomplete proof means no supersede.
-- Live-index reconciliation is guarded/path-scoped; never overwrite user-staged changes. See `internal/git/tree.go`, `internal/daemon/replay.go`, `internal/daemon/live_index_repair.go`.
+- `superseded_external` requires bounded history proof, parent/base tree match, live worktree before-state match. Incomplete proof -> no supersede.
+- Live-index reconciliation guarded/path-scoped; never overwrite user-staged changes. See `internal/git/tree.go`, `internal/daemon/replay.go`, `internal/daemon/live_index_repair.go`.
 
 ## Run Loop and Observability
 
 - `processBranchTokenChange` runs before capture and after flush drain; do not collapse. Post-flush recheck handles git surgery outside `wakeCh`.
-- Branch transitions use `branchTransitionSettleDelay = 100ms`; flush drain bounded by `DefaultFlushLimit = 256`.
-- Daemon stamps `commit.strategy`, `intent.window`, `intent.min_pending`, `intent.max_pending_age`, `intent.recent_commits`, `intent.defer_limit`, `intent.diff_egress`; CLI reads daemon meta before current env.
+- Branch transitions: `branchTransitionSettleDelay = 100ms`; flush drain `DefaultFlushLimit = 256`.
+- Daemon stamps `commit.strategy`, `intent.{window,min_pending,max_pending_age,recent_commits,defer_limit,diff_egress}`; CLI reads daemon meta before current env.
 - Startup sweeps `acknowledged` flush requests older than `OrphanFlushAckThreshold = 5m` to `failed`.
-- fsnotify dispatch must not block: runtime creates use `rewalkCh`/`rewalkWorker`; diagnostics use `diagCh`; tail clamps at `MaxDebounceTail = 500ms`; ENOSPC -> `errBudgetExceeded`.
-- Logs: raw JSONL at `paths.Roots.RepoLogPath(repoHash)` (`~/.local/state/acd/<repo-hash>/daemon.log`) with rotation/compression.
+- fsnotify dispatch must not block: runtime creates use `rewalkCh`/`rewalkWorker`; diagnostics `diagCh`; tail clamps `MaxDebounceTail = 500ms`; ENOSPC -> `errBudgetExceeded`.
+- Daemon log: JSONL at `paths.Roots.RepoLogPath(repoHash)` (`~/.local/state/acd/<repo-hash>/daemon.log`) with rotation/compression.
+- Hook log: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log` written by active-hook fail-soft tail. Doctor tails for codex.
 - `acd logs --follow` streams from EOF reached by initial tail read; do not re-`Stat` after tailing.
 - `acd list --watch --interval 2s` redraws table; `--watch` rejects `--json`.
-- `acd events --watch`: no `--since` starts at current ledger tail; with `--since`, resumes after cursor.
+- `acd events --watch`: no `--since` starts at current ledger tail; with `--since` resumes after cursor.
 - Probes: `acd status --repo .`; `acd events --watch`; `acd logs --repo . --lines 50 --follow`; `acd diagnose --repo . --json`; `acd doctor --repo . --json`; `git status --short --ignored`.
 
 ## CLI, Git, AI
 
-- `events`, `explain`, `doctor` read paths must not call `state.Open` or migrate DBs; use read-only SQLite projection. Missing `decision_records`/`planner_state` means empty summaries, clear human text, valid JSON, no table creation.
+- `events`/`explain`/`doctor` read paths must not call `state.Open` or migrate DBs; use read-only SQLite projection. Missing `decision_records`/`planner_state` -> empty summaries, clear human text, valid JSON, no table creation.
 - Status JSON: `decision_counts`, `recent_decisions`, `decision_cursor`, `failed_events`, `failed_blocking_pending`, `intent_strategy`; `explain --since` summarizes newest post-cursor decision.
-- `acd setup <harness> --raw` emits only snippet body; required for strict JSON like `~/.codex/hooks.json`. Default output keeps comment-wrapped instructions/README.
-- `acd commit-all`: one-shot capture+replay without persistent daemon. Refuses on detached HEAD, git-op markers, manual pause marker, or running per-repo daemon. Force-reseeds shadow from HEAD and drops stale pending for active `(branch_ref, generation)`.
-- Manual `acd start` without `--session-id` registers stable `human:<repoHash>`. Harness paths pass `--session-id`, `--harness`, and usually `--watch-pid`.
+- `acd doctor` (since v2026-05-08) detects installed-snippet drift: warns when active-hook bodies lack both `acd start` AND `acd wake`; emits per-harness remediation. Falls back to alternate-path detection on EACCES/EIO (not just ENOENT). Tails codex hook log (last 50 lines or 5 min); surfaces error count + first line.
+- `acd setup <harness> --raw` emits only snippet body (required for strict JSON like `~/.codex/hooks.json`). Default keeps comment-wrapped instructions/README. Shell `--raw` writes `\n` separator between direnv and zshrc snippets.
+- `acd commit-all`: one-shot capture+replay without persistent daemon. Refuses on detached HEAD, git-op markers, manual pause marker, running per-repo daemon. Force-reseeds shadow from HEAD; drops stale pending for active `(branch_ref, generation)`.
+- `acd start` short-circuit: top of `runStart` reads central registry without lock; same `session_id` + heartbeat under `clientTTL` returns success without lock/SQLite/registry rewrite. Healthy hot path ~50ms vs 1s budget. Cold/dead path unchanged. Adapter PPID `kill(0)` probe runs mid-`runStart` near `RegisterClient`; ESRCH logs informational warning naming pid+session+harness, continues.
+- Manual `acd start` without `--session-id` registers `human:<repoHash>`. Harness paths pass `--session-id`, `--harness`, usually `--watch-pid`.
 - `internal/git`: `RunOpts.Timeout`, `RunWithLimit`, `ErrStdoutOverflow`, `DefaultReadTimeout=30s`, `DefaultWriteTimeout=60s`, `git.DefaultDiffCap` (1 MiB). Ambiguous `RevParse` -> `git.ErrRefAmbiguous`.
-- Pinned `ps`: `/bin/ps` on Darwin, `/usr/bin/ps` on Linux. Do not use `$PATH`. `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
-- AI providers declare `NeedsDiff`; network providers receive redacted diffs only when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` is truthy. `DeterministicProvider` uses `NeedsDiff=false`.
+- Pinned `ps`: `/bin/ps` Darwin, `/usr/bin/ps` Linux. Do not use `$PATH`. `isSQLiteLocked` must unwrap `*sqlite.Error` and compare typed code before substring fallback.
+- `acd hook-stdin-extract <field> [field...]`: rejects CR/LF/NUL in extracted scalars (req+opt); empty-required treated as field-not-found (trailing `|| exit 0` short-circuits); required outputs buffered, flushed only after every required field resolves; 1 MiB stdin truncation surfaces distinct error from generic decode failure. Optional `?` suffix.
+- AI providers declare `NeedsDiff`; network providers receive redacted diffs only when `NeedsDiff=true` and `ACD_AI_DIFF_EGRESS` truthy. `DeterministicProvider` `NeedsDiff=false`.
 - `BuildOpsDiff` caps rendered text at `ai.DiffCap`; per-op git diff uses `2 * ai.DiffCap` and 5s timeout. Redact + truncate before provider send.
-- `ACD_AI_SEND_DIFF` was removed; if set, emit one startup deprecation warning.
-- `ACD_TRACE=1` writes best-effort JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`; `ACD_TRACE_DIR` overrides. Never block/abort. Verify classes with `rg -n "EventClass:" internal/`.
+- `ACD_AI_SEND_DIFF` removed; if set, emits one startup deprecation warning.
+- `ACD_TRACE=1` writes best-effort JSONL `<gitDir>/acd/trace/YYYY-MM-DD.jsonl`; `ACD_TRACE_DIR` overrides. Never block/abort. Verify classes via `rg -n "EventClass:" internal/`.
 
 ## Recovery
-
-Prefer built-in recovery before SQLite edits:
 
 ```bash
 acd diagnose --repo . --json
@@ -139,28 +142,38 @@ acd wake --repo . --session-id <session>
 acd status --repo .
 ```
 
-- `acd recover --auto` refuses while daemon PID is alive.
-- It creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows to current branch/generation, resets blocked rows, clears replay/pause metadata, removes manual pause marker.
-- Use `acd resume --yes` when only lifting manual pause.
-- Last-resort cleanup: `acd pause --repo . --reason "manual reset" --yes`; `acd resume --repo . --yes`; `sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"`.
+- `acd recover --auto` refuses while daemon PID alive. Creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows to current branch/generation, resets blocked, clears replay/pause meta, removes manual pause marker.
+- `acd resume --yes` lifts only manual pause.
+- Last-resort: pause/resume + `sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"`.
 
 ## Harness/Templates
 
-| Harness | Start | Active hooks | End/session hooks | Notes |
+| Harness | Start | Active hooks | End | Notes |
 |---|---|---|---|---|
-| Claude Code | `SessionStart -> acd start` | `PreToolUse`/`PostToolUse`: idempotent `acd start`, then `acd wake` | `Stop -> acd touch`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON hook schema required. |
-| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`PreToolUse`/`PostToolUse`: idempotent `acd start`, then `acd wake` | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s; tool matcher `apply_patch|Edit|Write|Bash`. |
-| OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: idempotent `acd start`, then `acd wake` | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | Native `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`. |
-| Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: idempotent `acd start`, then `acd wake` | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | Stable fallback `SID="${PI_SESSION_ID:-unknown}"`; no one-off `uuidgen`. |
+| Claude Code | `SessionStart -> acd start` (fail-soft) | `Pre/PostToolUse`: and-chain + log fallback | `Stop -> acd touch`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON. |
+| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`Pre/PostToolUse`: and-chain + log fallback; mkdir gated `[ -d "$LOG_DIR" ] || mkdir -p` | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s; matcher `apply_patch|Edit|Write|Bash`. |
+| OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback (block-scalar bash) | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`. Path `~/.config/opencode/hooks.yaml`. |
+| Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-unknown}"` (no `uuidgen`). Path `~/.pi/hook/hooks.yaml`. |
 
-- Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML snippet deleted. `_acd_managed: true` is top-level JSON. Adapter detection is per path: JSON markers for hooks.json, TOML comment marker for config.toml.
-- `acd doctor` warns when `~/.codex/hooks.json` and legacy Codex TOML both carry acd markers; Codex merges hook sources, so both installed doubles events.
-- Codex needs `/hooks` approval after `acd setup codex --raw > ~/.codex/hooks.json`; until approved, `SessionStart` never fires and `acd status` shows no Codex client.
+Active-hook canonical body (all harnesses):
+
+```bash
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
+[ -d "$(dirname "$LOG")" ] || mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+{ acd start --... && acd wake --... ; } 2>>"$LOG" || { printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"; exit 1; }
+```
+
+- `acd start` failure NO LONGER masked by wake; active hook exits nonzero. AdapterE2E covers stop-all self-heal + corrupt-DB negative path.
+- Existing-user migration: re-run `acd setup <harness>` and replace hooks block in installed config so self-heal pattern takes effect. CHANGELOG v2026-05-08 + per-harness READMEs document. `acd doctor` flags drift.
+- Marker constants format-specific: `tomlAcdManagedMarkers = "# acd-managed: true"`; `yamlAcdManagedMarkers = "acd-managed: true"`. Distinct values.
+- Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted. `_acd_managed: true` top-level JSON. Adapter detection per path: JSON markers for hooks.json, TOML comment marker for config.toml.
+- `acd doctor` warns when both hooks.json and legacy Codex TOML carry acd markers (Codex merges -> doubled events).
+- Codex `/hooks` re-approval required after every `~/.codex/hooks.json` content change; until approved, `SessionStart` never fires. Shell-overwrite (`acd setup codex --raw > ~/.codex/hooks.json`) destroys non-acd entries; users with custom hooks must back up or merge.
 - Codex deprecated `[features].codex_hooks = true` for `[features].hooks = true`; new `hooks.json` needs no `[features]` block.
-- Codex `cwd` comes from stdin via `acd hook-stdin-extract session_id cwd? <&0`; missing `cwd` falls back to `$PWD`. `CODEX_PROJECT_DIR` and `printf "{}\n"` are gone. Bash bodies use `|| exit 0` after helper so missing `acd` does not block the hook.
-- `acd hook-stdin-extract <field> [field...]` supports multi-arg extraction and optional `?` suffix. Keep `internal/cli/hookhelper.go`, `internal/cli/setup_test.go`, and AdapterE2E in sync with template changes.
+- Codex `cwd` from stdin via `acd hook-stdin-extract session_id cwd? <&0`; missing `cwd` falls back to `$PWD`. `CODEX_PROJECT_DIR`/`printf "{}\n"` gone. Bash bodies use `|| exit 0` after helper so missing `acd` does not block hook.
+- Keep `internal/cli/hookhelper.go`, `internal/cli/setup_test.go`, AdapterE2E in sync. Setup tests assert and-chain + log-fallback per harness; codex test asserts mkdir gate.
 
-## Env and Release Notes
+## Env
 
 | Group | Vars |
 |---|---|
@@ -172,4 +185,4 @@ acd status --repo .
 | Watcher/client | `ACD_FSNOTIFY_ENABLED`; `ACD_DISABLE_FSNOTIFY`; `ACD_MAX_INOTIFY_WATCHES`; `ACD_CLIENT_TTL_SECONDS` |
 
 - `.goreleaser.yaml` hardcodes `prerelease: false`; date tags otherwise become pre-releases and `releases/latest` breaks.
-- Brew publishing is gated behind `--skip=homebrew` until `HOMEBREW_TAP_TOKEN` and tap repo exist.
+- Brew gated behind `--skip=homebrew` until `HOMEBREW_TAP_TOKEN` and tap repo exist.
