@@ -349,11 +349,15 @@ func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterPrune(t *testing.T) {
 	}
 }
 
-// TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune asserts the three
-// dead_branch_prune_* JSON fields are absent (omitempty) or zero when the
-// daemon has never recorded a non-empty prune. Sister test to the
-// "after prune" assertion above; ensures we are not stamping false-positive
-// meta on every boot.
+// TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune asserts the
+// dead-branch prune JSON shape on a fresh repo with no recorded prune. The
+// two int fields (`dead_branch_prune_last_run_ts`, `_last_count`) are
+// always present in the JSON — `0` is the documented "never ran" sentinel
+// (omitempty was dropped on those fields deliberately so dashboards can
+// distinguish "field missing" from "value present and zero"). The slice
+// (`_last_refs`) keeps `omitempty` and is therefore absent when nil. This
+// is the sister test to the "after prune" assertion above; together they
+// pin the contract.
 func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
 	requireSQLite(t)
 
