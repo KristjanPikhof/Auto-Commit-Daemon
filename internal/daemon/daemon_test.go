@@ -1959,14 +1959,14 @@ func TestRun_BranchSwitchDropsPending(t *testing.T) {
 }
 
 // TestRun_RuntimeDivergedPrunesDeadBranchTerminals exercises the runtime
-// Diverged-hook end-to-end: the daemon is on a feature branch, accumulates
-// a blocked_conflict + pending capture_events row tied to that branch, the
-// branch is then deleted from underneath the daemon, and on the next wake
-// the runtime Diverged path prunes the dead-branch rows and stamps the
-// `dead_branch_prune.last_run_ts` meta key. This is the regression-against-
-// "P2 #7" coverage gap (the prior dead_branch_sweep_test.go test invoked
-// the helper directly rather than driving the run loop into the runtime
-// Diverged path).
+// Diverged-hook end-to-end: the daemon boots on refs/heads/feat-x (created
+// + checked out before the run loop starts), accumulates a blocked_conflict
+// + pending capture_events row tied to that ref, the worktree is then
+// switched back to refs/heads/main AND refs/heads/feat-x deleted from
+// underneath the daemon, and on the next wake the runtime Diverged path
+// prunes the dead-branch rows. This is the regression-against-"P2 #7"
+// coverage gap (the prior dead_branch_sweep_test.go test invoked the helper
+// directly rather than driving the run loop into the runtime Diverged path).
 func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
@@ -1978,23 +1978,20 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 		t.Fatalf("rev-parse: %v", err)
 	}
 
-	// Build a sibling commit on a fresh tree (no shared history with the
-	// seed). The daemon will see this as a Diverged transition once main
-	// is reset onto it.
-	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("sibling-runtime\n"))
-	if err != nil {
-		t.Fatalf("hash sibling blob: %v", err)
+	// Create refs/heads/feat-x at HEAD and check it out so the daemon's
+	// boot sees feat-x as the active branch.
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/feat-x", seedHead, ""); err != nil {
+		t.Fatalf("update-ref refs/heads/feat-x: %v", err)
 	}
-	siblingTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
-		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "sibling-runtime.txt"},
-	})
-	if err != nil {
-		t.Fatalf("mktree sibling: %v", err)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/feat-x"); err != nil {
+		t.Fatalf("symbolic-ref to feat-x: %v", err)
 	}
-	sibling, err := git.CommitTree(ctx, f.dir, siblingTree, "sibling-runtime root")
-	if err != nil {
-		t.Fatalf("commit-tree sibling: %v", err)
-	}
+
+	// Pre-seed the rows tied to feat-x at generation 1. Boot will load
+	// generation 1 from daemon_meta as well (the very first tick's
+	// SaveBranchGeneration writes 1).
+	seedTerminalEvent(t, f.db, "refs/heads/feat-x", 1, seedHead, "feat-x-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, "refs/heads/feat-x", 1, seedHead, "feat-x-pending.txt", state.EventStatePending)
 
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
@@ -2017,63 +2014,20 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 		})
 	}()
 
-	// Wait for the daemon to seed branch.generation = 1 AND branch.head
-	// pointing at the seed. Without both we could race a still-booting
-	// daemon and treat the upcoming sibling reset as the boot transition.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
-		head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
-		if gen == "1" && head == seedHead {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Wait for the daemon to publish the running mode with branch.head ==
+	// seedHead AND the in-memory token pointing at feat-x. branch.token
+	// is the closure variable observable through MetaKeyBranchToken meta.
+	want := "rev:" + seedHead + " refs/heads/feat-x"
+	waitForMetaValue(t, f.db, MetaKeyBranchToken, want, 5*time.Second)
 
-	// Seed a blocked_conflict + pending row tied to refs/heads/dying-feature
-	// at generation 1. We never check out this ref in the worktree — the
-	// row is the realistic shape of "daemon was on dying-feature in a prior
-	// session, stamped a blocker, then the operator merged + deleted that
-	// branch and switched to main". The runtime Diverged transition below
-	// (main -> sibling) does not name dying-feature; the runtime
-	// pruneDeadBranchTerminals call only operates on tokenBranchRef(oldToken),
-	// which is refs/heads/main here. So to genuinely cover "runtime hook
-	// observes a Diverged transition AND prunes dead refs that happen to
-	// be in capture_events", we must use main itself as the dying ref:
-	// reset main onto sibling means the prior token's branch_ref IS
-	// refs/heads/main. But refs/heads/main remains alive after the reset,
-	// so we cannot use it for the dead-branch path.
-	//
-	// Instead, drive the Diverged path AND directly verify that the runtime
-	// pruneDeadBranchTerminals helper is engaged via its observable
-	// side-effect: the dead_branch_prune.last_run_ts meta key is stamped
-	// when a non-empty prune occurs. Seed the dead-ref rows on a separate
-	// branch refs/heads/dying-feature (which we never create in git), and
-	// trigger the runtime helper via the pruneDeadBranchTerminals path on
-	// the sibling reset by making oldToken's ref the dead one.
-	//
-	// To do that cleanly: seed branch.token in daemon_meta to point at
-	// refs/heads/dying-feature BEFORE the sibling reset. The runtime path
-	// will see oldToken=refs/heads/dying-feature, newToken=...refs/heads/main,
-	// classify as Diverged (or at minimum a generation bump), and call
-	// pruneDeadBranchTerminals with oldRef=refs/heads/dying-feature — which
-	// IS dead.
-	const dyingRef = "refs/heads/dying-feature"
-	seedTerminalEvent(t, f.db, dyingRef, 1, seedHead, "dying-blocked.txt", state.EventStateBlockedConflict)
-	seedTerminalEvent(t, f.db, dyingRef, 1, seedHead, "dying-pending.txt", state.EventStatePending)
-	// Overwrite the persisted token so the next runtime classification
-	// pass sees oldToken=dying-feature. We only need the ref half of the
-	// token to drive tokenBranchRef(); the rev part doesn't have to match
-	// the live HEAD because the daemon classifies by ref change, not rev.
-	if err := state.MetaSet(ctx, f.db, MetaKeyBranchToken, "rev:"+seedHead+" "+dyingRef); err != nil {
-		t.Fatalf("seed branch.token: %v", err)
+	// Now switch the worktree back to refs/heads/main and delete feat-x.
+	// The daemon's next tick classifies the change as Diverged (ref change
+	// refs/heads/feat-x -> refs/heads/main on a divergent rev).
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref back to main: %v", err)
 	}
-
-	// External reset: point main at the sibling. The daemon's next tick
-	// classifies the change as Diverged (refname change refs/heads/dying-feature
-	// -> refs/heads/main, plus rev divergence).
-	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", sibling, ""); err != nil {
-		t.Fatalf("update-ref to sibling: %v", err)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", "refs/heads/feat-x"); err != nil {
+		t.Fatalf("delete refs/heads/feat-x: %v", err)
 	}
 	for i := 0; i < 4; i++ {
 		select {
@@ -2086,7 +2040,7 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	// Wait for the runtime hook to stamp last_run_ts (the observable
 	// side-effect of a non-empty dead-branch prune). 5s is generous; the
 	// Diverged path runs synchronously inside processBranchTokenChange.
-	deadline = time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	var sawTS bool
 	for time.Now().Before(deadline) {
 		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRunTS)
@@ -2109,12 +2063,12 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	// (not just terminals) ran in the runtime path.
 	var total int
 	if err := f.db.SQL().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, dyingRef,
+		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, "refs/heads/feat-x",
 	).Scan(&total); err != nil {
-		t.Fatalf("count dying-ref rows: %v", err)
+		t.Fatalf("count feat-x rows: %v", err)
 	}
 	if total != 0 {
-		t.Fatalf("dying-ref rows=%d want 0 after runtime Diverged hook", total)
+		t.Fatalf("feat-x rows=%d want 0 after runtime Diverged hook", total)
 	}
 
 	cancel()
