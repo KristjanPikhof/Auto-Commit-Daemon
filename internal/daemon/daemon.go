@@ -1000,6 +1000,14 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: cctx.BranchGeneration,
 			})
+			// Prune terminal rows for the prior (branch_ref, generation)
+			// when the prior branch ref no longer resolves. Avoids
+			// phantom blocked_conflict / failed barriers accumulating
+			// after a feature branch is merged and deleted upstream.
+			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB, cctx,
+				tokenBranchRef(oldToken), prevGeneration,
+				logger, tracer,
+				"dead branch terminals pruned after Diverged")
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
