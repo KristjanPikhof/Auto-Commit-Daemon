@@ -211,6 +211,70 @@ func TestDaemonStateRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTouchClient_RefreshesLastSeenWithoutClobberingMetadata pins the
+// hot-path contract used by start.go's short-circuit branch: Touch must
+// bump last_seen_ts only and never disturb harness / watch_pid / watch_fp
+// / registered_ts. A fresh registration is followed by Touch with a
+// distinct timestamp; we then confirm only last_seen_ts changed and that
+// the unknown-session probe returns ok=false.
+func TestTouchClient_RefreshesLastSeenWithoutClobberingMetadata(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	original := Client{
+		SessionID: "hot-path", Harness: "claude-code",
+		WatchPID: sql.NullInt64{Int64: 7777, Valid: true},
+		WatchFP:  sql.NullString{String: "lstart|argv-hash", Valid: true},
+	}
+	if err := RegisterClient(ctx, d, original); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	pre, err := ListClients(ctx, d)
+	if err != nil || len(pre) != 1 {
+		t.Fatalf("list pre: len=%d err=%v", len(pre), err)
+	}
+	registered := pre[0].RegisteredTS
+
+	const refresh = 9_999_999.5
+	ok, err := TouchClient(ctx, d, "hot-path", refresh)
+	if err != nil || !ok {
+		t.Fatalf("touch: ok=%v err=%v", ok, err)
+	}
+	post, err := ListClients(ctx, d)
+	if err != nil || len(post) != 1 {
+		t.Fatalf("list post: len=%d err=%v", len(post), err)
+	}
+	got := post[0]
+	if got.LastSeenTS != refresh {
+		t.Fatalf("last_seen_ts=%v want %v", got.LastSeenTS, refresh)
+	}
+	if got.RegisteredTS != registered {
+		t.Fatalf("registered_ts changed: pre=%v post=%v", registered, got.RegisteredTS)
+	}
+	if got.Harness != "claude-code" {
+		t.Fatalf("harness clobbered: %q", got.Harness)
+	}
+	if !got.WatchPID.Valid || got.WatchPID.Int64 != 7777 {
+		t.Fatalf("watch_pid clobbered: %+v", got.WatchPID)
+	}
+	if !got.WatchFP.Valid || got.WatchFP.String != "lstart|argv-hash" {
+		t.Fatalf("watch_fp clobbered: %+v", got.WatchFP)
+	}
+
+	missing, err := TouchClient(ctx, d, "no-such-session", 1)
+	if err != nil {
+		t.Fatalf("touch missing err: %v", err)
+	}
+	if missing {
+		t.Fatalf("touch missing returned ok=true (should be false)")
+	}
+
+	if _, err := TouchClient(ctx, d, "", 1); err == nil {
+		t.Fatalf("empty session_id should error")
+	}
+}
+
 func TestClientsRefcount(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
