@@ -797,6 +797,31 @@ func runCodexE2E(t *testing.T, bin string) {
 
 	assertActiveHookSelfHeals(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
 
+	// Cover P2-7: stop --all teardown then re-fire the active hook.
+	assertActiveHookSelfHealsAfterStopAll(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
+
+	// Negative-path: corrupt state.db so `acd start` fails. Active hook
+	// must exit nonzero AND log "active hook failed" to the codex hook log.
+	negStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
+	if negStop.ExitCode != 0 {
+		t.Fatalf("codex negative-path pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			negStop.ExitCode, negStop.Stdout, negStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, "codex daemon stopped before negative-path", repo)
+	assertActiveHookFailsOnCorruptDB(t, "codex", ctx, env, repo, "codex", upHook, stdin)
+	// Re-arm the daemon so the Stop/teardown logic below works on a clean
+	// running daemon.
+	if rearm := runBash(t, ctx, env, stdin, startHook.Command); rearm.ExitCode != 0 {
+		t.Fatalf("codex re-arm after negative-path exit=%d\nstdout=%s\nstderr=%s",
+			rearm.ExitCode, rearm.Stdout, rearm.Stderr)
+	}
+	waitFor(t, "codex daemon mode==running after re-arm", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
+
 	// PreToolUse -> acd wake (matcher path).
 	preHook := pickHookByEvent(t, hooks, "PreToolUse")
 	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {
