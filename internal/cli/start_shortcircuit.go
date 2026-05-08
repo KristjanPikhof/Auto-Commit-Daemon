@@ -137,10 +137,23 @@ func writeStartCache(gitDir string, sc startCache) error {
 	}
 	body = append(body, '\n')
 	target := startCachePath(gitDir, sc.SessionID)
-	tmp := target + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Use a unique tmp filename so two concurrent active hooks don't
+	// interleave bytes into a shared inode. os.CreateTemp gives us
+	// `<prefix>.<random>.tmp` in the same directory; the atomic rename
+	// onto `target` is unchanged. Without this, two `acd start`
+	// invocations from the same harness firing close together both
+	// OpenFile(target+".tmp", O_CREATE|O_TRUNC) and the resulting
+	// start-cache.json was unparseable JSON.
+	pattern := startCacheFilenamePrefix + sessionCacheSuffix(sc.SessionID) + ".*.tmp"
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return fmt.Errorf("start-cache open tmp: %w", err)
+	}
+	tmp := f.Name()
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("start-cache chmod tmp: %w", err)
 	}
 	if _, err := f.Write(body); err != nil {
 		_ = f.Close()
