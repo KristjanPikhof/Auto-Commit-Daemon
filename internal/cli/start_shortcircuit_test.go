@@ -361,6 +361,58 @@ func TestWriteStartCache_RoundTripCreatesParent(t *testing.T) {
 	}
 }
 
+// TestWriteStartCache_ConcurrentWritersProduceParseableFile pins that
+// N concurrent writeStartCache calls (active-hook-style storm) leave the
+// final start-cache file as parseable JSON, never a half-written tail
+// from one writer interleaved with another's truncate. The fix is the
+// per-call tmp filename via os.CreateTemp; without it the asserts below
+// fail intermittently with json: invalid character / unexpected EOF.
+func TestWriteStartCache_ConcurrentWritersProduceParseableFile(t *testing.T) {
+	t.Parallel()
+	gitDir := t.TempDir()
+	const writers = 20
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			err := writeStartCache(gitDir, startCache{
+				Version: startCacheVersion, RepoHash: "abc",
+				SessionID: "shared-session", Harness: "claude-code",
+				DaemonPID: 10000 + i, UpdatedAt: int64(i + 1),
+				DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv-x",
+			})
+			if err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("writeStartCache concurrent: %v", err)
+	}
+	got := readStartCache(startCachePath(gitDir, "shared-session"))
+	if got == nil {
+		t.Fatalf("final cache unreadable / unparseable JSON")
+	}
+	// The winning writer's UpdatedAt must be in [1, writers].
+	if got.UpdatedAt < 1 || got.UpdatedAt > writers {
+		t.Fatalf("winning UpdatedAt=%d outside [1,%d] — possibly bytes-interleaved", got.UpdatedAt, writers)
+	}
+	// No leaked .tmp files in the directory once writers are done.
+	entries, err := os.ReadDir(filepath.Join(gitDir, "acd"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("tmp leak: %s", e.Name())
+		}
+	}
+}
+
 // TestReadStartCache_LegacyV1Rejected pins that v1 cache files (before the
 // fingerprint schema bump) are treated as missing so the cold path is
 // forced to repopulate the cache with v2 fields.
