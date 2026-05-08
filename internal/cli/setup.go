@@ -7,8 +7,10 @@ package cli
 // --apply is accepted for forward-compat but deferred to v0.2.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -45,6 +47,11 @@ var harnessSnippets = map[string]harnessSnippet{
 
 // shellExtra is the second snippet for the shell harness (zshrc).
 const shellZshrcSnippet = "shell/zshrc.snippet.sh"
+
+// templatesFS is the embedded FS used by runSetup. Tests overlay it via
+// setTemplatesFSForTest to inject malformed JSON without touching the
+// production templates package. Production callers always use templates.FS.
+var templatesFS fs.FS = templates.FS
 
 // readmeFile returns the README path for a harness.
 func readmeFile(harness string) string {
@@ -126,7 +133,7 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 
 	meta := harnessSnippets[harness]
 	cp := meta.commentPrefix
-	embeddedFS := templates.FS
+	embeddedFS := templatesFS
 
 	out := cmd.OutOrStdout()
 
@@ -145,6 +152,30 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 				return err
 			}
 			if err := printSnippet(out, embeddedFS, shellZshrcSnippet); err != nil {
+				return err
+			}
+			return nil
+		}
+		// Strict-JSON validation guard: when the canonical install path is a
+		// `.json` config (e.g. `~/.codex/hooks.json`), users redirect the
+		// raw output directly into the file. If a future template edit ships
+		// invalid JSON (trailing comma, unescaped quote, schema drift), the
+		// harness silently ignores the file. Validate before emitting so the
+		// regression surfaces as a non-zero exit with an actionable error
+		// instead of a silently broken install.
+		if filepath.Ext(meta.file) == ".json" {
+			body, err := fs.ReadFile(embeddedFS, meta.file)
+			if err != nil {
+				return fmt.Errorf("acd setup: read template %s: %w", meta.file, err)
+			}
+			if !json.Valid(body) {
+				offset := jsonInvalidOffset(body)
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"acd setup: template %s is not valid JSON (parse error near byte offset %d); refusing to emit --raw output that would corrupt %s. Please file a bug at github.com/KristjanPikhof/Auto-Commit-Daemon.\n",
+					meta.file, offset, meta.file)
+				return fmt.Errorf("acd setup: template %s contains invalid JSON", meta.file)
+			}
+			if _, err := out.Write(body); err != nil {
 				return err
 			}
 			return nil
@@ -195,6 +226,24 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 
 	fmt.Fprintf(out, "%s ─────────────────────────────────────────────────────────────\n", cp)
 	return nil
+}
+
+// jsonInvalidOffset returns the byte offset of the first JSON parse error in
+// body, or len(body) if json.Decoder reports no offset (e.g. trailing
+// content). Used to render an actionable error message when the embedded
+// JSON template fails json.Valid.
+func jsonInvalidOffset(body []byte) int64 {
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	for {
+		_, err := dec.Token()
+		if err == nil {
+			continue
+		}
+		if se, ok := err.(*json.SyntaxError); ok {
+			return se.Offset
+		}
+		return dec.InputOffset()
+	}
 }
 
 // printSnippet reads a file from the embedded FS and writes it verbatim.
