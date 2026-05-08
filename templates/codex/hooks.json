@@ -7,7 +7,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\" || { printf '\"'\"'[%s] session-start failed exit=%d cmd=acd-start\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; OUT=$(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-hook-stdin-extract\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 0; }; SID=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 1p); CWD=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 2p); REPO=\"${CWD:-$PWD}\"; acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; OUT=$(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-hook-stdin-extract\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 0; }; SID=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 1p); CWD=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 2p); REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -30,7 +30,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; OUT=$(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-hook-stdin-extract\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 0; }; SID=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 1p); CWD=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 2p); REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -42,7 +42,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; OUT=$(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-hook-stdin-extract\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 0; }; SID=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 1p); CWD=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 2p); REPO=\"${CWD:-$PWD}\"; { acd start --session-id \"$SID\" --harness codex --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -53,7 +53,7 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; { read -r SID; read -r CWD; } < <(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || exit 0; REPO=\"${CWD:-$PWD}\"; acd touch --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/codex-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; OUT=$(acd hook-stdin-extract session_id cwd? <&0 2>>\"$LOG\") || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-hook-stdin-extract\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 0; }; SID=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 1p); CWD=$(printf '\"'\"'%s\\n'\"'\"' \"$OUT\" | sed -n 2p); REPO=\"${CWD:-$PWD}\"; acd touch --session-id \"$SID\" --repo \"$REPO\" >/dev/null 2>>\"$LOG\"'"
           }
         ]
       }
