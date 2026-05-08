@@ -286,6 +286,7 @@ func tryShortCircuitStart(
 	d := evaluateShortCircuit(cache, repoHash, sessionID, harness, rec,
 		shortCircuitNow(), clientTTL(), identity.Alive, captureDaemonFingerprint)
 	if !d.OK {
+		fmt.Fprintf(os.Stderr, "[DBG short-circuit] reason=%s cache=%+v\n", d.Reason, cache)
 		return false, 0, 0, d.Reason
 	}
 	return true, d.DaemonPID, d.ClientCount, ""
