@@ -13,6 +13,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // Decision matrix coverage for evaluateShortCircuit. Each row drives the
@@ -388,7 +389,7 @@ func TestRunStart_DifferentSession_NoShortCircuit(t *testing.T) {
 	// confirm via an SQLite read in the test harness (not the short-
 	// circuit path).
 	db := openStartDB(t, repoDir)
-	clients, err := listClientsForTest(ctx, db)
+	clients, err := state.ListClients(ctx, db)
 	if err != nil {
 		t.Fatalf("ListClients: %v", err)
 	}
