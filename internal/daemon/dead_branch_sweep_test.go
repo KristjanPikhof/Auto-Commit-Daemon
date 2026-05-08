@@ -292,12 +292,13 @@ func TestDeadBranchSweep_OptOutPreservesRows(t *testing.T) {
 	}
 }
 
-// TestDeadBranchSweep_RefExistsErrorPreservesRows asserts that when RefExists
-// returns an error (e.g. corrupt repoDir), the sweep fails open: terminal rows
-// are preserved rather than silently dropped. We feed a bogus repoDir so
-// `git show-ref` exits non-zero with non-1 status (typical: 128 from "Not a
-// git repository").
-func TestDeadBranchSweep_RefExistsErrorPreservesRows(t *testing.T) {
+// TestDeadBranchSweep_LiveRefsErrorPreservesRows asserts that when
+// git.LiveBranchSet returns an error (e.g. bogus repoDir), the sweep fails
+// closed: terminal rows are preserved rather than silently dropped. The
+// sweep now batches liveness probes via for-each-ref instead of per-pair
+// RefExists, so a single error preserves all candidate rows in one go (the
+// previous per-pair contract preserved on a per-ref basis).
+func TestDeadBranchSweep_LiveRefsErrorPreservesRows(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
 	ctx := context.Background()
@@ -310,8 +311,9 @@ func TestDeadBranchSweep_RefExistsErrorPreservesRows(t *testing.T) {
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "probe-blocked.txt", state.EventStateBlockedConflict)
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "probe-failed.txt", state.EventStateFailed)
 
-	// Bogus repoDir — show-ref will exit with 128 (not a git repo). Sweep
-	// must surface it as a probe error and skip the prune.
+	// Bogus repoDir — for-each-ref will exit with 128 (not a git repo).
+	// Sweep must surface the liveness-probe error and skip the prune
+	// entirely (fail closed: cannot prove dead, cannot delete).
 	bogusRepo := t.TempDir()
 	cctx := CaptureContext{
 		BranchRef:        "refs/heads/main",
@@ -321,10 +323,10 @@ func TestDeadBranchSweep_RefExistsErrorPreservesRows(t *testing.T) {
 	runStartupDeadBranchSweep(ctx, bogusRepo, f.db, cctx, slog.Default(), nil)
 
 	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateBlockedConflict); got != 1 {
-		t.Fatalf("probe-error blocked_conflict rows=%d want 1 (must fail open)", got)
+		t.Fatalf("probe-error blocked_conflict rows=%d want 1 (must fail closed)", got)
 	}
 	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateFailed); got != 1 {
-		t.Fatalf("probe-error failed rows=%d want 1 (must fail open)", got)
+		t.Fatalf("probe-error failed rows=%d want 1 (must fail closed)", got)
 	}
 }
 
