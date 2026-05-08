@@ -46,6 +46,8 @@ acd setup shell         # universal direnv / zshrc fallback
 
 Install the hook engine first (Codex, Claude Code, OpenCode-Hooks, Pi-YAML-Hooks), then run the matching `acd setup …` to wire `acd` into it.
 
+Run `acd doctor` to check whether your installed snippet is current. It warns when active hooks are missing `acd start` or `acd wake`, and shows the remediation command per harness.
+
 ## Use it
 
 Open your harness. Edit files. Commits land automatically.
