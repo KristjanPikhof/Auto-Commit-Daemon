@@ -2121,11 +2121,6 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	wg.Wait()
 }
 
-// seedTerminalEvent inserts one capture_events row in the requested terminal
-// (or pending) state for the given (branch_ref, branch_generation). Mirrors
-// the helper in dead_branch_sweep_test.go but is duplicated here so this
-// test compiles without depending on that file's package-private helper
-// being kept stable across refactors. Returns the assigned seq.
 func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	t.Setenv(EnvShadowRetentionGenerations, "0")
 
