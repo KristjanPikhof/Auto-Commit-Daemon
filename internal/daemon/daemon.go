@@ -573,6 +573,16 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
+			// Prune terminal rows for the prior generation if its branch
+			// ref has since been deleted. Mirrors the runtime Diverged
+			// hook below so a daemon restart that observes a Diverged
+			// transition into a now-dead branch cleans up barriers
+			// instead of leaving them stuck forever.
+			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB,
+				CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID},
+				tokenBranchRef(prevToken), prevGeneration,
+				logger, tracer,
+				"dead branch terminals pruned after startup Diverged")
 		} else if transition == TokenTransitionFastForward {
 			startupFastForwardResync = true
 		}
