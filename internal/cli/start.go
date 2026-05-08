@@ -144,6 +144,47 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		return err
 	}
 
+	/* perf-lane: registry-read short-circuit
+	 *
+	 * Hot-path optimization for active hooks (PreToolUse / PostToolUse /
+	 * UserPromptSubmit) that fire `acd start` on every tool invocation.
+	 * When the same session_id has already been registered for this repo
+	 * and the cached daemon heartbeat is fresh, return success without
+	 * acquiring control.lock, opening SQLite, or rewriting registry.json.
+	 *
+	 * The cache file at <gitDir>/acd/start-cache.json is written by the
+	 * full registration path below; missing / stale / mismatched cache
+	 * forces the cold path (which is unchanged).
+	 *
+	 * Coordination: this short-circuit MUST run before any lock
+	 * acquisition so concurrent active hooks from the same session never
+	 * serialize on the daemon's control.lock. The adapter-lane PPID
+	 * probe lives mid-runStart (near refcount.RegisterClient) and only
+	 * applies on the cold path.
+	 */
+	if ok, cachedPID, _ := tryShortCircuitStart(ctx, gitDir, repoHash, sessionID, harness, repo); ok {
+		res := startResult{
+			Started:   false,
+			Duplicate: true,
+			DaemonPID: cachedPID,
+			Repo:      repo,
+			RepoHash:  repoHash,
+			SessionID: sessionID,
+			Harness:   harness,
+			// ClientCount is unknown without SQLite; leave at zero. The
+			// hook caller does not depend on it on the fast path.
+			ClientCount: 0,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd start: refreshed session %s (daemon already running, pid %d)\n",
+			sessionID, cachedPID)
+		return nil
+	}
+
 	// Brief control.lock for the daemon_clients read-modify-write window.
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		return fmt.Errorf("acd start: mkdir state dir: %w", err)
@@ -286,6 +327,23 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		return nil
 	}); err != nil {
 		return fmt.Errorf("acd start: update registry: %w", err)
+	}
+
+	// perf-lane: persist the per-repo start-cache so subsequent active
+	// hooks under the same session_id can short-circuit at the top of
+	// runStart without re-acquiring control.lock or re-opening SQLite.
+	// Failure to write is non-fatal — the next call simply takes the
+	// cold path.
+	if daemonPID > 0 {
+		_ = writeStartCache(gitDir, startCache{
+			Version:   startCacheVersion,
+			RepoHash:  repoHash,
+			SessionID: sessionID,
+			Harness:   harness,
+			DaemonPID: daemonPID,
+			WatchPID:  watchPID,
+			UpdatedAt: time.Now().Unix(),
+		})
 	}
 
 	clients, _ := state.CountClients(ctx, db)
