@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +13,31 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// fpStub returns a stub captureDaemonFingerprint that always reports the
+// supplied (start, argv) tuple. Tests pass it through evaluateShortCircuit's
+// fpCapture parameter to pin a deterministic fingerprint.
+func fpStub(startTS, argvHash string) func(context.Context, int) (identity.Fingerprint, error) {
+	return func(context.Context, int) (identity.Fingerprint, error) {
+		return identity.Fingerprint{StartTime: startTS, ArgvHash: argvHash}, nil
+	}
+}
+
+// installFakeDaemonFingerprint replaces captureDaemonFingerprint for the
+// duration of the test with a stub returning fp. The package-level var is
+// the entry point used by tryShortCircuitStart and the cold-path writer.
+func installFakeDaemonFingerprint(t *testing.T, fp identity.Fingerprint) {
+	t.Helper()
+	prev := captureDaemonFingerprint
+	captureDaemonFingerprint = func(context.Context, int) (identity.Fingerprint, error) {
+		return fp, nil
+	}
+	t.Cleanup(func() { captureDaemonFingerprint = prev })
+}
 
 // Decision matrix coverage for evaluateShortCircuit. Each row drives the
 // pure decision function with an explicit cache + registry snapshot so
