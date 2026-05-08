@@ -178,8 +178,14 @@ acd diagnose --repo . --json
 ~~~
 
 It reports the current git `HEAD` branch, the daemon's persisted branch anchor,
-blocked-conflict counts by `error_class`, failed terminal barriers, and the
-five most recent blocked or failed events. If the daemon is stopped and the
+blocked-conflict counts by `error_class`, failed terminal barriers, the five
+most recent blocked or failed events, and the most recent dead-branch prune
+(`dead_branch_prune_last_run_ts`, `dead_branch_prune_last_count`,
+`dead_branch_prune_last_refs`). ACD auto-prunes `blocked_conflict` / `failed`
+rows whose branch ref has been deleted — so phantom blocked counts no longer
+linger after a merged feature branch is removed. Set
+`ACD_KEEP_DEAD_BRANCH_BARRIERS=1` to keep those rows around for forensic
+inspection. If the daemon is stopped and the
 plan looks right, recover a stale anchor with an automatic backup:
 
 ~~~bash
