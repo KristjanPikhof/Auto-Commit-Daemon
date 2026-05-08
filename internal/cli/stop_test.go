@@ -438,3 +438,128 @@ func TestStopAll_RoutesFailuresToFailedBucket(t *testing.T) {
 		t.Fatalf("failed[0].DaemonPID = %d, want 12345", got.Failed[0].DaemonPID)
 	}
 }
+
+// TestStop_DeferredRemovesOnlyCallerCache pins the P1 #7 acceptance:
+// `acd stop --session-id A` against a repo with a peer alive must
+// remove A's per-session start-cache file but leave B's intact.
+func TestStop_DeferredRemovesOnlyCallerCache(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+
+	for _, sid := range []string{"sess-A", "sess-B"} {
+		if err := state.RegisterClient(ctx, db, state.Client{
+			SessionID: sid, Harness: "claude-code",
+		}); err != nil {
+			t.Fatalf("register %s: %v", sid, err)
+		}
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: 99999, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = db.Close()
+
+	gitDir := filepath.Join(repoDir, ".git")
+	pathA := startCachePath(gitDir, "sess-A")
+	pathB := startCachePath(gitDir, "sess-B")
+	for _, sid := range []string{"sess-A", "sess-B"} {
+		if err := writeStartCache(gitDir, startCache{
+			Version: startCacheVersion, RepoHash: "abc",
+			SessionID: sid, Harness: "claude-code",
+			DaemonPID: 99999, UpdatedAt: time.Now().Unix(),
+			DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv",
+		}); err != nil {
+			t.Fatalf("seed cache %s: %v", sid, err)
+		}
+	}
+
+	count, restore := installStopSignal(t, repoDir)
+	defer restore()
+
+	var out bytes.Buffer
+	if err := runStop(ctx, &out, repoDir, "sess-A", false, false, true); err != nil {
+		t.Fatalf("runStop: %v", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("expected no signal when peer remains, got %d", count.Load())
+	}
+	var got stopRepoResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Deferred {
+		t.Fatalf("expected deferred, got %+v", got)
+	}
+	if _, err := os.Stat(pathA); !os.IsNotExist(err) {
+		t.Fatalf("session-A cache still present after deferred stop: %v", err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		t.Fatalf("session-B cache must survive: %v", err)
+	}
+}
+
+// TestStop_ForceFailedEscalationWipesCaches pins the P1 #7 second
+// acceptance: when --force escalation fails (daemon survived SIGKILL),
+// every per-session cache is removed so subsequent active hooks cannot
+// short-circuit onto the unknown-state daemon.
+func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: 1, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	_ = db.Close()
+
+	gitDir := filepath.Join(repoDir, ".git")
+	for _, sid := range []string{"sess-A", "sess-B"} {
+		if err := writeStartCache(gitDir, startCache{
+			Version: startCacheVersion, RepoHash: "abc",
+			SessionID: sid, Harness: "claude-code",
+			DaemonPID: 1, UpdatedAt: time.Now().Unix(),
+			DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv",
+		}); err != nil {
+			t.Fatalf("seed cache %s: %v", sid, err)
+		}
+	}
+
+	// Stub that never stamps mode=stopped, so SIGKILL escalation runs
+	// but the post-kill identity.Alive(1) loop times out → res.Stopped
+	// stays false. This is the "Failed" bucket the matrix above wipes.
+	prev := signalProcess
+	signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string) error {
+		return nil
+	}
+	defer func() { signalProcess = prev }()
+
+	prevTO := stopWaitTimeout
+	stopWaitTimeout = 100 * time.Millisecond
+	prevPI := stopPollInterval
+	stopPollInterval = 25 * time.Millisecond
+	defer func() {
+		stopWaitTimeout = prevTO
+		stopPollInterval = prevPI
+	}()
+
+	var out bytes.Buffer
+	if err := runStop(ctx, &out, repoDir, "", true, false, true); err != nil {
+		t.Fatalf("runStop: %v", err)
+	}
+	var got stopRepoResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Stopped {
+		t.Fatalf("expected stopped=false (survived SIGKILL fixture), got %+v", got)
+	}
+	for _, sid := range []string{"sess-A", "sess-B"} {
+		p := startCachePath(gitDir, sid)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("force-failed should have wiped %s cache, err=%v", sid, err)
+		}
+	}
+}
