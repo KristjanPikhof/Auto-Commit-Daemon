@@ -877,7 +877,6 @@ func Run(ctx context.Context, opts Options) error {
 		runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
 	}()
 
-
 	// lastStampedBranchHead is the most recent value the run loop has
 	// written to MetaKeyBranchHead through the SameGeneration "per-tick
 	// keep-alive" path inside processBranchTokenChange. The previous
