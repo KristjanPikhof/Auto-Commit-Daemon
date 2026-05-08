@@ -305,9 +305,9 @@ func pruneDeadBranchTerminals(
 		// Live ref — no action, no log.
 		return
 	}
-	rows, err := state.DeleteTerminalForDeadBranch(ctx, db, oldRef, prevGeneration)
+	rows, err := state.PurgeUnpublishedForDeadBranch(ctx, db, oldRef, prevGeneration)
 	if err != nil {
-		logger.Warn("delete dead-branch terminals failed",
+		logger.Warn("purge dead-branch unpublished failed",
 			"ref", oldRef,
 			"generation", prevGeneration,
 			"err", err.Error())
