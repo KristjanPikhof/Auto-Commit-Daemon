@@ -19,9 +19,11 @@
 //     reliably makes `git show-ref` exit non-1 across hosts; that has proven
 //     fragile so we lean on the unit test for this case and document it
 //     here).
-//   - Diagnose-meta surface assertion: `acd diagnose --json` includes the
-//     three dead_branch_prune_* fields on the prune path and omits them on
-//     the no-prune path (omitempty semantics).
+//   - Diagnose-meta surface assertion: `acd diagnose --json` includes all
+//     three dead_branch_prune_* fields on the prune path; on the no-prune
+//     path the two int fields render as `0` (always-emit contract — zero
+//     is the documented "never ran" sentinel) and the refs slice is
+//     omitted (omitempty + nil).
 //
 // Capture rows are seeded through the sqlite3 binary against the real
 // state.db, exactly as the existing populated-state and explainable-UX
