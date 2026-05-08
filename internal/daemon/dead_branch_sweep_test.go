@@ -113,10 +113,12 @@ func countEventsByRefState(t *testing.T, db *state.DB, branchRef, eventState str
 	return n
 }
 
-// TestDeadBranchSweep_PrunesDeadRefRows seeds blocked_conflict + failed rows
-// for refs/heads/old (which is NOT created in the test repo) and for the
-// active refs/heads/main; runs the startup sweep; asserts old's terminal rows
-// are deleted, main's rows are preserved, and pending rows for old survive.
+// TestDeadBranchSweep_PrunesDeadRefRows seeds blocked_conflict + failed +
+// pending rows for refs/heads/old (which is NOT created in the test repo) and
+// terminal rows for the active refs/heads/main; runs the startup sweep;
+// asserts old's pending + terminal rows are all deleted (the helper now drops
+// pending rows together with terminals so the prune does not get reverted on
+// the next replay tick), and main's rows are preserved.
 func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
@@ -129,8 +131,9 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	const deadRef = "refs/heads/old"
 	const activeRef = "refs/heads/main"
 
-	// Dead-ref rows: one terminal of each kind plus one pending we expect to
-	// survive.
+	// Dead-ref rows: one of each (terminal + pending). All three must be
+	// deleted — leaving pending rows behind would let replay restamp a
+	// blocked_conflict on the next tick and defeat the prune.
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-blocked.txt", state.EventStateBlockedConflict)
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-failed.txt", state.EventStateFailed)
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-pending.txt", state.EventStatePending)
@@ -138,6 +141,9 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	// because cctx.BranchRef matches and the sweep skips the active pair.
 	seedTerminalEvent(t, f.db, activeRef, 1, headOID, "main-blocked.txt", state.EventStateBlockedConflict)
 	seedTerminalEvent(t, f.db, activeRef, 1, headOID, "main-failed.txt", state.EventStateFailed)
+	// And a live-ref pending row to confirm the live-ref path leaves
+	// pending alone (only the dead pair drops pending).
+	seedTerminalEvent(t, f.db, activeRef, 1, headOID, "main-pending.txt", state.EventStatePending)
 
 	cctx := CaptureContext{
 		BranchRef:        activeRef,
@@ -152,14 +158,107 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateFailed); got != 0 {
 		t.Fatalf("dead-ref failed rows=%d want 0", got)
 	}
-	if got := countEventsByRefState(t, f.db, deadRef, state.EventStatePending); got != 1 {
-		t.Fatalf("dead-ref pending rows=%d want 1 (sweep must not touch pending)", got)
+	// Pending rows for the dead pair must also be gone so PendingEvents does
+	// not re-expose them on the next replay tick.
+	if got := countEventsByRefState(t, f.db, deadRef, state.EventStatePending); got != 0 {
+		t.Fatalf("dead-ref pending rows=%d want 0 (helper must drop pending+terminal together)", got)
 	}
 	if got := countEventsByRefState(t, f.db, activeRef, state.EventStateBlockedConflict); got != 1 {
 		t.Fatalf("active-ref blocked_conflict rows=%d want 1 (active pair must be preserved)", got)
 	}
 	if got := countEventsByRefState(t, f.db, activeRef, state.EventStateFailed); got != 1 {
 		t.Fatalf("active-ref failed rows=%d want 1 (active pair must be preserved)", got)
+	}
+	if got := countEventsByRefState(t, f.db, activeRef, state.EventStatePending); got != 1 {
+		t.Fatalf("active-ref pending rows=%d want 1 (live-ref pending must be preserved)", got)
+	}
+}
+
+// TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier asserts the P1
+// regression: after deleting terminals for a dead branch, no later
+// PendingEvents call must surface pending rows for the same dead pair (which
+// would let replay re-stamp a blocked_conflict and defeat the prune). This
+// is the test against the bug cr-expert flagged.
+func TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	const deadRef = "refs/heads/dead"
+	// Seed blocked_conflict + failed + pending plus a stamped publish_state
+	// singleton pointing at the blocked_conflict (the realistic shape of a
+	// daemon DB after a Diverged-into-deleted-branch sequence).
+	blockedSeq := seedTerminalEvent(t, f.db, deadRef, 1, headOID, "dead-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "dead-failed.txt", state.EventStateFailed)
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "dead-pending.txt", state.EventStatePending)
+	if err := state.MarkEventBlocked(ctx, f.db, blockedSeq, "seeded blocker", float64(time.Now().UnixNano())/1e9,
+		sql.NullString{String: deadRef, Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: headOID, Valid: true},
+	); err != nil {
+		t.Fatalf("MarkEventBlocked: %v", err)
+	}
+
+	cctx := CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         headOID,
+	}
+	runStartupDeadBranchSweep(ctx, f.dir, f.db, cctx, slog.Default(), nil)
+
+	// All capture_events for the dead ref must be gone.
+	var total int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, deadRef,
+	).Scan(&total); err != nil {
+		t.Fatalf("count dead-ref rows: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("dead-ref rows=%d want 0 after sweep", total)
+	}
+
+	// PendingEvents must not surface anything for the dead ref — this is the
+	// regression: pre-fix the helper left pending rows behind, so the next
+	// replay pass would re-stamp a fresh blocked_conflict on the dead pair.
+	pending, err := state.PendingEvents(ctx, f.db, 64)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	for _, ev := range pending {
+		if ev.BranchRef == deadRef {
+			t.Fatalf("PendingEvents surfaced row for dead ref %q after sweep: seq=%d",
+				deadRef, ev.Seq)
+		}
+	}
+
+	// publish_state must read 'ok' (barrier was lifted in the same tx).
+	var status string
+	var errMsg sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT status, error FROM publish_state WHERE id = 1`,
+	).Scan(&status, &errMsg); err != nil {
+		t.Fatalf("read publish_state: %v", err)
+	}
+	if status != "ok" {
+		t.Fatalf("publish_state.status=%q want 'ok' after sweep", status)
+	}
+	if errMsg.Valid {
+		t.Fatalf("publish_state.error=%q want NULL after sweep", errMsg.String)
+	}
+
+	// Breadcrumb meta keys must be cleared.
+	for _, key := range []string{
+		"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error",
+	} {
+		if _, ok, err := state.MetaGet(ctx, f.db, key); err != nil {
+			t.Fatalf("MetaGet %q: %v", key, err)
+		} else if ok {
+			t.Fatalf("breadcrumb %q still present after sweep", key)
+		}
 	}
 }
 
