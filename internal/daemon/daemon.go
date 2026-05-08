@@ -1058,14 +1058,34 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: cctx.BranchGeneration,
 			})
-			// Prune terminal rows for the prior (branch_ref, generation)
-			// when the prior branch ref no longer resolves. Avoids
-			// phantom blocked_conflict / failed barriers accumulating
-			// after a feature branch is merged and deleted upstream.
-			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB, cctx,
-				tokenBranchRef(oldToken), prevGeneration,
-				logger, tracer,
-				"dead branch terminals pruned after Diverged")
+			// Prune unpublished rows for the prior (branch_ref,
+			// generation) when the prior branch ref no longer resolves.
+			// Avoids phantom blocked_conflict / failed / pending barriers
+			// accumulating after a feature branch is merged and deleted
+			// upstream.
+			//
+			// Honor the manual-pause marker. processBranchTokenChange runs
+			// at section 4d, BEFORE the run-loop pause gate at 4f, so a
+			// runtime Diverged transition can otherwise fire while the
+			// operator has paused for surgery. Skip the prune so paused
+			// operators see no unsolicited capture_events mutation.
+			runtimePruneAllowed := true
+			if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+				logger.Warn("read pause state before runtime dead-branch prune; skipping",
+					"err", perr.Error())
+				runtimePruneAllowed = false
+			} else if pauseStatus.Active {
+				logger.Info("dead-branch prune skipped (manual pause)",
+					"source", pauseStatus.Source,
+					"reason", pauseStatus.Reason)
+				runtimePruneAllowed = false
+			}
+			if runtimePruneAllowed {
+				pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB, cctx,
+					tokenBranchRef(oldToken), prevGeneration,
+					logger, tracer,
+					"dead branch unpublished pruned after Diverged")
+			}
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
