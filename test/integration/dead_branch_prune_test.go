@@ -70,19 +70,6 @@ func countTerminalsForRef(t *testing.T, dbPath, branchRef string) int {
 	return n
 }
 
-// activeBranchGeneration reads daemon_meta.branch.generation; defaults to "1"
-// if absent. Returned as int.
-func activeBranchGeneration(t *testing.T, dbPath string) int {
-	t.Helper()
-	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
-	if gen == "" {
-		return 1
-	}
-	n := 1
-	fmt.Sscanf(gen, "%d", &n)
-	return n
-}
-
 // TestDeadBranchPrune_DivergedDeletedBranchPrunesRows covers scenario (a):
 // a Diverged transition where the prior branch has been deleted prunes the
 // blocked_conflict rows tied to that dead ref. We seed the dead-branch row
