@@ -1212,7 +1212,7 @@ func readSnippet(t *testing.T, path string) []byte {
 	return body
 }
 
-// TestExtractYAMLHookBodies_DriftFromVerbatimSnippet feeds the verbatim
+// TestYAMLDrift_FromVerbatimSnippet feeds the verbatim
 // opencode/pi snippet bodies into extractYAMLHookBodies and asserts that
 // (a) the unmodified body has every active hook carrying both `acd start`
 // and `acd wake` (no drift), and (b) when one `acd start` invocation is
@@ -1220,7 +1220,7 @@ func readSnippet(t *testing.T, path string) []byte {
 // at least one stale hook. This locks down the regression where the
 // scanner misread nested `actions: - bash:` items as new orphan hookItems
 // and silently dropped the parent event association.
-func TestExtractYAMLHookBodies_DriftFromVerbatimSnippet(t *testing.T) {
+func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 	cases := []struct {
 		harness     string
 		snippetPath string
