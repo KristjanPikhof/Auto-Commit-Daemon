@@ -173,7 +173,19 @@ func runStartupDeadBranchSweep(
 	if scanned == 0 {
 		return
 	}
-	prunedRefs := make([]string, 0, len(pairs))
+	// Enumerate live branch refs once up-front instead of per-pair `git
+	// show-ref` shell-outs. With N distinct terminal pairs this collapses N
+	// forks into 1; on a long-lived repo with many stale branches the
+	// difference dominates the sweep's wall-clock cost. Fail closed: any
+	// error here preserves terminals (callers see the same "could not prove
+	// dead, leave it alone" semantics as the per-pair RefExists fail-open).
+	liveRefs, err := git.LiveBranchSet(ctx, repoDir)
+	if err != nil {
+		logger.Warn("startup sweep: enumerate live refs failed; preserving terminals",
+			"err", err.Error())
+		return
+	}
+	prunedRefs := make([]string, 0, deadBranchSweepRefsCap)
 	totalRows := 0
 	prunedPairs := 0
 	for _, p := range pairs {
@@ -184,20 +196,12 @@ func runStartupDeadBranchSweep(
 		if p.Ref == cctx.BranchRef && p.Generation == cctx.BranchGeneration {
 			continue
 		}
-		exists, err := git.RefExists(ctx, repoDir, p.Ref)
-		if err != nil {
-			logger.Warn("startup sweep: dead-branch ref probe failed; preserving terminals",
-				"ref", p.Ref,
-				"generation", p.Generation,
-				"err", err.Error())
+		if _, alive := liveRefs[p.Ref]; alive {
 			continue
 		}
-		if exists {
-			continue
-		}
-		rows, dErr := state.DeleteTerminalForDeadBranch(ctx, db, p.Ref, p.Generation)
+		rows, dErr := state.PurgeUnpublishedForDeadBranch(ctx, db, p.Ref, p.Generation)
 		if dErr != nil {
-			logger.Warn("startup sweep: delete dead-branch terminals failed",
+			logger.Warn("startup sweep: purge dead-branch unpublished failed",
 				"ref", p.Ref,
 				"generation", p.Generation,
 				"err", dErr.Error())
@@ -211,7 +215,7 @@ func runStartupDeadBranchSweep(
 		if len(prunedRefs) < deadBranchSweepRefsCap {
 			prunedRefs = append(prunedRefs, p.Ref)
 		}
-		logger.Info("startup sweep pruned dead-branch terminals",
+		logger.Info("startup sweep pruned dead-branch unpublished",
 			"ref", p.Ref,
 			"generation", p.Generation,
 			"rows", rows)
