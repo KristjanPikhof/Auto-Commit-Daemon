@@ -672,6 +672,17 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
+	// Sweep terminal capture_events rows whose owning branch ref has been
+	// deleted. Runs once at boot, before the main loop, so a daemon restart
+	// observes a clean queue even when the runtime Diverged hook never had a
+	// chance to fire (for instance: branch deleted while the daemon was
+	// stopped). The opt-out log fires first so operators see the env knob in
+	// effect even when there is nothing to sweep.
+	if isKeepDeadBranchBarriers() {
+		logger.Info("dead-branch terminal pruning disabled by env",
+			"env", EnvKeepDeadBranchBarriers)
+	}
+	runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
