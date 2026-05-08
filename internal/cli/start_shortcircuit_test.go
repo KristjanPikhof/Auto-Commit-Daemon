@@ -336,13 +336,15 @@ func TestReadStartCache_TolerantOfBadInputs(t *testing.T) {
 }
 
 // writeStartCache + readStartCache round-trip including the parent dir
-// being created on demand under <gitDir>/acd.
+// being created on demand under <gitDir>/acd. Schema v2 also round-trips
+// the daemon fingerprint stamp.
 func TestWriteStartCache_RoundTripCreatesParent(t *testing.T) {
 	gitDir := t.TempDir()
 	in := startCache{
 		Version: startCacheVersion, RepoHash: "abc",
 		SessionID: "s", Harness: "claude-code",
 		DaemonPID: 9999, WatchPID: 1234, UpdatedAt: 42,
+		DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv-hash-roundtrip",
 	}
 	if err := writeStartCache(gitDir, in); err != nil {
 		t.Fatalf("writeStartCache: %v", err)
@@ -353,8 +355,27 @@ func TestWriteStartCache_RoundTripCreatesParent(t *testing.T) {
 	}
 	if got.SessionID != in.SessionID || got.DaemonPID != in.DaemonPID ||
 		got.RepoHash != in.RepoHash || got.WatchPID != in.WatchPID ||
-		got.UpdatedAt != in.UpdatedAt {
+		got.UpdatedAt != in.UpdatedAt ||
+		got.DaemonStartTS != in.DaemonStartTS || got.DaemonArgvHash != in.DaemonArgvHash {
 		t.Fatalf("round-trip mismatch:\n in=%+v\ngot=%+v", in, *got)
+	}
+}
+
+// TestReadStartCache_LegacyV1Rejected pins that v1 cache files (before the
+// fingerprint schema bump) are treated as missing so the cold path is
+// forced to repopulate the cache with v2 fields.
+func TestReadStartCache_LegacyV1Rejected(t *testing.T) {
+	dir := t.TempDir()
+	v1Path := filepath.Join(dir, "v1.json")
+	body, _ := json.Marshal(map[string]any{
+		"version": 1, "repo_hash": "abc", "session_id": "s",
+		"harness": "claude-code", "daemon_pid": 12345, "updated_at_unix": 42,
+	})
+	if err := os.WriteFile(v1Path, body, 0o600); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	if got := readStartCache(v1Path); got != nil {
+		t.Fatalf("v1 cache must be rejected, got %+v", got)
 	}
 }
 
