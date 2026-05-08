@@ -137,6 +137,13 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 			if err := printSnippet(out, embeddedFS, meta.file); err != nil {
 				return err
 			}
+			// Guarantee a blank line between the direnv and zshrc snippets so
+			// the concatenated body parses as bash even if either snippet's
+			// last line lacks a trailing newline. bash -n must succeed on the
+			// joined body when redirected into a startup file.
+			if _, err := out.Write([]byte("\n")); err != nil {
+				return err
+			}
 			if err := printSnippet(out, embeddedFS, shellZshrcSnippet); err != nil {
 				return err
 			}
