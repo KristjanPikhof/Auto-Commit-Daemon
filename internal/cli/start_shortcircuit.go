@@ -209,25 +209,25 @@ func evaluateShortCircuit(
 func tryShortCircuitStart(
 	ctx context.Context,
 	gitDir, repoHash, sessionID, harness, repo string,
-) (didShortCircuit bool, daemonPID int, reason string) {
+) (didShortCircuit bool, daemonPID, clientCount int, reason string) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return false, 0, "ctx_done"
+			return false, 0, 0, "ctx_done"
 		}
 	}
 	cache := readStartCache(startCachePath(gitDir))
 	roots, err := paths.Resolve()
 	if err != nil {
-		return false, 0, "paths_resolve_failed"
+		return false, 0, 0, "paths_resolve_failed"
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
 		// A registry that cannot be parsed must escalate to the full
 		// path so the writer (under flock) can repair it.
 		if errors.Is(err, central.ErrUnsupportedVersion) {
-			return false, 0, "registry_unsupported_version"
+			return false, 0, 0, "registry_unsupported_version"
 		}
-		return false, 0, "registry_load_failed"
+		return false, 0, 0, "registry_load_failed"
 	}
 	var rec *central.RepoRecord
 	if reg != nil {
@@ -242,7 +242,7 @@ func tryShortCircuitStart(
 	d := evaluateShortCircuit(cache, repoHash, sessionID, harness, rec,
 		shortCircuitNow(), clientTTL(), identity.Alive)
 	if !d.OK {
-		return false, 0, d.Reason
+		return false, 0, 0, d.Reason
 	}
-	return true, d.DaemonPID, ""
+	return true, d.DaemonPID, d.ClientCount, ""
 }
