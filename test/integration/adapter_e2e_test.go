@@ -699,6 +699,33 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
 
+	// Cover P2-7: tear the daemon down via `acd stop --all --force` (not
+	// per-session deregistration) and prove the active hook still self-heals.
+	assertActiveHookSelfHealsAfterStopAll(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
+
+	// Negative-path: corrupt state.db so `acd start` fails. The new
+	// templates chain semantics must surface the failure as a nonzero hook
+	// exit AND write the "active hook failed" line to the harness log.
+	negStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
+	if negStop.ExitCode != 0 {
+		t.Fatalf("claude-code negative-path pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			negStop.ExitCode, negStop.Stdout, negStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, "claude-code daemon stopped before negative-path", repo)
+	assertActiveHookFailsOnCorruptDB(t, "claude-code", ctx, env, repo, "claude-code", wakeHook, stdin)
+	// Re-arm the daemon so the SessionEnd path below operates on a clean,
+	// running daemon (avoids a flaky stop on a never-started daemon).
+	if rearm := runBash(t, ctx, env, stdin, startHook.Command); rearm.ExitCode != 0 {
+		t.Fatalf("claude-code re-arm after negative-path exit=%d\nstdout=%s\nstderr=%s",
+			rearm.ExitCode, rearm.Stdout, rearm.Stderr)
+	}
+	waitFor(t, "claude-code daemon mode==running after re-arm", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
+
 	// SessionEnd → acd stop. The daemon should shut down because this is
 	// the only registered session.
 	stopHook := pickHookByEvent(t, hooks, "SessionEnd")
