@@ -4,7 +4,7 @@ hooks:
     event: session.created
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-unknown}"
+          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -21,7 +21,7 @@ hooks:
     event: tool.before.*
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-unknown}"
+          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -41,7 +41,7 @@ hooks:
     event: tool.after.*
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-unknown}"
+          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -61,7 +61,7 @@ hooks:
     event: session.idle
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-unknown}"
+          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -73,7 +73,7 @@ hooks:
     event: session.deleted
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-unknown}"
+          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
