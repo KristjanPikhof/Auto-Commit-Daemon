@@ -183,6 +183,71 @@ func TestCodexInstalls_NeitherFile(t *testing.T) {
 	}
 }
 
+// TestDetectInstalled_OpenCodeIgnoresBareYAMLMarker guards against the
+// substring-collision regression: a hand-edited or third-party YAML that
+// contains a bare `acd-managed: true` line (without the canonical `#`
+// comment prefix) must NOT be classified as an acd-managed install. The
+// canonical acd templates always write `# acd-managed: true`, so requiring
+// the comment prefix removes the false-positive without breaking any real
+// install.
+func TestDetectInstalled_OpenCodeIgnoresBareYAMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	// Bare key form (no `#` prefix). Could appear in a user-authored
+	// hooks.yaml as a config key whose name collides with the acd marker.
+	if err := os.WriteFile(hooks, []byte("hooks:\n  - id: foo\n    acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write hooks.yaml: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none (bare YAML acd-managed line must not match)", got)
+	}
+}
+
+// TestDetectInstalled_PiIgnoresBareYAMLMarker mirrors the opencode case for
+// the Pi harness path.
+func TestDetectInstalled_PiIgnoresBareYAMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".pi", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir pi dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte("hooks:\n  - id: foo\n    acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write hooks.yaml: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none (bare YAML acd-managed line must not match)", got)
+	}
+}
+
+// TestDetectInstalled_OpenCodeMatchesCommentMarker confirms the canonical
+// comment-form template still classifies as installed.
+func TestDetectInstalled_OpenCodeMatchesCommentMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "opencode" {
+		t.Fatalf("DetectInstalled=%#v, want opencode only", got)
+	}
+}
+
 func TestCodexInstalls_OnlyJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

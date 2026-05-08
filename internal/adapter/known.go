@@ -32,19 +32,19 @@ var (
 	jsonAcdManagedMarkers = []string{`"_acd_managed": true`, `"_acd_managed":true`}
 	// tomlAcdManagedMarkers requires the leading `#` comment prefix because
 	// TOML has no other way to embed a free-form line, and the canonical acd
-	// install writes a `# acd-managed: true` comment block. Distinguishing
-	// this from the yaml marker prevents a YAML file that happens to contain
-	// the substring `acd-managed: true` (e.g. as a config key) from being
-	// classified as a TOML acd install in the unlikely event a path is
-	// re-bound across formats.
+	// install writes a `# acd-managed: true` comment block.
 	tomlAcdManagedMarkers = []string{"# acd-managed: true"}
-	// yamlAcdManagedMarkers matches the bare key form. Templates write the
-	// commented form `# acd-managed: true`, which still contains this
-	// substring, so detection of the canonical install is preserved. Keeping
-	// the yaml marker bare makes it strictly less restrictive than the toml
-	// marker — the two values are now provably distinct, eliminating the
-	// previous accidental cross-format substring collision.
-	yamlAcdManagedMarkers = []string{"acd-managed: true"}
+	// yamlAcdManagedMarkers matches only the canonical comment form
+	// `# acd-managed: true`. acd-managed YAML templates always write the
+	// comment-prefixed form (never a bare key), so this is sufficient to
+	// detect canonical installs. Requiring the `#` prefix prevents a
+	// hand-edited YAML containing a bare `acd-managed: true` line — e.g.,
+	// a user-config key that happens to use the same identifier — from
+	// being misclassified as an acd install (which would cause `acd doctor`
+	// to recommend overwrite remediation against a file acd never wrote).
+	// All three marker slices now require the canonical prefix:
+	// JSON uses the `_acd_managed` key; TOML and YAML use `# acd-managed: true`.
+	yamlAcdManagedMarkers = []string{"# acd-managed: true"}
 )
 
 var knownHarnesses = []knownHarness{
