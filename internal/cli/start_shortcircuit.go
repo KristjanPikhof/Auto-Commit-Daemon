@@ -27,10 +27,19 @@ import (
 // fails the equality check and the caller escalates to the cold path.
 const startCacheVersion = 2
 
-// startCacheFilename is the per-repo cache file written under
-// <gitDir>/acd/. Atomic writes (tmp + rename) keep it safe under concurrent
-// readers and writers without taking control.lock.
-const startCacheFilename = "start-cache.json"
+// startCacheFilenamePrefix is the per-repo cache file prefix written under
+// <gitDir>/acd/. Atomic writes (tmp + rename) keep each file safe under
+// concurrent readers and writers without taking control.lock. The full
+// filename is "<prefix><sha256(session_id)[:16]>.json" so two harnesses
+// (Claude Code + Codex) or two parallel sessions of the same harness can
+// share a repo without evicting each other from the short-circuit cache.
+//
+// Hashing the session_id (rather than embedding it raw) keeps the path
+// fixed-length, avoids os-level filename surprises (slashes, colons in
+// some harness session UUIDs), and reduces the disclosure surface — the
+// 16-hex prefix is enough to disambiguate hundreds of millions of entries
+// before a collision.
+const startCacheFilenamePrefix = "start-cache-"
 
 // startCache is the JSON payload persisted at <gitDir>/acd/start-cache.json
 // after a successful runStart. Its sole purpose is to let a subsequent
