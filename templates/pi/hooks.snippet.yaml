@@ -5,54 +5,78 @@ hooks:
     actions:
       - bash: |
           SID="${PI_SESSION_ID:-unknown}"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd start \
             --session-id "$SID" \
             --harness pi \
             --watch-pid "$PPID" \
-            --repo "$PI_PROJECT_DIR"
+            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
+              printf '[%s] session-start failed exit=%d cmd=acd-start\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-wake-tool-before
     event: tool.before.*
     actions:
       - bash: |
           SID="${PI_SESSION_ID:-unknown}"
-          acd start \
-            --session-id "$SID" \
-            --harness pi \
-            --watch-pid "$PPID" \
-            --repo "$PI_PROJECT_DIR"
-          acd wake \
-            --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
+          { acd start \
+              --session-id "$SID" \
+              --harness pi \
+              --watch-pid "$PPID" \
+              --repo "$PI_PROJECT_DIR" >/dev/null \
+            && acd wake \
+              --session-id "$SID" \
+              --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-wake-tool-after
     event: tool.after.*
     actions:
       - bash: |
           SID="${PI_SESSION_ID:-unknown}"
-          acd start \
-            --session-id "$SID" \
-            --harness pi \
-            --watch-pid "$PPID" \
-            --repo "$PI_PROJECT_DIR"
-          acd wake \
-            --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
+          { acd start \
+              --session-id "$SID" \
+              --harness pi \
+              --watch-pid "$PPID" \
+              --repo "$PI_PROJECT_DIR" >/dev/null \
+            && acd wake \
+              --session-id "$SID" \
+              --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-touch-idle
     event: session.idle
     actions:
       - bash: |
           SID="${PI_SESSION_ID:-unknown}"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd touch \
             --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR"
+            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG"
 
   - id: acd-stop
     event: session.deleted
     actions:
       - bash: |
           SID="${PI_SESSION_ID:-unknown}"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd stop \
             --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR"
+            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG"
