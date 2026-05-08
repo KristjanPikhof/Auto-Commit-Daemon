@@ -382,3 +382,170 @@ func TestDivergedHookPrunesDeadBranchTerminals(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+// TestDeadBranchSweep_WritesMetaKeysWhenRowsPruned asserts the startup sweep
+// stamps the three operator-facing meta keys when at least one row is pruned.
+// This is the input `acd diagnose --json` reads to surface stale-branch
+// hygiene activity.
+func TestDeadBranchSweep_WritesMetaKeysWhenRowsPruned(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	const deadRef = "refs/heads/old"
+	const activeRef = "refs/heads/main"
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-failed.txt", state.EventStateFailed)
+
+	before := time.Now().Unix()
+	cctx := CaptureContext{
+		BranchRef:        activeRef,
+		BranchGeneration: 1,
+		BaseHead:         headOID,
+	}
+	runStartupDeadBranchSweep(ctx, f.dir, f.db, cctx, slog.Default(), nil)
+	after := time.Now().Unix()
+
+	// last_run_ts must be a parseable int within the wall-clock window.
+	tsRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRunTS)
+	if err != nil {
+		t.Fatalf("MetaGet last_run_ts: %v", err)
+	}
+	if !ok || tsRaw == "" {
+		t.Fatalf("expected meta %q to be set after non-empty sweep", MetaKeyDeadBranchPruneLastRunTS)
+	}
+	ts, err := strconv.ParseInt(tsRaw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse last_run_ts %q: %v", tsRaw, err)
+	}
+	if ts < before || ts > after {
+		t.Fatalf("last_run_ts=%d outside [%d, %d]", ts, before, after)
+	}
+
+	// last_count must equal the total rows pruned (2: blocked_conflict + failed).
+	countRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastCount)
+	if err != nil {
+		t.Fatalf("MetaGet last_count: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected meta %q to be set", MetaKeyDeadBranchPruneLastCount)
+	}
+	if countRaw != "2" {
+		t.Fatalf("last_count=%q want %q", countRaw, "2")
+	}
+
+	// last_refs must be valid JSON containing the dead ref.
+	refsRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRefs)
+	if err != nil {
+		t.Fatalf("MetaGet last_refs: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected meta %q to be set", MetaKeyDeadBranchPruneLastRefs)
+	}
+	var refs []string
+	if err := json.Unmarshal([]byte(refsRaw), &refs); err != nil {
+		t.Fatalf("unmarshal last_refs %q: %v", refsRaw, err)
+	}
+	if len(refs) != 1 || refs[0] != deadRef {
+		t.Fatalf("last_refs=%v want [%q]", refs, deadRef)
+	}
+}
+
+// TestDeadBranchSweep_NoMetaWhenNoOp asserts the sweep does NOT stamp the meta
+// keys when no rows were pruned (only live-ref terminals exist). The previous
+// "last action that did something" snapshot must survive a no-op pass.
+func TestDeadBranchSweep_NoMetaWhenNoOp(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	const activeRef = "refs/heads/main"
+	// Only seed terminals on the active ref — sweep must skip them.
+	seedTerminalEvent(t, f.db, activeRef, 1, headOID, "main-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, activeRef, 1, headOID, "main-failed.txt", state.EventStateFailed)
+
+	cctx := CaptureContext{
+		BranchRef:        activeRef,
+		BranchGeneration: 1,
+		BaseHead:         headOID,
+	}
+	runStartupDeadBranchSweep(ctx, f.dir, f.db, cctx, slog.Default(), nil)
+
+	for _, key := range []string{
+		MetaKeyDeadBranchPruneLastRunTS,
+		MetaKeyDeadBranchPruneLastCount,
+		MetaKeyDeadBranchPruneLastRefs,
+	} {
+		v, ok, err := state.MetaGet(ctx, f.db, key)
+		if err != nil {
+			t.Fatalf("MetaGet %q: %v", key, err)
+		}
+		if ok {
+			t.Fatalf("expected meta %q absent after no-op sweep; got %q", key, v)
+		}
+	}
+}
+
+// TestDivergedHookWritesMetaKeys drives the runtime Diverged-hook helper
+// directly with a dead previous ref and asserts the three meta keys are
+// stamped. Mirrors the integration in TestDivergedHookPrunesDeadBranchTerminals
+// but isolates the meta-write contract.
+func TestDivergedHookWritesMetaKeys(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	const deadRef = "refs/heads/dead-after-merge"
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "dead-blocked.txt", state.EventStateBlockedConflict)
+
+	before := time.Now().Unix()
+	pruneDeadBranchTerminals(ctx, f.dir, f.db,
+		CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 2, BaseHead: headOID},
+		deadRef, 1,
+		slog.Default(), nil,
+		"diverged hook")
+	after := time.Now().Unix()
+
+	tsRaw, ok, err := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRunTS)
+	if err != nil {
+		t.Fatalf("MetaGet last_run_ts: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected meta %q to be set after Diverged-hook prune", MetaKeyDeadBranchPruneLastRunTS)
+	}
+	ts, err := strconv.ParseInt(tsRaw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse last_run_ts: %v", err)
+	}
+	if ts < before || ts > after {
+		t.Fatalf("last_run_ts=%d outside [%d, %d]", ts, before, after)
+	}
+
+	countRaw, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastCount)
+	if !ok || countRaw != "1" {
+		t.Fatalf("last_count=%q ok=%v want %q", countRaw, ok, "1")
+	}
+	refsRaw, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRefs)
+	if !ok {
+		t.Fatalf("expected meta %q to be set", MetaKeyDeadBranchPruneLastRefs)
+	}
+	var refs []string
+	if err := json.Unmarshal([]byte(refsRaw), &refs); err != nil {
+		t.Fatalf("unmarshal last_refs %q: %v", refsRaw, err)
+	}
+	if len(refs) != 1 || refs[0] != deadRef {
+		t.Fatalf("last_refs=%v want [%q]", refs, deadRef)
+	}
+}
