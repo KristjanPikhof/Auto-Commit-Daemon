@@ -1,5 +1,18 @@
 # Changelog
 
+## v2026-05-09
+
+### Added
+
+- ACD now auto-prunes `blocked_conflict` / `failed` capture rows whose owning
+  branch ref no longer resolves, so `acd status` no longer shows phantom
+  blocked counts after a feature branch is merged and deleted. Both the
+  runtime `Diverged` transition and a one-shot daemon-startup sweep clean up
+  stale terminals; `acd diagnose --json` surfaces `dead_branch_prune_last_run_ts`,
+  `dead_branch_prune_last_count`, and `dead_branch_prune_last_refs` so the
+  action is visible without grepping logs. Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1`
+  to opt out and keep dead-branch terminals around for forensic inspection.
+
 ## v2026-05-08
 
 ### Added

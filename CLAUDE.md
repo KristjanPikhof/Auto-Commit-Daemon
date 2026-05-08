@@ -75,7 +75,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Detached HEAD pauses capture/replay; `acd start` refuses. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - Git-op markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`. Non-`ErrNotExist` stat errors fail open with warning.
 - Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins.
-- Diverged drops stale `pending` for prior generation only; keep `published`/`failed`/`blocked_conflict`. SQLite read errors in `daemonPauseState` fail closed.
+- Diverged drops stale `pending` for prior generation only; keep `published`. `failed`/`blocked_conflict` for the prior `(branch_ref, generation)` are auto-pruned when the prior `branch_ref` no longer resolves (post `git.RefExists` probe); live ref preserves rows. Daemon-startup sweep applies the same rule to pre-existing dead-branch terminals once before the main loop. `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` disables both paths. Daemon stamps `dead_branch_prune.{last_run_ts,last_count,last_refs}` meta on prune; `acd diagnose --json` surfaces them. SQLite read errors in `daemonPauseState` fail closed.
 - Capture compares live worktree to shadow; stale/missing bootstrap creates phantom creates.
 - `walkLive` BFSes by directory layer; ignore checks batched (`ignoreCheckBatchSize=1000`); prunes ignored/sensitive/safe-ignore dirs before readdir.
 - Never prune worktree-rooted `acd/`; `.git/acd` is daemon state. Symlinks mode `120000`; never descend.
@@ -178,7 +178,7 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 | Group | Vars |
 |---|---|
 | Trace | `ACD_TRACE`; `ACD_TRACE_DIR` default `<gitDir>/acd/trace` |
-| Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables) |
+| Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables); `ACD_KEEP_DEAD_BRANCH_BARRIERS` truthy disables auto-prune of dead-branch terminals |
 | Capture | `ACD_SENSITIVE_GLOBS`; `ACD_SAFE_IGNORE`; `ACD_SAFE_IGNORE_EXTRA`; `ACD_MAX_PENDING_EVENTS` |
 | AI | `ACD_AI_PROVIDER=deterministic|openai-compat|subprocess:<name>`; `ACD_AI_BASE_URL`; `ACD_AI_API_KEY`; `ACD_AI_MODEL`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS` |
 | Strategy | `ACD_COMMIT_STRATEGY=event|intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=2` |
