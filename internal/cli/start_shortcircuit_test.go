@@ -690,15 +690,21 @@ func TestMultiSession_PerSessionCacheKeepsBothOnHotPath(t *testing.T) {
 		t.Fatalf("session-B cache missing: %v", err)
 	}
 
-	// Detonate the SQLite tripwire: if a hot call falls through to the
-	// cold path, state.Open will recreate the DB.
-	dbPath := filepath.Join(gitDir, "acd", "state.db")
-	if err := os.Remove(dbPath); err != nil {
-		t.Fatalf("remove state.db: %v", err)
+	// Tripwire: stub touchClientHotPath so we can record each hot-path
+	// touch by session_id. A fall-through to the cold path would
+	// re-spawn the daemon (caught by the spawn-count assertion below)
+	// and would NOT record a hot-path touch for that call.
+	var touchedSessions sync.Map
+	prevTouch := touchClientHotPath
+	touchClientHotPath = func(ctx context.Context, gitDir, sessionID string) error {
+		v, _ := touchedSessions.LoadOrStore(sessionID, new(atomic.Int32))
+		v.(*atomic.Int32).Add(1)
+		return prevTouch(ctx, gitDir, sessionID)
 	}
+	t.Cleanup(func() { touchClientHotPath = prevTouch })
 
-	// Interleave hot calls. Both sessions must short-circuit and the
-	// SQLite file must stay absent.
+	// Interleave hot calls. Both sessions must short-circuit and each
+	// must record one hot-path touch per call.
 	for _, sess := range []string{"sess-A", "sess-B", "sess-A", "sess-B"} {
 		harness := "claude-code"
 		if sess == "sess-B" {
@@ -719,8 +725,14 @@ func TestMultiSession_PerSessionCacheKeepsBothOnHotPath(t *testing.T) {
 	if count.Load() != 1 {
 		t.Fatalf("spawn count after interleaved hot calls=%d want 1", count.Load())
 	}
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("state.db reappeared: %v — short-circuit fell through", err)
+	for _, sess := range []string{"sess-A", "sess-B"} {
+		v, ok := touchedSessions.Load(sess)
+		if !ok {
+			t.Fatalf("hot-path touch never recorded for %s", sess)
+		}
+		if got := v.(*atomic.Int32).Load(); got != 2 {
+			t.Fatalf("hot-path touch count for %s=%d want 2", sess, got)
+		}
 	}
 
 	// Stop session A only; session B's cache must survive. Use the
