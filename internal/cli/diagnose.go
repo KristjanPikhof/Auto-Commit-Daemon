@@ -73,11 +73,14 @@ type diagnoseReport struct {
 	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
 	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
 	// terminal prune action so operators can confirm stale-branch hygiene
-	// is keeping pace. All three are omitted from the JSON when the daemon
-	// has never recorded a non-empty prune (the meta keys are simply
-	// absent).
-	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts,omitempty"`
-	DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count,omitempty"`
+	// is keeping pace. The two int fields are ALWAYS present in the JSON —
+	// a zero value is the documented "daemon has never recorded a non-empty
+	// prune" sentinel, distinguishable from any real prune (real prunes
+	// stamp last_run_ts to the wall-clock unix-second the prune ran and
+	// last_count >= 1). The slice keeps `omitempty` so an empty list
+	// serializes as absent rather than `null`/`[]`.
+	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts"`
+	DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
 	DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs,omitempty"`
 	Remediation              []string `json:"remediation"`
 	StateDBChecksumBefore    string   `json:"state_db_checksum_before"`
