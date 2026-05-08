@@ -187,15 +187,19 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	// cold path will re-spawn or refuse based on the live daemon_state
 	// row.
 	//
-	// Per-session caches are now scattered across <gitDir>/acd/ —
-	// when the daemon is fully stopped, every lookup must escalate, so
-	// we wipe all start-cache-*.json files. When only one session was
-	// deregistered (sessionID != "" and the caller did not survive to
-	// stop the daemon), we still drop that one session's cache below
-	// before the deferred sweep runs — see Deferred path.
+	// Per-session caches are scattered across <gitDir>/acd/. When the
+	// daemon is fully stopped, every lookup must escalate so we wipe
+	// every start-cache-*.json file. When only one session was
+	// deregistered (Deferred path: peers remain) we drop just that
+	// session's cache so it cannot mask a missing daemon_clients row;
+	// the surviving peers keep their caches and stay on the hot path.
 	defer func() {
 		if res.Stopped {
 			removeAllStartCaches(gitDir)
+			return
+		}
+		if sessionID != "" {
+			_ = os.Remove(startCachePath(gitDir, sessionID))
 		}
 	}()
 	clock, err := daemon.AcquireControlLock(gitDir)
