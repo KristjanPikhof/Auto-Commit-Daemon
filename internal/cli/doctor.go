@@ -683,9 +683,19 @@ func looksLikeHookError(ln string) bool {
 }
 
 // parseLogTimestamp tries to extract a timestamp from the start of ln. It
-// understands the JSONL `"ts":` field used by acd's structured logger and
-// the ISO-8601 prefix "YYYY-MM-DDTHH:MM:SS" common to bash-redirected
+// understands the JSONL `"ts":` field used by acd's structured logger,
+// the wrapper printf shape `[2026-05-08T12:34:56+0300] message` emitted
+// by templates/codex/hooks.json (and the OpenCode/Pi YAML snippets), and
+// the bare ISO-8601 prefix "YYYY-MM-DDTHH:MM:SS" common to bash-redirected
 // stderr. Returns ok=false when no timestamp is found.
+//
+// The wrapper printf is built from `date +%FT%T%z` — that is, ISO-8601
+// with a numeric timezone offset and NO colon between hh:mm of the zone
+// (e.g. `+0300`, not `+03:00`). We must accept both the full bracketed
+// form (with zone) and the bare 19-char ISO prefix; otherwise every
+// hook-failure line falls through to the no-timestamp branch and is
+// counted as recent regardless of when it was written, defeating the
+// 5-minute window in tailCodexHookLog.
 func parseLogTimestamp(ln string) (time.Time, bool) {
 	// JSONL: {"ts":"2026-05-08T...","level":"error",...}
 	if idx := strings.Index(ln, `"ts":"`); idx >= 0 {
@@ -699,10 +709,18 @@ func parseLogTimestamp(ln string) (time.Time, bool) {
 			}
 		}
 	}
-	// ISO-8601 prefix "2026-05-08T12:34:56".
-	if len(ln) >= 19 {
-		head := ln[:19]
-		if t, err := time.Parse("2006-01-02T15:04:05", head); err == nil {
+	// Strip an optional leading "[" so the wrapper printf shape
+	// `[2026-05-08T12:34:56+0300] active hook failed exit=1 ...` parses.
+	head := strings.TrimPrefix(ln, "[")
+	// Bracketed form with numeric zone (date +%FT%T%z): 24-char prefix.
+	if len(head) >= 24 {
+		if t, err := time.Parse("2006-01-02T15:04:05-0700", head[:24]); err == nil {
+			return t, true
+		}
+	}
+	// Bare ISO-8601 prefix "2026-05-08T12:34:56" (no zone).
+	if len(head) >= 19 {
+		if t, err := time.Parse("2006-01-02T15:04:05", head[:19]); err == nil {
 			return t, true
 		}
 	}
