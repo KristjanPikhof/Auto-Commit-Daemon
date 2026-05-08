@@ -28,11 +28,36 @@ go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest
 
 ~~~bash
 acd setup claude-code   # paste output into ~/.claude/settings.json
-acd setup codex         # paste output into ~/.config/codex/config.toml
+acd setup codex         # paste output into ~/.codex/hooks.json
 acd setup opencode      # paste output into your OpenCode-Hooks hooks.yaml
 acd setup pi            # paste output into your .pi/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
+
+> **Overwrite warning:** each `acd setup` command prints a snippet to stdout
+> for you to merge into the target config. Redirecting with `>` (e.g. `acd
+> setup codex --raw > ~/.codex/hooks.json`) replaces the entire file and will
+> destroy any custom (non-acd) hooks or settings you already have there. Back
+> up the file first if you have made manual edits, then merge the acd block
+> in by hand. See the per-harness README for details:
+> [claude-code](templates/claude-code/README.md),
+> [codex](templates/codex/README.md),
+> [opencode](templates/opencode/README.md),
+> [pi](templates/pi/README.md).
+
+### Supported harnesses
+
+| Harness | Hook engine | Source |
+|---|---|---|
+| `claude-code` | Claude Code native hooks (`~/.claude/settings.json`) | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
+| `codex` | Codex hooks v2 (`~/.codex/hooks.json`; legacy `~/.codex/config.toml` still detected). Run `/hooks` inside Codex after every install or re-install to approve newly-written acd hooks — Codex re-flags all entries as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
+| `opencode` | OpenCode-Hooks YAML engine (`~/.config/opencode/hooks.yaml`) | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
+| `pi` | Pi-YAML-Hooks YAML engine (`~/.pi/hook/hooks.yaml`) | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
+| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` fallback | n/a (no harness required) |
+
+Install the hook engine first (Codex, Claude Code, OpenCode-Hooks, Pi-YAML-Hooks), then run the matching `acd setup …` to wire `acd` into it.
+
+Run `acd doctor` to check whether your installed snippet is current. It warns when active hooks are missing `acd start` or `acd wake`, and shows the remediation command per harness.
 
 ## Use it
 
@@ -399,7 +424,7 @@ Notes:
 ## Status
 
 Active development. 
-- First tag: `v2026-04-28` - Last tag: `v2026-05-05-04`
+- First tag: `v2026-04-28` - Last tag: `v2026-05-08`
 
 ## License
 

@@ -94,13 +94,29 @@ func TestEventsWatchStreamsAppendedRowsOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	ready := make(chan struct{})
+	prevHook := eventsWatchReadyHook
+	eventsWatchReadyHook = func() {
+		select {
+		case <-ready:
+		default:
+			close(ready)
+		}
+	}
+	t.Cleanup(func() { eventsWatchReadyHook = prevHook })
+
 	var out lockedBuffer
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runEvents(ctx, &out, repo, "", 0, 10, true, 10*time.Millisecond, true)
 	}()
 
-	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatalf("watch did not reach ready hook within 5s")
+	}
 	if _, err := state.AppendDecision(context.Background(), db, state.DecisionRecord{
 		DecisionTS:       20,
 		Kind:             state.DecisionKindCaptured,

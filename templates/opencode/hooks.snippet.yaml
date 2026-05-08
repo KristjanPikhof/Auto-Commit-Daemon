@@ -4,40 +4,74 @@ hooks:
     event: session.created
     actions:
       - bash: |
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/opencode-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd start \
             --session-id "$OPENCODE_SESSION_ID" \
             --harness opencode \
             --watch-pid "$PPID" \
-            --repo "$OPENCODE_PROJECT_DIR"
+            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
+              printf '[%s] session-start failed exit=%d cmd=acd-start\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-wake-tool-before
     event: tool.before.*
     actions:
       - bash: |
-          acd wake \
-            --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/opencode-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
+          { acd start \
+              --session-id "$OPENCODE_SESSION_ID" \
+              --harness opencode \
+              --watch-pid "$PPID" \
+              --repo "$OPENCODE_PROJECT_DIR" >/dev/null \
+            && acd wake \
+              --session-id "$OPENCODE_SESSION_ID" \
+              --repo "$OPENCODE_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-wake-tool-after
     event: tool.after.*
     actions:
       - bash: |
-          acd wake \
-            --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR"
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/opencode-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
+          { acd start \
+              --session-id "$OPENCODE_SESSION_ID" \
+              --harness opencode \
+              --watch-pid "$PPID" \
+              --repo "$OPENCODE_PROJECT_DIR" >/dev/null \
+            && acd wake \
+              --session-id "$OPENCODE_SESSION_ID" \
+              --repo "$OPENCODE_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              exit 1
+            }
 
   - id: acd-touch-idle
     event: session.idle
     actions:
       - bash: |
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/opencode-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd touch \
             --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR"
+            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG"
 
   - id: acd-stop
     event: session.deleted
     actions:
       - bash: |
+          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/opencode-hook.log"
+          LOG_DIR="$(dirname "$LOG")"
+          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd stop \
             --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR"
+            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG"

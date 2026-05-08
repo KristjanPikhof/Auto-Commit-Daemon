@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,133 @@ func TestRegressions(t *testing.T) {
 	t.Run("RepeatedEditsPublishOrderedCommits", regRepeatedEditsPublishOrderedCommits)
 	t.Run("BlockedConflictTerminalAcrossPolls", regBlockedConflictTerminalAcrossPolls)
 	t.Run("BlockedConflictPreventsLeapfrogPublish", regBlockedConflictPreventsLeapfrogPublish)
+}
+
+// TestStopAll_WipesAllPerSessionCaches pins the P1 #7 acceptance for the
+// `acd stop --all` path: every per-session start-cache file under each
+// repo's <gitDir>/acd/ must be removed once the daemon is fully stopped,
+// otherwise a subsequent active hook short-circuits onto a stale daemon
+// row. Two sessions on the same repo seed the test; we then run `acd
+// stop --all` and inspect the directory.
+func TestStopAll_WipesAllPerSessionCaches(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "sess-A", "claude-code")
+	startSession(t, ctx, env, repo, "sess-B", "codex")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	cacheDir := filepath.Join(repo, ".git", "acd")
+	listCaches := func() []string {
+		entries, err := os.ReadDir(cacheDir)
+		if err != nil {
+			t.Fatalf("readdir: %v", err)
+		}
+		var names []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "start-cache-") && strings.HasSuffix(e.Name(), ".json") {
+				names = append(names, e.Name())
+			}
+		}
+		return names
+	}
+	before := listCaches()
+	if len(before) != 2 {
+		t.Fatalf("expected 2 per-session cache files, got %d (%v)", len(before), before)
+	}
+
+	res := runAcd(t, ctx, env, "stop", "--all", "--force", "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("stop --all exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	after := listCaches()
+	if len(after) != 0 {
+		t.Fatalf("expected 0 cache files after stop --all, got %d (%v)", len(after), after)
+	}
+}
+
+// TestRefcountSweep_HotPathRefreshesLastSeen pins the P1 #5 acceptance:
+// running `acd start` repeatedly under the same session_id (the active-
+// hook hot-path pattern) must refresh daemon_clients.last_seen_ts even
+// when every call after the first short-circuits. Without the
+// touchClientHotPath wire-up the row would float at the cold-path
+// timestamp until the sweeper evicted it.
+//
+// To keep the test under five seconds we observe last_seen_ts before
+// and after a small burst of hot calls and assert the value monotonically
+// increases — running for the full clientTTL window (default 1800s) is
+// not feasible, but the contract we care about is "hot path advances
+// the timestamp" which is identical at any duration.
+func TestRefcountSweep_HotPathRefreshesLastSeen(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required for refcount probes")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Cold path: register the session.
+	startSession(t, ctx, env, repo, "hot-loop", "claude-code")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	readLastSeen := func() float64 {
+		raw := strings.TrimSpace(sqliteScalar(t, dbPath,
+			"SELECT last_seen_ts FROM daemon_clients WHERE session_id='hot-loop'"))
+		if raw == "" {
+			t.Fatalf("daemon_clients row missing for hot-loop")
+		}
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			t.Fatalf("parse last_seen=%q: %v", raw, err)
+		}
+		return v
+	}
+
+	first := readLastSeen()
+
+	// Sleep just over a second so the hot path's Unix-second-resolution
+	// touch can observe a strictly larger timestamp.
+	time.Sleep(1100 * time.Millisecond)
+
+	// Three hot-path calls in quick succession. Each must short-circuit
+	// (Started=false, Duplicate=true) and refresh last_seen_ts.
+	for i := 0; i < 3; i++ {
+		res := runAcd(t, ctx, env,
+			"start", "--session-id", "hot-loop", "--repo", repo,
+			"--harness", "claude-code", "--json")
+		if res.ExitCode != 0 {
+			t.Fatalf("hot start %d exit=%d\nstdout=%s\nstderr=%s",
+				i, res.ExitCode, res.Stdout, res.Stderr)
+		}
+		var got struct {
+			Started   bool `json:"started"`
+			Duplicate bool `json:"duplicate"`
+		}
+		if err := json.Unmarshal([]byte(res.Stdout), &got); err != nil {
+			t.Fatalf("decode %d: %v\n%s", i, err, res.Stdout)
+		}
+		if got.Started || !got.Duplicate {
+			t.Fatalf("hot call %d not short-circuited: %+v", i, got)
+		}
+	}
+	last := readLastSeen()
+	if last <= first {
+		t.Fatalf("last_seen_ts did not advance: first=%v last=%v", first, last)
+	}
 }
 
 // startDaemon is shared scaffolding: `acd start` + wait for mode=running.

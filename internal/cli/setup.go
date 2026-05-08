@@ -7,8 +7,10 @@ package cli
 // --apply is accepted for forward-compat but deferred to v0.2.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -29,15 +31,27 @@ type harnessSnippet struct {
 
 var harnessSnippets = map[string]harnessSnippet{
 	"claude-code": {"claude-code/settings.snippet.json", "//"},
-	"codex":       {"codex/config.snippet.toml", "#"},
-	"opencode":    {"opencode/hooks.snippet.yaml", "#"},
-	"pi":          {"pi/hooks.snippet.yaml", "#"},
+	// codex points at `codex/hooks.json` (not `*.snippet.json`) by design:
+	// `~/.codex/hooks.json` is consumed verbatim by Codex and must be strict
+	// JSON, so the template ships the full file content rather than a
+	// `.snippet.*` excerpt. `acd setup codex --raw > ~/.codex/hooks.json`
+	// is the canonical install path. Keep this entry's filename in sync
+	// with `templates/codex/hooks.json` rather than renaming it to a
+	// `.snippet.json` form, which would imply a partial fragment.
+	"codex":    {"codex/hooks.json", "//"},
+	"opencode": {"opencode/hooks.snippet.yaml", "#"},
+	"pi":       {"pi/hooks.snippet.yaml", "#"},
 	// shell prints both snippet files separated by a divider.
 	"shell": {"shell/direnv.envrc.snippet", "#"},
 }
 
 // shellExtra is the second snippet for the shell harness (zshrc).
 const shellZshrcSnippet = "shell/zshrc.snippet.sh"
+
+// templatesFS is the embedded FS used by runSetup. Tests overlay it via
+// setTemplatesFSForTest to inject malformed JSON without touching the
+// production templates package. Production callers always use templates.FS.
+var templatesFS fs.FS = templates.FS
 
 // readmeFile returns the README path for a harness.
 func readmeFile(harness string) string {
@@ -46,6 +60,7 @@ func readmeFile(harness string) string {
 
 func newSetupCmd() *cobra.Command {
 	var applyFlag bool
+	var rawFlag bool
 
 	cmd := &cobra.Command{
 		Use:     "setup [harness]",
@@ -55,8 +70,10 @@ func newSetupCmd() *cobra.Command {
 
 When no harness is provided, acd tries to detect one installed acd-managed harness. Otherwise pass a harness name explicitly. This command prints snippets only; --apply is reserved for a future version and is hidden.
 
+Use --raw to emit only the snippet body (no comment-wrapped header, footer, or README). This is required when the snippet is strict JSON (e.g. acd setup codex --raw > ~/.codex/hooks.json) because JSON has no comment syntax.
+
 Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
-		Example: `  acd setup codex
+		Example: `  acd setup codex --raw > ~/.codex/hooks.json
   acd setup claude-code
   acd setup opencode
   acd setup shell`,
@@ -75,15 +92,16 @@ Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
 			if len(args) == 1 {
 				harness = args[0]
 			}
-			return runSetup(cmd, harness)
+			return runSetup(cmd, harness, rawFlag)
 		},
 	}
 	cmd.Flags().BoolVar(&applyFlag, "apply", false, "Automatically apply snippet (deferred to v0.2)")
+	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Emit only the snippet body (no comment-wrapped instructions); required for strict-JSON targets like ~/.codex/hooks.json")
 	_ = cmd.Flags().MarkHidden("apply")
 	return cmd
 }
 
-func runSetup(cmd *cobra.Command, harness string) error {
+func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 	if harness == "" {
 		detected := adapter.DetectInstalled()
 		switch len(detected) {
@@ -115,9 +133,55 @@ func runSetup(cmd *cobra.Command, harness string) error {
 
 	meta := harnessSnippets[harness]
 	cp := meta.commentPrefix
-	embeddedFS := templates.FS
+	embeddedFS := templatesFS
 
 	out := cmd.OutOrStdout()
+
+	if raw {
+		// Raw mode: emit just the snippet body so the output can be redirected
+		// directly into a strict-JSON config (no comment syntax allowed).
+		if harness == "shell" {
+			if err := printSnippet(out, embeddedFS, meta.file); err != nil {
+				return err
+			}
+			// Guarantee a blank line between the direnv and zshrc snippets so
+			// the concatenated body parses as bash even if either snippet's
+			// last line lacks a trailing newline. bash -n must succeed on the
+			// joined body when redirected into a startup file.
+			if _, err := out.Write([]byte("\n")); err != nil {
+				return err
+			}
+			if err := printSnippet(out, embeddedFS, shellZshrcSnippet); err != nil {
+				return err
+			}
+			return nil
+		}
+		// Strict-JSON validation guard: when the canonical install path is a
+		// `.json` config (e.g. `~/.codex/hooks.json`), users redirect the
+		// raw output directly into the file. If a future template edit ships
+		// invalid JSON (trailing comma, unescaped quote, schema drift), the
+		// harness silently ignores the file. Validate before emitting so the
+		// regression surfaces as a non-zero exit with an actionable error
+		// instead of a silently broken install.
+		if filepath.Ext(meta.file) == ".json" {
+			body, err := fs.ReadFile(embeddedFS, meta.file)
+			if err != nil {
+				return fmt.Errorf("acd setup: read template %s: %w", meta.file, err)
+			}
+			if !json.Valid(body) {
+				offset := jsonInvalidOffset(body)
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"acd setup: template %s is not valid JSON (parse error near byte offset %d); refusing to emit --raw output that would corrupt %s. Please file a bug at github.com/KristjanPikhof/Auto-Commit-Daemon.\n",
+					meta.file, offset, meta.file)
+				return fmt.Errorf("acd setup: template %s contains invalid JSON", meta.file)
+			}
+			if _, err := out.Write(body); err != nil {
+				return err
+			}
+			return nil
+		}
+		return printSnippet(out, embeddedFS, meta.file)
+	}
 
 	// Header.
 	fmt.Fprintf(out, "%s acd setup %s — copy the snippet below into your harness config\n", cp, harness)
@@ -162,6 +226,24 @@ func runSetup(cmd *cobra.Command, harness string) error {
 
 	fmt.Fprintf(out, "%s ─────────────────────────────────────────────────────────────\n", cp)
 	return nil
+}
+
+// jsonInvalidOffset returns the byte offset of the first JSON parse error in
+// body, or len(body) if json.Decoder reports no offset (e.g. trailing
+// content). Used to render an actionable error message when the embedded
+// JSON template fails json.Valid.
+func jsonInvalidOffset(body []byte) int64 {
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	for {
+		_, err := dec.Token()
+		if err == nil {
+			continue
+		}
+		if se, ok := err.(*json.SyntaxError); ok {
+			return se.Offset
+		}
+		return dec.InputOffset()
+	}
 }
 
 // printSnippet reads a file from the embedded FS and writes it verbatim.

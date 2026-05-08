@@ -1,47 +1,129 @@
 # Changelog
 
-## Unreleased
+## v2026-05-08
+
+### Added
+
+- `acd commit-all` can capture and replay a dirty worktree without starting the
+  persistent daemon. It is meant for cold starts, repos where the daemon was off,
+  and onboarding existing work into ACD history. It supports `--dry-run`, `--yes`,
+  `--json`, and `--repo`, refuses unsafe git states, and uses the active commit
+  strategy instead of adding a separate strategy flag.
+- `acd start` short-circuits repeated active-hook calls through a per-session
+  cache file at `<gitDir>/acd/start-cache-<sessionhash>.json`. The hot path
+  returns in roughly 50 ms instead of the cold-path budget of 1 s, while the
+  cold path is unchanged. The cache stores a daemon fingerprint (start time
+  plus argv hash) so PID reuse on long-running boxes cannot serve a stale fast
+  path for an unrelated process. Each hot-path call also refreshes
+  `daemon_clients.last_seen_ts` so the refcount sweeper does not evict a
+  session that lives entirely on the fast path.
+- `acd doctor` flags installed snippet drift. It warns when active hook bodies
+  in `~/.claude/settings.json`, `~/.codex/hooks.json`,
+  `~/.config/opencode/hooks.yaml`, or `~/.pi/hook/hooks.yaml` lack both the
+  `acd start` and `acd wake` calls or the log fallback, and prints
+  per-harness remediation pointing at `acd setup <harness>` with merge
+  instructions.
+- `acd doctor` tails the Codex hook log (last 50 lines or 5 minutes) and
+  surfaces the error count plus the first failing line. Output also reports
+  config read errors separately from marker-missing on EACCES/EIO via a new
+  `config_read_error` field in the JSON view.
+- `acd setup <harness> --raw` validates JSON for `.json` snippet targets
+  before emitting. Invalid templates exit non-zero with the byte offset
+  instead of letting users redirect malformed JSON into
+  `~/.codex/hooks.json`.
 
 ### Changed
 
-- `acd status`, `acd diagnose`, and `acd doctor` now report the *effective*
-  commit strategy by resolving daemon `commit.strategy` meta first, then the
-  `ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
-  values no longer leak into the report; they emit a slog warning and the
-  env-derived strategy is shown instead. New helper
-  `cli.ResolveEffectiveCommitStrategy` centralizes this resolution so
-  `commit-all`, intent observability, and any future read-only consumers
-  agree on what is active.
+- **Codex hooks v2 is a breaking setup change.** `acd setup codex` now writes
+  `~/.codex/hooks.json` instead of the legacy TOML hook snippet. To migrate,
+  run `acd setup codex` and merge the printed JSON into `~/.codex/hooks.json`
+  manually. If the file contains only the acd block you can redirect directly:
+  `acd setup codex --raw > ~/.codex/hooks.json`. **Warning:** the redirect
+  replaces the entire file. If you have custom non-acd hooks in
+  `~/.codex/hooks.json`, back up the file first and merge by hand instead of
+  using `>`. After writing the file, remove the old `# acd-managed: true` block
+  from `~/.codex/config.toml`, then approve the new hooks with `/hooks` inside
+  Codex. Codex re-flags all hook entries as review-required after every
+  `hooks.json` content change, so re-run `/hooks` after any re-install too.
+  `acd doctor` now warns when both old and new Codex hook configs are installed,
+  because Codex will run both. See
+  [templates/codex/README.md](templates/codex/README.md) for full details.
+- Codex hooks now read `cwd` from hook stdin, no longer require
+  `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the
+  hook payload. The helper also supports multiple fields and optional fields.
+  Codex hook bodies capture helper exit explicitly: a failing
+  `acd hook-stdin-extract` now logs `[ts] active hook failed exit=N
+  cmd=acd-hook-stdin-extract` to the hook log instead of being swallowed by a
+  trailing `|| exit 0`.
+- Claude Code, Codex, OpenCode, and Pi active hooks now run idempotent
+  `acd start` before `acd wake`. ACD can recover after a manual `acd stop`
+  without waiting for a brand-new harness session. **Migration:** if you ran
+  `acd stop --all` and the daemon does not restart automatically when the next
+  prompt or tool event fires, your installed snippet is stale. Re-run
+  `acd setup <harness>` and merge the updated hooks block into your installed
+  config. **Warning:** redirecting `acd setup <harness> --raw > <config-path>`
+  replaces the entire file. Back it up first if you have custom non-acd
+  entries. See the per-harness READMEs
+  ([claude-code](templates/claude-code/README.md),
+  [codex](templates/codex/README.md),
+  [opencode](templates/opencode/README.md),
+  [pi](templates/pi/README.md)) for merge instructions. Run `acd doctor` to
+  identify which harness needs updating.
+- Pi SID fallback is now per-process unique (`pi-$$-$(date +%s)`) instead of
+  a shared `unknown`. Multiple Pi sessions without `PI_SESSION_ID` no longer
+  collapse onto the same client, so the first `session.deleted` does not tear
+  down the daemon while other sessions are still active.
+- `acd doctor` drift remediation suggests `acd setup <harness>` (merge into
+  config) by default, with the `--raw` redirect form only after backing up
+  the target file. README and per-harness READMEs for claude-code, opencode,
+  and pi now carry the same overwrite warning the codex template already
+  shipped.
+- `templates/codex/uninstall.md` documents surgical removal of the five acd
+  hook entries and the `_acd_managed` flag instead of deleting
+  `~/.codex/hooks.json` outright. The previous wording destroyed merged
+  custom hooks.
+- `acd setup shell --raw` writes a blank line between the direnv and zshrc
+  snippets so callers can split them into separate files cleanly.
+- `acd status`, `acd diagnose`, and `acd doctor` now report the effective commit
+  strategy from daemon metadata first, then `ACD_COMMIT_STRATEGY`, then the
+  default. Unknown daemon values fall back to the environment-derived strategy
+  and emit a warning instead of leaking into user output.
 
 ### Fixed
 
 - `acd commit-all` now force-reseeds `shadow_paths` from `HEAD` and drops
-  stale `pending` capture events for the active `(branch_ref,
-  branch_generation)` before capturing. Previously, when a prior daemon
-  session had absorbed worktree edits into shadow without successfully
-  replaying them, the bootstrap marker was already set; `commit-all` saw a
-  shadow that mirrored live state, captured zero events, and reported
-  `Commits: 0; no pending events; worktree already clean` while the
-  worktree was still dirty. The fix exposes a new
-  `state.DeletePendingForBranchGeneration` helper, switches `commit-all`
-  to `daemon.ReseedShadowFromHead`, and surfaces a `dropped_stale_pending`
-  count plus a `shadow reseeded from HEAD` note in the JSON and human
-  output.
-
-### Added
-
-- `acd commit-all`: one-shot command that captures every uncommitted file in
-  the worktree and replays them as commits without starting the persistent
-  daemon. Useful for cold starts, dirty repos after the daemon was off, and
-  onboarding an existing worktree into ACD history. Files are sorted
-  lexicographically by path so sibling files cluster together in the commit
-  sequence and the intent planner sees coherent windows of related siblings.
-  The active commit strategy is read from existing config; there is no
-  `--strategy` override. Flags: `--dry-run` (plan without committing),
-  `--yes` (skip confirmation), `--json` (machine-readable output, requires
-  `--yes`), `--repo`. Refuses to run on detached HEAD, during active git
-  operations (rebase, merge, cherry-pick, bisect), while a manual pause marker
-  is present, or while the per-repo daemon is running.
+  stale pending capture events before capture. It no longer reports a clean
+  worktree when an earlier daemon session had absorbed unreplayed edits into
+  shadow state. Human and JSON output now show the reseed note and
+  `dropped_stale_pending` count.
+- `acd doctor` YAML drift detection now actually fires for OpenCode and Pi
+  configs. The previous parser misread nested `actions` items as new
+  top-level hook entries, dropped the parent association, and silently
+  emitted zero drift for every real config.
+- `acd doctor` `parseLogTimestamp` now matches the bracketed timestamp shape
+  hook templates write (`[2026-05-08T12:34:56-0700] ...`). The five-minute
+  recency window was effectively disabled before because every line fell
+  through to the no-timestamp branch and counted as recent.
+- `acd doctor` no longer flags JSONL info lines that contain the substring
+  `failed` (for example `failed_blocking_pending=0`). Only wrapper-printf
+  failure lines and JSONL `level=error|fatal` are counted as hook errors.
+- `acd doctor` distinguishes "config unreadable" from "marker missing" on
+  EACCES/EIO. JSON consumers can now read `config_read_error` to tell the
+  two cases apart.
+- The YAML `acd-managed` marker now requires the `# ` comment prefix. A
+  hand-edited config containing bare `acd-managed: true` is no longer
+  detected as an acd install, and the marker no longer collides with the
+  TOML form as a substring.
+- `acd start` short-circuit cache writes use unique temp filenames. Two
+  concurrent active hooks no longer collide on a shared
+  `start-cache.json.tmp` and corrupt the cache file.
+- `acd stop` invalidates the start cache on the `Deferred` path and after a
+  failed force-stop escalation. A deferred stop no longer leaves a fresh
+  cache for a session that was just deregistered, and a daemon that
+  survived `--force` no longer leaves stale caches behind.
+- Codex `SessionStart` no longer swallows helper failures. A missing `acd`
+  binary, oversized stdin, or malformed JSON now surfaces as a logged
+  failure with the real exit code instead of a silent skip.
 
 ## v2026-05-06
 

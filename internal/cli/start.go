@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -143,6 +144,59 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		return err
 	}
 
+	/* perf-lane: registry-read short-circuit
+	 *
+	 * Hot-path optimization for active hooks (PreToolUse / PostToolUse /
+	 * UserPromptSubmit) that fire `acd start` on every tool invocation.
+	 * When the same session_id has already been registered for this repo
+	 * and the cached daemon heartbeat is fresh, return success without
+	 * acquiring control.lock, opening SQLite, or rewriting registry.json.
+	 *
+	 * The cache file at <gitDir>/acd/start-cache.json is written by the
+	 * full registration path below; missing / stale / mismatched cache
+	 * forces the cold path (which is unchanged).
+	 *
+	 * Coordination: this short-circuit MUST run before any lock
+	 * acquisition so concurrent active hooks from the same session never
+	 * serialize on the daemon's control.lock. The adapter-lane PPID
+	 * probe lives mid-runStart (near refcount.RegisterClient) and only
+	 * applies on the cold path.
+	 */
+	if ok, cachedPID, cachedClients, _ := tryShortCircuitStart(ctx, gitDir, repoHash, sessionID, harness, repo); ok {
+		// Refresh daemon_clients.last_seen_ts so the daemon's refcount
+		// sweeper does not evict this session after clientTTL minutes
+		// of all-hot-path activity. We deliberately keep this on the
+		// hot path: it is a single UPDATE on a primary-key row (no
+		// flock, no migrations, no central registry rewrite) and
+		// completes well under our 50ms hot-path budget. Failure is
+		// non-fatal — the worst case is the next sweeper tick evicts
+		// the row and the next active hook re-registers via the cold
+		// path. The cache short-circuit decision itself is unchanged.
+		_ = touchClientHotPath(ctx, gitDir, sessionID)
+
+		res := startResult{
+			Started:   false,
+			Duplicate: true,
+			DaemonPID: cachedPID,
+			Repo:      repo,
+			RepoHash:  repoHash,
+			SessionID: sessionID,
+			Harness:   harness,
+			// ClientCount comes from the cache snapshot. May lag the
+			// SQLite truth by one tick under concurrent registrations;
+			// hook consumers do not depend on a strictly-fresh value.
+			ClientCount: cachedClients,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd start: refreshed session %s (daemon already running, pid %d)\n",
+			sessionID, cachedPID)
+		return nil
+	}
+
 	// Brief control.lock for the daemon_clients read-modify-write window.
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		return fmt.Errorf("acd start: mkdir state dir: %w", err)
@@ -160,10 +214,31 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	defer func() { _ = db.Close() }()
 
+	/* adapter-lane: PPID liveness probe.
+	 *
+	 * Probe the resolved watch_pid with kill(pid, 0) BEFORE consulting
+	 * identity.AliveContext — kill(0) is the lowest-overhead syscall-level
+	 * liveness check and lets us emit a focused diagnostic for the common
+	 * "harness wraps `bash -c` through a transient parent" failure mode,
+	 * where $PPID at hook-fire time names a shell process that has already
+	 * exited by the time `acd start` runs. ESRCH here is informational —
+	 * we log a single warning naming the pid (so users can grep the daemon
+	 * log to confirm the wrapper-exit hypothesis) and continue without
+	 * recording a watch_pid; the refcount sweeper will fall back to the
+	 * TTL gate. Other kill(0) errors (EPERM, etc.) imply the pid is alive
+	 * but owned by another user and are passed through to AliveContext.
+	 */
 	var watchPIDNull sql.NullInt64
 	var watchFPNull sql.NullString
 	if watchPID > 0 {
-		if identity.AliveContext(ctx, watchPID) {
+		if perr := syscall.Kill(watchPID, 0); errors.Is(perr, syscall.ESRCH) {
+			slog.Default().Warn(
+				"acd start: watch_pid is not alive at registration; harness may be wrapping the hook through a transient parent (e.g. `bash -c`) whose PID has already exited; continuing without a fast-path liveness PID",
+				"pid", watchPID,
+				"session_id", sessionID,
+				"harness", harness,
+			)
+		} else if identity.AliveContext(ctx, watchPID) {
 			watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
 			if fp, ferr := identity.CaptureContext(ctx, watchPID); ferr == nil && !fp.Empty() {
 				watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
@@ -266,7 +341,42 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		return fmt.Errorf("acd start: update registry: %w", err)
 	}
 
+	// perf-lane: persist the per-repo start-cache so subsequent active
+	// hooks under the same session_id can short-circuit at the top of
+	// runStart without re-acquiring control.lock or re-opening SQLite.
+	// Failure to write is non-fatal — the next call simply takes the
+	// cold path.
+	//
+	// Schema v2 also stamps the daemon's process-identity fingerprint
+	// (lstart + argv hash). The short-circuit reader re-captures the
+	// fingerprint and requires equality before granting hot-path
+	// success. This defends against PID reuse: a kill(0) succeeds for
+	// any process that inherits the recycled pid, but ps will report
+	// a different start-time + argv vector.
 	clients, _ := state.CountClients(ctx, db)
+	if daemonPID > 0 {
+		var startTS, argvHash string
+		// Indirected through captureDaemonFingerprint so unit tests that
+		// stub the short-circuit reader's fingerprint stub also pin the
+		// cold-path writer's stamp; production callers leave it at the
+		// identity.CaptureContext default.
+		if fp, ferr := captureDaemonFingerprint(ctx, daemonPID); ferr == nil && !fp.Empty() {
+			startTS = fp.StartTime
+			argvHash = fp.ArgvHash
+		}
+		_ = writeStartCache(gitDir, startCache{
+			Version:        startCacheVersion,
+			RepoHash:       repoHash,
+			SessionID:      sessionID,
+			Harness:        harness,
+			DaemonPID:      daemonPID,
+			WatchPID:       watchPID,
+			ClientCount:    clients,
+			UpdatedAt:      time.Now().Unix(),
+			DaemonStartTS:  startTS,
+			DaemonArgvHash: argvHash,
+		})
+	}
 
 	res := startResult{
 		Started:     started,
@@ -350,4 +460,36 @@ func ensureAttachedHEAD(ctx context.Context, repo string) error {
 // daemon-side helper rather than duplicating the format.
 func fingerprintToken(fp identity.Fingerprint) string {
 	return daemon.FingerprintToken(fp)
+}
+
+// touchClientHotPath bumps daemon_clients.last_seen_ts for the supplied
+// session without touching any other field. It opens the per-repo SQLite
+// file briefly, runs a single UPDATE keyed on session_id, then closes —
+// no flock, no migrations, no registry rewrite. Used by the short-
+// circuit branch of runStart so a session that lives entirely on the
+// hot path never exceeds the refcount sweeper's clientTTL window.
+//
+// All errors are returned to the caller (which logs and continues): a
+// failed touch never blocks the active hook from progressing — the next
+// sweeper tick may evict the row, but the next runStart will simply
+// fall through to the cold path and re-register via state.RegisterClient.
+//
+// Indirected through a package var so unit tests can stub the helper to
+// observe call sites without a real SQLite open.
+var touchClientHotPath = defaultTouchClientHotPath
+
+func defaultTouchClientHotPath(ctx context.Context, gitDir, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("touchClientHotPath: empty session_id")
+	}
+	dbPath := state.DBPathFromGitDir(gitDir)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("touchClientHotPath: open db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := state.TouchClient(ctx, db, sessionID, float64(time.Now().Unix())); err != nil {
+		return fmt.Errorf("touchClientHotPath: touch: %w", err)
+	}
+	return nil
 }

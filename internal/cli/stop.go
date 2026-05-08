@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -179,6 +182,40 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	if err != nil {
 		return res, fmt.Errorf("acd stop: resolve git dir: %w", err)
 	}
+	// perf-lane: remove start-cache files so subsequent active hooks no
+	// longer short-circuit onto a daemon that is being torn down. The
+	// cold path will re-spawn or refuse based on the live daemon_state
+	// row.
+	//
+	// Invalidation matrix (per-session caches under <gitDir>/acd/):
+	//   - res.Stopped              → wipe every start-cache-*.json
+	//                                (and matching .tmp leftovers).
+	//   - Deferred via sessionID   → wipe just that session's cache so
+	//                                a stale entry cannot mask the
+	//                                missing daemon_clients row.
+	//   - Failed (force survived)  → wipe every cache. The daemon is in
+	//                                an unknown state; we deliberately
+	//                                force every subsequent active hook
+	//                                onto the cold path so it can
+	//                                re-establish daemon_state truth.
+	defer func() {
+		if res.Stopped {
+			removeAllStartCaches(gitDir)
+			return
+		}
+		if force {
+			// `force=true` and !Stopped means we either swallowed a
+			// SIGKILL ("daemon survived SIGKILL") or we never even
+			// got that far. Either way the cache cannot be trusted.
+			removeAllStartCaches(gitDir)
+			return
+		}
+		if sessionID != "" {
+			// Default-mode Deferred: caller's row was deregistered
+			// but peers remain. Drop just the caller's cache.
+			_ = os.Remove(startCachePath(gitDir, sessionID))
+		}
+	}()
 	clock, err := daemon.AcquireControlLock(gitDir)
 	if err != nil {
 		return res, fmt.Errorf("acd stop: acquire control.lock: %w", err)
@@ -300,6 +337,34 @@ func waitForStopped(ctx context.Context, db *state.DB, timeout time.Duration) bo
 		time.Sleep(stopPollInterval)
 	}
 	return false
+}
+
+// removeAllStartCaches deletes every per-session start-cache file under
+// <gitDir>/acd/. Called when the daemon is fully stopped so no subsequent
+// active hook can short-circuit onto a corpse. Errors are best-effort:
+// the cold path is still safe even if a stale cache lingers (a missing
+// daemon will fail the kill(0) probe and force escalation).
+func removeAllStartCaches(gitDir string) {
+	dir := filepath.Join(gitDir, "acd")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, startCacheFilenamePrefix) {
+			continue
+		}
+		// Final files end in ".json"; in-flight tmp files (from
+		// os.CreateTemp) match "<prefix><suffix>.<random>.tmp".
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
 }
 
 func writeStopResult(out io.Writer, res stopRepoResult, jsonOut bool) error {
