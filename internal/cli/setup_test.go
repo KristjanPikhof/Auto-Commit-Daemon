@@ -550,6 +550,56 @@ func TestSetup_Shell_FooterInstructions(t *testing.T) {
 	}
 }
 
+// TestSetup_Shell_RawHasSeparatorAndParses verifies that `acd setup shell
+// --raw` emits a blank-line separator between the direnv and zshrc
+// snippets and that the concatenated body parses as bash. Regression
+// target: P3-21 (shell --raw output must be safe to redirect into a
+// startup file even if either snippet's last line lacks a trailing
+// newline).
+func TestSetup_Shell_RawHasSeparatorAndParses(t *testing.T) {
+	out, _, err := runSetupCmd(t, "shell", "--raw")
+	if err != nil {
+		t.Fatalf("acd setup shell --raw exit=%v\nout:\n%s", err, out)
+	}
+	// Both snippets must be present.
+	direnv := snippetBody(t, "shell/direnv.envrc.snippet")
+	zshrc := snippetBody(t, "shell/zshrc.snippet.sh")
+	if !strings.Contains(out, strings.TrimSpace(direnv)) {
+		t.Errorf("--raw output missing direnv snippet:\n%s", out)
+	}
+	if !strings.Contains(out, strings.TrimSpace(zshrc)) {
+		t.Errorf("--raw output missing zshrc snippet:\n%s", out)
+	}
+	// There must be at least one blank line between the two snippets so
+	// the boundary is unambiguous regardless of trailing-newline policy.
+	// We anchor on the zshrc snippet's first line and look for "\n\n"
+	// preceding it.
+	zshrcStart := strings.Index(out, "# acd-managed: true\n# Add to ~/.zshrc")
+	if zshrcStart < 0 {
+		t.Fatalf("--raw output: zshrc anchor not found:\n%s", out)
+	}
+	prefix := out[:zshrcStart]
+	if !strings.HasSuffix(prefix, "\n\n") {
+		t.Errorf("--raw output must have a blank-line separator before zshrc snippet, got prefix tail %q", tailString(prefix, 20))
+	}
+	// The concatenated body must parse as bash.
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not on PATH; skipping syntax check")
+	}
+	cmd := exec.Command(bash, "-n", "-c", out)
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("bash -n on concatenated --raw shell snippet failed: %v\n%s", err, combined)
+	}
+}
+
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
 func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
