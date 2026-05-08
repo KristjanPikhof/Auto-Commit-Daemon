@@ -48,6 +48,8 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 	const harness = "claude-code"
 	const livePID = 4242
 	const deadPID = 4243
+	const stampedStartTS = "Mon May  5 12:00:00 2026"
+	const stampedArgvHash = "argv-hash-original"
 
 	now := time.Unix(1_700_000_000, 0)
 	ttl := 30 * time.Minute
@@ -55,6 +57,7 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 	staleTS := now.Add(-31 * time.Minute).Unix()
 
 	pidAlive := func(pid int) bool { return pid == livePID }
+	matchingFP := fpStub(stampedStartTS, stampedArgvHash)
 
 	freshRegistry := &central.RepoRecord{
 		Path:       "/tmp/x",
@@ -62,137 +65,184 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 		LastSeenTS: freshTS,
 	}
 
+	// stampedCache returns a happy-path cache that should short-circuit
+	// when paired with matchingFP. Tests that only need to flip one
+	// field clone via a copy + tweak.
+	stampedCache := func() *startCache {
+		return &startCache{
+			Version: startCacheVersion, RepoHash: repoHash,
+			SessionID: sessionID, Harness: harness,
+			DaemonPID: livePID, UpdatedAt: freshTS,
+			DaemonStartTS:  stampedStartTS,
+			DaemonArgvHash: stampedArgvHash,
+		}
+	}
+
 	tests := []struct {
 		name      string
 		cache     *startCache
 		registry  *central.RepoRecord
+		fp        func(context.Context, int) (identity.Fingerprint, error)
 		wantOK    bool
 		wantBlame string // substring expected in Reason on escalation
 	}{
 		{
-			name: "same_session_and_fresh_short_circuits",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
+			name:     "same_session_and_fresh_short_circuits",
+			cache:    stampedCache(),
 			registry: freshRegistry,
+			fp:       matchingFP,
 			wantOK:   true,
 		},
 		{
 			name:      "no_cache_escalates",
 			cache:     nil,
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "no_cache",
 		},
 		{
 			name: "different_session_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: "other-session", Harness: harness,
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.SessionID = "other-session"
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "session_mismatch",
 		},
 		{
 			name: "stale_heartbeat_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: staleTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.UpdatedAt = staleTS
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "stale_heartbeat",
 		},
 		{
-			name: "missing_registry_entry_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
+			name:      "missing_registry_entry_escalates",
+			cache:     stampedCache(),
 			registry:  nil,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "registry_missing_repo",
 		},
 		{
 			name: "harness_mismatch_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: "codex",
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.Harness = "codex"
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "harness_mismatch",
 		},
 		{
 			name: "dead_daemon_pid_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: deadPID, UpdatedAt: freshTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.DaemonPID = deadPID
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "daemon_pid_dead",
 		},
 		{
 			name: "repo_hash_mismatch_in_cache_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: "differenthash",
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.RepoHash = "differenthash"
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "repo_hash_mismatch",
 		},
 		{
-			name: "registry_hash_mismatch_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: freshTS,
-			},
-			registry: &central.RepoRecord{
-				Path: "/tmp/x", RepoHash: "wronghash", LastSeenTS: freshTS,
-			},
+			name:     "registry_hash_mismatch_escalates",
+			cache:    stampedCache(),
+			registry: &central.RepoRecord{Path: "/tmp/x", RepoHash: "wronghash", LastSeenTS: freshTS},
+			fp:       matchingFP,
 			wantOK:    false,
 			wantBlame: "registry_hash_mismatch",
 		},
 		{
 			name: "zero_updated_at_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: livePID, UpdatedAt: 0,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.UpdatedAt = 0
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "stale_heartbeat",
 		},
 		{
 			name: "no_daemon_pid_escalates",
-			cache: &startCache{
-				Version: startCacheVersion, RepoHash: repoHash,
-				SessionID: sessionID, Harness: harness,
-				DaemonPID: 0, UpdatedAt: freshTS,
-			},
+			cache: func() *startCache {
+				c := stampedCache()
+				c.DaemonPID = 0
+				return c
+			}(),
 			registry:  freshRegistry,
+			fp:        matchingFP,
 			wantOK:    false,
 			wantBlame: "no_daemon_pid",
+		},
+		{
+			name: "fingerprint_mismatch_escalates",
+			// Cache stamped from one daemon; live ps returns a
+			// different start time + argv (PID was recycled by an
+			// unrelated process).
+			cache:     stampedCache(),
+			registry:  freshRegistry,
+			fp:        fpStub("Tue May  6 09:30:00 2026", "argv-hash-recycled"),
+			wantOK:    false,
+			wantBlame: "fingerprint_mismatch",
+		},
+		{
+			name: "fingerprint_missing_escalates",
+			// Legacy / partial cache that lacks the fingerprint
+			// stamp must escalate; schema v2 requires it.
+			cache: func() *startCache {
+				c := stampedCache()
+				c.DaemonStartTS = ""
+				c.DaemonArgvHash = ""
+				return c
+			}(),
+			registry:  freshRegistry,
+			fp:        matchingFP,
+			wantOK:    false,
+			wantBlame: "fingerprint_missing",
+		},
+		{
+			name:     "fingerprint_capture_failure_escalates",
+			cache:    stampedCache(),
+			registry: freshRegistry,
+			fp: func(context.Context, int) (identity.Fingerprint, error) {
+				return identity.Fingerprint{}, errors.New("ps: no such process")
+			},
+			wantOK:    false,
+			wantBlame: "fingerprint_capture_failed",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := evaluateShortCircuit(tt.cache, repoHash, sessionID, harness,
-				tt.registry, now, ttl, pidAlive)
+				tt.registry, now, ttl, pidAlive, tt.fp)
 			if d.OK != tt.wantOK {
 				t.Fatalf("OK=%v want %v (reason=%q)", d.OK, tt.wantOK, d.Reason)
 			}
@@ -204,6 +254,49 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEvaluateShortCircuit_FingerprintMatchAndMismatch is the explicit
+// matched/mismatched pair the task requires (P1 #3 acceptance). It uses
+// the stub fingerprint capturer to pin both sides without spawning a
+// real ps invocation.
+func TestEvaluateShortCircuit_FingerprintMatchAndMismatch(t *testing.T) {
+	const repoHash = "abcd1234"
+	const sessionID = "sess-fp"
+	const harness = "claude-code"
+	const livePID = 12345
+	const startTS = "Wed May  7 08:15:00 2026"
+	const argvHash = "stamped-argv"
+
+	now := time.Unix(1_700_000_000, 0)
+	freshTS := now.Add(-30 * time.Second).Unix()
+	pidAlive := func(int) bool { return true }
+	registry := &central.RepoRecord{Path: "/tmp/x", RepoHash: repoHash, LastSeenTS: freshTS}
+
+	cache := &startCache{
+		Version: startCacheVersion, RepoHash: repoHash,
+		SessionID: sessionID, Harness: harness, DaemonPID: livePID, UpdatedAt: freshTS,
+		DaemonStartTS: startTS, DaemonArgvHash: argvHash,
+	}
+
+	t.Run("matching_fingerprint_short_circuits", func(t *testing.T) {
+		d := evaluateShortCircuit(cache, repoHash, sessionID, harness, registry,
+			now, 30*time.Minute, pidAlive, fpStub(startTS, argvHash))
+		if !d.OK {
+			t.Fatalf("expected OK, got reason=%q", d.Reason)
+		}
+	})
+
+	t.Run("mismatched_fingerprint_escalates", func(t *testing.T) {
+		d := evaluateShortCircuit(cache, repoHash, sessionID, harness, registry,
+			now, 30*time.Minute, pidAlive, fpStub("different start", "different argv"))
+		if d.OK {
+			t.Fatalf("expected escalation, got OK")
+		}
+		if !strings.Contains(d.Reason, "fingerprint_mismatch") {
+			t.Fatalf("reason=%q want fingerprint_mismatch", d.Reason)
+		}
+	})
 }
 
 // readStartCache must tolerate missing files, empty files, malformed JSON,
