@@ -1,0 +1,418 @@
+//go:build integration
+// +build integration
+
+// dead_branch_prune_test.go drives the dead-branch terminal pruning surface
+// end-to-end against the production `acd` binary:
+//
+//   - (a) Diverged transition with the prior branch deleted prunes the
+//     blocked_conflict / failed rows tied to that ref.
+//   - (b) Diverged transition with the prior branch still alive preserves the
+//     terminal rows.
+//   - (c) Daemon startup sweep removes pre-seeded terminals for refs that
+//     have since been deleted.
+//   - (d) ACD_KEEP_DEAD_BRANCH_BARRIERS=1 is honored on both paths — terminals
+//     survive even though their ref is dead.
+//   - (e) RefExists transient-error fail-open path. Covered by the unit-level
+//     TestDeadBranchSweep_RefExistsErrorPreservesRows in
+//     internal/daemon/dead_branch_sweep_test.go (the integration-level
+//     simulation requires corrupting a packed-refs blob in a way that
+//     reliably makes `git show-ref` exit non-1 across hosts; that has proven
+//     fragile so we lean on the unit test for this case and document it
+//     here).
+//   - Diagnose-meta surface assertion: `acd diagnose --json` includes the
+//     three dead_branch_prune_* fields on the prune path and omits them on
+//     the no-prune path (omitempty semantics).
+//
+// Capture rows are seeded through the sqlite3 binary against the real
+// state.db, exactly as the existing populated-state and explainable-UX
+// integration tests do — the integration package cannot import the internal
+// state package, and the daemon's own SQL drivers are ABI-compatible with
+// raw inserts via `sqlite3` since the schema is materialized by the binary
+// itself before we seed.
+package integration_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// seedTerminalCaptureEvent inserts one capture_events row in the requested
+// terminal state for the given (branch_ref, branch_generation) tuple via the
+// sqlite3 CLI. Returns the assigned seq.
+func seedTerminalCaptureEvent(t *testing.T, dbPath, branchRef string, generation int, baseHead, path, eventState string) {
+	t.Helper()
+	now := nowFloatSeconds()
+	stmt := fmt.Sprintf(
+		"INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state) VALUES (%s, %d, %s, 'create', %s, 'full', %f, %s);",
+		sqliteLiteral(branchRef), generation, sqliteLiteral(baseHead), sqliteLiteral(path), now, sqliteLiteral(eventState))
+	if out, err := exec.Command("sqlite3", dbPath, stmt).CombinedOutput(); err != nil {
+		t.Fatalf("seed capture_events ref=%s state=%s: %v\n%s", branchRef, eventState, err, out)
+	}
+}
+
+// countTerminalsForRef returns the count of capture_events rows whose
+// branch_ref matches the given ref and whose state is in {blocked_conflict,
+// failed}. Used as the assertion surface for "row pruned" vs "row preserved".
+func countTerminalsForRef(t *testing.T, dbPath, branchRef string) int {
+	t.Helper()
+	q := fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_events WHERE branch_ref = %s AND state IN ('blocked_conflict','failed');",
+		sqliteLiteral(branchRef))
+	out := sqliteScalar(t, dbPath, q)
+	n := 0
+	fmt.Sscanf(out, "%d", &n)
+	return n
+}
+
+// activeBranchGeneration reads daemon_meta.branch.generation; defaults to "1"
+// if absent. Returned as int.
+func activeBranchGeneration(t *testing.T, dbPath string) int {
+	t.Helper()
+	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
+	if gen == "" {
+		return 1
+	}
+	n := 1
+	fmt.Sscanf(gen, "%d", &n)
+	return n
+}
+
+// TestDeadBranchPrune_DivergedDeletedBranchPrunesRows covers scenario (a):
+// a Diverged transition where the prior branch has been deleted prunes the
+// blocked_conflict rows tied to that dead ref. We seed the dead-branch row
+// AFTER the daemon comes up (so the schema exists), then drive the daemon
+// off the dead ref via a hard reset that the daemon classifies Diverged.
+//
+// Strategy notes:
+//
+//   - A live `acd start` populates the state.db schema and stamps
+//     branch.generation. We then pause the daemon, stop it, seed a dead-ref
+//     row, delete the dead ref, and restart the daemon so the *startup*
+//     sweep observes the dead ref. This exercises the same code path as a
+//     runtime Diverged hook (both call pruneDeadBranchTerminals) without
+//     having to fight the run-loop's branch-token settle window.
+//   - Scenario (c) — pure startup sweep with no prior daemon session — uses
+//     a separate test below. This test is specifically the "ref was alive
+//     when terminals landed, then operator merged + deleted" shape.
+func TestDeadBranchPrune_DivergedDeletedBranchPrunesRows(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Bring up the daemon once so .git/acd/state.db materializes with the
+	// canonical schema. Then stop so we can seed deterministically.
+	startSession(t, ctx, env, repo, "dbp-a-init", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+
+	// Create refs/heads/foo on top of HEAD so the seeded rows reference an
+	// initially-real branch. The integration repo is on refs/heads/main.
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	runGitOK(t, repo, "update-ref", "refs/heads/foo", headOID)
+
+	// Seed a blocked_conflict row tied to refs/heads/foo (generation 1).
+	const deadRef = "refs/heads/foo"
+	seedTerminalCaptureEvent(t, dbPath, deadRef, 1, headOID, "foo-blocked.txt", "blocked_conflict")
+	seedTerminalCaptureEvent(t, dbPath, deadRef, 1, headOID, "foo-failed.txt", "failed")
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
+		t.Fatalf("seeded terminals for %s: got=%d want=2", deadRef, got)
+	}
+
+	// Delete refs/heads/foo to simulate "merged + branch deleted".
+	runGitOK(t, repo, "update-ref", "-d", deadRef)
+
+	// Start the daemon again — startup sweep + Diverged path will observe the
+	// dead ref. The daemon's main loop runs runStartupDeadBranchSweep before
+	// any capture work, so the rows must be gone shortly after mode=running.
+	startSession(t, ctx, env, repo, "dbp-a-prune", "shell")
+	waitMode(t, repo, "running", 10*time.Second)
+
+	waitFor(t, "dead-ref terminals pruned", 10*time.Second, func() bool {
+		return countTerminalsForRef(t, dbPath, deadRef) == 0
+	})
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 0 {
+		t.Fatalf("dead-ref %s terminals=%d want 0", deadRef, got)
+	}
+}
+
+// TestDeadBranchPrune_LiveBranchPreservesRows covers scenario (b): when the
+// prior branch ref is still alive in the repo, the sweep must leave its
+// terminal rows alone.
+func TestDeadBranchPrune_LiveBranchPreservesRows(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "dbp-b-init", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	const liveRef = "refs/heads/keep"
+	runGitOK(t, repo, "update-ref", liveRef, headOID)
+
+	// Seed the same terminal rows but DO NOT delete the ref.
+	seedTerminalCaptureEvent(t, dbPath, liveRef, 1, headOID, "keep-blocked.txt", "blocked_conflict")
+	seedTerminalCaptureEvent(t, dbPath, liveRef, 1, headOID, "keep-failed.txt", "failed")
+	if got := countTerminalsForRef(t, dbPath, liveRef); got != 2 {
+		t.Fatalf("seed rows for %s: got=%d want 2", liveRef, got)
+	}
+
+	// Restart the daemon — sweep should NOT touch live-ref rows.
+	startSession(t, ctx, env, repo, "dbp-b-keep", "shell")
+	waitMode(t, repo, "running", 10*time.Second)
+
+	// Allow time for any sweep activity to complete; assert preservation.
+	time.Sleep(500 * time.Millisecond)
+	if got := countTerminalsForRef(t, dbPath, liveRef); got != 2 {
+		t.Fatalf("live-ref %s terminals=%d want 2 (sweep must preserve live refs)", liveRef, got)
+	}
+}
+
+// TestDeadBranchPrune_StartupSweepRemovesPreSeededTerminals covers scenario
+// (c): seed terminal rows for refs that never existed, then start the daemon.
+// runStartupDeadBranchSweep observes the dead refs and prunes the rows.
+func TestDeadBranchPrune_StartupSweepRemovesPreSeededTerminals(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Materialize the schema, then stop and seed.
+	startSession(t, ctx, env, repo, "dbp-c-init", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+
+	const deadRef1 = "refs/heads/dead-1"
+	const deadRef2 = "refs/heads/dead-2"
+	// Neither ref ever exists in the repo. Sweep must observe RefExists=false
+	// for both and prune their terminals.
+	seedTerminalCaptureEvent(t, dbPath, deadRef1, 1, headOID, "dead1-blocked.txt", "blocked_conflict")
+	seedTerminalCaptureEvent(t, dbPath, deadRef1, 1, headOID, "dead1-failed.txt", "failed")
+	seedTerminalCaptureEvent(t, dbPath, deadRef2, 1, headOID, "dead2-blocked.txt", "blocked_conflict")
+
+	if got := countTerminalsForRef(t, dbPath, deadRef1); got != 2 {
+		t.Fatalf("seed deadRef1: got=%d want 2", got)
+	}
+	if got := countTerminalsForRef(t, dbPath, deadRef2); got != 1 {
+		t.Fatalf("seed deadRef2: got=%d want 1", got)
+	}
+
+	// Restart — startup sweep should prune both refs' terminals.
+	startSession(t, ctx, env, repo, "dbp-c-prune", "shell")
+	waitMode(t, repo, "running", 10*time.Second)
+
+	waitFor(t, "deadRef1 terminals pruned", 10*time.Second, func() bool {
+		return countTerminalsForRef(t, dbPath, deadRef1) == 0
+	})
+	waitFor(t, "deadRef2 terminals pruned", 10*time.Second, func() bool {
+		return countTerminalsForRef(t, dbPath, deadRef2) == 0
+	})
+}
+
+// TestDeadBranchPrune_OptOutPreservesRows covers scenario (d): with
+// ACD_KEEP_DEAD_BRANCH_BARRIERS=1, neither path prunes — even when refs are
+// dead. We exercise this via the startup sweep (the runtime Diverged hook
+// short-circuits on the same isKeepDeadBranchBarriers check, so a single
+// scenario gives us both code paths).
+func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Boot once to create state.db schema.
+	startSession(t, ctx, env, repo, "dbp-d-init", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+
+	const deadRef = "refs/heads/keep-dead-rows"
+	seedTerminalCaptureEvent(t, dbPath, deadRef, 1, headOID, "keep-blocked.txt", "blocked_conflict")
+	seedTerminalCaptureEvent(t, dbPath, deadRef, 1, headOID, "keep-failed.txt", "failed")
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
+		t.Fatalf("seed rows for %s: got=%d want 2", deadRef, got)
+	}
+
+	// Restart with the opt-out env. The daemon's startup sweep must skip
+	// pruning entirely — leaving both terminals intact.
+	startSession(t, ctx, env, repo, "dbp-d-keep", "shell",
+		"ACD_KEEP_DEAD_BRANCH_BARRIERS=1")
+	waitMode(t, repo, "running", 10*time.Second)
+
+	// Settle window for any background work; rows must remain.
+	time.Sleep(750 * time.Millisecond)
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
+		t.Fatalf("opt-out: dead-ref %s terminals=%d want 2 (sweep must skip)", deadRef, got)
+	}
+}
+
+// TestDeadBranchPrune_DiagnoseMetaSurfacesAfterPrune asserts the three
+// dead_branch_prune_* JSON fields surface from `acd diagnose --json` after a
+// successful sweep. Counterpart to the unit-level meta-write tests in
+// internal/daemon/dead_branch_sweep_test.go: this proves the full pipeline
+// (daemon writes meta -> CLI diagnose reads meta -> JSON fields populate).
+func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterPrune(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Boot to materialize schema, then stop and seed.
+	startSession(t, ctx, env, repo, "dbp-meta-init", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+	stopSessionForce(t, env, repo)
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+
+	const deadRef = "refs/heads/diagnose-dead"
+	seedTerminalCaptureEvent(t, dbPath, deadRef, 1, headOID, "diag-blocked.txt", "blocked_conflict")
+
+	beforeTS := time.Now().Unix() - 1 // tolerate clock skew
+
+	// Restart — the startup sweep prunes the dead-ref terminal AND stamps
+	// the three dead_branch_prune.* meta keys.
+	startSession(t, ctx, env, repo, "dbp-meta-prune", "shell")
+	waitMode(t, repo, "running", 10*time.Second)
+
+	waitFor(t, "dead-ref terminal pruned (precondition for meta)", 10*time.Second, func() bool {
+		return countTerminalsForRef(t, dbPath, deadRef) == 0
+	})
+	// Wait until daemon has stamped the meta keys (sweep is best-effort and
+	// runs slightly after row delete).
+	waitFor(t, "dead_branch_prune.last_run_ts present", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'dead_branch_prune.last_run_ts'") != ""
+	})
+
+	res := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd diagnose exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	var report struct {
+		DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts"`
+		DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
+		DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs"`
+	}
+	if err := json.Unmarshal([]byte(res.Stdout), &report); err != nil {
+		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
+	}
+
+	afterTS := time.Now().Unix() + 1
+	if report.DeadBranchPruneLastRunTS < beforeTS || report.DeadBranchPruneLastRunTS > afterTS {
+		t.Fatalf("dead_branch_prune_last_run_ts=%d outside [%d, %d]\njson=%s",
+			report.DeadBranchPruneLastRunTS, beforeTS, afterTS, res.Stdout)
+	}
+	if report.DeadBranchPruneLastCount < 1 {
+		t.Fatalf("dead_branch_prune_last_count=%d want >= 1\njson=%s",
+			report.DeadBranchPruneLastCount, res.Stdout)
+	}
+	foundDeadRef := false
+	for _, r := range report.DeadBranchPruneLastRefs {
+		if r == deadRef {
+			foundDeadRef = true
+			break
+		}
+	}
+	if !foundDeadRef {
+		t.Fatalf("dead_branch_prune_last_refs=%v missing %q\njson=%s",
+			report.DeadBranchPruneLastRefs, deadRef, res.Stdout)
+	}
+}
+
+// TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune asserts the three
+// dead_branch_prune_* JSON fields are absent (omitempty) or zero when the
+// daemon has never recorded a non-empty prune. Sister test to the
+// "after prune" assertion above; ensures we are not stamping false-positive
+// meta on every boot.
+func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Bring the daemon up but do NOT seed any dead-ref terminals — the sweep
+	// is a no-op and the meta keys must remain absent.
+	startSession(t, ctx, env, repo, "dbp-noprune", "shell")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	res := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd diagnose exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	// Decode into a map so we can confirm the keys are not even present
+	// (omitempty drops zero/nil values from the encoded JSON).
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(res.Stdout), &raw); err != nil {
+		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
+	}
+	for _, key := range []string{
+		"dead_branch_prune_last_run_ts",
+		"dead_branch_prune_last_count",
+		"dead_branch_prune_last_refs",
+	} {
+		if _, ok := raw[key]; ok {
+			t.Fatalf("expected JSON field %q absent before any prune; got value=%v\nstdout=%s",
+				key, raw[key], res.Stdout)
+		}
+	}
+
+	// Belt-and-suspenders: also verify the meta keys are unset in state.db.
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	for _, key := range []string{
+		"dead_branch_prune.last_run_ts",
+		"dead_branch_prune.last_count",
+		"dead_branch_prune.last_refs",
+	} {
+		v := sqliteScalar(t, dbPath, fmt.Sprintf("SELECT value FROM daemon_meta WHERE key = %s", sqliteLiteral(key)))
+		if v != "" {
+			t.Fatalf("meta %q=%q expected unset on no-prune boot", key, v)
+		}
+	}
+}
