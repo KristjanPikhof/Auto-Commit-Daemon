@@ -627,30 +627,83 @@ WHERE state IN ('blocked_conflict', 'failed')
 	return int(n), nil
 }
 
-// DeleteTerminalForDeadBranch deletes terminal capture_events rows scoped to a
-// (branch_ref, branch_generation) pair whose branch has since been merged and
-// deleted. Terminal rows — state IN ('blocked_conflict', 'failed') — are the
-// only target; pending rows are intentionally not touched so any in-flight
-// replay work for the same pair is not disrupted. Published rows are never
-// modified by this helper.
+// PurgeUnpublishedForDeadBranch deletes both pending and terminal
+// (blocked_conflict, failed) capture_events rows for a (branch_ref,
+// branch_generation) pair whose branch ref has since been deleted. Published
+// rows are never touched. If a deleted row was referenced by the
+// publish_state singleton (status='blocked_conflict'), that barrier is
+// lifted and the breadcrumb meta keys (last_replay_conflict,
+// last_replay_conflict_legacy, last_replay_error) are cleared in the same
+// transaction so `acd status` / `acd diagnose` read clean immediately.
 //
-// Typical caller: the branch-token transition path, after confirming the ref
-// no longer exists, to prevent phantom blocked counts from accumulating in the
-// replay queue indefinitely once the branch is gone.
-func DeleteTerminalForDeadBranch(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
+// Empty branchRef returns an error. Returns the total number of capture_events
+// rows deleted (pending + terminal combined). Caller is responsible for
+// confirming the ref is actually dead before invoking — the helper does no
+// liveness check itself.
+//
+// Why pending matters here: leaving pending rows behind while deleting their
+// terminal predecessor lets PendingEvents re-expose them on the next replay
+// pass; replay then re-evaluates them against the (now-irrelevant) prior
+// generation, mismatches in `checkEventGeneration`, and stamps a fresh
+// blocked_conflict, defeating the prune entirely. Pending + terminal must
+// drop together for the dead-branch case.
+func PurgeUnpublishedForDeadBranch(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
 	if branchRef == "" {
-		return 0, fmt.Errorf("state: DeleteTerminalForDeadBranch: empty branch_ref")
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: empty branch_ref")
 	}
-	res, err := d.conn.ExecContext(ctx,
-		`DELETE FROM capture_events WHERE state IN (?, ?) AND branch_ref = ? AND branch_generation = ?`,
-		EventStateBlockedConflict, EventStateFailed, branchRef, branchGeneration,
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state IN (?, ?, ?)`,
+		branchRef, branchGeneration,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("state: delete terminal branch %q generation %d: %w", branchRef, branchGeneration, err)
+		return 0, fmt.Errorf("state: purge unpublished branch %q generation %d: %w", branchRef, branchGeneration, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("state: delete terminal branch generation rows: %w", err)
+		return 0, fmt.Errorf("state: purge unpublished branch generation rows: %w", err)
+	}
+
+	// Lift the barrier in publish_state if it referenced a row we just
+	// deleted. The singleton row is keyed at id=1; clear status + error so
+	// `acd status` reads "ok" immediately and the breadcrumbs do not point
+	// at a row that no longer exists. Mirrors the pattern in
+	// internal/cli/purge.go (the operator-driven `acd purge-events`).
+	nowSec := nowSeconds()
+	pubRes, err := tx.ExecContext(ctx, `
+UPDATE publish_state
+SET status = 'ok', error = NULL, updated_ts = ?
+WHERE id = 1 AND status = 'blocked_conflict'`, nowSec)
+	if err != nil {
+		return 0, fmt.Errorf("state: clear publish_state for dead branch %q: %w", branchRef, err)
+	}
+	pubRows, _ := pubRes.RowsAffected()
+	if pubRows > 0 {
+		// Drop the human-readable breadcrumbs only when we actually lifted
+		// the singleton barrier — otherwise we'd be clearing breadcrumbs
+		// that belong to a different (live) branch's barrier.
+		for _, key := range []string{
+			"last_replay_conflict",
+			"last_replay_conflict_legacy",
+			"last_replay_error",
+		} {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
+				return 0, fmt.Errorf("state: clear daemon_meta %s for dead branch %q: %w", key, branchRef, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: commit: %w", err)
 	}
 	return int(n), nil
 }
