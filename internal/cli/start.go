@@ -335,17 +335,31 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	// runStart without re-acquiring control.lock or re-opening SQLite.
 	// Failure to write is non-fatal — the next call simply takes the
 	// cold path.
+	//
+	// Schema v2 also stamps the daemon's process-identity fingerprint
+	// (lstart + argv hash). The short-circuit reader re-captures the
+	// fingerprint and requires equality before granting hot-path
+	// success. This defends against PID reuse: a kill(0) succeeds for
+	// any process that inherits the recycled pid, but ps will report
+	// a different start-time + argv vector.
 	clients, _ := state.CountClients(ctx, db)
 	if daemonPID > 0 {
+		var startTS, argvHash string
+		if fp, ferr := identity.CaptureContext(ctx, daemonPID); ferr == nil && !fp.Empty() {
+			startTS = fp.StartTime
+			argvHash = fp.ArgvHash
+		}
 		_ = writeStartCache(gitDir, startCache{
-			Version:     startCacheVersion,
-			RepoHash:    repoHash,
-			SessionID:   sessionID,
-			Harness:     harness,
-			DaemonPID:   daemonPID,
-			WatchPID:    watchPID,
-			ClientCount: clients,
-			UpdatedAt:   time.Now().Unix(),
+			Version:        startCacheVersion,
+			RepoHash:       repoHash,
+			SessionID:      sessionID,
+			Harness:        harness,
+			DaemonPID:      daemonPID,
+			WatchPID:       watchPID,
+			ClientCount:    clients,
+			UpdatedAt:      time.Now().Unix(),
+			DaemonStartTS:  startTS,
+			DaemonArgvHash: argvHash,
 		})
 	}
 
