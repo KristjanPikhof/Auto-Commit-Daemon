@@ -500,6 +500,18 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 	}
 }
 
+// TestSetup_Pi_ActiveHooksAndChainPlusLogFallback guards that tool.before.*
+// and tool.after.* hooks chain start AND wake with `&&` and route failure
+// through the harness LOG file, exiting nonzero so pi surfaces it.
+// Regression target: P1-3 (wake masks start failure).
+func TestSetup_Pi_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
+		block := yamlHookBlock(t, body, id)
+		assertYAMLActiveHookAndChainAndLogFallback(t, id, block, "pi-hook.log")
+	}
+}
+
 // --- shell ------------------------------------------------------------------
 
 func TestSetup_Shell_ExitsZero(t *testing.T) {
