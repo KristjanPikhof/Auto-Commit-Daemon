@@ -671,29 +671,81 @@ func tailCodexHookLog() string {
 		totalErr, len(tail), first, homeShort(path))
 }
 
-// looksLikeHookError returns true when ln looks like a stderr-style error
-// line emitted by the codex hook bash wrapper. We accept either the literal
-// substring "error" (case-insensitive) or a typical command-not-found /
-// permission-denied / fatal prefix.
+// looksLikeHookError returns true when ln looks like a real failure
+// emitted by the codex hook bash wrapper or a structured ACD error log
+// line. Two narrow shapes count:
+//
+//  1. Wrapper printf shape: a leading bracketed timestamp followed by
+//     `... failed exit=N` OR a `cmd=acd-` marker. The wrappers in
+//     templates/codex/hooks.json (and the OpenCode/Pi YAML snippets) use
+//     this exact form. Example:
+//     `[2026-05-08T12:34:56+0300] active hook failed exit=1 cmd=acd-start-wake`
+//
+//  2. JSONL with an explicit failure level: lines that look like JSON
+//     with `"level":"error"` or `"level":"fatal"`. Other JSONL fields
+//     (e.g. `failed_blocking_pending=0`) do NOT count — they are status
+//     fields on info-level lines and were the dominant false positive.
+//
+// Free-text "error" / "failed" substring matches are intentionally
+// dropped: tail noise like `failed_blocking_pending=0` and the
+// wrapper's own `active-hook failed` prose used to round-trip through
+// the broad matcher and inflate the recent-error count.
 func looksLikeHookError(ln string) bool {
-	low := strings.ToLower(ln)
-	if strings.Contains(low, "error") {
+	if isWrapperFailureLine(ln) {
 		return true
 	}
-	for _, needle := range []string{
-		"command not found",
-		"permission denied",
-		"no such file",
-		"acd: ",
-		"fatal:",
-		"panic:",
-		"failed",
-	} {
-		if strings.Contains(low, needle) {
+	if level, ok := jsonlLevel(ln); ok {
+		switch strings.ToLower(level) {
+		case "error", "fatal":
 			return true
 		}
 	}
 	return false
+}
+
+// isWrapperFailureLine reports whether ln looks like the bash wrapper's
+// `printf '[%s] ... failed exit=%d cmd=acd-%s\n' ...` output.
+func isWrapperFailureLine(ln string) bool {
+	if !strings.HasPrefix(ln, "[") {
+		return false
+	}
+	close := strings.IndexByte(ln, ']')
+	if close <= 0 {
+		return false
+	}
+	// Require a parseable timestamp inside the brackets so we do not
+	// accidentally flag arbitrary `[anything]` prefixes.
+	if _, ok := parseLogTimestamp(ln); !ok {
+		return false
+	}
+	rest := ln[close+1:]
+	if strings.Contains(rest, "failed exit=") {
+		return true
+	}
+	if strings.Contains(rest, "cmd=acd-") {
+		return true
+	}
+	return false
+}
+
+// jsonlLevel best-effort extracts the value of a `"level":"<x>"` field
+// from a JSONL-shaped line. Returns ok=false when the line does not
+// look like JSON or when no level field is present.
+func jsonlLevel(ln string) (string, bool) {
+	trimmed := strings.TrimSpace(ln)
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	idx := strings.Index(trimmed, `"level":"`)
+	if idx < 0 {
+		return "", false
+	}
+	rest := trimmed[idx+len(`"level":"`):]
+	end := strings.IndexByte(rest, '"')
+	if end <= 0 {
+		return "", false
+	}
+	return rest[:end], true
 }
 
 // parseLogTimestamp tries to extract a timestamp from the start of ln. It
