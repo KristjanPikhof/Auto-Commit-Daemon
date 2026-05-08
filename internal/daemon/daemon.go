@@ -691,17 +691,18 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 
-	// Sweep terminal capture_events rows whose owning branch ref has been
-	// deleted. Runs once at boot, before the main loop, so a daemon restart
-	// observes a clean queue even when the runtime Diverged hook never had a
-	// chance to fire (for instance: branch deleted while the daemon was
-	// stopped). The opt-out log fires first so operators see the env knob in
-	// effect even when there is nothing to sweep.
+	// The dead-branch sweep used to run synchronously here, before the
+	// main loop. That put two costs on the blocking startup path: a
+	// `git for-each-ref` shell-out and an O(distinct-terminal-pairs) walk
+	// over capture_events. The sweep is now scheduled below as a one-shot
+	// goroutine fired AFTER the running-mode publish so neither cost
+	// counts against the start-latency budget. The env opt-out log still
+	// fires synchronously so operators see the knob even on a no-op
+	// startup.
 	if isKeepDeadBranchBarriers() {
-		logger.Info("dead-branch terminal pruning disabled by env",
+		logger.Info("dead-branch unpublished pruning disabled by env",
 			"env", EnvKeepDeadBranchBarriers)
 	}
-	runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
