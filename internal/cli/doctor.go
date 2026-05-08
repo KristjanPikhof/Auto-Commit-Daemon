@@ -3,6 +3,7 @@ package cli
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
