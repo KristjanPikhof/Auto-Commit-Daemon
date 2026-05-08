@@ -585,6 +585,41 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	}
 }
 
+// TestSetup_OpenCode_AllHooksGateMkdir guards that every opencode YAML hook
+// body gates `mkdir -p` behind a `[ -d "$LOG_DIR" ]` check, mirroring the
+// codex template invariant. Unconditional `mkdir -p` on every hook event
+// fork+execs an extra subprocess on the hot path; the gate elides that
+// when the log dir already exists. Regression target: P2-20 (parity gap
+// between codex and opencode/pi snippets).
+func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
+	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+		block := yamlHookBlock(t, body, id)
+		if !strings.Contains(block, "mkdir -p") {
+			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
+		}
+		if !strings.Contains(block, `[ -d "$LOG_DIR" ] || mkdir -p`) {
+			t.Errorf("%s: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p:\n%s", id, block)
+		}
+	}
+}
+
+// TestSetup_Pi_AllHooksGateMkdir mirrors the opencode case for the Pi
+// template — every Pi YAML hook body must gate mkdir -p behind a
+// directory-exists check.
+func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+		block := yamlHookBlock(t, body, id)
+		if !strings.Contains(block, "mkdir -p") {
+			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
+		}
+		if !strings.Contains(block, `[ -d "$LOG_DIR" ] || mkdir -p`) {
+			t.Errorf("%s: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p:\n%s", id, block)
+		}
+	}
+}
+
 // TestSetup_OpenCode_ActiveHooksAndChainPlusLogFallback guards that
 // tool.before.* and tool.after.* hooks chain start AND wake with `&&` and
 // route a failure through the harness LOG file, exiting nonzero so opencode
