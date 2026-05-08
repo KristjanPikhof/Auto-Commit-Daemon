@@ -38,16 +38,16 @@ const startCacheFilename = "start-cache.json"
 // or opening SQLite — that the daemon is still healthy and the registration
 // is still valid.
 type startCache struct {
-	Version         int    `json:"version"`
-	RepoHash        string `json:"repo_hash"`
-	SessionID       string `json:"session_id"`
-	Harness         string `json:"harness"`
-	DaemonPID       int    `json:"daemon_pid"`
-	WatchPID        int    `json:"watch_pid,omitempty"`
-	ClientCount     int    `json:"client_count,omitempty"`
-	UpdatedAt       int64  `json:"updated_at_unix"`
-	DaemonStartTS   string `json:"daemon_start_ts,omitempty"`
-	DaemonArgvHash  string `json:"daemon_argv_hash,omitempty"`
+	Version        int    `json:"version"`
+	RepoHash       string `json:"repo_hash"`
+	SessionID      string `json:"session_id"`
+	Harness        string `json:"harness"`
+	DaemonPID      int    `json:"daemon_pid"`
+	WatchPID       int    `json:"watch_pid,omitempty"`
+	ClientCount    int    `json:"client_count,omitempty"`
+	UpdatedAt      int64  `json:"updated_at_unix"`
+	DaemonStartTS  string `json:"daemon_start_ts,omitempty"`
+	DaemonArgvHash string `json:"daemon_argv_hash,omitempty"`
 }
 
 // captureDaemonFingerprint resolves the running daemon's identity stamp.
