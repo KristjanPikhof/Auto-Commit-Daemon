@@ -349,7 +349,7 @@ func TestWriteStartCache_RoundTripCreatesParent(t *testing.T) {
 	if err := writeStartCache(gitDir, in); err != nil {
 		t.Fatalf("writeStartCache: %v", err)
 	}
-	got := readStartCache(startCachePath(gitDir))
+	got := readStartCache(startCachePath(gitDir, in.SessionID))
 	if got == nil {
 		t.Fatalf("expected cache hit, got nil")
 	}
