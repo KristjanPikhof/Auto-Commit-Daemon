@@ -461,3 +461,35 @@ func ensureAttachedHEAD(ctx context.Context, repo string) error {
 func fingerprintToken(fp identity.Fingerprint) string {
 	return daemon.FingerprintToken(fp)
 }
+
+// touchClientHotPath bumps daemon_clients.last_seen_ts for the supplied
+// session without touching any other field. It opens the per-repo SQLite
+// file briefly, runs a single UPDATE keyed on session_id, then closes —
+// no flock, no migrations, no registry rewrite. Used by the short-
+// circuit branch of runStart so a session that lives entirely on the
+// hot path never exceeds the refcount sweeper's clientTTL window.
+//
+// All errors are returned to the caller (which logs and continues): a
+// failed touch never blocks the active hook from progressing — the next
+// sweeper tick may evict the row, but the next runStart will simply
+// fall through to the cold path and re-register via state.RegisterClient.
+//
+// Indirected through a package var so unit tests can stub the helper to
+// observe call sites without a real SQLite open.
+var touchClientHotPath = defaultTouchClientHotPath
+
+func defaultTouchClientHotPath(ctx context.Context, gitDir, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("touchClientHotPath: empty session_id")
+	}
+	dbPath := state.DBPathFromGitDir(gitDir)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("touchClientHotPath: open db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := state.TouchClient(ctx, db, sessionID, float64(time.Now().Unix())); err != nil {
+		return fmt.Errorf("touchClientHotPath: touch: %w", err)
+	}
+	return nil
+}
