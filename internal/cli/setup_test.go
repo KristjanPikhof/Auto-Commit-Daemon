@@ -571,6 +571,78 @@ func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	}
 }
 
+// assertActiveHookAndChainAndLogFallback verifies that an active hook
+// command chains `acd start` and `acd wake` with logical-and so a failed
+// start is not masked by a successful wake, and that the trailing
+// or-clause writes the failure cause into logFile and exits nonzero so the
+// harness can surface it. Used by JSON-bodied harnesses (claude-code,
+// codex) where the bash body lives inside a JSON string.
+func assertActiveHookAndChainAndLogFallback(t *testing.T, ev string, i, j int, cmd, logFile string) {
+	t.Helper()
+	// Order: acd start before acd wake.
+	startIdx := strings.Index(cmd, "acd start")
+	wakeIdx := strings.Index(cmd, "acd wake")
+	if startIdx < 0 || wakeIdx < 0 {
+		t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
+		return
+	}
+	if startIdx > wakeIdx {
+		t.Errorf("%s entry %d hook %d: acd start must precede acd wake: %s", ev, i, j, cmd)
+	}
+	// Logical-and chain between start and wake (no plain `;` masking exit).
+	chain := cmd[startIdx:wakeIdx]
+	if !strings.Contains(chain, "&&") {
+		t.Errorf("%s entry %d hook %d: acd start and acd wake must be chained with &&, got: %s", ev, i, j, chain)
+	}
+	// LOG file path appears.
+	if !strings.Contains(cmd, logFile) {
+		t.Errorf("%s entry %d hook %d: missing LOG path %q in: %s", ev, i, j, logFile, cmd)
+	}
+	// Trailing or-clause that writes failure cause and exits nonzero.
+	// Either pattern: `|| { printf ... ; exit 1; }` (JSON-escaped) or `|| {`.
+	if !strings.Contains(cmd, "|| {") {
+		t.Errorf("%s entry %d hook %d: missing tail or-clause `|| { ... ; exit 1; }`: %s", ev, i, j, cmd)
+	}
+	if !strings.Contains(cmd, "exit 1") {
+		t.Errorf("%s entry %d hook %d: failure branch must exit nonzero: %s", ev, i, j, cmd)
+	}
+	// Failure cause goes to LOG.
+	if !strings.Contains(cmd, ">>\\\"$LOG\\\"") && !strings.Contains(cmd, `>>"$LOG"`) {
+		t.Errorf("%s entry %d hook %d: failure must be appended to $LOG: %s", ev, i, j, cmd)
+	}
+}
+
+// assertYAMLActiveHookAndChainAndLogFallback is the YAML/block-scalar
+// counterpart for opencode and pi snippets.
+func assertYAMLActiveHookAndChainAndLogFallback(t *testing.T, id, block, logFile string) {
+	t.Helper()
+	startIdx := strings.Index(block, "acd start")
+	wakeIdx := strings.Index(block, "acd wake")
+	if startIdx < 0 || wakeIdx < 0 {
+		t.Errorf("%s: must call both acd start and acd wake:\n%s", id, block)
+		return
+	}
+	if startIdx > wakeIdx {
+		t.Errorf("%s: acd start must precede acd wake:\n%s", id, block)
+	}
+	chain := block[startIdx:wakeIdx]
+	if !strings.Contains(chain, "&&") {
+		t.Errorf("%s: acd start and acd wake must be chained with &&:\n%s", id, chain)
+	}
+	if !strings.Contains(block, logFile) {
+		t.Errorf("%s: missing LOG path %q:\n%s", id, logFile, block)
+	}
+	if !strings.Contains(block, "|| {") {
+		t.Errorf("%s: missing tail or-clause `|| { ... ; exit 1 }`:\n%s", id, block)
+	}
+	if !strings.Contains(block, "exit 1") {
+		t.Errorf("%s: failure branch must exit nonzero:\n%s", id, block)
+	}
+	if !strings.Contains(block, `>>"$LOG"`) {
+		t.Errorf("%s: failure must be appended to $LOG:\n%s", id, block)
+	}
+}
+
 func yamlHookBlock(t *testing.T, body, id string) string {
 	t.Helper()
 	start := strings.Index(body, "- id: "+id)
