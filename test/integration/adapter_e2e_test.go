@@ -931,8 +931,105 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read codex hook log %s: %v", logPath, err)
 	}
-	if !strings.Contains(string(logBody), "acd") {
-		t.Fatalf("codex hook log missing acd failure, got:\n%s", logBody)
+	// Per the new codex bash body (P1-8 regression), hook-stdin-extract
+	// failure must surface as a printf line tagged
+	// `active hook failed exit=<rc> cmd=acd-hook-stdin-extract`. The
+	// previous shape silently swallowed the helper exit code and only the
+	// "acd: command not found" stderr ended up in the log.
+	for _, want := range []string{"active hook failed exit=", "cmd=acd-hook-stdin-extract"} {
+		if !strings.Contains(string(logBody), want) {
+			t.Fatalf("codex hook log missing %q, got:\n%s", want, logBody)
+		}
+	}
+}
+
+// TestAdapterE2E_Codex_HelperMissing covers the P1-8 regression target: when
+// `acd` is on PATH but exits non-zero (here `/usr/bin/false` masquerades as
+// the binary), the codex hook bodies must
+//   - return exit 0 to the harness so the user is not blocked,
+//   - log an explicit printf line tagged `cmd=acd-hook-stdin-extract` so the
+//     failure cause is visible in `acd doctor` output and the harness log.
+//
+// Distinct from `runCodexMissingAcdWritesHookLog` which removes acd from
+// PATH entirely (testing exit=127 / "command not found"). This case tests
+// the more subtle real-world failure where acd exists but is broken.
+func TestAdapterE2E_Codex_HelperMissing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adapter e2e: Windows snippets not in scope for v1")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("adapter e2e: bash not on PATH")
+	}
+	falseBin := "/usr/bin/false"
+	if _, err := os.Stat(falseBin); err != nil {
+		t.Skipf("skip: %s missing", falseBin)
+	}
+
+	body := readSnippet(t, "codex/hooks.json")
+	hooks := parseCodexHooksJSON(t, body)
+
+	// Build a directory where `acd` is a symlink to /usr/bin/false. This
+	// shadows any installed acd on PATH so every invocation exits 1.
+	fakeBin := t.TempDir()
+	if err := os.Symlink(falseBin, filepath.Join(fakeBin, "acd")); err != nil {
+		t.Fatalf("symlink acd -> %s: %v", falseBin, err)
+	}
+
+	base := withIsolatedHome(t)
+	home := ""
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "HOME=") {
+			home = strings.TrimPrefix(kv, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		t.Fatal("isolated HOME missing from env")
+	}
+
+	env := envWith(base,
+		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	logPath := filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
+
+	// Run every event the codex template registers; each must exit 0
+	// (helper failure is soft-failed) and append a tagged printf line.
+	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"} {
+		// Truncate the log between events so each assertion observes only
+		// the printf line written by this event.
+		_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+		_ = os.WriteFile(logPath, nil, 0o644)
+
+		hook := pickHookByEvent(t, hooks, event)
+		stdin := fmt.Sprintf(`{"session_id":"e2e-codex-helper-missing-%s","cwd":"%s"}`, event, t.TempDir())
+		res := runBash(t, ctx, env, stdin, hook.Command)
+		if res.ExitCode != 0 {
+			t.Fatalf("codex %s with broken acd should exit 0, got=%d\nstdout=%s\nstderr=%s",
+				event, res.ExitCode, res.Stdout, res.Stderr)
+		}
+		logBody, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("%s: read codex hook log %s: %v", event, logPath, err)
+		}
+		// `/usr/bin/false` exits 1, so the hook-stdin-extract printf branch
+		// fires. The exit code printed must be the real exit (1), not 0.
+		for _, want := range []string{
+			"active hook failed exit=",
+			"cmd=acd-hook-stdin-extract",
+		} {
+			if !strings.Contains(string(logBody), want) {
+				t.Fatalf("%s: codex hook log missing %q, got:\n%s", event, want, logBody)
+			}
+		}
+		// Guard against the rc=$? regression: the printed exit must NOT be
+		// 0 because /usr/bin/false exits 1. If a future template edit drops
+		// the rc=$? capture, $(date +...) would clobber $? to 0.
+		if strings.Contains(string(logBody), "active hook failed exit=0 cmd=acd-hook-stdin-extract") {
+			t.Fatalf("%s: codex hook log printed exit=0 — rc=$? capture lost (P1-8 regression):\n%s", event, logBody)
+		}
 	}
 }
 
