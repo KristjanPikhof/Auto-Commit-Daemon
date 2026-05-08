@@ -573,16 +573,35 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
-			// Prune terminal rows for the prior generation if its branch
-			// ref has since been deleted. Mirrors the runtime Diverged
-			// hook below so a daemon restart that observes a Diverged
-			// transition into a now-dead branch cleans up barriers
-			// instead of leaving them stuck forever.
-			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB,
-				CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID},
-				tokenBranchRef(prevToken), prevGeneration,
-				logger, tracer,
-				"dead branch terminals pruned after startup Diverged")
+			// Prune unpublished rows for the prior generation if its
+			// branch ref has since been deleted. Mirrors the runtime
+			// Diverged hook below so a daemon restart that observes a
+			// Diverged transition into a now-dead branch cleans up
+			// barriers instead of leaving them stuck forever.
+			//
+			// Honor the manual-pause marker: an operator paused mid-
+			// surgery does not want background hygiene to mutate
+			// capture_events while they investigate. A read failure on
+			// the pause state is logged and the prune is skipped (fail
+			// closed — same posture as the run-loop pause gate).
+			startupPruneAllowed := true
+			if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+				logger.Warn("read pause state before startup dead-branch prune; skipping",
+					"err", perr.Error())
+				startupPruneAllowed = false
+			} else if pauseStatus.Active {
+				logger.Info("dead-branch prune skipped (manual pause)",
+					"source", pauseStatus.Source,
+					"reason", pauseStatus.Reason)
+				startupPruneAllowed = false
+			}
+			if startupPruneAllowed {
+				pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB,
+					CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID},
+					tokenBranchRef(prevToken), prevGeneration,
+					logger, tracer,
+					"dead branch unpublished pruned after startup Diverged")
+			}
 		} else if transition == TokenTransitionFastForward {
 			startupFastForwardResync = true
 		}
