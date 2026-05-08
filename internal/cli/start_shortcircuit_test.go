@@ -380,7 +380,9 @@ func TestReadStartCache_LegacyV1Rejected(t *testing.T) {
 }
 
 // tryShortCircuitStart end-to-end: a fresh cache + a registered repo lets
-// the call return OK without us needing to mock anything else.
+// the call return OK without us needing to mock anything else (besides the
+// fingerprint capturer, which is stubbed to a deterministic value so the
+// cached and recaptured stamps agree).
 func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repoDir := t.TempDir()
@@ -399,11 +401,16 @@ func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("registry WithLock: %v", err)
 	}
+	// Pin a deterministic daemon fingerprint so the cached stamp matches
+	// the live re-capture inside tryShortCircuitStart.
+	stamped := identity.Fingerprint{StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "argv-hash"}
+	installFakeDaemonFingerprint(t, stamped)
 	// Stamp a fresh cache pointing at our own pid (always alive).
 	if err := writeStartCache(gitDir, startCache{
 		Version: startCacheVersion, RepoHash: repoHash,
 		SessionID: "sess-A", Harness: "claude-code",
 		DaemonPID: os.Getpid(), UpdatedAt: time.Now().Unix(),
+		DaemonStartTS: stamped.StartTime, DaemonArgvHash: stamped.ArgvHash,
 	}); err != nil {
 		t.Fatalf("writeStartCache: %v", err)
 	}
@@ -415,6 +422,50 @@ func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 	}
 	if pid != os.Getpid() {
 		t.Fatalf("daemon pid=%d want %d", pid, os.Getpid())
+	}
+}
+
+// TestTryShortCircuitStart_FingerprintMismatchEscalates exercises the live
+// PID-reuse defense end-to-end: a cached fingerprint that disagrees with
+// the (stubbed) live capture forces the cold path with reason
+// fingerprint_mismatch.
+func TestTryShortCircuitStart_FingerprintMismatchEscalates(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repoDir := t.TempDir()
+	gitDir := filepath.Join(repoDir, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	repoHash, err := paths.RepoHash(repoDir)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.UpsertRepo(repoDir, repoHash, "/state/db", "claude-code", time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatalf("registry WithLock: %v", err)
+	}
+	// Cached fingerprint from the original daemon.
+	if err := writeStartCache(gitDir, startCache{
+		Version: startCacheVersion, RepoHash: repoHash,
+		SessionID: "sess-A", Harness: "claude-code",
+		DaemonPID: os.Getpid(), UpdatedAt: time.Now().Unix(),
+		DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "original-argv",
+	}); err != nil {
+		t.Fatalf("writeStartCache: %v", err)
+	}
+	// Live re-capture returns a different stamp (PID was recycled).
+	installFakeDaemonFingerprint(t, identity.Fingerprint{
+		StartTime: "Tue May  6 09:30:00 2026", ArgvHash: "recycled-argv",
+	})
+	ok, _, _, reason := tryShortCircuitStart(context.Background(), gitDir,
+		repoHash, "sess-A", "claude-code", repoDir)
+	if ok {
+		t.Fatalf("expected escalation, got OK")
+	}
+	if !strings.Contains(reason, "fingerprint_mismatch") {
+		t.Fatalf("reason=%q want fingerprint_mismatch", reason)
 	}
 }
 
@@ -450,6 +501,9 @@ func TestRunStart_RepeatedActiveHooks_ShortCircuit(t *testing.T) {
 
 	count, restore := installFakeSpawn(t, os.Getpid())
 	defer restore()
+	installFakeDaemonFingerprint(t, identity.Fingerprint{
+		StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "test-argv",
+	})
 
 	// First call takes the cold path (writes the cache).
 	var first bytes.Buffer
