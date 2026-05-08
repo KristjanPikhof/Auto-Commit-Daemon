@@ -161,10 +161,31 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	defer func() { _ = db.Close() }()
 
+	/* adapter-lane: PPID liveness probe.
+	 *
+	 * Probe the resolved watch_pid with kill(pid, 0) BEFORE consulting
+	 * identity.AliveContext — kill(0) is the lowest-overhead syscall-level
+	 * liveness check and lets us emit a focused diagnostic for the common
+	 * "harness wraps `bash -c` through a transient parent" failure mode,
+	 * where $PPID at hook-fire time names a shell process that has already
+	 * exited by the time `acd start` runs. ESRCH here is informational —
+	 * we log a single warning naming the pid (so users can grep the daemon
+	 * log to confirm the wrapper-exit hypothesis) and continue without
+	 * recording a watch_pid; the refcount sweeper will fall back to the
+	 * TTL gate. Other kill(0) errors (EPERM, etc.) imply the pid is alive
+	 * but owned by another user and are passed through to AliveContext.
+	 */
 	var watchPIDNull sql.NullInt64
 	var watchFPNull sql.NullString
 	if watchPID > 0 {
-		if identity.AliveContext(ctx, watchPID) {
+		if perr := syscall.Kill(watchPID, 0); errors.Is(perr, syscall.ESRCH) {
+			slog.Default().Warn(
+				"acd start: watch_pid is not alive at registration; harness may be wrapping the hook through a transient parent (e.g. `bash -c`) whose PID has already exited; continuing without a fast-path liveness PID",
+				"pid", watchPID,
+				"session_id", sessionID,
+				"harness", harness,
+			)
+		} else if identity.AliveContext(ctx, watchPID) {
 			watchPIDNull = sql.NullInt64{Int64: int64(watchPID), Valid: true}
 			if fp, ferr := identity.CaptureContext(ctx, watchPID); ferr == nil && !fp.Empty() {
 				watchFPNull = sql.NullString{String: fingerprintToken(fp), Valid: true}
