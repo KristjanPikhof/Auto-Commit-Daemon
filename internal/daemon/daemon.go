@@ -573,6 +573,16 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
+			// Prune terminal rows for the prior generation if its branch
+			// ref has since been deleted. Mirrors the runtime Diverged
+			// hook below so a daemon restart that observes a Diverged
+			// transition into a now-dead branch cleans up barriers
+			// instead of leaving them stuck forever.
+			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB,
+				CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID},
+				tokenBranchRef(prevToken), prevGeneration,
+				logger, tracer,
+				"dead branch terminals pruned after startup Diverged")
 		} else if transition == TokenTransitionFastForward {
 			startupFastForwardResync = true
 		}
@@ -661,6 +671,18 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Info("published live index repair checked", "candidates", repaired.Candidates, "applied", repaired.Applied, "skipped", len(repaired.Skipped))
 		}
 	}
+
+	// Sweep terminal capture_events rows whose owning branch ref has been
+	// deleted. Runs once at boot, before the main loop, so a daemon restart
+	// observes a clean queue even when the runtime Diverged hook never had a
+	// chance to fire (for instance: branch deleted while the daemon was
+	// stopped). The opt-out log fires first so operators see the env knob in
+	// effect even when there is nothing to sweep.
+	if isKeepDeadBranchBarriers() {
+		logger.Info("dead-branch terminal pruning disabled by env",
+			"env", EnvKeepDeadBranchBarriers)
+	}
+	runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
@@ -990,6 +1012,14 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: cctx.BranchGeneration,
 			})
+			// Prune terminal rows for the prior (branch_ref, generation)
+			// when the prior branch ref no longer resolves. Avoids
+			// phantom blocked_conflict / failed barriers accumulating
+			// after a feature branch is merged and deleted upstream.
+			pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB, cctx,
+				tokenBranchRef(oldToken), prevGeneration,
+				logger, tracer,
+				"dead branch terminals pruned after Diverged")
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",
