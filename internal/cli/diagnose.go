@@ -339,11 +339,12 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 //   - dead_branch_prune.last_count    rows pruned (string-encoded int)
 //   - dead_branch_prune.last_refs     JSON-encoded []string of refs
 //
-// Missing keys default to zero / nil; the JSON omitempty on the report fields
-// drops them entirely from `acd diagnose --json` when the daemon has never
-// recorded a non-empty prune. Malformed values fail open: a parse error zeros
-// the affected field and we keep going (a corrupt JSON refs blob does not
-// abort diagnose).
+// Missing keys default to zero / nil. The two int fields render as 0 in the
+// JSON (omitempty was dropped from the struct tag deliberately so 0 is the
+// documented "never ran" sentinel rather than an absent key). The slice keeps
+// `omitempty` so an empty list serializes as absent. Malformed values fail
+// open: a parse error zeros the affected field and we keep going (a corrupt
+// JSON refs blob does not abort diagnose).
 func diagnoseDeadBranchPrune(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
 	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_run_ts"); err != nil {
 		return fmt.Errorf("dead_branch_prune.last_run_ts: %w", err)
