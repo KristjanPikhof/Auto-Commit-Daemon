@@ -162,7 +162,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	 * probe lives mid-runStart (near refcount.RegisterClient) and only
 	 * applies on the cold path.
 	 */
-	if ok, cachedPID, _ := tryShortCircuitStart(ctx, gitDir, repoHash, sessionID, harness, repo); ok {
+	if ok, cachedPID, cachedClients, _ := tryShortCircuitStart(ctx, gitDir, repoHash, sessionID, harness, repo); ok {
 		res := startResult{
 			Started:   false,
 			Duplicate: true,
@@ -171,9 +171,10 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			RepoHash:  repoHash,
 			SessionID: sessionID,
 			Harness:   harness,
-			// ClientCount is unknown without SQLite; leave at zero. The
-			// hook caller does not depend on it on the fast path.
-			ClientCount: 0,
+			// ClientCount comes from the cache snapshot. May lag the
+			// SQLite truth by one tick under concurrent registrations;
+			// hook consumers do not depend on a strictly-fresh value.
+			ClientCount: cachedClients,
 		}
 		if jsonOut {
 			enc := json.NewEncoder(out)
@@ -334,19 +335,19 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	// runStart without re-acquiring control.lock or re-opening SQLite.
 	// Failure to write is non-fatal — the next call simply takes the
 	// cold path.
+	clients, _ := state.CountClients(ctx, db)
 	if daemonPID > 0 {
 		_ = writeStartCache(gitDir, startCache{
-			Version:   startCacheVersion,
-			RepoHash:  repoHash,
-			SessionID: sessionID,
-			Harness:   harness,
-			DaemonPID: daemonPID,
-			WatchPID:  watchPID,
-			UpdatedAt: time.Now().Unix(),
+			Version:     startCacheVersion,
+			RepoHash:    repoHash,
+			SessionID:   sessionID,
+			Harness:     harness,
+			DaemonPID:   daemonPID,
+			WatchPID:    watchPID,
+			ClientCount: clients,
+			UpdatedAt:   time.Now().Unix(),
 		})
 	}
-
-	clients, _ := state.CountClients(ctx, db)
 
 	res := startResult{
 		Started:     started,
