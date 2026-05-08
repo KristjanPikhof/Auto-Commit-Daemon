@@ -11,9 +11,47 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
+
+// withTemplatesFSOverride swaps the package-level templatesFS for an FS
+// that returns the supplied bytes at each given path and falls back to the
+// real templates FS otherwise. The original FS is restored at test end.
+// Used by raw-mode JSON validation tests to inject malformed templates
+// without touching the embedded production data.
+func withTemplatesFSOverride(t *testing.T, files map[string][]byte) {
+	t.Helper()
+	overlay := fstest.MapFS{}
+	now := time.Now()
+	for path, body := range files {
+		overlay[path] = &fstest.MapFile{Data: body, ModTime: now}
+	}
+	prev := templatesFS
+	templatesFS = overlayFS{primary: overlay, fallback: prev}
+	t.Cleanup(func() { templatesFS = prev })
+}
+
+// overlayFS reads from primary first; on os.ErrNotExist it falls back to
+// fallback. Used to splice in a malformed template path while leaving the
+// rest of the production templates FS intact.
+type overlayFS struct {
+	primary  fs.FS
+	fallback fs.FS
+}
+
+func (o overlayFS) Open(name string) (fs.File, error) {
+	f, err := o.primary.Open(name)
+	if err == nil {
+		return f, nil
+	}
+	if os.IsNotExist(err) {
+		return o.fallback.Open(name)
+	}
+	return nil, err
+}
 
 // runSetupCmd is a test helper that drives newSetupCmd() through its cobra
 // RunE and captures stdout + stderr. It returns the captured output and
