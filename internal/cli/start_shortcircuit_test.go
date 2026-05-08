@@ -271,7 +271,7 @@ func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 		t.Fatalf("writeStartCache: %v", err)
 	}
 
-	ok, pid, reason := tryShortCircuitStart(context.Background(), gitDir,
+	ok, pid, _, reason := tryShortCircuitStart(context.Background(), gitDir,
 		repoHash, "sess-A", "claude-code", repoDir)
 	if !ok {
 		t.Fatalf("short-circuit failed: reason=%q", reason)
@@ -293,7 +293,7 @@ func TestTryShortCircuitStart_NoCacheEscalates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RepoHash: %v", err)
 	}
-	ok, _, reason := tryShortCircuitStart(context.Background(), gitDir,
+	ok, _, _, reason := tryShortCircuitStart(context.Background(), gitDir,
 		repoHash, "sess-A", "claude-code", repoDir)
 	if ok {
 		t.Fatalf("expected escalation when cache missing")
