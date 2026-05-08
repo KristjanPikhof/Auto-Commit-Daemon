@@ -127,6 +127,11 @@ type shortCircuitDecision struct {
 	// DaemonPID is the cached daemon pid surfaced to the caller's
 	// startResult so a short-circuited reply still reports the right pid.
 	DaemonPID int
+	// ClientCount is the cached client count snapshot. May lag the live
+	// SQLite truth by one tick if a concurrent runStart registered a
+	// new session between cache writes; harness consumers do not depend
+	// on a strictly-fresh value here.
+	ClientCount int
 }
 
 // evaluateShortCircuit runs the decision matrix against an explicit cache +
@@ -184,7 +189,11 @@ func evaluateShortCircuit(
 	if !pidAlive(cache.DaemonPID) {
 		return shortCircuitDecision{Reason: "daemon_pid_dead"}
 	}
-	return shortCircuitDecision{OK: true, DaemonPID: cache.DaemonPID}
+	return shortCircuitDecision{
+		OK:          true,
+		DaemonPID:   cache.DaemonPID,
+		ClientCount: cache.ClientCount,
+	}
 }
 
 // tryShortCircuitStart implements the registry-read short-circuit at the
