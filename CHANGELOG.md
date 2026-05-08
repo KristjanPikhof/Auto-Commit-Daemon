@@ -23,7 +23,14 @@
   hook payload. The helper also supports multiple fields and optional fields.
 - Claude Code, Codex, OpenCode, and Pi active hooks now run idempotent
   `acd start` before `acd wake`. ACD can recover after a manual `acd stop`
-  without waiting for a brand-new harness session.
+  without waiting for a brand-new harness session. **Migration:** if you ran
+  `acd stop --all` and the daemon does not restart automatically when the next
+  prompt or tool event fires, your installed snippet is stale. Re-run
+  `acd setup <harness>` and replace the hooks block in your installed config
+  (e.g. `~/.claude/settings.json`, `~/.codex/hooks.json`,
+  `~/.config/opencode/hooks.yaml`, or `~/.pi/hook/hooks.yaml`) so the new
+  self-heal hooks take effect. Run `acd doctor` to identify which harness needs
+  updating.
 - `acd status`, `acd diagnose`, and `acd doctor` now report the effective commit
   strategy from daemon metadata first, then `ACD_COMMIT_STRATEGY`, then the
   default. Unknown daemon values fall back to the environment-derived strategy
