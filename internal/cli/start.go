@@ -163,6 +163,17 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	 * applies on the cold path.
 	 */
 	if ok, cachedPID, cachedClients, _ := tryShortCircuitStart(ctx, gitDir, repoHash, sessionID, harness, repo); ok {
+		// Refresh daemon_clients.last_seen_ts so the daemon's refcount
+		// sweeper does not evict this session after clientTTL minutes
+		// of all-hot-path activity. We deliberately keep this on the
+		// hot path: it is a single UPDATE on a primary-key row (no
+		// flock, no migrations, no central registry rewrite) and
+		// completes well under our 50ms hot-path budget. Failure is
+		// non-fatal — the worst case is the next sweeper tick evicts
+		// the row and the next active hook re-registers via the cold
+		// path. The cache short-circuit decision itself is unchanged.
+		_ = touchClientHotPath(ctx, gitDir, sessionID)
+
 		res := startResult{
 			Started:   false,
 			Duplicate: true,
