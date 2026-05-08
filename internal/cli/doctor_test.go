@@ -1121,7 +1121,9 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 }
 
 // TestDoctor_CodexHookLogQuietWhenNoErrors verifies the log-tail check stays
-// silent when the log only contains info-level lines.
+// silent for lines that are not wrapper-printf failures: plain info lines,
+// JSONL info lines that happen to mention "failed_blocking_pending=0", and
+// "no error encountered" prose. None of these should trigger a Note.
 func TestDoctor_CodexHookLogQuietWhenNoErrors(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -1138,7 +1140,11 @@ func TestDoctor_CodexHookLogQuietWhenNoErrors(t *testing.T) {
 	if err := os.MkdirAll(roots.State, 0o700); err != nil {
 		t.Fatalf("mkdir state: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(roots.State, "codex-hook.log"), []byte("info: ok\ninfo: ok again\n"), 0o600); err != nil {
+	logBody := "info: ok\n" +
+		"info: ok again\n" +
+		`{"ts":"2026-05-08T12:00:00Z","level":"info","msg":"replay","failed_blocking_pending":0}` + "\n" +
+		"info: no error encountered while flushing\n"
+	if err := os.WriteFile(filepath.Join(roots.State, "codex-hook.log"), []byte(logBody), 0o600); err != nil {
 		t.Fatalf("write codex hook log: %v", err)
 	}
 
