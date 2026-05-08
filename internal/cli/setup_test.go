@@ -437,6 +437,18 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	}
 }
 
+// TestSetup_OpenCode_ActiveHooksAndChainPlusLogFallback guards that
+// tool.before.* and tool.after.* hooks chain start AND wake with `&&` and
+// route a failure through the harness LOG file, exiting nonzero so opencode
+// surfaces it. Regression target: P1-3 (wake masks start failure).
+func TestSetup_OpenCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
+		block := yamlHookBlock(t, body, id)
+		assertYAMLActiveHookAndChainAndLogFallback(t, id, block, "opencode-hook.log")
+	}
+}
+
 // --- pi ---------------------------------------------------------------------
 
 func TestSetup_Pi_ExitsZero(t *testing.T) {
