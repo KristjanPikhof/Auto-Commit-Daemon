@@ -19,10 +19,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -40,6 +43,57 @@ const EnvKeepDeadBranchBarriers = "ACD_KEEP_DEAD_BRANCH_BARRIERS"
 // payload is for operator forensics — bounding the slice keeps the JSONL row
 // reasonable on a long-lived repo with many stale branches.
 const deadBranchSweepRefsCap = 32
+
+// MetaKeyDeadBranchPruneLastRunTS records the wall-clock unix-seconds of the
+// most recent dead-branch prune action that actually deleted rows (in either
+// the runtime Diverged-hook path or the startup sweep). Operators read this
+// via `acd diagnose --json` to reason about whether stale-branch hygiene is
+// keeping pace. No-op sweeps (zero rows pruned) do NOT update this key — the
+// surface is intentionally "last action that did something" so a long quiet
+// period after an operator deletes a branch remains visible.
+const MetaKeyDeadBranchPruneLastRunTS = "dead_branch_prune.last_run_ts"
+
+// MetaKeyDeadBranchPruneLastCount records the total number of capture_events
+// rows pruned by the most recent non-empty dead-branch prune action. Stored as
+// a base-10 string. Reset to the new total on every non-empty prune; not
+// cumulative.
+const MetaKeyDeadBranchPruneLastCount = "dead_branch_prune.last_count"
+
+// MetaKeyDeadBranchPruneLastRefs is a JSON-encoded []string of the branch refs
+// whose terminals were pruned in the most recent non-empty dead-branch prune
+// action. The slice is bounded by deadBranchSweepRefsCap so a sweep across
+// many stale branches does not balloon the meta payload.
+const MetaKeyDeadBranchPruneLastRefs = "dead_branch_prune.last_refs"
+
+// recordDeadBranchPruneMeta stamps the three dead-branch prune meta keys in a
+// single MetaSetMany transaction so `acd diagnose` reads them atomically.
+// Best-effort: any error is logged at warn level and the caller continues. The
+// meta surface is forensic — never block prune progress on a meta write.
+//
+// rows must be > 0 (the caller guards on the no-op case so empty sweeps do not
+// overwrite the previous "last action that did something" snapshot). refs is
+// the already-capped slice of pruned refs.
+func recordDeadBranchPruneMeta(ctx context.Context, db *state.DB, logger *slog.Logger, rows int, refs []string) {
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		// Marshalling a []string cannot fail under normal conditions, but
+		// log defensively and keep going — the count + ts are still useful.
+		logger.Warn("dead-branch prune: marshal refs failed; recording empty refs",
+			"err", err.Error())
+		refsJSON = []byte("[]")
+	}
+	pairs := map[string]string{
+		MetaKeyDeadBranchPruneLastRunTS: strconv.FormatInt(time.Now().Unix(), 10),
+		MetaKeyDeadBranchPruneLastCount: strconv.Itoa(rows),
+		MetaKeyDeadBranchPruneLastRefs:  string(refsJSON),
+	}
+	if err := state.MetaSetMany(ctx, db, pairs); err != nil {
+		logger.Warn("dead-branch prune: stamp meta keys failed",
+			"err", err.Error(),
+			"rows", rows,
+			"refs", len(refs))
+	}
+}
 
 // isKeepDeadBranchBarriers reports whether the operator opted out of dead-branch
 // terminal pruning via EnvKeepDeadBranchBarriers. Empty / falsy / unset -> false
