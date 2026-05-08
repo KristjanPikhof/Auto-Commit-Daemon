@@ -216,6 +216,11 @@ func runStartupDeadBranchSweep(
 			"generation", p.Generation,
 			"rows", rows)
 	}
+	if totalRows > 0 {
+		// Stamp the diagnose-visible meta keys before recording the trace
+		// event so readers that wake on the trace see consistent meta.
+		recordDeadBranchPruneMeta(ctx, db, logger, totalRows, prunedRefs)
+	}
 	recordTrace(tracer, acdtrace.Event{
 		Repo:       repoDir,
 		BranchRef:  cctx.BranchRef,
@@ -325,6 +330,11 @@ func pruneDeadBranchTerminals(
 			"ref", oldRef,
 			"generation", prevGeneration,
 			"rows", rows)
+		// Stamp the diagnose-visible meta keys for the operator-facing
+		// "last action that did something" surface. Skipped on the
+		// rows == 0 path (probe-was-dead-but-no-terminals-queued) so the
+		// previous snapshot survives.
+		recordDeadBranchPruneMeta(ctx, db, logger, rows, []string{oldRef})
 	}
 	recordTrace(tracer, acdtrace.Event{
 		Repo:       repoDir,
