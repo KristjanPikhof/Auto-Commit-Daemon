@@ -592,6 +592,129 @@ func TestRunStart_DifferentSession_NoShortCircuit(t *testing.T) {
 	}
 }
 
+// TestMultiSession_PerSessionCacheKeepsBothOnHotPath exercises the per-
+// session cache filename switch (P1 #4 acceptance). Two sessions register
+// against the same repo; after the cold-path setup, each session's
+// subsequent runStart must short-circuit without evicting the other.
+func TestMultiSession_PerSessionCacheKeepsBothOnHotPath(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	installFakeDaemonFingerprint(t, identity.Fingerprint{
+		StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "test-argv",
+	})
+
+	// Cold path for two distinct sessions.
+	for _, s := range []struct {
+		session, harness string
+	}{
+		{"sess-A", "claude-code"},
+		{"sess-B", "codex"},
+	} {
+		var buf bytes.Buffer
+		if err := runStart(ctx, &buf, repoDir, s.session, s.harness, 0, true); err != nil {
+			t.Fatalf("cold runStart %s: %v", s.session, err)
+		}
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count after two cold sessions=%d want 1", count.Load())
+	}
+
+	// Both per-session cache files must exist.
+	gitDir := filepath.Join(repoDir, ".git")
+	pathA := startCachePath(gitDir, "sess-A")
+	pathB := startCachePath(gitDir, "sess-B")
+	if pathA == pathB {
+		t.Fatalf("per-session paths collided: %s", pathA)
+	}
+	if _, err := os.Stat(pathA); err != nil {
+		t.Fatalf("session-A cache missing: %v", err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		t.Fatalf("session-B cache missing: %v", err)
+	}
+
+	// Detonate the SQLite tripwire: if a hot call falls through to the
+	// cold path, state.Open will recreate the DB.
+	dbPath := filepath.Join(gitDir, "acd", "state.db")
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("remove state.db: %v", err)
+	}
+
+	// Interleave hot calls. Both sessions must short-circuit and the
+	// SQLite file must stay absent.
+	for _, sess := range []string{"sess-A", "sess-B", "sess-A", "sess-B"} {
+		harness := "claude-code"
+		if sess == "sess-B" {
+			harness = "codex"
+		}
+		var buf bytes.Buffer
+		if err := runStart(ctx, &buf, repoDir, sess, harness, 0, true); err != nil {
+			t.Fatalf("hot runStart %s: %v", sess, err)
+		}
+		var got startResult
+		if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+			t.Fatalf("unmarshal %s: %v\n%s", sess, err, buf.String())
+		}
+		if !got.Duplicate {
+			t.Fatalf("session %s did not short-circuit: %+v", sess, got)
+		}
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count after interleaved hot calls=%d want 1", count.Load())
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("state.db reappeared: %v — short-circuit fell through", err)
+	}
+
+	// Stop session A only; session B's cache must survive. Use the
+	// stop path with no kill (peer remains -> Deferred). We need the
+	// daemon_state row alive so the stop logic enters the refcount
+	// branch. Recreate state.db by re-running a cold call against a
+	// throwaway session, then register A and B again so we can stop
+	// A explicitly.
+	//
+	// Simpler: directly invoke os.Remove(startCachePath(gitDir, "sess-A"))
+	// would beg the question. Instead drive runStop with a peer alive.
+	dbA, err := state.Open(ctx, state.DBPathFromGitDir(gitDir))
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	for _, sid := range []string{"sess-A", "sess-B"} {
+		if err := state.RegisterClient(ctx, dbA, state.Client{
+			SessionID: sid, Harness: "claude-code",
+		}); err != nil {
+			t.Fatalf("register %s: %v", sid, err)
+		}
+	}
+	if err := state.SaveDaemonState(ctx, dbA, state.DaemonState{
+		PID: 99999, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = dbA.Close()
+
+	signalCount, restoreSig := installStopSignal(t, repoDir)
+	defer restoreSig()
+
+	var stopOut bytes.Buffer
+	if err := runStop(ctx, &stopOut, repoDir, "sess-A", false, false, true); err != nil {
+		t.Fatalf("runStop sess-A: %v", err)
+	}
+	if signalCount.Load() != 0 {
+		t.Fatalf("stop sess-A signaled daemon despite peer alive: count=%d", signalCount.Load())
+	}
+	if _, err := os.Stat(pathA); !os.IsNotExist(err) {
+		t.Fatalf("session-A cache survived stop: %v", err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		t.Fatalf("session-B cache must still exist after stopping A: %v", err)
+	}
+}
+
 // shortCircuitNow override knob — keep it from leaking across tests.
 func TestShortCircuitNow_Overridable(t *testing.T) {
 	prev := shortCircuitNow
