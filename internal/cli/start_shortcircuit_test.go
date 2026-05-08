@@ -567,19 +567,20 @@ func TestRunStart_RepeatedActiveHooks_ShortCircuit(t *testing.T) {
 		t.Fatalf("first call spawn count=%d want 1", count.Load())
 	}
 
-	// Replace state.Open / control.lock with shims that detonate if the
-	// short-circuit ever falls through. The simplest "did we touch
-	// SQLite?" tripwire is to delete .git/acd/state.db before the second
-	// call — if the cold path runs, state.Open would re-create it and
-	// the test would observe the regenerated file. The short-circuit
-	// must skip that entirely.
-	gitDir := filepath.Join(repoDir, ".git")
-	dbPath := filepath.Join(gitDir, "acd", "state.db")
-	if err := os.Remove(dbPath); err != nil {
-		t.Fatalf("remove state.db: %v", err)
+	// Tripwire: stub touchClientHotPath so we can prove the hot path
+	// (a) actually fires, and (b) does not re-spawn the daemon. The
+	// short-circuit MUST take this path; if it falls through to the
+	// cold path the spawn-count assertion below catches it.
+	var hotTouches atomic.Int32
+	prevTouch := touchClientHotPath
+	touchClientHotPath = func(ctx context.Context, gitDir, sessionID string) error {
+		hotTouches.Add(1)
+		return prevTouch(ctx, gitDir, sessionID)
 	}
+	t.Cleanup(func() { touchClientHotPath = prevTouch })
 
-	// Second call must short-circuit without re-opening SQLite.
+	// Second call must short-circuit and bump last_seen_ts via the
+	// hot-path touch helper (no daemon respawn).
 	var second bytes.Buffer
 	if err := runStart(ctx, &second, repoDir, "sess-active-hook", "claude-code", 0, true); err != nil {
 		t.Fatalf("second runStart: %v", err)
@@ -587,9 +588,8 @@ func TestRunStart_RepeatedActiveHooks_ShortCircuit(t *testing.T) {
 	if count.Load() != 1 {
 		t.Fatalf("second call spawn count=%d want 1 (no respawn)", count.Load())
 	}
-	// state.db must still be absent — the short-circuit did not call state.Open.
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("state.db reappeared at %s err=%v — short-circuit hit cold path", dbPath, err)
+	if hotTouches.Load() != 1 {
+		t.Fatalf("hot-path touchClient invocations=%d want 1", hotTouches.Load())
 	}
 
 	// JSON output sanity: non-error, daemon pid surfaced from the cache.
