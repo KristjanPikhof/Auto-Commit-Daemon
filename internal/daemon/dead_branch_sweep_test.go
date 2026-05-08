@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
