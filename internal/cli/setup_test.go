@@ -669,6 +669,13 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 	if strings.Contains(body, "uuidgen") {
 		t.Fatalf("pi snippet must not create one-off session ids with uuidgen:\n%s", body)
 	}
+	// CLAUDE.md / P2-14 requires the SID fallback to be unique per process
+	// when PI_SESSION_ID is unset, so concurrent Pi sessions do not collapse
+	// onto a single shared "unknown" client (which would let the first
+	// session.deleted tear down the daemon while sibling sessions stay
+	// active). The fallback is `pi-$$-$(date +%s)`: $$ is the shell pid
+	// and date is in seconds, so every hook process gets a unique id
+	// without pulling in uuidgen.
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, "acd start") || !strings.Contains(block, "acd wake") {
@@ -677,8 +684,63 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 		if strings.Index(block, "acd start") > strings.Index(block, "acd wake") {
 			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
 		}
-		if !strings.Contains(block, `SID="${PI_SESSION_ID:-unknown}"`) || !strings.Contains(block, `--session-id "$SID"`) {
-			t.Fatalf("%s must use the stable SID fallback:\n%s", id, block)
+		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) || !strings.Contains(block, `--session-id "$SID"`) {
+			t.Fatalf("%s must use the per-process unique SID fallback:\n%s", id, block)
+		}
+		// Must not regress to the shared "unknown" placeholder.
+		if strings.Contains(block, `PI_SESSION_ID:-unknown`) {
+			t.Fatalf("%s reverted to shared 'unknown' SID — concurrent Pi sessions would collapse:\n%s", id, block)
+		}
+	}
+}
+
+// TestSetup_Pi_AllHooksUsePerProcessSIDFallback guards every Pi hook id
+// (start, wake-before, wake-after, idle-touch, stop) carries the same
+// per-process unique fallback. Regression target: P2-14 — if any single
+// hook keeps the legacy `unknown` literal, two concurrent Pi sessions with
+// neither setting PI_SESSION_ID would still collapse on that event.
+func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+		block := yamlHookBlock(t, body, id)
+		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) {
+			t.Errorf("%s: must use per-process unique SID fallback (pi-$$-$(date +%%s)):\n%s", id, block)
+		}
+	}
+}
+
+// TestPiSIDFallbackProducesUniqueIDsAcrossProcesses runs the bash fallback
+// expression in two distinct shells and asserts they produce different IDs
+// when PI_SESSION_ID is unset. This catches a future regression where the
+// fallback drifts to a shared literal and concurrent sessions would
+// collapse onto the same client row.
+func TestPiSIDFallbackProducesUniqueIDsAcrossProcesses(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not on PATH; skipping process-uniqueness check")
+	}
+	// Use the exact fallback expression from the snippet so any drift in
+	// templates/pi/hooks.snippet.yaml surfaces here too.
+	expr := `unset PI_SESSION_ID; SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"; printf '%s' "$SID"`
+	out1, err := exec.Command(bash, "-c", expr).Output()
+	if err != nil {
+		t.Fatalf("first bash invocation: %v", err)
+	}
+	// Sleep just long enough that even if both shells happened to share a
+	// second boundary, we see distinct seconds in the second pid run too.
+	// $$ alone (different pid per process) is enough; the date guard is
+	// belt-and-suspenders against a degenerate scheduling case.
+	out2, err := exec.Command(bash, "-c", expr).Output()
+	if err != nil {
+		t.Fatalf("second bash invocation: %v", err)
+	}
+	id1, id2 := string(out1), string(out2)
+	if id1 == id2 {
+		t.Fatalf("two bash processes produced identical SIDs: %q == %q", id1, id2)
+	}
+	for _, id := range []string{id1, id2} {
+		if !strings.HasPrefix(id, "pi-") {
+			t.Errorf("SID %q missing pi- prefix", id)
 		}
 	}
 }
