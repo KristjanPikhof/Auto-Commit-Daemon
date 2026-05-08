@@ -430,6 +430,15 @@ func extractJSONHookBodies(body []byte, events []string) []string {
 // We do not pull a YAML parser in for this — the snippet shape is stable
 // and indentation-anchored. A real YAML parser would be a heavier dep for
 // what amounts to substring inspection of installed-snippet command bodies.
+//
+// The OpenCode/Pi snippet shape nests action items under each top-level
+// hook. We treat the FIRST `- ` encountered as the canonical top-level item
+// indent; deeper `- ` lines (nested action lists like
+// `actions: - bash: |`) are consumed as content of the current parent
+// item, not as new hook items. Without this guard we would allocate
+// orphan hookItems for every `- bash: |` under `actions:` and silently
+// drop the parent event association — drift detection would never fire
+// for a real OpenCode/Pi config.
 func extractYAMLHookBodies(body []byte, eventPrefixes []string) []string {
 	lines := strings.Split(string(body), "\n")
 	type hookItem struct {
@@ -441,21 +450,41 @@ func extractYAMLHookBodies(body []byte, eventPrefixes []string) []string {
 	inBash := false
 	bashIndent := 0
 	itemIndent := -1
+	topItemIndent := -1
 	for _, raw := range lines {
 		stripped := strings.TrimRight(raw, "\r")
 		trimmed := strings.TrimSpace(stripped)
 		indent := len(stripped) - len(strings.TrimLeft(stripped, " "))
-		// Detect start of a new hook list item like "  - id: acd-...".
-		if strings.HasPrefix(trimmed, "- ") {
-			items = append(items, hookItem{})
-			cur = &items[len(items)-1]
-			itemIndent = indent
-			inBash = false
-			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
-			if strings.HasPrefix(rest, "event:") {
-				cur.eventLine = strings.TrimSpace(strings.TrimPrefix(rest, "event:"))
+		// Detect a list-item line like "  - id: acd-..." or
+		// "    - bash: |". Only treat it as a NEW top-level hook item
+		// when its indent matches the canonical top-level indent
+		// established by the first `- ` we ever see; deeper dashes are
+		// nested action items and must remain part of the current
+		// parent's bash body / metadata.
+		if strings.HasPrefix(trimmed, "- ") || trimmed == "-" {
+			if topItemIndent < 0 {
+				topItemIndent = indent
 			}
-			continue
+			if indent == topItemIndent {
+				items = append(items, hookItem{})
+				cur = &items[len(items)-1]
+				itemIndent = indent
+				inBash = false
+				rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+				if strings.HasPrefix(rest, "event:") {
+					cur.eventLine = strings.TrimSpace(strings.TrimPrefix(rest, "event:"))
+				}
+				continue
+			}
+			// Nested action item (e.g. `- bash: |` under `actions:`).
+			// Fall through so the existing bash-block detector below
+			// can pick up the literal block opener under the parent.
+			if cur == nil {
+				continue
+			}
+			// Strip the leading `- ` so a line like `- bash: |` is
+			// handled the same as the bare `bash: |` form below.
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
 		}
 		if cur == nil {
 			continue
