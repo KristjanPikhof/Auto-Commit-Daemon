@@ -412,6 +412,66 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	}
 }
 
+// TestSetup_Codex_HelperFailureExplicitlyLogged guards that every codex hook
+// command captures `acd hook-stdin-extract` exit explicitly: when the helper
+// fails (binary missing, oversized stdin, bad JSON), the snippet must
+//   - log a `cmd=acd-hook-stdin-extract` line to LOG before any subsequent
+//     command runs (so the failure cause is visible);
+//   - capture rc=$? immediately after each guarded command so the printed
+//     `exit=%d` is the real failure code rather than an exit code clobbered
+//     by an intervening `$(date +...)` substitution; the regression target
+//     is rendered exit=0 hiding a real exit=7 from `acd start`.
+//
+// Regression target: P1-8 (codex SessionStart silently swallowed helper
+// failure when previously fed via process substitution + read).
+func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "codex")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 {
+		t.Fatalf("no JSON block")
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	for ev, entries := range settings.Hooks {
+		for i, entry := range entries {
+			for j, h := range entry.Hooks {
+				cmd := h.Command
+				// New shape: capture helper output via OUT=$(...) so we can
+				// distinguish helper failure from start failure. The old
+				// shape used `{ read -r SID; read -r CWD; } < <(...) || exit 0`
+				// which dropped helper exit on the floor.
+				if strings.Contains(cmd, "< <(acd hook-stdin-extract") {
+					t.Errorf("%s entry %d hook %d: must not use process substitution + read for helper (drops helper exit): %s", ev, i, j, cmd)
+				}
+				if !strings.Contains(cmd, "OUT=$(acd hook-stdin-extract") {
+					t.Errorf("%s entry %d hook %d: must capture helper output via OUT=$(acd hook-stdin-extract ...): %s", ev, i, j, cmd)
+				}
+				// Helper failure path must log with cmd=acd-hook-stdin-extract
+				// (so corrupt-DB vs missing-binary cases are distinguishable
+				// in the harness log).
+				if !strings.Contains(cmd, "cmd=acd-hook-stdin-extract") {
+					t.Errorf("%s entry %d hook %d: helper failure branch must record cmd=acd-hook-stdin-extract: %s", ev, i, j, cmd)
+				}
+				// Every failure branch must capture rc immediately so an
+				// intervening $(date) substitution does not clobber $?
+				// before printf reads it.
+				if strings.Count(cmd, "rc=$?") < 2 {
+					t.Errorf("%s entry %d hook %d: each failure branch must capture rc=$? before printing (got <2): %s", ev, i, j, cmd)
+				}
+			}
+		}
+	}
+}
+
 // TestSetup_Codex_ActiveHooksSelfHeal guards that codex active hooks
 // (UserPromptSubmit, PreToolUse, PostToolUse) are resilient: they must
 //   - call `acd start` before `acd wake` so a fresh session can self-register;
