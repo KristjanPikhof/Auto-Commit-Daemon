@@ -163,6 +163,37 @@ func RefExists(ctx context.Context, repoDir, ref string) (bool, error) {
 	return false, err
 }
 
+// LiveBranchSet returns a set of every refname under refs/heads/ in repoDir.
+// Used by the dead-branch sweep to perform set-membership probes against
+// many candidate refs without one shellout per ref.
+//
+// The shell-out is `git for-each-ref --format=%(refname) refs/heads/`. An
+// empty repo (no refs) returns an empty set with no error. Honors ctx
+// cancellation. Times out via DefaultReadTimeout.
+//
+// Empty repoDir is rejected immediately. A non-zero exit from git surfaces
+// as a real error (callers must fail closed — preserving rows when
+// liveness cannot be determined).
+func LiveBranchSet(ctx context.Context, repoDir string) (map[string]struct{}, error) {
+	if repoDir == "" {
+		return nil, fmt.Errorf("git: LiveBranchSet called with empty repoDir")
+	}
+	out, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"for-each-ref", "--format=%(refname)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{})
+	for _, line := range strings.Split(string(out), "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" {
+			continue
+		}
+		set[ref] = struct{}{}
+	}
+	return set, nil
+}
+
 // IsAncestor reports whether ancestor is an ancestor of descendant.
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
