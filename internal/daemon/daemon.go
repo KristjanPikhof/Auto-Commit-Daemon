@@ -852,6 +852,32 @@ func Run(ctx context.Context, opts Options) error {
 		"repo", opts.RepoPath, "pid", pid, "branch", branchRef,
 		"head", headOID, "token", currentToken)
 
+	// Schedule the dead-branch sweep on a one-shot goroutine, AFTER the
+	// "daemon running" log lands, so neither the for-each-ref shell-out
+	// nor the O(N) walk over distinct terminal pairs counts against the
+	// start-latency budget. The goroutine reads ctx — when the daemon
+	// stops the sweep is short-circuited.
+	//
+	// Honor the manual-pause marker first: an operator paused mid-surgery
+	// expects no background mutation to capture_events while they
+	// investigate. A read failure on the pause state is logged and the
+	// sweep is skipped (fail closed — same posture as the run-loop pause
+	// gate).
+	go func() {
+		if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+			logger.Warn("read pause state before startup dead-branch sweep; skipping",
+				"err", perr.Error())
+			return
+		} else if pauseStatus.Active {
+			logger.Info("startup dead-branch sweep skipped (manual pause)",
+				"source", pauseStatus.Source,
+				"reason", pauseStatus.Reason)
+			return
+		}
+		runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
+	}()
+
+
 	// lastStampedBranchHead is the most recent value the run loop has
 	// written to MetaKeyBranchHead through the SameGeneration "per-tick
 	// keep-alive" path inside processBranchTokenChange. The previous
