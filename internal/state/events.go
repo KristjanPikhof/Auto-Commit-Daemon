@@ -627,6 +627,34 @@ WHERE state IN ('blocked_conflict', 'failed')
 	return int(n), nil
 }
 
+// DeleteTerminalForDeadBranch deletes terminal capture_events rows scoped to a
+// (branch_ref, branch_generation) pair whose branch has since been merged and
+// deleted. Terminal rows — state IN ('blocked_conflict', 'failed') — are the
+// only target; pending rows are intentionally not touched so any in-flight
+// replay work for the same pair is not disrupted. Published rows are never
+// modified by this helper.
+//
+// Typical caller: the branch-token transition path, after confirming the ref
+// no longer exists, to prevent phantom blocked counts from accumulating in the
+// replay queue indefinitely once the branch is gone.
+func DeleteTerminalForDeadBranch(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: DeleteTerminalForDeadBranch: empty branch_ref")
+	}
+	res, err := d.conn.ExecContext(ctx,
+		`DELETE FROM capture_events WHERE state IN (?, ?) AND branch_ref = ? AND branch_generation = ?`,
+		EventStateBlockedConflict, EventStateFailed, branchRef, branchGeneration,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete terminal branch %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: delete terminal branch generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // LatestEventSeq returns the highest seq value present, or 0 if the table is
 // empty. Useful as a smoke-test for monotonic ordering and for the daily
 // rollup window query.

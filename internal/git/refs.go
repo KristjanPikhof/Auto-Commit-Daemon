@@ -129,6 +129,40 @@ func RunBranchRef(ctx context.Context, repoDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// RefExists probes whether a fully-qualified ref (e.g. "refs/heads/main")
+// currently resolves in the repo. It uses `git show-ref --verify --quiet`
+// which is a cheaper probe than RevParse: no SHA is returned, no object
+// dereferencing happens, and git's ambiguity logic for short names is
+// bypassed because show-ref --verify only matches exact ref names.
+//
+// Exit-code contract (git show-ref --verify --quiet):
+//
+//   - Exit 0   → ref exists; returns (true, nil).
+//   - Exit 1   → ref does not exist; git writes nothing to stderr;
+//     returns (false, nil).
+//   - Any other exit, or a non-*Error failure (e.g. exec not found),
+//     returns (false, err) with err wrapping git's stderr.
+//
+// An empty ref argument is rejected immediately without shelling out,
+// mirroring the defensive guards in other helpers in this package.
+//
+// The call is bounded by DefaultReadTimeout via RunOpts.Timeout; it also
+// respects ctx cancellation because RunWithStderr honors it.
+func RefExists(ctx context.Context, repoDir, ref string) (bool, error) {
+	if ref == "" {
+		return false, fmt.Errorf("git: RefExists called with empty ref")
+	}
+	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "show-ref", "--verify", "--quiet", ref)
+	if err == nil {
+		return true, nil
+	}
+	var gerr *Error
+	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // IsAncestor reports whether ancestor is an ancestor of descendant.
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
