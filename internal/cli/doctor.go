@@ -279,14 +279,26 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
 				hr.Installed = true
 			}
+			if hr.Installed {
+				if note := scanHookBodyDrift(name, body); note != "" {
+					hr.Notes = append(hr.Notes, note)
+				}
+			}
 		case errors.Is(err, os.ErrNotExist):
 			if detected[name] {
 				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
 				hr.Installed = true
 			}
 		default:
+			// Permission-denied / EIO / other read errors must not silently
+			// drop the harness from the report. Treat the primary config as
+			// "present but unreadable" and fall back to alternate-path
+			// detection just like ENOENT does.
 			hr.ConfigPresent = true
-			hr.Notes = append(hr.Notes, "config read failed: "+err.Error())
+			hr.Notes = append(hr.Notes, "primary-path read failed: "+err.Error()+"; using alternate-path detection")
+			if detected[name] {
+				hr.Installed = true
+			}
 		}
 
 		if name == "codex" {
@@ -294,10 +306,377 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			if jsonOK && legacyTOMLOK {
 				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml carry acd markers; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
 			}
+			if note := tailCodexHookLog(); note != "" {
+				hr.Notes = append(hr.Notes, note)
+			}
 		}
 		reports = append(reports, hr)
 	}
 	return reports
+}
+
+// driftRemediationCommands maps each supported harness to the exact command
+// the operator should run to refresh its installed snippet. Used by
+// scanHookBodyDrift to surface a copy/pasteable fix when an active hook is
+// missing the canonical `acd start` + `acd wake` body.
+var driftRemediationCommands = map[string]string{
+	"claude-code": "acd setup claude-code --raw > ~/.claude/settings.json",
+	"codex":       "acd setup codex --raw > ~/.codex/hooks.json",
+	"opencode":    "acd setup opencode --raw > ~/.config/opencode/hooks.yaml",
+	"pi":          "acd setup pi --raw > ~/.pi/hook/hooks.yaml",
+}
+
+// scanHookBodyDrift inspects the installed config body for the named harness
+// and returns a non-empty note when one or more active-hook command bodies
+// are missing the canonical `acd start` + `acd wake` pair. Active hooks are:
+//
+//   - claude-code, codex : PreToolUse + PostToolUse entries inside JSON
+//     "hooks" map
+//   - opencode, pi       : YAML hook items whose `event:` is `tool.before.*`
+//     or `tool.after.*`
+//
+// Returns "" when no drift is detected, when the harness has no
+// active-hook concept (shell), or when the config cannot be parsed at all
+// (we leave silent rather than scream — drift detection is opportunistic).
+func scanHookBodyDrift(name string, body []byte) string {
+	bodies := extractActiveHookBodies(name, body)
+	if len(bodies) == 0 {
+		return ""
+	}
+	stale := 0
+	for _, b := range bodies {
+		if !(strings.Contains(b, "acd start") && strings.Contains(b, "acd wake")) {
+			stale++
+		}
+	}
+	if stale == 0 {
+		return ""
+	}
+	cmd, ok := driftRemediationCommands[name]
+	if !ok {
+		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via acd setup %s --raw", stale, name)
+	}
+	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
+}
+
+// extractActiveHookBodies returns the command-string bodies of the active
+// hooks for harness `name`. JSON harnesses (claude-code, codex) parse the
+// "hooks" map and return the "command" string of every entry under
+// PreToolUse + PostToolUse. YAML harnesses (opencode, pi) text-scan for hook
+// items whose event matches tool.before.* / tool.after.* and concatenate the
+// `bash: |` block bodies.
+func extractActiveHookBodies(name string, body []byte) []string {
+	switch name {
+	case "claude-code", "codex":
+		return extractJSONHookBodies(body, []string{"PreToolUse", "PostToolUse"})
+	case "opencode", "pi":
+		return extractYAMLHookBodies(body, []string{"tool.before.", "tool.after."})
+	default:
+		return nil
+	}
+}
+
+// extractJSONHookBodies parses a Claude-Code-style settings.json / Codex
+// hooks.json and returns the `command` string of every hook entry under any
+// of the requested top-level event keys (e.g. PreToolUse, PostToolUse).
+//
+// Schema (per templates/claude-code/settings.snippet.json and
+// templates/codex/hooks.json):
+//
+//	{
+//	  "hooks": {
+//	    "<event>": [
+//	      { "matcher": "...", "hooks": [ { "command": "..." }, ... ] },
+//	      ...
+//	    ]
+//	  }
+//	}
+func extractJSONHookBodies(body []byte, events []string) []string {
+	var top struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil
+	}
+	if len(top.Hooks) == 0 {
+		return nil
+	}
+	var out []string
+	for _, ev := range events {
+		entries, ok := top.Hooks[ev]
+		if !ok {
+			continue
+		}
+		for _, e := range entries {
+			for _, h := range e.Hooks {
+				if strings.TrimSpace(h.Command) != "" {
+					out = append(out, h.Command)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// extractYAMLHookBodies text-scans the OpenCode / Pi hooks.yaml for hook
+// items keyed by `event:` matching any of the supplied prefixes, and
+// concatenates the body of each `bash: |` block under those items.
+//
+// We do not pull a YAML parser in for this — the snippet shape is stable
+// and indentation-anchored. A real YAML parser would be a heavier dep for
+// what amounts to substring inspection of installed-snippet command bodies.
+func extractYAMLHookBodies(body []byte, eventPrefixes []string) []string {
+	lines := strings.Split(string(body), "\n")
+	type hookItem struct {
+		eventLine string
+		bashBody  strings.Builder
+	}
+	var items []hookItem
+	var cur *hookItem
+	inBash := false
+	bashIndent := 0
+	itemIndent := -1
+	for _, raw := range lines {
+		stripped := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(stripped)
+		indent := len(stripped) - len(strings.TrimLeft(stripped, " "))
+		// Detect start of a new hook list item like "  - id: acd-...".
+		if strings.HasPrefix(trimmed, "- ") {
+			items = append(items, hookItem{})
+			cur = &items[len(items)-1]
+			itemIndent = indent
+			inBash = false
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "-"))
+			if strings.HasPrefix(rest, "event:") {
+				cur.eventLine = strings.TrimSpace(strings.TrimPrefix(rest, "event:"))
+			}
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		// End the bash block when indentation falls back to or above the
+		// item indent.
+		if inBash && indent <= bashIndent && trimmed != "" {
+			inBash = false
+		}
+		if inBash {
+			// Preserve original line content (without the indent prefix
+			// that prefixes the literal block) for `acd start`/`acd wake`
+			// substring search; we do not need the exact whitespace.
+			cur.bashBody.WriteString(trimmed)
+			cur.bashBody.WriteByte('\n')
+			continue
+		}
+		// Capture event: lines that appear as item children.
+		if strings.HasPrefix(trimmed, "event:") && itemIndent >= 0 && indent > itemIndent {
+			cur.eventLine = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			continue
+		}
+		// Detect literal `bash: |` block under the current item.
+		if strings.HasPrefix(trimmed, "bash:") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "bash:"))
+			if rest == "|" || rest == "|+" || rest == "|-" {
+				inBash = true
+				bashIndent = indent
+				continue
+			}
+			// Inline `bash: <cmd>` form (rare; we don't emit it but accept it).
+			if rest != "" {
+				cur.bashBody.WriteString(rest)
+				cur.bashBody.WriteByte('\n')
+			}
+		}
+	}
+	var out []string
+	for _, it := range items {
+		ev := it.eventLine
+		if ev == "" {
+			continue
+		}
+		matched := false
+		for _, p := range eventPrefixes {
+			if strings.HasPrefix(ev, p) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		bash := it.bashBody.String()
+		if strings.TrimSpace(bash) == "" {
+			continue
+		}
+		out = append(out, bash)
+	}
+	return out
+}
+
+// codexHookLogPath returns the canonical location of codex-hook.log under
+// XDG_STATE_HOME (defaulting to $HOME/.local/state). Mirrors the path used
+// by templates/codex/hooks.json.
+func codexHookLogPath() string {
+	if v := os.Getenv("XDG_STATE_HOME"); v != "" && filepath.IsAbs(v) {
+		return filepath.Join(v, "acd", "codex-hook.log")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
+}
+
+// codexHookLogRecentWindow controls how far back tailCodexHookLog looks for
+// "recent" errors; events outside the window are still reported when they
+// fall within the last 50 lines but do not count toward the recent total.
+var codexHookLogRecentWindow = 5 * time.Minute
+
+// tailCodexHookLog returns a Note describing recent codex-hook.log entries
+// that look like errors (stderr-style), or "" when the file does not exist
+// or contains no error-like lines. We read the trailing 8 KiB of the file
+// and inspect up to the last 50 non-empty lines.
+func tailCodexHookLog() string {
+	path := codexHookLogPath()
+	if path == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	const tailBytes = 8 * 1024
+	var buf []byte
+	if st.Size() > tailBytes {
+		if _, err := f.Seek(-tailBytes, io.SeekEnd); err != nil {
+			return ""
+		}
+		buf = make([]byte, tailBytes)
+		n, err := io.ReadFull(f, buf)
+		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return ""
+		}
+		buf = buf[:n]
+		// Drop the first (potentially partial) line.
+		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+			buf = buf[i+1:]
+		}
+	} else {
+		buf, err = io.ReadAll(f)
+		if err != nil {
+			return ""
+		}
+	}
+	lines := strings.Split(string(buf), "\n")
+	// Take last 50 non-empty lines.
+	const maxLines = 50
+	tail := make([]string, 0, maxLines)
+	for i := len(lines) - 1; i >= 0 && len(tail) < maxLines; i-- {
+		ln := strings.TrimRight(lines[i], "\r")
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		tail = append([]string{ln}, tail...)
+	}
+	if len(tail) == 0 {
+		return ""
+	}
+	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	var firstErr string
+	recentCount := 0
+	totalErr := 0
+	for _, ln := range tail {
+		if !looksLikeHookError(ln) {
+			continue
+		}
+		totalErr++
+		if firstErr == "" {
+			firstErr = ln
+		}
+		if ts, ok := parseLogTimestamp(ln); ok {
+			if ts.After(cutoff) {
+				recentCount++
+			}
+		} else {
+			// No parseable timestamp — count it as recent so operators do
+			// not miss errors when the log line lacks a timestamp prefix.
+			recentCount++
+		}
+	}
+	if totalErr == 0 {
+		return ""
+	}
+	first := firstErr
+	if len(first) > 240 {
+		first = first[:240] + "…"
+	}
+	if recentCount > 0 {
+		return fmt.Sprintf("codex-hook.log shows %d recent error(s) within the last %s (first: %s); see %s",
+			recentCount, formatDurationCompact(codexHookLogRecentWindow), first, homeShort(path))
+	}
+	return fmt.Sprintf("codex-hook.log shows %d error(s) in the last %d line(s) (first: %s); see %s",
+		totalErr, len(tail), first, homeShort(path))
+}
+
+// looksLikeHookError returns true when ln looks like a stderr-style error
+// line emitted by the codex hook bash wrapper. We accept either the literal
+// substring "error" (case-insensitive) or a typical command-not-found /
+// permission-denied / fatal prefix.
+func looksLikeHookError(ln string) bool {
+	low := strings.ToLower(ln)
+	if strings.Contains(low, "error") {
+		return true
+	}
+	for _, needle := range []string{
+		"command not found",
+		"permission denied",
+		"no such file",
+		"acd: ",
+		"fatal:",
+		"panic:",
+		"failed",
+	} {
+		if strings.Contains(low, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseLogTimestamp tries to extract a timestamp from the start of ln. It
+// understands the JSONL `"ts":` field used by acd's structured logger and
+// the ISO-8601 prefix "YYYY-MM-DDTHH:MM:SS" common to bash-redirected
+// stderr. Returns ok=false when no timestamp is found.
+func parseLogTimestamp(ln string) (time.Time, bool) {
+	// JSONL: {"ts":"2026-05-08T...","level":"error",...}
+	if idx := strings.Index(ln, `"ts":"`); idx >= 0 {
+		rest := ln[idx+len(`"ts":"`):]
+		if end := strings.IndexByte(rest, '"'); end > 0 {
+			if t, err := time.Parse(time.RFC3339Nano, rest[:end]); err == nil {
+				return t, true
+			}
+			if t, err := time.Parse(time.RFC3339, rest[:end]); err == nil {
+				return t, true
+			}
+		}
+	}
+	// ISO-8601 prefix "2026-05-08T12:34:56".
+	if len(ln) >= 19 {
+		head := ln[:19]
+		if t, err := time.Parse("2006-01-02T15:04:05", head); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func collectDoctorAI() doctorAIReport {
