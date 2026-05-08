@@ -274,7 +274,7 @@ func sweepDecision(prunedPairs int) string {
 // cctx is the post-bump context (used for trace BranchRef / HeadSHA /
 // Generation).
 //
-// Best-effort: errors from RefExists or DeleteTerminalForDeadBranch are logged
+// Best-effort: errors from RefExists or PurgeUnpublishedForDeadBranch are logged
 // and traced (Error field) but do not propagate to the caller.
 func pruneDeadBranchTerminals(
 	ctx context.Context,
