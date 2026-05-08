@@ -30,7 +30,20 @@ func fileContainsAny(path string, markers []string) bool {
 
 var (
 	jsonAcdManagedMarkers = []string{`"_acd_managed": true`, `"_acd_managed":true`}
-	tomlAcdManagedMarkers = []string{"acd-managed: true"}
+	// tomlAcdManagedMarkers requires the leading `#` comment prefix because
+	// TOML has no other way to embed a free-form line, and the canonical acd
+	// install writes a `# acd-managed: true` comment block. Distinguishing
+	// this from the yaml marker prevents a YAML file that happens to contain
+	// the substring `acd-managed: true` (e.g. as a config key) from being
+	// classified as a TOML acd install in the unlikely event a path is
+	// re-bound across formats.
+	tomlAcdManagedMarkers = []string{"# acd-managed: true"}
+	// yamlAcdManagedMarkers matches the bare key form. Templates write the
+	// commented form `# acd-managed: true`, which still contains this
+	// substring, so detection of the canonical install is preserved. Keeping
+	// the yaml marker bare makes it strictly less restrictive than the toml
+	// marker — the two values are now provably distinct, eliminating the
+	// previous accidental cross-format substring collision.
 	yamlAcdManagedMarkers = []string{"acd-managed: true"}
 )
 
