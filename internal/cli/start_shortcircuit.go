@@ -27,6 +27,15 @@ import (
 // recycled daemon PID; the fingerprint check pins the cached pid to the
 // original daemon's process start time + argv hash, so the recycled pid
 // fails the equality check and the caller escalates to the cold path.
+//
+// Hot-path refcount refresh: the short-circuit branch in runStart calls
+// state.TouchClient (via touchClientHotPath in start.go) immediately
+// after a successful decision. The single keyed UPDATE on
+// daemon_clients.last_seen_ts keeps the daemon's refcount sweeper from
+// evicting a session that lives entirely on the hot path. We accept the
+// extra ~1ms SQLite open/UPDATE/close because the alternative (halving
+// the cache TTL so the cold path runs more often) would defeat the
+// 50ms-vs-1s budget that justifies the cache in the first place.
 const startCacheVersion = 2
 
 // startCacheFilenamePrefix is the per-repo cache file prefix written under
