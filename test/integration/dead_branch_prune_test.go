@@ -377,8 +377,10 @@ func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
 	if res.ExitCode != 0 {
 		t.Fatalf("acd diagnose exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
 	}
-	// Decode into a map so we can confirm the keys are not even present
-	// (omitempty drops zero/nil values from the encoded JSON).
+	// Decode into a map so we can inspect the JSON shape: the two int
+	// fields must be present with value 0 (always-emit contract — zero is
+	// the "never ran" sentinel); the refs slice must be absent (omitempty
+	// + nil).
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(res.Stdout), &raw); err != nil {
 		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
@@ -386,12 +388,21 @@ func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
 	for _, key := range []string{
 		"dead_branch_prune_last_run_ts",
 		"dead_branch_prune_last_count",
-		"dead_branch_prune_last_refs",
 	} {
-		if _, ok := raw[key]; ok {
-			t.Fatalf("expected JSON field %q absent before any prune; got value=%v\nstdout=%s",
-				key, raw[key], res.Stdout)
+		v, ok := raw[key]
+		if !ok {
+			t.Fatalf("expected JSON field %q present (always-emit contract) on no-prune boot\nstdout=%s",
+				key, res.Stdout)
 		}
+		// JSON numbers decode as float64 in any-typed maps.
+		if num, isNum := v.(float64); !isNum || num != 0 {
+			t.Fatalf("expected JSON field %q == 0 on no-prune boot; got %v (%T)\nstdout=%s",
+				key, v, v, res.Stdout)
+		}
+	}
+	if _, ok := raw["dead_branch_prune_last_refs"]; ok {
+		t.Fatalf("expected JSON field 'dead_branch_prune_last_refs' absent (omitempty + nil) on no-prune boot; got value=%v\nstdout=%s",
+			raw["dead_branch_prune_last_refs"], res.Stdout)
 	}
 
 	// Belt-and-suspenders: also verify the meta keys are unset in state.db.
