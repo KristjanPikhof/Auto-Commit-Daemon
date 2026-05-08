@@ -53,6 +53,59 @@ func TestRegressions(t *testing.T) {
 	t.Run("BlockedConflictPreventsLeapfrogPublish", regBlockedConflictPreventsLeapfrogPublish)
 }
 
+// TestStopAll_WipesAllPerSessionCaches pins the P1 #7 acceptance for the
+// `acd stop --all` path: every per-session start-cache file under each
+// repo's <gitDir>/acd/ must be removed once the daemon is fully stopped,
+// otherwise a subsequent active hook short-circuits onto a stale daemon
+// row. Two sessions on the same repo seed the test; we then run `acd
+// stop --all` and inspect the directory.
+func TestStopAll_WipesAllPerSessionCaches(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	startSession(t, ctx, env, repo, "sess-A", "claude-code")
+	startSession(t, ctx, env, repo, "sess-B", "codex")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	cacheDir := filepath.Join(repo, ".git", "acd")
+	listCaches := func() []string {
+		entries, err := os.ReadDir(cacheDir)
+		if err != nil {
+			t.Fatalf("readdir: %v", err)
+		}
+		var names []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "start-cache-") && strings.HasSuffix(e.Name(), ".json") {
+				names = append(names, e.Name())
+			}
+		}
+		return names
+	}
+	before := listCaches()
+	if len(before) != 2 {
+		t.Fatalf("expected 2 per-session cache files, got %d (%v)", len(before), before)
+	}
+
+	res := runAcd(t, ctx, env, "stop", "--all", "--force", "--json")
+	if res.ExitCode != 0 {
+		t.Fatalf("stop --all exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	waitMode(t, repo, "stopped", 5*time.Second)
+
+	after := listCaches()
+	if len(after) != 0 {
+		t.Fatalf("expected 0 cache files after stop --all, got %d (%v)", len(after), after)
+	}
+}
+
 // TestRefcountSweep_HotPathRefreshesLastSeen pins the P1 #5 acceptance:
 // running `acd start` repeatedly under the same session_id (the active-
 // hook hot-path pattern) must refresh daemon_clients.last_seen_ts even
