@@ -302,8 +302,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			// Permission-denied / EIO / other read errors must not silently
 			// drop the harness from the report. Treat the primary config as
 			// "present but unreadable" and fall back to alternate-path
-			// detection just like ENOENT does.
+			// detection just like ENOENT does. ConfigReadable + MarkerFound
+			// stay false (we genuinely could not read the body), and the
+			// error string is surfaced via ConfigReadError so JSON consumers
+			// can distinguish this state from "config is readable, marker is
+			// just missing".
 			hr.ConfigPresent = true
+			hr.ConfigReadError = err.Error()
 			hr.Notes = append(hr.Notes, "primary-path read failed: "+err.Error()+"; using alternate-path detection")
 			if detected[name] {
 				hr.Installed = true
@@ -324,15 +329,16 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 	return reports
 }
 
-// driftRemediationCommands maps each supported harness to the exact command
-// the operator should run to refresh its installed snippet. Used by
-// scanHookBodyDrift to surface a copy/pasteable fix when an active hook is
-// missing the canonical `acd start` + `acd wake` body.
+// driftRemediationCommands maps each supported harness to the recommended
+// remediation hint shown when an active hook is missing the canonical
+// `acd start` + `acd wake` body. The hint shows the merge-first (non-
+// destructive) form first, then the full-overwrite form as an alternative so
+// users with custom hooks are not surprised by silent config loss.
 var driftRemediationCommands = map[string]string{
-	"claude-code": "acd setup claude-code --raw > ~/.claude/settings.json",
-	"codex":       "acd setup codex --raw > ~/.codex/hooks.json",
-	"opencode":    "acd setup opencode --raw > ~/.config/opencode/hooks.yaml",
-	"pi":          "acd setup pi --raw > ~/.pi/hook/hooks.yaml",
+	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
+	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
+	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hooks.yaml; to overwrite: cp ~/.config/opencode/hooks.yaml ~/.config/opencode/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hooks.yaml",
+	"pi":          "acd setup pi  # merge output into ~/.pi/hook/hooks.yaml; to overwrite: cp ~/.pi/hook/hooks.yaml ~/.pi/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/hook/hooks.yaml",
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
