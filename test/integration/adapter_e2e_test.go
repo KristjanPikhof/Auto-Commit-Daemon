@@ -566,6 +566,97 @@ func assertActiveHookSelfHeals(t *testing.T, label string, ctx context.Context, 
 	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
 }
 
+// assertActiveHookSelfHealsAfterStopAll tears the daemon down via
+// `acd stop --all --force` (registry-wide teardown rather than per-session
+// deregistration), then re-fires the active hook and asserts the daemon
+// comes back up with the same client registered. Covers P2-7 — the
+// stop --all path was previously not exercised in the harness E2E flows.
+func assertActiveHookSelfHealsAfterStopAll(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
+	t.Helper()
+	selfHealStop := runBash(t, ctx, env, "",
+		"acd stop --all --force >/dev/null 2>&1")
+	if selfHealStop.ExitCode != 0 {
+		t.Fatalf("%s stop-all self-heal pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			label, selfHealStop.ExitCode, selfHealStop.Stdout, selfHealStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, label+" daemon stopped before stop-all self-heal", repo)
+	if healRes := runBash(t, ctx, env, stdin, hook.Command); healRes.ExitCode != 0 {
+		t.Fatalf("%s active-hook stop-all self-heal exit=%d\nstdout=%s\nstderr=%s",
+			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
+	}
+	waitFor(t, label+" daemon mode==running after stop-all self-heal", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
+}
+
+// assertActiveHookFailsOnCorruptDB verifies the new chain semantics from the
+// templates lane: when `acd start` fails (here because state.db is garbage),
+// the active hook exits nonzero AND writes an "active hook failed exit=" line
+// to the harness log under XDG_STATE_HOME/acd/<harness>-hook.log. Caller
+// must have already torn the daemon down.
+func assertActiveHookFailsOnCorruptDB(t *testing.T, label string, ctx context.Context, env []string, repo, harness string, hook hookSpec, stdin string) {
+	t.Helper()
+	// Resolve the harness log file from the env we are about to invoke the
+	// hook under so the test reads the same file the hook writes.
+	home := ""
+	xdgState := ""
+	for _, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "HOME="):
+			home = strings.TrimPrefix(kv, "HOME=")
+		case strings.HasPrefix(kv, "XDG_STATE_HOME="):
+			xdgState = strings.TrimPrefix(kv, "XDG_STATE_HOME=")
+		}
+	}
+	if home == "" {
+		t.Fatalf("%s corrupt-db: HOME missing from env", label)
+	}
+	stateRoot := xdgState
+	if stateRoot == "" {
+		stateRoot = filepath.Join(home, ".local", "state")
+	}
+	logPath := filepath.Join(stateRoot, "acd", harness+"-hook.log")
+	// Truncate any pre-existing log content so we can assert the failure
+	// line was written by THIS hook invocation.
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	_ = os.WriteFile(logPath, nil, 0o644)
+
+	// Corrupt state.db. The daemon's sqlite open should fail on garbage,
+	// which propagates as a nonzero exit from `acd start`. Per the new
+	// chain semantics, that nonzero must surface as a nonzero hook exit
+	// (the previous `;` chain swallowed it).
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("%s corrupt-db: mkdir: %v", label, err)
+	}
+	if err := os.WriteFile(dbPath, []byte("not a sqlite database -- garbage bytes\n"), 0o644); err != nil {
+		t.Fatalf("%s corrupt-db: write garbage: %v", label, err)
+	}
+
+	res := runBash(t, ctx, env, stdin, hook.Command)
+	if res.ExitCode == 0 {
+		t.Fatalf("%s active hook with corrupt state.db: want nonzero exit, got 0\nstdout=%s\nstderr=%s",
+			label, res.Stdout, res.Stderr)
+	}
+
+	// Tail the harness log; it must include the "active hook failed exit="
+	// line emitted by the snippet's failure branch.
+	waitFor(t, label+" harness log records active hook failure", 5*time.Second, func() bool {
+		body, err := os.ReadFile(logPath)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(string(body), "active hook failed exit=")
+	})
+
+	// Clean up: remove the corrupt db so subsequent steps (or a fresh
+	// daemon spawn from the caller) can rebuild a clean schema.
+	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("%s corrupt-db: remove garbage db: %v", label, err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // per-harness flows
 // -----------------------------------------------------------------------------
