@@ -117,10 +117,12 @@ func readStartCache(path string) *startCache {
 	return &sc
 }
 
-// writeStartCache atomically persists sc to <gitDir>/acd/start-cache.json.
-// The parent directory is assumed to exist (the full registration path
-// creates it). Errors are returned so the caller can log; failure to write
-// the cache is non-fatal — the next runStart simply takes the full path.
+// writeStartCache atomically persists sc to its per-session file under
+// <gitDir>/acd/. The session_id is taken from sc.SessionID; an empty
+// session_id falls back to a fixed "empty" filename suffix. The parent
+// directory is assumed to exist (the full registration path creates
+// it). Errors are returned so the caller can log; failure to write the
+// cache is non-fatal — the next runStart simply takes the full path.
 func writeStartCache(gitDir string, sc startCache) error {
 	if sc.Version == 0 {
 		sc.Version = startCacheVersion
@@ -134,7 +136,7 @@ func writeStartCache(gitDir string, sc startCache) error {
 		return fmt.Errorf("start-cache marshal: %w", err)
 	}
 	body = append(body, '\n')
-	target := startCachePath(gitDir)
+	target := startCachePath(gitDir, sc.SessionID)
 	tmp := target + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -287,7 +289,7 @@ func tryShortCircuitStart(
 			return false, 0, 0, "ctx_done"
 		}
 	}
-	cache := readStartCache(startCachePath(gitDir))
+	cache := readStartCache(startCachePath(gitDir, sessionID))
 	roots, err := paths.Resolve()
 	if err != nil {
 		return false, 0, 0, "paths_resolve_failed"
