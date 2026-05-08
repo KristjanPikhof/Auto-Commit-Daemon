@@ -28,6 +28,11 @@ const (
 
 var eventsWatchPollInterval = defaultEventsWatchInterval
 
+// eventsWatchReadyHook is fired once after the watch path captures its cursor
+// and before entering followEvents. Tests use it to synchronize appends with
+// the moment the watcher is live; production leaves it nil.
+var eventsWatchReadyHook func()
+
 type eventsReport struct {
 	Repo    string       `json:"repo"`
 	Cursor  int64        `json:"cursor"`
@@ -156,6 +161,9 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 	}
 	if !watch {
 		return nil
+	}
+	if eventsWatchReadyHook != nil {
+		eventsWatchReadyHook()
 	}
 	return followEvents(ctx, out, db, rec.Path, path, cursor, limit, interval, jsonOut)
 }
