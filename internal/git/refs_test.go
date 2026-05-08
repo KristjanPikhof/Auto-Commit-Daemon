@@ -224,6 +224,104 @@ func TestRevParse_DisambiguatesAmbiguousRef(t *testing.T) {
 	}
 }
 
+// TestRefExists_PresentAndMissing verifies the basic present/absent contract.
+func TestRefExists_PresentAndMissing(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	// Set up a real commit so refs/heads/main resolves.
+	commit := commitFile(t, ctx, dir, "init.txt", "hello", "init")
+	if err := UpdateRef(ctx, dir, "refs/heads/main", commit, ""); err != nil {
+		t.Fatalf("update-ref main: %v", err)
+	}
+
+	// Existing ref → true.
+	ok, err := RefExists(ctx, dir, "refs/heads/main")
+	if err != nil {
+		t.Fatalf("RefExists refs/heads/main: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected refs/heads/main to exist")
+	}
+
+	// Missing ref → false, no error.
+	ok, err = RefExists(ctx, dir, "refs/heads/does-not-exist")
+	if err != nil {
+		t.Fatalf("RefExists missing: %v", err)
+	}
+	if ok {
+		t.Fatal("expected refs/heads/does-not-exist to be absent")
+	}
+}
+
+// TestRefExists_CreateAndDelete creates a second branch, checks it, then
+// deletes it and checks again — covering the full present→absent lifecycle.
+func TestRefExists_CreateAndDelete(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	commit := commitFile(t, ctx, dir, "seed.txt", "seed", "seed")
+	if err := UpdateRef(ctx, dir, "refs/heads/main", commit, ""); err != nil {
+		t.Fatalf("update-ref main: %v", err)
+	}
+
+	// Create feat-x pointing at HEAD.
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "update-ref", "refs/heads/feat-x", commit); err != nil {
+		t.Fatalf("create refs/heads/feat-x: %v", err)
+	}
+
+	ok, err := RefExists(ctx, dir, "refs/heads/feat-x")
+	if err != nil {
+		t.Fatalf("RefExists after create: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected refs/heads/feat-x to exist after creation")
+	}
+
+	// Delete feat-x.
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "update-ref", "-d", "refs/heads/feat-x"); err != nil {
+		t.Fatalf("delete refs/heads/feat-x: %v", err)
+	}
+
+	ok, err = RefExists(ctx, dir, "refs/heads/feat-x")
+	if err != nil {
+		t.Fatalf("RefExists after delete: %v", err)
+	}
+	if ok {
+		t.Fatal("expected refs/heads/feat-x to be absent after deletion")
+	}
+}
+
+// TestRefExists_EmptyRef ensures that an empty ref argument returns an error
+// immediately without shelling out.
+func TestRefExists_EmptyRef(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	ok, err := RefExists(ctx, t.TempDir(), "")
+	if err == nil {
+		t.Fatal("expected error for empty ref, got nil")
+	}
+	if ok {
+		t.Fatal("expected ok=false for empty ref")
+	}
+}
+
+// TestRefExists_CancelledCtx confirms that a cancelled context propagates as
+// an error (not a silent false).
+func TestRefExists_CancelledCtx(t *testing.T) {
+	dir := initRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately before the call
+
+	ok, err := RefExists(ctx, dir, "refs/heads/main")
+	if err == nil {
+		t.Fatal("expected error for cancelled ctx, got nil")
+	}
+	if ok {
+		t.Fatal("expected ok=false for cancelled ctx")
+	}
+}
+
 func commitFile(t *testing.T, ctx context.Context, dir, path, content, message string, parents ...string) string {
 	t.Helper()
 	blob, err := HashObjectStdin(ctx, dir, []byte(content))
