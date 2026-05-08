@@ -6,7 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
 func TestDoctor_Human_HasSectionHeaders(t *testing.T) {
@@ -1058,7 +1061,9 @@ func TestDoctor_FallbackOnEACCESPrimaryConfig(t *testing.T) {
 
 // TestDoctor_CodexHookLogTailSurfaced seeds a codex-hook.log under the
 // isolated XDG_STATE_HOME and asserts doctor's codex Notes surface a count
-// plus the first error line.
+// plus the first error line. Fixture matches the wrapper printf shape
+// emitted by templates/codex/hooks.json: a bracketed numeric-zone
+// timestamp prefix followed by `... failed exit=N cmd=acd-...`.
 func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -1082,9 +1087,12 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	}
 	logPath := filepath.Join(logDir, "codex-hook.log")
 	now := time.Now().UTC()
-	stamp := now.Format("2006-01-02T15:04:05")
-	logBody := stamp + " bash: acd: command not found\n" +
-		stamp + " error: failed to read session_id from stdin\n" +
+	// Wrapper printf shape: `date +%FT%T%z` produces e.g.
+	// `2026-05-08T12:34:56+0000` (no colon in the zone). The line
+	// emitted by the bash wrapper is bracketed.
+	stamp := now.Format("2006-01-02T15:04:05-0700")
+	logBody := "[" + stamp + "] session-start failed exit=2 cmd=acd-start\n" +
+		"[" + stamp + "] active hook failed exit=1 cmd=acd-start-wake\n" +
 		"info: harmless line\n"
 	if err := os.WriteFile(logPath, []byte(logBody), 0o600); err != nil {
 		t.Fatalf("write codex hook log: %v", err)
@@ -1103,8 +1111,8 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	if !strings.Contains(notes, "codex-hook.log") {
 		t.Fatalf("expected codex-hook.log note, got %v", codex.Notes)
 	}
-	if !strings.Contains(notes, "error") && !strings.Contains(notes, "command not found") {
-		t.Fatalf("expected first-error excerpt in note, got %v", codex.Notes)
+	if !strings.Contains(notes, "cmd=acd-") {
+		t.Fatalf("expected first-error excerpt to include cmd=acd-, got %v", codex.Notes)
 	}
 	// Ensure the count is at least 1 (we wrote 2 errors).
 	if !strings.Contains(notes, "1 ") && !strings.Contains(notes, "2 ") {

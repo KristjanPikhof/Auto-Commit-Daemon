@@ -14,10 +14,18 @@
 
 - **Codex hooks v2 is a breaking setup change.** `acd setup codex` now writes
   `~/.codex/hooks.json` instead of the legacy TOML hook snippet. To migrate,
-  run `acd setup codex --raw > ~/.codex/hooks.json`, remove the old
-  `# acd-managed: true` block from `~/.codex/config.toml`, then approve the new
-  hooks with `/hooks` inside Codex. `acd doctor` now warns when both old and new
-  Codex hook configs are installed, because Codex will run both.
+  run `acd setup codex` and merge the printed JSON into `~/.codex/hooks.json`
+  manually. If the file contains only the acd block you can redirect directly:
+  `acd setup codex --raw > ~/.codex/hooks.json`. **Warning:** the redirect
+  replaces the entire file — if you have custom non-acd hooks in
+  `~/.codex/hooks.json`, back up the file first and merge by hand instead of
+  using `>`. After writing the file, remove the old `# acd-managed: true` block
+  from `~/.codex/config.toml`, then approve the new hooks with `/hooks` inside
+  Codex. Codex re-flags all hook entries as review-required after every
+  `hooks.json` content change, so re-run `/hooks` after any re-install too.
+  `acd doctor` now warns when both old and new Codex hook configs are installed,
+  because Codex will run both. See
+  [templates/codex/README.md](templates/codex/README.md) for full details.
 - Codex hooks now read `cwd` from hook stdin, no longer require
   `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the
   hook payload. The helper also supports multiple fields and optional fields.
@@ -26,11 +34,15 @@
   without waiting for a brand-new harness session. **Migration:** if you ran
   `acd stop --all` and the daemon does not restart automatically when the next
   prompt or tool event fires, your installed snippet is stale. Re-run
-  `acd setup <harness>` and replace the hooks block in your installed config
-  (e.g. `~/.claude/settings.json`, `~/.codex/hooks.json`,
-  `~/.config/opencode/hooks.yaml`, or `~/.pi/hook/hooks.yaml`) so the new
-  self-heal hooks take effect. Run `acd doctor` to identify which harness needs
-  updating.
+  `acd setup <harness>` and merge the updated hooks block into your installed
+  config. **Warning:** redirecting `acd setup <harness> --raw > <config-path>`
+  replaces the entire file — back it up first if you have custom non-acd
+  entries. See the per-harness READMEs
+  ([claude-code](templates/claude-code/README.md),
+  [codex](templates/codex/README.md),
+  [opencode](templates/opencode/README.md),
+  [pi](templates/pi/README.md)) for merge instructions. Run `acd doctor` to
+  identify which harness needs updating.
 - `acd status`, `acd diagnose`, and `acd doctor` now report the effective commit
   strategy from daemon metadata first, then `ACD_COMMIT_STRATEGY`, then the
   default. Unknown daemon values fall back to the environment-derived strategy
