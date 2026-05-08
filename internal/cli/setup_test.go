@@ -142,6 +142,81 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 	}
 }
 
+// TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback guards that
+// PreToolUse and PostToolUse:
+//   - chain `acd start` and `acd wake` with logical-and (`&&`) so a failed
+//     start cannot be silently masked by a successful wake;
+//   - end with an or-clause that writes the failure cause into the harness
+//     LOG file and exits nonzero so Claude Code can surface it.
+//
+// Regression target: P1-3 (wake masks start failure).
+func TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block in output:\n%s", out)
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	for _, ev := range []string{"PreToolUse", "PostToolUse"} {
+		for i, entry := range settings.Hooks[ev] {
+			for j, h := range entry.Hooks {
+				assertActiveHookAndChainAndLogFallback(t, ev, i, j, h.Command, "claude-code-hook.log")
+			}
+		}
+	}
+}
+
+// TestSetup_ClaudeCode_SessionStartFailSoft guards that SessionStart adopts
+// the codex fail-soft pattern: defines LOG, makes its directory, redirects
+// stderr into LOG, and guards the extract pipeline so a missing acd binary
+// or schema drift never blocks SessionStart.
+//
+// Regression target: P2-15 (claude-code SessionStart no fail-soft).
+func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 {
+		t.Fatalf("no JSON block")
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	ss := settings.Hooks["SessionStart"]
+	if len(ss) == 0 || len(ss[0].Hooks) == 0 {
+		t.Fatalf("SessionStart hook missing")
+	}
+	cmd := ss[0].Hooks[0].Command
+	for _, want := range []string{
+		`LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log"`,
+		`mkdir -p`,
+		`acd hook-stdin-extract session_id`,
+		`|| exit 0`,
+		`2>>"$LOG"`,
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("SessionStart missing fail-soft fragment %q in:\n%s", want, cmd)
+		}
+	}
+}
+
 // --- codex ------------------------------------------------------------------
 
 func TestSetup_Codex_ExitsZero(t *testing.T) {
