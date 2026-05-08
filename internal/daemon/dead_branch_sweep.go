@@ -1,20 +1,32 @@
-// dead_branch_sweep.go houses the helpers that prune terminal capture_events
-// rows whose owning branch ref no longer resolves. Two callers live here:
+// dead_branch_sweep.go houses the helpers that prune unpublished
+// capture_events rows (pending + blocked_conflict + failed) whose owning
+// branch ref no longer resolves. Two callers live here:
 //
 //   - the runtime Diverged transition path (daemon.go) calls
-//     pruneDeadBranchTerminals after dropping pending rows for the prior
-//     generation. When the prior branch ref is gone, its blocked_conflict /
-//     failed rows would otherwise accumulate forever — `acd status` and the
-//     PendingEvents barrier path would surface phantom blocked counts for a
-//     branch the operator has long since deleted.
-//   - daemon Run init calls runStartupDeadBranchSweep BEFORE the main loop
-//     so a daemon restart that discovers pre-existing dead-branch terminals
-//     prunes them up-front instead of waiting for the next Diverged hook
-//     (which may never fire if the operator moved on to a different branch
-//     entirely).
+//     pruneDeadBranchTerminals after the prior generation's pending rows
+//     have already been swept by DeletePendingForGeneration. When the prior
+//     branch ref is gone, its terminal rows (and any pending rows that
+//     escaped the generation-only sweep, e.g. captured under a different
+//     active generation) would otherwise accumulate forever — `acd status`
+//     and the PendingEvents barrier path would surface phantom blocked
+//     counts for a branch the operator has long since deleted.
+//   - daemon Run init schedules runStartupDeadBranchSweep on a goroutine
+//     after the running-mode publish so a daemon restart that discovers
+//     pre-existing dead-branch rows cleans them up off the blocking startup
+//     path (the sweep can shell out to git for-each-ref and walk the entire
+//     terminal-pair set, neither of which we want on the start-latency
+//     budget).
 //
 // Both paths honor EnvKeepDeadBranchBarriers as an operator opt-out — set it
 // truthy when you want to keep the rows around for forensic inspection.
+//
+// Pending + terminal must drop together for the dead-branch case. Leaving
+// pending rows behind while deleting their terminal predecessor lets
+// PendingEvents re-expose them on the next replay pass; replay then
+// re-evaluates them against the prior (now-irrelevant) generation,
+// mismatches in checkEventGeneration, and stamps a fresh blocked_conflict.
+// The state-layer helper PurgeUnpublishedForDeadBranch enforces this in
+// one transaction.
 package daemon
 
 import (
