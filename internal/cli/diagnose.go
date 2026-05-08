@@ -665,6 +665,17 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 	}
 
+	// Dead-branch prune surface. Zero last_run_ts means the daemon has
+	// never recorded a non-empty prune — render nothing in that case so a
+	// fresh repo's diagnose output is not cluttered with "never ran" noise.
+	if r.DeadBranchPruneLastRunTS > 0 {
+		fmt.Fprintf(out, "Dead-branch prune: %d row(s) pruned at %s, refs=%v\n",
+			r.DeadBranchPruneLastCount,
+			time.Unix(r.DeadBranchPruneLastRunTS, 0).Format(time.RFC3339),
+			r.DeadBranchPruneLastRefs,
+		)
+	}
+
 	fmt.Fprintln(out, "Suggested remediation:")
 	for _, item := range r.Remediation {
 		fmt.Fprintf(out, "  - %s\n", item)
