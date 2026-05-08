@@ -1200,3 +1200,264 @@ func readZipFile(t *testing.T, r *zip.ReadCloser, name string) string {
 	t.Fatalf("zip member %s not found", name)
 	return ""
 }
+
+// readSnippet reads a verbatim template snippet from the embedded
+// templates FS so YAML-drift tests do not drift from the shipped shape.
+func readSnippet(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := fs.ReadFile(templates.FS, path)
+	if err != nil {
+		t.Fatalf("read embedded snippet %s: %v", path, err)
+	}
+	return body
+}
+
+// TestExtractYAMLHookBodies_DriftFromVerbatimSnippet feeds the verbatim
+// opencode/pi snippet bodies into extractYAMLHookBodies and asserts that
+// (a) the unmodified body has every active hook carrying both `acd start`
+// and `acd wake` (no drift), and (b) when one `acd start` invocation is
+// stripped from a tool.before/tool.after item, the drift scanner reports
+// at least one stale hook. This locks down the regression where the
+// scanner misread nested `actions: - bash:` items as new orphan hookItems
+// and silently dropped the parent event association.
+func TestExtractYAMLHookBodies_DriftFromVerbatimSnippet(t *testing.T) {
+	cases := []struct {
+		harness     string
+		snippetPath string
+	}{
+		{harness: "opencode", snippetPath: "opencode/hooks.snippet.yaml"},
+		{harness: "pi", snippetPath: "pi/hooks.snippet.yaml"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.harness, func(t *testing.T) {
+			body := readSnippet(t, tc.snippetPath)
+			// Clean snippet: every active hook (tool.before.* / tool.after.*)
+			// carries `acd start` AND `acd wake`. scanHookBodyDrift returns
+			// "" when no drift is detected.
+			if note := scanHookBodyDrift(tc.harness, body); note != "" {
+				t.Fatalf("verbatim %s snippet should not report drift, got %q", tc.harness, note)
+			}
+			// Bodies should also be non-empty: at least the two active hooks
+			// (tool.before.*, tool.after.*) must parse out.
+			bodies := extractYAMLHookBodies(body, []string{"tool.before.", "tool.after."})
+			if len(bodies) < 2 {
+				t.Fatalf("expected at least 2 active hook bodies for %s, got %d", tc.harness, len(bodies))
+			}
+			for i, b := range bodies {
+				if !strings.Contains(b, "acd start") {
+					t.Fatalf("%s active hook[%d] missing 'acd start' in body=%q", tc.harness, i, b)
+				}
+				if !strings.Contains(b, "acd wake") {
+					t.Fatalf("%s active hook[%d] missing 'acd wake' in body=%q", tc.harness, i, b)
+				}
+			}
+			// Now strip the FIRST `acd start \` line under any
+			// tool.before/tool.after action to simulate user drift. We
+			// only remove a line that begins (after whitespace) with
+			// `acd start` — the regression we are guarding against: drift
+			// detection silently never fires for real OpenCode/Pi configs.
+			drifted := stripFirstAcdStart(t, string(body))
+			note := scanHookBodyDrift(tc.harness, []byte(drifted))
+			if note == "" {
+				t.Fatalf("%s drift snippet should report drift, got empty note", tc.harness)
+			}
+			if !strings.Contains(note, "installed snippet drift") {
+				t.Fatalf("%s drift note missing prefix, got %q", tc.harness, note)
+			}
+		})
+	}
+}
+
+// stripFirstAcdStart removes the first leading-whitespace `acd start \`
+// line from body — used by YAMLDrift tests to introduce a single drift.
+func stripFirstAcdStart(t *testing.T, body string) string {
+	t.Helper()
+	lines := strings.Split(body, "\n")
+	for i, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		// The OpenCode/Pi snippets open the active-hook chain with
+		// `{ acd start \\` (literal backslash) under each
+		// tool.before/tool.after item. Drop just the first such line.
+		if strings.HasPrefix(trimmed, "{ acd start") {
+			lines = append(lines[:i], lines[i+1:]...)
+			return strings.Join(lines, "\n")
+		}
+	}
+	t.Fatalf("could not find an `{ acd start` line to strip in body")
+	return body
+}
+
+// TestParseLogTimestamp_WrapperPrintfShape locks down the parser against
+// the production wrapper printf line shape. Run with TZ=Asia/Tokyo to
+// catch zone bugs where the parser silently coerced into local time.
+func TestParseLogTimestamp_WrapperPrintfShape(t *testing.T) {
+	// Pin codexHookLogRecentWindow to 5 minutes (matches default; reset
+	// is not strictly needed but documents the intent of the test).
+	now := time.Now()
+	wrap := func(off time.Duration) string {
+		// Mirror `date +%FT%T%z`: e.g. 2026-05-08T12:34:56+0900.
+		return "[" + now.Add(off).Format("2006-01-02T15:04:05-0700") + "] active hook failed exit=1 cmd=acd-start-wake"
+	}
+	cases := []struct {
+		name       string
+		line       string
+		wantOK     bool
+		wantRecent bool
+	}{
+		{
+			name:       "bracketed_recent_within_5min",
+			line:       wrap(-1 * time.Minute),
+			wantOK:     true,
+			wantRecent: true,
+		},
+		{
+			name:       "bracketed_outside_5min_window",
+			line:       wrap(-30 * time.Minute),
+			wantOK:     true,
+			wantRecent: false,
+		},
+		{
+			name:       "bare_iso_no_zone",
+			line:       now.Format("2006-01-02T15:04:05") + " bash error",
+			wantOK:     true,
+			wantRecent: true,
+		},
+		{
+			name:       "jsonl_ts_field",
+			line:       fmt.Sprintf(`{"ts":%q,"level":"error","msg":"boom"}`, now.Format(time.RFC3339Nano)),
+			wantOK:     true,
+			wantRecent: true,
+		},
+		{
+			name:       "no_timestamp",
+			line:       "info: harmless line",
+			wantOK:     false,
+			wantRecent: false,
+		},
+	}
+	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ts, ok := parseLogTimestamp(tc.line)
+			if ok != tc.wantOK {
+				t.Fatalf("parseLogTimestamp ok mismatch: line=%q got=%v want=%v ts=%v", tc.line, ok, tc.wantOK, ts)
+			}
+			if !ok {
+				return
+			}
+			recent := ts.After(cutoff)
+			if recent != tc.wantRecent {
+				t.Fatalf("recent mismatch: line=%q ts=%v cutoff=%v got recent=%v want=%v", tc.line, ts, cutoff, recent, tc.wantRecent)
+			}
+		})
+	}
+}
+
+// TestDoctor_UnreadablePrimaryConfigSetsConfigReadError verifies that an
+// EACCES on the primary harness config produces a non-empty
+// ConfigReadError, ConfigPresent=true, ConfigReadable=false, and
+// MarkerFound=false. JSON consumers can use this to disambiguate
+// "marker missing" from "fell back to alternate-path detection".
+func TestDoctor_UnreadablePrimaryConfigSetsConfigReadError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("EACCES test cannot run as root: 0o000 still readable")
+	}
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	hooksPath := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+	if err := os.Chmod(hooksPath, 0o000); err != nil {
+		t.Fatalf("chmod 0000: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksPath, 0o600) })
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.ConfigPresent {
+		t.Fatalf("expected ConfigPresent=true for unreadable primary, got %+v", codex)
+	}
+	if codex.ConfigReadable {
+		t.Fatalf("expected ConfigReadable=false for unreadable primary, got %+v", codex)
+	}
+	if codex.MarkerFound {
+		t.Fatalf("expected MarkerFound=false for unreadable primary, got %+v", codex)
+	}
+	if codex.ConfigReadError == "" {
+		t.Fatalf("expected non-empty ConfigReadError for unreadable primary, got %+v", codex)
+	}
+}
+
+// TestLooksLikeHookError_TightMatcher locks down the new wrapper-aware
+// rules: only the wrapper printf shape and explicit JSONL error/fatal
+// levels are flagged. JSONL info lines (even ones that mention
+// "failed_blocking_pending=0") and bland prose stay silent.
+func TestLooksLikeHookError_TightMatcher(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "wrapper_active_hook_failed",
+			line: "[2026-05-08T12:34:56+0300] active hook failed exit=1 cmd=acd-start-wake",
+			want: true,
+		},
+		{
+			name: "wrapper_session_start_failed",
+			line: "[2026-05-08T12:34:56+0300] session-start failed exit=2 cmd=acd-start",
+			want: true,
+		},
+		{
+			name: "jsonl_error_level",
+			line: `{"ts":"2026-05-08T12:34:56Z","level":"error","msg":"boom"}`,
+			want: true,
+		},
+		{
+			name: "jsonl_fatal_level",
+			line: `{"ts":"2026-05-08T12:34:56Z","level":"fatal","msg":"halt"}`,
+			want: true,
+		},
+		{
+			name: "jsonl_info_failed_blocking_pending_zero",
+			line: `{"ts":"2026-05-08T12:34:56Z","level":"info","failed_blocking_pending":0}`,
+			want: false,
+		},
+		{
+			name: "info_no_error_encountered",
+			line: "info: no error encountered while flushing",
+			want: false,
+		},
+		{
+			name: "plain_info_line",
+			line: "info: ok",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := looksLikeHookError(tc.line)
+			if got != tc.want {
+				t.Fatalf("looksLikeHookError(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}

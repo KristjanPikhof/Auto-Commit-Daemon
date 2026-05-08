@@ -264,6 +264,49 @@ func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
 	}
 }
 
+// TestSetup_Codex_RawRejectsInvalidJSON guards that `acd setup codex --raw`
+// refuses to emit a body that would silently corrupt ~/.codex/hooks.json.
+// We swap templatesFS for an overlay FS that returns malformed JSON for
+// the codex template path; runSetup must detect the parse error, write an
+// actionable message to stderr, and return non-zero. Regression target:
+// P1-11 (invalid template JSON would cause Codex to silently disable hooks).
+func TestSetup_Codex_RawRejectsInvalidJSON(t *testing.T) {
+	// Trailing comma after first key — clearly invalid per RFC 8259.
+	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	withTemplatesFSOverride(t, map[string][]byte{"codex/hooks.json": bad})
+
+	out, stderr, err := runSetupCmd(t, "codex", "--raw")
+	if err == nil {
+		t.Fatalf("acd setup codex --raw with invalid template must return non-zero, got nil\nstdout:%s\nstderr:%s", out, stderr)
+	}
+	if out != "" {
+		t.Errorf("invalid JSON template must not emit body to stdout, got:\n%s", out)
+	}
+	for _, want := range []string{"codex/hooks.json", "not valid JSON", "byte offset"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing %q in:\n%s", want, stderr)
+		}
+	}
+}
+
+// TestSetup_ClaudeCode_RawRejectsInvalidJSON mirrors the codex case for the
+// claude-code raw path, since it also targets a strict-JSON config file.
+func TestSetup_ClaudeCode_RawRejectsInvalidJSON(t *testing.T) {
+	bad := []byte(`{"hooks": {`) // truncated
+	withTemplatesFSOverride(t, map[string][]byte{"claude-code/settings.snippet.json": bad})
+
+	out, stderr, err := runSetupCmd(t, "claude-code", "--raw")
+	if err == nil {
+		t.Fatalf("acd setup claude-code --raw with invalid template must return non-zero, got nil\nstdout:%s\nstderr:%s", out, stderr)
+	}
+	if out != "" {
+		t.Errorf("invalid JSON template must not emit body to stdout, got:\n%s", out)
+	}
+	if !strings.Contains(stderr, "not valid JSON") {
+		t.Errorf("stderr missing 'not valid JSON' marker:\n%s", stderr)
+	}
+}
+
 func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
 	// Strip the leading "// " comment prefix from each line so the embedded
