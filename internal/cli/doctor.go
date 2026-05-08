@@ -68,13 +68,21 @@ type doctorRepoReport struct {
 }
 
 type doctorHarnessReport struct {
-	Name           string   `json:"name"`
-	ConfigPath     string   `json:"config_path"`
-	ConfigPresent  bool     `json:"config_present"`
-	ConfigReadable bool     `json:"config_readable"`
-	MarkerFound    bool     `json:"marker_found"`
-	Installed      bool     `json:"installed"`
-	Notes          []string `json:"notes,omitempty"`
+	Name           string `json:"name"`
+	ConfigPath     string `json:"config_path"`
+	ConfigPresent  bool   `json:"config_present"`
+	ConfigReadable bool   `json:"config_readable"`
+	MarkerFound    bool   `json:"marker_found"`
+	Installed      bool   `json:"installed"`
+	// ConfigReadError carries the os.ReadFile error string when the
+	// primary config exists (ConfigPresent=true) but we could not read
+	// it (EACCES / EIO / etc). When non-empty, ConfigReadable is false
+	// AND MarkerFound is false purely because the body was unreadable —
+	// not because the marker is genuinely absent. JSON consumers must
+	// use this to disambiguate "marker missing" from "fell back to
+	// alternate-path detection because the primary was unreadable".
+	ConfigReadError string   `json:"config_read_error,omitempty"`
+	Notes           []string `json:"notes,omitempty"`
 }
 
 type doctorAIReport struct {
