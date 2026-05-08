@@ -180,13 +180,20 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	if err != nil {
 		return res, fmt.Errorf("acd stop: resolve git dir: %w", err)
 	}
-	// perf-lane: remove the start-cache so a subsequent active hook from
-	// the same session no longer short-circuits onto a daemon that is
-	// being torn down. The cold path will re-spawn or refuse based on
-	// the live daemon_state row.
+	// perf-lane: remove start-cache files so subsequent active hooks no
+	// longer short-circuit onto a daemon that is being torn down. The
+	// cold path will re-spawn or refuse based on the live daemon_state
+	// row.
+	//
+	// Per-session caches are now scattered across <gitDir>/acd/ —
+	// when the daemon is fully stopped, every lookup must escalate, so
+	// we wipe all start-cache-*.json files. When only one session was
+	// deregistered (sessionID != "" and the caller did not survive to
+	// stop the daemon), we still drop that one session's cache below
+	// before the deferred sweep runs — see Deferred path.
 	defer func() {
 		if res.Stopped {
-			_ = os.Remove(startCachePath(gitDir))
+			removeAllStartCaches(gitDir)
 		}
 	}()
 	clock, err := daemon.AcquireControlLock(gitDir)
