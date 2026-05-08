@@ -29,9 +29,16 @@ type harnessSnippet struct {
 
 var harnessSnippets = map[string]harnessSnippet{
 	"claude-code": {"claude-code/settings.snippet.json", "//"},
-	"codex":       {"codex/hooks.json", "//"},
-	"opencode":    {"opencode/hooks.snippet.yaml", "#"},
-	"pi":          {"pi/hooks.snippet.yaml", "#"},
+	// codex points at `codex/hooks.json` (not `*.snippet.json`) by design:
+	// `~/.codex/hooks.json` is consumed verbatim by Codex and must be strict
+	// JSON, so the template ships the full file content rather than a
+	// `.snippet.*` excerpt. `acd setup codex --raw > ~/.codex/hooks.json`
+	// is the canonical install path. Keep this entry's filename in sync
+	// with `templates/codex/hooks.json` rather than renaming it to a
+	// `.snippet.json` form, which would imply a partial fragment.
+	"codex":    {"codex/hooks.json", "//"},
+	"opencode": {"opencode/hooks.snippet.yaml", "#"},
+	"pi":       {"pi/hooks.snippet.yaml", "#"},
 	// shell prints both snippet files separated by a divider.
 	"shell": {"shell/direnv.envrc.snippet", "#"},
 }
