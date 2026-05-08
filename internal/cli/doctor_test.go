@@ -900,6 +900,254 @@ func TestDoctor_RepoWarnsOnMultipleDaemonProcesses(t *testing.T) {
 	}
 }
 
+// TestDoctor_DriftWarningClaudeCodeWakeOnly seeds a Claude Code settings.json
+// whose PreToolUse body only calls `acd wake` (missing `acd start`) and
+// asserts the doctor report flags the drift with a copy/pasteable
+// remediation command.
+func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	// Drifted snippet: PreToolUse only fires `acd wake`, PostToolUse is
+	// canonical. Marker is present so the harness counts as installed.
+	body := `{
+		"_acd_managed": true,
+		"hooks": {
+			"PreToolUse": [
+				{ "matcher": "", "hooks": [
+					{ "type": "command", "command": "bash -c 'acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+				]}
+			],
+			"PostToolUse": [
+				{ "matcher": "", "hooks": [
+					{ "type": "command", "command": "bash -c 'acd start --harness claude-code --session-id \"$SID\" --repo \"$PWD\"; acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+				]}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write claude settings: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	cc := findDoctorHarness(t, rep, "claude-code")
+	if !cc.Installed {
+		t.Fatalf("claude-code should be installed: %+v", cc)
+	}
+	notes := strings.Join(cc.Notes, "\n")
+	if !strings.Contains(notes, "installed snippet drift") {
+		t.Fatalf("expected drift warning, got notes=%v", cc.Notes)
+	}
+	if !strings.Contains(notes, "acd setup claude-code --raw") {
+		t.Fatalf("drift note missing remediation command, got notes=%v", cc.Notes)
+	}
+}
+
+// TestDoctor_DriftCleanWhenSnippetMatchesTemplate seeds a fully canonical
+// claude-code snippet (both `acd start` and `acd wake` present in every
+// active hook) and asserts no drift warning fires.
+func TestDoctor_DriftCleanWhenSnippetMatchesTemplate(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	body := `{
+		"_acd_managed": true,
+		"hooks": {
+			"PreToolUse": [
+				{ "matcher": "", "hooks": [
+					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+				]}
+			],
+			"PostToolUse": [
+				{ "matcher": "", "hooks": [
+					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+				]}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write claude settings: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	cc := findDoctorHarness(t, rep, "claude-code")
+	if got := strings.Join(cc.Notes, "\n"); strings.Contains(got, "installed snippet drift") {
+		t.Fatalf("did not expect drift warning, got notes=%v", cc.Notes)
+	}
+}
+
+// TestDoctor_FallbackOnEACCESPrimaryConfig writes a primary config that is
+// unreadable (mode 0000) and a legacy alternate-path TOML carrying the acd
+// marker. Doctor must mark the harness as installed via fallback and append a
+// "primary-path read failed" Note, instead of skipping fallback as it did
+// before.
+func TestDoctor_FallbackOnEACCESPrimaryConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("EACCES test cannot run as root: 0o000 still readable")
+	}
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	hooksPath := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+	// Make primary config unreadable so the read produces EACCES.
+	if err := os.Chmod(hooksPath, 0o000); err != nil {
+		t.Fatalf("chmod hooks.json 0000: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksPath, 0o600) })
+
+	// Seed alternate-path legacy TOML so DetectInstalled flags codex.
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write legacy config.toml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed via alternate-path fallback after EACCES: %+v", codex)
+	}
+	notes := strings.Join(codex.Notes, "\n")
+	if !strings.Contains(notes, "primary-path read failed") {
+		t.Fatalf("expected primary-path read failed note, got %v", codex.Notes)
+	}
+	if !strings.Contains(notes, "alternate-path detection") {
+		t.Fatalf("expected alternate-path detection note, got %v", codex.Notes)
+	}
+}
+
+// TestDoctor_CodexHookLogTailSurfaced seeds a codex-hook.log under the
+// isolated XDG_STATE_HOME and asserts doctor's codex Notes surface a count
+// plus the first error line.
+func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	// Install codex hook so doctor reports the harness at all.
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+
+	// Seed codex-hook.log at the XDG state path. roots.State already
+	// contains the trailing /acd subdir.
+	logDir := roots.State
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		t.Fatalf("mkdir codex log dir: %v", err)
+	}
+	logPath := filepath.Join(logDir, "codex-hook.log")
+	now := time.Now().UTC()
+	stamp := now.Format("2006-01-02T15:04:05")
+	logBody := stamp + " bash: acd: command not found\n" +
+		stamp + " error: failed to read session_id from stdin\n" +
+		"info: harmless line\n"
+	if err := os.WriteFile(logPath, []byte(logBody), 0o600); err != nil {
+		t.Fatalf("write codex hook log: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	notes := strings.Join(codex.Notes, "\n")
+	if !strings.Contains(notes, "codex-hook.log") {
+		t.Fatalf("expected codex-hook.log note, got %v", codex.Notes)
+	}
+	if !strings.Contains(notes, "error") && !strings.Contains(notes, "command not found") {
+		t.Fatalf("expected first-error excerpt in note, got %v", codex.Notes)
+	}
+	// Ensure the count is at least 1 (we wrote 2 errors).
+	if !strings.Contains(notes, "1 ") && !strings.Contains(notes, "2 ") {
+		t.Fatalf("expected error count, got %v", codex.Notes)
+	}
+}
+
+// TestDoctor_CodexHookLogQuietWhenNoErrors verifies the log-tail check stays
+// silent when the log only contains info-level lines.
+func TestDoctor_CodexHookLogQuietWhenNoErrors(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write codex hooks.json: %v", err)
+	}
+	if err := os.MkdirAll(roots.State, 0o700); err != nil {
+		t.Fatalf("mkdir state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(roots.State, "codex-hook.log"), []byte("info: ok\ninfo: ok again\n"), 0o600); err != nil {
+		t.Fatalf("write codex hook log: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "codex-hook.log") {
+		t.Fatalf("did not expect codex-hook.log note for clean log, got %v", codex.Notes)
+	}
+}
+
 func findDoctorHarness(t *testing.T, rep doctorReport, name string) doctorHarnessReport {
 	t.Helper()
 	for _, h := range rep.Harnesses {
