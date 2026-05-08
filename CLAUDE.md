@@ -151,7 +151,7 @@ acd status --repo .
 | Harness | Start | Active hooks | End | Notes |
 |---|---|---|---|---|
 | Claude Code | `SessionStart -> acd start` (fail-soft) | `Pre/PostToolUse`: and-chain + log fallback | `Stop -> acd touch`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON. |
-| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`Pre/PostToolUse`: and-chain + log fallback; mkdir gated `[ -d "$LOG_DIR" ] || mkdir -p` | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s; matcher `apply_patch|Edit|Write|Bash`. |
+| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`Pre/PostToolUse` (matcher `apply_patch\|Edit\|Write\|Bash` on `Pre/PostToolUse` only): and-chain + log fallback; mkdir gated `[ -d "$LOG_DIR" ] || mkdir -p` | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s. |
 | OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback (block-scalar bash) | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`. Path `~/.config/opencode/hooks.yaml`. |
 | Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-unknown}"` (no `uuidgen`). Path `~/.pi/hook/hooks.yaml`. |
 
@@ -165,7 +165,7 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 
 - `acd start` failure NO LONGER masked by wake; active hook exits nonzero. AdapterE2E covers stop-all self-heal + corrupt-DB negative path.
 - Existing-user migration: re-run `acd setup <harness>` and replace hooks block in installed config so self-heal pattern takes effect. CHANGELOG v2026-05-08 + per-harness READMEs document. `acd doctor` flags drift.
-- Marker constants format-specific: `tomlAcdManagedMarkers = "# acd-managed: true"`; `yamlAcdManagedMarkers = "acd-managed: true"`. Distinct values.
+- Marker constants format-specific `[]string` slices: `tomlAcdManagedMarkers = []string{"# acd-managed: true"}`; `yamlAcdManagedMarkers = []string{"# acd-managed: true"}` (hash-comment form, no longer substring of TOML); `jsonAcdManagedMarkers = []string{` `"_acd_managed": true` `, ` `"_acd_managed":true` `}`. Substring collision eliminated by requiring leading `#` for both TOML and YAML.
 - Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted. `_acd_managed: true` top-level JSON. Adapter detection per path: JSON markers for hooks.json, TOML comment marker for config.toml.
 - `acd doctor` warns when both hooks.json and legacy Codex TOML carry acd markers (Codex merges -> doubled events).
 - Codex `/hooks` re-approval required after every `~/.codex/hooks.json` content change; until approved, `SessionStart` never fires. Shell-overwrite (`acd setup codex --raw > ~/.codex/hooks.json`) destroys non-acd entries; users with custom hooks must back up or merge.
