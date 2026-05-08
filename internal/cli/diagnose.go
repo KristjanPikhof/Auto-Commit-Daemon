@@ -70,10 +70,19 @@ type diagnoseReport struct {
 	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
 	StaleOperationMarker    bool                   `json:"stale_operation_marker"`
 	OperationMarkerDuration string                 `json:"operation_marker_duration,omitempty"`
-	Remediation             []string               `json:"remediation"`
-	StateDBChecksumBefore   string                 `json:"state_db_checksum_before"`
-	StateDBChecksumAfter    string                 `json:"state_db_checksum_after"`
-	StateDBChecksumVerified bool                   `json:"state_db_checksum_verified"`
+	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
+	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
+	// terminal prune action so operators can confirm stale-branch hygiene
+	// is keeping pace. All three are omitted from the JSON when the daemon
+	// has never recorded a non-empty prune (the meta keys are simply
+	// absent).
+	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts,omitempty"`
+	DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count,omitempty"`
+	DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs,omitempty"`
+	Remediation              []string `json:"remediation"`
+	StateDBChecksumBefore    string   `json:"state_db_checksum_before"`
+	StateDBChecksumAfter     string   `json:"state_db_checksum_after"`
+	StateDBChecksumVerified  bool     `json:"state_db_checksum_verified"`
 }
 
 type replayConflictMeta struct {
@@ -170,6 +179,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		report.IntentStrategy = intentStrategy
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := diagnoseDeadBranchPrune(ctx, conn, &report); err != nil {
 		return report, err
 	}
 	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
