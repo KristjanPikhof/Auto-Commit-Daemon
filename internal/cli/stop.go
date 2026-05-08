@@ -344,7 +344,9 @@ func removeAllStartCaches(gitDir string) {
 		if !strings.HasPrefix(name, startCacheFilenamePrefix) {
 			continue
 		}
-		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".json.tmp") {
+		// Final files end in ".json"; in-flight tmp files (from
+		// os.CreateTemp) match "<prefix><suffix>.<random>.tmp".
+		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".tmp") {
 			continue
 		}
 		_ = os.Remove(filepath.Join(dir, name))
