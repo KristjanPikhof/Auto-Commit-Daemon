@@ -155,14 +155,21 @@ type shortCircuitDecision struct {
 // tests cover every branch without filesystem fixtures.
 //
 // The matrix:
-//   - cache == nil        → escalate (no entry / corrupt file)
-//   - mismatched repo     → escalate (cache from another repo, paranoid)
-//   - mismatched session  → escalate (different session_id)
-//   - mismatched harness  → escalate (harness rebinding requires SQLite)
-//   - stale heartbeat     → escalate (clientTTL exceeded)
-//   - missing registry    → escalate (cold registry / first ever start)
-//   - dead daemon pid     → escalate (cache lies about liveness)
-//   - all fresh + alive   → short-circuit
+//   - cache == nil          → escalate (no entry / corrupt file)
+//   - mismatched repo       → escalate (cache from another repo, paranoid)
+//   - mismatched session    → escalate (different session_id)
+//   - mismatched harness    → escalate (harness rebinding requires SQLite)
+//   - stale heartbeat       → escalate (clientTTL exceeded)
+//   - missing registry      → escalate (cold registry / first ever start)
+//   - dead daemon pid       → escalate (cache lies about liveness)
+//   - fingerprint mismatch  → escalate (PID reuse: pid alive but unrelated process)
+//   - all fresh + alive     → short-circuit
+//
+// fpCapture is the daemon-fingerprint resolver; when nil, the package
+// default is used. The captured fingerprint is compared against the cached
+// (DaemonStartTS, DaemonArgvHash). If the cache lacks a fingerprint stamp
+// (legacy / never written) we treat it as a mismatch and force the cold
+// path — schema v2 requires a stamp.
 func evaluateShortCircuit(
 	cache *startCache,
 	repoHash, sessionID, harness string,
@@ -170,6 +177,7 @@ func evaluateShortCircuit(
 	now time.Time,
 	ttl time.Duration,
 	pidAlive func(int) bool,
+	fpCapture func(context.Context, int) (identity.Fingerprint, error),
 ) shortCircuitDecision {
 	if cache == nil {
 		return shortCircuitDecision{Reason: "no_cache"}
@@ -204,6 +212,26 @@ func evaluateShortCircuit(
 	}
 	if !pidAlive(cache.DaemonPID) {
 		return shortCircuitDecision{Reason: "daemon_pid_dead"}
+	}
+	// Defense against PID reuse: the kill(0) probe above only proves
+	// SOMEONE owns this pid; it does not prove the original daemon
+	// still owns it. Pin the cached pid to the daemon's lstart + argv
+	// fingerprint stamped on cold-path write. Mismatch => recycled pid.
+	if cache.DaemonStartTS == "" && cache.DaemonArgvHash == "" {
+		return shortCircuitDecision{Reason: "fingerprint_missing"}
+	}
+	if fpCapture == nil {
+		fpCapture = captureDaemonFingerprint
+	}
+	live, err := fpCapture(context.Background(), cache.DaemonPID)
+	if err != nil {
+		// A `ps` failure here typically means the pid disappeared
+		// between the kill(0) probe and the ps call; treat as a
+		// mismatch and force the cold path to re-establish identity.
+		return shortCircuitDecision{Reason: "fingerprint_capture_failed"}
+	}
+	if live.StartTime != cache.DaemonStartTS || live.ArgvHash != cache.DaemonArgvHash {
+		return shortCircuitDecision{Reason: "fingerprint_mismatch"}
 	}
 	return shortCircuitDecision{
 		OK:          true,
@@ -256,7 +284,7 @@ func tryShortCircuitStart(
 		}
 	}
 	d := evaluateShortCircuit(cache, repoHash, sessionID, harness, rec,
-		shortCircuitNow(), clientTTL(), identity.Alive)
+		shortCircuitNow(), clientTTL(), identity.Alive, captureDaemonFingerprint)
 	if !d.OK {
 		return false, 0, 0, d.Reason
 	}
