@@ -331,6 +331,67 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	}
 }
 
+// TestSetup_Codex_ActiveHooksSelfHeal guards that codex active hooks
+// (UserPromptSubmit, PreToolUse, PostToolUse) are resilient: they must
+//   - call `acd start` before `acd wake` so a fresh session can self-register;
+//   - chain start and wake with `&&` so a failed start cannot be masked by
+//     a successful wake;
+//   - tail with an or-clause that logs the failure cause into the harness
+//     LOG file and exits nonzero so codex can surface it;
+//   - gate `mkdir -p` behind a directory-exists check so the hot path does
+//     not fork+exec mkdir on every tool turn.
+//
+// Regression targets: P1-3 (wake masks start failure), P3-17 (mkdir hot-path).
+func TestSetup_Codex_ActiveHooksSelfHeal(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "codex")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 {
+		t.Fatalf("no JSON block")
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	for _, ev := range []string{"UserPromptSubmit", "PreToolUse", "PostToolUse"} {
+		entries := settings.Hooks[ev]
+		if len(entries) == 0 {
+			t.Errorf("event %q missing", ev)
+			continue
+		}
+		for i, entry := range entries {
+			for j, h := range entry.Hooks {
+				cmd := h.Command
+				if !strings.Contains(cmd, "acd start") || !strings.Contains(cmd, "acd wake") {
+					t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
+				}
+				if strings.Index(cmd, "acd start") > strings.Index(cmd, "acd wake") {
+					t.Errorf("%s entry %d hook %d: acd start must precede acd wake: %s", ev, i, j, cmd)
+				}
+				assertActiveHookAndChainAndLogFallback(t, ev, i, j, cmd, "codex-hook.log")
+			}
+		}
+	}
+	// All codex hook bodies must gate mkdir behind a directory-exists check
+	// to avoid fork+exec on every PreToolUse / PostToolUse.
+	for ev, entries := range settings.Hooks {
+		for i, entry := range entries {
+			for j, h := range entry.Hooks {
+				if strings.Contains(h.Command, "mkdir -p") &&
+					!strings.Contains(h.Command, `[ -d "$LOG_DIR" ] || mkdir -p`) {
+					t.Errorf("%s entry %d hook %d: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p: %s", ev, i, j, h.Command)
+				}
+			}
+		}
+	}
+}
+
 // --- opencode ---------------------------------------------------------------
 
 func TestSetup_OpenCode_ExitsZero(t *testing.T) {
