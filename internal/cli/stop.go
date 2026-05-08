@@ -179,6 +179,15 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	if err != nil {
 		return res, fmt.Errorf("acd stop: resolve git dir: %w", err)
 	}
+	// perf-lane: remove the start-cache so a subsequent active hook from
+	// the same session no longer short-circuits onto a daemon that is
+	// being torn down. The cold path will re-spawn or refuse based on
+	// the live daemon_state row.
+	defer func() {
+		if res.Stopped {
+			_ = os.Remove(startCachePath(gitDir))
+		}
+	}()
 	clock, err := daemon.AcquireControlLock(gitDir)
 	if err != nil {
 		return res, fmt.Errorf("acd stop: acquire control.lock: %w", err)
