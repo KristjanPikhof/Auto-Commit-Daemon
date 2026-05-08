@@ -19,7 +19,13 @@ import (
 // A cache file with version != startCacheVersion is treated as missing and
 // the caller falls back to the full registration path. This lets future
 // schema changes invalidate stale caches without surgical migration.
-const startCacheVersion = 1
+//
+// v2 (2026-05): adds DaemonStartTS (truncated lstart) + DaemonArgvHash.
+// PID-reuse on long-running boxes lets an unrelated process inherit a
+// recycled daemon PID; the fingerprint check pins the cached pid to the
+// original daemon's process start time + argv hash, so the recycled pid
+// fails the equality check and the caller escalates to the cold path.
+const startCacheVersion = 2
 
 // startCacheFilename is the per-repo cache file written under
 // <gitDir>/acd/. Atomic writes (tmp + rename) keep it safe under concurrent
@@ -32,14 +38,24 @@ const startCacheFilename = "start-cache.json"
 // or opening SQLite — that the daemon is still healthy and the registration
 // is still valid.
 type startCache struct {
-	Version     int    `json:"version"`
-	RepoHash    string `json:"repo_hash"`
-	SessionID   string `json:"session_id"`
-	Harness     string `json:"harness"`
-	DaemonPID   int    `json:"daemon_pid"`
-	WatchPID    int    `json:"watch_pid,omitempty"`
-	ClientCount int    `json:"client_count,omitempty"`
-	UpdatedAt   int64  `json:"updated_at_unix"`
+	Version         int    `json:"version"`
+	RepoHash        string `json:"repo_hash"`
+	SessionID       string `json:"session_id"`
+	Harness         string `json:"harness"`
+	DaemonPID       int    `json:"daemon_pid"`
+	WatchPID        int    `json:"watch_pid,omitempty"`
+	ClientCount     int    `json:"client_count,omitempty"`
+	UpdatedAt       int64  `json:"updated_at_unix"`
+	DaemonStartTS   string `json:"daemon_start_ts,omitempty"`
+	DaemonArgvHash  string `json:"daemon_argv_hash,omitempty"`
+}
+
+// captureDaemonFingerprint resolves the running daemon's identity stamp.
+// Indirected through a package-level var so unit tests can pin a
+// deterministic fingerprint without spawning a real process. Returns the
+// captured Fingerprint or an error from the underlying ps call.
+var captureDaemonFingerprint = func(ctx context.Context, pid int) (identity.Fingerprint, error) {
+	return identity.CaptureContext(ctx, pid)
 }
 
 // shortCircuitNow is the clock used by the short-circuit decision matrix.
