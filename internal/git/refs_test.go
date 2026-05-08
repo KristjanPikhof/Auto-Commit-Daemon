@@ -322,6 +322,110 @@ func TestRefExists_CancelledCtx(t *testing.T) {
 	}
 }
 
+// TestLiveBranchSet_EmptyRepoReturnsEmptySet exercises the no-refs case. A
+// freshly-initialized repo with no commits has no refs under refs/heads/;
+// for-each-ref exits 0 with empty stdout. The helper must return a
+// non-nil empty map (callers do `_, ok := set[ref]` membership probes).
+func TestLiveBranchSet_EmptyRepoReturnsEmptySet(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	set, err := LiveBranchSet(ctx, dir)
+	if err != nil {
+		t.Fatalf("LiveBranchSet on empty repo: %v", err)
+	}
+	if set == nil {
+		t.Fatal("expected non-nil empty set, got nil")
+	}
+	if len(set) != 0 {
+		t.Fatalf("empty repo set len=%d want 0; got %v", len(set), set)
+	}
+}
+
+// TestLiveBranchSet_OneBranch creates a single ref and asserts the set
+// contains exactly that ref.
+func TestLiveBranchSet_OneBranch(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	commit := commitFile(t, ctx, dir, "seed.txt", "seed", "seed")
+	if err := UpdateRef(ctx, dir, "refs/heads/main", commit, ""); err != nil {
+		t.Fatalf("update-ref main: %v", err)
+	}
+
+	set, err := LiveBranchSet(ctx, dir)
+	if err != nil {
+		t.Fatalf("LiveBranchSet: %v", err)
+	}
+	if _, ok := set["refs/heads/main"]; !ok {
+		t.Fatalf("expected refs/heads/main in set; got %v", set)
+	}
+	if len(set) != 1 {
+		t.Fatalf("set len=%d want 1; got %v", len(set), set)
+	}
+}
+
+// TestLiveBranchSet_MultipleBranches asserts the set contains every ref
+// when several branches coexist. Order-independent: callers do membership
+// probes, not iteration in a fixed order.
+func TestLiveBranchSet_MultipleBranches(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+
+	commit := commitFile(t, ctx, dir, "seed.txt", "seed", "seed")
+	for _, ref := range []string{
+		"refs/heads/main",
+		"refs/heads/feature-a",
+		"refs/heads/feature-b",
+		"refs/heads/release/v1",
+	} {
+		if err := UpdateRef(ctx, dir, ref, commit, ""); err != nil {
+			t.Fatalf("update-ref %s: %v", ref, err)
+		}
+	}
+
+	set, err := LiveBranchSet(ctx, dir)
+	if err != nil {
+		t.Fatalf("LiveBranchSet: %v", err)
+	}
+	for _, ref := range []string{
+		"refs/heads/main",
+		"refs/heads/feature-a",
+		"refs/heads/feature-b",
+		"refs/heads/release/v1",
+	} {
+		if _, ok := set[ref]; !ok {
+			t.Fatalf("expected %q in set; got %v", ref, set)
+		}
+	}
+	if len(set) != 4 {
+		t.Fatalf("set len=%d want 4; got %v", len(set), set)
+	}
+}
+
+// TestLiveBranchSet_BogusRepoReturnsError asserts that a non-git directory
+// surfaces a real error rather than a silently-empty map (which would let
+// the dead-branch sweep prune every ref on a transient FS error).
+func TestLiveBranchSet_BogusRepoReturnsError(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+
+	bogus := t.TempDir()
+	_, err := LiveBranchSet(ctx, bogus)
+	if err == nil {
+		t.Fatal("expected error for non-git directory, got nil")
+	}
+}
+
+// TestLiveBranchSet_EmptyRepoDirReturnsError asserts the defensive guard.
+func TestLiveBranchSet_EmptyRepoDirReturnsError(t *testing.T) {
+	ctx := context.Background()
+	_, err := LiveBranchSet(ctx, "")
+	if err == nil {
+		t.Fatal("expected error for empty repoDir, got nil")
+	}
+}
+
 func commitFile(t *testing.T, ctx context.Context, dir, path, content, message string, parents ...string) string {
 	t.Helper()
 	blob, err := HashObjectStdin(ctx, dir, []byte(content))
