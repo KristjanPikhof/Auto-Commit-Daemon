@@ -463,9 +463,16 @@ func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
 				}
 				// Every failure branch must capture rc immediately so an
 				// intervening $(date) substitution does not clobber $?
-				// before printf reads it.
-				if strings.Count(cmd, "rc=$?") < 2 {
-					t.Errorf("%s entry %d hook %d: each failure branch must capture rc=$? before printing (got <2): %s", ev, i, j, cmd)
+				// before printf reads it. SessionStart, UserPromptSubmit,
+				// PreToolUse, PostToolUse have two failure branches (helper
+				// + start/wake); Stop has one (helper only) because the
+				// trailing `acd touch` is best-effort with no log line.
+				wantRC := 2
+				if ev == "Stop" {
+					wantRC = 1
+				}
+				if got := strings.Count(cmd, "rc=$?"); got < wantRC {
+					t.Errorf("%s entry %d hook %d: failure branches must capture rc=$? before printing (got %d, want >= %d): %s", ev, i, j, got, wantRC, cmd)
 				}
 			}
 		}
