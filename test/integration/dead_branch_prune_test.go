@@ -107,7 +107,7 @@ func TestDeadBranchPrune_RuntimeDivergedDeletedBranchPrunesRows(t *testing.T) {
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	wantToken := "rev:" + headOID + " " + deadRef
 	waitFor(t, "daemon observed runtime-dead branch token", 5*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.token'") == wantToken
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch_token'") == wantToken
 	})
 	// Let the startup no-op sweep finish before we seed rows intended for the
 	// runtime branch-transition path.
@@ -351,7 +351,7 @@ func TestDeadBranchPrune_RuntimeOptOutPreservesRows(t *testing.T) {
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	wantToken := "rev:" + headOID + " " + deadRef
 	waitFor(t, "daemon observed runtime opt-out branch token", 5*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.token'") == wantToken
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch_token'") == wantToken
 	})
 	time.Sleep(750 * time.Millisecond)
 	gen := currentBranchGeneration(t, dbPath)
