@@ -337,8 +337,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 var driftRemediationCommands = map[string]string{
 	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
 	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
-	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hooks.yaml; to overwrite: cp ~/.config/opencode/hooks.yaml ~/.config/opencode/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hooks.yaml",
-	"pi":          "acd setup pi  # merge output into ~/.pi/hook/hooks.yaml; to overwrite: cp ~/.pi/hook/hooks.yaml ~/.pi/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/hook/hooks.yaml",
+	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
+	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
