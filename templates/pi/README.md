@@ -1,6 +1,6 @@
 # acd adapter: pi
 
-For [`KristjanPikhof/pi-yaml-hooks`](https://github.com/KristjanPikhof/pi-yaml-hooks).
+For [`KristjanPikhof/Pi-YAML-Hooks`](https://github.com/KristjanPikhof/Pi-YAML-Hooks).
 
 ## Install
 
