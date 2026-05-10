@@ -285,11 +285,9 @@ func TestDeadBranchPrune_StartupSweepRemovesPreSeededTerminals(t *testing.T) {
 	})
 }
 
-// TestDeadBranchPrune_OptOutPreservesRows covers scenario (d): with
-// ACD_KEEP_DEAD_BRANCH_BARRIERS=1, neither path prunes — even when refs are
-// dead. We exercise this via the startup sweep (the runtime Diverged hook
-// short-circuits on the same isKeepDeadBranchBarriers check, so a single
-// scenario gives us both code paths).
+// TestDeadBranchPrune_OptOutPreservesRows covers scenario (d) for startup
+// sweep: with ACD_KEEP_DEAD_BRANCH_BARRIERS=1, the sweep preserves rows even
+// when refs are dead.
 func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
 	requireSQLite(t)
 
@@ -326,6 +324,54 @@ func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
 	time.Sleep(750 * time.Millisecond)
 	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
 		t.Fatalf("opt-out: dead-ref %s terminals=%d want 2 (sweep must skip)", deadRef, got)
+	}
+}
+
+// TestDeadBranchPrune_RuntimeOptOutPreservesRows covers scenario (d) for the
+// same-daemon runtime Diverged path.
+func TestDeadBranchPrune_RuntimeOptOutPreservesRows(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const branchName = "runtime-keep-dead"
+	const deadRef = "refs/heads/" + branchName
+	runGitOK(t, repo, "checkout", "-b", branchName)
+	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+
+	startSession(t, ctx, env, repo, "dbp-runtime-keep", "shell",
+		"ACD_KEEP_DEAD_BRANCH_BARRIERS=1")
+	waitMode(t, repo, "running", 5*time.Second)
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	wantToken := "rev:" + headOID + " " + deadRef
+	waitFor(t, "daemon observed runtime opt-out branch token", 5*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.token'") == wantToken
+	})
+	time.Sleep(750 * time.Millisecond)
+	gen := currentBranchGeneration(t, dbPath)
+
+	seedTerminalCaptureEvent(t, dbPath, deadRef, gen, headOID, "runtime-keep-blocked.txt", "blocked_conflict")
+	seedTerminalCaptureEvent(t, dbPath, deadRef, gen, headOID, "runtime-keep-failed.txt", "failed")
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
+		t.Fatalf("seeded runtime opt-out terminals for %s: got=%d want=2", deadRef, got)
+	}
+
+	runGitOK(t, repo, "checkout", "main")
+	runGitOK(t, repo, "update-ref", "-d", deadRef)
+	wakeSession(t, ctx, env, repo, "dbp-runtime-keep")
+
+	time.Sleep(750 * time.Millisecond)
+	if got := countTerminalsForRef(t, dbPath, deadRef); got != 2 {
+		t.Fatalf("runtime opt-out: dead-ref %s terminals=%d want 2", deadRef, got)
+	}
+	if v := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM daemon_meta WHERE key = 'dead_branch_prune.last_run_ts'"); v != "0" {
+		t.Fatalf("runtime opt-out stamped prune meta; count=%s want 0", v)
 	}
 }
 
