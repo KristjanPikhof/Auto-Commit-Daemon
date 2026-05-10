@@ -671,3 +671,217 @@ func mustSHA256(t *testing.T, path string) string {
 func itoa64(v int64) string {
 	return strconv.FormatInt(v, 10)
 }
+
+// TestDiagnose_DeadBranchPrune_Populated seeds the three daemon_meta keys
+// stamped by daemon.recordDeadBranchPruneMeta and asserts diagnose surfaces
+// them on the JSON report with the agreed snake_case field names. This is
+// the operator-visible signal that stale-branch hygiene ran and what it
+// pruned.
+func TestDiagnose_DeadBranchPrune_Populated(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	const wantTS int64 = 1_700_000_000
+	const wantCount = 7
+	wantRefs := []string{"refs/heads/old", "refs/heads/feature-x"}
+	refsJSON, err := json.Marshal(wantRefs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRunTS, strconv.FormatInt(wantTS, 10)); err != nil {
+		t.Fatalf("seed last_run_ts: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastCount, strconv.Itoa(wantCount)); err != nil {
+		t.Fatalf("seed last_count: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRefs, string(refsJSON)); err != nil {
+		t.Fatalf("seed last_refs: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.DeadBranchPruneLastRunTS != wantTS {
+		t.Fatalf("DeadBranchPruneLastRunTS=%d want %d", rep.DeadBranchPruneLastRunTS, wantTS)
+	}
+	if rep.DeadBranchPruneLastCount != wantCount {
+		t.Fatalf("DeadBranchPruneLastCount=%d want %d", rep.DeadBranchPruneLastCount, wantCount)
+	}
+	if len(rep.DeadBranchPruneLastRefs) != len(wantRefs) {
+		t.Fatalf("DeadBranchPruneLastRefs len=%d want %d", len(rep.DeadBranchPruneLastRefs), len(wantRefs))
+	}
+	for i, r := range wantRefs {
+		if rep.DeadBranchPruneLastRefs[i] != r {
+			t.Fatalf("DeadBranchPruneLastRefs[%d]=%q want %q", i, rep.DeadBranchPruneLastRefs[i], r)
+		}
+	}
+	// JSON keys must match the agreed snake_case names so dashboards and
+	// scripted operators are not regressed by a struct-tag drift.
+	for _, want := range []string{
+		`"dead_branch_prune_last_run_ts": 1700000000`,
+		`"dead_branch_prune_last_count": 7`,
+		`"dead_branch_prune_last_refs"`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("diagnose JSON missing %q in:\n%s", want, out.String())
+		}
+	}
+}
+
+// TestDiagnose_DeadBranchPrune_Absent asserts that when no meta keys are
+// present (fresh repo / never-pruned), all three fields default to their
+// zero values. The two int fields render as 0 in the JSON (zero is the
+// documented "never ran" sentinel — distinguishable absence is no longer
+// needed because zero IS the meaningful value). The slice keeps `omitempty`
+// and renders as absent when nil.
+func TestDiagnose_DeadBranchPrune_Absent(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.DeadBranchPruneLastRunTS != 0 {
+		t.Fatalf("DeadBranchPruneLastRunTS=%d want 0", rep.DeadBranchPruneLastRunTS)
+	}
+	if rep.DeadBranchPruneLastCount != 0 {
+		t.Fatalf("DeadBranchPruneLastCount=%d want 0", rep.DeadBranchPruneLastCount)
+	}
+	if rep.DeadBranchPruneLastRefs != nil {
+		t.Fatalf("DeadBranchPruneLastRefs=%v want nil", rep.DeadBranchPruneLastRefs)
+	}
+	// The two int fields must be present (always-emit contract) with their
+	// zero values. The slice (omitempty) must be absent when nil.
+	for _, want := range []string{
+		`"dead_branch_prune_last_run_ts": 0`,
+		`"dead_branch_prune_last_count": 0`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("diagnose JSON missing %q in:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "dead_branch_prune_last_refs") {
+		t.Fatalf("diagnose JSON unexpectedly contains 'dead_branch_prune_last_refs' (slice omitempty broken):\n%s", out.String())
+	}
+}
+
+// TestDiagnose_RenderHumanIncludesDeadBranchPrune asserts the human renderer
+// surfaces the dead-branch prune surface when the meta keys are populated.
+// A zero last_run_ts must NOT render the line (no clutter on fresh repos).
+func TestDiagnose_RenderHumanIncludesDeadBranchPrune(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	const wantTS int64 = 1_700_000_000
+	const wantCount = 5
+	wantRefs := []string{"refs/heads/old-feature"}
+	refsJSON, err := json.Marshal(wantRefs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRunTS, strconv.FormatInt(wantTS, 10)); err != nil {
+		t.Fatalf("seed last_run_ts: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastCount, strconv.Itoa(wantCount)); err != nil {
+		t.Fatalf("seed last_count: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRefs, string(refsJSON)); err != nil {
+		t.Fatalf("seed last_refs: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runDiagnose human: %v", err)
+	}
+	want := "Dead-branch prune: 5 row(s) pruned at " + time.Unix(wantTS, 0).Format(time.RFC3339)
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("human renderer missing dead-branch prune line %q in:\n%s", want, out.String())
+	}
+	if !strings.Contains(out.String(), "refs/heads/old-feature") {
+		t.Fatalf("human renderer missing pruned ref name in:\n%s", out.String())
+	}
+}
+
+// TestDiagnose_RenderHumanOmitsDeadBranchPruneWhenZero asserts the renderer
+// suppresses the dead-branch prune line entirely when last_run_ts == 0
+// (never-ran sentinel). Avoids cluttering output on fresh repos.
+func TestDiagnose_RenderHumanOmitsDeadBranchPruneWhenZero(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runDiagnose human: %v", err)
+	}
+	if strings.Contains(out.String(), "Dead-branch prune") {
+		t.Fatalf("human renderer included dead-branch prune line on never-ran repo:\n%s", out.String())
+	}
+}
+
+// TestDiagnose_DeadBranchPrune_MalformedJSON asserts that a corrupt
+// last_refs blob does NOT panic or abort diagnose: ts/count still parse,
+// refs becomes nil, and the report is otherwise well-formed.
+func TestDiagnose_DeadBranchPrune_MalformedJSON(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRunTS, "1700000000"); err != nil {
+		t.Fatalf("seed last_run_ts: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastCount, "3"); err != nil {
+		t.Fatalf("seed last_count: %v", err)
+	}
+	// "{" is invalid JSON — Unmarshal returns an error and the helper must
+	// fall back to nil refs without aborting diagnose.
+	if err := state.MetaSet(ctx, d, daemon.MetaKeyDeadBranchPruneLastRefs, "{"); err != nil {
+		t.Fatalf("seed last_refs: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.DeadBranchPruneLastRunTS != 1_700_000_000 {
+		t.Fatalf("DeadBranchPruneLastRunTS=%d want 1700000000", rep.DeadBranchPruneLastRunTS)
+	}
+	if rep.DeadBranchPruneLastCount != 3 {
+		t.Fatalf("DeadBranchPruneLastCount=%d want 3", rep.DeadBranchPruneLastCount)
+	}
+	if rep.DeadBranchPruneLastRefs != nil {
+		t.Fatalf("DeadBranchPruneLastRefs=%v want nil after malformed JSON", rep.DeadBranchPruneLastRefs)
+	}
+}

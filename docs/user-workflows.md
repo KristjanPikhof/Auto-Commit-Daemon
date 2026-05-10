@@ -280,6 +280,14 @@ specifically reports stale replay state that should be retargeted. Recovery
 preserves a manual pause marker unless you apply it with `--clear-pause`; use
 `acd resume --yes` when the marker itself is the only problem.
 
+When a feature branch has been merged and deleted, ACD cleans up stale
+`pending`, `blocked_conflict`, and `failed` rows for that dead branch ref during
+the next runtime branch transition or daemon startup. `acd diagnose --json`
+shows the most recent cleanup in `dead_branch_prune_last_run_ts`,
+`dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`. If you need
+to inspect those rows before cleanup, start the daemon with
+`ACD_KEEP_DEAD_BRANCH_BARRIERS=1`.
+
 ## Skipped generated or sensitive files
 
 ACD intentionally avoids committing generated dependency/cache trees and

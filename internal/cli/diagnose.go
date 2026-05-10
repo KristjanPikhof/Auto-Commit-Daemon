@@ -70,10 +70,22 @@ type diagnoseReport struct {
 	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
 	StaleOperationMarker    bool                   `json:"stale_operation_marker"`
 	OperationMarkerDuration string                 `json:"operation_marker_duration,omitempty"`
-	Remediation             []string               `json:"remediation"`
-	StateDBChecksumBefore   string                 `json:"state_db_checksum_before"`
-	StateDBChecksumAfter    string                 `json:"state_db_checksum_after"`
-	StateDBChecksumVerified bool                   `json:"state_db_checksum_verified"`
+	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
+	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
+	// terminal prune action so operators can confirm stale-branch hygiene
+	// is keeping pace. The two int fields are ALWAYS present in the JSON —
+	// a zero value is the documented "daemon has never recorded a non-empty
+	// prune" sentinel, distinguishable from any real prune (real prunes
+	// stamp last_run_ts to the wall-clock unix-second the prune ran and
+	// last_count >= 1). The slice keeps `omitempty` so an empty list
+	// serializes as absent rather than `null`/`[]`.
+	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts"`
+	DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
+	DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs,omitempty"`
+	Remediation              []string `json:"remediation"`
+	StateDBChecksumBefore    string   `json:"state_db_checksum_before"`
+	StateDBChecksumAfter     string   `json:"state_db_checksum_after"`
+	StateDBChecksumVerified  bool     `json:"state_db_checksum_verified"`
 }
 
 type replayConflictMeta struct {
@@ -170,6 +182,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		report.IntentStrategy = intentStrategy
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := diagnoseDeadBranchPrune(ctx, conn, &report); err != nil {
 		return report, err
 	}
 	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
@@ -312,6 +327,49 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
 			report.EventsDroppedTotal = total
 		}
+	}
+	return nil
+}
+
+// diagnoseDeadBranchPrune surfaces the daemon-recorded "last non-empty
+// dead-branch prune action" via three meta keys stamped by
+// daemon.recordDeadBranchPruneMeta:
+//
+//   - dead_branch_prune.last_run_ts   unix seconds (string-encoded int)
+//   - dead_branch_prune.last_count    rows pruned (string-encoded int)
+//   - dead_branch_prune.last_refs     JSON-encoded []string of refs
+//
+// Missing keys default to zero / nil. The two int fields render as 0 in the
+// JSON (omitempty was dropped from the struct tag deliberately so 0 is the
+// documented "never ran" sentinel rather than an absent key). The slice keeps
+// `omitempty` so an empty list serializes as absent. Malformed values fail
+// open: a parse error zeros the affected field and we keep going (a corrupt
+// JSON refs blob does not abort diagnose).
+func diagnoseDeadBranchPrune(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_run_ts"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_run_ts: %w", err)
+	} else if ok && v != "" {
+		if ts, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			report.DeadBranchPruneLastRunTS = ts
+		}
+		// Parse error -> field stays at zero (omitempty drops it from JSON).
+	}
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_count"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_count: %w", err)
+	} else if ok && v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil {
+			report.DeadBranchPruneLastCount = n
+		}
+	}
+	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_refs"); err != nil {
+		return fmt.Errorf("dead_branch_prune.last_refs: %w", err)
+	} else if ok && v != "" {
+		var refs []string
+		if jerr := json.Unmarshal([]byte(v), &refs); jerr == nil {
+			report.DeadBranchPruneLastRefs = refs
+		}
+		// Malformed JSON -> leave nil; report stays consistent with "no
+		// refs recorded".
 	}
 	return nil
 }
@@ -605,6 +663,17 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 			}
 			fmt.Fprintln(out)
 		}
+	}
+
+	// Dead-branch prune surface. Zero last_run_ts means the daemon has
+	// never recorded a non-empty prune — render nothing in that case so a
+	// fresh repo's diagnose output is not cluttered with "never ran" noise.
+	if r.DeadBranchPruneLastRunTS > 0 {
+		fmt.Fprintf(out, "Dead-branch prune: %d row(s) pruned at %s, refs=%v\n",
+			r.DeadBranchPruneLastCount,
+			time.Unix(r.DeadBranchPruneLastRunTS, 0).Format(time.RFC3339),
+			r.DeadBranchPruneLastRefs,
+		)
 	}
 
 	fmt.Fprintln(out, "Suggested remediation:")

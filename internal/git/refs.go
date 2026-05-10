@@ -129,6 +129,71 @@ func RunBranchRef(ctx context.Context, repoDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// RefExists probes whether a fully-qualified ref (e.g. "refs/heads/main")
+// currently resolves in the repo. It uses `git show-ref --verify --quiet`
+// which is a cheaper probe than RevParse: no SHA is returned, no object
+// dereferencing happens, and git's ambiguity logic for short names is
+// bypassed because show-ref --verify only matches exact ref names.
+//
+// Exit-code contract (git show-ref --verify --quiet):
+//
+//   - Exit 0   → ref exists; returns (true, nil).
+//   - Exit 1   → ref does not exist; git writes nothing to stderr;
+//     returns (false, nil).
+//   - Any other exit, or a non-*Error failure (e.g. exec not found),
+//     returns (false, err) with err wrapping git's stderr.
+//
+// An empty ref argument is rejected immediately without shelling out,
+// mirroring the defensive guards in other helpers in this package.
+//
+// The call is bounded by DefaultReadTimeout via RunOpts.Timeout; it also
+// respects ctx cancellation because RunWithStderr honors it.
+func RefExists(ctx context.Context, repoDir, ref string) (bool, error) {
+	if ref == "" {
+		return false, fmt.Errorf("git: RefExists called with empty ref")
+	}
+	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "show-ref", "--verify", "--quiet", ref)
+	if err == nil {
+		return true, nil
+	}
+	var gerr *Error
+	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// LiveBranchSet returns a set of every refname under refs/heads/ in repoDir.
+// Used by the dead-branch sweep to perform set-membership probes against
+// many candidate refs without one shellout per ref.
+//
+// The shell-out is `git for-each-ref --format=%(refname) refs/heads/`. An
+// empty repo (no refs) returns an empty set with no error. Honors ctx
+// cancellation. Times out via DefaultReadTimeout.
+//
+// Empty repoDir is rejected immediately. A non-zero exit from git surfaces
+// as a real error (callers must fail closed — preserving rows when
+// liveness cannot be determined).
+func LiveBranchSet(ctx context.Context, repoDir string) (map[string]struct{}, error) {
+	if repoDir == "" {
+		return nil, fmt.Errorf("git: LiveBranchSet called with empty repoDir")
+	}
+	out, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"for-each-ref", "--format=%(refname)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{})
+	for _, line := range strings.Split(string(out), "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" {
+			continue
+		}
+		set[ref] = struct{}{}
+	}
+	return set, nil
+}
+
 // IsAncestor reports whether ancestor is an ancestor of descendant.
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.

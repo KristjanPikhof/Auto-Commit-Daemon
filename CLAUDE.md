@@ -75,7 +75,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Detached HEAD pauses capture/replay; `acd start` refuses. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - Git-op markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`. Non-`ErrNotExist` stat errors fail open with warning.
 - Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins.
-- Diverged drops stale `pending` for prior generation only; keep `published`/`failed`/`blocked_conflict`. SQLite read errors in `daemonPauseState` fail closed.
+- Diverged drops stale `pending` for prior generation; keep `published`. When the prior `branch_ref` no longer resolves, `state.PurgeUnpublishedForDeadBranch` auto-prunes BOTH `pending` AND terminal (`blocked_conflict`/`failed`) rows for that `(branch_ref, generation)` in one tx, lifts the singleton `publish_state` barrier only when it points at a deleted blocked row for that same pair, and clears the `last_replay_conflict{,_legacy}` / `last_replay_error` breadcrumbs. Live ref preserves all rows and live `publish_state` blockers. Daemon-startup sweep is fired AFTER the running-mode publish on a one-shot goroutine (off the start-latency budget) and uses `git.LiveBranchSet` (one `for-each-ref`) for batched membership instead of per-pair `RefExists`. Both startup and runtime paths honor the manual-pause marker (skip-if-paused) and `ACD_KEEP_DEAD_BRANCH_BARRIERS=1`. Daemon stamps `dead_branch_prune.{last_run_ts,last_count,last_refs}` meta on non-empty prune; `acd diagnose --json` surfaces them (the two int fields render as `0` when never run; the slice keeps `omitempty`). SQLite read errors in `daemonPauseState` fail closed.
 - Capture compares live worktree to shadow; stale/missing bootstrap creates phantom creates.
 - `walkLive` BFSes by directory layer; ignore checks batched (`ignoreCheckBatchSize=1000`); prunes ignored/sensitive/safe-ignore dirs before readdir.
 - Never prune worktree-rooted `acd/`; `.git/acd` is daemon state. Symlinks mode `120000`; never descend.
@@ -178,7 +178,7 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 | Group | Vars |
 |---|---|
 | Trace | `ACD_TRACE`; `ACD_TRACE_DIR` default `<gitDir>/acd/trace` |
-| Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables) |
+| Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables); `ACD_KEEP_DEAD_BRANCH_BARRIERS` truthy disables auto-prune of dead-branch terminals |
 | Capture | `ACD_SENSITIVE_GLOBS`; `ACD_SAFE_IGNORE`; `ACD_SAFE_IGNORE_EXTRA`; `ACD_MAX_PENDING_EVENTS` |
 | AI | `ACD_AI_PROVIDER=deterministic|openai-compat|subprocess:<name>`; `ACD_AI_BASE_URL`; `ACD_AI_API_KEY`; `ACD_AI_MODEL`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS` |
 | Strategy | `ACD_COMMIT_STRATEGY=event|intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=2` |

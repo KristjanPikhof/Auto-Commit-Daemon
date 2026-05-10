@@ -1958,6 +1958,123 @@ func TestRun_BranchSwitchDropsPending(t *testing.T) {
 	}
 }
 
+// TestRun_RuntimeDivergedPrunesDeadBranchTerminals exercises the runtime
+// Diverged-hook end-to-end: the daemon boots on refs/heads/feat-x (created
+// + checked out before the run loop starts), accumulates a blocked_conflict
+// + pending capture_events row tied to that ref, the worktree is then
+// switched back to refs/heads/main AND refs/heads/feat-x deleted from
+// underneath the daemon, and on the next wake the runtime Diverged path
+// prunes the dead-branch rows. This is the regression-against-"P2 #7"
+// coverage gap (the prior dead_branch_sweep_test.go test invoked the helper
+// directly rather than driving the run loop into the runtime Diverged path).
+func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Create refs/heads/feat-x at HEAD and check it out so the daemon's
+	// boot sees feat-x as the active branch.
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/feat-x", seedHead, ""); err != nil {
+		t.Fatalf("update-ref refs/heads/feat-x: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/feat-x"); err != nil {
+		t.Fatalf("symbolic-ref to feat-x: %v", err)
+	}
+
+	// Pre-seed the rows tied to feat-x at generation 1. Boot will load
+	// generation 1 from daemon_meta as well (the very first tick's
+	// SaveBranchGeneration writes 1).
+	seedTerminalEvent(t, f.db, "refs/heads/feat-x", 1, seedHead, "feat-x-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, "refs/heads/feat-x", 1, seedHead, "feat-x-pending.txt", state.EventStatePending)
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	// Wait for the daemon to publish the running mode with branch.head ==
+	// seedHead AND the in-memory token pointing at feat-x. branch.token
+	// is the closure variable observable through MetaKeyBranchToken meta.
+	want := "rev:" + seedHead + " refs/heads/feat-x"
+	waitForMetaValue(t, f.db, MetaKeyBranchToken, want, 5*time.Second)
+
+	// Now switch the worktree back to refs/heads/main and delete feat-x.
+	// The daemon's next tick classifies the change as Diverged (ref change
+	// refs/heads/feat-x -> refs/heads/main on a divergent rev).
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref back to main: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", "refs/heads/feat-x"); err != nil {
+		t.Fatalf("delete refs/heads/feat-x: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Wait for the runtime hook to stamp last_run_ts (the observable
+	// side-effect of a non-empty dead-branch prune). 5s is generous; the
+	// Diverged path runs synchronously inside processBranchTokenChange.
+	deadline := time.Now().Add(5 * time.Second)
+	var sawTS bool
+	for time.Now().Before(deadline) {
+		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyDeadBranchPruneLastRunTS)
+		if ok && v != "" && v != "0" {
+			sawTS = true
+			break
+		}
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !sawTS {
+		t.Fatalf("runtime Diverged hook did not stamp %s within 5s", MetaKeyDeadBranchPruneLastRunTS)
+	}
+
+	// All capture_events rows for the dead ref must be gone — both the
+	// blocked_conflict and the pending — proving pending+terminal pruning
+	// (not just terminals) ran in the runtime path.
+	var total int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, "refs/heads/feat-x",
+	).Scan(&total); err != nil {
+		t.Fatalf("count feat-x rows: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("feat-x rows=%d want 0 after runtime Diverged hook", total)
+	}
+
+	cancel()
+	wg.Wait()
+}
+
 func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	t.Setenv(EnvShadowRetentionGenerations, "0")
 

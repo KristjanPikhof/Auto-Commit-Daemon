@@ -573,6 +573,35 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: persistedGen,
 			})
+			// Prune unpublished rows for the prior generation if its
+			// branch ref has since been deleted. Mirrors the runtime
+			// Diverged hook below so a daemon restart that observes a
+			// Diverged transition into a now-dead branch cleans up
+			// barriers instead of leaving them stuck forever.
+			//
+			// Honor the manual-pause marker: an operator paused mid-
+			// surgery does not want background hygiene to mutate
+			// capture_events while they investigate. A read failure on
+			// the pause state is logged and the prune is skipped (fail
+			// closed — same posture as the run-loop pause gate).
+			startupPruneAllowed := true
+			if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+				logger.Warn("read pause state before startup dead-branch prune; skipping",
+					"err", perr.Error())
+				startupPruneAllowed = false
+			} else if pauseStatus.Active {
+				logger.Info("dead-branch prune skipped (manual pause)",
+					"source", pauseStatus.Source,
+					"reason", pauseStatus.Reason)
+				startupPruneAllowed = false
+			}
+			if startupPruneAllowed {
+				pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB,
+					CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID},
+					tokenBranchRef(prevToken), prevGeneration,
+					logger, tracer,
+					"dead branch unpublished pruned after startup Diverged")
+			}
 		} else if transition == TokenTransitionFastForward {
 			startupFastForwardResync = true
 		}
@@ -660,6 +689,19 @@ func Run(ctx context.Context, opts Options) error {
 		} else if repaired.Applied > 0 || len(repaired.Skipped) > 0 {
 			logger.Info("published live index repair checked", "candidates", repaired.Candidates, "applied", repaired.Applied, "skipped", len(repaired.Skipped))
 		}
+	}
+
+	// The dead-branch sweep used to run synchronously here, before the
+	// main loop. That put two costs on the blocking startup path: a
+	// `git for-each-ref` shell-out and an O(distinct-terminal-pairs) walk
+	// over capture_events. The sweep is now scheduled below as a one-shot
+	// goroutine fired AFTER the running-mode publish so neither cost
+	// counts against the start-latency budget. The env opt-out log still
+	// fires synchronously so operators see the knob even on a no-op
+	// startup.
+	if isKeepDeadBranchBarriers() {
+		logger.Info("dead-branch unpublished pruning disabled by env",
+			"env", EnvKeepDeadBranchBarriers)
 	}
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
@@ -809,6 +851,32 @@ func Run(ctx context.Context, opts Options) error {
 	logger.Info("daemon running",
 		"repo", opts.RepoPath, "pid", pid, "branch", branchRef,
 		"head", headOID, "token", currentToken)
+
+	// Schedule the dead-branch sweep on a one-shot goroutine, AFTER the
+	// "daemon running" log lands, so neither the for-each-ref shell-out
+	// nor the O(N) walk over distinct terminal pairs counts against the
+	// start-latency budget. The goroutine reads ctx — when the daemon
+	// stops the sweep is short-circuited.
+	//
+	// Honor the manual-pause marker first: an operator paused mid-surgery
+	// expects no background mutation to capture_events while they
+	// investigate. A read failure on the pause state is logged and the
+	// sweep is skipped (fail closed — same posture as the run-loop pause
+	// gate).
+	startupSweepCctx := cctx
+	go func(sweepCctx CaptureContext) {
+		if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+			logger.Warn("read pause state before startup dead-branch sweep; skipping",
+				"err", perr.Error())
+			return
+		} else if pauseStatus.Active {
+			logger.Info("startup dead-branch sweep skipped (manual pause)",
+				"source", pauseStatus.Source,
+				"reason", pauseStatus.Reason)
+			return
+		}
+		runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, sweepCctx, logger, tracer)
+	}(startupSweepCctx)
 
 	// lastStampedBranchHead is the most recent value the run loop has
 	// written to MetaKeyBranchHead through the SameGeneration "per-tick
@@ -990,6 +1058,34 @@ func Run(ctx context.Context, opts Options) error {
 				Error:      traceErrString(dropErr),
 				Generation: cctx.BranchGeneration,
 			})
+			// Prune unpublished rows for the prior (branch_ref,
+			// generation) when the prior branch ref no longer resolves.
+			// Avoids phantom blocked_conflict / failed / pending barriers
+			// accumulating after a feature branch is merged and deleted
+			// upstream.
+			//
+			// Honor the manual-pause marker. processBranchTokenChange runs
+			// at section 4d, BEFORE the run-loop pause gate at 4f, so a
+			// runtime Diverged transition can otherwise fire while the
+			// operator has paused for surgery. Skip the prune so paused
+			// operators see no unsolicited capture_events mutation.
+			runtimePruneAllowed := true
+			if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
+				logger.Warn("read pause state before runtime dead-branch prune; skipping",
+					"err", perr.Error())
+				runtimePruneAllowed = false
+			} else if pauseStatus.Active {
+				logger.Info("dead-branch prune skipped (manual pause)",
+					"source", pauseStatus.Source,
+					"reason", pauseStatus.Reason)
+				runtimePruneAllowed = false
+			}
+			if runtimePruneAllowed {
+				pruneDeadBranchTerminals(ctx, opts.RepoPath, opts.DB, cctx,
+					tokenBranchRef(oldToken), prevGeneration,
+					logger, tracer,
+					"dead branch unpublished pruned after Diverged")
+			}
 			if err := SaveBranchGeneration(ctx, opts.DB,
 				cctx.BranchGeneration, headOID); err != nil {
 				logger.Warn("persist bumped branch generation",

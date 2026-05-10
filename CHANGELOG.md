@@ -1,5 +1,22 @@
 # Changelog
 
+## v2026-05-10
+
+### Added
+
+- `acd diagnose` now reports the most recent dead-branch cleanup. JSON output
+  includes `dead_branch_prune_last_run_ts`,
+  `dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`; human
+  output prints a `Dead-branch prune:` row after a cleanup removes rows.
+
+### Fixed
+
+- Deleted feature branches no longer leave phantom replay blockers behind.
+  ACD prunes stale `pending`, `blocked_conflict`, and `failed` rows for dead
+  branch refs during runtime branch changes and daemon startup. Paused repos
+  are left untouched, and `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` keeps the old rows
+  for forensic inspection.
+
 ## v2026-05-08
 
 ### Added

@@ -627,6 +627,138 @@ WHERE state IN ('blocked_conflict', 'failed')
 	return int(n), nil
 }
 
+// PurgeUnpublishedForDeadBranch deletes both pending and terminal
+// (blocked_conflict, failed) capture_events rows for a (branch_ref,
+// branch_generation) pair whose branch ref has since been deleted. Published
+// rows are never touched. If a deleted row was referenced by the
+// publish_state singleton (status='blocked_conflict'), that barrier is
+// lifted and the breadcrumb meta keys (last_replay_conflict,
+// last_replay_conflict_legacy, last_replay_error) are cleared in the same
+// transaction so `acd status` / `acd diagnose` read clean immediately.
+//
+// Empty branchRef returns an error. Returns the total number of capture_events
+// rows deleted (pending + terminal combined). Caller is responsible for
+// confirming the ref is actually dead before invoking — the helper does no
+// liveness check itself.
+//
+// Why pending matters here: leaving pending rows behind while deleting their
+// terminal predecessor lets PendingEvents re-expose them on the next replay
+// pass; replay then re-evaluates them against the (now-irrelevant) prior
+// generation, mismatches in `checkEventGeneration`, and stamps a fresh
+// blocked_conflict, defeating the prune entirely. Pending + terminal must
+// drop together for the dead-branch case.
+func PurgeUnpublishedForDeadBranch(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
+	if branchRef == "" {
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: empty branch_ref")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	blockedSeqs := make(map[int64]struct{})
+	blockedRows, err := tx.QueryContext(ctx, `
+SELECT seq
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state = ?`,
+		branchRef, branchGeneration, EventStateBlockedConflict)
+	if err != nil {
+		return 0, fmt.Errorf("state: load dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	for blockedRows.Next() {
+		var seq int64
+		if err := blockedRows.Scan(&seq); err != nil {
+			_ = blockedRows.Close()
+			return 0, fmt.Errorf("state: scan dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+		}
+		blockedSeqs[seq] = struct{}{}
+	}
+	if err := blockedRows.Close(); err != nil {
+		return 0, fmt.Errorf("state: close dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	if err := blockedRows.Err(); err != nil {
+		return 0, fmt.Errorf("state: iterate dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state IN (?, ?, ?)`,
+		branchRef, branchGeneration,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state: purge unpublished branch %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: purge unpublished branch generation rows: %w", err)
+	}
+
+	// Lift the barrier in publish_state if it referenced a row we just
+	// deleted. The singleton row is keyed at id=1; clear status + error so
+	// `acd status` reads "ok" immediately and the breadcrumbs do not point
+	// at a row that no longer exists. Mirrors the pattern in
+	// internal/cli/purge.go (the operator-driven `acd purge-events`).
+	nowSec := nowSeconds()
+	var pubRows int64
+	if len(blockedSeqs) > 0 {
+		var pubSeq sql.NullInt64
+		var pubBranchRef sql.NullString
+		var pubBranchGeneration sql.NullInt64
+		err = tx.QueryRowContext(ctx, `
+SELECT event_seq, branch_ref, branch_generation
+FROM publish_state
+WHERE id = 1 AND status = 'blocked_conflict'`,
+		).Scan(&pubSeq, &pubBranchRef, &pubBranchGeneration)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, fmt.Errorf("state: load publish_state for dead branch %q: %w", branchRef, err)
+		}
+		if err == nil &&
+			pubSeq.Valid &&
+			pubBranchRef.Valid && pubBranchRef.String == branchRef &&
+			pubBranchGeneration.Valid && pubBranchGeneration.Int64 == branchGeneration {
+			if _, ok := blockedSeqs[pubSeq.Int64]; ok {
+				pubRes, err := tx.ExecContext(ctx, `
+UPDATE publish_state
+SET status = 'ok', error = NULL, updated_ts = ?
+WHERE id = 1
+  AND status = 'blocked_conflict'
+  AND event_seq = ?
+  AND branch_ref = ?
+  AND branch_generation = ?`, nowSec, pubSeq.Int64, branchRef, branchGeneration)
+				if err != nil {
+					return 0, fmt.Errorf("state: clear publish_state for dead branch %q: %w", branchRef, err)
+				}
+				pubRows, _ = pubRes.RowsAffected()
+			}
+		}
+	}
+	if pubRows > 0 {
+		// Drop the human-readable breadcrumbs only when we actually lifted
+		// the singleton barrier — otherwise we'd be clearing breadcrumbs
+		// that belong to a different (live) branch's barrier.
+		for _, key := range []string{
+			"last_replay_conflict",
+			"last_replay_conflict_legacy",
+			"last_replay_error",
+		} {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
+				return 0, fmt.Errorf("state: clear daemon_meta %s for dead branch %q: %w", key, branchRef, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: commit: %w", err)
+	}
+	return int(n), nil
+}
+
 // LatestEventSeq returns the highest seq value present, or 0 if the table is
 // empty. Useful as a smoke-test for monotonic ordering and for the daily
 // rollup window query.
