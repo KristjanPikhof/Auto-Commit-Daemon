@@ -4,25 +4,18 @@
 
 ### Added
 
-- ACD now auto-prunes `pending`, `blocked_conflict`, and `failed` capture
-  rows whose owning branch ref no longer resolves, so `acd status` no longer
-  shows phantom blocked counts after a feature branch is merged and deleted.
-  Pending and terminal drop together in one transaction (and the singleton
-  `publish_state` barrier is lifted when it pointed at a deleted row) so the
-  next replay tick cannot re-stamp a fresh `blocked_conflict` and defeat the
-  prune. Both the runtime `Diverged` transition and a daemon-startup sweep
-  clean up stale rows; the startup sweep now runs on a one-shot goroutine
-  AFTER the running-mode publish (off the start-latency budget) and uses a
-  single `git for-each-ref` for batched ref-set membership instead of
-  per-pair `show-ref`. Both paths honor the manual-pause marker (skip if the
-  operator paused mid-surgery). `acd diagnose --json` surfaces
-  `dead_branch_prune_last_run_ts`, `dead_branch_prune_last_count`, and
-  `dead_branch_prune_last_refs` so the action is visible without grepping
-  logs (the two int fields always render; `0` is the documented "never ran"
-  sentinel). The human renderer prints a one-line `Dead-branch prune:` row
-  when the daemon has run a non-empty prune. Set
-  `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` to opt out and keep dead-branch rows
-  around for forensic inspection.
+- `acd diagnose` now reports the most recent dead-branch cleanup. JSON output
+  includes `dead_branch_prune_last_run_ts`,
+  `dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`; human
+  output prints a `Dead-branch prune:` row after a cleanup removes rows.
+
+### Fixed
+
+- Deleted feature branches no longer leave phantom replay blockers behind.
+  ACD prunes stale `pending`, `blocked_conflict`, and `failed` rows for dead
+  branch refs during runtime branch changes and daemon startup. Paused repos
+  are left untouched, and `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` keeps the old rows
+  for forensic inspection.
 
 ## v2026-05-08
 
