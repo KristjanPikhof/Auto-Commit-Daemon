@@ -1269,6 +1269,67 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 	}
 }
 
+// TestDriftRemediation_OpenCodePiCanonicalPaths locks in that the
+// remediation hints surfaced by `acd doctor` for OpenCode and Pi point at
+// the canonical default hook paths (`~/.config/opencode/hook/hooks.yaml`
+// and `~/.pi/agent/hook/hooks.yaml`). Both the merge-into hint and the
+// destructive cp/backup-then-overwrite recipe must mention the canonical
+// path, never the legacy pre-canonical layout. Guards against silent
+// regressions when the path map is touched.
+func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
+	cases := []struct {
+		harness         string
+		mustContain     []string // every substring must appear in the hint
+		mustNotContain  []string // every substring must NOT appear in the hint
+		expectedSetupCmd string
+	}{
+		{
+			harness: "opencode",
+			mustContain: []string{
+				"acd setup opencode",
+				"merge output into ~/.config/opencode/hook/hooks.yaml",
+				"cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak",
+				"acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
+			},
+			// Legacy bare-`hooks.yaml` form must not leak into either
+			// command. We assert the legacy parent dir without the
+			// canonical `hook/` suffix is absent — the canonical path
+			// itself starts with the same prefix, so we check for the
+			// telltale `~/.config/opencode/hooks.yaml` (no `hook/`).
+			mustNotContain: []string{"~/.config/opencode/hooks.yaml"},
+		},
+		{
+			harness: "pi",
+			mustContain: []string{
+				"acd setup pi",
+				"merge output into ~/.pi/agent/hook/hooks.yaml",
+				"cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak",
+				"acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
+			},
+			mustNotContain: []string{"~/.pi/hook/hooks.yaml"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.harness, func(t *testing.T) {
+			cmd, ok := driftRemediationCommands[tc.harness]
+			if !ok {
+				t.Fatalf("driftRemediationCommands missing entry for %q", tc.harness)
+			}
+			for _, want := range tc.mustContain {
+				if !strings.Contains(cmd, want) {
+					t.Fatalf("%s remediation missing %q\nfull: %s", tc.harness, want, cmd)
+				}
+			}
+			for _, banned := range tc.mustNotContain {
+				if strings.Contains(cmd, banned) {
+					t.Fatalf("%s remediation must not reference legacy path %q\nfull: %s", tc.harness, banned, cmd)
+				}
+			}
+		})
+	}
+}
+
 // stripFirstAcdStart removes the first leading-whitespace `acd start \`
 // line from body — used by YAMLDrift tests to introduce a single drift.
 func stripFirstAcdStart(t *testing.T, body string) string {
