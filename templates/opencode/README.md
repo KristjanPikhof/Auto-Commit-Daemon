@@ -6,10 +6,10 @@ For [`KristjanPikhof/OpenCode-Hooks`](https://github.com/KristjanPikhof/OpenCode
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
 2. Generate snippet: `acd setup opencode`
-3. Merge the printed YAML into `~/.config/opencode/hooks.yaml`
+3. Merge the printed YAML into `~/.config/opencode/hook/hooks.yaml`
 
    **Overwrite warning:** if you redirect `acd setup opencode --raw` straight
-   to `~/.config/opencode/hooks.yaml` with `>`, the entire file is replaced. If
+   to `~/.config/opencode/hook/hooks.yaml` with `>`, the entire file is replaced. If
    you have other hooks or settings in that file, back it up first and merge the
    acd YAML block in manually rather than using `>`.
 
@@ -19,7 +19,7 @@ OpenCode exposes `OPENCODE_SESSION_ID` natively; no jq required.
 
 If you previously installed a snippet that predates the v2026-05-08 release,
 re-run `acd setup opencode` and replace the acd block in
-`~/.config/opencode/hooks.yaml` so the new self-heal hooks take effect. Run
+`~/.config/opencode/hook/hooks.yaml` so the new self-heal hooks take effect. Run
 `acd doctor` to check whether your installed snippet is current; it warns when
 active hooks are missing `acd start` or `acd wake` and shows the remediation
 command.
