@@ -8,6 +8,11 @@
   includes `dead_branch_prune_last_run_ts`,
   `dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`; human
   output prints a `Dead-branch prune:` row after a cleanup removes rows.
+- `acd setup opencode` and `acd setup pi` now print the canonical default hook
+  paths (`~/.config/opencode/hook/hooks.yaml` and
+  `~/.pi/agent/hook/hooks.yaml`). `acd doctor` detects acd-managed hooks at
+  those paths and points remediation guidance at them. Older hook paths remain
+  detected as a secondary fallback during migration.
 
 ### Fixed
 
