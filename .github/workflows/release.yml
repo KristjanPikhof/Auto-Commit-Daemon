@@ -36,5 +36,14 @@ jobs:
           ACD_INSTALL_DIR: ${{ runner.temp }}/acd-smoke-bin
           ACD_VERSION: ${{ github.ref_name }}
         run: |
-          bash scripts/install.sh
+          for attempt in 1 2 3 4 5 6; do
+            if bash scripts/install.sh; then
+              break
+            fi
+            if [ "$attempt" = "6" ]; then
+              exit 1
+            fi
+            echo "install smoke failed; retrying after release asset propagation (attempt $attempt/6)"
+            sleep 10
+          done
           "$ACD_INSTALL_DIR/acd" version
