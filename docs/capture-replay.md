@@ -149,7 +149,7 @@ moment of capture. The daemon classifies each HEAD movement as:
 | Transition | Classification | Effect on queue |
 |---|---|---|
 | New HEAD descends from previous HEAD on the same branch ref | Fast-forward | Generation unchanged; queue remains valid |
-| New HEAD does NOT descend from previous HEAD, or branch ref changes even at the same SHA | Diverged (rebase / reset / branch-switch) | Generation bumped; old-generation events become `blocked_conflict` at replay time |
+| New HEAD does NOT descend from previous HEAD, or branch ref changes even at the same SHA | Diverged (rebase / reset / branch-switch) | Generation bumped; stale pending rows from the old generation are dropped. Terminal rows are preserved while the old ref still exists; if that ref was deleted, ACD prunes stale `pending`, `blocked_conflict`, and `failed` rows for the old ref/generation. |
 | HEAD transitions to or from `missing` (orphan) | Diverged | Same as above |
 
 The generation counter is persisted in `daemon_meta` under `branch.generation`
@@ -171,6 +171,13 @@ while the daemon was offline, generation bumps and `shadow_paths` is reseeded
 before capture resumes. Detached HEAD is treated as a pause: `acd start`
 refuses to register, the daemon stamps `detached_head_paused`, and capture plus
 replay stay disabled until HEAD is attached to a branch again.
+
+Startup also sweeps stale terminal rows whose branch refs no longer exist. That
+cleanup runs after the daemon has published `running`, so it does not sit on the
+start path. It preserves the active branch/generation, preserves any branch ref
+that still exists, and skips entirely when a manual pause marker is active. Set
+`ACD_KEEP_DEAD_BRANCH_BARRIERS=1` before starting the daemon to keep deleted
+branch rows for forensic inspection.
 
 ### Replay pauses
 
@@ -354,6 +361,12 @@ The daemon prunes old `published` rows after `ACD_EVENT_RETENTION_DAYS`
 rows past the same cutoff, but only when deleting them would not expose a later
 pending row that still depends on the terminal barrier. Active barriers remain
 until the operator resolves the conflict or deletes the row intentionally.
+
+Dead-branch cleanup is separate from time-based retention. When the old branch
+ref has been deleted, ACD can remove stale `pending`, `blocked_conflict`, and
+`failed` rows for that old ref/generation together. If the removed blocked row
+is the current `publish_state` blocker, ACD clears that stale singleton too.
+Blockers for live refs are left intact.
 
 ---
 
@@ -866,7 +879,9 @@ poll tick and activates `operation_in_progress`:
 - Pre-rebase `pending` rows for the old generation are **dropped** on the next
   poll tick (stale events cannot replay on top of a rewritten branch).
   `blocked_conflict` and `failed` rows from before the rebase are **preserved**
-  for operator inspection.
+  while the old branch ref still exists. If the old ref has been deleted, ACD
+  prunes stale rows for that old ref/generation unless
+  `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` is set.
 - `shadow_paths` is reseeded from the new HEAD via `BootstrapShadow`, and
   capture resumes from the clean post-rebase state.
 
