@@ -1,6 +1,6 @@
 # Uninstall acd from OpenCode
 
-1. Remove the `# acd-managed: true` block (and the five `acd-*` hooks it added) from your OpenCode-Hooks `hooks.yaml`.
+1. Remove the `# acd-managed: true` block (and the five `acd-*` hooks it added) from your `~/.config/opencode/hook/hooks.yaml`.
 2. Stop any running daemons:
    ~~~bash
    acd stop --all
