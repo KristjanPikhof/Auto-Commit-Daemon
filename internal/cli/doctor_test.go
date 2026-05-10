@@ -1278,9 +1278,9 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 // regressions when the path map is touched.
 func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
 	cases := []struct {
-		harness         string
-		mustContain     []string // every substring must appear in the hint
-		mustNotContain  []string // every substring must NOT appear in the hint
+		harness          string
+		mustContain      []string // every substring must appear in the hint
+		mustNotContain   []string // every substring must NOT appear in the hint
 		expectedSetupCmd string
 	}{
 		{
