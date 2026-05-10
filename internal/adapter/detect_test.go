@@ -189,12 +189,12 @@ func TestCodexInstalls_NeitherFile(t *testing.T) {
 // comment prefix) must NOT be classified as an acd-managed install. The
 // canonical acd templates always write `# acd-managed: true`, so requiring
 // the comment prefix removes the false-positive without breaking any real
-// install.
+// install. Asserts the canonical (`hook/hooks.yaml`) layout.
 func TestDetectInstalled_OpenCodeIgnoresBareYAMLMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	hooks := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	hooks := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir opencode dir: %v", err)
 	}
@@ -210,12 +210,12 @@ func TestDetectInstalled_OpenCodeIgnoresBareYAMLMarker(t *testing.T) {
 }
 
 // TestDetectInstalled_PiIgnoresBareYAMLMarker mirrors the opencode case for
-// the Pi harness path.
+// the Pi harness path. Asserts the canonical (`agent/hook/hooks.yaml`) layout.
 func TestDetectInstalled_PiIgnoresBareYAMLMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	hooks := filepath.Join(home, ".pi", "hook", "hooks.yaml")
+	hooks := filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml")
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir pi dir: %v", err)
 	}
@@ -229,12 +229,13 @@ func TestDetectInstalled_PiIgnoresBareYAMLMarker(t *testing.T) {
 }
 
 // TestDetectInstalled_OpenCodeMatchesCommentMarker confirms the canonical
-// comment-form template still classifies as installed.
+// comment-form template still classifies as installed at the canonical
+// `~/.config/opencode/hook/hooks.yaml` location.
 func TestDetectInstalled_OpenCodeMatchesCommentMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	hooks := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	hooks := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir opencode dir: %v", err)
 	}
@@ -245,6 +246,145 @@ func TestDetectInstalled_OpenCodeMatchesCommentMarker(t *testing.T) {
 	got := DetectInstalled()
 	if len(got) != 1 || got[0].Name() != "opencode" {
 		t.Fatalf("DetectInstalled=%#v, want opencode only", got)
+	}
+	// ConfigPath() must report the canonical primary, regardless of where
+	// the marker lives — doctor uses this to surface remediation hints.
+	if path := got[0].ConfigPath(); path != hooks {
+		t.Fatalf("ConfigPath=%q, want canonical %q", path, hooks)
+	}
+}
+
+// TestDetectInstalled_OpenCodeLegacyPath confirms a marker at the
+// pre-canonical legacy path (~/.config/opencode/hooks.yaml) still detects as
+// installed so users mid-migration are not silently dropped from doctor's
+// view. ConfigPath() still reports the canonical primary so remediation
+// nudges them forward.
+func TestDetectInstalled_OpenCodeLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "opencode" {
+		t.Fatalf("DetectInstalled=%#v, want opencode only via legacy path", got)
+	}
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	if path := got[0].ConfigPath(); path != canonical {
+		t.Fatalf("ConfigPath=%q, want canonical %q (legacy must not steer remediation)", path, canonical)
+	}
+}
+
+// TestDetectInstalled_OpenCodeCanonicalWinsOverLegacy asserts the pathSpec
+// ordering: when both files exist with the marker, the canonical primary is
+// effectively chosen for ConfigPath. Detection still succeeds.
+func TestDetectInstalled_OpenCodeCanonicalWinsOverLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write canonical hooks.yaml: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "opencode" {
+		t.Fatalf("DetectInstalled=%#v, want opencode only", got)
+	}
+	if path := got[0].ConfigPath(); path != canonical {
+		t.Fatalf("ConfigPath=%q, want canonical primary %q", path, canonical)
+	}
+}
+
+// TestDetectInstalled_PiMatchesCommentMarker confirms the canonical Pi
+// install at ~/.pi/agent/hook/hooks.yaml is detected.
+func TestDetectInstalled_PiMatchesCommentMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir pi dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "pi" {
+		t.Fatalf("DetectInstalled=%#v, want pi only", got)
+	}
+	if path := got[0].ConfigPath(); path != hooks {
+		t.Fatalf("ConfigPath=%q, want canonical %q", path, hooks)
+	}
+}
+
+// TestDetectInstalled_PiLegacyPath confirms a marker at the pre-canonical
+// legacy Pi path (~/.pi/hook/hooks.yaml) still detects so users mid-
+// migration are not silently dropped. ConfigPath() returns the canonical
+// primary regardless.
+func TestDetectInstalled_PiLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	legacy := filepath.Join(home, ".pi", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir pi dir: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "pi" {
+		t.Fatalf("DetectInstalled=%#v, want pi only via legacy path", got)
+	}
+	canonical := filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml")
+	if path := got[0].ConfigPath(); path != canonical {
+		t.Fatalf("ConfigPath=%q, want canonical %q (legacy must not steer remediation)", path, canonical)
+	}
+}
+
+// TestDetectInstalled_PiCanonicalWinsOverLegacy mirrors the OpenCode
+// ordering test for Pi.
+func TestDetectInstalled_PiCanonicalWinsOverLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonical := filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml")
+	legacy := filepath.Join(home, ".pi", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir canonical pi dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir legacy pi dir: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write canonical hooks.yaml: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "pi" {
+		t.Fatalf("DetectInstalled=%#v, want pi only", got)
+	}
+	if path := got[0].ConfigPath(); path != canonical {
+		t.Fatalf("ConfigPath=%q, want canonical primary %q", path, canonical)
 	}
 }
 
