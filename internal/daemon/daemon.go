@@ -863,7 +863,8 @@ func Run(ctx context.Context, opts Options) error {
 	// investigate. A read failure on the pause state is logged and the
 	// sweep is skipped (fail closed — same posture as the run-loop pause
 	// gate).
-	go func() {
+	startupSweepCctx := cctx
+	go func(sweepCctx CaptureContext) {
 		if pauseStatus, perr := daemonPauseState(ctx, opts.GitDir, opts.DB); perr != nil {
 			logger.Warn("read pause state before startup dead-branch sweep; skipping",
 				"err", perr.Error())
@@ -874,8 +875,8 @@ func Run(ctx context.Context, opts Options) error {
 				"reason", pauseStatus.Reason)
 			return
 		}
-		runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, cctx, logger, tracer)
-	}()
+		runStartupDeadBranchSweep(ctx, opts.RepoPath, opts.DB, sweepCctx, logger, tracer)
+	}(startupSweepCctx)
 
 	// lastStampedBranchHead is the most recent value the run loop has
 	// written to MetaKeyBranchHead through the SameGeneration "per-tick
