@@ -181,16 +181,14 @@ It reports the current git `HEAD` branch, the daemon's persisted branch anchor,
 blocked-conflict counts by `error_class`, failed terminal barriers, the five
 most recent blocked or failed events, and the most recent dead-branch prune
 (`dead_branch_prune_last_run_ts`, `dead_branch_prune_last_count`,
-`dead_branch_prune_last_refs`). ACD auto-prunes `pending`, `blocked_conflict`,
-and `failed` rows whose branch ref has been deleted — pending and terminal
-drop together so the next replay tick cannot re-stamp a fresh
-`blocked_conflict` and defeat the prune. Phantom blocked counts no longer
-linger after a merged feature branch is removed. Set
-`ACD_KEEP_DEAD_BRANCH_BARRIERS=1` to keep those rows around for forensic
-inspection. The two int fields render as `0` when the daemon has never
-recorded a non-empty prune (zero IS the meaningful "never ran" value); the
-refs slice is omitted from the JSON when empty. If the daemon is stopped and the
-plan looks right, recover a stale anchor with an automatic backup:
+`dead_branch_prune_last_refs`). ACD prunes stale `pending`,
+`blocked_conflict`, and `failed` rows for deleted branch refs, so phantom
+blocked counts no longer linger after a merged feature branch is removed.
+Paused repos are left untouched. Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` to keep
+dead-branch rows for forensic inspection. The two int fields render as `0` when
+the daemon has never recorded a non-empty prune; the refs slice is omitted from
+JSON when empty. If the daemon is stopped and the plan looks right, recover a
+stale anchor with an automatic backup:
 
 ~~~bash
 acd recover --repo . --auto --dry-run
@@ -433,7 +431,7 @@ Notes:
 
 ## Status
 
-Active development. 
+Active development.
 - First tag: `v2026-04-28` - Last tag: `v2026-05-08`
 
 ## License
