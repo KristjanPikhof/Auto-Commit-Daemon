@@ -17,12 +17,15 @@ import (
 //   - All rows for a different branch_ref are untouched.
 //   - All rows for a different branch_generation are untouched.
 //   - An empty branchRef returns an error and deletes nothing.
-//   - When publish_state.status='blocked_conflict' AT id=1, the helper lifts
-//     the singleton barrier (status->'ok', error->NULL) and clears the
-//     last_replay_conflict / last_replay_conflict_legacy / last_replay_error
-//     breadcrumbs in the same transaction.
+//   - When publish_state.status='blocked_conflict' AT id=1 references a deleted
+//     blocked row for the exact pair, the helper lifts the singleton barrier
+//     (status->'ok', error->NULL) and clears the last_replay_conflict /
+//     last_replay_conflict_legacy / last_replay_error breadcrumbs in the same
+//     transaction.
 //   - When publish_state status is NOT 'blocked_conflict', the breadcrumbs
 //     are left intact (they may belong to a different live barrier).
+//   - When publish_state.status='blocked_conflict' references a different pair,
+//     the live barrier and breadcrumbs are left intact.
 func TestPurgeUnpublishedForDeadBranch(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -222,6 +225,90 @@ func TestPurgeUnpublishedForDeadBranch(t *testing.T) {
 		}
 		if !ok || v != "live" {
 			t.Fatalf("breadcrumb was cleared but publish_state was not in blocked_conflict; got ok=%v v=%q", ok, v)
+		}
+	})
+
+	// A dead-branch purge must not lift a live branch's blocked singleton just
+	// because publish_state happens to be blocked_conflict.
+	t.Run("live_blocked_publish_state_preserved", func(t *testing.T) {
+		d4, _ := openTestDB(t)
+		deadSeq, err := AppendCaptureEvent(ctx, d4, CaptureEvent{
+			BranchRef:        "refs/heads/dead3",
+			BranchGeneration: 1,
+			BaseHead:         "abc",
+			Operation:        "modify",
+			Path:             "dead3.txt",
+			Fidelity:         "exact",
+			State:            EventStateBlockedConflict,
+		}, []CaptureOp{{Op: "modify", Path: "dead3.txt", Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append dead: %v", err)
+		}
+		liveSeq, err := AppendCaptureEvent(ctx, d4, CaptureEvent{
+			BranchRef:        "refs/heads/live",
+			BranchGeneration: 7,
+			BaseHead:         "def",
+			Operation:        "modify",
+			Path:             "live.txt",
+			Fidelity:         "exact",
+			State:            EventStateBlockedConflict,
+		}, []CaptureOp{{Op: "modify", Path: "live.txt", Fidelity: "exact"}})
+		if err != nil {
+			t.Fatalf("append live: %v", err)
+		}
+		if err := MarkEventBlocked(ctx, d4, liveSeq, "live blocker", nowSeconds(),
+			sql.NullString{String: "refs/heads/live", Valid: true},
+			sql.NullInt64{Int64: 7, Valid: true},
+			sql.NullString{String: "def", Valid: true}); err != nil {
+			t.Fatalf("MarkEventBlocked live: %v", err)
+		}
+		for _, key := range []string{
+			"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error",
+		} {
+			if err := MetaSet(ctx, d4, key, "live"); err != nil {
+				t.Fatalf("seed live meta %q: %v", key, err)
+			}
+		}
+
+		n, err := PurgeUnpublishedForDeadBranch(ctx, d4, "refs/heads/dead3", 1)
+		if err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("deleted=%d want 1", n)
+		}
+		var deadCount int
+		if err := d4.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, deadSeq,
+		).Scan(&deadCount); err != nil {
+			t.Fatalf("count dead row: %v", err)
+		}
+		if deadCount != 0 {
+			t.Fatalf("dead blocked row survived; count=%d", deadCount)
+		}
+
+		var status, branchRef string
+		var eventSeq, branchGeneration int64
+		var errMsg sql.NullString
+		if err := d4.SQL().QueryRowContext(ctx,
+			`SELECT event_seq, branch_ref, branch_generation, status, error FROM publish_state WHERE id = 1`,
+		).Scan(&eventSeq, &branchRef, &branchGeneration, &status, &errMsg); err != nil {
+			t.Fatalf("read publish_state: %v", err)
+		}
+		if eventSeq != liveSeq || branchRef != "refs/heads/live" || branchGeneration != 7 || status != "blocked_conflict" || !errMsg.Valid {
+			t.Fatalf("live publish_state changed: seq=%d branch=%q gen=%d status=%q err_valid=%v",
+				eventSeq, branchRef, branchGeneration, status, errMsg.Valid)
+		}
+		for _, key := range []string{
+			"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error",
+		} {
+			v, ok, err := MetaGet(ctx, d4, key)
+			if err != nil {
+				t.Fatalf("MetaGet %q: %v", key, err)
+			}
+			if !ok || v != "live" {
+				t.Fatalf("live breadcrumb %q changed: ok=%v v=%q", key, ok, v)
+			}
 		}
 	})
 }
