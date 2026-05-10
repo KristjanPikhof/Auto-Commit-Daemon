@@ -566,9 +566,9 @@ func TestSetup_OpenCode_AcdManagedMarker(t *testing.T) {
 
 func TestSetup_OpenCode_FooterInstructions(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "opencode")
-	// README says "hooks.yaml"
-	if !strings.Contains(out, "hooks.yaml") {
-		t.Errorf("footer missing 'hooks.yaml' in output:\n%s", out)
+	// README says "~/.config/opencode/hook/hooks.yaml"
+	if !strings.Contains(out, ".config/opencode/hook/hooks.yaml") {
+		t.Errorf("footer missing '.config/opencode/hook/hooks.yaml' in output:\n%s", out)
 	}
 }
 
@@ -658,9 +658,9 @@ func TestSetup_Pi_AcdManagedMarker(t *testing.T) {
 
 func TestSetup_Pi_FooterInstructions(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "pi")
-	// README says ".pi/hook/hooks.yaml"
-	if !strings.Contains(out, ".pi/hook/hooks.yaml") {
-		t.Errorf("footer missing '.pi/hook/hooks.yaml' in output:\n%s", out)
+	// README says ".pi/agent/hook/hooks.yaml"
+	if !strings.Contains(out, ".pi/agent/hook/hooks.yaml") {
+		t.Errorf("footer missing '.pi/agent/hook/hooks.yaml' in output:\n%s", out)
 	}
 }
 

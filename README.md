@@ -47,15 +47,15 @@ acd setup shell         # universal direnv / zshrc fallback
 
 ### Supported harnesses
 
-| Harness | Hook engine | Source |
-|---|---|---|
-| `claude-code` | Claude Code native hooks (`~/.claude/settings.json`) | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
-| `codex` | Codex hooks v2 (`~/.codex/hooks.json`; legacy `~/.codex/config.toml` still detected). Run `/hooks` inside Codex after every install or re-install to approve newly-written acd hooks — Codex re-flags all entries as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
-| `opencode` | OpenCode-Hooks YAML engine (`~/.config/opencode/hooks.yaml`) | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
-| `pi` | Pi-YAML-Hooks YAML engine (`~/.pi/hook/hooks.yaml`) | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
-| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` fallback | n/a (no harness required) |
+| Harness | Hook support | Install location | Source |
+|---|---|---|---|
+| `claude-code` | Native hooks (default, no extra engine required) | `~/.claude/settings.json` — managed block via `acd setup claude-code` | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
+| `codex` | Native hooks (default, no extra engine required) | `~/.codex/hooks.json`. Run `/hooks` inside Codex after every install to approve entries — Codex re-flags all hooks as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
+| `opencode` | External engine: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) (default) | `~/.config/opencode/hook/hooks.yaml` | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
+| `pi` | External engine: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) (default) | `~/.pi/agent/hook/hooks.yaml` | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
+| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` / `~/.bashrc` fallback | `~/.zshrc` / `~/.bashrc` + direnv snippet | n/a (no harness required) |
 
-Install the hook engine first (Codex, Claude Code, OpenCode-Hooks, Pi-YAML-Hooks), then run the matching `acd setup …` to wire `acd` into it.
+ACD supports Claude Code and Codex via their native hook systems by default. OpenCode and Pi are supported via the external hook engines [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) and [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) respectively; install the engine first, then run the matching `acd setup …` to wire `acd` into it.
 
 Run `acd doctor` to check whether your installed snippet is current. It warns when active hooks are missing `acd start` or `acd wake`, and shows the remediation command per harness.
 
