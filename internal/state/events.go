@@ -657,6 +657,32 @@ func PurgeUnpublishedForDeadBranch(ctx context.Context, d *DB, branchRef string,
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	blockedSeqs := make(map[int64]struct{})
+	blockedRows, err := tx.QueryContext(ctx, `
+SELECT seq
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state = ?`,
+		branchRef, branchGeneration, EventStateBlockedConflict)
+	if err != nil {
+		return 0, fmt.Errorf("state: load dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	for blockedRows.Next() {
+		var seq int64
+		if err := blockedRows.Scan(&seq); err != nil {
+			_ = blockedRows.Close()
+			return 0, fmt.Errorf("state: scan dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+		}
+		blockedSeqs[seq] = struct{}{}
+	}
+	if err := blockedRows.Close(); err != nil {
+		return 0, fmt.Errorf("state: close dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+	if err := blockedRows.Err(); err != nil {
+		return 0, fmt.Errorf("state: iterate dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
+	}
+
 	res, err := tx.ExecContext(ctx, `
 DELETE FROM capture_events
 WHERE branch_ref = ?
@@ -679,14 +705,39 @@ WHERE branch_ref = ?
 	// at a row that no longer exists. Mirrors the pattern in
 	// internal/cli/purge.go (the operator-driven `acd purge-events`).
 	nowSec := nowSeconds()
-	pubRes, err := tx.ExecContext(ctx, `
+	var pubRows int64
+	if len(blockedSeqs) > 0 {
+		var pubSeq sql.NullInt64
+		var pubBranchRef sql.NullString
+		var pubBranchGeneration sql.NullInt64
+		err = tx.QueryRowContext(ctx, `
+SELECT event_seq, branch_ref, branch_generation
+FROM publish_state
+WHERE id = 1 AND status = 'blocked_conflict'`,
+		).Scan(&pubSeq, &pubBranchRef, &pubBranchGeneration)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, fmt.Errorf("state: load publish_state for dead branch %q: %w", branchRef, err)
+		}
+		if err == nil &&
+			pubSeq.Valid &&
+			pubBranchRef.Valid && pubBranchRef.String == branchRef &&
+			pubBranchGeneration.Valid && pubBranchGeneration.Int64 == branchGeneration {
+			if _, ok := blockedSeqs[pubSeq.Int64]; ok {
+				pubRes, err := tx.ExecContext(ctx, `
 UPDATE publish_state
 SET status = 'ok', error = NULL, updated_ts = ?
-WHERE id = 1 AND status = 'blocked_conflict'`, nowSec)
-	if err != nil {
-		return 0, fmt.Errorf("state: clear publish_state for dead branch %q: %w", branchRef, err)
+WHERE id = 1
+  AND status = 'blocked_conflict'
+  AND event_seq = ?
+  AND branch_ref = ?
+  AND branch_generation = ?`, nowSec, pubSeq.Int64, branchRef, branchGeneration)
+				if err != nil {
+					return 0, fmt.Errorf("state: clear publish_state for dead branch %q: %w", branchRef, err)
+				}
+				pubRows, _ = pubRes.RowsAffected()
+			}
+		}
 	}
-	pubRows, _ := pubRes.RowsAffected()
 	if pubRows > 0 {
 		// Drop the human-readable breadcrumbs only when we actually lifted
 		// the singleton barrier — otherwise we'd be clearing breadcrumbs
