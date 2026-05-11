@@ -71,13 +71,29 @@ var knownHarnesses = []knownHarness{
 	},
 	{
 		name: "opencode",
+		// Canonical OpenCode default is ~/.config/opencode/hook/hooks.yaml
+		// (note the `hook/` segment). The pre-canonical layout
+		// ~/.config/opencode/hooks.yaml ships as a SECONDARY legacy
+		// fallback so a user mid-migration still detects as installed and
+		// `acd doctor` can steer them to the canonical path. ConfigPath()
+		// always returns the primary candidate so remediation hints point
+		// at the canonical location regardless of which file holds the
+		// existing marker.
 		paths: []pathSpec{
+			{path: "~/.config/opencode/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+			// legacy fallback (pre-canonical default).
 			{path: "~/.config/opencode/hooks.yaml", markers: yamlAcdManagedMarkers},
 		},
 	},
 	{
 		name: "pi",
+		// Canonical Pi default is ~/.pi/agent/hook/hooks.yaml. The
+		// pre-canonical ~/.pi/hook/hooks.yaml stays as a SECONDARY legacy
+		// fallback so existing installs still register; doctor remediation
+		// uses the canonical path so users are nudged forward.
 		paths: []pathSpec{
+			{path: "~/.pi/agent/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+			// legacy fallback (pre-canonical default).
 			{path: "~/.pi/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
 		},
 	},

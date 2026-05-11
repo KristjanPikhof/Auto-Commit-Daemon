@@ -8,6 +8,22 @@
   includes `dead_branch_prune_last_run_ts`,
   `dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`; human
   output prints a `Dead-branch prune:` row after a cleanup removes rows.
+- `acd setup opencode` and `acd setup pi` now print the canonical default hook
+  paths (`~/.config/opencode/hook/hooks.yaml` and
+  `~/.pi/agent/hook/hooks.yaml`). `acd doctor` detects acd-managed hooks at
+  those paths and points remediation guidance at them. Older hook paths remain
+  detected as a secondary fallback during migration.
+- `acd doctor` now surfaces the actual file that carries the acd marker when
+  it differs from the canonical primary. JSON adds a `matched_path` field on
+  each harness report; human output prints a `marker found at` line. Drift
+  scans run against the matched file, and remediation switches to a
+  merge-only nudge toward the canonical path so users on a legacy fallback
+  are never told to overwrite a non-canonical file they hand-authored.
+- `README.md`, `templates/opencode/README.md`, and `templates/pi/README.md`
+  now document the `# acd-managed: true` marker requirement and explain how
+  to recover when `acd doctor` reports detection as `no` despite the hook
+  file existing. The README harness table splits "hook support" (native vs
+  external engine) from install location for clearer onboarding.
 
 ### Fixed
 
@@ -18,6 +34,10 @@
   for forensic inspection.
 
 ## v2026-05-08
+
+> **Note:** The hook paths named in the doctor and setup items below were updated in
+> [v2026-05-10](#v2026-05-10), which is the current canonical reference for OpenCode
+> (`~/.config/opencode/hook/hooks.yaml`) and Pi (`~/.pi/agent/hook/hooks.yaml`) paths.
 
 ### Added
 

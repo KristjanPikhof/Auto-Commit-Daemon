@@ -29,8 +29,8 @@ go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest
 ~~~bash
 acd setup claude-code   # paste output into ~/.claude/settings.json
 acd setup codex         # paste output into ~/.codex/hooks.json
-acd setup opencode      # paste output into your OpenCode-Hooks hooks.yaml
-acd setup pi            # paste output into your .pi/hook/hooks.yaml
+acd setup opencode      # paste output into ~/.config/opencode/hook/hooks.yaml
+acd setup pi            # paste output into ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
@@ -47,17 +47,29 @@ acd setup shell         # universal direnv / zshrc fallback
 
 ### Supported harnesses
 
-| Harness | Hook engine | Source |
-|---|---|---|
-| `claude-code` | Claude Code native hooks (`~/.claude/settings.json`) | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
-| `codex` | Codex hooks v2 (`~/.codex/hooks.json`; legacy `~/.codex/config.toml` still detected). Run `/hooks` inside Codex after every install or re-install to approve newly-written acd hooks — Codex re-flags all entries as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
-| `opencode` | OpenCode-Hooks YAML engine (`~/.config/opencode/hooks.yaml`) | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
-| `pi` | Pi-YAML-Hooks YAML engine (`~/.pi/hook/hooks.yaml`) | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
-| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` fallback | n/a (no harness required) |
+| Harness | Hook support | Install location | Source |
+|---|---|---|---|
+| `claude-code` | Native hooks (default, no extra engine required) | `~/.claude/settings.json` — managed block via `acd setup claude-code` | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
+| `codex` | Native hooks (default, no extra engine required) | `~/.codex/hooks.json`. Run `/hooks` inside Codex after every install to approve entries — Codex re-flags all hooks as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
+| `opencode` | External engine: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) (default) | `~/.config/opencode/hook/hooks.yaml` | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
+| `pi` | External engine: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) (default) | `~/.pi/agent/hook/hooks.yaml` | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
+| `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` / `~/.bashrc` fallback | `~/.zshrc` / `~/.bashrc` + direnv snippet | n/a (no harness required) |
 
-Install the hook engine first (Codex, Claude Code, OpenCode-Hooks, Pi-YAML-Hooks), then run the matching `acd setup …` to wire `acd` into it.
+ACD supports Claude Code and Codex via their native hook systems by default. OpenCode and Pi are supported via the external hook engines [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) and [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) respectively; install the engine first, then run the matching `acd setup …` to wire `acd` into it.
 
 Run `acd doctor` to check whether your installed snippet is current. It warns when active hooks are missing `acd start` or `acd wake`, and shows the remediation command per harness.
+
+**Hook file detected but `acd doctor` still reports detection as `no`?** The hook
+file is missing the `# acd-managed: true` marker on its first line, so `acd
+doctor` cannot recognise it as an acd-managed file. To fix this, either:
+
+- **Prepend the marker manually** — open the hook file in an editor and add
+  `# acd-managed: true` as the very first line.
+- **Re-run setup and merge** — run `acd setup <harness>` (no `>`), copy the
+  printed snippet, and merge the acd block into your existing hook file.
+
+  **Do not use `>` to redirect** when you have custom hooks — redirecting with
+  `>` overwrites the entire file and destroys any existing entries.
 
 ## Use it
 

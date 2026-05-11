@@ -74,6 +74,15 @@ type doctorHarnessReport struct {
 	ConfigReadable bool   `json:"config_readable"`
 	MarkerFound    bool   `json:"marker_found"`
 	Installed      bool   `json:"installed"`
+	// MatchedPath is the candidate path that actually carried the acd
+	// marker on disk, when it differs from ConfigPath (i.e., the marker
+	// lives on a legacy fallback path rather than the canonical primary).
+	// Empty when the marker is on the canonical ConfigPath or no marker
+	// was found. JSON consumers use this to learn which file the user
+	// must edit; the text renderer surfaces it as a "marker found at"
+	// line so users know remediation will be a merge-only nudge toward
+	// the canonical layout.
+	MatchedPath string `json:"matched_path,omitempty"`
 	// ConfigReadError carries the os.ReadFile error string when the
 	// primary config exists (ConfigPresent=true) but we could not read
 	// it (EACCES / EIO / etc). When non-empty, ConfigReadable is false
@@ -262,8 +271,12 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 
 func collectDoctorHarnesses() []doctorHarnessReport {
 	detected := map[string]bool{}
+	matched := map[string]string{}
 	for _, h := range adapter.DetectInstalled() {
 		detected[h.Name()] = true
+		if mp, ok := h.MatchedPath(); ok {
+			matched[h.Name()] = mp
+		}
 	}
 
 	reports := make([]doctorHarnessReport, 0, len(supportedHarnesses))
@@ -277,6 +290,14 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			Name:       name,
 			ConfigPath: path,
 		}
+		// If the marker lives on a candidate path that differs from
+		// ConfigPath (e.g., the legacy fallback), surface it so the user
+		// learns which file to edit. Doctor scans drift against the file
+		// that actually carries the marker.
+		matchedPath := matched[name]
+		if matchedPath != "" && matchedPath != path {
+			hr.MatchedPath = matchedPath
+		}
 		body, err := os.ReadFile(path)
 		switch {
 		case err == nil:
@@ -289,7 +310,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Installed = true
 			}
 			if hr.Installed {
-				if note := scanHookBodyDrift(name, body); note != "" {
+				driftBody := body
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						driftBody = mb
+					}
+				}
+				if note := scanHookBodyDriftAt(name, driftBody, hr.MatchedPath); note != "" {
 					hr.Notes = append(hr.Notes, note)
 				}
 			}
@@ -297,6 +324,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			if detected[name] {
 				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
 				hr.Installed = true
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
+							hr.Notes = append(hr.Notes, note)
+						}
+					}
+				}
 			}
 		default:
 			// Permission-denied / EIO / other read errors must not silently
@@ -312,6 +346,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			hr.Notes = append(hr.Notes, "primary-path read failed: "+err.Error()+"; using alternate-path detection")
 			if detected[name] {
 				hr.Installed = true
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
+							hr.Notes = append(hr.Notes, note)
+						}
+					}
+				}
 			}
 		}
 
@@ -337,8 +378,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 var driftRemediationCommands = map[string]string{
 	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
 	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
-	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hooks.yaml; to overwrite: cp ~/.config/opencode/hooks.yaml ~/.config/opencode/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hooks.yaml",
-	"pi":          "acd setup pi  # merge output into ~/.pi/hook/hooks.yaml; to overwrite: cp ~/.pi/hook/hooks.yaml ~/.pi/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/hook/hooks.yaml",
+	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
+	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
@@ -354,6 +395,16 @@ var driftRemediationCommands = map[string]string{
 // active-hook concept (shell), or when the config cannot be parsed at all
 // (we leave silent rather than scream — drift detection is opportunistic).
 func scanHookBodyDrift(name string, body []byte) string {
+	return scanHookBodyDriftAt(name, body, "")
+}
+
+// scanHookBodyDriftAt is the legacy-aware variant of scanHookBodyDrift. When
+// matchedPath is non-empty (the marker lives on a path other than the
+// canonical primary), the returned note names the matched file in a merge-
+// only remediation so we never recommend a destructive overwrite of a user-
+// authored canonical file. When matchedPath is empty, behaves identically to
+// the canonical-path remediation.
+func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	bodies := extractActiveHookBodies(name, body)
 	if len(bodies) == 0 {
 		return ""
@@ -366,6 +417,12 @@ func scanHookBodyDrift(name string, body []byte) string {
 	}
 	if stale == 0 {
 		return ""
+	}
+	if matchedPath != "" {
+		// Marker lives on a non-canonical (legacy) path. Recommend a merge
+		// into the matched file only — never an overwrite that could blow
+		// away a user's canonical config they have not migrated yet.
+		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake' at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
 	}
 	cmd, ok := driftRemediationCommands[name]
 	if !ok {
@@ -1099,6 +1156,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 			installed = "yes"
 		}
 		fmt.Fprintf(out, "    %-11s : %s (%s)\n", h.Name, installed, homeShort(h.ConfigPath))
+		if h.MatchedPath != "" && h.MatchedPath != h.ConfigPath {
+			fmt.Fprintf(out, "                  marker found at: %s\n", homeShort(h.MatchedPath))
+		}
 		if len(h.Notes) > 0 {
 			fmt.Fprintf(out, "                  notes: %s\n", strings.Join(h.Notes, "; "))
 		}
@@ -1496,6 +1556,9 @@ func sanitizeReport(r doctorReport) doctorReport {
 	for _, h := range r.Harnesses {
 		c := h
 		c.ConfigPath = homeShort(h.ConfigPath)
+		if h.MatchedPath != "" {
+			c.MatchedPath = homeShort(h.MatchedPath)
+		}
 		harnesses = append(harnesses, c)
 	}
 	out.Harnesses = harnesses

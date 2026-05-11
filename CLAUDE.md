@@ -155,8 +155,8 @@ acd status --repo .
 |---|---|---|---|---|
 | Claude Code | `SessionStart -> acd start` fail-soft | `Pre/PostToolUse`: and-chain + log fallback | `Stop -> acd touch`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON |
 | Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`PreToolUse`/`PostToolUse`; matcher `apply_patch\|Edit\|Write\|Bash` on `PreToolUse` only; mkdir gated | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s |
-| OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`; `~/.config/opencode/hooks.yaml` |
-| Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`; no `uuidgen`; `~/.pi/hook/hooks.yaml` |
+| OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`; `~/.config/opencode/hook/hooks.yaml` |
+| Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`; no `uuidgen`; `~/.pi/agent/hook/hooks.yaml` |
 
 Active-hook body:
 
