@@ -1405,12 +1405,22 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 // destructive cp/backup-then-overwrite recipe must mention the canonical
 // path, never the legacy pre-canonical layout. Guards against silent
 // regressions when the path map is touched.
+//
+// The legacy-leak check is performed via token-suffix validation, not a
+// loose `strings.Contains` substring check: every path token that follows
+// `merge output into `, `cp `, or `--raw > ` must end with the canonical
+// `/hook/hooks.yaml` (opencode) or `/agent/hook/hooks.yaml` (pi). This
+// tighter assertion would catch a regression where the format changes in
+// a way the legacy bare `hooks.yaml` leaks in but the legacy substring
+// happens to also appear as a prefix of the canonical path (which it
+// does: `~/.config/opencode/hooks.yaml` is a suffix of nothing legitimate
+// but a future format like `~/.config/opencode/hooks.yaml.tmpl` would
+// confuse a naive Contains check).
 func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
 	cases := []struct {
-		harness          string
-		mustContain      []string // every substring must appear in the hint
-		mustNotContain   []string // every substring must NOT appear in the hint
-		expectedSetupCmd string
+		harness            string
+		mustContain        []string // every substring must appear in the hint
+		canonicalPathToken string   // each extracted path token must end with this
 	}{
 		{
 			harness: "opencode",
@@ -1420,12 +1430,7 @@ func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
 				"cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak",
 				"acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
 			},
-			// Legacy bare-`hooks.yaml` form must not leak into either
-			// command. We assert the legacy parent dir without the
-			// canonical `hook/` suffix is absent — the canonical path
-			// itself starts with the same prefix, so we check for the
-			// telltale `~/.config/opencode/hooks.yaml` (no `hook/`).
-			mustNotContain: []string{"~/.config/opencode/hooks.yaml"},
+			canonicalPathToken: "/hook/hooks.yaml",
 		},
 		{
 			harness: "pi",
@@ -1435,7 +1440,7 @@ func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
 				"cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak",
 				"acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
 			},
-			mustNotContain: []string{"~/.pi/hook/hooks.yaml"},
+			canonicalPathToken: "/agent/hook/hooks.yaml",
 		},
 	}
 	for _, tc := range cases {
@@ -1450,13 +1455,62 @@ func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
 					t.Fatalf("%s remediation missing %q\nfull: %s", tc.harness, want, cmd)
 				}
 			}
-			for _, banned := range tc.mustNotContain {
-				if strings.Contains(cmd, banned) {
-					t.Fatalf("%s remediation must not reference legacy path %q\nfull: %s", tc.harness, banned, cmd)
+			// Tighter assertion: extract every path-shaped token that
+			// appears after `merge output into `, `cp `, or `--raw > ` and
+			// confirm it ends with the canonical suffix. A leaked legacy
+			// token would end in `/hooks.yaml` (opencode) or `/hook/hooks.yaml`
+			// (pi) which differ from the canonical suffix.
+			tokens := extractPathTokensAfter(t, cmd, []string{
+				"merge output into ",
+				"cp ",
+				"--raw > ",
+			})
+			if len(tokens) == 0 {
+				t.Fatalf("%s remediation: extracted 0 path tokens\nfull: %s", tc.harness, cmd)
+			}
+			for _, tok := range tokens {
+				// Strip the `.bak` suffix used by the cp recipe so the
+				// canonical-suffix check applies uniformly to backup paths.
+				normalized := strings.TrimSuffix(tok, ".bak")
+				if !strings.HasSuffix(normalized, tc.canonicalPathToken) {
+					t.Fatalf("%s remediation path token %q does not end with canonical suffix %q\nfull: %s",
+						tc.harness, tok, tc.canonicalPathToken, cmd)
 				}
 			}
 		})
 	}
+}
+
+// extractPathTokensAfter scans s for each marker in markers and returns
+// every whitespace-bounded token that immediately follows. Used to assert
+// that every path mentioned in a remediation hint is the canonical one.
+func extractPathTokensAfter(t *testing.T, s string, markers []string) []string {
+	t.Helper()
+	var out []string
+	for _, m := range markers {
+		rest := s
+		for {
+			idx := strings.Index(rest, m)
+			if idx < 0 {
+				break
+			}
+			after := rest[idx+len(m):]
+			// The token runs until the next whitespace, semicolon, or
+			// end-of-string.
+			end := len(after)
+			for i, r := range after {
+				if r == ' ' || r == '\t' || r == ';' || r == '\n' {
+					end = i
+					break
+				}
+			}
+			if end > 0 {
+				out = append(out, after[:end])
+			}
+			rest = after[end:]
+		}
+	}
+	return out
 }
 
 // stripFirstAcdStart removes the first leading-whitespace `acd start \`
