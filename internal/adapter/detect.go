@@ -14,6 +14,11 @@ type Harness interface {
 	ConfigPath() string
 	IsInstalled() bool
 	HasMarker() bool
+	// MatchedPath returns the candidate path (with `~` expanded) that
+	// actually carries the acd marker on disk. Iterates candidates in
+	// pathSpec slice order, so canonical wins over legacy when both are
+	// marked. Returns "", false when no candidate carries a marker.
+	MatchedPath() (string, bool)
 }
 
 type knownHarness struct {
