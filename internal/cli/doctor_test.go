@@ -1123,13 +1123,13 @@ func TestDoctor_OpenCodeCanonicalUnmarkedLegacyMarkedNoDestructiveOverwrite(t *t
 	if !strings.Contains(notes, "installed snippet drift") {
 		t.Fatalf("expected drift warning, got notes=%v", oc.Notes)
 	}
-	// Must not contain the destructive `cp ~/.config/opencode/hook/hooks.yaml`
-	// + `> ~/.config/opencode/hook/hooks.yaml` recipe — that would clobber
-	// the user-authored canonical file.
-	if strings.Contains(notes, "> ~/.config/opencode/hook/hooks.yaml") {
+	// Must not contain the destructive cp/redirect recipe against the
+	// canonical primary — that would clobber the user-authored canonical
+	// file. JSON output is unsanitized so check the absolute canonical path.
+	if strings.Contains(notes, "> "+canonical) {
 		t.Fatalf("drift note must NOT recommend destructive overwrite of canonical, got notes=%v", oc.Notes)
 	}
-	if strings.Contains(notes, "cp ~/.config/opencode/hook/hooks.yaml") {
+	if strings.Contains(notes, "cp "+canonical) {
 		t.Fatalf("drift note must NOT recommend destructive cp on canonical, got notes=%v", oc.Notes)
 	}
 }
