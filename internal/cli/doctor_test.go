@@ -1005,6 +1005,135 @@ func TestDoctor_DriftCleanWhenSnippetMatchesTemplate(t *testing.T) {
 	}
 }
 
+// TestDoctor_OpenCodeLegacyOnlyDriftSurfacesMatchedPath seeds a legacy
+// OpenCode hooks.yaml at the pre-canonical path (~/.config/opencode/hooks.yaml)
+// with a drifted active hook body (missing `acd start`+`acd wake`). The
+// canonical path does not exist. Doctor must:
+//   - mark the harness installed (via legacy fallback)
+//   - populate MatchedPath in the JSON report
+//   - emit a drift note that names the legacy file
+//   - NEVER recommend overwriting the canonical primary
+func TestDoctor_OpenCodeLegacyOnlyDriftSurfacesMatchedPath(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	// Marker present, but the active hook body is missing acd start+wake.
+	body := "# acd-managed: true\nhooks:\n" +
+		"  - event: tool.before.write\n" +
+		"    command:\n" +
+		"      bash: |\n" +
+		"        echo no-op\n"
+	if err := os.WriteFile(legacy, []byte(body), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	oc := findDoctorHarness(t, rep, "opencode")
+	if !oc.Installed {
+		t.Fatalf("opencode should be installed via legacy path: %+v", oc)
+	}
+	if oc.MatchedPath == "" {
+		t.Fatalf("MatchedPath must be populated when marker lives on legacy path: %+v", oc)
+	}
+	// MatchedPath in JSON output is home-shortened.
+	wantMatched := "~/.config/opencode/hooks.yaml"
+	if oc.MatchedPath != wantMatched {
+		t.Fatalf("MatchedPath=%q, want %q", oc.MatchedPath, wantMatched)
+	}
+	notes := strings.Join(oc.Notes, "\n")
+	if !strings.Contains(notes, "installed snippet drift") {
+		t.Fatalf("expected drift warning, got notes=%v", oc.Notes)
+	}
+	// Drift note must reference the matched (legacy) path so users know
+	// which file to edit. Match either the absolute path (note is built
+	// before sanitization) or the home-shortened form.
+	if !strings.Contains(notes, legacy) && !strings.Contains(notes, "~/.config/opencode/hooks.yaml") {
+		t.Fatalf("drift note must name matched/legacy path, got notes=%v", oc.Notes)
+	}
+	// Crucial: must never suggest overwriting the canonical primary when the
+	// marker is on the legacy file — that would destroy a user's canonical
+	// config they have not yet migrated.
+	if strings.Contains(notes, "> ~/.config/opencode/hook/hooks.yaml") {
+		t.Fatalf("drift note must NOT recommend overwriting canonical primary, got notes=%v", oc.Notes)
+	}
+}
+
+// TestDoctor_OpenCodeCanonicalUnmarkedLegacyMarkedNoDestructiveOverwrite seeds
+// a canonical OpenCode hooks.yaml WITHOUT the acd marker (a user's
+// hand-authored config) alongside a legacy hooks.yaml WITH the marker and
+// drifted body. Doctor must steer remediation toward the legacy file and
+// never recommend overwriting the canonical primary that the user authored.
+func TestDoctor_OpenCodeCanonicalUnmarkedLegacyMarkedNoDestructiveOverwrite(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir canonical dir: %v", err)
+	}
+	// Canonical exists WITHOUT acd marker — represents user-authored config
+	// that acd must not blow away.
+	if err := os.WriteFile(canonical, []byte("hooks:\n  - event: tool.before.write\n    command:\n      bash: |\n        user-hook\n"), 0o600); err != nil {
+		t.Fatalf("write canonical: %v", err)
+	}
+	// Legacy carries the acd marker and a drifted body.
+	body := "# acd-managed: true\nhooks:\n" +
+		"  - event: tool.before.write\n" +
+		"    command:\n" +
+		"      bash: |\n" +
+		"        echo no-op\n"
+	if err := os.WriteFile(legacy, []byte(body), 0o600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	oc := findDoctorHarness(t, rep, "opencode")
+	if !oc.Installed {
+		t.Fatalf("opencode should be installed via legacy path: %+v", oc)
+	}
+	if oc.MatchedPath == "" {
+		t.Fatalf("MatchedPath must be populated when marker is on legacy not canonical: %+v", oc)
+	}
+	notes := strings.Join(oc.Notes, "\n")
+	if !strings.Contains(notes, "installed snippet drift") {
+		t.Fatalf("expected drift warning, got notes=%v", oc.Notes)
+	}
+	// Must not contain the destructive `cp ~/.config/opencode/hook/hooks.yaml`
+	// + `> ~/.config/opencode/hook/hooks.yaml` recipe — that would clobber
+	// the user-authored canonical file.
+	if strings.Contains(notes, "> ~/.config/opencode/hook/hooks.yaml") {
+		t.Fatalf("drift note must NOT recommend destructive overwrite of canonical, got notes=%v", oc.Notes)
+	}
+	if strings.Contains(notes, "cp ~/.config/opencode/hook/hooks.yaml") {
+		t.Fatalf("drift note must NOT recommend destructive cp on canonical, got notes=%v", oc.Notes)
+	}
+}
+
 // TestDoctor_FallbackOnEACCESPrimaryConfig writes a primary config that is
 // unreadable (mode 0000) and a legacy alternate-path TOML carrying the acd
 // marker. Doctor must mark the harness as installed via fallback and append a
