@@ -1156,6 +1156,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 			installed = "yes"
 		}
 		fmt.Fprintf(out, "    %-11s : %s (%s)\n", h.Name, installed, homeShort(h.ConfigPath))
+		if h.MatchedPath != "" && h.MatchedPath != h.ConfigPath {
+			fmt.Fprintf(out, "                  marker found at: %s\n", homeShort(h.MatchedPath))
+		}
 		if len(h.Notes) > 0 {
 			fmt.Fprintf(out, "                  notes: %s\n", strings.Join(h.Notes, "; "))
 		}
