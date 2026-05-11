@@ -1049,25 +1049,25 @@ func TestDoctor_OpenCodeLegacyOnlyDriftSurfacesMatchedPath(t *testing.T) {
 	if oc.MatchedPath == "" {
 		t.Fatalf("MatchedPath must be populated when marker lives on legacy path: %+v", oc)
 	}
-	// MatchedPath in JSON output is home-shortened.
-	wantMatched := "~/.config/opencode/hooks.yaml"
-	if oc.MatchedPath != wantMatched {
-		t.Fatalf("MatchedPath=%q, want %q", oc.MatchedPath, wantMatched)
+	// runDoctor's JSON output emits absolute paths (sanitization is only
+	// applied for bundle manifests). Confirm MatchedPath points at the
+	// legacy file we wrote.
+	if oc.MatchedPath != legacy {
+		t.Fatalf("MatchedPath=%q, want %q", oc.MatchedPath, legacy)
 	}
 	notes := strings.Join(oc.Notes, "\n")
 	if !strings.Contains(notes, "installed snippet drift") {
 		t.Fatalf("expected drift warning, got notes=%v", oc.Notes)
 	}
-	// Drift note must reference the matched (legacy) path so users know
-	// which file to edit. Match either the absolute path (note is built
-	// before sanitization) or the home-shortened form.
-	if !strings.Contains(notes, legacy) && !strings.Contains(notes, "~/.config/opencode/hooks.yaml") {
-		t.Fatalf("drift note must name matched/legacy path, got notes=%v", oc.Notes)
+	// Drift note must reference the matched (legacy) absolute path.
+	if !strings.Contains(notes, legacy) {
+		t.Fatalf("drift note must name matched/legacy path %q, got notes=%v", legacy, oc.Notes)
 	}
 	// Crucial: must never suggest overwriting the canonical primary when the
 	// marker is on the legacy file — that would destroy a user's canonical
 	// config they have not yet migrated.
-	if strings.Contains(notes, "> ~/.config/opencode/hook/hooks.yaml") {
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	if strings.Contains(notes, "> "+canonical) {
 		t.Fatalf("drift note must NOT recommend overwriting canonical primary, got notes=%v", oc.Notes)
 	}
 }
