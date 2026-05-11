@@ -74,6 +74,15 @@ type doctorHarnessReport struct {
 	ConfigReadable bool   `json:"config_readable"`
 	MarkerFound    bool   `json:"marker_found"`
 	Installed      bool   `json:"installed"`
+	// MatchedPath is the candidate path that actually carried the acd
+	// marker on disk, when it differs from ConfigPath (i.e., the marker
+	// lives on a legacy fallback path rather than the canonical primary).
+	// Empty when the marker is on the canonical ConfigPath or no marker
+	// was found. JSON consumers use this to learn which file the user
+	// must edit; the text renderer surfaces it as a "marker found at"
+	// line so users know remediation will be a merge-only nudge toward
+	// the canonical layout.
+	MatchedPath string `json:"matched_path,omitempty"`
 	// ConfigReadError carries the os.ReadFile error string when the
 	// primary config exists (ConfigPresent=true) but we could not read
 	// it (EACCES / EIO / etc). When non-empty, ConfigReadable is false
