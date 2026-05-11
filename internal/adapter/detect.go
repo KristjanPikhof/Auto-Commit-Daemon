@@ -71,6 +71,20 @@ func (h knownHarness) allPaths() []string {
 	return paths
 }
 
+// MatchedPath returns the expanded candidate path that currently carries an
+// acd marker on disk. Iteration follows pathSpec slice order, so the
+// canonical primary is preferred over legacy fallbacks when both carry the
+// marker. Returns "", false when no candidate carries a marker.
+func (h knownHarness) MatchedPath() (string, bool) {
+	for _, p := range h.paths {
+		expanded := expandHome(p.path)
+		if fileContainsAny(expanded, p.markers) {
+			return expanded, true
+		}
+	}
+	return "", false
+}
+
 // DetectInstalled returns the supported harnesses that already have an
 // acd-managed marker in their known config path.
 func DetectInstalled() []Harness {
