@@ -282,8 +282,11 @@ func TestDetectInstalled_OpenCodeLegacyPath(t *testing.T) {
 }
 
 // TestDetectInstalled_OpenCodeCanonicalWinsOverLegacy asserts the pathSpec
-// ordering: when both files exist with the marker, the canonical primary is
-// effectively chosen for ConfigPath. Detection still succeeds.
+// slice ordering for OpenCode: when both files carry the marker, the
+// canonical primary wins for both ConfigPath (paths[0]) and MatchedPath
+// (first marker-bearing path in slice order). Repurposed from a pure
+// ConfigPath check to also exercise MatchedPath so this test genuinely
+// fails when slice order in known.go is reversed.
 func TestDetectInstalled_OpenCodeCanonicalWinsOverLegacy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -306,6 +309,34 @@ func TestDetectInstalled_OpenCodeCanonicalWinsOverLegacy(t *testing.T) {
 	}
 	if path := got[0].ConfigPath(); path != canonical {
 		t.Fatalf("ConfigPath=%q, want canonical primary %q", path, canonical)
+	}
+	// MatchedPath must also pick the canonical because slice iteration
+	// hits the canonical pathSpec before the legacy one. Reversing the
+	// slice order in known.go must break THIS assertion.
+	matched, ok := got[0].MatchedPath()
+	if !ok {
+		t.Fatalf("MatchedPath ok=false, want true")
+	}
+	if matched != canonical {
+		t.Fatalf("MatchedPath=%q, want canonical %q (slice order broken?)", matched, canonical)
+	}
+
+	// Sibling sub-case: when only the legacy file carries the marker,
+	// MatchedPath must return legacy (proves the iteration falls through
+	// past the canonical pathSpec when canonical has no marker).
+	if err := os.Remove(canonical); err != nil {
+		t.Fatalf("remove canonical: %v", err)
+	}
+	h, ok := Lookup("opencode")
+	if !ok {
+		t.Fatalf("Lookup(opencode) missing")
+	}
+	matched, ok = h.MatchedPath()
+	if !ok {
+		t.Fatalf("MatchedPath ok=false after canonical removed, want true")
+	}
+	if matched != legacy {
+		t.Fatalf("MatchedPath=%q, want legacy %q (legacy fall-through broken?)", matched, legacy)
 	}
 }
 
