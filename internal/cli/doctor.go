@@ -271,8 +271,12 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 
 func collectDoctorHarnesses() []doctorHarnessReport {
 	detected := map[string]bool{}
+	matched := map[string]string{}
 	for _, h := range adapter.DetectInstalled() {
 		detected[h.Name()] = true
+		if mp, ok := h.MatchedPath(); ok {
+			matched[h.Name()] = mp
+		}
 	}
 
 	reports := make([]doctorHarnessReport, 0, len(supportedHarnesses))
@@ -286,6 +290,14 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			Name:       name,
 			ConfigPath: path,
 		}
+		// If the marker lives on a candidate path that differs from
+		// ConfigPath (e.g., the legacy fallback), surface it so the user
+		// learns which file to edit. Doctor scans drift against the file
+		// that actually carries the marker.
+		matchedPath := matched[name]
+		if matchedPath != "" && matchedPath != path {
+			hr.MatchedPath = matchedPath
+		}
 		body, err := os.ReadFile(path)
 		switch {
 		case err == nil:
@@ -298,7 +310,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Installed = true
 			}
 			if hr.Installed {
-				if note := scanHookBodyDrift(name, body); note != "" {
+				driftBody := body
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						driftBody = mb
+					}
+				}
+				if note := scanHookBodyDriftAt(name, driftBody, hr.MatchedPath); note != "" {
 					hr.Notes = append(hr.Notes, note)
 				}
 			}
@@ -306,6 +324,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			if detected[name] {
 				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
 				hr.Installed = true
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
+							hr.Notes = append(hr.Notes, note)
+						}
+					}
+				}
 			}
 		default:
 			// Permission-denied / EIO / other read errors must not silently
@@ -321,6 +346,13 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			hr.Notes = append(hr.Notes, "primary-path read failed: "+err.Error()+"; using alternate-path detection")
 			if detected[name] {
 				hr.Installed = true
+				if hr.MatchedPath != "" {
+					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
+							hr.Notes = append(hr.Notes, note)
+						}
+					}
+				}
 			}
 		}
 
