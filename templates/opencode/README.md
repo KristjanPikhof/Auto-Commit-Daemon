@@ -24,6 +24,20 @@ re-run `acd setup opencode` and replace the acd block in
 active hooks are missing `acd start` or `acd wake` and shows the remediation
 command.
 
+**Hook file detected but `acd doctor` still reports detection as `no`?**
+The hook file exists but lacks the `# acd-managed: true` marker on its first
+line, so `acd doctor` cannot recognise it as an acd-managed file. To fix this,
+either:
+
+- **Prepend the marker manually** — open `~/.config/opencode/hook/hooks.yaml` in
+  an editor and add `# acd-managed: true` as the very first line.
+- **Re-run setup and merge** — run `acd setup opencode` (no `>`), copy the
+  printed YAML, and merge the acd block into your existing file.
+
+  **Do not use `>` to redirect** when you have custom hooks — `acd setup opencode
+  --raw > ~/.config/opencode/hook/hooks.yaml` overwrites the entire file and
+  destroys any existing entries.
+
 Tool hooks run idempotent `acd start` before `acd wake`, so later tool activity
 can recover if you manually ran `acd stop` while the OpenCode session stayed
 open. `session.deleted` still deregisters the session with
