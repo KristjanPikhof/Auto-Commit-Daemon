@@ -395,6 +395,16 @@ var driftRemediationCommands = map[string]string{
 // active-hook concept (shell), or when the config cannot be parsed at all
 // (we leave silent rather than scream — drift detection is opportunistic).
 func scanHookBodyDrift(name string, body []byte) string {
+	return scanHookBodyDriftAt(name, body, "")
+}
+
+// scanHookBodyDriftAt is the legacy-aware variant of scanHookBodyDrift. When
+// matchedPath is non-empty (the marker lives on a path other than the
+// canonical primary), the returned note names the matched file in a merge-
+// only remediation so we never recommend a destructive overwrite of a user-
+// authored canonical file. When matchedPath is empty, behaves identically to
+// the canonical-path remediation.
+func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	bodies := extractActiveHookBodies(name, body)
 	if len(bodies) == 0 {
 		return ""
@@ -407,6 +417,12 @@ func scanHookBodyDrift(name string, body []byte) string {
 	}
 	if stale == 0 {
 		return ""
+	}
+	if matchedPath != "" {
+		// Marker lives on a non-canonical (legacy) path. Recommend a merge
+		// into the matched file only — never an overwrite that could blow
+		// away a user's canonical config they have not migrated yet.
+		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake' at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
 	}
 	cmd, ok := driftRemediationCommands[name]
 	if !ok {
