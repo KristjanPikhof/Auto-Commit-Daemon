@@ -24,6 +24,10 @@
 
 ## v2026-05-08
 
+> **Note:** The hook paths named in the doctor and setup items below were updated in
+> [v2026-05-10](#v2026-05-10), which is the current canonical reference for OpenCode
+> (`~/.config/opencode/hook/hooks.yaml`) and Pi (`~/.pi/agent/hook/hooks.yaml`) paths.
+
 ### Added
 
 - `acd commit-all` can capture and replay a dirty worktree without starting the
