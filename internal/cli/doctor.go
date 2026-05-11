@@ -1556,6 +1556,9 @@ func sanitizeReport(r doctorReport) doctorReport {
 	for _, h := range r.Harnesses {
 		c := h
 		c.ConfigPath = homeShort(h.ConfigPath)
+		if h.MatchedPath != "" {
+			c.MatchedPath = homeShort(h.MatchedPath)
+		}
 		harnesses = append(harnesses, c)
 	}
 	out.Harnesses = harnesses
