@@ -390,7 +390,9 @@ func TestDetectInstalled_PiLegacyPath(t *testing.T) {
 }
 
 // TestDetectInstalled_PiCanonicalWinsOverLegacy mirrors the OpenCode
-// ordering test for Pi.
+// ordering test for Pi: when both files carry the marker, canonical wins
+// for both ConfigPath and MatchedPath. Repurposed from a pure ConfigPath
+// check so reversing slice order in known.go genuinely breaks this test.
 func TestDetectInstalled_PiCanonicalWinsOverLegacy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -416,6 +418,34 @@ func TestDetectInstalled_PiCanonicalWinsOverLegacy(t *testing.T) {
 	}
 	if path := got[0].ConfigPath(); path != canonical {
 		t.Fatalf("ConfigPath=%q, want canonical primary %q", path, canonical)
+	}
+	// MatchedPath must also pick canonical because slice iteration hits
+	// the canonical pathSpec before the legacy one. Reversing slice order
+	// in known.go must break THIS assertion.
+	matched, ok := got[0].MatchedPath()
+	if !ok {
+		t.Fatalf("MatchedPath ok=false, want true")
+	}
+	if matched != canonical {
+		t.Fatalf("MatchedPath=%q, want canonical %q (slice order broken?)", matched, canonical)
+	}
+
+	// Sibling sub-case: with only legacy carrying the marker, MatchedPath
+	// returns legacy — proves the iteration falls past the canonical
+	// pathSpec when canonical lacks a marker.
+	if err := os.Remove(canonical); err != nil {
+		t.Fatalf("remove canonical: %v", err)
+	}
+	h, ok := Lookup("pi")
+	if !ok {
+		t.Fatalf("Lookup(pi) missing")
+	}
+	matched, ok = h.MatchedPath()
+	if !ok {
+		t.Fatalf("MatchedPath ok=false after canonical removed, want true")
+	}
+	if matched != legacy {
+		t.Fatalf("MatchedPath=%q, want legacy %q (legacy fall-through broken?)", matched, legacy)
 	}
 }
 
