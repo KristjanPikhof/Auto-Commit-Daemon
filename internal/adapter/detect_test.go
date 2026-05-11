@@ -388,6 +388,144 @@ func TestDetectInstalled_PiCanonicalWinsOverLegacy(t *testing.T) {
 	}
 }
 
+// TestMatchedPath_OpenCodeCanonicalOnly verifies MatchedPath returns the
+// canonical path when only the canonical primary carries the marker.
+func TestMatchedPath_OpenCodeCanonicalOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write canonical hooks.yaml: %v", err)
+	}
+
+	h, ok := Lookup("opencode")
+	if !ok {
+		t.Fatalf("Lookup(opencode) missing")
+	}
+	got, found := h.MatchedPath()
+	if !found {
+		t.Fatalf("MatchedPath found=false, want true")
+	}
+	if got != canonical {
+		t.Fatalf("MatchedPath=%q, want canonical %q", got, canonical)
+	}
+}
+
+// TestMatchedPath_OpenCodeLegacyOnly verifies MatchedPath returns the legacy
+// path when only the legacy fallback carries the marker.
+func TestMatchedPath_OpenCodeLegacyOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	h, ok := Lookup("opencode")
+	if !ok {
+		t.Fatalf("Lookup(opencode) missing")
+	}
+	got, found := h.MatchedPath()
+	if !found {
+		t.Fatalf("MatchedPath found=false, want true")
+	}
+	if got != legacy {
+		t.Fatalf("MatchedPath=%q, want legacy %q", got, legacy)
+	}
+}
+
+// TestMatchedPath_OpenCodeBothCanonicalWins verifies pathSpec slice order:
+// when both canonical and legacy carry markers, MatchedPath returns canonical.
+func TestMatchedPath_OpenCodeBothCanonicalWins(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonical := filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml")
+	legacy := filepath.Join(home, ".config", "opencode", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir opencode dir: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write canonical hooks.yaml: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	h, ok := Lookup("opencode")
+	if !ok {
+		t.Fatalf("Lookup(opencode) missing")
+	}
+	got, found := h.MatchedPath()
+	if !found {
+		t.Fatalf("MatchedPath found=false, want true")
+	}
+	if got != canonical {
+		t.Fatalf("MatchedPath=%q, want canonical %q (canonical must win over legacy)", got, canonical)
+	}
+}
+
+// TestMatchedPath_OpenCodeNeither verifies MatchedPath returns "", false when
+// no candidate carries a marker.
+func TestMatchedPath_OpenCodeNeither(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	h, ok := Lookup("opencode")
+	if !ok {
+		t.Fatalf("Lookup(opencode) missing")
+	}
+	got, found := h.MatchedPath()
+	if found {
+		t.Fatalf("MatchedPath found=true (path=%q), want false", got)
+	}
+	if got != "" {
+		t.Fatalf("MatchedPath=%q, want empty", got)
+	}
+}
+
+// TestMatchedPath_PiCanonicalWinsOverLegacy mirrors the OpenCode ordering
+// check for the Pi harness.
+func TestMatchedPath_PiCanonicalWinsOverLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	canonical := filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml")
+	legacy := filepath.Join(home, ".pi", "hook", "hooks.yaml")
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o700); err != nil {
+		t.Fatalf("mkdir canonical pi dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+		t.Fatalf("mkdir legacy pi dir: %v", err)
+	}
+	if err := os.WriteFile(canonical, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write canonical hooks.yaml: %v", err)
+	}
+	if err := os.WriteFile(legacy, []byte("# acd-managed: true\nhooks: []\n"), 0o600); err != nil {
+		t.Fatalf("write legacy hooks.yaml: %v", err)
+	}
+
+	h, ok := Lookup("pi")
+	if !ok {
+		t.Fatalf("Lookup(pi) missing")
+	}
+	got, found := h.MatchedPath()
+	if !found {
+		t.Fatalf("MatchedPath found=false, want true")
+	}
+	if got != canonical {
+		t.Fatalf("MatchedPath=%q, want canonical %q (canonical must win over legacy)", got, canonical)
+	}
+}
+
 func TestCodexInstalls_OnlyJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -59,6 +59,18 @@ ACD supports Claude Code and Codex via their native hook systems by default. Ope
 
 Run `acd doctor` to check whether your installed snippet is current. It warns when active hooks are missing `acd start` or `acd wake`, and shows the remediation command per harness.
 
+**Hook file detected but `acd doctor` still reports detection as `no`?** The hook
+file is missing the `# acd-managed: true` marker on its first line, so `acd
+doctor` cannot recognise it as an acd-managed file. To fix this, either:
+
+- **Prepend the marker manually** — open the hook file in an editor and add
+  `# acd-managed: true` as the very first line.
+- **Re-run setup and merge** — run `acd setup <harness>` (no `>`), copy the
+  printed snippet, and merge the acd block into your existing hook file.
+
+  **Do not use `>` to redirect** when you have custom hooks — redirecting with
+  `>` overwrites the entire file and destroys any existing entries.
+
 ## Use it
 
 Open your harness. Edit files. Commits land automatically.
