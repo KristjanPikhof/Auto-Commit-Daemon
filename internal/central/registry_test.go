@@ -1,6 +1,7 @@
 package central
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
@@ -99,6 +101,35 @@ func TestRegistry_UpsertIdempotent(t *testing.T) {
 	}
 }
 
+func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
+	reg := NewRegistry()
+	reg.Repos = []RepoRecord{{
+		Path:              "/tmp/repo/subdir",
+		RepoHash:          "old",
+		StateDB:           "/tmp/repo/.git/acd/state.db",
+		FirstRegisteredTS: 10,
+		LastSeenTS:        20,
+		Harnesses:         []string{"codex"},
+	}}
+
+	reg.UpsertRepo("/tmp/repo", "new", "/tmp/repo/.git/acd/state.db", "pi", 30)
+
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	rec := reg.Repos[0]
+	if rec.Path != "/tmp/repo" || rec.RepoHash != "new" || rec.StateDB != "/tmp/repo/.git/acd/state.db" {
+		t.Fatalf("record=%+v, want canonical path/hash/state", rec)
+	}
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 30 {
+		t.Fatalf("timestamps=%d/%d want 10/30", rec.FirstRegisteredTS, rec.LastSeenTS)
+	}
+	wantHarnesses := []string{"codex", "pi"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
 func TestRegistry_NormalizesCaseDuplicateOnCaseFoldedPlatforms(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
 		t.Skip("case-folded registry path matching is only enabled on darwin/windows")
@@ -137,6 +168,61 @@ func TestRegistry_UpsertHarnessesDedupAndSort(t *testing.T) {
 	want := []string{"claude-code", "codex", "pi"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("harnesses=%v, want %v", got, want)
+	}
+}
+
+func TestRegistry_CleanupLegacyDuplicatesMergesSubdirRowsByGitToplevel(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	subdir := filepath.Join(wt.Root, "pkg", "sub")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+
+	reg := NewRegistry()
+	reg.Repos = []RepoRecord{
+		{Path: wt.Root, RepoHash: "old", StateDB: filepath.Join(wt.GitDir, "acd", "state.db"), FirstRegisteredTS: 20, LastSeenTS: 30, Harnesses: []string{"codex"}},
+		{Path: subdir, RepoHash: "new", StateDB: filepath.Join(wt.GitDir, "acd", "state.db"), FirstRegisteredTS: 10, LastSeenTS: 40, Harnesses: []string{"claude-code"}},
+	}
+
+	changes, err := reg.CleanupLegacyDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Reason != "same-git-toplevel" {
+		t.Fatalf("changes=%+v, want one same-git-toplevel merge", changes)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := reg.Repos[0]
+	if rec.Path != wt.Root {
+		t.Fatalf("path=%q, want canonical root %q", rec.Path, wt.Root)
+	}
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 40 {
+		t.Fatalf("timestamps not merged: %+v", rec)
+	}
+	wantHarnesses := []string{"claude-code", "codex"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+
+	again, err := reg.CleanupLegacyDuplicates(ctx)
+	if err != nil {
+		t.Fatalf("cleanup again: %v", err)
+	}
+	if len(again) != 0 || len(reg.Repos) != 1 {
+		t.Fatalf("cleanup not idempotent: changes=%+v repos=%+v", again, reg.Repos)
 	}
 }
 

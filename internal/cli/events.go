@@ -17,7 +17,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -258,21 +257,9 @@ func latestDecisionIDSQL(ctx context.Context, db *sql.DB) (int64, error) {
 }
 
 func eventsRepoRecord(repo string) (central.RepoRecord, error) {
-	abs, err := resolveRepo(repo)
+	rec, _, abs, err := lookupRegisteredRepo("events", repo)
 	if err != nil {
 		return central.RepoRecord{}, err
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return central.RepoRecord{}, fmt.Errorf("acd events: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return central.RepoRecord{}, fmt.Errorf("acd events: load registry: %w", err)
-	}
-	rec, ok := findRepo(reg, abs)
-	if !ok {
-		return central.RepoRecord{}, fmt.Errorf("acd events: repo %s is not registered (try `acd start --repo %s`)", abs, abs)
 	}
 	if !fileExists(rec.StateDB) {
 		return central.RepoRecord{}, fmt.Errorf("acd events: state.db missing for repo %s (try `acd start --repo %s`)", abs, abs)

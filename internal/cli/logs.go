@@ -11,9 +11,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 const (
@@ -104,21 +101,9 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 }
 
 func resolveRepoLogPath(repo string) (logPath, absRepo string, err error) {
-	abs, err := resolveRepo(repo)
+	rec, roots, abs, err := lookupRegisteredRepo("logs", repo)
 	if err != nil {
 		return "", "", err
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return "", "", fmt.Errorf("acd logs: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return "", "", fmt.Errorf("acd logs: load registry: %w", err)
-	}
-	rec, ok := findRepo(reg, abs)
-	if !ok {
-		return "", "", fmt.Errorf("acd logs: repo %s is not registered (try `acd start --repo %s`)", abs, abs)
 	}
 	return roots.RepoLogPath(rec.RepoHash), abs, nil
 }

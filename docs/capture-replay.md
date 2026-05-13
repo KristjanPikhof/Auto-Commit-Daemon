@@ -408,6 +408,13 @@ Review dry-run output before applying fix, recovery, or purge plans with
 `--yes`. Prefer `acd fix --dry-run` for common stuck states; use `recover` and
 `purge-events` as advanced tools when focused diagnostics point there.
 
+ACD keys lifecycle state by the canonical Git worktree root. `acd start` from
+`repo/sub/dir` registers `repo`, not the subdirectory, and later `acd status` or
+`acd diagnose --repo repo/sub/dir` look up that same root. Commands that need a
+repo (`start`, `status`, `diagnose`, and related current-repo operations) refuse
+directories outside a Git worktree instead of creating central-registry entries
+for arbitrary paths.
+
 `acd list --watch` redraws plain table frames on the requested interval; it is
 for watching daemon liveness and queue counts, not an interactive TUI. `acd
 logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
@@ -544,8 +551,9 @@ forced-aging readiness, and last planner error fields when available.
 
 #### `acd list --json` shape
 
-`acd list --json` wraps all known repos in a `repos` array. Each entry adds
-`status`, `status_note`, and `stale_heartbeat` on top of the pause fields:
+`acd list --json` wraps all known canonical Git worktree roots in a `repos`
+array. Each entry adds `status`, `status_note`, and `stale_heartbeat` on top of
+the pause fields:
 
 ```json
 {
@@ -651,7 +659,13 @@ acd gc
 
 Removes central-registry entries for repos that no longer exist on disk, whose
 `state.db` is missing, or whose daemon has been dead for more than 30 days.
-Does not touch the git object database.
+Before pruning, `acd gc` also merges legacy duplicate rows that identify the
+same repo by canonical Git toplevel or by shared `state.db` path; merges are
+reported in `acd gc --json` under a `merged[]` array of
+`{kept_path, dropped_path, reason}` entries (reason is `same-git-toplevel` or
+`same-state-db`). Current `acd start` calls write canonical Git worktree roots,
+so `acd gc` is only needed for stale or legacy rows. It does not touch the git
+object database.
 
 ---
 

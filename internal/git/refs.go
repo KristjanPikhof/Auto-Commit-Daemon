@@ -72,7 +72,7 @@ func bytesContains(b []byte, sub string) bool {
 
 // ShowToplevel returns the absolute path of the worktree root.
 func ShowToplevel(ctx context.Context, dir string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: dir}, "rev-parse", "--show-toplevel")
+	out, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultReadTimeout}, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", err
 	}
@@ -82,7 +82,7 @@ func ShowToplevel(ctx context.Context, dir string) (string, error) {
 // AbsoluteGitDir returns the absolute path of the worktree's git dir
 // (`.git` for normal repos, the linked git dir for worktrees).
 func AbsoluteGitDir(ctx context.Context, dir string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: dir}, "rev-parse", "--absolute-git-dir")
+	out, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultReadTimeout}, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return "", err
 	}

@@ -2,11 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
@@ -19,6 +21,31 @@ import (
 // We exercise the helper directly so the test stays fast and does not
 // have to spin the daemon loop. The DB handle can be nil here — the
 // helper does not dereference it.
+func TestResolveDaemonWorktreeCanonicalizesSubdirectory(t *testing.T) {
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
+	nested := filepath.Join(repoDir, "nested", "daemon")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	gotRepo, gotGitDir, err := resolveDaemonWorktree(ctx, nested, "")
+	if err != nil {
+		t.Fatalf("resolveDaemonWorktree: %v", err)
+	}
+	if gotRepo != repoDir {
+		t.Fatalf("repo = %q, want canonical root %q", gotRepo, repoDir)
+	}
+	if gotGitDir != wt.GitDir {
+		t.Fatalf("gitDir = %q, want resolver git dir %q", gotGitDir, wt.GitDir)
+	}
+}
+
 func TestBuildDaemonRunOptions_WiresCentralStats(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repoDir, _, db := makeRepoStateDB(t)

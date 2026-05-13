@@ -12,8 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
@@ -127,21 +125,9 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 }
 
 func promptRepoRecord(repo string) (repoRecord, error) {
-	abs, err := resolveRepo(repo)
+	rec, _, _, err := lookupRegisteredRepo("prompt", repo)
 	if err != nil {
 		return repoRecord{}, err
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return repoRecord{}, fmt.Errorf("acd prompt: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return repoRecord{}, fmt.Errorf("acd prompt: load registry: %w", err)
-	}
-	rec, ok := findRepo(reg, abs)
-	if !ok {
-		return repoRecord{}, fmt.Errorf("acd prompt: repo %s is not registered (try `acd start --repo %s`)", abs, abs)
 	}
 	return repoRecord{Path: rec.Path, StateDB: rec.StateDB}, nil
 }

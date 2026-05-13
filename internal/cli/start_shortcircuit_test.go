@@ -780,6 +780,139 @@ func TestMultiSession_PerSessionCacheKeepsBothOnHotPath(t *testing.T) {
 	}
 }
 
+func TestRunStart_LegacySubdirRegistryRowFallsBackAndRepairs(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	subdir := filepath.Join(repoDir, "nested", "pkg")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	repoHash, err := paths.RepoHash(repoDir)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	gitDir := filepath.Join(repoDir, ".git")
+	dbPath := state.DBPathFromGitDir(gitDir)
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{{
+			Path:              subdir,
+			RepoHash:          repoHash,
+			StateDB:           dbPath,
+			FirstRegisteredTS: 1,
+			LastSeenTS:        1,
+			Harnesses:         []string{"claude-code"},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("write legacy registry row: %v", err)
+	}
+
+	stamped := identity.Fingerprint{StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "legacy-cache-argv"}
+	installFakeDaemonFingerprint(t, stamped)
+	if err := writeStartCache(gitDir, startCache{
+		Version:        startCacheVersion,
+		RepoHash:       repoHash,
+		SessionID:      "sess-legacy-subdir",
+		Harness:        "claude-code",
+		DaemonPID:      os.Getpid(),
+		ClientCount:    1,
+		UpdatedAt:      time.Now().Unix(),
+		DaemonStartTS:  stamped.StartTime,
+		DaemonArgvHash: stamped.ArgvHash,
+	}); err != nil {
+		t.Fatalf("write legacy v2 start-cache: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var hotTouches atomic.Int32
+	prevTouch := touchClientHotPath
+	touchClientHotPath = func(ctx context.Context, gitDir, sessionID string) error {
+		hotTouches.Add(1)
+		return prevTouch(ctx, gitDir, sessionID)
+	}
+	t.Cleanup(func() { touchClientHotPath = prevTouch })
+
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, subdir, "sess-legacy-subdir", "claude-code", 0, true); err != nil {
+		t.Fatalf("runStart from legacy subdir: %v", err)
+	}
+	if hotTouches.Load() != 0 {
+		t.Fatalf("legacy subdir row should not use either short-circuit path; hot touches=%d", hotTouches.Load())
+	}
+	if count.Load() != 1 {
+		t.Fatalf("cold repair path spawn count=%d want 1", count.Load())
+	}
+	var got startResult
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal start result: %v\n%s", err, stdout.String())
+	}
+	if !central.SameRepoPath(got.Repo, repoDir) {
+		t.Fatalf("Repo=%q want canonical root %q", got.Repo, repoDir)
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load repaired registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows=%d want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	if !central.SameRepoPath(reg.Repos[0].Path, repoDir) {
+		t.Fatalf("registry path=%q want repaired canonical root %q", reg.Repos[0].Path, repoDir)
+	}
+	if sc := readStartCache(startCachePath(gitDir, "sess-legacy-subdir")); sc == nil || sc.Version != startCacheVersion {
+		t.Fatalf("v2 start-cache was not present after fallback repair: %+v", sc)
+	}
+}
+
+func TestRunStart_CanonicalRegistryRowUsesEarlyShortCircuitFromSubdir(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	subdir := filepath.Join(repoDir, "nested", "pkg")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	installFakeDaemonFingerprint(t, identity.Fingerprint{
+		StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "canonical-cache-argv",
+	})
+
+	var first bytes.Buffer
+	if err := runStart(ctx, &first, repoDir, "sess-canonical", "claude-code", 0, true); err != nil {
+		t.Fatalf("cold runStart: %v", err)
+	}
+
+	var hotTouches atomic.Int32
+	prevTouch := touchClientHotPath
+	touchClientHotPath = func(ctx context.Context, gitDir, sessionID string) error {
+		hotTouches.Add(1)
+		return prevTouch(ctx, gitDir, sessionID)
+	}
+	t.Cleanup(func() { touchClientHotPath = prevTouch })
+
+	var second bytes.Buffer
+	if err := runStart(ctx, &second, subdir, "sess-canonical", "claude-code", 0, true); err != nil {
+		t.Fatalf("hot runStart from subdir: %v", err)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count=%d want 1", count.Load())
+	}
+	if hotTouches.Load() != 1 {
+		t.Fatalf("early short-circuit hot touches=%d want 1", hotTouches.Load())
+	}
+	var got startResult
+	if err := json.Unmarshal(second.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal hot result: %v\n%s", err, second.String())
+	}
+	if !got.Duplicate || !central.SameRepoPath(got.Repo, repoDir) {
+		t.Fatalf("hot result should be duplicate at canonical root: %+v", got)
+	}
+}
+
 // shortCircuitNow override knob — keep it from leaking across tests.
 func TestShortCircuitNow_Overridable(t *testing.T) {
 	prev := shortCircuitNow

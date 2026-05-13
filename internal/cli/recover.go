@@ -19,7 +19,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -106,21 +105,9 @@ func runRecover(ctx context.Context, out io.Writer, repo string, auto, dryRun, y
 }
 
 func recoverRepoRecord(repo string) (central.RepoRecord, error) {
-	abs, err := resolveRepo(repo)
+	rec, _, abs, err := lookupRegisteredRepo("recover", repo)
 	if err != nil {
 		return central.RepoRecord{}, err
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return central.RepoRecord{}, fmt.Errorf("acd recover: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return central.RepoRecord{}, fmt.Errorf("acd recover: load registry: %w", err)
-	}
-	rec, ok := findRepo(reg, abs)
-	if !ok {
-		return central.RepoRecord{}, fmt.Errorf("acd recover: repo %s is not registered", abs)
 	}
 	if !fileExists(rec.StateDB) {
 		return central.RepoRecord{}, fmt.Errorf("acd recover: state.db missing for repo %s", abs)

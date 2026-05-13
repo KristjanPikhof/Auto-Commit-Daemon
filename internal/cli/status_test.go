@@ -113,7 +113,7 @@ func TestStatus_UnregisteredRepoErrors(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 
-	stranger := t.TempDir()
+	stranger := initCLIResolverRepo(t)
 	var out bytes.Buffer
 	err := runStatus(ctx, &out, stranger, false)
 	if err == nil {

@@ -30,6 +30,9 @@ func initRepo(t *testing.T) string {
 	if err := Init(ctx, dir); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
 	// commit-tree refuses to run without an author; configure repo-local
 	// values so we don't rely on the host's ~/.gitconfig.
 	for _, kv := range [][2]string{

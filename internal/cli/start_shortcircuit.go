@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
@@ -82,6 +83,11 @@ var captureDaemonFingerprint = func(ctx context.Context, pid int) (identity.Fing
 // Tests override it to pin a deterministic time reference; production
 // callers leave it at the default.
 var shortCircuitNow = func() time.Time { return time.Now() }
+
+type registryBackedStartResult struct {
+	gitDir string
+	startResult
+}
 
 // startCachePath returns the per-session cache path under gitDir. It does
 // NOT create the parent directory — the full runStart path does that under
@@ -327,11 +333,29 @@ func tryShortCircuitStart(
 	}
 	var rec *central.RepoRecord
 	if reg != nil {
+		// Two-pass lookup: prefer exact path-match so a stale legacy
+		// duplicate that shares only the RepoHash never shadows the
+		// canonical row. The hash fallback covers post-relocation
+		// recovery (Path moved, hash stable) only when no path-match
+		// exists.
 		for i := range reg.Repos {
-			if central.SameRepoPath(reg.Repos[i].Path, repo) ||
-				(reg.Repos[i].RepoHash != "" && reg.Repos[i].RepoHash == repoHash) {
+			if !registryRecordLooksCanonical(reg.Repos[i]) {
+				continue
+			}
+			if central.SameRepoPath(reg.Repos[i].Path, repo) {
 				rec = &reg.Repos[i]
 				break
+			}
+		}
+		if rec == nil && repoHash != "" {
+			for i := range reg.Repos {
+				if !registryRecordLooksCanonical(reg.Repos[i]) {
+					continue
+				}
+				if reg.Repos[i].RepoHash == repoHash {
+					rec = &reg.Repos[i]
+					break
+				}
 			}
 		}
 	}
@@ -341,4 +365,125 @@ func tryShortCircuitStart(
 		return false, 0, 0, d.Reason
 	}
 	return true, d.DaemonPID, d.ClientCount, ""
+}
+
+// tryRegistryBackedShortCircuitStart is the earliest active-hook hot path.
+// It resolves canonical repo identity from a fresh central-registry row plus
+// that session's start-cache instead of running Git before the cache decision.
+// Any uncertainty falls back to the canonical Git-backed cold path in runStart.
+func tryRegistryBackedShortCircuitStart(
+	ctx context.Context,
+	repoFlag, sessionID, harness string,
+) (registryBackedStartResult, bool) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return registryBackedStartResult{}, false
+		}
+	}
+	startPath := repoFlag
+	if startPath == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return registryBackedStartResult{}, false
+		}
+		startPath = cwd
+	}
+	abs, err := filepath.Abs(startPath)
+	if err != nil {
+		return registryBackedStartResult{}, false
+	}
+	abs = filepath.Clean(abs)
+	if realAbs, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = filepath.Clean(realAbs)
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return registryBackedStartResult{}, false
+	}
+
+	roots, err := paths.Resolve()
+	if err != nil {
+		return registryBackedStartResult{}, false
+	}
+	reg, err := central.Load(roots)
+	if err != nil || reg == nil {
+		return registryBackedStartResult{}, false
+	}
+	var rec *central.RepoRecord
+	for i := range reg.Repos {
+		if !registryRecordLooksCanonical(reg.Repos[i]) {
+			continue
+		}
+		if pathWithinRepoRoot(abs, reg.Repos[i].Path) {
+			rec = &reg.Repos[i]
+			break
+		}
+	}
+	if rec == nil || rec.RepoHash == "" || rec.StateDB == "" {
+		return registryBackedStartResult{}, false
+	}
+	gitDir := gitDirFromStateDB(rec.StateDB)
+	if gitDir == "" || !headFileLooksAttached(gitDir) {
+		return registryBackedStartResult{}, false
+	}
+	cache := readStartCache(startCachePath(gitDir, sessionID))
+	d := evaluateShortCircuit(cache, rec.RepoHash, sessionID, harness, rec,
+		shortCircuitNow(), clientTTL(), identity.Alive, captureDaemonFingerprint)
+	if !d.OK {
+		return registryBackedStartResult{}, false
+	}
+	return registryBackedStartResult{
+		gitDir: gitDir,
+		startResult: startResult{
+			Started:     false,
+			Duplicate:   true,
+			DaemonPID:   d.DaemonPID,
+			Repo:        filepath.Clean(rec.Path),
+			RepoHash:    rec.RepoHash,
+			SessionID:   sessionID,
+			Harness:     harness,
+			ClientCount: d.ClientCount,
+		},
+	}, true
+}
+
+func registryRecordLooksCanonical(rec central.RepoRecord) bool {
+	if rec.Path == "" {
+		return false
+	}
+	root := filepath.Clean(rec.Path)
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		return false
+	}
+	return true
+}
+
+func pathWithinRepoRoot(path, root string) bool {
+	if path == "" || root == "" {
+		return false
+	}
+	cleanRoot := filepath.Clean(root)
+	if realRoot, err := filepath.EvalSymlinks(cleanRoot); err == nil {
+		cleanRoot = filepath.Clean(realRoot)
+	}
+	if central.SameRepoPath(cleanRoot, path) {
+		return true
+	}
+	rel, err := filepath.Rel(cleanRoot, path)
+	return err == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+func headFileLooksAttached(gitDir string) bool {
+	if gitDir == "" {
+		return false
+	}
+	body, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(body)), "ref: refs/heads/")
 }

@@ -7,13 +7,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -323,6 +326,287 @@ func TestStart_RegistryUpdated(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte(repoDir)) || !bytes.Contains(body, []byte("codex")) {
 		t.Fatalf("registry missing repo or harness:\n%s", body)
+	}
+}
+
+func TestStart_CanonicalizesSubdirectoryForIdentityAndRegistry(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
+	nestedA := filepath.Join(repoDir, "nested", "a")
+	nestedB := filepath.Join(repoDir, "nested", "b")
+	if err := os.MkdirAll(nestedA, 0o755); err != nil {
+		t.Fatalf("mkdir nestedA: %v", err)
+	}
+	if err := os.MkdirAll(nestedB, 0o755); err != nil {
+		t.Fatalf("mkdir nestedB: %v", err)
+	}
+
+	var spawnedRepo string
+	prevSpawn := spawnDaemon
+	var count atomic.Int32
+	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
+		count.Add(1)
+		spawnedRepo = repoAbs
+		gitDir := filepath.Join(repoAbs, ".git")
+		dbPath := state.DBPathFromGitDir(gitDir)
+		db, err := state.Open(ctx, dbPath)
+		if err != nil {
+			return 0, err
+		}
+		defer db.Close()
+		if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+			PID:         os.Getpid(),
+			Mode:        "running",
+			HeartbeatTS: nowFloat(),
+			UpdatedTS:   nowFloat(),
+		}); err != nil {
+			return 0, err
+		}
+		return os.Getpid(), nil
+	}
+	t.Cleanup(func() { spawnDaemon = prevSpawn })
+
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, nestedA, "session-a", "codex", 0, true); err != nil {
+		t.Fatalf("first runStart: %v", err)
+	}
+	var first startResult
+	if err := json.Unmarshal(stdout.Bytes(), &first); err != nil {
+		t.Fatalf("unmarshal first: %v\n%s", err, stdout.String())
+	}
+	wantHash, err := paths.RepoHash(repoDir)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	if first.Repo != repoDir || first.RepoHash != wantHash || first.SessionID != "session-a" {
+		t.Fatalf("first result = %+v, want canonical repo %q hash %q", first, repoDir, wantHash)
+	}
+	if spawnedRepo != repoDir {
+		t.Fatalf("spawned repo = %q, want canonical root %q", spawnedRepo, repoDir)
+	}
+
+	stdout.Reset()
+	if err := runStart(ctx, &stdout, nestedB, "session-b", "pi", 0, true); err != nil {
+		t.Fatalf("second runStart: %v", err)
+	}
+	var second startResult
+	if err := json.Unmarshal(stdout.Bytes(), &second); err != nil {
+		t.Fatalf("unmarshal second: %v\n%s", err, stdout.String())
+	}
+	if second.Repo != repoDir || second.RepoHash != wantHash {
+		t.Fatalf("second result = %+v, want canonical repo %q hash %q", second, repoDir, wantHash)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count = %d, want 1", count.Load())
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows = %d, want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	row := reg.Repos[0]
+	if row.Path != repoDir {
+		t.Fatalf("registry path = %q, want canonical root %q", row.Path, repoDir)
+	}
+	if row.RepoHash != wantHash {
+		t.Fatalf("registry hash = %q, want %q", row.RepoHash, wantHash)
+	}
+	wantStateDB := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
+	if row.StateDB != wantStateDB {
+		t.Fatalf("registry state_db = %q, want %q", row.StateDB, wantStateDB)
+	}
+	for _, bad := range []string{nestedA, nestedB} {
+		if central.SameRepoPath(row.Path, bad) {
+			t.Fatalf("registry path %q unexpectedly matched subdir %q", row.Path, bad)
+		}
+	}
+}
+
+func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
+	legacySubdir := filepath.Join(repoDir, "legacy", "subdir")
+	if err := os.MkdirAll(legacySubdir, 0o755); err != nil {
+		t.Fatalf("mkdir legacy subdir: %v", err)
+	}
+	stateDB := state.DBPathFromGitDir(wt.GitDir)
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{{
+			Path:              legacySubdir,
+			RepoHash:          "legacy-hash",
+			StateDB:           stateDB,
+			FirstRegisteredTS: 10,
+			LastSeenTS:        20,
+			Harnesses:         []string{"codex"},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy registry: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, repoDir, "root-session", "pi", 0, true); err != nil {
+		t.Fatalf("runStart: %v", err)
+	}
+	var res startResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal start: %v\n%s", err, stdout.String())
+	}
+	if res.Repo != repoDir {
+		t.Fatalf("start repo=%q want canonical root %q", res.Repo, repoDir)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count=%d want 1", count.Load())
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows=%d want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	rec := reg.Repos[0]
+	if rec.Path != repoDir || rec.StateDB != stateDB {
+		t.Fatalf("registry record=%+v want canonical path %q state_db %q", rec, repoDir, stateDB)
+	}
+	if !reflect.DeepEqual(rec.Harnesses, []string{"codex", "pi"}) {
+		t.Fatalf("harnesses=%v want [codex pi]", rec.Harnesses)
+	}
+}
+
+func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	mainRepo := makeStartRepo(t)
+	for _, kv := range [][2]string{
+		{"user.email", "acd-test@example.com"},
+		{"user.name", "ACD Test"},
+		{"commit.gpgsign", "false"},
+	} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "config", kv[0], kv[1]); err != nil {
+			t.Fatalf("git config %s: %v", kv[0], err)
+		}
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "commit", "--allow-empty", "-m", "init"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-start", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(linked, ".git")); err != nil {
+		t.Fatalf("stat linked .git: %v", err)
+	} else if info.IsDir() {
+		t.Fatalf("linked worktree .git is a directory, want git-file")
+	}
+	wt, err := git.ResolveWorktree(ctx, linked)
+	if err != nil {
+		t.Fatalf("resolve linked worktree: %v", err)
+	}
+	nested := filepath.Join(linked, "pkg", "deep")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	var spawnedRepo string
+	prevSpawn := spawnDaemon
+	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
+		spawnedRepo = repoAbs
+		spawnWT, err := git.ResolveWorktree(ctx, repoAbs)
+		if err != nil {
+			return 0, err
+		}
+		db, err := state.Open(ctx, state.DBPathFromGitDir(spawnWT.GitDir))
+		if err != nil {
+			return 0, err
+		}
+		defer db.Close()
+		if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+			PID:         os.Getpid(),
+			Mode:        "running",
+			HeartbeatTS: nowFloat(),
+			UpdatedTS:   nowFloat(),
+		}); err != nil {
+			return 0, err
+		}
+		return os.Getpid(), nil
+	}
+	t.Cleanup(func() { spawnDaemon = prevSpawn })
+
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, nested, "linked-session", "codex", 0, true); err != nil {
+		t.Fatalf("runStart linked subdir: %v", err)
+	}
+	var res startResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal start result: %v\n%s", err, stdout.String())
+	}
+	if res.Repo != wt.Root {
+		t.Fatalf("start repo=%q want linked worktree root %q", res.Repo, wt.Root)
+	}
+	if spawnedRepo != wt.Root {
+		t.Fatalf("spawned repo=%q want linked worktree root %q", spawnedRepo, wt.Root)
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows=%d, want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	row := reg.Repos[0]
+	if row.Path != wt.Root {
+		t.Fatalf("registry path=%q want linked worktree root %q", row.Path, wt.Root)
+	}
+	wantStateDB := state.DBPathFromGitDir(wt.GitDir)
+	if row.StateDB != wantStateDB {
+		t.Fatalf("registry state_db=%q want resolved git dir state DB %q", row.StateDB, wantStateDB)
+	}
+	if row.StateDB == state.DBPathFromGitDir(filepath.Join(wt.Root, ".git")) {
+		t.Fatalf("registry state_db used literal .git file path: %q", row.StateDB)
+	}
+}
+
+func TestStart_NonWorktreeFailsBeforeRegistryOrDaemonSpawn(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	nonRepo := t.TempDir()
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+
+	var stdout bytes.Buffer
+	err := runStart(ctx, &stdout, nonRepo, "session-x", "codex", 0, true)
+	if err == nil {
+		t.Fatalf("runStart succeeded for non-worktree")
+	}
+	if !strings.Contains(err.Error(), "not inside a Git worktree") {
+		t.Fatalf("error %q does not mention non-worktree", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count = %d, want 0", count.Load())
+	}
+	if _, statErr := os.Stat(roots.RegistryPath()); !os.IsNotExist(statErr) {
+		t.Fatalf("registry stat err = %v, want not exist before upsert", statErr)
 	}
 }
 

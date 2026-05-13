@@ -51,28 +51,9 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	repo, err := resolveRepo(repoFlag)
+	repo, gitDir, err := resolveDaemonWorktree(ctx, repoFlag, gitDirFlag)
 	if err != nil {
 		return err
-	}
-	if !fileExists(repo) {
-		return fmt.Errorf("acd daemon run: repo %s does not exist", repo)
-	}
-	gitDir := gitDirFlag
-	if gitDir == "" {
-		// Resolve via git so worktrees/submodules work.
-		resolved, gerr := git.AbsoluteGitDir(ctx, repo)
-		if gerr != nil {
-			// Fall back to <repo>/.git when git invocation fails (common
-			// in tests with synthetic repos).
-			fallback := filepath.Join(repo, ".git")
-			if !fileExists(fallback) {
-				return fmt.Errorf("acd daemon run: resolve git dir for %s: %w", repo, gerr)
-			}
-			gitDir = fallback
-		} else {
-			gitDir = resolved
-		}
 	}
 
 	// Wire SIGTERM/SIGINT to ctx cancel. The daemon package installs its
@@ -139,6 +120,28 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 //   - CentralStatsDBPath + RepoHash are wired from the same canonical
 //     path resolution used by `acd logs`, so stats and logs agree on the
 //     repo identity.
+func resolveDaemonWorktree(ctx context.Context, repoFlag, gitDirFlag string) (string, string, error) {
+	wt, err := git.ResolveWorktree(ctx, repoFlag)
+	if err != nil {
+		if errors.Is(err, git.ErrNotWorktree) {
+			return "", "", fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repoFlag, err)
+		}
+		return "", "", err
+	}
+	gitDir := wt.GitDir
+	if gitDirFlag != "" {
+		abs, err := filepath.Abs(gitDirFlag)
+		if err != nil {
+			return "", "", fmt.Errorf("acd daemon run: resolve git dir %q: %w", gitDirFlag, err)
+		}
+		gitDir = filepath.Clean(abs)
+		if realGitDir, err := filepath.EvalSymlinks(gitDir); err == nil {
+			gitDir = filepath.Clean(realGitDir)
+		}
+	}
+	return wt.Root, gitDir, nil
+}
+
 func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daemon.Options, io.Closer, error) {
 	fsEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {

@@ -81,7 +81,7 @@ func TestLogsMissingLogReturnsActionableError(t *testing.T) {
 
 func TestLogsUnregisteredRepoReturnsActionableError(t *testing.T) {
 	withIsolatedHome(t)
-	repo := t.TempDir()
+	repo := initCLIResolverRepo(t)
 
 	var out bytes.Buffer
 	err := runLogs(context.Background(), &out, repo, defaultLogLines, false)

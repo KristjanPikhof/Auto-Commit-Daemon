@@ -29,6 +29,7 @@
 package central
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +38,10 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
@@ -65,6 +68,14 @@ type RepoRecord struct {
 	FirstRegisteredTS int64    `json:"first_registered_ts"`
 	LastSeenTS        int64    `json:"last_seen_ts"`
 	Harnesses         []string `json:"harnesses"`
+}
+
+// LegacyDuplicateChange describes one registry row removed by
+// CleanupLegacyDuplicates. Reason is "same-git-toplevel" or "same-state-db".
+type LegacyDuplicateChange struct {
+	KeptPath    string `json:"kept_path"`
+	DroppedPath string `json:"dropped_path"`
+	Reason      string `json:"reason"`
 }
 
 // NewRegistry returns an empty v1 registry.
@@ -184,8 +195,10 @@ func (r *Registry) UpsertRepo(path, repoHash, stateDB, harness string, now int64
 	if r == nil {
 		return
 	}
+	wantStateDB := canonicalStateDB(stateDB)
 	for i := range r.Repos {
-		if SameRepoPath(r.Repos[i].Path, path) {
+		rowStateDB := canonicalStateDB(r.Repos[i].StateDB)
+		if SameRepoPath(r.Repos[i].Path, path) || (wantStateDB != "" && rowStateDB != "" && sameCleanPath(rowStateDB, wantStateDB)) {
 			row := &r.Repos[i]
 			// Refresh the metadata that may have changed since the row was
 			// first written (state_db can move if .git is relocated; the
@@ -261,14 +274,182 @@ func mergeRepoRecord(dst *RepoRecord, src RepoRecord) {
 		if src.RepoHash != "" {
 			dst.RepoHash = src.RepoHash
 		}
-		if src.StateDB != "" {
+		if shouldReplaceStateDB(dst.StateDB, src.StateDB) {
 			dst.StateDB = src.StateDB
 		}
 		dst.LastSeenTS = src.LastSeenTS
+	} else if shouldReplaceStateDB(dst.StateDB, src.StateDB) {
+		dst.StateDB = src.StateDB
 	}
 	for _, h := range src.Harnesses {
 		dst.Harnesses = addHarness(dst.Harnesses, h)
 	}
+}
+
+func shouldReplaceStateDB(dst, src string) bool {
+	if src == "" {
+		return false
+	}
+	if dst == "" {
+		return true
+	}
+	dstExists := fileExists(dst)
+	srcExists := fileExists(src)
+	if dstExists != srcExists {
+		return srcExists
+	}
+	return true
+}
+
+// CleanupLegacyDuplicates merges legacy registry rows that identify the same
+// repo by Git toplevel, or that point at the same per-repo state DB. Callers
+// should run this under WithLock so cleanup, pruning, and Save are atomic.
+func (r *Registry) CleanupLegacyDuplicates(ctx context.Context) ([]LegacyDuplicateChange, error) {
+	if r == nil || len(r.Repos) < 2 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// canonicalGitRoot spawns `git rev-parse --show-toplevel` per row.
+	// CleanupLegacyDuplicates runs under registry WithLock so writers
+	// block until it completes; parallelize the git probes with a
+	// bounded worker pool to keep critical-section time near a single
+	// subprocess regardless of registry size.
+	infos := make([]legacyRepoInfo, len(r.Repos))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if len(r.Repos) < workers {
+		workers = len(r.Repos)
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, rec := range r.Repos {
+		i, rec := i, rec
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			infos[i] = legacyRepoInfo{
+				Record:  rec,
+				Root:    canonicalGitRoot(ctx, rec.Path),
+				StateDB: canonicalStateDB(rec.StateDB),
+			}
+		}()
+	}
+	wg.Wait()
+
+	out := make([]legacyRepoInfo, 0, len(infos))
+	changes := make([]LegacyDuplicateChange, 0)
+	for _, info := range infos {
+		merged := false
+		for i := range out {
+			if reason, same := legacyDuplicateReason(out[i], info); same {
+				before := out[i].Record.Path
+				mergeRepoRecord(&out[i].Record, info.Record)
+				if out[i].Root == "" && info.Root != "" {
+					out[i].Root = info.Root
+				}
+				if out[i].StateDB == "" && info.StateDB != "" {
+					out[i].StateDB = info.StateDB
+				}
+				if out[i].Root != "" {
+					out[i].Record.Path = out[i].Root
+				}
+				changes = append(changes, LegacyDuplicateChange{KeptPath: out[i].Record.Path, DroppedPath: info.Record.Path, Reason: reason})
+				if before != out[i].Record.Path {
+					changes[len(changes)-1].KeptPath = out[i].Record.Path
+				}
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			if info.Root != "" {
+				info.Record.Path = info.Root
+			}
+			out = append(out, info)
+		}
+	}
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	r.Repos = make([]RepoRecord, 0, len(out))
+	for _, info := range out {
+		r.Repos = append(r.Repos, info.Record)
+	}
+	return changes, nil
+}
+
+type legacyRepoInfo struct {
+	Record  RepoRecord
+	Root    string
+	StateDB string
+}
+
+func legacyDuplicateReason(a, b legacyRepoInfo) (string, bool) {
+	if a.Root != "" && b.Root != "" && SameRepoPath(a.Root, b.Root) {
+		return "same-git-toplevel", true
+	}
+	if a.StateDB != "" && b.StateDB != "" && sameCleanPath(a.StateDB, b.StateDB) {
+		return "same-state-db", true
+	}
+	return "", false
+}
+
+func sameCleanPath(a, b string) bool {
+	if a == "" || b == "" {
+		return a == b
+	}
+	cleanA := filepath.Clean(a)
+	cleanB := filepath.Clean(b)
+	if cleanA == cleanB {
+		return true
+	}
+	if pathCaseFoldedByDefault() {
+		return strings.EqualFold(cleanA, cleanB)
+	}
+	return false
+}
+
+func canonicalGitRoot(ctx context.Context, path string) string {
+	if path == "" {
+		return ""
+	}
+	wt, err := git.ResolveWorktree(ctx, path)
+	if err != nil {
+		return ""
+	}
+	return wt.Root
+}
+
+func canonicalStateDB(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	path = filepath.Clean(path)
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = filepath.Clean(realPath)
+	}
+	return path
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // SameRepoPath reports whether two registry paths identify the same repo.
