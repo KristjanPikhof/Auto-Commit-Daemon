@@ -4,10 +4,21 @@
 
 ### Added
 
-- `acd start`, `acd status`, and `acd diagnose` now resolve subdirectories to
-  the canonical Git worktree root. Starting ACD from `repo/subdir` refreshes the
-  existing repo daemon and central-registry row instead of creating a duplicate
-  subdirectory entry. Non-Git directories are refused with a clear error.
+- `acd start`, `acd status`, `acd diagnose`, `acd events`, `acd logs`,
+  `acd prompt`, `acd recover`, and `acd daemon run` now resolve subdirectories
+  to the canonical Git worktree root via a shared `git.ResolveWorktree` helper.
+  Starting ACD from `repo/subdir` refreshes the existing repo daemon and
+  central-registry row instead of creating a duplicate subdirectory entry.
+  Non-Git directories are refused with a clear error (`ErrNotWorktree`).
+- `acd start` gains a registry-backed early short-circuit that resolves
+  canonical repo identity from a fresh central-registry row plus the session's
+  start-cache before invoking `git rev-parse`. Existing path-vs-hash lookup
+  also prefers exact path matches so stale legacy duplicates no longer shadow
+  the canonical row.
+- `acd gc` now merges legacy duplicate registry rows that share a Git
+  toplevel or `state.db` before pruning. `acd gc --json` adds a `merged[]`
+  array of `{kept_path, dropped_path, reason}` entries alongside the existing
+  `dropped[]` and `kept` fields.
 - `acd setup opencode` and `acd setup pi` now print the canonical default hook
   paths (`~/.config/opencode/hook/hooks.yaml` and
   `~/.pi/agent/hook/hooks.yaml`). `acd doctor` detects acd-managed hooks at
