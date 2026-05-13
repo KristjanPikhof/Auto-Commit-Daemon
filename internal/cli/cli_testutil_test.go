@@ -22,6 +22,8 @@ func withIsolatedHome(t *testing.T) paths.Roots {
 	t.Setenv("XDG_DATA_HOME", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("ACD_CLIENT_TTL_SECONDS", "")
+	t.Setenv("ACD_INTENT_MIN_PENDING", "")
+	t.Setenv("ACD_INTENT_MAX_PENDING_AGE", "")
 	roots, err := paths.Resolve()
 	if err != nil {
 		t.Fatalf("paths.Resolve: %v", err)

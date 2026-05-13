@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -169,5 +168,3 @@ func TestRepoLookupRejectsNonGitWithoutRegistryMutation(t *testing.T) {
 		})
 	}
 }
-
-var _ paths.Roots
