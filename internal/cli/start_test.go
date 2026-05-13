@@ -332,6 +332,11 @@ func TestStart_CanonicalizesSubdirectoryForIdentityAndRegistry(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir := makeStartRepo(t)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
 	nestedA := filepath.Join(repoDir, "nested", "a")
 	nestedB := filepath.Join(repoDir, "nested", "b")
 	if err := os.MkdirAll(nestedA, 0o755); err != nil {
