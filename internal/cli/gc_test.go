@@ -63,6 +63,135 @@ func TestGC_DropsMissingStateDB(t *testing.T) {
 	}
 }
 
+func TestGC_MergesDuplicateSubdirRowAndReportsJSON(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, db, d := makeRepoStateDB(t)
+	_ = d.Close()
+	subdir := filepath.Join(repo, "nested")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{
+			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 20, LastSeenTS: 30, Harnesses: []string{"codex"}},
+			{Path: subdir, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 10, LastSeenTS: 40, Harnesses: []string{"claude-code"}},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runGC(ctx, &out, true); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	var rep gcReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(rep.Merged) != 1 || rep.Merged[0].Reason != "same-git-toplevel" {
+		t.Fatalf("merged=%+v, want one same-git-toplevel merge", rep.Merged)
+	}
+	if len(rep.Dropped) != 0 || rep.Kept != 1 {
+		t.Fatalf("report dropped=%+v kept=%d, want 0 dropped, 1 kept", rep.Dropped, rep.Kept)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(reg.Repos) != 1 || reg.Repos[0].Path != repo {
+		t.Fatalf("registry=%+v, want one canonical repo row", reg.Repos)
+	}
+	if reg.Repos[0].FirstRegisteredTS != 10 || reg.Repos[0].LastSeenTS != 40 {
+		t.Fatalf("timestamps not merged: %+v", reg.Repos[0])
+	}
+}
+
+func TestGC_MergesSameStateDBRowsAndIsIdempotent(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo1, db, d := makeRepoStateDB(t)
+	_ = d.Close()
+	repo2 := t.TempDir()
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{
+			{Path: repo1, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 5, LastSeenTS: 10, Harnesses: []string{"codex"}},
+			{Path: repo2, RepoHash: "h2", StateDB: db, FirstRegisteredTS: 7, LastSeenTS: 20, Harnesses: []string{"pi"}},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runGC(ctx, &out, true); err != nil {
+		t.Fatalf("runGC #1: %v", err)
+	}
+	var rep gcReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal #1: %v", err)
+	}
+	if len(rep.Merged) != 1 || rep.Merged[0].Reason != "same-state-db" {
+		t.Fatalf("merged=%+v, want one same-state-db merge", rep.Merged)
+	}
+	if len(rep.Dropped) != 0 || rep.Kept != 1 {
+		t.Fatalf("report dropped=%+v kept=%d, want 0 dropped, 1 kept", rep.Dropped, rep.Kept)
+	}
+
+	out.Reset()
+	if err := runGC(ctx, &out, true); err != nil {
+		t.Fatalf("runGC #2: %v", err)
+	}
+	var rep2 gcReport
+	if err := json.Unmarshal(out.Bytes(), &rep2); err != nil {
+		t.Fatalf("unmarshal #2: %v", err)
+	}
+	if len(rep2.Merged) != 0 || len(rep2.Dropped) != 0 || rep2.Kept != 1 {
+		t.Fatalf("second run not idempotent: %+v", rep2)
+	}
+}
+
+func TestGC_MergePreservesExistingStateDBWhenDuplicateHasMissingDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, db, d := makeRepoStateDB(t)
+	_ = d.Close()
+	subdir := filepath.Join(repo, "legacy")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	missingDB := filepath.Join(repo, ".git", "acd", "missing-state.db")
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{
+			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 1, LastSeenTS: 10, Harnesses: []string{"codex"}},
+			{Path: subdir, RepoHash: "h1", StateDB: missingDB, FirstRegisteredTS: 2, LastSeenTS: 20, Harnesses: []string{"claude-code"}},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runGC(ctx, &out, true); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	var rep gcReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(rep.Merged) != 1 || len(rep.Dropped) != 0 || rep.Kept != 1 {
+		t.Fatalf("report=%+v, want merge without stale missing-db drop", rep)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(reg.Repos) != 1 || reg.Repos[0].StateDB != db {
+		t.Fatalf("registry=%+v, want existing state DB preserved", reg.Repos)
+	}
+}
+
 func TestGC_DropsDeadDaemon30dOld(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
