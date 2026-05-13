@@ -333,14 +333,29 @@ func tryShortCircuitStart(
 	}
 	var rec *central.RepoRecord
 	if reg != nil {
+		// Two-pass lookup: prefer exact path-match so a stale legacy
+		// duplicate that shares only the RepoHash never shadows the
+		// canonical row. The hash fallback covers post-relocation
+		// recovery (Path moved, hash stable) only when no path-match
+		// exists.
 		for i := range reg.Repos {
 			if !registryRecordLooksCanonical(reg.Repos[i]) {
 				continue
 			}
-			if central.SameRepoPath(reg.Repos[i].Path, repo) ||
-				(reg.Repos[i].RepoHash != "" && reg.Repos[i].RepoHash == repoHash) {
+			if central.SameRepoPath(reg.Repos[i].Path, repo) {
 				rec = &reg.Repos[i]
 				break
+			}
+		}
+		if rec == nil && repoHash != "" {
+			for i := range reg.Repos {
+				if !registryRecordLooksCanonical(reg.Repos[i]) {
+					continue
+				}
+				if reg.Repos[i].RepoHash == repoHash {
+					rec = &reg.Repos[i]
+					break
+				}
 			}
 		}
 	}
