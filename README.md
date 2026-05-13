@@ -114,9 +114,15 @@ acd commit-all --repo /path/to/repo --yes   # target a repo other than $PWD
 ~~~
 
 Use the no-flag lifecycle commands when you are driving ACD from a terminal.
-Manual `acd start` registers a stable human client for the current repo, so
-running it again refreshes the same client instead of creating a new session.
-Manual `acd stop` stops the current repo daemon directly.
+Manual `acd start` resolves the current directory to its canonical Git worktree
+root, registers that root in the central registry, and creates a stable human
+client for it. Starting from a subdirectory of the same worktree refreshes the
+same root entry instead of creating a second daemon or registry row. Manual
+`acd stop` stops the current repo daemon directly.
+
+ACD refuses lifecycle and lookup commands outside a Git worktree. If `--repo` or
+`$PWD` is not inside a worktree, `start`, `status`, and `diagnose` fail with a
+clear non-Git error instead of registering an arbitrary directory.
 
 Harness integrations should keep passing `--session-id` (and usually
 `--harness`). That path is refcount-aware: `acd stop --session-id X` removes one
@@ -166,9 +172,11 @@ acd explain --commit HEAD
 acd fix --dry-run
 ~~~
 
-`status` shows daemon health, queue counts, pause state, failed terminal
-barriers, recent decision counts, and the active commit strategy. `status
---json` includes the decision cursor plus recent decision records, and includes
+`status` resolves `--repo` or `$PWD` the same way `start` does: subdirectories
+look up the canonical worktree root that was registered by `acd start`. It shows
+daemon health, queue counts, pause state, failed terminal barriers, recent
+decision counts, and the active commit strategy. `status --json` includes the
+decision cursor plus recent decision records, and includes
 `failed_events` / `failed_blocking_pending` when failed rows are holding pending
 replay behind a terminal barrier. With intent grouping enabled, it also reports
 planner deferrals, forced-aging readiness, and the latest planner error.

@@ -4,6 +4,10 @@
 
 ### Added
 
+- `acd start`, `acd status`, and `acd diagnose` now resolve subdirectories to
+  the canonical Git worktree root. Starting ACD from `repo/subdir` refreshes the
+  existing repo daemon and central-registry row instead of creating a duplicate
+  subdirectory entry. Non-Git directories are refused with a clear error.
 - `acd setup opencode` and `acd setup pi` now print the canonical default hook
   paths (`~/.config/opencode/hook/hooks.yaml` and
   `~/.pi/agent/hook/hooks.yaml`). `acd doctor` detects acd-managed hooks at
