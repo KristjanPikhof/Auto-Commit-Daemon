@@ -33,9 +33,9 @@ type gcDrop struct {
 // gcReport is the §7.11 JSON shape: dropped[] + kept count, plus legacy
 // duplicate merges performed before pruning.
 type gcReport struct {
-	Dropped []gcDrop                         `json:"dropped"`
+	Dropped []gcDrop                        `json:"dropped"`
 	Merged  []central.LegacyDuplicateChange `json:"merged"`
-	Kept    int                              `json:"kept"`
+	Kept    int                             `json:"kept"`
 }
 
 func newGCCmd() *cobra.Command {
