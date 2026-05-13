@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -30,9 +31,10 @@ func withIsolatedHome(t *testing.T) paths.Roots {
 	return roots
 }
 
-// makeRepoStateDB creates a synthetic .git/acd/state.db at <repoDir> with
-// the canonical schema applied. Returns the repo dir, .git/acd/state.db
-// path, and a state.DB handle the caller can write fixture rows into.
+// makeRepoStateDB creates a real Git repo with .git/acd/state.db at <repoDir>
+// with the canonical schema applied. Returns the canonical repo dir,
+// .git/acd/state.db path, and a state.DB handle the caller can write fixture
+// rows into.
 //
 // The caller MUST close the returned *state.DB before its companion test
 // process tries to open the file read-only on Windows-y filesystems; on
@@ -40,11 +42,16 @@ func withIsolatedHome(t *testing.T) paths.Roots {
 func makeRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
 	t.Helper()
 	repoDir = t.TempDir()
-	gitDir := filepath.Join(repoDir, ".git")
-	if err := os.MkdirAll(gitDir, 0o700); err != nil {
-		t.Fatalf("mkdir .git: %v", err)
+	ctx := context.Background()
+	if err := git.Init(ctx, repoDir); err != nil {
+		t.Fatalf("git init: %v", err)
 	}
-	dbPath := state.DBPathFromGitDir(gitDir)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
+	dbPath := state.DBPathFromGitDir(wt.GitDir)
 	d, err := state.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)

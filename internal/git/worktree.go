@@ -35,6 +35,9 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 		return Worktree{}, fmt.Errorf("git: abs %q: %w", repoPath, err)
 	}
 	abs = filepath.Clean(abs)
+	if realAbs, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = filepath.Clean(realAbs)
+	}
 	info, err := os.Stat(abs)
 	if err != nil {
 		return Worktree{}, fmt.Errorf("git: stat %s: %w", abs, err)
@@ -51,8 +54,13 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 	if err != nil {
 		return Worktree{}, fmt.Errorf("git: resolve absolute git dir for %s: %w", abs, err)
 	}
-	return Worktree{
-		Root:   filepath.Clean(root),
-		GitDir: filepath.Clean(gitDir),
-	}, nil
+	root = filepath.Clean(root)
+	if realRoot, err := filepath.EvalSymlinks(root); err == nil {
+		root = filepath.Clean(realRoot)
+	}
+	gitDir = filepath.Clean(gitDir)
+	if realGitDir, err := filepath.EvalSymlinks(gitDir); err == nil {
+		gitDir = filepath.Clean(realGitDir)
+	}
+	return Worktree{Root: root, GitDir: gitDir}, nil
 }
