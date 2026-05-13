@@ -119,6 +119,22 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if sessionID == "" && harness != "" {
 		return errors.New("acd start: --session-id is required when --harness is set")
 	}
+	if harness == "" {
+		harness = "other"
+	}
+	if sessionID != "" {
+		if res, ok := tryRegistryBackedShortCircuitStart(ctx, repoFlag, sessionID, harness); ok {
+			_ = touchClientHotPath(ctx, res.gitDir, sessionID)
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(res.startResult)
+			}
+			fmt.Fprintf(out, "acd start: refreshed session %s (daemon already running, pid %d)\n",
+				sessionID, res.startResult.DaemonPID)
+			return nil
+		}
+	}
 	wt, err := git.ResolveWorktree(ctx, repoFlag)
 	if err != nil {
 		if errors.Is(err, git.ErrNotWorktree) {
@@ -134,9 +150,6 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	if sessionID == "" {
 		sessionID = humanStartSessionID(repoHash)
-	}
-	if harness == "" {
-		harness = "other"
 	}
 	if err := ensureAttachedHEAD(ctx, repo); err != nil {
 		return err
