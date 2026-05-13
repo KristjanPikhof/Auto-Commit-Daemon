@@ -334,6 +334,9 @@ func tryShortCircuitStart(
 	var rec *central.RepoRecord
 	if reg != nil {
 		for i := range reg.Repos {
+			if !registryRecordLooksCanonical(reg.Repos[i]) {
+				continue
+			}
 			if central.SameRepoPath(reg.Repos[i].Path, repo) ||
 				(reg.Repos[i].RepoHash != "" && reg.Repos[i].RepoHash == repoHash) {
 				rec = &reg.Repos[i]
@@ -393,6 +396,9 @@ func tryRegistryBackedShortCircuitStart(
 	}
 	var rec *central.RepoRecord
 	for i := range reg.Repos {
+		if !registryRecordLooksCanonical(reg.Repos[i]) {
+			continue
+		}
 		if pathWithinRepoRoot(abs, reg.Repos[i].Path) {
 			rec = &reg.Repos[i]
 			break
@@ -424,6 +430,21 @@ func tryRegistryBackedShortCircuitStart(
 			ClientCount: d.ClientCount,
 		},
 	}, true
+}
+
+func registryRecordLooksCanonical(rec central.RepoRecord) bool {
+	if rec.Path == "" {
+		return false
+	}
+	root := filepath.Clean(rec.Path)
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		return false
+	}
+	return true
 }
 
 func pathWithinRepoRoot(path, root string) bool {
