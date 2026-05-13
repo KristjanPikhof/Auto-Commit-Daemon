@@ -430,6 +430,100 @@ func TestStart_CanonicalizesSubdirectoryForIdentityAndRegistry(t *testing.T) {
 	}
 }
 
+func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	mainRepo := makeStartRepo(t)
+	for _, kv := range [][2]string{
+		{"user.email", "acd-test@example.com"},
+		{"user.name", "ACD Test"},
+		{"commit.gpgsign", "false"},
+	} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "config", kv[0], kv[1]); err != nil {
+			t.Fatalf("git config %s: %v", kv[0], err)
+		}
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "commit", "--allow-empty", "-m", "init"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-start", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(linked, ".git")); err != nil {
+		t.Fatalf("stat linked .git: %v", err)
+	} else if info.IsDir() {
+		t.Fatalf("linked worktree .git is a directory, want git-file")
+	}
+	wt, err := git.ResolveWorktree(ctx, linked)
+	if err != nil {
+		t.Fatalf("resolve linked worktree: %v", err)
+	}
+	nested := filepath.Join(linked, "pkg", "deep")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	var spawnedRepo string
+	prevSpawn := spawnDaemon
+	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
+		spawnedRepo = repoAbs
+		spawnWT, err := git.ResolveWorktree(ctx, repoAbs)
+		if err != nil {
+			return 0, err
+		}
+		db, err := state.Open(ctx, state.DBPathFromGitDir(spawnWT.GitDir))
+		if err != nil {
+			return 0, err
+		}
+		defer db.Close()
+		if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+			PID:         os.Getpid(),
+			Mode:        "running",
+			HeartbeatTS: nowFloat(),
+			UpdatedTS:   nowFloat(),
+		}); err != nil {
+			return 0, err
+		}
+		return os.Getpid(), nil
+	}
+	t.Cleanup(func() { spawnDaemon = prevSpawn })
+
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, nested, "linked-session", "codex", 0, true); err != nil {
+		t.Fatalf("runStart linked subdir: %v", err)
+	}
+	var res startResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal start result: %v\n%s", err, stdout.String())
+	}
+	if res.Repo != wt.Root {
+		t.Fatalf("start repo=%q want linked worktree root %q", res.Repo, wt.Root)
+	}
+	if spawnedRepo != wt.Root {
+		t.Fatalf("spawned repo=%q want linked worktree root %q", spawnedRepo, wt.Root)
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows=%d, want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	row := reg.Repos[0]
+	if row.Path != wt.Root {
+		t.Fatalf("registry path=%q want linked worktree root %q", row.Path, wt.Root)
+	}
+	wantStateDB := state.DBPathFromGitDir(wt.GitDir)
+	if row.StateDB != wantStateDB {
+		t.Fatalf("registry state_db=%q want resolved git dir state DB %q", row.StateDB, wantStateDB)
+	}
+	if row.StateDB == state.DBPathFromGitDir(filepath.Join(wt.Root, ".git")) {
+		t.Fatalf("registry state_db used literal .git file path: %q", row.StateDB)
+	}
+}
+
 func TestStart_NonWorktreeFailsBeforeRegistryOrDaemonSpawn(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

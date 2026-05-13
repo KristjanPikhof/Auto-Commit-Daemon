@@ -46,6 +46,9 @@ func makeRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
 	if err := git.Init(ctx, repoDir); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
 	wt, err := git.ResolveWorktree(ctx, repoDir)
 	if err != nil {
 		t.Fatalf("resolve worktree: %v", err)

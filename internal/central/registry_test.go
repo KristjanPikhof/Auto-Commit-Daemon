@@ -148,6 +148,9 @@ func TestRegistry_CleanupLegacyDuplicatesMergesSubdirRowsByGitToplevel(t *testin
 	if err := git.Init(ctx, repo); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
 	wt, err := git.ResolveWorktree(ctx, repo)
 	if err != nil {
 		t.Fatalf("resolve worktree: %v", err)
