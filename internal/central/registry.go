@@ -311,10 +311,39 @@ func (r *Registry) CleanupLegacyDuplicates(ctx context.Context) ([]LegacyDuplica
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// canonicalGitRoot spawns `git rev-parse --show-toplevel` per row.
+	// CleanupLegacyDuplicates runs under registry WithLock so writers
+	// block until it completes; parallelize the git probes with a
+	// bounded worker pool to keep critical-section time near a single
+	// subprocess regardless of registry size.
 	infos := make([]legacyRepoInfo, len(r.Repos))
-	for i, rec := range r.Repos {
-		infos[i] = legacyRepoInfo{Record: rec, Root: canonicalGitRoot(ctx, rec.Path), StateDB: canonicalStateDB(rec.StateDB)}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
 	}
+	if workers < 1 {
+		workers = 1
+	}
+	if len(r.Repos) < workers {
+		workers = len(r.Repos)
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, rec := range r.Repos {
+		i, rec := i, rec
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			infos[i] = legacyRepoInfo{
+				Record:  rec,
+				Root:    canonicalGitRoot(ctx, rec.Path),
+				StateDB: canonicalStateDB(rec.StateDB),
+			}
+		}()
+	}
+	wg.Wait()
 
 	out := make([]legacyRepoInfo, 0, len(infos))
 	changes := make([]LegacyDuplicateChange, 0)
