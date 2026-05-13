@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-13
+
 ### Added
 
 - `acd start`, `acd status`, `acd diagnose`, `acd events`, `acd logs`,
