@@ -72,10 +72,11 @@ func TestGC_MergesDuplicateSubdirRowAndReportsJSON(t *testing.T) {
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatalf("mkdir subdir: %v", err)
 	}
+	now := time.Now().Unix()
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{
-			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 20, LastSeenTS: 30, Harnesses: []string{"codex"}},
-			{Path: subdir, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 10, LastSeenTS: 40, Harnesses: []string{"claude-code"}},
+			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: now - 20, LastSeenTS: now - 10, Harnesses: []string{"codex"}},
+			{Path: subdir, RepoHash: "h1", StateDB: db, FirstRegisteredTS: now - 30, LastSeenTS: now, Harnesses: []string{"claude-code"}},
 		}
 		return nil
 	}); err != nil {
@@ -103,7 +104,7 @@ func TestGC_MergesDuplicateSubdirRowAndReportsJSON(t *testing.T) {
 	if len(reg.Repos) != 1 || reg.Repos[0].Path != repo {
 		t.Fatalf("registry=%+v, want one canonical repo row", reg.Repos)
 	}
-	if reg.Repos[0].FirstRegisteredTS != 10 || reg.Repos[0].LastSeenTS != 40 {
+	if reg.Repos[0].FirstRegisteredTS != now-30 || reg.Repos[0].LastSeenTS != now {
 		t.Fatalf("timestamps not merged: %+v", reg.Repos[0])
 	}
 }
@@ -114,10 +115,11 @@ func TestGC_MergesSameStateDBRowsAndIsIdempotent(t *testing.T) {
 	repo1, db, d := makeRepoStateDB(t)
 	_ = d.Close()
 	repo2 := t.TempDir()
+	now := time.Now().Unix()
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{
-			{Path: repo1, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 5, LastSeenTS: 10, Harnesses: []string{"codex"}},
-			{Path: repo2, RepoHash: "h2", StateDB: db, FirstRegisteredTS: 7, LastSeenTS: 20, Harnesses: []string{"pi"}},
+			{Path: repo1, RepoHash: "h1", StateDB: db, FirstRegisteredTS: now - 20, LastSeenTS: now - 10, Harnesses: []string{"codex"}},
+			{Path: repo2, RepoHash: "h2", StateDB: db, FirstRegisteredTS: now - 15, LastSeenTS: now, Harnesses: []string{"pi"}},
 		}
 		return nil
 	}); err != nil {
@@ -162,10 +164,11 @@ func TestGC_MergePreservesExistingStateDBWhenDuplicateHasMissingDB(t *testing.T)
 		t.Fatalf("mkdir subdir: %v", err)
 	}
 	missingDB := filepath.Join(repo, ".git", "acd", "missing-state.db")
+	now := time.Now().Unix()
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{
-			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: 1, LastSeenTS: 10, Harnesses: []string{"codex"}},
-			{Path: subdir, RepoHash: "h1", StateDB: missingDB, FirstRegisteredTS: 2, LastSeenTS: 20, Harnesses: []string{"claude-code"}},
+			{Path: repo, RepoHash: "h1", StateDB: db, FirstRegisteredTS: now - 20, LastSeenTS: now - 10, Harnesses: []string{"codex"}},
+			{Path: subdir, RepoHash: "h1", StateDB: missingDB, FirstRegisteredTS: now - 15, LastSeenTS: now, Harnesses: []string{"claude-code"}},
 		}
 		return nil
 	}); err != nil {
