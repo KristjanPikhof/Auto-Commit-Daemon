@@ -38,6 +38,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
