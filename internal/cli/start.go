@@ -119,13 +119,15 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if sessionID == "" && harness != "" {
 		return errors.New("acd start: --session-id is required when --harness is set")
 	}
-	repo, err := resolveRepo(repoFlag)
+	wt, err := git.ResolveWorktree(ctx, repoFlag)
 	if err != nil {
+		if errors.Is(err, git.ErrNotWorktree) {
+			return fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repoFlag, err)
+		}
 		return err
 	}
-	if !fileExists(repo) {
-		return fmt.Errorf("acd start: repo %s does not exist", repo)
-	}
+	repo := wt.Root
+	gitDir := wt.GitDir
 	repoHash, err := paths.RepoHash(repo)
 	if err != nil {
 		return fmt.Errorf("acd start: repo hash: %w", err)
@@ -135,10 +137,6 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	if harness == "" {
 		harness = "other"
-	}
-	gitDir, err := resolveGitDir(ctx, repo)
-	if err != nil {
-		return fmt.Errorf("acd start: resolve git dir: %w", err)
 	}
 	if err := ensureAttachedHEAD(ctx, repo); err != nil {
 		return err
