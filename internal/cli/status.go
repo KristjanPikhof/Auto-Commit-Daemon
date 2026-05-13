@@ -124,14 +124,30 @@ func runStatus(ctx context.Context, out io.Writer, repo string, jsonOut bool) er
 	return renderStatusHuman(out, report)
 }
 
-// findRepo returns the registry record whose Path matches abs.
-func findRepo(reg *central.Registry, abs string) (central.RepoRecord, bool) {
+// findRepo returns the registry record whose Path matches abs. If expected
+// state DB paths are supplied, legacy rows whose Path is a subdirectory but
+// StateDB points at the canonical repo DB are treated as the same repo without
+// mutating the registry.
+func findRepo(reg *central.Registry, abs string, expectedStateDBs ...string) (central.RepoRecord, bool) {
 	for _, r := range reg.Repos {
-		if central.SameRepoPath(r.Path, abs) {
+		if central.SameRepoPath(r.Path, abs) || matchesStateDB(r.StateDB, expectedStateDBs) {
+			r.Path = abs
 			return r, true
 		}
 	}
 	return central.RepoRecord{}, false
+}
+
+func matchesStateDB(actual string, expected []string) bool {
+	if actual == "" {
+		return false
+	}
+	for _, want := range expected {
+		if want != "" && central.SameRepoPath(actual, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildStatusReport opens the per-repo state.db read-only and projects the

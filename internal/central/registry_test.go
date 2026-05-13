@@ -101,6 +101,35 @@ func TestRegistry_UpsertIdempotent(t *testing.T) {
 	}
 }
 
+func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
+	reg := NewRegistry()
+	reg.Repos = []RepoRecord{{
+		Path:              "/tmp/repo/subdir",
+		RepoHash:          "old",
+		StateDB:           "/tmp/repo/.git/acd/state.db",
+		FirstRegisteredTS: 10,
+		LastSeenTS:        20,
+		Harnesses:         []string{"codex"},
+	}}
+
+	reg.UpsertRepo("/tmp/repo", "new", "/tmp/repo/.git/acd/state.db", "pi", 30)
+
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	rec := reg.Repos[0]
+	if rec.Path != "/tmp/repo" || rec.RepoHash != "new" || rec.StateDB != "/tmp/repo/.git/acd/state.db" {
+		t.Fatalf("record=%+v, want canonical path/hash/state", rec)
+	}
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 30 {
+		t.Fatalf("timestamps=%d/%d want 10/30", rec.FirstRegisteredTS, rec.LastSeenTS)
+	}
+	wantHarnesses := []string{"codex", "pi"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
 func TestRegistry_NormalizesCaseDuplicateOnCaseFoldedPlatforms(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
 		t.Skip("case-folded registry path matching is only enabled on darwin/windows")

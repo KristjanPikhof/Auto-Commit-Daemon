@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -140,6 +141,103 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 			t.Fatalf("stop should defer with peer still registered, got %+v", rep)
 		}
 	})
+}
+
+func TestRepoLookupCommandsFindLegacySubdirRegistryRowByStateDBReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	legacySubdir := filepath.Join(repo, "legacy", "subdir")
+	if err := os.MkdirAll(legacySubdir, 0o755); err != nil {
+		t.Fatalf("mkdir legacy subdir: %v", err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{{
+			Path:              legacySubdir,
+			RepoHash:          "legacy-hash",
+			StateDB:           stateDB,
+			FirstRegisteredTS: 10,
+			LastSeenTS:        20,
+			Harnesses:         []string{"codex"},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy registry: %v", err)
+	}
+
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: 0, Mode: "stopped", HeartbeatTS: nowFloat()}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:  nowFloat(),
+		Kind:        state.DecisionKindCaptured,
+		Path:        sql.NullString{String: "legacy/file.txt", Valid: true},
+		ActionTaken: sql.NullString{String: "queued", Valid: true},
+	}); err != nil {
+		t.Fatalf("append decision: %v", err)
+	}
+	writeRepoLog(t, roots, repo, `{"msg":"legacy"}`+"\n")
+
+	before, err := os.ReadFile(roots.RegistryPath())
+	if err != nil {
+		t.Fatalf("read registry before: %v", err)
+	}
+
+	for name, run := range map[string]func(string) (string, error){
+		"status-root": func(path string) (string, error) {
+			var out bytes.Buffer
+			err := runStatus(ctx, &out, path, true)
+			return out.String(), err
+		},
+		"status-subdir": func(path string) (string, error) {
+			var out bytes.Buffer
+			err := runStatus(ctx, &out, path, true)
+			return out.String(), err
+		},
+		"logs-root": func(path string) (string, error) {
+			var out bytes.Buffer
+			err := runLogs(ctx, &out, path, 1, false)
+			return out.String(), err
+		},
+		"events-subdir": func(path string) (string, error) {
+			var out bytes.Buffer
+			err := runEvents(ctx, &out, path, "", 0, 10, false, time.Millisecond, true)
+			return out.String(), err
+		},
+		"diagnose-root": func(path string) (string, error) {
+			var out bytes.Buffer
+			err := runDiagnose(ctx, &out, path, true)
+			return out.String(), err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := repo
+			if strings.Contains(name, "subdir") {
+				path = legacySubdir
+			}
+			out, err := run(path)
+			if err != nil {
+				t.Fatalf("%s failed: %v", name, err)
+			}
+			if strings.Contains(name, "logs") {
+				if !strings.Contains(out, "legacy") {
+					t.Fatalf("logs output missing legacy line: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, repo) {
+				t.Fatalf("output did not include canonical repo %q: %s", repo, out)
+			}
+		})
+	}
+
+	after, err := os.ReadFile(roots.RegistryPath())
+	if err != nil {
+		t.Fatalf("read registry after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("read-only lookup commands mutated registry\nbefore: %s\nafter: %s", before, after)
+	}
 }
 
 func TestRepoLookupRejectsNonGitWithoutRegistryMutation(t *testing.T) {
