@@ -194,8 +194,10 @@ func (r *Registry) UpsertRepo(path, repoHash, stateDB, harness string, now int64
 	if r == nil {
 		return
 	}
+	wantStateDB := canonicalStateDB(stateDB)
 	for i := range r.Repos {
-		if SameRepoPath(r.Repos[i].Path, path) {
+		rowStateDB := canonicalStateDB(r.Repos[i].StateDB)
+		if SameRepoPath(r.Repos[i].Path, path) || (wantStateDB != "" && rowStateDB != "" && sameCleanPath(rowStateDB, wantStateDB)) {
 			row := &r.Repos[i]
 			// Refresh the metadata that may have changed since the row was
 			// first written (state_db can move if .git is relocated; the

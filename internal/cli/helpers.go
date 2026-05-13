@@ -12,6 +12,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // defaultClientTTL is the heartbeat freshness window per D21 (§7.6 stale
@@ -80,10 +81,15 @@ func resolveRepo(repo string) (string, error) {
 // only reads registry state; callers that must stay read-only can use it
 // without creating or migrating per-repo state.
 func lookupRegisteredRepo(command, repo string) (central.RepoRecord, paths.Roots, string, error) {
-	abs, err := resolveRepo(repo)
+	wt, err := git.ResolveWorktree(context.Background(), repo)
 	if err != nil {
+		if errors.Is(err, git.ErrNotWorktree) {
+			return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repo, err)
+		}
 		return central.RepoRecord{}, paths.Roots{}, "", err
 	}
+	abs := wt.Root
+	stateDB := state.DBPathFromGitDir(wt.GitDir)
 	roots, err := paths.Resolve()
 	if err != nil {
 		return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("acd %s: resolve paths: %w", command, err)
@@ -92,7 +98,7 @@ func lookupRegisteredRepo(command, repo string) (central.RepoRecord, paths.Roots
 	if err != nil {
 		return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("acd %s: load registry: %w", command, err)
 	}
-	if rec, ok := findRepo(reg, abs); ok {
+	if rec, ok := findRepo(reg, abs, stateDB); ok {
 		return rec, roots, abs, nil
 	}
 	return central.RepoRecord{}, paths.Roots{}, abs, fmt.Errorf("acd %s: repo %s is not registered (try `acd start --repo %s`)", command, abs, abs)
