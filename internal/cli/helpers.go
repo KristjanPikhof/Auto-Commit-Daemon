@@ -1,13 +1,15 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 )
 
 // defaultClientTTL is the heartbeat freshness window per D21 (§7.6 stale
@@ -58,21 +60,17 @@ func parseSince(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("invalid duration %q", s)
 }
 
-// resolveRepo returns the absolute, cleaned path of the supplied repo.
+// resolveRepo returns the canonical Git worktree root for the supplied repo.
 // If repo is empty, the current working directory is used.
 func resolveRepo(repo string) (string, error) {
-	if repo == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", fmt.Errorf("cli: getwd: %w", err)
-		}
-		repo = cwd
-	}
-	abs, err := filepath.Abs(repo)
+	wt, err := git.ResolveWorktree(context.Background(), repo)
 	if err != nil {
-		return "", fmt.Errorf("cli: abs %q: %w", repo, err)
+		if errors.Is(err, git.ErrNotWorktree) {
+			return "", fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repo, err)
+		}
+		return "", err
 	}
-	return filepath.Clean(abs), nil
+	return wt.Root, nil
 }
 
 // formatDurationCompact renders a duration as "2s", "47s", "3m 14s",
