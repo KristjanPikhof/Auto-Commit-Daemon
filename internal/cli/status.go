@@ -130,7 +130,10 @@ func runStatus(ctx context.Context, out io.Writer, repo string, jsonOut bool) er
 // mutating the registry.
 func findRepo(reg *central.Registry, abs string, expectedStateDBs ...string) (central.RepoRecord, bool) {
 	for _, r := range reg.Repos {
-		if central.SameRepoPath(r.Path, abs) || matchesStateDB(r.StateDB, expectedStateDBs) {
+		if central.SameRepoPath(r.Path, abs) {
+			return r, true
+		}
+		if matchesStateDB(r.StateDB, expectedStateDBs) {
 			r.Path = abs
 			return r, true
 		}
