@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 

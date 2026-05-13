@@ -26,8 +26,9 @@ func TestResolveRepoUsesCurrentWorkingDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRepo cwd: %v", err)
 	}
-	if got != filepath.Clean(dir) {
-		t.Fatalf("repo=%q want %q", got, filepath.Clean(dir))
+	want := canonicalCLIResolverTestPath(t, dir)
+	if got != want {
+		t.Fatalf("repo=%q want %q", got, want)
 	}
 }
 
@@ -38,8 +39,9 @@ func TestResolveRepoUsesExplicitRepoPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRepo explicit: %v", err)
 	}
-	if got != filepath.Clean(dir) {
-		t.Fatalf("repo=%q want %q", got, filepath.Clean(dir))
+	want := canonicalCLIResolverTestPath(t, dir)
+	if got != want {
+		t.Fatalf("repo=%q want %q", got, want)
 	}
 }
 
@@ -54,8 +56,9 @@ func TestResolveRepoCanonicalizesNestedSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRepo nested: %v", err)
 	}
-	if got != filepath.Clean(dir) {
-		t.Fatalf("repo=%q want %q", got, filepath.Clean(dir))
+	want := canonicalCLIResolverTestPath(t, dir)
+	if got != want {
+		t.Fatalf("repo=%q want %q", got, want)
 	}
 }
 
@@ -87,4 +90,13 @@ func requireGitForCLIResolverTest(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not on PATH; skipping")
 	}
+}
+
+func canonicalCLIResolverTestPath(t *testing.T, path string) string {
+	t.Helper()
+	clean := filepath.Clean(path)
+	if realPath, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(realPath)
+	}
+	return clean
 }

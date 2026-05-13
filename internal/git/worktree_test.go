@@ -16,11 +16,13 @@ func TestResolveWorktreeExplicitRepoPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveWorktree: %v", err)
 	}
-	if wt.Root != filepath.Clean(dir) {
-		t.Fatalf("root=%q want %q", wt.Root, filepath.Clean(dir))
+	wantRoot := canonicalTestPath(t, dir)
+	if wt.Root != wantRoot {
+		t.Fatalf("root=%q want %q", wt.Root, wantRoot)
 	}
-	if wt.GitDir != filepath.Join(dir, ".git") {
-		t.Fatalf("gitDir=%q want %q", wt.GitDir, filepath.Join(dir, ".git"))
+	wantGitDir := filepath.Join(wantRoot, ".git")
+	if wt.GitDir != wantGitDir {
+		t.Fatalf("gitDir=%q want %q", wt.GitDir, wantGitDir)
 	}
 }
 
@@ -35,8 +37,9 @@ func TestResolveWorktreeNestedSubdir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveWorktree nested: %v", err)
 	}
-	if wt.Root != filepath.Clean(dir) {
-		t.Fatalf("root=%q want %q", wt.Root, filepath.Clean(dir))
+	wantRoot := canonicalTestPath(t, dir)
+	if wt.Root != wantRoot {
+		t.Fatalf("root=%q want %q", wt.Root, wantRoot)
 	}
 }
 
@@ -88,13 +91,23 @@ func TestResolveWorktreeLinkedWorktreeGitFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveWorktree linked: %v", err)
 	}
-	if wt.Root != filepath.Clean(linked) {
-		t.Fatalf("root=%q want %q", wt.Root, filepath.Clean(linked))
+	wantRoot := canonicalTestPath(t, linked)
+	if wt.Root != wantRoot {
+		t.Fatalf("root=%q want %q", wt.Root, wantRoot)
 	}
-	if wt.GitDir == filepath.Join(linked, ".git") {
+	if wt.GitDir == filepath.Join(wantRoot, ".git") {
 		t.Fatalf("git dir used literal .git file path: %q", wt.GitDir)
 	}
 	if _, err := os.Stat(wt.GitDir); err != nil {
 		t.Fatalf("resolved git dir does not exist: %s: %v", wt.GitDir, err)
 	}
+}
+
+func canonicalTestPath(t *testing.T, path string) string {
+	t.Helper()
+	clean := filepath.Clean(path)
+	if realPath, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(realPath)
+	}
+	return clean
 }
