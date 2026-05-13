@@ -659,8 +659,13 @@ acd gc
 
 Removes central-registry entries for repos that no longer exist on disk, whose
 `state.db` is missing, or whose daemon has been dead for more than 30 days.
-Current `acd start` calls write canonical Git worktree roots, so `acd gc` is
-only needed for stale or legacy rows. It does not touch the git object database.
+Before pruning, `acd gc` also merges legacy duplicate rows that identify the
+same repo by canonical Git toplevel or by shared `state.db` path; merges are
+reported in `acd gc --json` under a `merged[]` array of
+`{kept_path, dropped_path, reason}` entries (reason is `same-git-toplevel` or
+`same-state-db`). Current `acd start` calls write canonical Git worktree roots,
+so `acd gc` is only needed for stale or legacy rows. It does not touch the git
+object database.
 
 ---
 
