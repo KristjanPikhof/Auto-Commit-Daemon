@@ -58,6 +58,9 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 	if realRoot, err := filepath.EvalSymlinks(root); err == nil {
 		root = filepath.Clean(realRoot)
 	}
+	// `rev-parse --absolute-git-dir` already returns an absolute path, but a
+	// linked-worktree .git file or a .git symlink can point at a dir that
+	// is itself behind a symlink; resolve so registry identity stays stable.
 	gitDir = filepath.Clean(gitDir)
 	if realGitDir, err := filepath.EvalSymlinks(gitDir); err == nil {
 		gitDir = filepath.Clean(realGitDir)
