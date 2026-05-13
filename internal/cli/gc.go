@@ -30,10 +30,12 @@ type gcDrop struct {
 	Reason string `json:"reason"`
 }
 
-// gcReport is the §7.11 JSON shape: dropped[] + kept count.
+// gcReport is the §7.11 JSON shape: dropped[] + kept count, plus legacy
+// duplicate merges performed before pruning.
 type gcReport struct {
-	Dropped []gcDrop `json:"dropped"`
-	Kept    int      `json:"kept"`
+	Dropped []gcDrop                         `json:"dropped"`
+	Merged  []central.LegacyDuplicateChange `json:"merged"`
+	Kept    int                              `json:"kept"`
 }
 
 func newGCCmd() *cobra.Command {
@@ -65,6 +67,11 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 	var report gcReport
 	now := time.Now()
 	err = central.WithLock(roots, func(reg *central.Registry) error {
+		merged, err := reg.CleanupLegacyDuplicates(ctx)
+		if err != nil {
+			return err
+		}
+		report.Merged = merged
 		kept := make([]central.RepoRecord, 0, len(reg.Repos))
 		for _, rec := range reg.Repos {
 			if reason, drop := gcReason(ctx, rec, now); drop {
@@ -82,9 +89,12 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 	}
 
 	if jsonOut {
-		// Ensure non-nil slice so JSON renders [] not null.
+		// Ensure non-nil slices so JSON renders [] not null.
 		if report.Dropped == nil {
 			report.Dropped = []gcDrop{}
+		}
+		if report.Merged == nil {
+			report.Merged = []central.LegacyDuplicateChange{}
 		}
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
