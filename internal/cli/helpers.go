@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // defaultClientTTL is the heartbeat freshness window per D21 (§7.6 stale
@@ -71,6 +73,29 @@ func resolveRepo(repo string) (string, error) {
 		return "", err
 	}
 	return wt.Root, nil
+}
+
+// lookupRegisteredRepo canonicalizes repo to the Git worktree root before
+// loading the central registry and doing an exact registered-repo lookup. It
+// only reads registry state; callers that must stay read-only can use it
+// without creating or migrating per-repo state.
+func lookupRegisteredRepo(command, repo string) (central.RepoRecord, paths.Roots, string, error) {
+	abs, err := resolveRepo(repo)
+	if err != nil {
+		return central.RepoRecord{}, paths.Roots{}, "", err
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("acd %s: resolve paths: %w", command, err)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("acd %s: load registry: %w", command, err)
+	}
+	if rec, ok := findRepo(reg, abs); ok {
+		return rec, roots, abs, nil
+	}
+	return central.RepoRecord{}, paths.Roots{}, abs, fmt.Errorf("acd %s: repo %s is not registered (try `acd start --repo %s`)", command, abs, abs)
 }
 
 // formatDurationCompact renders a duration as "2s", "47s", "3m 14s",

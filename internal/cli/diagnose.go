@@ -20,7 +20,6 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -117,21 +116,9 @@ func runDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut bool) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	abs, err := resolveRepo(repo)
+	rec, _, _, err := lookupRegisteredRepo("diagnose", repo)
 	if err != nil {
 		return err
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd diagnose: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return fmt.Errorf("acd diagnose: load registry: %w", err)
-	}
-	rec, ok := findRepo(reg, abs)
-	if !ok {
-		return fmt.Errorf("acd diagnose: repo %s is not registered (try `acd start --repo %s`)", abs, abs)
 	}
 
 	report, err := buildDiagnoseReport(ctx, rec)
