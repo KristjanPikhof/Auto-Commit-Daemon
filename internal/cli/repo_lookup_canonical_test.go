@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -151,10 +152,14 @@ func TestRepoLookupCommandsFindLegacySubdirRegistryRowByStateDBReadOnly(t *testi
 	if err := os.MkdirAll(legacySubdir, 0o755); err != nil {
 		t.Fatalf("mkdir legacy subdir: %v", err)
 	}
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatalf("repo hash: %v", err)
+	}
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{{
 			Path:              legacySubdir,
-			RepoHash:          "legacy-hash",
+			RepoHash:          repoHash,
 			StateDB:           stateDB,
 			FirstRegisteredTS: 10,
 			LastSeenTS:        20,

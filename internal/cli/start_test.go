@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -427,6 +428,67 @@ func TestStart_CanonicalizesSubdirectoryForIdentityAndRegistry(t *testing.T) {
 		if central.SameRepoPath(row.Path, bad) {
 			t.Fatalf("registry path %q unexpectedly matched subdir %q", row.Path, bad)
 		}
+	}
+}
+
+func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	repoDir = wt.Root
+	legacySubdir := filepath.Join(repoDir, "legacy", "subdir")
+	if err := os.MkdirAll(legacySubdir, 0o755); err != nil {
+		t.Fatalf("mkdir legacy subdir: %v", err)
+	}
+	stateDB := state.DBPathFromGitDir(wt.GitDir)
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.Repos = []central.RepoRecord{{
+			Path:              legacySubdir,
+			RepoHash:          "legacy-hash",
+			StateDB:           stateDB,
+			FirstRegisteredTS: 10,
+			LastSeenTS:        20,
+			Harnesses:         []string{"codex"},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy registry: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, repoDir, "root-session", "pi", 0, true); err != nil {
+		t.Fatalf("runStart: %v", err)
+	}
+	var res startResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal start: %v\n%s", err, stdout.String())
+	}
+	if res.Repo != repoDir {
+		t.Fatalf("start repo=%q want canonical root %q", res.Repo, repoDir)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count=%d want 1", count.Load())
+	}
+
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("registry rows=%d want 1: %+v", len(reg.Repos), reg.Repos)
+	}
+	rec := reg.Repos[0]
+	if rec.Path != repoDir || rec.StateDB != stateDB {
+		t.Fatalf("registry record=%+v want canonical path %q state_db %q", rec, repoDir, stateDB)
+	}
+	if !reflect.DeepEqual(rec.Harnesses, []string{"codex", "pi"}) {
+		t.Fatalf("harnesses=%v want [codex pi]", rec.Harnesses)
 	}
 }
 
