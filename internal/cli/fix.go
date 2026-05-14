@@ -700,7 +700,26 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		stampManualPauseResume(ctx, plan.GitDir)
 		plan.ManualPauseRemoved = true
 	}
+
+	// Retarget post-commit phase: when retarget_stale_anchor was applied,
+	// run the live-index repair pass and reconcile the manual pause marker
+	// the same way acd recover did. These steps must run AFTER tx.Commit so
+	// the slow git ops never hold the SQLite write lock.
+	if planHasAction(plan, fixActionRetargetStaleAnchor) {
+		if err := finalizeRetargetPostCommit(ctx, db, plan); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func planHasAction(plan *fixPlan, kind string) bool {
+	for _, action := range plan.Actions {
+		if action.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func preflightFixFS(plan *fixPlan) error {
