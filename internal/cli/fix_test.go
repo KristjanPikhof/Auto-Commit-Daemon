@@ -156,7 +156,7 @@ func TestFix_ApplyDeletesObsoleteBarrierAndLeavesPending(t *testing.T) {
 	seedPurgeFixtureRows(t, db)
 
 	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, false, true, true); err != nil {
+	if err := runFix(context.Background(), &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runFix apply: %v\n%s", err, out.String())
 	}
 	got := countCaptureRowsByState(t, db)
