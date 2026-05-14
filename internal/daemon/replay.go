@@ -298,6 +298,27 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		defer closeIntentPlanner()
 	}
 
+	// Self-heal pass: probe every blocked_conflict row whose conflict class
+	// is before_state_mismatch against HEAD. When an external committer
+	// already landed the captured change, promote the row to published
+	// without minting a commit. Run BEFORE PendingEvents so a freshly
+	// self-healed barrier is invisible to the pending iteration this pass —
+	// PendingEvents filters subsequent pending rows behind blocked
+	// predecessors, so clearing the barrier now lets the very next query
+	// drain the suffix.
+	if cctx.BranchRef != "" {
+		if err := probeBlockedSelfHeal(ctx, repoRoot, db, cctx, opts.Trace); err != nil {
+			// Self-heal is best-effort: a failure must not stop the rest
+			// of the replay pass (the offending row simply stays
+			// blocked). Surface it via slog so an operator running with
+			// debug logging can see the cause.
+			slog.Default().Warn("daemon: self-heal probe failed",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", err.Error())
+		}
+	}
+
 	// Per-pass batch budget. When bounded, query one extra row so the "is
 	// there more queued behind this batch?" question can be answered without a
 	// follow-up COUNT. Intent replay uses its own visible-window budget so a
