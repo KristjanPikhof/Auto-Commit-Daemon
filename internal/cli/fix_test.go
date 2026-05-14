@@ -537,7 +537,7 @@ func TestFix_YesAloneRefusesToIncludePurge(t *testing.T) {
 func TestFix_ForceDryRunListsPurge(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, db)
+	stageBarrierWithSuccessors(t, ctx, repo, db)
 	before, err := fileSHA256(stateDB)
 	if err != nil {
 		t.Fatalf("checksum before: %v", err)
@@ -572,7 +572,7 @@ func TestFix_ForceDryRunListsPurge(t *testing.T) {
 func TestFix_ForceYesAppliesPurge(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, db)
+	stageBarrierWithSuccessors(t, ctx, repo, db)
 
 	var out bytes.Buffer
 	if err := runFix(ctx, &out, repo, false, true /*yes*/, true /*force*/, false, true); err != nil {
