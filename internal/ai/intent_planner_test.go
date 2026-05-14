@@ -353,6 +353,67 @@ func TestComposedPlanIntentReturnsPrimaryValidationError(t *testing.T) {
 	}
 }
 
+func TestNormalizeIntentPlanDeferredReasonsDropsNonDeferredEntries(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10, 11},
+		DeferredSeqs: []int64{12},
+		DeferredReasons: []DeferredReason{
+			{Seq: 12, Reason: "docs change is independent"},
+			{Seq: 11, Reason: "spurious entry for selected seq"},
+			{Seq: 99, Reason: "spurious entry for unknown seq"},
+		},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 2 || dropped[0] != 11 || dropped[1] != 99 {
+		t.Fatalf("dropped=%v want [11 99]", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Seq != 12 {
+		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
+	plan := IntentPlan{
+		DeferredSeqs:    []int64{12, 13},
+		DeferredReasons: []DeferredReason{{Seq: 12, Reason: "a"}, {Seq: 13, Reason: "b"}},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 0 {
+		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 2 {
+		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestValidateIntentPlanReturnsTypedErrorForDeferredReasonNotDeferred(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			{Seq: 102, Reason: "documentation change is separate"},
+			{Seq: 101, Reason: "spurious entry referencing selected seq"},
+		},
+	}
+	err := ValidateIntentPlan(req, plan)
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("expected *IntentPlanValidationError, got %T: %v", err, err)
+	}
+	if typed.Code != IntentPlanValidationDeferredReasonNotDeferred {
+		t.Fatalf("code=%v want IntentPlanValidationDeferredReasonNotDeferred", typed.Code)
+	}
+	if typed.Seq != 101 {
+		t.Fatalf("seq=%d want 101", typed.Seq)
+	}
+}
+
 // TestBadDeferredReasonFixtureReproducesValidatorError pins the upstream
 // planner bug captured in the Trekoon and Gitlab-Issues-Creator repo trace
 // logs: the planner emits a deferred_reasons entry whose seq is a selected
