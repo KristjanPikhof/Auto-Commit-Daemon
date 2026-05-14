@@ -756,15 +756,16 @@ version lives in [user-workflows.md](user-workflows.md).
    ~~~bash
    acd diagnose --repo .
    acd fix --dry-run
-   acd recover --repo . --auto --dry-run
-   acd purge-events --repo . --blocked --pending --dry-run
+   acd fix --force --dry-run
    ~~~
 
-   If the dry-run plan is correct, rerun the chosen command with `--yes`.
-   `fix` handles common safe cleanup, including externally handled decisions and
-   obsolete barriers. `recover` retargets stale generation rows after branch
-   surgery. `purge-events` deletes terminal barriers and, when selected,
-   obsolete pending rows behind them.
+   If the dry-run plan is correct, rerun with `--yes`. `acd fix` covers safe
+   cleanup (resolve_already_landed_barrier promotes blocked rows whose
+   captured after-state already exists at HEAD; retarget_stale_anchor handles
+   branch surgery; delete_obsolete_barrier removes barriers without pending
+   successors; mark_external_published settles externally-handled rows).
+   `acd fix --force --yes` adds purge_barrier_with_successors for terminal
+   barriers that still block later pending rows.
 
    After clearing the blockers, trigger a replay:
    `acd wake --session-id "$ACD_SESSION_ID"`.
