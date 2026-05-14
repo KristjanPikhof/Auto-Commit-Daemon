@@ -182,7 +182,7 @@ Troubleshooting:
   error and falls back to a deterministic one-capture plan rather than
   corrupting queue order.
 - Recovery remains the same: inspect with `acd diagnose --json`, preview with
-  `acd recover --auto --dry-run --json`, then apply recovery only when the
+  `acd fix --dry-run --json`, then apply with `acd fix --yes` only when the
   daemon is stopped.
 
 ---
