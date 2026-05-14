@@ -334,6 +334,14 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
+	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 {
+		slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+			slog.String("provider", p.Name()),
+			slog.String("model", model),
+			slog.Any("dropped_seqs", dropped),
+		)
+	}
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
