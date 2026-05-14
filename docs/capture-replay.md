@@ -730,15 +730,16 @@ version lives in [user-workflows.md](user-workflows.md).
    ~~~bash
    acd doctor
    acd fix --dry-run
-   acd recover --repo . --auto --dry-run
+   acd fix --yes
    ~~~
 
    A legacy stale-index shape looks like `D  path` plus `?? path` even though
    `HEAD:path` and the worktree file match. Current daemon startup and
-   `acd recover --auto --yes` repair only ACD-owned published paths proved from
-   `capture_events`/`capture_ops`, current `HEAD` ancestry, and matching
-   worktree content. Ambiguous same-path staged work is skipped; use normal git
-   inspection to decide whether it is user intent.
+   `acd fix --yes` (via the retarget_stale_anchor action) repair only
+   ACD-owned published paths proved from `capture_events`/`capture_ops`,
+   current `HEAD` ancestry, and matching worktree content. Ambiguous same-path
+   staged work is skipped; use normal git inspection to decide whether it is
+   user intent.
 
 5. **Resolve blocked conflicts.**
 
