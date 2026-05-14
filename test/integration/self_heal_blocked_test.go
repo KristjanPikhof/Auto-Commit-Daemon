@@ -184,28 +184,16 @@ func externalCommitAtPath(t *testing.T, repo, parent, path, blobOID, message str
 }
 
 // runGitOKEnv is runGitOK with extra env (GIT_INDEX_FILE for plumbing).
+// extraEnv entries override the inherited environment because Cmd.Env
+// evaluates later duplicates as overrides on macOS/Linux execve semantics.
 func runGitOKEnv(t *testing.T, repo string, extraEnv []string, args ...string) string {
 	t.Helper()
 	full := append([]string{"-C", repo}, args...)
 	cmd := exec.Command("git", full...)
-	// Inherit os.Environ via empty so existing GIT_* vars pass through, then
-	// append the overrides; later entries win in exec.Cmd semantics.
-	cmd.Env = append(append([]string{}, gitOSEnviron()...), extraEnv...)
+	cmd.Env = append(os.Environ(), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
-}
-
-// gitOSEnviron returns os.Environ via a helper so the test reads naturally;
-// keeps runGitOKEnv side-effect-free relative to the surrounding shell.
-func gitOSEnviron() []string {
-	return append([]string{}, osEnvironForGit()...)
-}
-
-// osEnvironForGit is a thin shim around os.Environ — split out so the
-// import surface in this file stays minimal.
-func osEnvironForGit() []string {
-	return osEnvironSnapshot()
 }
