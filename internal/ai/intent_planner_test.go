@@ -351,6 +351,27 @@ func TestComposedPlanIntentReturnsPrimaryValidationError(t *testing.T) {
 	}
 }
 
+// TestBadDeferredReasonFixtureReproducesValidatorError pins the upstream
+// planner bug captured in the Trekoon and Gitlab-Issues-Creator repo trace
+// logs: the planner emits a deferred_reasons entry whose seq is a selected
+// (not deferred) capture. parseIntentPlanToolCall accepts the JSON, but
+// ValidateIntentPlan rejects it and the daemon falls back to deterministic
+// one-item commits for the entire window. The fixture is the input to the
+// provider-side normalization implemented later in this file.
+func TestBadDeferredReasonFixtureReproducesValidatorError(t *testing.T) {
+	fx := loadBadDeferredReasonFixture(t)
+	req := badDeferredReasonRequest(t, fx)
+	plan, err := parseIntentPlanToolCall(fx.OpenAIResponse)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	if err := ValidateIntentPlan(req, plan); err == nil {
+		t.Fatalf("expected validator to reject fixture plan, got nil")
+	} else if !strings.Contains(err.Error(), "deferred reason references non-deferred seq") {
+		t.Fatalf("unexpected validator error: %v", err)
+	}
+}
+
 func TestComposedPlanIntentReturnsPrimaryProviderError(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	primaryErr := errors.New("primary unavailable")
