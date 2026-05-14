@@ -398,6 +398,11 @@ ORDER BY seq ASC`
 		if err := rows.Scan(&seq, &path, &st); err != nil {
 			return fmt.Errorf("acd fix: scan obsolete barrier: %w", err)
 		}
+		if _, skip := skipSeqs[seq]; skip {
+			// resolve_already_landed_barrier already owns this seq; skip the
+			// delete so the promote path can run and keep the audit trail.
+			continue
+		}
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:          fmt.Sprintf("%s:%d", fixActionDeleteObsoleteBarrier, seq),
 			Kind:        fixActionDeleteObsoleteBarrier,
