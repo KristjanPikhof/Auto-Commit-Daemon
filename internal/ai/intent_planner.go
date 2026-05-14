@@ -182,6 +182,34 @@ func NormalizeIntentReason(reason string) string {
 	return string(runes[:IntentReasonCap])
 }
 
+// IntentPlanValidationCode classifies planner-output validation failures so
+// providers can decide whether to normalize the plan locally or hard-fail.
+// New codes must be appended to keep the wire-style ordering stable for any
+// future telemetry mapping.
+type IntentPlanValidationCode int
+
+const (
+	// IntentPlanValidationUnknown is the zero-value catch-all.
+	IntentPlanValidationUnknown IntentPlanValidationCode = iota
+	// IntentPlanValidationDeferredReasonNotDeferred fires when a
+	// DeferredReason carries a seq that is not present in DeferredSeqs
+	// (the seq is selected, or absent from the offered window). Providers
+	// can normalize by dropping the spurious entry; see
+	// NormalizeIntentPlanDeferredReasons.
+	IntentPlanValidationDeferredReasonNotDeferred
+)
+
+// IntentPlanValidationError is the typed error returned by ValidateIntentPlan
+// when the failure is one providers may normalize. Untyped errors keep using
+// fmt.Errorf so existing string matches stay green.
+type IntentPlanValidationError struct {
+	Code    IntentPlanValidationCode
+	Seq     int64
+	Message string
+}
+
+func (e *IntentPlanValidationError) Error() string { return e.Message }
+
 // ValidateIntentPlan rejects malformed or incomplete planner output before it
 // can influence replay.
 func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
