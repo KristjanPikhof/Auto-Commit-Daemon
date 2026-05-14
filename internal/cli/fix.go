@@ -354,7 +354,7 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 	return nil
 }
 
-func planObsoleteBarrierFix(ctx context.Context, conn *sql.DB, hasDecisionRecords bool, plan *fixPlan) error {
+func planObsoleteBarrierFix(ctx context.Context, conn *sql.DB, hasDecisionRecords bool, plan *fixPlan, skipSeqs map[int64]struct{}) error {
 	decisionFilter := ""
 	if hasDecisionRecords {
 		decisionFilter = `
