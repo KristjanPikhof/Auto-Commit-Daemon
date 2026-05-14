@@ -110,11 +110,11 @@
   using `>`. After writing the file, remove the old `# acd-managed: true` block
   from `~/.codex/config.toml`, then approve the new hooks with `/hooks` inside
   Codex. Codex re-flags all hook entries as review-required after every
-	  `hooks.json` content change, so re-run `/hooks` after any re-install too.
-	  `acd doctor` now warns when both old and new Codex hook configs are installed,
-	  because Codex will run both. Keep Codex lifecycle hooks enabled in
-	  `~/.codex/config.toml` with `[features].codex_hooks = true`. See
-	  [templates/codex/README.md](templates/codex/README.md) for full details.
+  `hooks.json` content change, so re-run `/hooks` after any re-install too.
+  `acd doctor` now warns when both old and new Codex hook configs are installed,
+  because Codex will run both. Keep Codex lifecycle hooks enabled in
+  `~/.codex/config.toml` with `[features].codex_hooks = true`. See
+  [templates/codex/README.md](templates/codex/README.md) for full details.
 - Codex hooks now read `cwd` from hook stdin, no longer require
   `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the
   hook payload. The helper also supports multiple fields and optional fields.
