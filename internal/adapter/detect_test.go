@@ -126,8 +126,9 @@ func TestDetectInstalled_CodexRepoLocalHooksJSONMarker(t *testing.T) {
 		t.Fatalf("ConfigPath should remain user-scoped canonical path, got repo-local %q", hooks)
 	}
 	matched, ok := got[0].MatchedPath()
-	if !ok || matched != hooks {
-		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, hooks)
+	wantHooks := canonicalDetectTestPath(t, hooks)
+	if !ok || matched != wantHooks {
+		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, wantHooks)
 	}
 }
 
@@ -153,8 +154,9 @@ func TestDetectInstalled_CodexRepoLocalConfigTOMLMarker(t *testing.T) {
 		t.Fatalf("DetectInstalled=%#v, want codex only via repo-local config.toml", got)
 	}
 	matched, ok := got[0].MatchedPath()
-	if !ok || matched != cfg {
-		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, cfg)
+	wantConfig := canonicalDetectTestPath(t, cfg)
+	if !ok || matched != wantConfig {
+		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, wantConfig)
 	}
 }
 
@@ -299,6 +301,19 @@ func chdirForDetectTest(t *testing.T, dir string) {
 		t.Fatalf("chdir %s: %v", dir, err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+}
+
+func canonicalDetectTestPath(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return real
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("abs %s: %v", path, err)
+	}
+	return abs
 }
 
 // TestDetectInstalled_PiIgnoresBareYAMLMarker mirrors the opencode case for
