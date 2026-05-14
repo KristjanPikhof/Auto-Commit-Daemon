@@ -157,7 +157,7 @@ acd status --repo .
 | Harness | Start | Active hooks | End | Notes |
 |---|---|---|---|---|
 | Claude Code | `SessionStart -> acd start` fail-soft | `Pre/PostToolUse`: and-chain + log fallback | `Stop -> acd touch`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON |
-| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`PreToolUse`/`PostToolUse`; matcher `apply_patch\|Edit\|Write\|Bash` on `PreToolUse` only; mkdir gated | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s |
+| Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`PreToolUse`/`PostToolUse`; matcher `apply_patch\|Edit\|Write\|Bash` on `PreToolUse` and `PostToolUse`; mkdir gated | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s |
 | OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`; `~/.config/opencode/hook/hooks.yaml` |
 | Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: and-chain + log fallback | `session.idle -> acd touch`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`; no `uuidgen`; `~/.pi/agent/hook/hooks.yaml` |
 
@@ -174,7 +174,7 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 - Markers are format-specific: TOML/YAML use leading `# acd-managed: true`; JSON detects `"_acd_managed": true` with/without space. Keep hookhelper, setup tests, templates, AdapterE2E in sync.
 - Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted; `_acd_managed: true` is top-level JSON; `acd doctor` warns when both Codex files carry acd markers because events double.
 - Codex `/hooks` re-approval is required after every `~/.codex/hooks.json` change; until approved, `SessionStart` never fires. `acd setup codex --raw > ~/.codex/hooks.json` destroys non-acd entries; custom-hook users must merge manually.
-- Codex deprecated `[features].codex_hooks = true` for `[features].hooks = true`; new hooks.json needs no `[features]` block.
+- Codex hooks need the Codex feature flag in `~/.codex/config.toml`; official docs currently show `[features].codex_hooks = true`. `hooks.json` carries hook bodies, not feature flags.
 - Codex `cwd` comes from stdin via `acd hook-stdin-extract session_id cwd? <&0`; missing `cwd` falls back to `$PWD`. `CODEX_PROJECT_DIR`/`printf "{}\n"` are gone. Bash bodies use `|| exit 0` after helper so missing `acd` does not block hook.
 
 ## Env
