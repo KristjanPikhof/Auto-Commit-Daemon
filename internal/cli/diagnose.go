@@ -488,23 +488,24 @@ func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, re
 		return nil
 	}
 
-	head, err := git.RevParse(ctx, repoDir, "HEAD")
-	if err != nil {
-		// No HEAD (empty repo) — both counts stay zero; not an error.
-		return nil
-	}
-
-	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repoDir, head, branchRef, generation)
-	if err != nil {
-		return fmt.Errorf("diagnose: auto-resolvable count: %w", err)
-	}
-	report.AutoResolvableBlockedCount = len(candidates)
-
+	// BarrierWithSuccessorsCount is a pure SQL count — no git needed.
 	n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, generation)
 	if err != nil {
 		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
 	}
 	report.BarrierWithSuccessorsCount = n
+
+	// AutoResolvableBlockedCount requires a live HEAD to probe blobs.
+	head, err := git.RevParse(ctx, repoDir, "HEAD")
+	if err != nil {
+		// No HEAD (empty repo) — auto-resolvable stays zero; not an error.
+		return nil
+	}
+	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repoDir, head, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("diagnose: auto-resolvable count: %w", err)
+	}
+	report.AutoResolvableBlockedCount = len(candidates)
 	return nil
 }
 
