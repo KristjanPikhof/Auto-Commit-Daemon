@@ -107,58 +107,15 @@ ORDER BY seq ASC`, state.EventStateBlockedConflict, branchRef, generation)
 	return out, nil
 }
 
-// cliSelfHealEligibleByErrorMessage mirrors the daemon-side
-// classifyReplayIssue check for before_state_mismatch. classifyReplayIssue is
-// not exported from internal/daemon, so we match by stable substrings the
-// daemon uses when recording before-state mismatches. Anything else (cas
-// failure, ref missing, validation, commit build failure) is ineligible.
+// cliSelfHealEligibleByErrorMessage defers to daemon.IsBeforeStateMismatchError
+// so the CLI self-heal probe stays in lock-step with the daemon's classifier.
+// Any expansion of the daemon's before_state_mismatch class (additional
+// substrings) is automatically picked up here.
 func cliSelfHealEligibleByErrorMessage(errMsg string) bool {
 	if errMsg == "" {
 		return false
 	}
-	// The daemon's classifyReplayIssue routine encodes the class string as a
-	// stable substring in capture_events.error. Match the canonical phrases.
-	for _, marker := range []string{
-		"before-state mismatch",
-		"before_state_mismatch",
-	} {
-		if containsCaseInsensitive(errMsg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsCaseInsensitive(haystack, needle string) bool {
-	if len(needle) == 0 {
-		return true
-	}
-	if len(haystack) < len(needle) {
-		return false
-	}
-	// Lightweight ASCII case-insensitive contains; avoids importing strings
-	// for one call and keeps allocations to a single pass.
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-		for j := 0; j < len(needle); j++ {
-			a := haystack[i+j]
-			b := needle[j]
-			if a >= 'A' && a <= 'Z' {
-				a += 'a' - 'A'
-			}
-			if b >= 'A' && b <= 'Z' {
-				b += 'a' - 'A'
-			}
-			if a != b {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
+	return daemon.IsBeforeStateMismatchError(errMsg)
 }
 
 // cliSelfHealEligibleByOps is the CLI-side mirror of daemon
