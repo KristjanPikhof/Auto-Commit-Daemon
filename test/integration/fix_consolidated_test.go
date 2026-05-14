@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
