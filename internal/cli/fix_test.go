@@ -653,14 +653,19 @@ func TestFix_RetargetActionLandsWhenStaleAnchorPresent(t *testing.T) {
 }
 
 // stageBarrierWithSuccessors seeds: 1 blocked_conflict + 1 pending at higher
-// seq on same (refs/heads/main, generation=1) so the planner sees a barrier
-// with successors. Used by the --yes-without-force and --force tests.
-func stageBarrierWithSuccessors(t *testing.T, ctx context.Context, db *state.DB) {
+// seq on same (refs/heads/main, generation=1) anchored at the current HEAD so
+// the planner sees a barrier with successors WITHOUT also tripping the
+// retarget_stale_anchor predicate. Used by the --force tests.
+func stageBarrierWithSuccessors(t *testing.T, ctx context.Context, repo string, db *state.DB) {
 	t.Helper()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
 	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
-		BaseHead:         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		BaseHead:         head,
 		Operation:        "modify",
 		Path:             "barrier.txt",
 		Fidelity:         "exact",
@@ -672,7 +677,7 @@ func stageBarrierWithSuccessors(t *testing.T, ctx context.Context, db *state.DB)
 	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
-		BaseHead:         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		BaseHead:         head,
 		Operation:        "modify",
 		Path:             "successor.txt",
 		Fidelity:         "exact",
@@ -683,8 +688,8 @@ func stageBarrierWithSuccessors(t *testing.T, ctx context.Context, db *state.DB)
 	// Mirror publish_state singleton so the breadcrumb-clear path is exercised.
 	if _, err := db.SQL().ExecContext(ctx, `
 INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, status, error, updated_ts)
-VALUES (1, 1, 'refs/heads/main', 1, 'deadbeef', 'blocked_conflict', 'modify before-state mismatch', 1.0)
-ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error`); err != nil {
+VALUES (1, 1, 'refs/heads/main', 1, ?, 'blocked_conflict', 'modify before-state mismatch', 1.0)
+ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error`, head); err != nil {
 		t.Fatalf("seed publish_state: %v", err)
 	}
 }
