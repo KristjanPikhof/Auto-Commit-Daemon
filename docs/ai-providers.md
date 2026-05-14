@@ -131,6 +131,16 @@ If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
 containing only that overdue capture. That keeps intent grouping from starving
 small or hard-to-name edits.
 
+Planner contract: every entry in `deferred_reasons` must reference a seq that
+appears in `deferred_seqs`. Reasons attached to a selected seq, or to a seq
+outside the offered window, are invalid by contract. The `openai-compat` and
+`subprocess` providers normalize their own response before returning: if a
+planner emits a spurious `deferred_reasons` entry, the provider drops that
+entry, logs a single warning naming the affected seqs, and hands the cleaned
+plan to the validator. A plan that still fails validation after normalization
+is surfaced as `intent_planner_error` and replay falls back to deterministic
+one-capture commits as before.
+
 Batching behavior is deliberately bounded:
 
 - `ACD_INTENT_WINDOW` is a ceiling, not a target. A normal pass offers at most
