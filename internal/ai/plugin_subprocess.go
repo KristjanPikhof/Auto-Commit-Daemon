@@ -344,6 +344,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	if len(dropped) > 0 {
 		p.logger.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
 			slog.String("provider", p.Name()),
+			slog.String("plugin", p.name),
 			slog.Any("dropped_seqs", dropped),
 		)
 	}
