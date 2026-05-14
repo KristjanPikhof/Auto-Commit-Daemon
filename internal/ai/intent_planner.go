@@ -309,6 +309,10 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 // unknown) seq does not collapse the entire plan to deterministic fallback.
 // Returns the cleaned plan and the dropped seqs in input order so callers can
 // log a single deterministic warning.
+//
+// Aliasing: on the no-drop path the returned plan.DeferredReasons still
+// aliases the caller's backing array; callers must not mutate the slice in
+// place. On the drop path the slice is freshly allocated.
 func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64) {
 	if len(plan.DeferredReasons) == 0 {
 		return plan, nil
