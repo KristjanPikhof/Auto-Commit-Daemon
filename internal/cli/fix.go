@@ -59,23 +59,23 @@ type fixPlan struct {
 }
 
 type fixAction struct {
-	ID                 string `json:"id"`
-	Kind               string `json:"kind"`
-	Description        string `json:"description"`
-	Reason             string `json:"reason,omitempty"`
-	Seq                int64  `json:"seq,omitempty"`
-	Path               string `json:"path,omitempty"`
-	DecisionID         int64  `json:"decision_id,omitempty"`
-	CommitOID          string `json:"commit_oid,omitempty"`
-	BlobOID            string `json:"blob_oid,omitempty"`
-	CapturedAfterOID   string `json:"captured_after_oid,omitempty"`
-	BranchRef          string `json:"branch_ref,omitempty"`
-	BranchGeneration   int64  `json:"branch_generation,omitempty"`
-	BaseHead           string `json:"base_head,omitempty"`
-	RowsChanged        int64  `json:"rows_changed,omitempty"`
-	Applied            bool   `json:"applied,omitempty"`
-	SetAt              string `json:"set_at,omitempty"`
-	RequiresForce      bool   `json:"requires_force,omitempty"`
+	ID               string `json:"id"`
+	Kind             string `json:"kind"`
+	Description      string `json:"description"`
+	Reason           string `json:"reason,omitempty"`
+	Seq              int64  `json:"seq,omitempty"`
+	Path             string `json:"path,omitempty"`
+	DecisionID       int64  `json:"decision_id,omitempty"`
+	CommitOID        string `json:"commit_oid,omitempty"`
+	BlobOID          string `json:"blob_oid,omitempty"`
+	CapturedAfterOID string `json:"captured_after_oid,omitempty"`
+	BranchRef        string `json:"branch_ref,omitempty"`
+	BranchGeneration int64  `json:"branch_generation,omitempty"`
+	BaseHead         string `json:"base_head,omitempty"`
+	RowsChanged      int64  `json:"rows_changed,omitempty"`
+	Applied          bool   `json:"applied,omitempty"`
+	SetAt            string `json:"set_at,omitempty"`
+	RequiresForce    bool   `json:"requires_force,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
