@@ -13,14 +13,7 @@ import (
 
 func TestResolveRepoUsesCurrentWorkingDirectory(t *testing.T) {
 	dir := initCLIResolverRepo(t)
-	oldwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir repo: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+	chdirForTest(t, dir)
 
 	got, err := resolveRepo("")
 	if err != nil {
@@ -30,6 +23,18 @@ func TestResolveRepoUsesCurrentWorkingDirectory(t *testing.T) {
 	if got != want {
 		t.Fatalf("repo=%q want %q", got, want)
 	}
+}
+
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
 }
 
 func TestResolveRepoUsesExplicitRepoPath(t *testing.T) {
