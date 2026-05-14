@@ -1248,8 +1248,32 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		if plan.ManualPauseRemoved {
 			fmt.Fprintf(out, "Manual pause marker removed: %s\n", plan.ManualPausePath)
 		}
+		switch {
+		case plan.ManualMarkerRemoved:
+			fmt.Fprintf(out, "Manual pause marker (retarget) removed: %s\n", plan.ManualPausePath)
+		case plan.ManualMarkerPreserved:
+			fmt.Fprintf(out, "Manual pause marker (retarget) preserved: %s (use --clear-pause to remove)\n", plan.ManualPausePath)
+		}
+		if plan.ManualMarkerRemoveError != "" {
+			fmt.Fprintf(out, "WARNING: manual pause marker remove failed after commit: %s\n", plan.ManualMarkerRemoveError)
+		}
+		if plan.LiveIndexCandidates > 0 || plan.LiveIndexApplied > 0 || plan.LiveIndexSkipped > 0 {
+			fmt.Fprintf(out, "Live index repair: candidates=%d applied=%d skipped=%d\n",
+				plan.LiveIndexCandidates, plan.LiveIndexApplied, plan.LiveIndexSkipped)
+		}
 	} else {
-		fmt.Fprintln(out, "(dry-run; pass --yes to apply safe actions)")
+		hint := "pass --yes to apply safe actions"
+		if plan.Force {
+			hint = "pass --yes to apply safe actions; combine --yes --force to also apply destructive purge"
+		} else {
+			for _, action := range plan.Actions {
+				if action.RequiresForce {
+					hint = "pass --yes to apply safe actions; rerun with --force to plan purge_barrier_with_successors"
+					break
+				}
+			}
+		}
+		fmt.Fprintf(out, "(dry-run; %s)\n", hint)
 	}
 	return nil
 }
