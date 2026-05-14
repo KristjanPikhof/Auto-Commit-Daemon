@@ -4,59 +4,41 @@
 
 ### Added
 
-- Intent planner now self-corrects spurious `deferred_reasons`. The planner
-  contract requires every `deferred_reasons[i].seq` to appear in
-  `deferred_seqs`; some upstream models still emit reasons attached to a
-  selected (or non-offered) seq. The `openai-compat` and `subprocess`
-  providers drop those entries before handing the plan to the validator and
-  log a single deterministic warning naming the dropped seqs. Plans that
-  remain invalid after normalization keep falling back to deterministic
-  one-capture commits via `Compose`. The validator returns a typed
-  `*IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonNotDeferred}`
-  so future callers can dispatch on the specific failure. The system prompt
-  now spells out the contract with a worked example.
+- Intent planner tolerates spurious `deferred_reasons`. The `openai-compat`
+  and `subprocess` providers drop entries whose seq is selected or
+  non-offered, log one warning naming the dropped seqs, and proceed with the
+  cleaned plan. Restores intent grouping for repos that hit this planner
+  output instead of silently collapsing to deterministic commits. Same
+  normalization runs at the `Compose` and replay layers as defense in depth.
 
-- Self-heal for blocked replay barriers. The daemon's replay pass now probes
-  `blocked_conflict` rows before draining pending captures and promotes any
-  row whose captured after-state already matches HEAD. No new commit is
-  minted; the trace record carries event class `replay.self_heal` and the
-  decision ledger records `handled_external_after_block`. Rows that fail the
-  predicate stay blocked for operator inspection. The probe narrows to
-  `modify`/`mode` ops plus renames with a captured before-OID; create and
-  delete ops stay blocked at first cut. Triggered by a real incident where
-  one stuck `blocked_conflict` hid 94 pending captures whose captured changes
-  already existed at HEAD.
+- Self-heal for blocked replay barriers. Replay promotes `blocked_conflict`
+  rows whose captured after-state already matches `HEAD`, logged as
+  `handled_external_after_block`. No new commit; the row leaves the queue
+  cleanly. Limited to `modify`/`mode` ops and renames with a captured
+  before-OID.
 
-- `acd fix` is now the single recovery entrypoint. The planner covers
-  `resolve_already_landed_barrier`, `retarget_stale_anchor`,
-  `delete_obsolete_barrier`, `mark_external_published`,
-  `clear_expired_manual_pause`, and `clear_drained_backpressure` under
-  `--yes`. Add `--force` to opt into `purge_barrier_with_successors` for
-  blocked barriers that still hold pending rows behind them; combine with
-  `--yes` to apply. `--force` without `--yes` stays dry-run. `state.db` is
-  backed up before any mutation, and every action refuses while a live
-  daemon owns the database.
+- `acd fix` is the single recovery entrypoint. `--yes` resolves
+  already-landed barriers, stale anchors, obsolete barriers, external
+  publishes, expired manual pause markers, and drained backpressure.
+  `--force --yes` also purges blocked barriers with pending successors.
+  `state.db` is backed up first; every action refuses while a live daemon
+  owns the database.
 
 - `acd diagnose --json` reports `auto_resolvable_blocked_count` and
-  `barrier_with_successors_count`. The human output points operators at
-  `acd fix --dry-run` or `acd fix --force --dry-run` based on which case
-  applies.
+  `barrier_with_successors_count`. Human output points at the right
+  `acd fix --dry-run` invocation for the state found.
 
-- Codex install detection recognizes repo-local `.codex/hooks.json` and
-  `.codex/config.toml` from the current Git worktree root, alongside the
-  user-level `~/.codex/hooks.json` and legacy TOML locations. `acd setup`
-  and `acd doctor` pick up project-local Codex installs without a
-  user-level config. The user-scoped `~/.codex/hooks.json` stays the
-  canonical `ConfigPath`; `MatchedPath` reports the repo-local path when
-  only the project file carries the marker.
+- Codex install detection picks up repo-local `.codex/hooks.json` and
+  `.codex/config.toml` alongside `~/.codex/`. Project-local Codex installs
+  work without a user-level config. `~/.codex/hooks.json` stays the
+  canonical `ConfigPath`; `MatchedPath` names the repo-local file when only
+  the project carries the marker.
 
 ### Deprecated
 
-- `acd recover` and `acd purge-events` are deprecated and hidden from help.
-  Both print a one-line deprecation warning to stderr and keep working for
-  one release so existing scripts do not break. Switch to `acd fix` (and
-  `acd fix --force` for purge). The commands will be removed in a future
-  release.
+- `acd recover` and `acd purge-events`. Switch to `acd fix` (and
+  `acd fix --force` for purge). Both keep working for one release with a
+  stderr warning, then go away.
 
 ## v2026-05-13
 
