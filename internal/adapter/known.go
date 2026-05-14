@@ -55,23 +55,23 @@ var knownHarnesses = []knownHarness{
 			{path: "~/.claude/settings.json", markers: jsonAcdManagedMarkers},
 		},
 	},
-		{
-			name: "codex",
-			// hooks.json wins Codex discovery order over config.toml; primary
-			// path is the user-scoped JSON file. config.toml stays in the
-			// candidate set for legacy installs and triggers the doctor shadow
-			// warning when both files carry acd markers. Repo-local candidates
-			// are resolved from the current git root so a trusted project-local
-			// install is detected without treating arbitrary cwd-relative
-			// `.codex/*` files as global installs.
-			paths: []pathSpec{
-				{path: "~/.codex/hooks.json", markers: jsonAcdManagedMarkers},
-				{path: "~/.codex/config.toml", markers: tomlAcdManagedMarkers},
-				{path: "~/.config/codex/config.toml", markers: tomlAcdManagedMarkers},
-				{path: ".codex/hooks.json", markers: jsonAcdManagedMarkers, repoLocal: true},
-				{path: ".codex/config.toml", markers: tomlAcdManagedMarkers, repoLocal: true},
-			},
+	{
+		name: "codex",
+		// hooks.json wins Codex discovery order over config.toml; primary
+		// path is the user-scoped JSON file. config.toml stays in the
+		// candidate set for legacy installs and triggers the doctor shadow
+		// warning when both files carry acd markers. Repo-local candidates
+		// are resolved from the current git root so a trusted project-local
+		// install is detected without treating arbitrary cwd-relative
+		// `.codex/*` files as global installs.
+		paths: []pathSpec{
+			{path: "~/.codex/hooks.json", markers: jsonAcdManagedMarkers},
+			{path: "~/.codex/config.toml", markers: tomlAcdManagedMarkers},
+			{path: "~/.config/codex/config.toml", markers: tomlAcdManagedMarkers},
+			{path: ".codex/hooks.json", markers: jsonAcdManagedMarkers, repoLocal: true},
+			{path: ".codex/config.toml", markers: tomlAcdManagedMarkers, repoLocal: true},
 		},
+	},
 	{
 		name: "opencode",
 		// Canonical OpenCode default is ~/.config/opencode/hook/hooks.yaml
