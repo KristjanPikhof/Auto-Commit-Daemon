@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Self-heal for blocked barriers.** The daemon's replay loop now runs a
+  `probeBlockedSelfHeal` pass before each normal replay drain. It promotes
+  `blocked_conflict` rows to `published` when the idempotent settle probe
+  confirms an external committer already landed the captured after-state.
+  No new commit is created; the trace record carries event class
+  `replay.self_heal` and decision `handled_external_after_block`. Rows
+  that cannot self-heal are left in place for operator inspection.
+
+- **`acd fix` — single recovery entrypoint.** `acd fix` consolidates guided
+  remediation: `resolve_already_landed_barrier`, `retarget_stale_anchor`,
+  `delete_obsolete_barrier`, `mark_external_published`,
+  `clear_expired_manual_pause`, and `clear_drained_backpressure` are the safe
+  auto-resolvable set applied by `--yes`. `--force` opts into
+  `purge_barrier_with_successors` for blocked barriers that still have pending
+  successors; combine with `--yes` to apply. State.db is backed up before any
+  mutation and all actions refuse while a live daemon owns the database.
+
+### Deprecated
+
+- **`acd recover` and `acd purge-events`** are deprecated and hidden from help
+  output. Use `acd fix` (and `acd fix --force`) instead. The commands still
+  work for transition but will be removed in a future release.
+
 - Codex install detection now recognizes repo-local `.codex/hooks.json` and
   `.codex/config.toml` files from the current Git worktree root, alongside the
   user-level `~/.codex/hooks.json` and legacy TOML locations. `acd setup` and
