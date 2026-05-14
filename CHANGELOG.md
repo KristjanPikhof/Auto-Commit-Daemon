@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Codex install detection now recognizes repo-local `.codex/hooks.json` and
+  `.codex/config.toml` files from the current Git worktree root, alongside the
+  user-level `~/.codex/hooks.json` and legacy TOML locations. `acd setup` and
+  `acd doctor` pick up project-local Codex installs without requiring a
+  user-level config. The user-scoped `~/.codex/hooks.json` remains the
+  canonical `ConfigPath`; `MatchedPath` reports the repo-local path when only
+  the project file carries the marker.
+
 ## v2026-05-13
 
 ### Added
