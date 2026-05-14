@@ -1005,6 +1005,33 @@ func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	}
 }
 
+func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	hooks := filepath.Join(repo, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir .codex: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	chdirForTest(t, repo)
+
+	out, stderr, err := runSetupCmd(t)
+	if err != nil {
+		t.Fatalf("expected repo-local codex auto-detect to exit 0, got: %v\nstderr:\n%s", err, stderr)
+	}
+	want := snippetBody(t, "codex/hooks.json")
+	if !strings.Contains(out, strings.TrimSpace(want)) {
+		t.Errorf("auto-detected setup did not render codex snippet.\nwant:\n%s\ngot:\n%s", want, out)
+	}
+}
+
 func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

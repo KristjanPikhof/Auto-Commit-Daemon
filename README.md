@@ -34,6 +34,13 @@ acd setup pi            # paste output into ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
+Codex also needs lifecycle hooks enabled in `~/.codex/config.toml`:
+
+~~~toml
+[features]
+codex_hooks = true
+~~~
+
 > **Overwrite warning:** each `acd setup` command prints a snippet to stdout
 > for you to merge into the target config. Redirecting with `>` (e.g. `acd
 > setup codex --raw > ~/.codex/hooks.json`) replaces the entire file and will
@@ -50,7 +57,7 @@ acd setup shell         # universal direnv / zshrc fallback
 | Harness | Hook support | Install location | Source |
 |---|---|---|---|
 | `claude-code` | Native hooks (default, no extra engine required) | `~/.claude/settings.json` — managed block via `acd setup claude-code` | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
-| `codex` | Native hooks (default, no extra engine required) | `~/.codex/hooks.json`. Run `/hooks` inside Codex after every install to approve entries — Codex re-flags all hooks as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
+| `codex` | Native hooks (default, no extra engine required) | `~/.codex/hooks.json` plus `[features].codex_hooks = true` in `~/.codex/config.toml`. Run `/hooks` inside Codex after every install to approve entries — Codex re-flags all hooks as review-required after any `hooks.json` change. See [templates/codex/README.md](templates/codex/README.md). | OpenAI Codex |
 | `opencode` | External engine: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) (default) | `~/.config/opencode/hook/hooks.yaml` | [KristjanPikhof/OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) |
 | `pi` | External engine: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) (default) | `~/.pi/agent/hook/hooks.yaml` | [KristjanPikhof/Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) |
 | `shell` | Plain shell — `direnv` `.envrc` or `~/.zshrc` / `~/.bashrc` fallback | `~/.zshrc` / `~/.bashrc` + direnv snippet | n/a (no harness required) |

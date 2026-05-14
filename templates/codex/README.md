@@ -3,14 +3,19 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
+2. Enable Codex lifecycle hooks in `~/.codex/config.toml`:
+   ~~~toml
+   [features]
+   codex_hooks = true
+   ~~~
+3. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
 
    **Overwrite warning:** the shell redirect above replaces the entire file. If
    you have custom non-acd hooks in `~/.codex/hooks.json`, back up that file
    first and then merge the acd JSON block in manually rather than using `>`.
 
-3. Restart Codex.
-4. **Approve the hooks.** Codex flags every newly-added hook entry as "review required" and refuses to run them until you approve. On first launch you will see `5 hooks need review before they can run. Open /hooks to review them.` Run `/hooks` inside Codex and approve all five (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`). Until you approve, the daemon never starts and `acd status` will show no Codex client.
+4. Restart Codex.
+5. **Approve the hooks.** Codex flags every newly-added hook entry as "review required" and refuses to run them until you approve. On first launch you will see `5 hooks need review before they can run. Open /hooks to review them.` Run `/hooks` inside Codex and approve all five (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`). Until you approve, the daemon never starts and `acd status` will show no Codex client.
 
    **Re-approval on update:** Codex re-flags every hook entry as review-required
    whenever `hooks.json` content changes — even if only the acd block was
@@ -30,10 +35,9 @@ legacy block in place causes every event to fire twice — doubled
 `acd start`/`acd wake`/`acd touch` per turn. `acd doctor` warns when the JSON
 file and a legacy TOML config both carry an acd marker.
 
-Note: Codex deprecated `[features].codex_hooks = true` in favor of
-`[features].hooks = true`. The new `hooks.json` install does not need a
-`[features]` block at all. If you keep a legacy TOML install for any reason,
-rename the feature flag to silence the deprecation warning.
+Note: the official Codex hooks docs currently show `[features].codex_hooks =
+true`. Keep that flag in `config.toml`; the new `hooks.json` install only moves
+the hook bodies out of TOML.
 
 ## Wired events
 

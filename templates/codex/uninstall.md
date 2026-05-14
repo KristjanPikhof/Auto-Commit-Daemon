@@ -7,17 +7,19 @@
    and the top-level `_acd_managed` key instead of deleting the file, so your
    other hooks are preserved.
 2. If you still have the legacy TOML install, remove the `# acd-managed: true` block from `~/.codex/config.toml`.
-3. The daemon shuts down on its own once Codex exits and the refcount sweep clears the `watch_pid` row. Force-stop any survivors with:
+3. If you no longer use any Codex hooks, you can also remove `codex_hooks = true`
+   from the `[features]` table in `~/.codex/config.toml`.
+4. The daemon shuts down on its own once Codex exits and the refcount sweep clears the `watch_pid` row. Force-stop any survivors with:
    ~~~bash
    acd stop --all
    ~~~
-4. (Optional) Remove the acd binary:
+5. (Optional) Remove the acd binary:
    ~~~bash
    rm ~/.local/bin/acd
    # or
    brew uninstall acd
    ~~~
-5. (Optional) Remove all acd state and logs:
+6. (Optional) Remove all acd state and logs:
    ~~~bash
    rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
    ~~~

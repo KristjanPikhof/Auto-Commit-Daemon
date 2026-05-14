@@ -710,6 +710,41 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	}
 }
 
+func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
+	_ = withIsolatedHome(t)
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	hooksPath := filepath.Join(repo, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o700); err != nil {
+		t.Fatalf("mkdir .codex: %v", err)
+	}
+	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write repo-local hooks.json: %v", err)
+	}
+	chdirForTest(t, repo)
+
+	rep, err := collectDoctorReport(context.Background())
+	if err != nil {
+		t.Fatalf("collectDoctorReport: %v", err)
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed via repo-local hooks.json: %+v", codex)
+	}
+	wantHooksPath := canonicalCLIResolverTestPath(t, hooksPath)
+	if codex.MatchedPath != wantHooksPath {
+		t.Fatalf("MatchedPath=%q, want repo-local %q", codex.MatchedPath, wantHooksPath)
+	}
+	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "alternate config path") {
+		t.Fatalf("codex alternate-path note missing for repo-local install: %+v", codex)
+	}
+}
+
 func TestDoctor_CodexInstalledWhenPrimaryHooksJSONUnmanagedButLegacyTOMLManaged(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
