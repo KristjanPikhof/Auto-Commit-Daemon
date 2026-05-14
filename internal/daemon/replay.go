@@ -2128,6 +2128,177 @@ func traceReplayUpdateRef(
 	traceReplay(logger, repoRoot, cctx, ev, "replay.update_ref", decision, reason, output)
 }
 
+// probeBlockedSelfHeal walks blocked_conflict rows for the active
+// (branch_ref, branch_generation) and self-heals any whose captured change
+// HEAD already reflects.
+//
+// Eligibility narrows around a tight predicate so self-heal stays safe at
+// first cut:
+//
+//  1. Conflict class must be before_state_mismatch (derived from
+//     capture_events.error via classifyReplayIssue). cas_fail, ref_missing,
+//     commit_build_failure, and validation classes are NOT eligible — those
+//     classes are not resolved by an external committer landing the change.
+//  2. Every op MUST be in {"modify","mode"} OR ("rename" AND
+//     op.BeforeOID.Valid). create/delete rows are skipped intentionally;
+//     parallel create/delete are rare in practice and broadening coverage
+//     without test data risks masking real divergence.
+//
+// alreadyPublishedAtHEAD enforces the existing ancestry + per-op blob/mode
+// + rename-source + HEAD-movement guards unchanged. On (head, true, nil)
+// the row is promoted via state.TransitionBlockedToPublished (race-safe:
+// the helper refuses if the row already moved out of blocked_conflict).
+//
+// Best-effort meta cleanup: once the last blocked row on this
+// (branch_ref, branch_generation) clears, drop the last_replay_conflict /
+// last_replay_conflict_legacy / last_replay_error breadcrumbs so
+// `acd status` reads clean. Multiple still-blocked rows on the same anchor
+// (or any blocked rows on other anchors) keep the breadcrumbs intact.
+//
+// Errors during the per-row probe are logged and skipped — one bad row
+// must not abort the rest of the self-heal pass or the replay loop.
+func probeBlockedSelfHeal(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, logger acdtrace.Logger) error {
+	if cctx.BranchRef == "" {
+		return nil
+	}
+	blocked, err := state.BlockedEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration, 0)
+	if err != nil {
+		return fmt.Errorf("daemon: self-heal: load blocked rows: %w", err)
+	}
+	if len(blocked) == 0 {
+		return nil
+	}
+	healed := 0
+	for _, ev := range blocked {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !selfHealEligibleByClass(ev) {
+			continue
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
+		if err != nil {
+			slog.Default().Warn("daemon: self-heal: load ops",
+				"seq", ev.Seq, "err", err.Error())
+			continue
+		}
+		if !selfHealEligibleByOps(ops) {
+			continue
+		}
+		headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ev.BaseHead, ops)
+		if err != nil {
+			slog.Default().Warn("daemon: self-heal: probe HEAD",
+				"seq", ev.Seq, "path", ev.Path, "err", err.Error())
+			continue
+		}
+		if !alreadyPublished {
+			continue
+		}
+		nowSec := float64(time.Now().UnixNano()) / 1e9
+		if err := state.TransitionBlockedToPublished(ctx, db,
+			ev.Seq, headOID, nowSec,
+			cctx.BranchRef, cctx.BranchGeneration, ev.BaseHead,
+		); err != nil {
+			if errors.Is(err, state.ErrBlockedRowNotEligible) {
+				// Race: another writer moved the row out of
+				// blocked_conflict between our load and our update.
+				// Treat as a no-op — the row is no longer ours to
+				// self-heal.
+				continue
+			}
+			slog.Default().Warn("daemon: self-heal: transition row",
+				"seq", ev.Seq, "path", ev.Path, "err", err.Error())
+			continue
+		}
+		decisionCtx := cctx
+		decisionCtx.BaseHead = ev.BaseHead
+		recordReplayDecision(ctx, db, ev, decisionCtx, nowSec,
+			state.DecisionKindHandledExternalAfterBlock,
+			"handled_external_after_block",
+			headOID,
+		)
+		traceReplay(logger, repoRoot, decisionCtx, ev,
+			"replay.self_heal", state.DecisionKindHandledExternalAfterBlock,
+			"handled_external_after_block", map[string]any{
+				"commit":      headOID,
+				"head":        headOID,
+				"source_head": ev.BaseHead,
+				"branch_ref":  cctx.BranchRef,
+				"generation":  cctx.BranchGeneration,
+			})
+		healed++
+	}
+	if healed == 0 {
+		return nil
+	}
+	// Best-effort meta cleanup: only when no blocked rows remain on this
+	// (branch_ref, branch_generation). Other live anchors may still own
+	// the breadcrumbs, so we narrow the check to the active anchor before
+	// dropping the keys.
+	remaining, err := state.BlockedEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration, 1)
+	if err != nil {
+		slog.Default().Warn("daemon: self-heal: count remaining blocked",
+			"branch_ref", cctx.BranchRef, "err", err.Error())
+		return nil
+	}
+	if len(remaining) > 0 {
+		return nil
+	}
+	for _, key := range []string{
+		metaKeyLastReplayConflict,
+		metaKeyLastReplayConflictLegacy,
+		"last_replay_error",
+	} {
+		if _, err := state.MetaDelete(ctx, db, key); err != nil {
+			slog.Default().Warn("daemon: self-heal: clear meta",
+				"key", key, "err", err.Error())
+		}
+	}
+	return nil
+}
+
+// selfHealEligibleByClass narrows blocked rows to the before_state_mismatch
+// class. The error_class is not stored as its own column on
+// capture_events — it is derived from the persisted error message via
+// classifyReplayIssue (the same routine the recordConflict path uses to
+// stamp daemon_meta.last_replay_conflict). Rows whose error is empty or
+// classifies as any other class are returned ineligible without further
+// probing.
+func selfHealEligibleByClass(ev state.CaptureEvent) bool {
+	if !ev.Error.Valid || ev.Error.String == "" {
+		return false
+	}
+	return classifyReplayIssue(ev.Error.String) == replayErrorBeforeStateMismatch
+}
+
+// selfHealEligibleByOps narrows the self-heal predicate to op shapes whose
+// "external commit already landed the change" outcome is unambiguous from
+// HEAD alone. modify/mode rows match by AfterOID+AfterMode at the path;
+// rename rows match the same way at the new path PLUS verify the source
+// path is now absent AND the BeforeOID for the source is recorded (without
+// BeforeOID we cannot prove the rename source actually matched our intent).
+// create/delete rows are skipped — they are rarely the cause of a
+// before_state_mismatch barrier and broadening coverage without dedicated
+// tests would risk silently confirming a divergent worktree.
+func selfHealEligibleByOps(ops []state.CaptureOp) bool {
+	if len(ops) == 0 {
+		return false
+	}
+	for _, op := range ops {
+		switch op.Op {
+		case "modify", "mode":
+			// ok
+		case "rename":
+			if !op.BeforeOID.Valid || op.BeforeOID.String == "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // alreadyPublishedAtHEAD reports whether HEAD's tree already reflects the
 // captured ops, signalling that an external committer landed our intent
 // before we got there. Returning (headOID, true, nil) tells the caller to
