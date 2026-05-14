@@ -98,6 +98,7 @@ acd prompt              # inspect the last opt-in AI prompt trace
 acd prompt --seq 42 --json # inspect an event or offered intent seq as JSON
 acd fix --dry-run       # plan safe remediation for a stuck repo
 acd fix --yes           # apply the safe plan after reading it
+acd fix --force --yes   # also purge blocked barriers with pending successors
 acd logs                # tail the current repo daemon log as raw JSONL
 acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
@@ -105,7 +106,6 @@ acd stats --since 7d    # last week's commits
 acd doctor              # health/support diagnostics, including queue blockers
 acd doctor --bundle     # write a diagnostics zip for issue reports
 acd diagnose            # read-only branch anchor + blocked_conflict report
-acd recover --auto --dry-run  # preview stale-anchor recovery without mutation
 acd pause --reason "resetting branch" --yes   # durable manual replay pause
 acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
