@@ -741,6 +741,25 @@ func preflightFixFS(plan *fixPlan) error {
 			return fmt.Errorf("acd fix: manual pause marker parent not writable: %w", err)
 		}
 	}
+	// Retarget with --clear-pause also wants to remove the manual pause
+	// marker; perform the same FS preflight BEFORE opening the SQLite
+	// write tx so a slow stat on a network mount cannot hold the write
+	// lock. The retarget path uses plan.ManualMarkerPath (computed by
+	// planRetargetStaleAnchor) which may equal plan.ManualPausePath; the
+	// stat is cheap and idempotent so duplication is fine.
+	if plan.ClearPause && planHasAction(plan, fixActionRetargetStaleAnchor) {
+		markerPath := plan.ManualPausePath
+		if info, err := os.Lstat(markerPath); err == nil {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", markerPath)
+			}
+			if err := checkParentDirWritable(markerPath); err != nil {
+				return fmt.Errorf("acd fix: manual pause marker parent not writable: %w", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("acd fix: stat manual pause marker %s: %w", markerPath, err)
+		}
+	}
 	return nil
 }
 
