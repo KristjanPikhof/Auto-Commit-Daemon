@@ -212,7 +212,7 @@ func TestFix_ApplyRefusesWhenPlanHasUnsafeReasons(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = runFix(ctx, &out, repo, false, true, true)
+	err = runFix(ctx, &out, repo, false, true, false, false, true)
 	if err == nil {
 		t.Fatalf("runFix apply succeeded despite unsafe plan:\n%s", out.String())
 	}
@@ -280,7 +280,7 @@ func TestFix_ApplyMarksDecisionLedExternalRowPublished(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, true); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runFix apply: %v\n%s", err, out.String())
 	}
 	var stateName, commitOID string
