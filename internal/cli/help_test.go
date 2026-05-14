@@ -21,7 +21,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"prompt", []string{"ACD_AI_PROMPT_TRACE", "acd prompt --seq 42 --json", "--last"}},
 		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
 		{"diagnose", []string{"state read-only", "acd recover --repo . --auto --dry-run --json"}},
-		{"recover", []string{"acd recover --auto --dry-run", "requires --yes", "--clear-pause"}},
+		{"recover", []string{"DEPRECATED", "acd fix", "--clear-pause"}},
 		{"pause", []string{"acd pause --ttl 1h", "acd resume", "acd status"}},
 		{"resume", []string{"acd resume --repo /path/to/repo --yes", "--accept-overflow", "acd status"}},
 		{"setup", []string{"acd setup codex", "Supported harnesses", "prints snippets only"}},
