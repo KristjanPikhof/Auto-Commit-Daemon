@@ -173,6 +173,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
 	}
+	if err := diagnoseBlockedCounts(ctx, conn, rec.Path, &report); err != nil {
+		return report, err
+	}
 	if err := diagnoseDeadBranchPrune(ctx, conn, &report); err != nil {
 		return report, err
 	}
