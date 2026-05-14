@@ -472,178 +472,40 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 	return nil
 }
 
-// diagnoseBlockedCounts computes two read-only metrics over blocked_conflict rows:
+// diagnoseBlockedCounts computes two read-only metrics over blocked_conflict rows
+// on the active daemon anchor (branch_ref, branch_generation):
 //
 //   - AutoResolvableBlockedCount: rows that pass the same eligibility predicate
-//     the daemon self-heal uses (before_state_mismatch class, modify/mode/rename-with-BeforeOID
-//     op types, AND HEAD blob already matches captured after_oid with ancestry check).
+//     the daemon self-heal uses, via scanAutoResolvableBlockedRows.
 //   - BarrierWithSuccessorsCount: blocked_conflict rows that still have pending
-//     rows at a higher seq in the same (branch_ref, branch_generation).
+//     rows at a higher seq, via countBarrierBlockedWithSuccessors.
 //
-// Errors during per-row git probes are skipped so a single bad row does not
-// abort the rest of the count.
+// When the daemon anchor is unset (fresh or detached repo) both counts are zero.
 func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
-	// Load all blocked_conflict rows with their ops via a join.
-	rows, err := conn.QueryContext(ctx, `
-SELECT ce.seq, ce.branch_ref, ce.branch_generation, ce.base_head, ce.operation, ce.path,
-       ce.error,
-       co.op, co.path, co.before_oid, co.after_oid, co.after_mode
-FROM capture_events ce
-LEFT JOIN capture_ops co ON co.event_seq = ce.seq
-WHERE ce.state = ?
-ORDER BY ce.seq ASC, co.ord ASC`, state.EventStateBlockedConflict)
+	branchRef := report.Anchor.DaemonBranchRef
+	generation := report.Anchor.DaemonBranchGeneration
+	if branchRef == "" {
+		return nil
+	}
+
+	head, err := git.RevParse(ctx, repoDir, "HEAD")
 	if err != nil {
-		return fmt.Errorf("diagnose: load blocked for counts: %w", err)
-	}
-	defer rows.Close()
-
-	type blockedRow struct {
-		seq              int64
-		branchRef        string
-		branchGeneration int64
-		baseHead         string
-		errMsg           string
-		ops              []state.CaptureOp
+		// No HEAD (empty repo) — both counts stay zero; not an error.
+		return nil
 	}
 
-	bySeq := map[int64]*blockedRow{}
-	var seqOrder []int64
-	for rows.Next() {
-		var (
-			seq              int64
-			branchRef        string
-			branchGeneration int64
-			baseHead         string
-			evErr            sql.NullString
-			opOp             sql.NullString
-			opPath           sql.NullString
-			beforeOID        sql.NullString
-			afterOID         sql.NullString
-			afterMode        sql.NullString
-		)
-		// event.operation and event.path are not needed for eligibility check
-		// but we select them to satisfy the column count.
-		var evOp, evPath string
-		if err := rows.Scan(&seq, &branchRef, &branchGeneration, &baseHead, &evOp, &evPath,
-			&evErr, &opOp, &opPath, &beforeOID, &afterOID, &afterMode); err != nil {
-			return fmt.Errorf("diagnose: scan blocked row for counts: %w", err)
-		}
-		row, exists := bySeq[seq]
-		if !exists {
-			row = &blockedRow{
-				seq:              seq,
-				branchRef:        branchRef,
-				branchGeneration: branchGeneration,
-				baseHead:         baseHead,
-				errMsg:           evErr.String,
-			}
-			bySeq[seq] = row
-			seqOrder = append(seqOrder, seq)
-		}
-		if opOp.Valid && opOp.String != "" {
-			row.ops = append(row.ops, state.CaptureOp{
-				Op:        opOp.String,
-				Path:      opPath.String,
-				BeforeOID: beforeOID,
-				AfterOID:  afterOID,
-				AfterMode: afterMode,
-			})
-		}
+	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repoDir, head, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("diagnose: auto-resolvable count: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("diagnose: iter blocked rows for counts: %w", err)
-	}
+	report.AutoResolvableBlockedCount = len(candidates)
 
-	// BarrierWithSuccessorsCount: blocked rows that have later pending rows in same generation.
-	barrierSuccessorCount := 0
-	for _, seq := range seqOrder {
-		row := bySeq[seq]
-		var n int
-		if err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM capture_events
-WHERE branch_ref = ? AND branch_generation = ? AND state = ? AND seq > ?`,
-			row.branchRef, row.branchGeneration, state.EventStatePending, seq).Scan(&n); err == nil && n > 0 {
-			barrierSuccessorCount++
-		}
+	n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
 	}
-	report.BarrierWithSuccessorsCount = barrierSuccessorCount
-
-	// AutoResolvableBlockedCount: rows eligible for self-heal AND HEAD already matches.
-	autoResolvable := 0
-	for _, seq := range seqOrder {
-		row := bySeq[seq]
-		if !diagnoseEligibleByClass(row.errMsg) {
-			continue
-		}
-		if !diagnoseEligibleByOps(row.ops) {
-			continue
-		}
-		if diagnoseBlobMatchesHEAD(ctx, repoDir, row.baseHead, row.ops) {
-			autoResolvable++
-		}
-	}
-	report.AutoResolvableBlockedCount = autoResolvable
+	report.BarrierWithSuccessorsCount = n
 	return nil
-}
-
-// diagnoseEligibleByClass mirrors selfHealEligibleByClass: only before_state_mismatch rows
-// are candidates for auto-resolve.
-func diagnoseEligibleByClass(errMsg string) bool {
-	if errMsg == "" {
-		return false
-	}
-	return classifyDiagnoseError(0, errMsg, replayConflictMeta{}) == "before_state_mismatch"
-}
-
-// diagnoseEligibleByOps mirrors selfHealEligibleByOps: modify/mode ops are always eligible;
-// rename ops are eligible only when BeforeOID is set; anything else is not.
-func diagnoseEligibleByOps(ops []state.CaptureOp) bool {
-	if len(ops) == 0 {
-		return false
-	}
-	for _, op := range ops {
-		switch op.Op {
-		case "modify", "mode":
-			// ok
-		case "rename":
-			if !op.BeforeOID.Valid || op.BeforeOID.String == "" {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// diagnoseBlobMatchesHEAD performs a read-only probe: checks ancestry of baseHead against HEAD,
-// then verifies each op's AfterOID matches the live blob at HEAD. Returns true only when all
-// conditions are met (mirrors alreadyPublishedAtHEAD without HEAD-movement re-check, since
-// diagnose is a point-in-time snapshot rather than a transaction).
-func diagnoseBlobMatchesHEAD(ctx context.Context, repoDir, baseHead string, ops []state.CaptureOp) bool {
-	if len(ops) == 0 {
-		return false
-	}
-	headOID, err := git.RevParse(ctx, repoDir, "HEAD")
-	if err != nil {
-		return false
-	}
-	if baseHead != "" && baseHead != headOID {
-		descends, err := git.IsAncestor(ctx, repoDir, baseHead, headOID)
-		if err != nil || !descends {
-			return false
-		}
-	}
-	for _, op := range ops {
-		if !op.AfterOID.Valid || op.AfterOID.String == "" {
-			return false
-		}
-		blobOID, err := git.LsTreeBlobOID(ctx, repoDir, headOID, op.Path)
-		if err != nil || blobOID != op.AfterOID.String {
-			return false
-		}
-	}
-	return true
 }
 
 func loadLastReplayConflictMeta(ctx context.Context, conn *sql.DB) (replayConflictMeta, error) {
