@@ -22,8 +22,9 @@ type Harness interface {
 }
 
 type knownHarness struct {
-	name  string
-	paths []pathSpec
+	name     string
+	paths    []pathSpec
+	repoRoot string
 }
 
 func (h knownHarness) Name() string {
@@ -36,7 +37,7 @@ func (h knownHarness) ConfigPath() string {
 	if len(h.paths) == 0 {
 		return ""
 	}
-	return expandHome(h.paths[0].path)
+	return h.expandPath(h.paths[0])
 }
 
 func (h knownHarness) IsInstalled() bool {
@@ -47,16 +48,9 @@ func (h knownHarness) IsInstalled() bool {
 // registered for that path. Markers are checked per-path so JSON files do
 // not match TOML markers and vice versa.
 func (h knownHarness) HasMarker() bool {
-	for _, p := range h.paths {
-		body, err := os.ReadFile(expandHome(p.path))
-		if err != nil {
-			continue
-		}
-		text := string(body)
-		for _, marker := range p.markers {
-			if strings.Contains(text, marker) {
-				return true
-			}
+	for _, p := range h.candidatePaths() {
+		if fileContainsAny(p.path, p.markers) {
+			return true
 		}
 	}
 	return false
@@ -64,9 +58,10 @@ func (h knownHarness) HasMarker() bool {
 
 // allPaths returns every candidate path for this harness with `~` expanded.
 func (h knownHarness) allPaths() []string {
-	paths := make([]string, 0, len(h.paths))
-	for _, p := range h.paths {
-		paths = append(paths, expandHome(p.path))
+	candidates := h.candidatePaths()
+	paths := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		paths = append(paths, p.path)
 	}
 	return paths
 }
@@ -76,10 +71,9 @@ func (h knownHarness) allPaths() []string {
 // canonical primary is preferred over legacy fallbacks when both carry the
 // marker. Returns "", false when no candidate carries a marker.
 func (h knownHarness) MatchedPath() (string, bool) {
-	for _, p := range h.paths {
-		expanded := expandHome(p.path)
-		if fileContainsAny(expanded, p.markers) {
-			return expanded, true
+	for _, p := range h.candidatePaths() {
+		if fileContainsAny(p.path, p.markers) {
+			return p.path, true
 		}
 	}
 	return "", false
@@ -88,13 +82,82 @@ func (h knownHarness) MatchedPath() (string, bool) {
 // DetectInstalled returns the supported harnesses that already have an
 // acd-managed marker in their known config path.
 func DetectInstalled() []Harness {
+	return DetectInstalledFromDir("")
+}
+
+// DetectInstalledFromDir returns supported harnesses with an acd-managed marker
+// in a user-scoped config path or in a repo-local config path resolved from dir's
+// containing git worktree. An empty dir means the current working directory.
+func DetectInstalledFromDir(dir string) []Harness {
+	repoRoot := discoverGitRoot(dir)
 	var out []Harness
 	for _, h := range knownHarnesses {
+		h.repoRoot = repoRoot
 		if h.IsInstalled() {
 			out = append(out, h)
 		}
 	}
 	return out
+}
+
+type expandedPathSpec struct {
+	path    string
+	markers []string
+}
+
+func (h knownHarness) candidatePaths() []expandedPathSpec {
+	out := make([]expandedPathSpec, 0, len(h.paths))
+	repoRoot := h.repoRoot
+	if repoRoot == "" {
+		repoRoot = discoverGitRoot("")
+	}
+	for _, p := range h.paths {
+		expanded := h.expandPathWithRoot(p, repoRoot)
+		if expanded == "" {
+			continue
+		}
+		out = append(out, expandedPathSpec{path: expanded, markers: p.markers})
+	}
+	return out
+}
+
+func (h knownHarness) expandPath(p pathSpec) string {
+	return h.expandPathWithRoot(p, h.repoRoot)
+}
+
+func (h knownHarness) expandPathWithRoot(p pathSpec, repoRoot string) string {
+	if p.repoLocal {
+		if repoRoot == "" {
+			return ""
+		}
+		return filepath.Join(repoRoot, p.path)
+	}
+	return expandHome(p.path)
+}
+
+func discoverGitRoot(dir string) string {
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return ""
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	cur := filepath.Clean(abs)
+	for {
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		cur = parent
+	}
 }
 
 func expandHome(path string) string {
