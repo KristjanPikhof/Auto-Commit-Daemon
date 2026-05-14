@@ -53,7 +53,10 @@ func TestSelfHeal_BlockedPromotesToPublishedOnReplay(t *testing.T) {
 		t.Fatalf("baseline before_oid empty")
 	}
 
-	startSession(t, ctx, env, repo, "selfheal-blocked", "shell")
+	// ACD_REWIND_GRACE_SECONDS=0 disables the same-branch rewind grace so the
+	// external commit + wake here does not trigger a 60s replay pause that
+	// could time-out the 8-second self-heal wait loop on slow CI runners.
+	startSession(t, ctx, env, repo, "selfheal-blocked", "shell", "ACD_REWIND_GRACE_SECONDS=0")
 	waitMode(t, repo, "running", 5*time.Second)
 	dbPath := selfHealStateDB(repo)
 
