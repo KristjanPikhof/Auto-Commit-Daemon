@@ -398,15 +398,18 @@ acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue repor
 acd diagnose --repo . --json
 acd fix --dry-run
 acd fix --yes
-acd recover --repo . --auto --dry-run
-acd purge-events --repo . --blocked --pending --dry-run
+acd fix --force --dry-run
+acd fix --force --yes
 acd pause --repo . --reason "manual reset" --yes
 acd resume --repo . --yes
 ~~~
 
-Review dry-run output before applying fix, recovery, or purge plans with
-`--yes`. Prefer `acd fix --dry-run` for common stuck states; use `recover` and
-`purge-events` as advanced tools when focused diagnostics point there.
+`acd fix` is the single recovery entrypoint. Review the dry-run plan before
+applying with `--yes`; `--force` opts into purging blocked barriers that still
+have pending successors (use only when the captured changes already exist in
+HEAD via an external committer). The legacy `acd recover` and
+`acd purge-events` commands remain as hidden, deprecated aliases that forward
+into `acd fix` for one release.
 
 ACD keys lifecycle state by the canonical Git worktree root. `acd start` from
 `repo/sub/dir` registers `repo`, not the subdirectory, and later `acd status` or
