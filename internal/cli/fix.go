@@ -835,9 +835,94 @@ ON CONFLICT(id) DO UPDATE SET
 			}
 		}
 		return n, nil
+	case fixActionResolveAlreadyLandedBarrier:
+		// Promote the blocked_conflict row to published(commit_oid=HEAD)
+		// and record decision handled_external_after_block. Race-safe: the
+		// UPDATE includes the state predicate so a concurrent transition
+		// out of blocked_conflict cannot be overwritten.
+		res, err := tx.ExecContext(ctx, `
+UPDATE capture_events
+SET state = ?, commit_oid = ?, error = NULL, published_ts = ?
+WHERE seq = ? AND state = ?`,
+			state.EventStatePublished, action.CommitOID, nowSec, action.Seq,
+			state.EventStateBlockedConflict)
+		if err != nil {
+			return 0, fmt.Errorf("acd fix: promote blocked seq %d: %w", action.Seq, err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			// Row already moved out of blocked_conflict (race with another
+			// recovery action or replay pass). Treat as a no-op — the row
+			// is no longer ours to settle here.
+			return 0, nil
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid, status, error, updated_ts)
+VALUES (1, ?, ?, ?, ?, ?, 'published', NULL, ?)
+ON CONFLICT(id) DO UPDATE SET
+    event_seq = excluded.event_seq,
+    branch_ref = excluded.branch_ref,
+    branch_generation = excluded.branch_generation,
+    source_head = excluded.source_head,
+    target_commit_oid = excluded.target_commit_oid,
+    status = excluded.status,
+    error = excluded.error,
+    updated_ts = excluded.updated_ts`,
+			action.Seq, action.BranchRef, action.BranchGeneration, action.BaseHead, action.CommitOID, nowSec); err != nil {
+			return 0, fmt.Errorf("acd fix: upsert publish_state for self-heal seq %d: %w", action.Seq, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO decision_records(
+    decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
+    branch_ref, branch_generation, action_taken, user_message
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			nowSec, state.DecisionKindHandledExternalAfterBlock,
+			nullableString(action.Path),
+			nullableString("already_published_by_external_committer"),
+			sql.NullInt64{Int64: action.Seq, Valid: true},
+			nullableString(action.BaseHead),
+			nullableString(action.CommitOID),
+			nullableString(action.BranchRef),
+			sql.NullInt64{Int64: action.BranchGeneration, Valid: true},
+			nullableString("handled externally after block"),
+			nullableString(fmt.Sprintf("External commit cleared blocked replay for %s.", action.Path)),
+		); err != nil {
+			return 0, fmt.Errorf("acd fix: append decision for self-heal seq %d: %w", action.Seq, err)
+		}
+		return n, nil
+	case fixActionRetargetStaleAnchor:
+		return applyRetargetStaleAnchorTx(ctx, tx, plan, nowSec)
+	case fixActionPurgeBarrierWithSuccessors:
+		// Delete one specific blocked_conflict row by seq (planner enumerates
+		// rows with pending successors). Tightly scoped to seq + state so
+		// concurrent transitions cannot accidentally clobber an unrelated row.
+		res, err := tx.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE seq = ? AND state = ?`,
+			action.Seq, state.EventStateBlockedConflict)
+		if err != nil {
+			return 0, fmt.Errorf("acd fix: purge blocked seq %d: %w", action.Seq, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			// Clear publish_state breadcrumb if it pointed at this seq.
+			if _, err := tx.ExecContext(ctx, `
+UPDATE publish_state
+SET status = 'ok', error = NULL, updated_ts = ?
+WHERE id = 1
+  AND status = 'blocked_conflict'
+  AND event_seq = ?`, nowSec, action.Seq); err != nil {
+				return 0, fmt.Errorf("acd fix: clear publish_state for purged seq %d: %w", action.Seq, err)
+			}
+		}
+		return n, nil
 	default:
 		return 0, fmt.Errorf("acd fix: unknown action kind %q", action.Kind)
 	}
+}
+
+func nullableString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
 }
 
 func clearPublishBarrierIfSafe(ctx context.Context, tx *sql.Tx, nowSec float64) error {
