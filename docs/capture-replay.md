@@ -934,6 +934,7 @@ classes:
 | `capture.event` | Each op persisted to `capture_events` (decision `appended`) or dropped at queue cap (decision `dropped`) | `op`, `path`, `old_path`, `fidelity` | `seq` (appended) or `pending_depth`, `cap` (dropped) |
 | `capture.pause` | Capture pass skipped because replay is paused | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
 | `replay.commit` | Capture event published as a git commit, or idempotent-publish at HEAD | `operation`, `path` | `commit`, `parent` |
+| `replay.self_heal` | Blocked row promoted to `published` because HEAD already reflects the captured after-state (daemon-side `probeBlockedSelfHeal`) | `operation`, `path` | `commit`, `head`, `source_head`, `branch_ref`, `generation` |
 | `replay.conflict` | Event becomes `blocked_conflict` (before-state mismatch, CAS failure, or generation mismatch) | `operation`, `path` | `expected_sha`, `actual_sha`, `ref` |
 | `replay.failed` | Event becomes `failed` (bad op data, ancestry error, write-tree failure) | `operation`, `path` | — |
 | `replay.update_ref` | Each `git update-ref` attempt during commit publish (per-retry) | — | `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha`, `actual_sha` |
