@@ -701,9 +701,13 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"Current git HEAD branch differs from the daemon anchor; switch back to the daemon branch or restart acd on the current branch.")
 	}
-	if len(report.RecentBlocked) > 0 {
+	if report.AutoResolvableBlockedCount > 0 {
 		remediation = append(remediation,
-			"Resolve the listed replay barrier paths in the worktree/index, then run `acd fix --dry-run` to preview safe cleanup before removing terminal rows.")
+			fmt.Sprintf("Daemon will auto-resolve %d blocked row(s) on next tick (HEAD already matches captured after-state).", report.AutoResolvableBlockedCount))
+	}
+	if report.BarrierWithSuccessorsCount > report.AutoResolvableBlockedCount {
+		remediation = append(remediation,
+			"Run acd fix --dry-run to preview safe actions. For stuck barriers with successors, acd fix --force --dry-run shows purge plan.")
 	}
 	if report.FailedBlockingPending > 0 {
 		remediation = append(remediation,
