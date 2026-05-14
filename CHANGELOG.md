@@ -4,6 +4,18 @@
 
 ### Added
 
+- Intent planner now self-corrects spurious `deferred_reasons`. The planner
+  contract requires every `deferred_reasons[i].seq` to appear in
+  `deferred_seqs`; some upstream models still emit reasons attached to a
+  selected (or non-offered) seq. The `openai-compat` and `subprocess`
+  providers drop those entries before handing the plan to the validator and
+  log a single deterministic warning naming the dropped seqs. Plans that
+  remain invalid after normalization keep falling back to deterministic
+  one-capture commits via `Compose`. The validator returns a typed
+  `*IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonNotDeferred}`
+  so future callers can dispatch on the specific failure. The system prompt
+  now spells out the contract with a worked example.
+
 - Self-heal for blocked replay barriers. The daemon's replay pass now probes
   `blocked_conflict` rows before draining pending captures and promotes any
   row whose captured after-state already matches HEAD. No new commit is
