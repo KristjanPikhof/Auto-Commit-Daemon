@@ -118,7 +118,7 @@ func TestFix_ApplyClearsExpiredPauseAndDrainedBackpressure(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, true); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runFix apply: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
