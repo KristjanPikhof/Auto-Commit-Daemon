@@ -93,9 +93,6 @@
   surfaces the error count plus the first failing line. Output also reports
   config read errors separately from marker-missing on EACCES/EIO via a new
   `config_read_error` field in the JSON view.
-- Codex install detection now recognizes repo-local `.codex/hooks.json` and
-  `.codex/config.toml` files from the current git worktree, in addition to the
-  user-level `~/.codex/hooks.json` and legacy TOML locations.
 - `acd setup <harness> --raw` validates JSON for `.json` snippet targets
   before emitting. Invalid templates exit non-zero with the byte offset
   instead of letting users redirect malformed JSON into
