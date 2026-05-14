@@ -154,7 +154,7 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	return renderFix(out, plan, jsonOut)
 }
 
-func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun bool) (fixPlan, error) {
+func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clearPause bool) (fixPlan, error) {
 	gitDir, err := resolveGitDir(ctx, repo)
 	if err != nil {
 		return fixPlan{}, fmt.Errorf("acd fix: resolve git dir: %w", err)
@@ -182,6 +182,8 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun bool) (fixPl
 		CurrentHead:      head,
 		Generation:       1,
 		DryRun:           dryRun,
+		Force:            force,
+		ClearPause:       clearPause,
 	}
 	if raw, ok, err := metaLookup(ctx, conn, "branch.generation"); err != nil {
 		return fixPlan{}, fmt.Errorf("acd fix: load branch generation: %w", err)
@@ -219,6 +221,33 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun bool) (fixPl
 	}
 	if err := planObsoleteBarrierFix(ctx, conn, hasDecisionRecords, &plan); err != nil {
 		return fixPlan{}, err
+	}
+	// New action classes per SPEC LOCK (Wave 3a). Order matches the
+	// user-visible severity: resolve_already_landed_barrier (auto, safe) and
+	// retarget_stale_anchor (auto, safe) come before purge planning.
+	if branchRef != "" {
+		if err := planResolveAlreadyLandedBarrier(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
+			return fixPlan{}, err
+		}
+		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
+			return fixPlan{}, err
+		}
+		if force {
+			if err := planPurgeBarrierWithSuccessors(ctx, conn, branchRef, plan.Generation, &plan); err != nil {
+				return fixPlan{}, err
+			}
+		} else {
+			// Without --force we never plan the purge, but we still nudge the
+			// operator when a stuck barrier exists so they can opt in.
+			n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, plan.Generation)
+			if err != nil {
+				return fixPlan{}, err
+			}
+			if n > 0 {
+				plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
+					"%d blocked barrier row(s) still have pending successors; rerun with --force to plan purge_barrier_with_successors.", n))
+			}
+		}
 	}
 	return plan, nil
 }
