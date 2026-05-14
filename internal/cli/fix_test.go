@@ -554,9 +554,10 @@ func TestFix_ForceYesAppliesPurge(t *testing.T) {
 	}
 }
 
-// TestFix_RetargetActionLandsWhenStaleAnchorPresent mirrors the existing
-// recover_test fixture but drives the new action via acd fix. After --yes
-// the stale capture_events row must be retargeted onto refs/heads/main.
+// TestFix_RetargetActionLandsWhenStaleAnchorPresent mirrors the recover_test
+// fixture but drives the new action via acd fix. The fixture stages a stale
+// pending row (not blocked, so the older delete_obsolete_barrier path leaves
+// it alone); after --yes the row must be retargeted onto refs/heads/main.
 func TestFix_RetargetActionLandsWhenStaleAnchorPresent(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
@@ -582,8 +583,7 @@ func TestFix_RetargetActionLandsWhenStaleAnchorPresent(t *testing.T) {
 		Operation:        "create",
 		Path:             "stale.txt",
 		Fidelity:         "full",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "old conflict", Valid: true},
+		State:            state.EventStatePending,
 	}, []state.CaptureOp{{
 		Op:        "create",
 		Path:      "stale.txt",
