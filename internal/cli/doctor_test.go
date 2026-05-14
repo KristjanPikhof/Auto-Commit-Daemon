@@ -736,7 +736,7 @@ func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
 	if !codex.Installed {
 		t.Fatalf("codex should be installed via repo-local hooks.json: %+v", codex)
 	}
-	wantHooksPath := canonicalTestPath(t, hooksPath)
+	wantHooksPath := canonicalCLIResolverTestPath(t, hooksPath)
 	if codex.MatchedPath != wantHooksPath {
 		t.Fatalf("MatchedPath=%q, want repo-local %q", codex.MatchedPath, wantHooksPath)
 	}
