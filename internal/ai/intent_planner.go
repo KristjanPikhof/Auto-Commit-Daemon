@@ -274,8 +274,17 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 
 	reasons := make(map[int64]struct{}, len(plan.DeferredReasons))
 	for _, reason := range plan.DeferredReasons {
+		// Cross-check: every DeferredReason.Seq must appear in DeferredSeqs.
+		// Planners that emit a reason for a selected seq, or for a seq not in
+		// the offered window, get rejected here. Providers can pre-normalize
+		// via NormalizeIntentPlanDeferredReasons to drop the spurious entry
+		// and keep the rest of the plan.
 		if _, ok := deferred[reason.Seq]; !ok {
-			return fmt.Errorf("intent planner: deferred reason references non-deferred seq %d", reason.Seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationDeferredReasonNotDeferred,
+				Seq:     reason.Seq,
+				Message: fmt.Sprintf("intent planner: deferred reason references non-deferred seq %d", reason.Seq),
+			}
 		}
 		if _, exists := reasons[reason.Seq]; exists {
 			return fmt.Errorf("intent planner: duplicate deferred reason for seq %d", reason.Seq)
