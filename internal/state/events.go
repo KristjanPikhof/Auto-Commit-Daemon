@@ -483,6 +483,51 @@ ON CONFLICT(id) DO UPDATE SET
 	return nil
 }
 
+// BlockedEventsForGeneration returns capture_events rows in
+// EventStateBlockedConflict for (branch_ref, branch_generation), ordered by
+// seq ascending. This is the input for the replay self-heal pass — the
+// daemon enumerates blocked rows on the active generation and probes each
+// against HEAD to see whether an external committer already landed the
+// captured change.
+//
+// Empty branchRef is rejected to avoid a bag-of-blocked sweep across stale
+// generations; callers must pass a live anchor. limit <= 0 means "no limit".
+func BlockedEventsForGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64, limit int) ([]CaptureEvent, error) {
+	if branchRef == "" {
+		return nil, fmt.Errorf("state: BlockedEventsForGeneration: empty branch_ref")
+	}
+	q := `
+SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
+       fidelity, captured_ts, published_ts, state, commit_oid, error, message
+FROM capture_events
+WHERE state = ? AND branch_ref = ? AND branch_generation = ?
+ORDER BY seq ASC`
+	args := []any{EventStateBlockedConflict, branchRef, branchGeneration}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := d.readSQL().QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("state: query blocked events: %w", err)
+	}
+	defer rows.Close()
+	var out []CaptureEvent
+	for rows.Next() {
+		var ev CaptureEvent
+		if err := rows.Scan(&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead,
+			&ev.Operation, &ev.Path, &ev.OldPath, &ev.Fidelity,
+			&ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID, &ev.Error, &ev.Message); err != nil {
+			return nil, fmt.Errorf("state: scan blocked event: %w", err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iter blocked events: %w", err)
+	}
+	return out, nil
+}
+
 // ErrBlockedRowNotEligible is returned by TransitionBlockedToPublished when
 // the target capture_events row is no longer in EventStateBlockedConflict. It
 // distinguishes a benign race (a concurrent recovery action or replay pass
