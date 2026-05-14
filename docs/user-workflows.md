@@ -243,8 +243,8 @@ Apply only after reading the plan:
 acd fix --yes
 ~~~
 
-Use `recover` or `purge-events` only as advanced recovery tools when `diagnose`
-or `fix` points you there.
+If `fix --dry-run` reports barriers with pending successors, rerun with
+`--force` to include the purge in the plan before applying.
 
 ## Branch reset, rebase, or other branch surgery
 
@@ -400,6 +400,7 @@ artifact for issue reports.
 | `skipped` | ACD intentionally left a path uncommitted, usually due to ignore or policy. |
 | `protected` | ACD protected a sensitive or generated path and did not synthesize a delete. |
 | `handled_external` | Another commit already contains the captured after-state. |
+| `handled_external_after_block` | A `blocked_conflict` row was self-healed: an external committer landed the captured after-state, so the daemon promoted the row to `published` without a new commit. |
 | `superseded_external` | External history made the queued work obsolete. |
 | `blocked` | Replay stopped because applying the event was not provably safe. |
 | `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
