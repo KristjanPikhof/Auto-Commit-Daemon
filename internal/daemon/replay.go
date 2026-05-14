@@ -2731,6 +2731,8 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 	switch kind {
 	case state.DecisionKindHandledExternal:
 		action = "handled externally"
+	case state.DecisionKindHandledExternalAfterBlock:
+		action = "handled externally after block"
 	case state.DecisionKindSupersededExternal:
 		action = "superseded externally"
 	case state.DecisionKindCommitted:
