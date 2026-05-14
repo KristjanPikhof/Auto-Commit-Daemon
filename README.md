@@ -214,23 +214,21 @@ blocked counts no longer linger after a merged feature branch is removed.
 Paused repos are left untouched. Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` to keep
 dead-branch rows for forensic inspection. The two int fields render as `0` when
 the daemon has never recorded a non-empty prune; the refs slice is omitted from
-JSON when empty. If the daemon is stopped and the plan looks right, recover a
-stale anchor with an automatic backup:
+JSON when empty. If the daemon is stopped and `fix` reports a safe plan, apply
+it:
 
 ~~~bash
-acd recover --repo . --auto --dry-run
-acd recover --repo . --auto --yes
+acd fix --yes
 ~~~
 
-`recover` refuses to run while the daemon PID is alive. Applying a plan copies
-`.git/acd/state.db` to `.git/acd/state.db.recover-<timestamp>`, retargets stale
-pending/blocked rows to the current attached branch, resets `blocked_conflict`
-rows to `pending`, clears stale replay metadata, and repairs ACD-owned stale
-live-index entries when the current `HEAD` and worktree still match the
-published event. `acd doctor` also reports live-index repair candidates and
-points at the recover dry-run command. A manual pause marker is preserved unless
-you pass `--clear-pause`; use `acd resume --yes` when you only need to lift a
-manual pause.
+`fix --yes` backs up `state.db` before any mutation and refuses to run while a
+live daemon owns the database. It resolves already-landed barriers, retargets
+stale anchors, clears obsolete terminal barriers, marks externally-published
+rows, clears expired manual pauses, and clears drained backpressure. Add
+`--force` to also plan (and with `--yes`, apply) the purge of blocked barriers
+that still have pending successors. A manual pause marker is preserved unless
+you pass `--clear-pause`; use `acd resume --yes` when the marker itself is the
+only problem.
 
 ACD uses an isolated scratch index for replay correctness, then performs a
 guarded path-scoped live-index reconciliation so IDEs see the committed state
