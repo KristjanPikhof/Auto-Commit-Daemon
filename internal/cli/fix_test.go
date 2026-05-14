@@ -17,15 +17,32 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestFix_RequiresYesWhenNotDryRun(t *testing.T) {
-	repo, _, _ := makeRegisteredGitRepoStateDB(t)
-	var out bytes.Buffer
-	err := runFix(context.Background(), &out, repo, false, false, true)
-	if err == nil {
-		t.Fatalf("expected --yes refusal; out=%s", out.String())
+func TestFix_DefaultsToDryRunWhenNoFlagsPassed(t *testing.T) {
+	// Without --yes (and without --force) `acd fix` must be a pure dry-run.
+	// The old "refuse without --yes" guard has been replaced by silent
+	// dry-run default per SPEC LOCK so casual operators see the plan first.
+	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--yes") {
-		t.Fatalf("err=%v want --yes guidance", err)
+	var out bytes.Buffer
+	if err := runFix(context.Background(), &out, repo, false /*dryRun*/, false /*yes*/, false /*force*/, false /*clearPause*/, true /*jsonOut*/); err != nil {
+		t.Fatalf("runFix without --yes must dry-run silently, got err=%v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !plan.DryRun {
+		t.Fatalf("plan.DryRun=false in no-flag default: %+v", plan)
+	}
+	after, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("no-flag default mutated state.db: before=%s after=%s", before, after)
 	}
 }
 
@@ -38,7 +55,7 @@ func TestFix_DryRunPlansSafeActionsWithoutMutation(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, true, false, true); err != nil {
+	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
 		t.Fatalf("runFix dry-run: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
