@@ -219,16 +219,27 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 			return fixPlan{}, err
 		}
 	}
-	if err := planObsoleteBarrierFix(ctx, conn, hasDecisionRecords, &plan); err != nil {
-		return fixPlan{}, err
-	}
-	// New action classes per SPEC LOCK (Wave 3a). Order matches the
-	// user-visible severity: resolve_already_landed_barrier (auto, safe) and
-	// retarget_stale_anchor (auto, safe) come before purge planning.
+	// resolve_already_landed_barrier must precede delete_obsolete_barrier:
+	// a blocked row whose captured after-state matches HEAD is BOTH "obsolete"
+	// (no pending successors) AND "already landed externally". The promote
+	// path preserves the decision_records audit trail, so we want that
+	// outcome instead of a silent delete. Build a skip-set keyed by seq so
+	// planObsoleteBarrierFix never plans a delete for the same row.
+	resolveSeqs := map[int64]struct{}{}
 	if branchRef != "" {
 		if err := planResolveAlreadyLandedBarrier(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
 			return fixPlan{}, err
 		}
+		for _, a := range plan.Actions {
+			if a.Kind == fixActionResolveAlreadyLandedBarrier {
+				resolveSeqs[a.Seq] = struct{}{}
+			}
+		}
+	}
+	if err := planObsoleteBarrierFix(ctx, conn, hasDecisionRecords, &plan, resolveSeqs); err != nil {
+		return fixPlan{}, err
+	}
+	if branchRef != "" {
 		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
 			return fixPlan{}, err
 		}
