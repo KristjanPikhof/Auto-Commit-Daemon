@@ -277,10 +277,9 @@ acd fix --dry-run
 ~~~
 
 `diagnose` focuses on replay blockers and branch anchors. `fix` plans safe
-state cleanup. Use `acd recover --repo . --auto --dry-run` only when diagnose
-specifically reports stale replay state that should be retargeted. Recovery
-preserves a manual pause marker unless you apply it with `--clear-pause`; use
-`acd resume --yes` when the marker itself is the only problem.
+state cleanup. After reading `fix --dry-run`, apply with `acd fix --yes`. `fix` preserves a
+manual pause marker unless you add `--clear-pause`; use `acd resume --yes`
+when the marker itself is the only problem.
 
 When a feature branch has been merged and deleted, ACD cleans up stale
 `pending`, `blocked_conflict`, and `failed` rows for that dead branch ref during
