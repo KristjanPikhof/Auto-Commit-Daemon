@@ -307,9 +307,10 @@ acd explain --commit HEAD
 acd fix --dry-run
 ~~~
 
-You should usually see `handled_external` or `superseded_external`. Use
-`purge-events` only as an advanced fallback when `diagnose` or `fix` points at
-obsolete terminal barriers that must be deleted.
+You should usually see `handled_external` or `superseded_external`. If a
+blocked barrier remains after the external commit, run `acd fix --dry-run` to
+see the auto-resolvable plan, or `acd fix --force --dry-run` when the barrier
+has pending successors.
 
 Enable local decision tracing when you need a replay/capture audit trail:
 
