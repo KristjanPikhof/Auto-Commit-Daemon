@@ -22,10 +22,13 @@ import (
 )
 
 const (
-	fixActionClearExpiredManualPause  = "clear_expired_manual_pause"
-	fixActionClearDrainedBackpressure = "clear_drained_backpressure"
-	fixActionDeleteObsoleteBarrier    = "delete_obsolete_barrier"
-	fixActionMarkExternalPublished    = "mark_external_published"
+	fixActionClearExpiredManualPause     = "clear_expired_manual_pause"
+	fixActionClearDrainedBackpressure    = "clear_drained_backpressure"
+	fixActionDeleteObsoleteBarrier       = "delete_obsolete_barrier"
+	fixActionMarkExternalPublished       = "mark_external_published"
+	fixActionResolveAlreadyLandedBarrier = "resolve_already_landed_barrier"
+	fixActionRetargetStaleAnchor         = "retarget_stale_anchor"
+	fixActionPurgeBarrierWithSuccessors  = "purge_barrier_with_successors"
 )
 
 type fixPlan struct {
@@ -36,6 +39,8 @@ type fixPlan struct {
 	CurrentHead        string      `json:"current_head,omitempty"`
 	Generation         int64       `json:"generation,omitempty"`
 	DryRun             bool        `json:"dry_run"`
+	Force              bool        `json:"force,omitempty"`
+	ClearPause         bool        `json:"clear_pause,omitempty"`
 	BackupPath         string      `json:"backup_path,omitempty"`
 	Actions            []fixAction `json:"actions"`
 	Unsafe             []string    `json:"unsafe,omitempty"`
@@ -43,20 +48,34 @@ type fixPlan struct {
 	RowsChanged        int64       `json:"rows_changed"`
 	ManualPauseRemoved bool        `json:"manual_pause_removed,omitempty"`
 	ManualPausePath    string      `json:"manual_pause_path,omitempty"`
+	// Retarget bookkeeping (mirrors recoverPlan fields so JSON callers can
+	// follow ported acd recover semantics without losing data).
+	ManualMarkerRemoved     bool   `json:"manual_marker_removed,omitempty"`
+	ManualMarkerPreserved   bool   `json:"manual_marker_preserved,omitempty"`
+	ManualMarkerRemoveError string `json:"manual_marker_remove_error,omitempty"`
+	LiveIndexCandidates     int    `json:"live_index_candidates,omitempty"`
+	LiveIndexApplied        int    `json:"live_index_applied,omitempty"`
+	LiveIndexSkipped        int    `json:"live_index_skipped,omitempty"`
 }
 
 type fixAction struct {
-	ID          string `json:"id"`
-	Kind        string `json:"kind"`
-	Description string `json:"description"`
-	Reason      string `json:"reason,omitempty"`
-	Seq         int64  `json:"seq,omitempty"`
-	Path        string `json:"path,omitempty"`
-	DecisionID  int64  `json:"decision_id,omitempty"`
-	CommitOID   string `json:"commit_oid,omitempty"`
-	RowsChanged int64  `json:"rows_changed,omitempty"`
-	Applied     bool   `json:"applied,omitempty"`
-	SetAt       string `json:"set_at,omitempty"`
+	ID                 string `json:"id"`
+	Kind               string `json:"kind"`
+	Description        string `json:"description"`
+	Reason             string `json:"reason,omitempty"`
+	Seq                int64  `json:"seq,omitempty"`
+	Path               string `json:"path,omitempty"`
+	DecisionID         int64  `json:"decision_id,omitempty"`
+	CommitOID          string `json:"commit_oid,omitempty"`
+	BlobOID            string `json:"blob_oid,omitempty"`
+	CapturedAfterOID   string `json:"captured_after_oid,omitempty"`
+	BranchRef          string `json:"branch_ref,omitempty"`
+	BranchGeneration   int64  `json:"branch_generation,omitempty"`
+	BaseHead           string `json:"base_head,omitempty"`
+	RowsChanged        int64  `json:"rows_changed,omitempty"`
+	Applied            bool   `json:"applied,omitempty"`
+	SetAt              string `json:"set_at,omitempty"`
+	RequiresForce      bool   `json:"requires_force,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
