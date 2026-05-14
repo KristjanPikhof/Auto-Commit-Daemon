@@ -654,6 +654,16 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	if plan.CurrentBranchRef == "" {
 		return fmt.Errorf("acd fix: refusing to mutate state while HEAD is detached")
 	}
+	// Defense-in-depth: refuse to apply any RequiresForce action unless the
+	// plan's Force flag was set at build time. Planner gating already prevents
+	// these actions from appearing without --force, so this guard catches
+	// future refactors (re-hydrated plans, alternate callers) before they can
+	// silently apply a destructive purge.
+	for _, action := range plan.Actions {
+		if action.RequiresForce && !plan.Force {
+			return fmt.Errorf("acd fix: refusing to apply %s without --force (planner gating bypassed)", action.Kind)
+		}
+	}
 	if err := preflightFixFS(plan); err != nil {
 		return err
 	}
