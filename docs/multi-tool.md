@@ -104,19 +104,23 @@ acd fix --dry-run
 acd fix --yes
 ~~~
 
-Use `recover` or `purge-events` only as advanced fallbacks when `diagnose` or
-`fix --dry-run` points at stale branch anchors, obsolete terminal barriers, or
-failed terminal barriers that are blocking later pending replay:
+If `fix --dry-run` reports barriers with pending successors, add `--force` to
+include the purge in the plan:
 
 ~~~bash
-acd recover --repo . --auto --dry-run
-acd purge-events --repo . --blocked --dry-run
+acd fix --force --dry-run
+acd fix --force --yes
+~~~
+
+After applying, nudge the daemon if you are inside a harness shell:
+
+~~~bash
 acd wake --session-id "$ACD_SESSION_ID"
 ~~~
 
-`wake` requires a non-empty session id. Use it from harness shells that set
-`ACD_SESSION_ID`; otherwise wait for the next daemon tick after applying a safe
-plan.
+`wake` requires a non-empty session id. Without one, wait for the next daemon tick.
+
+`acd recover` and `acd purge-events` are deprecated; use `acd fix` instead.
 
 ---
 
