@@ -185,6 +185,8 @@ func TestIntentPlannerPromptContainsPlannerRules(t *testing.T) {
 		"Do not group unrelated captures",
 		"Do not invent intent beyond the supplied evidence",
 		"Forced-aging windows contain only the overdue capture",
+		"Every deferred_reasons[i].seq must appear in deferred_seqs",
+		"Worked example",
 	}
 	for _, want := range required {
 		if !strings.Contains(prompt, want) {
