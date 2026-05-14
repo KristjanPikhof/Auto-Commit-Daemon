@@ -2776,6 +2776,11 @@ func replayDecisionMessage(kind, path, commitOID string) string {
 			return fmt.Sprintf("External commit already contains %s.", path)
 		}
 		return "External commit already contains this change."
+	case state.DecisionKindHandledExternalAfterBlock:
+		if path != "" {
+			return fmt.Sprintf("External commit cleared blocked replay for %s.", path)
+		}
+		return "External commit cleared blocked replay for queued change."
 	case state.DecisionKindSupersededExternal:
 		if path != "" {
 			return fmt.Sprintf("External history superseded queued change for %s.", path)
