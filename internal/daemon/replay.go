@@ -3137,6 +3137,14 @@ func classifyReplayIssue(message string) string {
 	}
 }
 
+// IsBeforeStateMismatchError reports whether the recorded
+// capture_events.error string classifies as the before_state_mismatch class.
+// Exported so the CLI self-heal probe (acd fix / acd diagnose) can share the
+// single source of truth with the daemon's run-loop self-heal pass.
+func IsBeforeStateMismatchError(message string) bool {
+	return classifyReplayIssue(message) == replayErrorBeforeStateMismatch
+}
+
 func parseUpdateRefCASReason(reason string) (actual, expected string) {
 	const actualMarker = " is at "
 	const expectedMarker = " but expected "
