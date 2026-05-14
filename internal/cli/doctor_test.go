@@ -726,7 +726,7 @@ func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
 	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
 		t.Fatalf("write repo-local hooks.json: %v", err)
 	}
-	t.Chdir(repo)
+	chdirForTest(t, repo)
 
 	rep, err := collectDoctorReport(context.Background())
 	if err != nil {

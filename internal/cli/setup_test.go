@@ -1020,7 +1020,7 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
-	t.Chdir(repo)
+	chdirForTest(t, repo)
 
 	out, stderr, err := runSetupCmd(t)
 	if err != nil {
