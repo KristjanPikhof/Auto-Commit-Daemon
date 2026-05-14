@@ -97,6 +97,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - `ACD_COMMIT_STRATEGY=intent`: offers pending captures to AI planner; capture durability unchanged.
 - Intent defaults: `ACD_INTENT_WINDOW=10`, `ACD_INTENT_MIN_PENDING=10`, `ACD_INTENT_MAX_PENDING_AGE=5m`, `ACD_INTENT_RECENT_COMMITS=5`, `ACD_INTENT_DEFER_LIMIT=2`.
 - Planner selects one capture or any non-empty subset; every offered seq must be selected/deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to deterministic one-item.
+- `deferred_reasons[i].seq` MUST appear in `deferred_seqs`; reasons attached to selected/non-offered seqs are invalid. `internal/ai/intent_planner.go` `ValidateIntentPlan` returns typed `*IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonNotDeferred}` for this case. `openai-compat` and `subprocess` providers call `NormalizeIntentPlanDeferredReasons` before validate, drop spurious entries, and emit one `slog.Warn` naming the dropped seqs. Plans that still fail validation after normalization fall back through `Compose` as before.
 - Deferred stays pending in `planner_state`; at `defer_count >= ACD_INTENT_DEFER_LIMIT`, oldest overdue is forced one-item.
 - Grouped publish marks selected events `published` with same `commit_oid`; ledger records grouped seqs, deferrals, forced aging, planner errors.
 - Per-pass scratch index `<gitDir>/acd/replay-*.index` is seeded from `cctx.BaseHead`; reads via `git.LsFilesIndex(...)`.
