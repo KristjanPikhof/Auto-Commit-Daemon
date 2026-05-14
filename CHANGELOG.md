@@ -83,6 +83,9 @@
   surfaces the error count plus the first failing line. Output also reports
   config read errors separately from marker-missing on EACCES/EIO via a new
   `config_read_error` field in the JSON view.
+- Codex install detection now recognizes repo-local `.codex/hooks.json` and
+  `.codex/config.toml` files from the current git worktree, in addition to the
+  user-level `~/.codex/hooks.json` and legacy TOML locations.
 - `acd setup <harness> --raw` validates JSON for `.json` snippet targets
   before emitting. Invalid templates exit non-zero with the byte offset
   instead of letting users redirect malformed JSON into
@@ -100,10 +103,11 @@
   using `>`. After writing the file, remove the old `# acd-managed: true` block
   from `~/.codex/config.toml`, then approve the new hooks with `/hooks` inside
   Codex. Codex re-flags all hook entries as review-required after every
-  `hooks.json` content change, so re-run `/hooks` after any re-install too.
-  `acd doctor` now warns when both old and new Codex hook configs are installed,
-  because Codex will run both. See
-  [templates/codex/README.md](templates/codex/README.md) for full details.
+	  `hooks.json` content change, so re-run `/hooks` after any re-install too.
+	  `acd doctor` now warns when both old and new Codex hook configs are installed,
+	  because Codex will run both. Keep Codex lifecycle hooks enabled in
+	  `~/.codex/config.toml` with `[features].codex_hooks = true`. See
+	  [templates/codex/README.md](templates/codex/README.md) for full details.
 - Codex hooks now read `cwd` from hook stdin, no longer require
   `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the
   hook payload. The helper also supports multiple fields and optional fields.
