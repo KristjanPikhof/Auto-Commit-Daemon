@@ -142,14 +142,17 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 
 ```bash
 acd diagnose --repo . --json
-acd recover --repo . --auto --dry-run --json
-acd recover --repo . --auto --yes
+acd fix --dry-run
+acd fix --yes
+acd fix --force --dry-run
+acd fix --force --yes
 acd wake --repo . --session-id <session>
 acd status --repo .
 ```
 
-- `acd recover --auto` refuses while daemon PID lives; creates `.git/acd/state.db.recover-<timestamp>`, retargets pending/blocked rows, resets blocked, clears replay/pause meta, removes manual pause marker.
+- `acd fix` is the single recovery entrypoint. `--dry-run` (default without `--yes`) shows the plan. `--yes` applies safe actions: resolve already-landed barriers, retarget stale anchors, delete obsolete barriers, mark externally-published rows, clear expired manual pauses, clear drained backpressure. `--force` extends the plan to purge blocked barriers that still have pending successors; combine with `--yes` to apply. All actions refuse while a live daemon owns the state DB; state.db is backed up before any mutation.
 - `acd resume --yes` lifts only manual pause.
+- `acd recover` and `acd purge-events` are deprecated (hidden, will be removed in a future release); use `acd fix`.
 - Last-resort: pause/resume plus `sqlite3 .git/acd/state.db "DELETE FROM capture_events WHERE state='blocked_conflict';"`.
 
 ## Harness/Templates
