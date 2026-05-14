@@ -15,6 +15,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
