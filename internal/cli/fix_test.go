@@ -452,17 +452,17 @@ func TestFix_ApplyYesPromotesAlreadyLandedBarrier(t *testing.T) {
 	if err := db.SQL().QueryRowContext(ctx,
 		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq,
 	).Scan(&stateName, &commitOID); err != nil {
-		t.Fatalf("query: %v", err)
+		t.Fatalf("query (post-apply event):\n%s\n%v", out.String(), err)
 	}
 	if stateName != state.EventStatePublished || commitOID != head {
-		t.Fatalf("event after fix state=%q commit=%q want published+%s", stateName, commitOID, head)
+		t.Fatalf("event after fix state=%q commit=%q want published+%s\n%s", stateName, commitOID, head, out.String())
 	}
 	var kind string
 	if err := db.SQL().QueryRowContext(ctx,
 		`SELECT kind FROM decision_records WHERE event_seq = ? AND kind = ?`,
 		seq, state.DecisionKindHandledExternalAfterBlock,
 	).Scan(&kind); err != nil {
-		t.Fatalf("query decision: %v", err)
+		t.Fatalf("query decision (out=%s): %v", out.String(), err)
 	}
 }
 
