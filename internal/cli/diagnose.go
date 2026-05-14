@@ -52,23 +52,25 @@ type diagnoseBlockedEntry struct {
 }
 
 type diagnoseReport struct {
-	Repo                    string                 `json:"repo"`
-	RepoHash                string                 `json:"repo_hash"`
-	StateDB                 string                 `json:"state_db"`
-	Anchor                  diagnoseAnchorReport   `json:"anchor"`
-	PendingDepth            int                    `json:"pending_depth"`
-	FailedEvents            int                    `json:"failed_events"`
-	FailedBlockingPending   int                    `json:"failed_blocking_pending"`
-	PendingHighWater        int64                  `json:"pending_high_water"`
-	BackpressurePaused      bool                   `json:"backpressure_paused"`
-	BackpressurePausedAt    string                 `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal      int64                  `json:"events_dropped_total"`
-	IntentStrategy          intentStrategyReport   `json:"intent_strategy"`
-	BlockedHistogram        []diagnoseBlockedClass `json:"blocked_histogram"`
-	RecentBlocked           []diagnoseBlockedEntry `json:"recent_blocked"`
-	OperationInProgress     string                 `json:"operation_in_progress,omitempty"`
-	StaleOperationMarker    bool                   `json:"stale_operation_marker"`
-	OperationMarkerDuration string                 `json:"operation_marker_duration,omitempty"`
+	Repo                       string                 `json:"repo"`
+	RepoHash                   string                 `json:"repo_hash"`
+	StateDB                    string                 `json:"state_db"`
+	Anchor                     diagnoseAnchorReport   `json:"anchor"`
+	PendingDepth               int                    `json:"pending_depth"`
+	FailedEvents               int                    `json:"failed_events"`
+	FailedBlockingPending      int                    `json:"failed_blocking_pending"`
+	PendingHighWater           int64                  `json:"pending_high_water"`
+	BackpressurePaused         bool                   `json:"backpressure_paused"`
+	BackpressurePausedAt       string                 `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal         int64                  `json:"events_dropped_total"`
+	IntentStrategy             intentStrategyReport   `json:"intent_strategy"`
+	BlockedHistogram           []diagnoseBlockedClass `json:"blocked_histogram"`
+	RecentBlocked              []diagnoseBlockedEntry `json:"recent_blocked"`
+	AutoResolvableBlockedCount int                    `json:"auto_resolvable_blocked_count"`
+	BarrierWithSuccessorsCount int                    `json:"barrier_with_successors_count"`
+	OperationInProgress        string                 `json:"operation_in_progress,omitempty"`
+	StaleOperationMarker       bool                   `json:"stale_operation_marker"`
+	OperationMarkerDuration    string                 `json:"operation_marker_duration,omitempty"`
 	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
 	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
 	// terminal prune action so operators can confirm stale-branch hygiene
@@ -169,6 +171,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		report.IntentStrategy = intentStrategy
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := diagnoseBlockedCounts(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
 	if err := diagnoseDeadBranchPrune(ctx, conn, &report); err != nil {
@@ -467,6 +472,43 @@ func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) 
 	return nil
 }
 
+// diagnoseBlockedCounts computes two read-only metrics over blocked_conflict rows
+// on the active daemon anchor (branch_ref, branch_generation):
+//
+//   - AutoResolvableBlockedCount: rows that pass the same eligibility predicate
+//     the daemon self-heal uses, via scanAutoResolvableBlockedRows.
+//   - BarrierWithSuccessorsCount: blocked_conflict rows that still have pending
+//     rows at a higher seq, via countBarrierBlockedWithSuccessors.
+//
+// When the daemon anchor is unset (fresh or detached repo) both counts are zero.
+func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
+	branchRef := report.Anchor.DaemonBranchRef
+	generation := report.Anchor.DaemonBranchGeneration
+	if branchRef == "" {
+		return nil
+	}
+
+	// BarrierWithSuccessorsCount is a pure SQL count — no git needed.
+	n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
+	}
+	report.BarrierWithSuccessorsCount = n
+
+	// AutoResolvableBlockedCount requires a live HEAD to probe blobs.
+	head, err := git.RevParse(ctx, repoDir, "HEAD")
+	if err != nil {
+		// No HEAD (empty repo) — auto-resolvable stays zero; not an error.
+		return nil
+	}
+	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repoDir, head, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("diagnose: auto-resolvable count: %w", err)
+	}
+	report.AutoResolvableBlockedCount = len(candidates)
+	return nil
+}
+
 func loadLastReplayConflictMeta(ctx context.Context, conn *sql.DB) (replayConflictMeta, error) {
 	var meta replayConflictMeta
 	v, ok, err := metaLookup(ctx, conn, "last_replay_conflict")
@@ -522,9 +564,19 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			"Current git HEAD branch differs from the daemon anchor; switch back to the daemon branch or restart acd on the current branch.")
 	}
-	if len(report.RecentBlocked) > 0 {
+	if report.AutoResolvableBlockedCount > 0 {
 		remediation = append(remediation,
-			"Resolve the listed replay barrier paths in the worktree/index, then run `acd fix --dry-run` to preview safe cleanup before removing terminal rows.")
+			fmt.Sprintf("Daemon will auto-resolve %d blocked row(s) on next tick (HEAD already matches captured after-state).", report.AutoResolvableBlockedCount))
+	}
+	// The two counts measure overlapping sets: a single blocked row can be
+	// both auto-resolvable AND have pending successors. Comparing cardinalities
+	// is unsafe (5 vs 5 could mean fully auto-healable OR fully purge-only).
+	// Emit the fix hint whenever any barrier-with-successors exists, since the
+	// operator's correct next step is still `acd fix --dry-run` even when
+	// every blocked row is auto-resolvable.
+	if report.BarrierWithSuccessorsCount > 0 {
+		remediation = append(remediation,
+			"Run acd fix --dry-run to preview safe actions. For stuck barriers with successors, acd fix --force --dry-run shows purge plan.")
 	}
 	if report.FailedBlockingPending > 0 {
 		remediation = append(remediation,
@@ -532,7 +584,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
-			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume / acd recover to drain replay.")
+			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume or acd fix --dry-run to inspect.")
 	}
 	if report.BackpressurePaused {
 		remediation = append(remediation,

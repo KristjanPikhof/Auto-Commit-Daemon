@@ -41,6 +41,7 @@ Trace decision strings emitted by this path:
 | `already_published_by_external_committer` | Before-state probe would have blocked; HEAD tree already matches — external tool landed the change. |
 | `already_published_no_op_tree` | Op set produces an empty tree diff (no content change); settled at HEAD without a commit. |
 | `already_published_after_cas_exhaustion` | CAS retries exhausted; HEAD already reflects the captured change — treated as a parallel publish. |
+| `handled_external_after_block` | Emitted (event class `replay.self_heal`) when the daemon promotes a `blocked_conflict` row to `published` because an external committer already landed the captured after-state. The row was previously blocked but HEAD now matches the captured intent, so no new commit is needed. |
 
 ---
 
@@ -104,19 +105,23 @@ acd fix --dry-run
 acd fix --yes
 ~~~
 
-Use `recover` or `purge-events` only as advanced fallbacks when `diagnose` or
-`fix --dry-run` points at stale branch anchors, obsolete terminal barriers, or
-failed terminal barriers that are blocking later pending replay:
+If `fix --dry-run` reports barriers with pending successors, add `--force` to
+include the purge in the plan:
 
 ~~~bash
-acd recover --repo . --auto --dry-run
-acd purge-events --repo . --blocked --dry-run
+acd fix --force --dry-run
+acd fix --force --yes
+~~~
+
+After applying, nudge the daemon if you are inside a harness shell:
+
+~~~bash
 acd wake --session-id "$ACD_SESSION_ID"
 ~~~
 
-`wake` requires a non-empty session id. Use it from harness shells that set
-`ACD_SESSION_ID`; otherwise wait for the next daemon tick after applying a safe
-plan.
+`wake` requires a non-empty session id. Without one, wait for the next daemon tick.
+
+`acd recover` and `acd purge-events` are deprecated; use `acd fix` instead.
 
 ---
 

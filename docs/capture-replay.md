@@ -398,15 +398,18 @@ acd doctor --bundle     # write a diagnostics zip to ~/Downloads for issue repor
 acd diagnose --repo . --json
 acd fix --dry-run
 acd fix --yes
-acd recover --repo . --auto --dry-run
-acd purge-events --repo . --blocked --pending --dry-run
+acd fix --force --dry-run
+acd fix --force --yes
 acd pause --repo . --reason "manual reset" --yes
 acd resume --repo . --yes
 ~~~
 
-Review dry-run output before applying fix, recovery, or purge plans with
-`--yes`. Prefer `acd fix --dry-run` for common stuck states; use `recover` and
-`purge-events` as advanced tools when focused diagnostics point there.
+`acd fix` is the single recovery entrypoint. Review the dry-run plan before
+applying with `--yes`; `--force` opts into purging blocked barriers that still
+have pending successors (use only when the captured changes already exist in
+HEAD via an external committer). The legacy `acd recover` and
+`acd purge-events` commands remain as hidden, deprecated aliases that forward
+into `acd fix` for one release.
 
 ACD keys lifecycle state by the canonical Git worktree root. `acd start` from
 `repo/sub/dir` registers `repo`, not the subdirectory, and later `acd status` or
@@ -727,15 +730,16 @@ version lives in [user-workflows.md](user-workflows.md).
    ~~~bash
    acd doctor
    acd fix --dry-run
-   acd recover --repo . --auto --dry-run
+   acd fix --yes
    ~~~
 
    A legacy stale-index shape looks like `D  path` plus `?? path` even though
    `HEAD:path` and the worktree file match. Current daemon startup and
-   `acd recover --auto --yes` repair only ACD-owned published paths proved from
-   `capture_events`/`capture_ops`, current `HEAD` ancestry, and matching
-   worktree content. Ambiguous same-path staged work is skipped; use normal git
-   inspection to decide whether it is user intent.
+   `acd fix --yes` (via the retarget_stale_anchor action) repair only
+   ACD-owned published paths proved from `capture_events`/`capture_ops`,
+   current `HEAD` ancestry, and matching worktree content. Ambiguous same-path
+   staged work is skipped; use normal git inspection to decide whether it is
+   user intent.
 
 5. **Resolve blocked conflicts.**
 
@@ -752,15 +756,16 @@ version lives in [user-workflows.md](user-workflows.md).
    ~~~bash
    acd diagnose --repo .
    acd fix --dry-run
-   acd recover --repo . --auto --dry-run
-   acd purge-events --repo . --blocked --pending --dry-run
+   acd fix --force --dry-run
    ~~~
 
-   If the dry-run plan is correct, rerun the chosen command with `--yes`.
-   `fix` handles common safe cleanup, including externally handled decisions and
-   obsolete barriers. `recover` retargets stale generation rows after branch
-   surgery. `purge-events` deletes terminal barriers and, when selected,
-   obsolete pending rows behind them.
+   If the dry-run plan is correct, rerun with `--yes`. `acd fix` covers safe
+   cleanup (resolve_already_landed_barrier promotes blocked rows whose
+   captured after-state already exists at HEAD; retarget_stale_anchor handles
+   branch surgery; delete_obsolete_barrier removes barriers without pending
+   successors; mark_external_published settles externally-handled rows).
+   `acd fix --force --yes` adds purge_barrier_with_successors for terminal
+   barriers that still block later pending rows.
 
    After clearing the blockers, trigger a replay:
    `acd wake --session-id "$ACD_SESSION_ID"`.
@@ -934,6 +939,7 @@ classes:
 | `capture.event` | Each op persisted to `capture_events` (decision `appended`) or dropped at queue cap (decision `dropped`) | `op`, `path`, `old_path`, `fidelity` | `seq` (appended) or `pending_depth`, `cap` (dropped) |
 | `capture.pause` | Capture pass skipped because replay is paused | — | `source`, `reason`, `set_at`, `expires_at`, `remaining_seconds` |
 | `replay.commit` | Capture event published as a git commit, or idempotent-publish at HEAD | `operation`, `path` | `commit`, `parent` |
+| `replay.self_heal` | Blocked row promoted to `published` because HEAD already reflects the captured after-state (daemon-side `probeBlockedSelfHeal`) | `operation`, `path` | `commit`, `head`, `source_head`, `branch_ref`, `generation` |
 | `replay.conflict` | Event becomes `blocked_conflict` (before-state mismatch, CAS failure, or generation mismatch) | `operation`, `path` | `expected_sha`, `actual_sha`, `ref` |
 | `replay.failed` | Event becomes `failed` (bad op data, ancestry error, write-tree failure) | `operation`, `path` | — |
 | `replay.update_ref` | Each `git update-ref` attempt during commit publish (per-retry) | — | `attempt`, `max_attempts`, `retry`, `ref`, `commit`, `expected_sha`, `actual_sha` |

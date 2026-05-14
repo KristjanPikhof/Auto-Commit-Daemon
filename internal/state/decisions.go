@@ -8,18 +8,26 @@ import (
 )
 
 const (
-	DecisionKindCaptured           = "captured"
-	DecisionKindCommitted          = "committed"
-	DecisionKindSkipped            = "skipped"
-	DecisionKindProtected          = "protected"
-	DecisionKindHandledExternal    = "handled_external"
-	DecisionKindSupersededExternal = "superseded_external"
-	DecisionKindBlocked            = "blocked"
-	DecisionKindPaused             = "paused"
-	DecisionKindResumed            = "resumed"
-	DecisionKindIntentDeferred     = "intent_deferred"
-	DecisionKindIntentForced       = "intent_forced"
-	DecisionKindIntentPlannerError = "intent_planner_error"
+	DecisionKindCaptured        = "captured"
+	DecisionKindCommitted       = "committed"
+	DecisionKindSkipped         = "skipped"
+	DecisionKindProtected       = "protected"
+	DecisionKindHandledExternal = "handled_external"
+	// DecisionKindHandledExternalAfterBlock signals that a previously
+	// blocked_conflict row was self-healed by the replay-time settle probe:
+	// an external committer had already landed the captured change at HEAD,
+	// so the daemon promotes the row to published without minting a commit.
+	// Distinct from DecisionKindHandledExternal so operators can spot rows
+	// that cleared a barrier (vs idempotent settles taken while still
+	// pending). See internal/daemon/replay.go probeBlockedSelfHeal.
+	DecisionKindHandledExternalAfterBlock = "handled_external_after_block"
+	DecisionKindSupersededExternal        = "superseded_external"
+	DecisionKindBlocked                   = "blocked"
+	DecisionKindPaused                    = "paused"
+	DecisionKindResumed                   = "resumed"
+	DecisionKindIntentDeferred            = "intent_deferred"
+	DecisionKindIntentForced              = "intent_forced"
+	DecisionKindIntentPlannerError        = "intent_planner_error"
 )
 
 const (

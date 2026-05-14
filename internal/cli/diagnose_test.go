@@ -844,6 +844,153 @@ func TestDiagnose_RenderHumanOmitsDeadBranchPruneWhenZero(t *testing.T) {
 	}
 }
 
+// TestDiagnose_AutoResolvableBlocked seeds a blocked_conflict row whose
+// after_oid already matches the HEAD blob (modify op, before_state_mismatch
+// class). Expects auto_resolvable_blocked_count == 1 and the "Daemon will
+// auto-resolve" remediation hint.
+func TestDiagnose_AutoResolvableBlocked(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	// Create a real commit so HEAD resolves and has a blob we can reference.
+	headSHA := seedDiagnoseCommit(t, repo)
+
+	// Get the blob OID of the committed file from HEAD.
+	blobOID, err := git.RevParse(ctx, repo, "HEAD:seed.txt")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD:seed.txt: %v", err)
+	}
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running", BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+
+	// Append a blocked_conflict event with modify op + after_oid = blob at HEAD.
+	// base_head = headSHA so ancestry check passes (headSHA == HEAD => ancestor trivially).
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: headSHA, Operation: "modify", Path: "seed.txt",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, []state.CaptureOp{{
+		Op: "modify", Path: "seed.txt", Fidelity: "exact",
+		AfterOID: sql.NullString{String: blobOID, Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	// Mark blocked with a before_state_mismatch-class error.
+	if err := state.MarkEventBlocked(ctx, d, seq,
+		"before-state mismatch: expected abc actual def", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: headSHA, Valid: true},
+	); err != nil {
+		t.Fatalf("mark blocked: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.AutoResolvableBlockedCount != 1 {
+		t.Fatalf("AutoResolvableBlockedCount=%d, want 1", rep.AutoResolvableBlockedCount)
+	}
+	var sawHint bool
+	for _, r := range rep.Remediation {
+		if strings.Contains(r, "Daemon will auto-resolve 1 blocked row") {
+			sawHint = true
+			break
+		}
+	}
+	if !sawHint {
+		t.Fatalf("remediation lacks auto-resolve hint: %v", rep.Remediation)
+	}
+}
+
+// TestDiagnose_BarrierWithSuccessorsNoMatch seeds a blocked_conflict row with
+// a pending successor but where HEAD does NOT match the after_oid. Expects
+// barrier_with_successors_count > 0 and the acd fix --force --dry-run hint.
+func TestDiagnose_BarrierWithSuccessorsNoMatch(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: 7, Mode: "running", BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save daemon_state: %v", err)
+	}
+
+	// Blocked row with a non-matching after_oid (no real commit, HEAD is empty).
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "barrier.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, []state.CaptureOp{{
+		Op: "modify", Path: "barrier.go", Fidelity: "exact",
+		AfterOID: sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("append blocked event: %v", err)
+	}
+	if err := state.MarkEventBlocked(ctx, d, seq,
+		"before-state mismatch: missing-in-index", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("mark blocked: %v", err)
+	}
+
+	// Pending successor at a higher seq in the same (branch_ref, generation).
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "successor.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, []state.CaptureOp{{Op: "modify", Path: "successor.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append successor event: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.BarrierWithSuccessorsCount == 0 {
+		t.Fatalf("BarrierWithSuccessorsCount=0, want > 0")
+	}
+	// AutoResolvableBlockedCount must be 0 (HEAD is empty, after_oid won't match).
+	// So the condition BarrierWithSuccessorsCount > AutoResolvableBlockedCount fires.
+	var sawHint bool
+	for _, r := range rep.Remediation {
+		if strings.Contains(r, "acd fix --force --dry-run") {
+			sawHint = true
+			break
+		}
+	}
+	if !sawHint {
+		t.Fatalf("remediation lacks force dry-run hint: %v", rep.Remediation)
+	}
+}
+
 // TestDiagnose_DeadBranchPrune_MalformedJSON asserts that a corrupt
 // last_refs blob does NOT panic or abort diagnose: ts/count still parse,
 // refs becomes nil, and the report is otherwise well-formed.

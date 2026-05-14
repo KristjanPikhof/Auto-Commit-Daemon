@@ -4,13 +4,47 @@
 
 ### Added
 
-- Codex install detection now recognizes repo-local `.codex/hooks.json` and
-  `.codex/config.toml` files from the current Git worktree root, alongside the
-  user-level `~/.codex/hooks.json` and legacy TOML locations. `acd setup` and
-  `acd doctor` pick up project-local Codex installs without requiring a
-  user-level config. The user-scoped `~/.codex/hooks.json` remains the
-  canonical `ConfigPath`; `MatchedPath` reports the repo-local path when only
-  the project file carries the marker.
+- Self-heal for blocked replay barriers. The daemon's replay pass now probes
+  `blocked_conflict` rows before draining pending captures and promotes any
+  row whose captured after-state already matches HEAD. No new commit is
+  minted; the trace record carries event class `replay.self_heal` and the
+  decision ledger records `handled_external_after_block`. Rows that fail the
+  predicate stay blocked for operator inspection. The probe narrows to
+  `modify`/`mode` ops plus renames with a captured before-OID; create and
+  delete ops stay blocked at first cut. Triggered by a real incident where
+  one stuck `blocked_conflict` hid 94 pending captures whose captured changes
+  already existed at HEAD.
+
+- `acd fix` is now the single recovery entrypoint. The planner covers
+  `resolve_already_landed_barrier`, `retarget_stale_anchor`,
+  `delete_obsolete_barrier`, `mark_external_published`,
+  `clear_expired_manual_pause`, and `clear_drained_backpressure` under
+  `--yes`. Add `--force` to opt into `purge_barrier_with_successors` for
+  blocked barriers that still hold pending rows behind them; combine with
+  `--yes` to apply. `--force` without `--yes` stays dry-run. `state.db` is
+  backed up before any mutation, and every action refuses while a live
+  daemon owns the database.
+
+- `acd diagnose --json` reports `auto_resolvable_blocked_count` and
+  `barrier_with_successors_count`. The human output points operators at
+  `acd fix --dry-run` or `acd fix --force --dry-run` based on which case
+  applies.
+
+- Codex install detection recognizes repo-local `.codex/hooks.json` and
+  `.codex/config.toml` from the current Git worktree root, alongside the
+  user-level `~/.codex/hooks.json` and legacy TOML locations. `acd setup`
+  and `acd doctor` pick up project-local Codex installs without a
+  user-level config. The user-scoped `~/.codex/hooks.json` stays the
+  canonical `ConfigPath`; `MatchedPath` reports the repo-local path when
+  only the project file carries the marker.
+
+### Deprecated
+
+- `acd recover` and `acd purge-events` are deprecated and hidden from help.
+  Both print a one-line deprecation warning to stderr and keep working for
+  one release so existing scripts do not break. Switch to `acd fix` (and
+  `acd fix --force` for purge). The commands will be removed in a future
+  release.
 
 ## v2026-05-13
 

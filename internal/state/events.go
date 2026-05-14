@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -478,6 +479,146 @@ ON CONFLICT(id) DO UPDATE SET
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("state: commit block tx: %w", err)
+	}
+	return nil
+}
+
+// BlockedEventsForGeneration returns capture_events rows in
+// EventStateBlockedConflict for (branch_ref, branch_generation), ordered by
+// seq ascending. This is the input for the replay self-heal pass — the
+// daemon enumerates blocked rows on the active generation and probes each
+// against HEAD to see whether an external committer already landed the
+// captured change.
+//
+// Empty branchRef is rejected to avoid a bag-of-blocked sweep across stale
+// generations; callers must pass a live anchor. limit <= 0 means "no limit".
+func BlockedEventsForGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64, limit int) ([]CaptureEvent, error) {
+	if branchRef == "" {
+		return nil, fmt.Errorf("state: BlockedEventsForGeneration: empty branch_ref")
+	}
+	q := `
+SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
+       fidelity, captured_ts, published_ts, state, commit_oid, error, message
+FROM capture_events
+WHERE state = ? AND branch_ref = ? AND branch_generation = ?
+ORDER BY seq ASC`
+	args := []any{EventStateBlockedConflict, branchRef, branchGeneration}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := d.readSQL().QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("state: query blocked events: %w", err)
+	}
+	defer rows.Close()
+	var out []CaptureEvent
+	for rows.Next() {
+		var ev CaptureEvent
+		if err := rows.Scan(&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead,
+			&ev.Operation, &ev.Path, &ev.OldPath, &ev.Fidelity,
+			&ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID, &ev.Error, &ev.Message); err != nil {
+			return nil, fmt.Errorf("state: scan blocked event: %w", err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iter blocked events: %w", err)
+	}
+	return out, nil
+}
+
+// ErrBlockedRowNotEligible is returned by TransitionBlockedToPublished when
+// the target capture_events row is no longer in EventStateBlockedConflict. It
+// distinguishes a benign race (a concurrent recovery action or replay pass
+// already moved the row) from a real persistence failure so the caller can
+// skip self-heal of this row and continue with the next candidate.
+var ErrBlockedRowNotEligible = errors.New("state: row not in blocked_conflict state")
+
+// TransitionBlockedToPublished settles a previously-blocked capture_events row
+// as published in a single transaction. It is the persistence half of the
+// daemon's self-heal probe: when alreadyPublishedAtHEAD confirms an external
+// committer already landed the captured change, this helper records the
+// promotion atomically (capture_events + publish_state singleton) so a
+// status reader never sees a half-update.
+//
+// The row's current state MUST be EventStateBlockedConflict — that guard is
+// race-safe (the UPDATE includes the state predicate so a concurrent
+// transition into 'failed' or back into 'pending' cannot be silently
+// overwritten). If the predicate fails the helper returns
+// ErrBlockedRowNotEligible and writes nothing.
+//
+// publish_state is upserted in 'published' status carrying commitOID,
+// branchRef, branchGeneration, sourceHead, error=NULL, event_seq=seq. This
+// mirrors the shape settlePublishedEvent uses for the normal path so
+// downstream readers do not need a separate code path for self-healed rows.
+func TransitionBlockedToPublished(ctx context.Context, d *DB, seq int64, commitOID string, publishedTS float64, branchRef string, branchGeneration int64, sourceHead string) error {
+	if d == nil {
+		return fmt.Errorf("state: TransitionBlockedToPublished: nil db")
+	}
+	if seq <= 0 {
+		return fmt.Errorf("state: TransitionBlockedToPublished: invalid seq %d", seq)
+	}
+	if commitOID == "" {
+		return fmt.Errorf("state: TransitionBlockedToPublished: empty commit oid")
+	}
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: begin transition tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const updEvent = `
+UPDATE capture_events SET
+    state        = ?,
+    commit_oid   = ?,
+    error        = NULL,
+    published_ts = ?
+WHERE seq = ? AND state = ?`
+	res, err := tx.ExecContext(ctx, updEvent,
+		EventStatePublished,
+		sql.NullString{String: commitOID, Valid: true},
+		publishedTS, seq, EventStateBlockedConflict,
+	)
+	if err != nil {
+		return fmt.Errorf("state: transition blocked->published seq=%d: %w", seq, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("state: transition blocked->published rows seq=%d: %w", seq, err)
+	}
+	if n == 0 {
+		return ErrBlockedRowNotEligible
+	}
+
+	const upsertPub = `
+INSERT INTO publish_state(
+    id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid,
+    status, error, updated_ts
+) VALUES (1, ?, ?, ?, ?, ?, ?, NULL, ?)
+ON CONFLICT(id) DO UPDATE SET
+    event_seq         = excluded.event_seq,
+    branch_ref        = excluded.branch_ref,
+    branch_generation = excluded.branch_generation,
+    source_head       = excluded.source_head,
+    target_commit_oid = excluded.target_commit_oid,
+    status            = excluded.status,
+    error             = excluded.error,
+    updated_ts        = excluded.updated_ts`
+	if _, err := tx.ExecContext(ctx, upsertPub,
+		sql.NullInt64{Int64: seq, Valid: true},
+		sql.NullString{String: branchRef, Valid: branchRef != ""},
+		sql.NullInt64{Int64: branchGeneration, Valid: true},
+		sql.NullString{String: sourceHead, Valid: sourceHead != ""},
+		sql.NullString{String: commitOID, Valid: true},
+		"published",
+		publishedTS); err != nil {
+		return fmt.Errorf("state: upsert published publish_state seq=%d: %w", seq, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: commit transition tx seq=%d: %w", seq, err)
 	}
 	return nil
 }

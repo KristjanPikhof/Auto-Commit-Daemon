@@ -46,17 +46,17 @@ type recoverPlan struct {
 
 func newRecoverCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "recover",
-		Short: "Retarget stale replay state after an anchored-branch incident",
-		Long: `Plan or apply recovery for stale replay state in one repo.
+		Use:    "recover",
+		Short:  "[DEPRECATED] Retarget stale replay state (use `acd fix [--clear-pause]`)",
+		Hidden: true,
+		Long: `DEPRECATED: ` + "`acd recover`" + ` is now a thin alias for ` + "`acd fix`" + `.
 
-The default repo is the current working directory. Start with --auto --dry-run to inspect the plan; applying recovery requires --yes and refuses to run while the daemon PID is alive. Recovery backs up state.db, retargets pending/blocked rows to the current attached branch/generation, clears replay pause metadata, and can remove a manual pause marker with --clear-pause.
-
-Use acd diagnose first when you are not sure recovery is the right action.`,
-		Example: `  acd recover --auto --dry-run
-  acd recover --auto --dry-run --json
-  acd recover --auto --yes
-  acd recover --repo /path/to/repo --auto --yes --clear-pause`,
+` + "`acd fix`" + ` is the single recovery entrypoint; it plans
+retarget_stale_anchor automatically and applies it with --yes.
+Use ` + "`acd fix --clear-pause`" + ` to also remove a manual pause marker.`,
+		Example: `  acd fix --dry-run
+  acd fix --yes
+  acd fix --yes --clear-pause`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			auto, _ := cmd.Flags().GetBool("auto")
@@ -64,13 +64,14 @@ Use acd diagnose first when you are not sure recovery is the right action.`,
 			yes, _ := cmd.Flags().GetBool("yes")
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			clearPause, _ := cmd.Flags().GetBool("clear-pause")
+			fmt.Fprintln(cmd.ErrOrStderr(), "acd recover is deprecated; use acd fix [--clear-pause]. See acd fix --help.")
 			return runRecover(cmd.Context(), cmd.OutOrStdout(), repo, auto, dryRun, yes, jsonOut, clearPause)
 		},
 	}
-	cmd.Flags().Bool("auto", false, "Plan recovery automatically from current HEAD")
-	cmd.Flags().Bool("dry-run", false, "Show planned recovery without mutating state")
-	cmd.Flags().Bool("yes", false, "Apply recovery without an interactive prompt")
-	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker; without this flag, an existing marker is preserved")
+	cmd.Flags().Bool("auto", false, "(deprecated) Plan recovery automatically from current HEAD")
+	cmd.Flags().Bool("dry-run", false, "(deprecated) Show planned recovery without mutating state")
+	cmd.Flags().Bool("yes", false, "(deprecated) Apply recovery without an interactive prompt")
+	cmd.Flags().Bool("clear-pause", false, "(deprecated) Also remove the manual pause marker")
 	return cmd
 }
 

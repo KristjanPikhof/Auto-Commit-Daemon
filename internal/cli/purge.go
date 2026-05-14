@@ -53,18 +53,18 @@ type purgePlan struct {
 
 func newPurgeEventsCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "purge-events",
-		Short: "Delete non-published capture_events rows (e.g. clear blocked + pending barrier)",
-		Long: `Delete capture_events rows in the selected states.
+		Use:    "purge-events",
+		Short:  "[DEPRECATED] Delete non-published capture_events rows (use `acd fix --force --yes`)",
+		Hidden: true,
+		Long: `DEPRECATED: ` + "`acd purge-events`" + ` is now a thin alias for
+` + "`acd fix --force`" + `.
 
-Use this when a parallel committer (e.g. the atomic-commit hook plugin)
-has already landed the work acd captured, leaving rows stuck in
-'blocked_conflict' (forming a seq barrier) and a tail of 'pending' rows
-that can never replay.
+The recommended flow is:
+  acd fix --force --dry-run   # preview purge_barrier_with_successors
+  acd fix --force --yes       # apply
 
-` + "`acd recover`" + ` retargets stale rows onto the current HEAD;
-` + "`acd purge-events`" + ` deletes them outright. Pick the right tool
-for the situation.`,
+Selecting only --pending or --failed is preserved here for one release
+so existing scripts keep working.`,
 		RunE: func(c *cobra.Command, args []string) error {
 			repo, _ := c.Flags().GetString("repo")
 			blocked, _ := c.Flags().GetBool("blocked")
@@ -74,16 +74,17 @@ for the situation.`,
 			yes, _ := c.Flags().GetBool("yes")
 			dryRun, _ := c.Flags().GetBool("dry-run")
 			jsonOut, _ := c.Flags().GetBool("json")
+			fmt.Fprintln(c.ErrOrStderr(), "acd purge-events is deprecated; use acd fix --force [--yes]. See acd fix --help.")
 			return runPurgeEvents(c.Context(), c.OutOrStdout(),
 				repo, blocked, pending, failed, all, yes, dryRun, jsonOut)
 		},
 	}
-	cmd.Flags().Bool("blocked", false, "Include rows in state=blocked_conflict")
-	cmd.Flags().Bool("pending", false, "Include rows in state=pending")
-	cmd.Flags().Bool("failed", false, "Include rows in state=failed")
-	cmd.Flags().Bool("all", false, "Shortcut for --blocked --pending --failed")
-	cmd.Flags().Bool("yes", false, "Apply the deletion (without this, only --dry-run is allowed)")
-	cmd.Flags().Bool("dry-run", false, "Show what would be deleted without mutating state.db")
+	cmd.Flags().Bool("blocked", false, "(deprecated) Include rows in state=blocked_conflict")
+	cmd.Flags().Bool("pending", false, "(deprecated) Include rows in state=pending")
+	cmd.Flags().Bool("failed", false, "(deprecated) Include rows in state=failed")
+	cmd.Flags().Bool("all", false, "(deprecated) Shortcut for --blocked --pending --failed")
+	cmd.Flags().Bool("yes", false, "(deprecated) Apply the deletion")
+	cmd.Flags().Bool("dry-run", false, "(deprecated) Show what would be deleted")
 	return cmd
 }
 

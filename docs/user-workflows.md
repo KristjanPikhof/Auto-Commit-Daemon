@@ -91,6 +91,7 @@ Expected decisions:
 | Decision | Meaning |
 |---|---|
 | `handled_external` | The current `HEAD` already contains the captured after-state, so ACD marked the event published against that commit. |
+| `handled_external_after_block` | A previously `blocked_conflict` row was self-healed: the daemon detected that an external committer landed the captured after-state and promoted the row to `published` without a new commit. |
 | `superseded_external` | External history made the queued event obsolete, usually because `HEAD` now matches the captured before-state or otherwise proves replay would be redundant. |
 
 No action is needed when `acd explain` says the external commit already
@@ -103,7 +104,8 @@ acd fix --yes
 
 `fix --yes` refuses unsafe mutations and backs up `state.db` first. Stop the
 daemon before applying a plan if the command tells you a live daemon owns the
-state database.
+state database. If the plan reports barriers with pending successors, add
+`--force` to include the purge.
 
 ## Intent grouping deferred or forced a change
 
@@ -241,8 +243,8 @@ Apply only after reading the plan:
 acd fix --yes
 ~~~
 
-Use `recover` or `purge-events` only as advanced recovery tools when `diagnose`
-or `fix` points you there.
+If `fix --dry-run` reports barriers with pending successors, rerun with
+`--force` to include the purge in the plan before applying.
 
 ## Branch reset, rebase, or other branch surgery
 
@@ -275,10 +277,9 @@ acd fix --dry-run
 ~~~
 
 `diagnose` focuses on replay blockers and branch anchors. `fix` plans safe
-state cleanup. Use `acd recover --repo . --auto --dry-run` only when diagnose
-specifically reports stale replay state that should be retargeted. Recovery
-preserves a manual pause marker unless you apply it with `--clear-pause`; use
-`acd resume --yes` when the marker itself is the only problem.
+state cleanup. After reading `fix --dry-run`, apply with `acd fix --yes`. `fix` preserves a
+manual pause marker unless you add `--clear-pause`; use `acd resume --yes`
+when the marker itself is the only problem.
 
 When a feature branch has been merged and deleted, ACD cleans up stale
 `pending`, `blocked_conflict`, and `failed` rows for that dead branch ref during
@@ -399,6 +400,7 @@ artifact for issue reports.
 | `skipped` | ACD intentionally left a path uncommitted, usually due to ignore or policy. |
 | `protected` | ACD protected a sensitive or generated path and did not synthesize a delete. |
 | `handled_external` | Another commit already contains the captured after-state. |
+| `handled_external_after_block` | A `blocked_conflict` row was self-healed: an external committer landed the captured after-state, so the daemon promoted the row to `published` without a new commit. |
 | `superseded_external` | External history made the queued work obsolete. |
 | `blocked` | Replay stopped because applying the event was not provably safe. |
 | `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
