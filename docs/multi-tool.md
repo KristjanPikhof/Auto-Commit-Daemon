@@ -41,6 +41,7 @@ Trace decision strings emitted by this path:
 | `already_published_by_external_committer` | Before-state probe would have blocked; HEAD tree already matches — external tool landed the change. |
 | `already_published_no_op_tree` | Op set produces an empty tree diff (no content change); settled at HEAD without a commit. |
 | `already_published_after_cas_exhaustion` | CAS retries exhausted; HEAD already reflects the captured change — treated as a parallel publish. |
+| `handled_external_after_block` | Emitted (event class `replay.self_heal`) when the daemon promotes a `blocked_conflict` row to `published` because an external committer already landed the captured after-state. The row was previously blocked but HEAD now matches the captured intent, so no new commit is needed. |
 
 ---
 
