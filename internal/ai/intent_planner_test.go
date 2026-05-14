@@ -386,6 +386,36 @@ func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
 	}
 }
 
+func TestNormalizeIntentPlanDeferredReasonsEmptyPlanEarlyReturn(t *testing.T) {
+	plan := IntentPlan{DeferredSeqs: []int64{12}}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if dropped != nil {
+		t.Fatalf("dropped=%v want nil", dropped)
+	}
+	if cleaned.DeferredReasons != nil {
+		t.Fatalf("cleaned reasons=%+v want nil", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsPreservesInputOrder(t *testing.T) {
+	plan := IntentPlan{
+		DeferredSeqs: []int64{12, 13},
+		DeferredReasons: []DeferredReason{
+			{Seq: 12, Reason: "valid"},
+			{Seq: 99, Reason: "drop first"},
+			{Seq: 13, Reason: "valid"},
+			{Seq: 11, Reason: "drop second"},
+		},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 2 || dropped[0] != 99 || dropped[1] != 11 {
+		t.Fatalf("dropped=%v want [99 11]", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 2 || cleaned.DeferredReasons[0].Seq != 12 || cleaned.DeferredReasons[1].Seq != 13 {
+		t.Fatalf("cleaned=%+v", cleaned.DeferredReasons)
+	}
+}
+
 func TestValidateIntentPlanReturnsTypedErrorForDeferredReasonNotDeferred(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan := IntentPlan{
