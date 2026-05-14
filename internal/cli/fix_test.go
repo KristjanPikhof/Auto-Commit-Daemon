@@ -88,7 +88,7 @@ func TestFix_DryRunToleratesPreV5DB(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, true, false, true); err != nil {
+	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
 		t.Fatalf("runFix dry-run should tolerate missing decision_records: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
