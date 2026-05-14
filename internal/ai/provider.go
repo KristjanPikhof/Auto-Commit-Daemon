@@ -167,6 +167,7 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 			return IntentPlan{}, err
 		}
 		plan = NormalizeIntentPlanReasons(plan)
+		plan, _ = NormalizeIntentPlanDeferredReasons(plan)
 		if err := ValidateIntentPlan(req, plan); err != nil {
 			return IntentPlan{}, err
 		}
