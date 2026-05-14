@@ -116,7 +116,7 @@ func TestDetectInstalled_CodexRepoLocalHooksJSONMarker(t *testing.T) {
 	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
-	t.Chdir(subdir)
+	chdirForDetectTest(t, subdir)
 
 	got := DetectInstalled()
 	if len(got) != 1 || got[0].Name() != "codex" {
@@ -146,7 +146,7 @@ func TestDetectInstalled_CodexRepoLocalConfigTOMLMarker(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
 		t.Fatalf("write config.toml: %v", err)
 	}
-	t.Chdir(repo)
+	chdirForDetectTest(t, repo)
 
 	got := DetectInstalled()
 	if len(got) != 1 || got[0].Name() != "codex" {
@@ -170,7 +170,7 @@ func TestDetectInstalled_CodexRepoLocalIgnoredOutsideGitRoot(t *testing.T) {
 	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
-	t.Chdir(dir)
+	chdirForDetectTest(t, dir)
 
 	if got := DetectInstalled(); len(got) != 0 {
 		t.Fatalf("DetectInstalled=%#v, want none outside a git root", got)
@@ -287,6 +287,18 @@ func TestDetectInstalled_OpenCodeIgnoresBareYAMLMarker(t *testing.T) {
 	if got := DetectInstalled(); len(got) != 0 {
 		t.Fatalf("DetectInstalled=%#v, want none (bare YAML acd-managed line must not match)", got)
 	}
+}
+
+func chdirForDetectTest(t *testing.T, dir string) {
+	t.Helper()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
 }
 
 // TestDetectInstalled_PiIgnoresBareYAMLMarker mirrors the opencode case for
