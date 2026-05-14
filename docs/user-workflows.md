@@ -91,6 +91,7 @@ Expected decisions:
 | Decision | Meaning |
 |---|---|
 | `handled_external` | The current `HEAD` already contains the captured after-state, so ACD marked the event published against that commit. |
+| `handled_external_after_block` | A previously `blocked_conflict` row was self-healed: the daemon detected that an external committer landed the captured after-state and promoted the row to `published` without a new commit. |
 | `superseded_external` | External history made the queued event obsolete, usually because `HEAD` now matches the captured before-state or otherwise proves replay would be redundant. |
 
 No action is needed when `acd explain` says the external commit already
@@ -103,7 +104,8 @@ acd fix --yes
 
 `fix --yes` refuses unsafe mutations and backs up `state.db` first. Stop the
 daemon before applying a plan if the command tells you a live daemon owns the
-state database.
+state database. If the plan reports barriers with pending successors, add
+`--force` to include the purge.
 
 ## Intent grouping deferred or forced a change
 
