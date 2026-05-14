@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	DecisionKindCaptured           = "captured"
-	DecisionKindCommitted          = "committed"
-	DecisionKindSkipped            = "skipped"
-	DecisionKindProtected          = "protected"
-	DecisionKindHandledExternal    = "handled_external"
+	DecisionKindCaptured        = "captured"
+	DecisionKindCommitted       = "committed"
+	DecisionKindSkipped         = "skipped"
+	DecisionKindProtected       = "protected"
+	DecisionKindHandledExternal = "handled_external"
 	// DecisionKindHandledExternalAfterBlock signals that a previously
 	// blocked_conflict row was self-healed by the replay-time settle probe:
 	// an external committer had already landed the captured change at HEAD,
@@ -22,12 +22,12 @@ const (
 	// pending). See internal/daemon/replay.go probeBlockedSelfHeal.
 	DecisionKindHandledExternalAfterBlock = "handled_external_after_block"
 	DecisionKindSupersededExternal        = "superseded_external"
-	DecisionKindBlocked            = "blocked"
-	DecisionKindPaused             = "paused"
-	DecisionKindResumed            = "resumed"
-	DecisionKindIntentDeferred     = "intent_deferred"
-	DecisionKindIntentForced       = "intent_forced"
-	DecisionKindIntentPlannerError = "intent_planner_error"
+	DecisionKindBlocked                   = "blocked"
+	DecisionKindPaused                    = "paused"
+	DecisionKindResumed                   = "resumed"
+	DecisionKindIntentDeferred            = "intent_deferred"
+	DecisionKindIntentForced              = "intent_forced"
+	DecisionKindIntentPlannerError        = "intent_planner_error"
 )
 
 const (
