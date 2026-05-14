@@ -313,4 +313,3 @@ func suggestionsMentionForce(suggestions []string) bool {
 	}
 	return false
 }
-
