@@ -4,10 +4,48 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type badDeferredReasonFixture struct {
+	OfferedCaptures []OfferedCapture `json:"offered_captures"`
+	OpenAIResponse  json.RawMessage  `json:"openai_response"`
+}
+
+func loadBadDeferredReasonFixture(t *testing.T) badDeferredReasonFixture {
+	t.Helper()
+	path := filepath.Join("testdata", "intent_planner", "bad_deferred_reason.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fx badDeferredReasonFixture
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if len(fx.OfferedCaptures) == 0 {
+		t.Fatalf("fixture missing offered_captures")
+	}
+	if len(fx.OpenAIResponse) == 0 {
+		t.Fatalf("fixture missing openai_response")
+	}
+	return fx
+}
+
+func badDeferredReasonRequest(t *testing.T, fx badDeferredReasonFixture) IntentPlanRequest {
+	t.Helper()
+	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
+		OfferedCaptures: fx.OfferedCaptures,
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequest: %v", err)
+	}
+	return req
+}
 
 func sampleIntentPlanRequest(t *testing.T) IntentPlanRequest {
 	t.Helper()
