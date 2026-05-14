@@ -314,7 +314,3 @@ func suggestionsMentionForce(suggestions []string) bool {
 	return false
 }
 
-// time imported indirectly via initStateDBSchema/wait helpers; keep the
-// canonical reference so future edits don't need to re-add the import.
-var _ = time.Second
-var _ = filepath.Separator
