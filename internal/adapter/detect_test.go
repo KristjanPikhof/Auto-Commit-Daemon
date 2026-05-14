@@ -97,6 +97,86 @@ func TestDetectInstalled_CodexLegacyTOMLMarker(t *testing.T) {
 	}
 }
 
+func TestDetectInstalled_CodexRepoLocalHooksJSONMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	subdir := filepath.Join(repo, "nested")
+	if err := os.Mkdir(subdir, 0o700); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	hooks := filepath.Join(repo, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	t.Chdir(subdir)
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "codex" {
+		t.Fatalf("DetectInstalled=%#v, want codex only via repo-local hooks.json", got)
+	}
+	if got[0].ConfigPath() == hooks {
+		t.Fatalf("ConfigPath should remain user-scoped canonical path, got repo-local %q", hooks)
+	}
+	matched, ok := got[0].MatchedPath()
+	if !ok || matched != hooks {
+		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, hooks)
+	}
+}
+
+func TestDetectInstalled_CodexRepoLocalConfigTOMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	cfg := filepath.Join(repo, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(cfg, []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	t.Chdir(repo)
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "codex" {
+		t.Fatalf("DetectInstalled=%#v, want codex only via repo-local config.toml", got)
+	}
+	matched, ok := got[0].MatchedPath()
+	if !ok || matched != cfg {
+		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, cfg)
+	}
+}
+
+func TestDetectInstalled_CodexRepoLocalIgnoredOutsideGitRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := t.TempDir()
+	hooks := filepath.Join(dir, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	t.Chdir(dir)
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none outside a git root", got)
+	}
+}
+
 func TestDetectInstalled_CodexHooksJSONIgnoresTOMLMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
