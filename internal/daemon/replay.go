@@ -1216,6 +1216,10 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 	var validationFailure string
 	plan, err := planner.PlanIntent(ctx, req)
 	if err == nil {
+		// Defense in depth: providers normalize before returning, but a
+		// future provider that skips the helper still gets a clean plan
+		// here so the daemon never validates a known-fixable shape.
+		plan, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
 		err = ai.ValidateIntentPlan(req, plan)
 	}
 	if err == nil {
