@@ -951,6 +951,249 @@ WHERE id = 1`, nowSec); err != nil {
 	return nil
 }
 
+// planResolveAlreadyLandedBarrier appends resolve_already_landed_barrier
+// actions for every blocked_conflict row whose self-heal predicate currently
+// holds. Predicate parity with the daemon-side probe is enforced by
+// scanAutoResolvableBlockedRows (internal/cli/recovery_probe.go).
+func planResolveAlreadyLandedBarrier(ctx context.Context, conn *sql.DB, repo, head, branchRef string, generation int64, plan *fixPlan) error {
+	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repo, head, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("acd fix: scan auto-resolvable blocked rows: %w", err)
+	}
+	for _, c := range candidates {
+		afterOID := ""
+		if len(c.Ops) > 0 && c.Ops[0].AfterOID.Valid {
+			afterOID = c.Ops[0].AfterOID.String
+		}
+		blobOID := ""
+		if len(c.Ops) > 0 {
+			if oid, err := git.LsTreeBlobOID(ctx, repo, c.HeadOID, c.Ops[0].Path); err == nil {
+				blobOID = oid
+			}
+		}
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:               fmt.Sprintf("%s:%d", fixActionResolveAlreadyLandedBarrier, c.Seq),
+			Kind:             fixActionResolveAlreadyLandedBarrier,
+			Description:      "promote already-landed blocked barrier to published",
+			Reason:           "captured after-state matches HEAD; external committer landed the change",
+			Seq:              c.Seq,
+			Path:             c.Path,
+			CommitOID:        c.HeadOID,
+			BlobOID:          shortOID(blobOID, 12),
+			CapturedAfterOID: shortOID(afterOID, 12),
+			BranchRef:        c.BranchRef,
+			BranchGeneration: c.Generation,
+			BaseHead:         c.BaseHead,
+		})
+	}
+	return nil
+}
+
+// planRetargetStaleAnchor decides whether a retarget_stale_anchor action is
+// warranted. We mirror acd recover's gating: refuse on detached HEAD (already
+// recorded as plan.Unsafe at the start of buildFixPlan); otherwise plan the
+// retarget if there are pending/blocked rows on a stale (branch_ref,
+// generation) that no longer matches the live anchor, OR replay-pause meta
+// keys remain that the daemon never cleared.
+func planRetargetStaleAnchor(ctx context.Context, conn *sql.DB, repo, head, branchRef string, generation int64, plan *fixPlan) error {
+	if branchRef == "" {
+		return nil
+	}
+	// Two trigger conditions for retarget (either alone is enough):
+	//   1. capture_events rows in (pending, blocked_conflict) reference a
+	//      (branch_ref, branch_generation, base_head) tuple that no longer
+	//      matches the current attached anchor;
+	//   2. daemon_meta still carries stale replay/pause breadcrumbs the
+	//      daemon should have cleared on resume.
+	var staleRows int
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE state IN (?, ?)
+  AND (branch_ref <> ? OR branch_generation <> ? OR base_head <> ?)`,
+		state.EventStatePending, state.EventStateBlockedConflict,
+		branchRef, generation, head).Scan(&staleRows); err != nil {
+		return fmt.Errorf("acd fix: count stale anchor rows: %w", err)
+	}
+	hasStaleMeta := false
+	for _, key := range []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"detached_head_paused",
+		"operation_in_progress",
+		daemon.MetaKeyReplayPausedUntil,
+	} {
+		if _, ok, err := metaLookup(ctx, conn, key); err != nil {
+			return fmt.Errorf("acd fix: read meta %s: %w", key, err)
+		} else if ok {
+			hasStaleMeta = true
+			break
+		}
+	}
+	if staleRows == 0 && !hasStaleMeta {
+		return nil
+	}
+	description := "retarget stale capture/shadow rows to current branch/generation/head and clear stale replay/pause meta"
+	plan.Actions = append(plan.Actions, fixAction{
+		ID:               fixActionRetargetStaleAnchor,
+		Kind:             fixActionRetargetStaleAnchor,
+		Description:      description,
+		Reason:           fmt.Sprintf("stale_rows=%d stale_meta=%v", staleRows, hasStaleMeta),
+		BranchRef:        branchRef,
+		BranchGeneration: generation,
+		BaseHead:         head,
+	})
+	return nil
+}
+
+// planPurgeBarrierWithSuccessors enumerates blocked_conflict rows whose
+// (branch_ref, generation) still has pending successors. Only invoked when
+// --force is set on the planner inputs.
+func planPurgeBarrierWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64, plan *fixPlan) error {
+	rows, err := scanBarrierBlockedRowsWithSuccessors(ctx, conn, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("acd fix: scan barrier-with-successors rows: %w", err)
+	}
+	for _, r := range rows {
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:               fmt.Sprintf("%s:%d", fixActionPurgeBarrierWithSuccessors, r.Seq),
+			Kind:             fixActionPurgeBarrierWithSuccessors,
+			Description:      "purge blocked barrier with pending successors (destructive)",
+			Reason:           "blocked_conflict row still has pending successors on same (branch_ref, generation)",
+			Seq:              r.Seq,
+			Path:             r.Path,
+			BranchRef:        r.BranchRef,
+			BranchGeneration: r.Generation,
+			RequiresForce:    true,
+		})
+	}
+	return nil
+}
+
+// applyRetargetStaleAnchorTx ports the in-tx half of applyRecoverPlan into
+// acd fix. The mutations are deliberately identical so existing recover_test
+// fixtures still describe the contract. Live-index repair and the manual
+// pause marker reconciliation run AFTER tx.Commit in finalizeRetargetPostCommit
+// so slow FS/git ops never hold the SQLite write lock.
+func applyRetargetStaleAnchorTx(ctx context.Context, tx *sql.Tx, plan *fixPlan, nowSec float64) (int64, error) {
+	var rowsChanged int64
+	execTracked := func(q string, args ...any) error {
+		res, err := tx.ExecContext(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		if n, rerr := res.RowsAffected(); rerr == nil {
+			rowsChanged += n
+		}
+		return nil
+	}
+
+	if err := execTracked(`UPDATE capture_events
+SET branch_ref = ?, branch_generation = ?, base_head = ?
+WHERE state IN (?, ?)`,
+		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead,
+		state.EventStatePending, state.EventStateBlockedConflict); err != nil {
+		return 0, fmt.Errorf("acd fix: retarget capture_events: %w", err)
+	}
+	if err := execTracked(`UPDATE capture_events
+SET state = ?, published_ts = NULL, error = NULL
+WHERE state = ?`,
+		state.EventStatePending, state.EventStateBlockedConflict); err != nil {
+		return 0, fmt.Errorf("acd fix: reset blocked events: %w", err)
+	}
+	if err := execTracked(`DELETE FROM shadow_paths
+WHERE rowid NOT IN (
+    SELECT keep_rowid FROM (
+        SELECT MAX(rowid) AS keep_rowid
+        FROM shadow_paths
+        GROUP BY path
+    )
+)`); err != nil {
+		return 0, fmt.Errorf("acd fix: dedupe shadow_paths: %w", err)
+	}
+	if err := execTracked(`UPDATE shadow_paths
+SET branch_ref = ?, branch_generation = ?, base_head = ?`,
+		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead); err != nil {
+		return 0, fmt.Errorf("acd fix: retarget shadow_paths: %w", err)
+	}
+	if err := execTracked(`UPDATE publish_state
+SET branch_ref = ?, branch_generation = ?, source_head = ?, status = 'idle', error = NULL`,
+		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead); err != nil {
+		return 0, fmt.Errorf("acd fix: retarget publish_state: %w", err)
+	}
+	if err := execTracked(`UPDATE daemon_state
+SET branch_ref = ?, branch_generation = ?, mode = 'stopped', note = NULL`,
+		plan.CurrentBranchRef, plan.Generation); err != nil {
+		return 0, fmt.Errorf("acd fix: retarget daemon_state: %w", err)
+	}
+	for _, key := range []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"detached_head_paused",
+		"operation_in_progress",
+		daemon.MetaKeyReplayPausedUntil,
+	} {
+		if err := execTracked(`DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
+			return 0, fmt.Errorf("acd fix: clear %s: %w", key, err)
+		}
+	}
+	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch_token', ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
+		"rev:"+plan.CurrentHead+" "+plan.CurrentBranchRef, nowSec); err != nil {
+		return 0, fmt.Errorf("acd fix: set branch token: %w", err)
+	}
+	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.generation', ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
+		fmt.Sprintf("%d", plan.Generation), nowSec); err != nil {
+		return 0, fmt.Errorf("acd fix: set branch generation: %w", err)
+	}
+	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.head', ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
+		plan.CurrentHead, nowSec); err != nil {
+		return 0, fmt.Errorf("acd fix: set branch head: %w", err)
+	}
+	return rowsChanged, nil
+}
+
+// finalizeRetargetPostCommit runs the live-index repair pass and reconciles
+// the manual pause marker after the retarget tx commits. Failures here are
+// reported but the DB transaction has already landed, so we never re-open it.
+func finalizeRetargetPostCommit(ctx context.Context, db *state.DB, plan *fixPlan) error {
+	repaired, err := daemon.RepairPublishedLiveIndex(ctx, plan.Repo, db, plan.CurrentHead, daemon.DefaultLiveIndexRepairLimit)
+	if err != nil {
+		return fmt.Errorf("acd fix: repair live index: %w", err)
+	}
+	plan.LiveIndexCandidates = repaired.Candidates
+	plan.LiveIndexApplied = repaired.Applied
+	plan.LiveIndexSkipped = len(repaired.Skipped)
+
+	if plan.ManualPausePath == "" {
+		return nil
+	}
+	if _, err := os.Lstat(plan.ManualPausePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("acd fix: stat manual pause marker after commit: %w", err)
+	}
+	if !plan.ClearPause {
+		plan.ManualMarkerPreserved = true
+		return nil
+	}
+	if err := os.Remove(plan.ManualPausePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		plan.ManualMarkerRemoveError = err.Error()
+		return nil
+	}
+	plan.ManualMarkerRemoved = true
+	stampManualPauseResume(ctx, plan.GitDir)
+	return nil
+}
+
 func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 	if jsonOut {
 		enc := json.NewEncoder(out)
