@@ -81,43 +81,59 @@ type fixAction struct {
 func newFixCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fix",
-		Short: "Plan or apply guided safe remediation for a stuck repo",
-		Long: `Plan or apply conservative remediation for common stuck ACD states.
+		Short: "Plan or apply guided remediation for a stuck repo",
+		Long: `Plan or apply guided remediation for common stuck ACD states.
 
-The fix planner is read-only by default with --dry-run. Applying changes
-requires --yes, refuses while a live daemon owns the state DB, backs up
-state.db first, and only mutates rows whose existing state already proves a
-safe outcome.`,
+` + "`acd fix`" + ` is the single recovery entrypoint. Without --yes and
+without --force it prints a dry-run plan only. --yes applies the safe,
+auto-resolvable actions (resolve already-landed barriers, retarget stale
+anchors, clear obsolete barriers, mark externally-published rows, clear
+expired manual pauses, clear drained backpressure). --force opts into the
+destructive purge of blocked barriers that still have pending successors;
+--force without --yes is still dry-run. All actions refuse while a live
+daemon owns the state DB, and state.db is backed up before any mutation.`,
 		Example: `  acd fix --dry-run
-  acd fix --dry-run --json
   acd fix --yes
+  acd fix --force --dry-run
+  acd fix --force --yes
+  acd fix --yes --clear-pause
   acd fix --repo /path/to/repo --yes --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			yes, _ := cmd.Flags().GetBool("yes")
+			force, _ := cmd.Flags().GetBool("force")
+			clearPause, _ := cmd.Flags().GetBool("clear-pause")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runFix(cmd.Context(), cmd.OutOrStdout(), repo, dryRun, yes, jsonOut)
+			return runFix(cmd.Context(), cmd.OutOrStdout(), repo, dryRun, yes, force, clearPause, jsonOut)
 		},
 	}
 	cmd.Flags().Bool("dry-run", false, "Show the guided remediation plan without mutating state")
-	cmd.Flags().Bool("yes", false, "Apply safe remediation actions")
+	cmd.Flags().Bool("yes", false, "Apply safe remediation actions (auto/safe set)")
+	cmd.Flags().Bool("force", false, "Include destructive purge of blocked barriers with pending successors in the plan; combine with --yes to apply")
+	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker when retargeting a stale anchor")
 	return cmd
 }
 
-func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, jsonOut bool) error {
+func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force, clearPause, jsonOut bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if !dryRun && !yes {
-		return fmt.Errorf("acd fix: refusing to mutate state without --yes (use --dry-run first)")
+	// Resolve effective dry-run vs apply mode. The rules per SPEC LOCK:
+	//   neither --yes nor --force: dry-run default (same as --dry-run).
+	//   --yes alone: apply auto/safe actions (no purge).
+	//   --force without --yes: dry-run that INCLUDES purge plan.
+	//   --yes --force: apply auto + purge.
+	// An explicit --dry-run always wins (operator inspection).
+	if !yes {
+		dryRun = true
 	}
 
 	rec, err := recoverRepoRecord(repo)
 	if err != nil {
 		return err
 	}
-	plan, err := buildFixPlan(ctx, rec.Path, rec.StateDB, dryRun)
+	plan, err := buildFixPlan(ctx, rec.Path, rec.StateDB, dryRun, force, clearPause)
 	if err != nil {
 		return err
 	}
