@@ -29,7 +29,7 @@ import (
 //     intent already on disk.
 //  4. Wake the session. probeBlockedSelfHeal must:
 //     * promote the row state blocked_conflict -> published with
-//       commit_oid = HEAD,
+//     commit_oid = HEAD,
 //     * append decision_records kind=handled_external_after_block,
 //     * upsert publish_state singleton status=published,
 //     * NOT mint a new commit (HEAD unchanged after settle).
