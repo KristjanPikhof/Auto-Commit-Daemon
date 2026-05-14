@@ -303,6 +303,36 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	return nil
 }
 
+// NormalizeIntentPlanDeferredReasons drops DeferredReason entries whose Seq
+// is not present in plan.DeferredSeqs. Providers call this before
+// ValidateIntentPlan so a planner that emits a reason for a selected (or
+// unknown) seq does not collapse the entire plan to deterministic fallback.
+// Returns the cleaned plan and the dropped seqs in input order so callers can
+// log a single deterministic warning.
+func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64) {
+	if len(plan.DeferredReasons) == 0 {
+		return plan, nil
+	}
+	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
+	for _, seq := range plan.DeferredSeqs {
+		deferred[seq] = struct{}{}
+	}
+	cleaned := make([]DeferredReason, 0, len(plan.DeferredReasons))
+	var dropped []int64
+	for _, r := range plan.DeferredReasons {
+		if _, ok := deferred[r.Seq]; !ok {
+			dropped = append(dropped, r.Seq)
+			continue
+		}
+		cleaned = append(cleaned, r)
+	}
+	if len(dropped) == 0 {
+		return plan, nil
+	}
+	plan.DeferredReasons = cleaned
+	return plan, dropped
+}
+
 // PlanIntent provides the deterministic fallback planner. It selects exactly
 // one capture and defers every other offered capture with explicit reasons.
 func (p DeterministicProvider) PlanIntent(ctx context.Context, req IntentPlanRequest) (IntentPlan, error) {
