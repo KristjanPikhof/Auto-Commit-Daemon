@@ -568,7 +568,13 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			fmt.Sprintf("Daemon will auto-resolve %d blocked row(s) on next tick (HEAD already matches captured after-state).", report.AutoResolvableBlockedCount))
 	}
-	if report.BarrierWithSuccessorsCount > report.AutoResolvableBlockedCount {
+	// The two counts measure overlapping sets: a single blocked row can be
+	// both auto-resolvable AND have pending successors. Comparing cardinalities
+	// is unsafe (5 vs 5 could mean fully auto-healable OR fully purge-only).
+	// Emit the fix hint whenever any barrier-with-successors exists, since the
+	// operator's correct next step is still `acd fix --dry-run` even when
+	// every blocked row is auto-resolvable.
+	if report.BarrierWithSuccessorsCount > 0 {
 		remediation = append(remediation,
 			"Run acd fix --dry-run to preview safe actions. For stuck barriers with successors, acd fix --force --dry-run shows purge plan.")
 	}
