@@ -411,7 +411,7 @@ type diffSpec struct {
 // stripped and replaced by header lines that reflect the captured path
 // + mode. Anything past the first hunk header (`@@`) is forwarded
 // verbatim so binary-file markers or "No newline" trailers survive.
-func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error) {
+func renderDiff(ctx context.Context, repoRoot string, outerCap int, s diffSpec) (string, error) {
 	if err := ensureEmptyBlob(ctx, repoRoot, s); err != nil {
 		return "", err
 	}
