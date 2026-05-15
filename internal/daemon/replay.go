@@ -1122,14 +1122,20 @@ func buildIntentPlanRequest(
 	forced bool,
 	cfg intentReplayConfig,
 ) ([]intentReplayItem, ai.IntentPlanRequest, error) {
-	items := make([]intentReplayItem, 0, len(events))
-	offered := make([]ai.OfferedCapture, 0, len(events))
+	// Same-path coalesce runs ahead of the planner offer so a burst of
+	// edits to one file folds into one offered entry. Default ON; opt out
+	// via ACD_INTENT_PATH_COALESCE=0|false|no|off (restart to apply).
+	offers, err := coalesceIntentWindow(ctx, db, events, pathCoalesceEnabled(), state.LoadCaptureOps)
+	if err != nil {
+		return nil, ai.IntentPlanRequest{}, err
+	}
+
+	items := make([]intentReplayItem, 0, len(offers))
+	offered := make([]ai.OfferedCapture, 0, len(offers))
 	paths := map[string]struct{}{}
-	for _, ev := range events {
-		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
-		if err != nil {
-			return nil, ai.IntentPlanRequest{}, fmt.Errorf("daemon: load ops seq=%d for intent planning: %w", ev.Seq, err)
-		}
+	for _, offer := range offers {
+		ev := offer.Primary
+		ops := offer.MergedOps
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
 			return nil, ai.IntentPlanRequest{}, err
@@ -1148,7 +1154,20 @@ func buildIntentPlanRequest(
 				diff = rendered
 			}
 		}
-		items = append(items, intentReplayItem{event: ev, ops: ops, deferCount: deferCount})
+		// Attach the coalesce token only for true multi-event runs so
+		// non-coalesced items keep a nil token and existing single-event
+		// code paths read identical to the pre-coalesce world.
+		var token *coalesceToken
+		if len(offer.Token.Covered) > 0 {
+			tok := offer.Token
+			token = &tok
+		}
+		items = append(items, intentReplayItem{
+			event:      ev,
+			ops:        ops,
+			deferCount: deferCount,
+			coalesce:   token,
+		})
 		offered = append(offered, ai.OfferedCapture{
 			Seq:          ev.Seq,
 			Path:         ev.Path,
