@@ -1587,7 +1587,10 @@ const forcedSingletonSubjectBudget = time.Second
 // "use forcedSingletonSubjectBudget".
 var forcedSingletonSubjectBudgetOverride atomic.Int64
 
-func setForcedSingletonSubjectBudgetForTest(t interface{ Helper() }, d time.Duration) {
+func setForcedSingletonSubjectBudgetForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, d time.Duration) {
 	t.Helper()
 	forcedSingletonSubjectBudgetOverride.Store(int64(d))
 	t.Cleanup(func() { forcedSingletonSubjectBudgetOverride.Store(0) })
