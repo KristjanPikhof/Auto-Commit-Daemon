@@ -106,13 +106,23 @@ func IntentPlannerSystemPrompt() string {
 	return intentPlannerSystemPrompt
 }
 
-// BuildIntentPlanUserPrompt serializes req into the planner user message.
+// BuildIntentPlanUserPrompt serializes req into the planner user message. When
+// req.RetryCorrection is non-empty (set by composed.PlanIntent's retry loop on
+// a typed *IntentPlanValidationError), the validator error is quoted verbatim
+// in a follow-up correction block so the planner can fix the prior mistake
+// without losing offered-capture context.
 func BuildIntentPlanUserPrompt(req IntentPlanRequest) (string, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return "", fmt.Errorf("intent planner: marshal request: %w", err)
 	}
-	return "Plan the next commit intent for these offered captures:\n" + string(body), nil
+	out := "Plan the next commit intent for these offered captures:\n" + string(body)
+	if correction := strings.TrimSpace(req.RetryCorrection); correction != "" {
+		out += "\n\nYour previous capture_intent_plan tool call failed validation with this error:\n" +
+			correction +
+			"\n\nReturn a corrected capture_intent_plan tool call that fixes the listed problem. Keep every offered seq accounted for as either selected or deferred, and ensure every deferred_reasons[i].seq appears in deferred_seqs."
+	}
+	return out, nil
 }
 
 // Truncate caps a unified diff to `max` bytes. Mirrors the legacy 4000-char
