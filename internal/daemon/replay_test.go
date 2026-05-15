@@ -4810,11 +4810,11 @@ func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	seedTrackedFileCommit(t, ctx, f, "p.txt", "p0\n")
+	seedTrackedFileCommit(t, ctx, f, "q.txt", "q0\n")
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
-	seedTrackedFileCommit(t, ctx, f, "p.txt", "p0\n")
-	seedTrackedFileCommit(t, ctx, f, "q.txt", "q0\n")
 
 	captureSamePathEdit(t, ctx, f, "p.txt", "p1\n")
 	captureSamePathEdit(t, ctx, f, "q.txt", "q1\n")
