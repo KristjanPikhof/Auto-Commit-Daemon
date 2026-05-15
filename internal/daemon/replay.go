@@ -792,14 +792,16 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 
 	out := intentReplayConfig{
-		enabled:         true,
-		window:          cfg.IntentWindow,
-		minPending:      cfg.IntentMinPending,
-		maxPendingAge:   cfg.IntentMaxPendingAge,
-		recent:          cfg.IntentRecentCommits,
-		deferLimit:      cfg.IntentDeferLimit,
-		includeDiffs:    opts.IntentIncludeDiffs,
-		bypassBatchWait: opts.IntentBypassBatchWait,
+		enabled:              true,
+		window:               cfg.IntentWindow,
+		minPending:           cfg.IntentMinPending,
+		maxPendingAge:        cfg.IntentMaxPendingAge,
+		recent:               cfg.IntentRecentCommits,
+		deferLimit:           cfg.IntentDeferLimit,
+		includeDiffs:         opts.IntentIncludeDiffs,
+		bypassBatchWait:      opts.IntentBypassBatchWait,
+		pathQuiescence:       resolvePathQuiescenceSeconds(),
+		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
