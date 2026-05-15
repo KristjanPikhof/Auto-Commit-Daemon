@@ -351,6 +351,7 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		LogRejectedIntentPlan(ctx, p.Name(), plannerReq, string(raw), err)
 		return IntentPlan{}, err
 	}
 	p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{
