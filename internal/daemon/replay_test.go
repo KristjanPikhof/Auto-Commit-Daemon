@@ -5443,11 +5443,12 @@ func TestReplay_RecentCommitAffinityHintAbsentWhenStale(t *testing.T) {
 	}
 	// Commit with a back-dated committer timestamp (1 hour ago) so the
 	// affinity window can never include it without flake risk.
-	pastEnv := []string{
-		"GIT_COMMITTER_DATE=" + time.Now().Add(-time.Hour).Format(time.RFC3339),
-		"GIT_AUTHOR_DATE=" + time.Now().Add(-time.Hour).Format(time.RFC3339),
+	past := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	pastEnv := map[string]string{
+		"GIT_COMMITTER_DATE": past,
+		"GIT_AUTHOR_DATE":    past,
 	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir, Env: pastEnv}, "commit", "-q", "-m", "seed stale.go"); err != nil {
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir, ExtraEnv: pastEnv}, "commit", "-q", "-m", "seed stale.go"); err != nil {
 		t.Fatalf("git commit: %v", err)
 	}
 	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
