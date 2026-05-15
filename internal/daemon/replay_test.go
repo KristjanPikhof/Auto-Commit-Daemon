@@ -5084,3 +5084,404 @@ func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 		t.Fatalf("offered seq=%d want %d", planner.requests[0].OfferedCaptures[0].Seq, seq1)
 	}
 }
+
+// TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses runs the
+// scenario the task spec calls out: with quiescence=30s, two writes 5s
+// apart on path P only release P to the planner-offer pipeline once 30s
+// of silence has elapsed. The capture rows persist immediately for
+// durability — only the planner-offer is gated.
+func TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	clock := struct {
+		mu  sync.Mutex
+		now time.Time
+	}{now: t0}
+	SetPathQuiescenceClockForTest(t, func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	})
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	advance := func(d time.Duration) {
+		clock.mu.Lock()
+		clock.now = clock.now.Add(d)
+		clock.mu.Unlock()
+	}
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Write 1 at t=0.
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v1\n")
+	// Write 2 at t=5s.
+	advance(5 * time.Second)
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v2\n")
+
+	// At t=10s a replay tick under a 30s quiescence window must hold back
+	// the path: PathLastWrite=5, now=10, elapsed=5 < 30 → gated. We expect
+	// Skipped + skipped_due_path_quiescence and zero published commits.
+	advance(5 * time.Second) // now = t=10s
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			Subject:        "should not be called",
+			GroupingReason: "should not be called",
+		},
+	}
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay (gated): %v", err)
+	}
+	if !sum.Skipped || sum.SkippedReason != "skipped_due_path_quiescence" {
+		t.Fatalf("expected skipped_due_path_quiescence at t=10s; summary=%+v", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner.calls=%d want 0 while gated", planner.calls)
+	}
+	pendingMid, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pendingMid) < 2 {
+		t.Fatalf("pending=%d want >=2 — capture rows must persist for durability under the gate", len(pendingMid))
+	}
+
+	// Advance past the 30s quiescence window relative to the second write.
+	// Second write was at t=5s, so now must be >= t=35s. Advance 26s more
+	// to land at t=36s.
+	advance(26 * time.Second)
+	planner = &recordingIntentPlanner{}
+
+	pendingPost, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents pre-second-replay: %v", err)
+	}
+	planner.plan = ai.IntentPlan{
+		SelectedSeqs:   captureEventSeqs(pendingPost),
+		Subject:        "Quiet path released",
+		GroupingReason: "quiescence elapsed",
+	}
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay (released): %v", err)
+	}
+	if sum2.Skipped {
+		t.Fatalf("expected release after window elapsed; summary=%+v", sum2)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1 after release", planner.calls)
+	}
+}
+
+// captureEventSeqs returns the seqs from a slice of capture events in
+// the input order. Used by the quiescence release test where we hand the
+// recording planner a SelectedSeqs slice that matches every visible
+// pending row.
+func captureEventSeqs(evs []state.CaptureEvent) []int64 {
+	out := make([]int64, 0, len(evs))
+	for _, ev := range evs {
+		out = append(out, ev.Seq)
+	}
+	return out
+}
+
+// TestReplay_PathQuiescenceDisabledRegressionBaseline asserts the gate is
+// off when ACD_PATH_QUIESCENCE_SECONDS is unset / zero — captures still
+// flow to the planner on the very next replay pass without waiting for any
+// silence window. This is the regression baseline that protects existing
+// deployments from accidental behavior change.
+func TestReplay_PathQuiescenceDisabledRegressionBaseline(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t.Setenv(EnvPathQuiescenceSeconds, "")
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "fast.txt", "v1\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "Direct ship",
+			GroupingReason: "no quiescence gate",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Skipped {
+		t.Fatalf("baseline must not skip with gate disabled; summary=%+v", sum)
+	}
+	if sum.Published != 1 {
+		t.Fatalf("Published=%d want 1; summary=%+v", sum.Published, sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+}
+
+// TestReplay_PathQuiescenceSnapshotRecordsGatedCount confirms the daemon
+// stamps daemon_meta.path_quiescence.gated_count after every replay pass
+// under the gate. The CLI status path reads the same key (covered by an
+// intent_observability_test) so this test asserts the daemon-side write,
+// not the read.
+func TestReplay_PathQuiescenceSnapshotRecordsGatedCount(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return t0 })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "snap.txt", "v1\n")
+
+	t.Setenv(EnvPathQuiescenceSeconds, "60")
+	planner := &recordingIntentPlanner{}
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner.calls=%d want 0 (gated)", planner.calls)
+	}
+	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceGatedCount)
+	if err != nil {
+		t.Fatalf("MetaGet gated_count: %v", err)
+	}
+	if !ok {
+		t.Fatalf("daemon_meta missing %s after gated pass", MetaKeyPathQuiescenceGatedCount)
+	}
+	if v == "0" {
+		t.Fatalf("gated_count=0 after gated pass; want >0")
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAttachedWhenWindowMatches stages a
+// HEAD commit that touches path P, captures a fresh write to P, runs
+// replay with affinity=120s, and asserts the planner request now carries
+// PathRecentCommits[0] referring to that HEAD commit. The hint is shaped
+// so future amend support can switch on SuggestedAction; v1 only adds the
+// hint without taking action.
+func TestReplay_RecentCommitAffinityHintAttachedWhenWindowMatches(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Land a real HEAD commit that touches the path. We commit the file via
+	// raw git so the ACD daemon doesn't fold it into the test capture stream.
+	const path = "affinity.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package affinity\n"), 0o644); err != nil {
+		t.Fatalf("write affinity: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed affinity.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	captureOnePendingFile(t, ctx, f, path, "package affinity\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatalf("no pending after capture")
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "Affinity hint exposed",
+			GroupingReason: "verify hint serialization",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "3600")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+	got := planner.requests[0].PathRecentCommits
+	if len(got) != 1 {
+		t.Fatalf("PathRecentCommits len=%d want 1; got=%+v", len(got), got)
+	}
+	if got[0].Path != path {
+		t.Fatalf("PathRecentCommits[0].Path=%q want %q", got[0].Path, path)
+	}
+	if got[0].OID != headOID {
+		t.Fatalf("PathRecentCommits[0].OID=%q want HEAD %q", got[0].OID, headOID)
+	}
+	if got[0].SuggestedAction != ai.PathRecentCommitSuggestionExtendOrWait {
+		t.Fatalf("SuggestedAction=%q want %q", got[0].SuggestedAction, ai.PathRecentCommitSuggestionExtendOrWait)
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAbsentWhenDisabled asserts setting
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS=0 disables the hint even when a
+// matching HEAD commit exists. Mirror baseline for env-disable.
+func TestReplay_RecentCommitAffinityHintAbsentWhenDisabled(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	const path = "no-hint.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package nohint\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed no-hint.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, path, "package nohint\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "no hint",
+			GroupingReason: "env disabled",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "0")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].PathRecentCommits; len(got) != 0 {
+		t.Fatalf("PathRecentCommits=%+v want empty when env=0", got)
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAbsentWhenStale verifies an older HEAD
+// commit (older than the affinity window) does NOT generate a hint. Use a
+// short window of 5s and rely on the fact that the seeded commit is already
+// older than 5s by the time replay runs (we sleep briefly to be safe).
+func TestReplay_RecentCommitAffinityHintAbsentWhenStale(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	const path = "stale.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package stale\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	// Commit with a back-dated committer timestamp (1 hour ago) so the
+	// affinity window can never include it without flake risk.
+	pastEnv := []string{
+		"GIT_COMMITTER_DATE=" + time.Now().Add(-time.Hour).Format(time.RFC3339),
+		"GIT_AUTHOR_DATE=" + time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir, Env: pastEnv}, "commit", "-q", "-m", "seed stale.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, path, "package stale\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "stale skip",
+			GroupingReason: "older than window",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "60")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if got := planner.requests[0].PathRecentCommits; len(got) != 0 {
+		t.Fatalf("PathRecentCommits=%+v want empty when HEAD commit is older than the window", got)
+	}
+}
