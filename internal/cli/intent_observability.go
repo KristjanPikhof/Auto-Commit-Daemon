@@ -524,14 +524,28 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	// depth. OldestPendingAgeSeconds is intentionally NOT adjusted —
 	// quiescence does not change the persistence timestamp on the oldest
 	// row, only when the planner is offered the captures behind it.
+	//
+	// Freshness gate: the gated_count value is only meaningful while the
+	// daemon is actively running. A dead daemon leaves the last snapshot
+	// frozen on disk; subtracting it from VisiblePendingEvents would
+	// chronically under-count pending work because new captures land in
+	// capture_events while no replay pass refreshes the gated counter.
+	// We surface PathQuiescenceGatedEvents (raw value, for forensic
+	// inspection) but skip the subtraction when:
+	//   - daemon_state shows no live process (LoadDaemonState false or
+	//     identity.Alive returns false), OR
+	//   - the snapshot timestamp is older than pathQuiescenceStaleness
+	//     (default 30s, comfortably beyond the typical replay tick).
 	if v, ok, err := metaLookup(ctx, conn, "path_quiescence.gated_count"); err == nil && ok {
 		if gated, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil && gated > 0 {
 			report.PathQuiescenceGatedEvents = gated
-			adjusted := report.VisiblePendingEvents - gated
-			if adjusted < 0 {
-				adjusted = 0
+			if pathQuiescenceSnapshotFresh(ctx, conn) {
+				adjusted := report.VisiblePendingEvents - gated
+				if adjusted < 0 {
+					adjusted = 0
+				}
+				report.VisiblePendingEvents = adjusted
 			}
-			report.VisiblePendingEvents = adjusted
 		}
 	}
 	if !oldestCaptured.Valid || report.VisiblePendingEvents == 0 || report.MaxPendingAgeSeconds <= 0 {
