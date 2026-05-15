@@ -4688,13 +4688,14 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	// Seed the file as a tracked file so subsequent writes capture as
+	// modifies (not creates), giving us a clean modify→modify→modify chain
+	// to coalesce. Bootstrap AFTER the seed so the shadow reflects the
+	// committed v0 baseline.
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
-	// Seed the file as a tracked file so subsequent writes capture as
-	// modifies (not creates), giving us a clean modify→modify→modify chain
-	// to coalesce.
-	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
 
 	seq1 := captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
 	seq2 := captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
