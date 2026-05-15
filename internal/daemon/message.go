@@ -262,7 +262,7 @@ func BuildOpsDiffWithCap(ctx context.Context, repoRoot string, ops []state.Captu
 		if buf.Full() {
 			break
 		}
-		section, err := buildOpDiff(ctx, repoRoot, op)
+		section, err := buildOpDiff(ctx, repoRoot, op, cap)
 		if err != nil {
 			// Soft per-op failure: skip this op but keep going so the
 			// model still sees the other ops in a multi-op event.
