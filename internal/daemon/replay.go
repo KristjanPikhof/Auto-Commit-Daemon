@@ -93,16 +93,17 @@ func shouldEmitPauseWarn(key string) bool {
 // EnvRecentCommitAffinitySeconds names the operator knob that decides how
 // recent a HEAD commit must be for the planner to receive a
 // `path_recent_commits` hint linking the offered path back to that commit.
-// Default 120 seconds. Zero disables the hint. Restart the daemon for
-// changes to apply.
+// Default 0 (disabled). Restart the daemon for changes to apply.
 const EnvRecentCommitAffinitySeconds = "ACD_RECENT_COMMIT_AFFINITY_SECONDS"
 
 // DefaultRecentCommitAffinitySeconds is the default
 // ACD_RECENT_COMMIT_AFFINITY_SECONDS when the env var is unset or
-// unparseable. 120 seconds is wide enough to cover the typical "agent
-// finished a tool turn N seconds ago, then made one more change" window
-// without polluting the planner with stale commit references.
-const DefaultRecentCommitAffinitySeconds = 120
+// unparseable. Defaults to 0 (hint disabled) until the per-path HEAD
+// lookup is cached/batched — buildPathRecentCommits otherwise pays one
+// `git log` per offered path on every replay pass, which is excessive
+// for the marginal information the hint adds. Operators who want the
+// hint can opt in by setting a positive value.
+const DefaultRecentCommitAffinitySeconds = 0
 
 // resolveRecentCommitAffinitySeconds parses
 // ACD_RECENT_COMMIT_AFFINITY_SECONDS into a time.Duration. Negative or
