@@ -22,6 +22,7 @@ type intentStrategyReport struct {
 	DeferLimit               int    `json:"defer_limit,omitempty"`
 	MinPending               int    `json:"min_pending,omitempty"`
 	MaxPendingAgeSeconds     int64  `json:"max_pending_age_seconds,omitempty"`
+	IntentStageDiffCap       int    `json:"intent_stage_diff_cap,omitempty"`
 	VisiblePendingEvents     int    `json:"visible_pending_events,omitempty"`
 	OldestPendingEventSeq    int64  `json:"oldest_pending_event_seq,omitempty"`
 	OldestPendingPath        string `json:"oldest_pending_path,omitempty"`
@@ -39,7 +40,51 @@ type intentStrategyReport struct {
 	LastPlannerErrorEventSeq int64  `json:"last_planner_error_event_seq,omitempty"`
 	LastPlannerErrorPath     string `json:"last_planner_error_path,omitempty"`
 	LastPlannerError         string `json:"last_planner_error,omitempty"`
+	// PlannerErrorRateRecent is the share of intent_planner_error rows in
+	// the most recent IntentRecentDecisionWindow decisions. The denominator
+	// is always IntentRecentDecisionWindow (default 100) regardless of how
+	// many decisions have actually been recorded — the rate moves smoothly
+	// as the ledger fills rather than oscillating wildly during the first
+	// few decisions. Empty ledgers report 0.0 (no errors observed in a
+	// 100-decision window). The `,omitzero` tag keeps the field absent from
+	// JSON when no decisions have ever been recorded so that downstream
+	// tooling can distinguish "never observed" (absent) from "observed,
+	// rate is exactly zero" (present, value 0.0). A non-zero rate is
+	// always present.
+	PlannerErrorRateRecent float64 `json:"planner_error_rate_recent,omitempty"`
+	// SingletonCommitRateRecent is the share of one-event commits in the
+	// most recent IntentRecentCommitWindow distinct commit OIDs. The
+	// denominator follows the same "fixed 100 even when not yet filled"
+	// policy as PlannerErrorRateRecent.
+	SingletonCommitRateRecent float64 `json:"singleton_commit_rate_recent,omitempty"`
+	// PlannerErrorRateRecentWarn surfaces the intent_strategy threshold
+	// breach to operators in the human renderer. Set to true whenever
+	// PlannerErrorRateRecent exceeds IntentPlannerErrorRateWarnThreshold
+	// (default 0.05) so the diagnose remediation hint and the status human
+	// output stay in sync without re-deriving the threshold separately.
+	PlannerErrorRateRecentWarn bool `json:"planner_error_rate_recent_warn,omitempty"`
 }
+
+// IntentRecentDecisionWindow is the fixed denominator for
+// PlannerErrorRateRecent — the number of most-recent decision_records rows
+// considered when computing the planner-error share. The value is fixed at
+// 100 so the metric is comparable across repos and over time; raising it
+// would smooth the rate further at the cost of taking longer to react to
+// new planner regressions.
+const IntentRecentDecisionWindow = 100
+
+// IntentRecentCommitWindow is the fixed denominator for
+// SingletonCommitRateRecent — the number of most-recent unique commit OIDs
+// considered when computing the singleton (one-event) commit share. Mirrors
+// IntentRecentDecisionWindow.
+const IntentRecentCommitWindow = 100
+
+// IntentPlannerErrorRateWarnThreshold is the planner-error rate above which
+// the diagnose remediation surfaces a warning. 0.05 (5%) reflects the
+// observed noise floor of healthy planner deployments under the Wave 2
+// retry+normalize stack; sustained rates above this are an operator signal
+// to inspect <gitDir>/acd/planner-rejects.jsonl.
+const IntentPlannerErrorRateWarnThreshold = 0.05
 
 func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 	status := "event"
