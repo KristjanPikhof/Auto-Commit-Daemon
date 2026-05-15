@@ -204,6 +204,17 @@ func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
 func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
 	ctx := context.Background()
 	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	// Pre-register the session — see TestFlush_LogicalRefusesOnDetachedHEAD.
+	d, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("open db for register: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID: "s1", Harness: "claude-code",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	_ = d.Close()
 	gitDir := repoDir + "/.git"
 	markerDir := filepath.Join(gitDir, "acd")
 	if err := os.MkdirAll(markerDir, 0o700); err != nil {
