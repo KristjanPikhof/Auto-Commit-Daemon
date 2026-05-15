@@ -63,6 +63,14 @@ type intentStrategyReport struct {
 	// (default 0.05) so the diagnose remediation hint and the status human
 	// output stay in sync without re-deriving the threshold separately.
 	PlannerErrorRateRecentWarn bool `json:"planner_error_rate_recent_warn,omitempty"`
+	// PathQuiescenceGatedEvents records the most recent count of pending
+	// capture events held back by the per-path quiescence gate (see
+	// ACD_PATH_QUIESCENCE_SECONDS in CLAUDE.md). The daemon stamps this
+	// value once per replay pass to daemon_meta; status reads it
+	// best-effort and adjusts VisiblePendingEvents downward so the
+	// reported count reflects the planner-visible window. Absent when
+	// the daemon has never recorded a snapshot.
+	PathQuiescenceGatedEvents int `json:"path_quiescence_gated_events,omitempty"`
 }
 
 // IntentRecentDecisionWindow is the fixed denominator for
