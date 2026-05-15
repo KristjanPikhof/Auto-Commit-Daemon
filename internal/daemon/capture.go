@@ -1485,12 +1485,31 @@ func SetPathQuiescenceClockForTest(t interface{ Helper() }, fn func() time.Time)
 }
 
 // ResetPathQuiescenceForTest empties the tracker so adjacent tests do not
-// share path state. Test-only.
+// share path state. Test-only. Also resets the enable gate so the next
+// test starts from a known-disabled state.
 func ResetPathQuiescenceForTest(t interface{ Helper() }) {
 	t.Helper()
 	pathQuiescenceMu.Lock()
 	pathQuiescenceWrites = map[string]time.Time{}
 	pathQuiescenceMu.Unlock()
+	pathQuiescenceEnabled.Store(false)
+	pathQuiescenceWindowSec.Store(0)
+}
+
+// SetPathQuiescenceEnabled flips the hot-path gate. The daemon calls this
+// at startup once it has resolved ACD_PATH_QUIESCENCE_SECONDS so capture
+// can short-circuit RecordPathWrite when the gate is off. Idempotent.
+func SetPathQuiescenceEnabled(enabled bool) {
+	pathQuiescenceEnabled.Store(enabled)
+}
+
+// PathQuiescenceTrackerSize returns the current number of tracked paths.
+// Surface for diagnose/observability and tests.
+func PathQuiescenceTrackerSize() int {
+	pathQuiescenceMu.RLock()
+	n := len(pathQuiescenceWrites)
+	pathQuiescenceMu.RUnlock()
+	return n
 }
 
 // RecordPathWrite stamps `now` as the most recent capture timestamp for
@@ -1498,13 +1517,69 @@ func ResetPathQuiescenceForTest(t interface{ Helper() }) {
 // the tracker's write lock. Exported so callers outside this package
 // (currently none, but the intent-planner replay loop reads it) can keep
 // the API discoverable.
+//
+// Callers MUST pass repo-relative slash-separated paths matching the
+// canonicalization used for capture_ops.path (see touchedPaths). Defensive
+// normalization here would mask caller bugs; we trust the producer.
+//
+// Hot-path short-circuit: when SetPathQuiescenceEnabled has not been
+// flipped on (the default for ACD_PATH_QUIESCENCE_SECONDS=0 deployments),
+// RecordPathWrite returns immediately without acquiring the mutex. Callers
+// in capture.go run this on every captured op, so the cheap atomic Load
+// keeps the no-gate steady state at the same cost as the prior code path.
 func RecordPathWrite(path string, now time.Time) {
 	if path == "" {
 		return
 	}
+	if !pathQuiescenceEnabled.Load() {
+		return
+	}
 	pathQuiescenceMu.Lock()
 	pathQuiescenceWrites[path] = now
+	if len(pathQuiescenceWrites) > pathQuiescenceMaxEntries {
+		evictStalePathQuiescenceLocked(now)
+	}
 	pathQuiescenceMu.Unlock()
+}
+
+// evictStalePathQuiescenceLocked prunes tracker entries older than 2x the
+// configured quiescence window (or 1 hour when the window is zero). Caller
+// must hold pathQuiescenceMu in write mode.
+func evictStalePathQuiescenceLocked(now time.Time) {
+	windowSec := pathQuiescenceWindowSec.Load()
+	cutoff := time.Hour
+	if windowSec > 0 {
+		cutoff = 2 * time.Duration(windowSec) * time.Second
+	}
+	threshold := now.Add(-cutoff)
+	for k, v := range pathQuiescenceWrites {
+		if v.Before(threshold) {
+			delete(pathQuiescenceWrites, k)
+		}
+	}
+	// If eviction was insufficient (every entry is fresh), drop the
+	// oldest 25% to keep the cap honored. This only fires under
+	// pathological churn where 4k distinct paths are stamped within the
+	// quiescence window — practically: nothing falls out of the eviction
+	// branch under normal load.
+	if len(pathQuiescenceWrites) > pathQuiescenceMaxEntries {
+		type kv struct {
+			k string
+			t time.Time
+		}
+		entries := make([]kv, 0, len(pathQuiescenceWrites))
+		for k, v := range pathQuiescenceWrites {
+			entries = append(entries, kv{k: k, t: v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].t.Before(entries[j].t) })
+		drop := len(entries) / 4
+		if drop < 1 {
+			drop = 1
+		}
+		for i := 0; i < drop; i++ {
+			delete(pathQuiescenceWrites, entries[i].k)
+		}
+	}
 }
 
 // PathLastWrite returns the most recent recorded write timestamp for `path`,
