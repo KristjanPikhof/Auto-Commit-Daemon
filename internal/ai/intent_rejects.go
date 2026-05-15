@@ -359,7 +359,7 @@ func intentRejectsRawVerbatim() bool {
 	}
 }
 
-var intentRejectsRawWarnOnce sync.Once
+var intentRejectsRawWarnOnce = &sync.Once{}
 
 // notifyIntentRejectsRawOptIn emits a one-shot startup warn so an operator
 // who flipped on verbatim retention sees a visible reminder that planner
