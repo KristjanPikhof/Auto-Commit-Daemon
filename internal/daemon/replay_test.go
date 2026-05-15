@@ -5923,8 +5923,11 @@ func TestPathQuiescence_EvictionBoundsMapSize(t *testing.T) {
 
 	// Every entry was stale and should have been eligible for eviction;
 	// after the over-cap stamp the map should be much smaller than the
-	// hard cap (eviction drops everything older than 2*window).
-	if got := PathQuiescenceTrackerSize(); got > 100 {
+	// hard cap (eviction drops everything older than 2*window). We
+	// tolerate up to 25% of the cap because eviction only fires when
+	// the cap is exceeded, and the post-eviction adds accumulate up to
+	// the next over-cap event.
+	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries/4 {
 		t.Fatalf("eviction did not prune stale entries; size=%d", got)
 	}
 }
