@@ -1416,6 +1416,112 @@ func gitModeFor(m os.FileMode) string {
 	return git.RegularFileMode
 }
 
+// pathQuiescenceTracker tracks the most recent capture timestamp per path
+// across the daemon's lifetime. The intent planner consults the tracker
+// before deciding whether a captured path is "ready" to ship: a path that
+// just received a write is held back until ACD_PATH_QUIESCENCE_SECONDS of
+// silence has elapsed. The capture row itself is persisted immediately so
+// durability is unchanged; only the planner-offer is gated.
+//
+// The map is intentionally process-local: persisting per-path timestamps to
+// SQLite would add a write per capture event and cross-process status
+// queries already see the gated counts via the `path_quiescence.*`
+// daemon_meta keys we stamp at the end of each replay pass.
+//
+// Tests can substitute the wall clock via SetPathQuiescenceClockForTest and
+// reset the tracker via ResetPathQuiescenceForTest.
+var (
+	pathQuiescenceMu     sync.RWMutex
+	pathQuiescenceWrites = map[string]time.Time{}
+	pathQuiescenceNowFn  atomic.Pointer[func() time.Time]
+)
+
+func pathQuiescenceNow() time.Time {
+	if fn := pathQuiescenceNowFn.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return time.Now()
+}
+
+// SetPathQuiescenceClockForTest swaps the clock the tracker consults. Pass
+// nil to restore time.Now. Test-only.
+func SetPathQuiescenceClockForTest(t interface{ Helper() }, fn func() time.Time) {
+	t.Helper()
+	if fn == nil {
+		pathQuiescenceNowFn.Store(nil)
+		return
+	}
+	cp := fn
+	pathQuiescenceNowFn.Store(&cp)
+}
+
+// ResetPathQuiescenceForTest empties the tracker so adjacent tests do not
+// share path state. Test-only.
+func ResetPathQuiescenceForTest(t interface{ Helper() }) {
+	t.Helper()
+	pathQuiescenceMu.Lock()
+	pathQuiescenceWrites = map[string]time.Time{}
+	pathQuiescenceMu.Unlock()
+}
+
+// RecordPathWrite stamps `now` as the most recent capture timestamp for
+// `path`. Empty paths are ignored. Concurrent capture passes serialize on
+// the tracker's write lock. Exported so callers outside this package
+// (currently none, but the intent-planner replay loop reads it) can keep
+// the API discoverable.
+func RecordPathWrite(path string, now time.Time) {
+	if path == "" {
+		return
+	}
+	pathQuiescenceMu.Lock()
+	pathQuiescenceWrites[path] = now
+	pathQuiescenceMu.Unlock()
+}
+
+// PathLastWrite returns the most recent recorded write timestamp for `path`,
+// and `ok=false` when no capture has stamped the path during this daemon
+// lifetime. Used by the planner-offer gate to compute quiescence.
+func PathLastWrite(path string) (time.Time, bool) {
+	if path == "" {
+		return time.Time{}, false
+	}
+	pathQuiescenceMu.RLock()
+	ts, ok := pathQuiescenceWrites[path]
+	pathQuiescenceMu.RUnlock()
+	return ts, ok
+}
+
+// IsPathQuiescent returns true when `path` is eligible to be offered to the
+// planner under a `quiescence` gate. Quiescence == 0 short-circuits to true
+// (gate disabled). When the path has no recorded write (e.g. captured by a
+// previous daemon run before restart) we treat it as quiescent so a stale
+// pending row never gets stranded behind a tracker miss.
+func IsPathQuiescent(path string, quiescence time.Duration, now time.Time) bool {
+	if quiescence <= 0 || path == "" {
+		return true
+	}
+	last, ok := PathLastWrite(path)
+	if !ok {
+		return true
+	}
+	return now.Sub(last) >= quiescence
+}
+
+// resolvePathQuiescenceSeconds parses ACD_PATH_QUIESCENCE_SECONDS into a
+// time.Duration. Negative or unparseable values fall back to the default
+// (zero, i.e. gate disabled).
+func resolvePathQuiescenceSeconds() time.Duration {
+	env := os.Getenv(EnvPathQuiescenceSeconds)
+	if env == "" {
+		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
+	}
+	n, err := strconv.Atoi(env)
+	if err != nil || n < 0 {
+		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
 // recordOversize stores a daemon_meta breadcrumb so operators can see why a
 // path was skipped without having to grep the daemon log. Best-effort:
 // errors are dropped because the capture pipeline must keep running.
