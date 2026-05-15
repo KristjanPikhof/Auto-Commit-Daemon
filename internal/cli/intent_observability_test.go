@@ -337,3 +337,59 @@ func runStatusJSON(ctx context.Context, t *testing.T, repo string) statusReport 
 func commitOIDForIndex(i int) string {
 	return fmt.Sprintf("%040x", i)
 }
+
+// TestStatus_PathQuiescenceGatedCountAdjustsVisiblePending stamps a
+// path_quiescence.gated_count snapshot directly into daemon_meta and
+// asserts the status JSON adjusts VisiblePendingEvents downward while
+// leaving OldestPendingAgeSeconds anchored to the persistence timestamp
+// of the oldest pending row. The semantics mirror what the daemon writes
+// on every replay pass — see persistPathQuiescenceSnapshot in
+// internal/daemon/replay.go.
+func TestStatus_PathQuiescenceGatedCountAdjustsVisiblePending(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	// Seed two pending capture events so VisiblePendingEvents=2 before the
+	// gated_count adjustment.
+	now := float64(1_000_000)
+	for i := 0; i < 2; i++ {
+		ev := state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             fmt.Sprintf("file-%d.go", i),
+			Fidelity:         "full",
+			CapturedTS:       now + float64(i),
+		}
+		if _, err := state.AppendCaptureEvent(ctx, d, ev, []state.CaptureOp{{
+			Op: "modify", Path: ev.Path, Fidelity: "full",
+		}}); err != nil {
+			t.Fatalf("AppendCaptureEvent: %v", err)
+		}
+	}
+
+	// Stamp a gated_count snapshot — daemon would normally do this at the
+	// end of every replay pass under the gate.
+	if err := state.MetaSet(ctx, d, "path_quiescence.gated_count", "1"); err != nil {
+		t.Fatalf("MetaSet gated_count: %v", err)
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	if report.IntentStrategy.PathQuiescenceGatedEvents != 1 {
+		t.Fatalf("PathQuiescenceGatedEvents=%d want 1; report=%+v", report.IntentStrategy.PathQuiescenceGatedEvents, report.IntentStrategy)
+	}
+	// 2 raw pending - 1 gated = 1 visible to the planner.
+	if report.IntentStrategy.VisiblePendingEvents != 1 {
+		t.Fatalf("VisiblePendingEvents=%d want 1 after gated adjustment; report=%+v",
+			report.IntentStrategy.VisiblePendingEvents, report.IntentStrategy)
+	}
+	// OldestPendingPath is still derived from the oldest pending row — the
+	// gate does not change persistence semantics.
+	if report.IntentStrategy.OldestPendingPath != "file-0.go" {
+		t.Fatalf("OldestPendingPath=%q want file-0.go (gate must not change persistence-derived fields)",
+			report.IntentStrategy.OldestPendingPath)
+	}
+}
