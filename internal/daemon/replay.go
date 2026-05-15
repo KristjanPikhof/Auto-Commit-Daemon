@@ -1900,13 +1900,23 @@ func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg s
 
 func settleIntentPublished(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason, message string) error {
 	for _, item := range items {
-		ev := item.event
-		ev.Message = sql.NullString{String: message, Valid: message != ""}
-		if err := settlePublishedEvent(ctx, db, ev, cctx, sourceHead, commitOID, decisionKind, decisionReason); err != nil {
-			return err
-		}
-		if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
-			slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
+		// Coalesced items absorb additional capture events under one
+		// representative. Every covered event must land as published with
+		// the same commit_oid + decision row so `acd events --json`
+		// surfaces grouped_seqs covering the full run (the cli derives
+		// grouped_seqs from decision_records joined by commit_oid).
+		// Settling the events in seq order keeps the decision ledger
+		// monotonic and matches what readers expect for a multi-event
+		// publish.
+		for _, covered := range item.allCoveredEvents() {
+			ev := covered
+			ev.Message = sql.NullString{String: message, Valid: message != ""}
+			if err := settlePublishedEvent(ctx, db, ev, cctx, sourceHead, commitOID, decisionKind, decisionReason); err != nil {
+				return err
+			}
+			if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
+				slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
+			}
 		}
 	}
 	return nil
