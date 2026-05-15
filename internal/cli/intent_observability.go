@@ -172,6 +172,7 @@ func intentStrategyFromEnv() intentStrategyReport {
 		MaxPendingAgeSeconds: int64(
 			cfg.IntentMaxPendingAge / time.Second,
 		),
+		IntentStageDiffCap: ai.IntentStageDiffCap,
 	}
 }
 
