@@ -1149,6 +1149,67 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	return pending[:n], false, "", nil
 }
 
+// MetaKeyPathQuiescenceGatedCount surfaces the most recent count of pending
+// capture events held back by the per-path quiescence gate. `acd status`
+// reads it (best-effort) and subtracts from the raw visible-pending count
+// so operators see the planner-visible window rather than the durable
+// FIFO depth.
+const MetaKeyPathQuiescenceGatedCount = "path_quiescence.gated_count"
+
+// MetaKeyPathQuiescenceUpdatedAt records the RFC3339 UTC timestamp of the
+// most recent gated-count snapshot so stale data is recognizable when the
+// daemon stops without clearing it.
+const MetaKeyPathQuiescenceUpdatedAt = "path_quiescence.updated_at"
+
+// filterPendingByPathQuiescence drops events whose path (or rename
+// counterpart) has been touched more recently than `quiescence` seconds
+// ago. Returns the filtered pending slice plus the count that was held
+// back. quiescence == 0 short-circuits to (pending, 0).
+func filterPendingByPathQuiescence(pending []state.CaptureEvent, quiescence time.Duration, now time.Time) ([]state.CaptureEvent, int) {
+	if quiescence <= 0 || len(pending) == 0 {
+		return pending, 0
+	}
+	out := pending[:0:0]
+	gated := 0
+	for _, ev := range pending {
+		if !pathQuiescentForEvent(ev, quiescence, now) {
+			gated++
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out, gated
+}
+
+// pathQuiescentForEvent returns true when both the primary path and any
+// rename source path have been quiet for the configured window. Rename
+// events that touch two paths must wait for both paths so the planner
+// never sees one half of a rename while the other is still active.
+func pathQuiescentForEvent(ev state.CaptureEvent, quiescence time.Duration, now time.Time) bool {
+	if ev.Path != "" && !IsPathQuiescent(ev.Path, quiescence, now) {
+		return false
+	}
+	if ev.OldPath.Valid && ev.OldPath.String != "" {
+		if !IsPathQuiescent(ev.OldPath.String, quiescence, now) {
+			return false
+		}
+	}
+	return true
+}
+
+// persistPathQuiescenceSnapshot records the most recent gated-count snapshot
+// to daemon_meta. Best-effort: meta writes never block the replay loop. We
+// always write the count (even zero) so cross-process readers can tell the
+// difference between "no gate active this pass" (zero) and "no replay pass
+// has ever recorded a snapshot" (key missing).
+func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int) {
+	if db == nil {
+		return
+	}
+	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceGatedCount, strconv.Itoa(gated))
+	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceUpdatedAt, time.Now().UTC().Format(time.RFC3339))
+}
+
 func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
 		return false
