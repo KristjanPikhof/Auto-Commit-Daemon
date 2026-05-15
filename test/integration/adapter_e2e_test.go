@@ -726,6 +726,30 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
 
+	// Stop hook (d1 rewire): now calls `acd flush --logical` rather than the
+	// legacy `acd touch`. Exit must be 0 and the daemon must remain alive
+	// (Stop fires when Claude finishes a turn — the agent is not exiting,
+	// only pausing). The flush request itself drives the bypass-min-pending
+	// commit; we cover the commit-within-2s timing in the dedicated
+	// flush_logical integration test.
+	turnStopHook := pickHookByEvent(t, hooks, "Stop")
+	if turnStopHook.Command == "" {
+		t.Fatalf("claude-code snippet missing Stop hook entry")
+	}
+	if !strings.Contains(turnStopHook.Command, "acd flush --logical") {
+		t.Fatalf("claude-code Stop hook must call `acd flush --logical`, got: %s", turnStopHook.Command)
+	}
+	if strings.Contains(turnStopHook.Command, "acd touch") {
+		t.Fatalf("claude-code Stop hook still calls legacy `acd touch`; rewire incomplete: %s", turnStopHook.Command)
+	}
+	if turnRes := runBash(t, ctx, env, stdin, turnStopHook.Command); turnRes.ExitCode != 0 {
+		t.Fatalf("claude-code Stop (turn end) exit=%d\nstdout=%s\nstderr=%s",
+			turnRes.ExitCode, turnRes.Stdout, turnRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("claude-code daemon mode after Stop=%q; want running (Stop must flush, not stop)", mode)
+	}
+
 	// SessionEnd → acd stop. The daemon should shut down because this is
 	// the only registered session.
 	stopHook := pickHookByEvent(t, hooks, "SessionEnd")
