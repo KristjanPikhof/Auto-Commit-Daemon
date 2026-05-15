@@ -972,7 +972,10 @@ func replayIntentBatch(
 			BranchRef:    activeCtx.BranchRef,
 			Generation:   activeCtx.BranchGeneration,
 			DiffIncluded: intentRequestIncludesDiff(req),
-			DiffCap:      ai.DiffCap,
+			// Intent planner stage uses the larger per-stage diff cap so the
+			// planner sees enough context to group multi-file changes; the
+			// per-event commit-message path retains the legacy DiffCap.
+			DiffCap: ai.IntentStageDiffCap,
 		})
 	}
 	plan, validationFailure, err := planIntentWithFallback(plannerCtx, db, cfg.planner, req, items, activeCtx, nowSec)
