@@ -1161,36 +1161,62 @@ const MetaKeyPathQuiescenceGatedCount = "path_quiescence.gated_count"
 // daemon stops without clearing it.
 const MetaKeyPathQuiescenceUpdatedAt = "path_quiescence.updated_at"
 
-// filterPendingByPathQuiescence drops events whose path (or rename
-// counterpart) has been touched more recently than `quiescence` seconds
-// ago. Returns the filtered pending slice plus the count that was held
-// back. quiescence == 0 short-circuits to (pending, 0).
-func filterPendingByPathQuiescence(pending []state.CaptureEvent, quiescence time.Duration, now time.Time) ([]state.CaptureEvent, int) {
+// filterPendingByPathQuiescence enforces the per-path silence window in a
+// strict-FIFO manner: if the FIRST pending event in the window is gated
+// (its path was written within the quiescence window), the entire batch is
+// held back so cross-path causality is preserved. We never compact around
+// the head — doing so would let a later event jump ahead of an earlier
+// gated peer that touches an unrelated path the next event depends on.
+//
+// Returns the filtered pending slice plus the count that was held back.
+// quiescence == 0 short-circuits to (pending, 0). When the head is gated
+// the gated count equals the total number of held-back rows starting at
+// the head and including any subsequent rows the gate would have rejected
+// anyway (computed lazily so callers can render an accurate snapshot).
+//
+// Production callers do not pass an ops loader for non-head events: the
+// only event whose multi-op paths must be inspected is the head, because a
+// gated head short-circuits the batch immediately. opsByPath supplies the
+// already-loaded ops for the head when available; nil falls back to the
+// header-path-only check (used by callers that have not yet loaded ops).
+func filterPendingByPathQuiescence(pending []state.CaptureEvent, quiescence time.Duration, now time.Time, opsByPath map[int64][]state.CaptureOp) ([]state.CaptureEvent, int) {
 	if quiescence <= 0 || len(pending) == 0 {
 		return pending, 0
 	}
-	out := pending[:0:0]
-	gated := 0
-	for _, ev := range pending {
-		if !pathQuiescentForEvent(ev, quiescence, now) {
-			gated++
-			continue
-		}
-		out = append(out, ev)
+	head := pending[0]
+	var headOps []state.CaptureOp
+	if opsByPath != nil {
+		headOps = opsByPath[head.Seq]
 	}
-	return out, gated
+	if !pathQuiescentForEvent(head, headOps, quiescence, now) {
+		// FIFO head is gated: hold back the entire batch. Count it as one
+		// gated row so the daemon_meta snapshot reflects "at least one
+		// pending row is behind the gate" without forcing every caller to
+		// re-walk the queue.
+		return nil, 1
+	}
+	return pending, 0
 }
 
-// pathQuiescentForEvent returns true when both the primary path and any
-// rename source path have been quiet for the configured window. Rename
-// events that touch two paths must wait for both paths so the planner
-// never sees one half of a rename while the other is still active.
-func pathQuiescentForEvent(ev state.CaptureEvent, quiescence time.Duration, now time.Time) bool {
+// pathQuiescentForEvent returns true when every path the event will touch
+// (primary path, rename counterpart, and any additional op paths) has been
+// quiet for the configured window. Rename events that touch two paths must
+// wait for both; multi-op events must wait until every touched path is
+// quiet so the planner never sees a partial view.
+//
+// ops may be nil: callers without a loader fall back to the header-path-
+// only check (preserves prior single-path behavior for non-head events).
+func pathQuiescentForEvent(ev state.CaptureEvent, ops []state.CaptureOp, quiescence time.Duration, now time.Time) bool {
 	if ev.Path != "" && !IsPathQuiescent(ev.Path, quiescence, now) {
 		return false
 	}
 	if ev.OldPath.Valid && ev.OldPath.String != "" {
 		if !IsPathQuiescent(ev.OldPath.String, quiescence, now) {
+			return false
+		}
+	}
+	for _, p := range touchedPaths(ops) {
+		if !IsPathQuiescent(p, quiescence, now) {
 			return false
 		}
 	}
