@@ -1,15 +1,36 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// captureSlogDefault swaps the slog default logger for one that writes JSON
+// records to a buffer and returns a function that returns those lines. Used
+// by NormalizeIntentPlanDeferredReasons callers (provider.go, openai_compat.go)
+// to assert the warn-line count.
+func captureSlogDefault(t *testing.T) func() []string {
+	t.Helper()
+	prev := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return func() []string {
+		raw := strings.TrimSpace(buf.String())
+		if raw == "" {
+			return nil
+		}
+		return strings.Split(raw, "\n")
+	}
+}
 
 type badDeferredReasonFixture struct {
 	OfferedCaptures []OfferedCapture `json:"offered_captures"`
