@@ -1090,6 +1090,24 @@ func runOpencodeE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "opencode", ctx, env, repo, sessionID, "opencode", wakeHook, "")
 
+	// Idle hook (d1 rewire): now calls `acd flush --logical` rather than
+	// the legacy `acd touch`. Daemon must remain alive — session.idle does
+	// not end the session.
+	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
+	if idleHook.Command == "" {
+		t.Fatalf("opencode snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
+	}
+	if !strings.Contains(idleHook.Command, "acd flush --logical") {
+		t.Fatalf("opencode acd-flush-idle must call `acd flush --logical`, got: %s", idleHook.Command)
+	}
+	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
+		t.Fatalf("opencode acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
+			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("opencode daemon mode after idle=%q; want running", mode)
+	}
+
 	stopHook := pickHookByEvent(t, hooks, "acd-stop")
 	stopRes := runBash(t, ctx, env, "", stopHook.Command)
 	if stopRes.ExitCode != 0 {
