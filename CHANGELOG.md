@@ -4,6 +4,32 @@
 
 ### Added
 
+- Per-path quiescence gate `ACD_PATH_QUIESCENCE_SECONDS` (default `0`,
+  off). When non-zero the daemon defers offering pending captures for
+  path P to the intent planner until P has been quiet for the configured
+  number of seconds. The capture row itself is persisted to
+  `capture_events` immediately for durability — only the planner-offer
+  is gated, so a daemon restart, crash, or `acd commit-all` still sees
+  the captured work. The daemon stamps `daemon_meta.path_quiescence
+  .gated_count` on every replay pass under the gate; `acd status --json`
+  reads that key into a new `intent_strategy.path_quiescence_gated_events`
+  field and subtracts it from `visible_pending_events` so operators see
+  the planner-visible window. `oldest_pending_age_seconds` stays anchored
+  to the persistence timestamp (the row's `captured_ts`) and is NOT
+  shifted by the gate. Restart the daemon for env changes to apply.
+
+- Prior-commit affinity hint `ACD_RECENT_COMMIT_AFFINITY_SECONDS`
+  (default `120`, set `0` to disable). When the most recent HEAD commit
+  reachable from the active branch touched an offered capture's path AND
+  landed within the window, the planner request now carries a
+  `path_recent_commits[i] = {path, oid, age_seconds, suggested_action}`
+  entry. `suggested_action` is fixed at `"extend or wait"` in v1 — the
+  hint is informational only; the daemon does NOT amend on the planner's
+  behalf. The hint is forwarded through the composed primary + retry +
+  fallback paths so every planner invocation sees consistent context.
+  Follow-up: act on the hint with an actual amend path (tracked
+  separately; v1 ships only the hint surface).
+
 - Planner rejects forensic log at `<gitDir>/acd/planner-rejects.jsonl`. Every
   `ValidateIntentPlan` failure on the `openai-compat` and `subprocess`
   providers now persists one JSON line carrying the timestamp (RFC3339Nano),
