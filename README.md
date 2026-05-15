@@ -462,6 +462,39 @@ Notes:
 - [docs/ai-providers.md](docs/ai-providers.md) — AI provider configuration, env vars, subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
 
+## Migrating from prior releases
+
+Re-run `acd setup <harness>` after upgrading. The Stop / `session.idle` hook for
+Claude Code, OpenCode, and Pi changed from `acd touch` to `acd flush --logical`
+so partial work commits at session-end instead of waiting up to 5 minutes for
+the age trigger. Existing snippets keep working — they just lose the new
+prompt-end commit boundary. `acd doctor` flags the drift.
+
+`acd flush --logical` is the new explicit drain entrypoint:
+
+- Refreshes the session heartbeat (same as `acd touch`).
+- Enqueues a labeled `flush_logical` request.
+- Signals the daemon to drain immediately, bypassing `ACD_INTENT_MIN_PENDING`
+  and `ACD_INTENT_MAX_PENDING_AGE`.
+- Refuses on detached HEAD, while a git operation is in progress, or with a
+  manual pause marker present (heartbeat still runs).
+- **Requires an existing registered session** when `--logical` is set; without
+  `--logical` the command falls back to `acd touch`-style lazy registration.
+
+The Wave 2 planner-atomicity epic also added forensic surfaces operators
+should know about:
+
+- `<gitDir>/acd/planner-rejects.jsonl` — rotating JSONL of validator-rejected
+  planner responses, 5 MiB per file, 2 files retained. **Raw model output is
+  redacted by default**; set `ACD_INTENT_REJECTS_RAW=1` to opt into verbatim
+  capture for debugging. The daemon emits a one-shot `slog.Warn` at startup
+  when verbatim mode is on; treat the file as sensitive in either case.
+- `acd status` JSON adds `planner_error_rate_recent`,
+  `singleton_commit_rate_recent`, `intent_stage_diff_cap`, and
+  `path_quiescence_gated_events` under the `intent_strategy` block.
+- `acd diagnose` warns when `planner_error_rate_recent` exceeds 5% over the
+  last 100 decisions and points at the rejects log.
+
 ## Status
 
 Active development.
