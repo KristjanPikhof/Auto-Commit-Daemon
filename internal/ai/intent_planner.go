@@ -198,7 +198,10 @@ func NormalizeIntentReason(reason string) string {
 type IntentPlanValidationCode int
 
 const (
-	// IntentPlanValidationUnknown is the zero-value catch-all.
+	// IntentPlanValidationUnknown is the zero-value catch-all. Returned for
+	// validation failures that do not fit a more specific code; the
+	// composed retry loop still treats it as a validation error and may
+	// retry.
 	IntentPlanValidationUnknown IntentPlanValidationCode = iota
 	// IntentPlanValidationDeferredReasonNotDeferred fires when a
 	// DeferredReason carries a seq that is not present in DeferredSeqs
@@ -206,6 +209,21 @@ const (
 	// can normalize by dropping the spurious entry; see
 	// NormalizeIntentPlanDeferredReasons.
 	IntentPlanValidationDeferredReasonNotDeferred
+	// IntentPlanValidationDeferredReasonMissing fires when a deferred seq
+	// has no entry in DeferredReasons. The composed retry loop quotes the
+	// validator message back to the provider so it can synthesize a
+	// reason on the second attempt.
+	IntentPlanValidationDeferredReasonMissing
+	// IntentPlanValidationShape covers structural mismatches that the
+	// planner could correct on retry — empty selected_seqs, omitted
+	// offered seqs, duplicate selected/deferred entries, overlap between
+	// selected and deferred, or an empty subject/grouping_reason.
+	IntentPlanValidationShape
+	// IntentPlanValidationOfferedWindow covers planner output that
+	// references a seq outside the offered window (selected or deferred).
+	// Often a planner hallucination; retry quotes the validator message
+	// back so the planner can drop the spurious seq.
+	IntentPlanValidationOfferedWindow
 )
 
 // IntentPlanValidationError is the typed error returned by ValidateIntentPlan
