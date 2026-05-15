@@ -5486,3 +5486,455 @@ func TestReplay_RecentCommitAffinityHintAbsentWhenStale(t *testing.T) {
 		t.Fatalf("PathRecentCommits=%+v want empty when HEAD commit is older than the window", got)
 	}
 }
+
+// TestReplay_PathQuiescence_GatedHeadBlocksBatch covers the FIFO-preserving
+// fix: when the FIRST pending event in the window is gated, the entire
+// batch is held back so cross-path causality is preserved. We never
+// compact around the head — that would let a later event jump ahead of
+// an earlier gated peer that touches an unrelated path the next event
+// depends on.
+func TestReplay_PathQuiescence_GatedHeadBlocksBatch(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	clock := struct {
+		mu  sync.Mutex
+		now time.Time
+	}{now: t0}
+	SetPathQuiescenceClockForTest(t, func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	})
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	advance := func(d time.Duration) {
+		clock.mu.Lock()
+		clock.now = clock.now.Add(d)
+		clock.mu.Unlock()
+	}
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	// seqA: hot path "hot.txt" written at t=0, will still be inside the
+	// 30s window when replay runs.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	captureOnePendingFile(t, ctx, f, "hot.txt", "v1\n")
+	// seqB: cool path "cool.txt" written 60s later — cool.txt itself
+	// would pass the gate, but it sits behind seqA in FIFO order.
+	advance(60 * time.Second)
+	captureOnePendingFile(t, ctx, f, "cool.txt", "v1\n")
+	// Now advance only 5s further so hot.txt is still hot (gate=30s,
+	// elapsed since hot.txt write=65s? no — wait. Let me re-think:
+	// hot.txt written at t=0; we need now < t=30s to keep hot.txt gated.
+	// But we already advanced by 60s before writing cool.txt. So at
+	// "now" hot.txt has been quiet for 60s and IS quiescent.
+	//
+	// Restart: write hot.txt first, advance only to t=10s, write
+	// cool.txt at t=10s, advance to t=20s. At t=20s:
+	//   hot.txt last write = t=10s? NO — only one write each.
+	// The captureOnePendingFile call records a path write at the
+	// CURRENT clock value. Let me reset and redo precisely.
+	pendingDB, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents pre-replay: %v", err)
+	}
+	if len(pendingDB) < 2 {
+		t.Fatalf("expected >=2 pending rows, got %d", len(pendingDB))
+	}
+	// To keep hot.txt under the 30s gate we need the wall clock minus
+	// hot.txt's last write to be < 30s. hot.txt was written at t=0;
+	// cool.txt was written at t=60s. After captureOnePendingFile for
+	// cool.txt, advance the clock only 5s so:
+	//   now = t=65s
+	//   PathLastWrite("hot.txt") = t=0; elapsed=65s >= 30s -> quiescent
+	// That defeats the test. Re-stamp hot.txt to "now-5s" so it's
+	// still inside the gate window when replay runs. Use
+	// SetPathQuiescenceClockForTest to back-date the stamp by calling
+	// RecordPathWrite directly with a fresh timestamp.
+	advance(5 * time.Second)
+	RecordPathWrite("hot.txt", clock.now.Add(-10*time.Second))
+	// Sanity check: hot.txt should be NOT quiescent under 30s gate at "now".
+	if IsPathQuiescent("hot.txt", 30*time.Second, clock.now) {
+		t.Fatalf("test setup error: hot.txt must be hot at this point")
+	}
+	if !IsPathQuiescent("cool.txt", 30*time.Second, clock.now) {
+		t.Fatalf("test setup error: cool.txt must be cool at this point")
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			Subject:        "should not be called",
+			GroupingReason: "head gated must short-circuit batch",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !sum.Skipped || sum.SkippedReason != "skipped_due_path_quiescence" {
+		t.Fatalf("FIFO violation: head gated but batch not held back; summary=%+v", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner must not be called when head is gated; calls=%d", planner.calls)
+	}
+	// Both pending rows must still be in the durable queue — the gate
+	// only blocks the planner-offer, not capture persistence.
+	pendingPost, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents post-replay: %v", err)
+	}
+	if len(pendingPost) < 2 {
+		t.Fatalf("durable rows lost; post=%d want >=2", len(pendingPost))
+	}
+}
+
+// TestReplay_PathQuiescence_MultiOpEventGatesOnAllPaths verifies the
+// multi-op gap fix: an event whose ops touch two paths (A, B) must be
+// gated when EITHER path is hot, not just when the header path is hot.
+// Previously pathQuiescentForEvent only inspected ev.Path + ev.OldPath
+// and let the multi-op-touched-path slip through.
+func TestReplay_PathQuiescence_MultiOpEventGatesOnAllPaths(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	// Enable the gate so RecordPathWrite stamps below take effect.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+
+	// Header path "header.txt" was quiet (no recent write) but op path
+	// "hot.txt" was just written. The event below carries ops touching
+	// both paths.
+	RecordPathWrite("hot.txt", now.Add(-1*time.Second))
+
+	ev := state.CaptureEvent{Seq: 42, Path: "header.txt"}
+	ops := []state.CaptureOp{
+		{EventSeq: 42, Path: "header.txt", Op: "modify"},
+		{EventSeq: 42, Path: "hot.txt", Op: "modify"},
+	}
+	if pathQuiescentForEvent(ev, ops, 30*time.Second, now) {
+		t.Fatalf("multi-op gap: hot op-path was not gated")
+	}
+	// Sanity: the legacy single-path check (no ops) would have passed.
+	if !pathQuiescentForEvent(ev, nil, 30*time.Second, now) {
+		t.Fatalf("regression: header-only check unexpectedly gated; pre-fix behavior expected for nil ops")
+	}
+}
+
+// TestReplay_PathQuiescence_SnapshotSkipsWritesWhenDisabled verifies the
+// write-amplification fix: persistPathQuiescenceSnapshot must NOT touch
+// daemon_meta when the gate is disabled (quiescence == 0).
+func TestReplay_PathQuiescence_SnapshotSkipsWritesWhenDisabled(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	resetLastPersistedQuiescenceGatedForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Pre-stamp a known value so we can detect any rewrite.
+	const sentinel = "test-sentinel-7"
+	if err := state.MetaSet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt, sentinel); err != nil {
+		t.Fatalf("MetaSet sentinel: %v", err)
+	}
+
+	// Run snapshot with gate disabled (quiescence=0). Writes must not
+	// happen — sentinel must survive untouched.
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 0)
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 0)
+	persistPathQuiescenceSnapshot(ctx, f.db, 5, 0) // gated count > 0 still skipped
+
+	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if err != nil {
+		t.Fatalf("MetaGet updated_at: %v", err)
+	}
+	if !ok || v != sentinel {
+		t.Fatalf("sentinel was overwritten when gate disabled; got=%q want=%q", v, sentinel)
+	}
+
+	// Now active gate (quiescence>0) and unchanged count: only the FIRST
+	// call should rewrite (sentinel→0 transition); subsequent identical
+	// values should NOT touch the gated_count key. We verify by
+	// re-stamping the timestamp sentinel between calls and checking
+	// only one rewrite occurred.
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 30*time.Second) // first write happens
+	if err := state.MetaSet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt, sentinel); err != nil {
+		t.Fatalf("MetaSet sentinel re-stamp: %v", err)
+	}
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 30*time.Second) // same count, must skip
+	v2, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if v2 != sentinel {
+		t.Fatalf("repeat call with unchanged count rewrote timestamp; got=%q", v2)
+	}
+
+	// Different count must rewrite both keys.
+	persistPathQuiescenceSnapshot(ctx, f.db, 3, 30*time.Second)
+	gv, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceGatedCount)
+	if gv != "3" {
+		t.Fatalf("gated_count not refreshed on change; got=%q want=3", gv)
+	}
+	v3, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if v3 == sentinel {
+		t.Fatalf("updated_at not refreshed on change")
+	}
+}
+
+// TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath verifies the
+// forced-aging fast path runs the same selection-safety validator as the
+// normal planner path. We synthesize an items list whose paths overlap so
+// any plan selecting the second item while the first is "deferred" fails
+// validation. The fast path always selects items[0], so we instead test
+// the wider invariant: the validator IS invoked, and its failure path
+// records a planner error decision.
+//
+// The most direct way to exercise the fallback is to inject a planner
+// fast-path plan that nominates a seq NOT in items via a safety override.
+// Since the production planIntentSingletonFastPath always selects
+// items[0].event.Seq, this test instead asserts the validators fire at
+// all — by checking that a malformed plan would land an error decision.
+// We do that by stubbing planIntentSingletonFastPath to return a plan
+// claiming a seq the items list does not contain.
+func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+
+	// The forced-singleton fast path is exercised below by:
+	//   - capturing one event,
+	//   - bumping its planner_state.defer_count past the limit,
+	//   - running replay with deferLimit=1 so selectIntentWindow yields
+	//     a single forced item.
+	// We then override planIntentSingletonFastPath to return an invalid
+	// plan (claims a seq absent from items) so ai.ValidateIntentPlan
+	// rejects it. The test asserts the deterministic fallback fires
+	// (planner_error decision recorded, deterministic plan publishes).
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "force.txt", "v1\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	seq := pending[0].Seq
+	// Defer the row past the limit so selectIntentWindow forces it.
+	if err := state.RecordPlannerOffer(ctx, f.db, seq, 1); err != nil {
+		t.Fatalf("RecordPlannerOffer: %v", err)
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, seq, 2, "test-defer"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, seq, 3, "test-defer"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	// Stub the fast path to return an unsafe plan: claims a seq absent
+	// from items. ai.ValidateIntentPlan rejects this in the
+	// "selected_seqs not in offered" path, exercising the fast-path
+	// validator branch.
+	prev := planIntentSingletonFastPathFn.Load()
+	bad := func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+		return ai.IntentPlan{
+			SelectedSeqs:   []int64{item.event.Seq + 999}, // not offered
+			Subject:        "unsafe forced-singleton plan",
+			GroupingReason: "synthetic unsafe plan",
+			Source:         (ai.DeterministicProvider{}).Name(),
+		}
+	}
+	planIntentSingletonFastPathFn.Store(&bad)
+	t.Cleanup(func() { planIntentSingletonFastPathFn.Store(prev) })
+
+	planner := &recordingIntentPlanner{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+		IntentDeferLimit: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// Either path should land a deterministic commit (one published) or
+	// at minimum NOT publish the unsafe plan. We accept Published>=1
+	// because the deterministic fallback ships the event.
+	if sum.Published == 0 && sum.Failed == 0 && sum.Conflicts == 0 {
+		t.Fatalf("expected forced-aging fallback to advance the row; sum=%+v", sum)
+	}
+	// Verify a planner_error decision exists for the seq.
+	rows, err := state.RecentDecisionsByEventSeq(ctx, f.db, seq, 16)
+	if err != nil {
+		t.Fatalf("RecentDecisionsByEventSeq: %v", err)
+	}
+	hasErr := false
+	for _, row := range rows {
+		if row.Kind == state.DecisionKindIntentPlannerError {
+			hasErr = true
+			break
+		}
+	}
+	if !hasErr {
+		t.Fatalf("expected intent_planner_error decision after fast-path validator failed; rows=%+v", rows)
+	}
+}
+
+// TestReplay_CoalescedDeferAdvancesAllCoveredEvents verifies the
+// coalesce-defer fix: when the planner defers a coalesced offer,
+// recordIntentDeferrals must advance defer_count for EVERY covered seq,
+// not just the representative. Otherwise the aging clock silently resets
+// for covered seqs after an external publish of the representative.
+func TestReplay_CoalescedDeferAdvancesAllCoveredEvents(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Two captures on the SAME path → coalesced into one offer with the
+	// first seq as representative and the second seq covered.
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v1\n")
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v2\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+	repSeq := pending[0].Seq
+	covSeq := pending[1].Seq
+
+	// Construct an items list that mirrors what buildIntentPlanRequest
+	// would produce after coalesce: representative seq carries a
+	// coalesce token covering both seqs.
+	items := []intentReplayItem{
+		{
+			event: pending[0],
+			coalesce: &coalesceToken{
+				OriginalSeqs: []int64{repSeq, covSeq},
+				Covered:      []state.CaptureEvent{pending[1]},
+			},
+		},
+	}
+	plan := ai.IntentPlan{
+		DeferredSeqs:    []int64{repSeq},
+		DeferredReasons: []ai.DeferredReason{{Seq: repSeq, Reason: "coalesce-defer-test"}},
+	}
+	if err := recordIntentDeferrals(ctx, f.db, plan, items, f.cctx, 100); err != nil {
+		t.Fatalf("recordIntentDeferrals: %v", err)
+	}
+
+	// Both representative AND covered must have defer_count == 1.
+	for _, seq := range []int64{repSeq, covSeq} {
+		ps, ok, err := state.PlannerStateForEvent(ctx, f.db, seq)
+		if err != nil {
+			t.Fatalf("PlannerStateForEvent seq=%d: %v", seq, err)
+		}
+		if !ok {
+			t.Fatalf("seq=%d missing planner_state row after coalesced defer", seq)
+		}
+		if ps.DeferCount != 1 {
+			t.Fatalf("seq=%d defer_count=%d want 1; covered seq must advance with representative", seq, ps.DeferCount)
+		}
+	}
+}
+
+// TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout verifies the
+// bounded subject-extraction budget on the forced-aging fast path: a
+// slow BuildOpsDiff stand-in must not stall the run loop; the fast path
+// falls back to the cheap singleOpSubject when the budget elapses.
+func TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	setForcedSingletonSubjectBudgetForTest(t, 50*time.Millisecond)
+
+	// Inject a deliberately slow diff renderer.
+	prev := buildOpsDiffForForcedSingleton
+	buildOpsDiffForForcedSingleton = func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+		select {
+		case <-time.After(2 * time.Second):
+			return "diff that should never reach the subject", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	t.Cleanup(func() { buildOpsDiffForForcedSingleton = prev })
+
+	item := intentReplayItem{
+		event: state.CaptureEvent{Seq: 1, Path: "slow.go", Operation: "modify"},
+		ops:   []state.CaptureOp{{EventSeq: 1, Path: "slow.go", Op: "modify"}},
+	}
+	start := time.Now()
+	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item)
+	elapsed := time.Since(start)
+	if elapsed > time.Second {
+		t.Fatalf("subject budget exceeded; elapsed=%s want <= ~50ms+overhead", elapsed)
+	}
+	if plan.Subject == "" {
+		t.Fatalf("Subject empty after timeout; expected fallback to singleOpSubject")
+	}
+	// The cheap subject for an "Update slow.go" should resolve via
+	// DiffAwareSubject(op, "") to a non-diff-derived line.
+	if !strings.Contains(plan.Subject, "slow.go") {
+		t.Fatalf("Subject=%q does not reference path; budget fallback may have produced unexpected text", plan.Subject)
+	}
+	if plan.SelectedSeqs[0] != item.event.Seq {
+		t.Fatalf("SelectedSeqs[0]=%d want %d", plan.SelectedSeqs[0], item.event.Seq)
+	}
+}
+
+// TestPathQuiescence_DisabledDoesNotStamp verifies the capture hot-path
+// short-circuit: when ACD_PATH_QUIESCENCE_SECONDS is unset (default), no
+// path entry is recorded by RecordPathWrite, so the tracker stays empty.
+func TestPathQuiescence_DisabledDoesNotStamp(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	// Default-disabled: env unset, gate flag must remain false.
+	t.Setenv(EnvPathQuiescenceSeconds, "")
+	_ = resolvePathQuiescenceSeconds()
+
+	for i := 0; i < 100; i++ {
+		RecordPathWrite("file-"+strconv.Itoa(i)+".go", time.Now())
+	}
+	if got := PathQuiescenceTrackerSize(); got != 0 {
+		t.Fatalf("tracker size=%d want 0 when gate disabled", got)
+	}
+}
+
+// TestPathQuiescence_EvictionBoundsMapSize verifies the eviction guard:
+// after pathQuiescenceMaxEntries entries have been stamped, the next
+// stamp triggers eviction of stale entries (older than 2x window) and
+// keeps the map under the cap.
+func TestPathQuiescence_EvictionBoundsMapSize(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t.Setenv(EnvPathQuiescenceSeconds, "1")
+	_ = resolvePathQuiescenceSeconds()
+
+	// Stamp pathQuiescenceMaxEntries+200 entries with old timestamps so
+	// every one is older than 2x the 1s window. Eviction must fire and
+	// drop the map back below the cap.
+	stale := time.Now().Add(-1 * time.Hour)
+	for i := 0; i < pathQuiescenceMaxEntries+200; i++ {
+		RecordPathWrite("stale-"+strconv.Itoa(i)+".go", stale)
+	}
+	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries {
+		t.Fatalf("tracker size=%d exceeds cap=%d", got, pathQuiescenceMaxEntries)
+	}
+
+	// Every entry was stale and should have been eligible for eviction;
+	// after the over-cap stamp the map should be much smaller than the
+	// hard cap (eviction drops everything older than 2*window).
+	if got := PathQuiescenceTrackerSize(); got > 100 {
+		t.Fatalf("eviction did not prune stale entries; size=%d", got)
+	}
+}
