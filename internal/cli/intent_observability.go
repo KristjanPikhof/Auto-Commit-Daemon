@@ -28,9 +28,17 @@ const pathQuiescenceStaleness = 30 * time.Second
 // pathQuiescenceStaleness. A missing or unparseable timestamp is treated
 // as stale: we would rather under-report the gated subtraction than
 // over-count when the daemon is dead and meta is frozen.
+//
+// Reads daemon_state directly via raw SQL (rather than
+// state.LoadDaemonState) so this stays compatible with the *sql.DB
+// handle the read-only observability paths use.
 func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
-	st, ok, err := state.LoadDaemonState(ctx, conn)
-	if err != nil || !ok || st.PID <= 0 || !identity.Alive(st.PID) {
+	var pid sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT pid FROM daemon_state WHERE id = 1`).Scan(&pid); err != nil {
+		return false
+	}
+	if !pid.Valid || pid.Int64 <= 0 || !identity.Alive(int(pid.Int64)) {
 		return false
 	}
 	v, ok, err := metaLookup(ctx, conn, "path_quiescence.updated_at")
