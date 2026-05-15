@@ -230,13 +230,8 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		plan, err := primary.PlanIntent(ctx, currentReq)
 		if err == nil {
 			plan = NormalizeIntentPlanReasons(plan)
-			plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-			if len(dropped) > 0 {
-				slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
-					slog.String("provider", c.primary.Name()),
-					slog.Any("dropped_seqs", dropped),
-				)
-			}
+			plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+			logIntentPlanNormalization(c.primary.Name(), dropped, synthesized)
 			err = ValidateIntentPlan(req, plan)
 			if err == nil {
 				if plan.Source == "" {
