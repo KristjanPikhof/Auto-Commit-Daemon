@@ -784,6 +784,49 @@ func TestComposedPlanIntentSkipsRetryOnUntypedError(t *testing.T) {
 	}
 }
 
+// TestBuildIntentPlanUserPromptCarriesAboveDiffCapInOpsDiff verifies that
+// per-capture diffs threaded through NewIntentPlanRequest can land in the
+// user prompt at sizes above the per-event ai.DiffCap (4 KiB), bounded by
+// IntentStageDiffCap. The previous implementation hard-wired the planner
+// stage to ai.DiffCap so a single large captured diff was silently
+// truncated to 4 KiB before the planner ever saw it.
+func TestBuildIntentPlanUserPromptCarriesAboveDiffCapInOpsDiff(t *testing.T) {
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	// 12 KiB synthetic captured diff — comfortably above DiffCap and below
+	// IntentStageDiffCap so the threading is observable in the prompt.
+	bigDiff := "@@ -1,1 +1,1200 @@\n" + strings.Repeat("+payload-line\n", 900)
+	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
+		OfferedCaptures: []OfferedCapture{{
+			Seq:          7,
+			Path:         "src/big.go",
+			Op:           "modify",
+			Timestamp:    now,
+			Fidelity:     "full",
+			CapturedDiff: bigDiff,
+		}},
+		IncludeCapturedDiffs: true,
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequest: %v", err)
+	}
+	if got := len(req.OfferedCaptures[0].CapturedDiff); got <= DiffCap {
+		t.Fatalf("CapturedDiff len=%d <= DiffCap=%d; intent-stage cap not applied", got, DiffCap)
+	}
+	if got := len(req.OfferedCaptures[0].CapturedDiff); got > IntentStageDiffCap {
+		t.Fatalf("CapturedDiff len=%d > IntentStageDiffCap=%d; cap exceeded", got, IntentStageDiffCap)
+	}
+	prompt, err := BuildIntentPlanUserPrompt(req)
+	if err != nil {
+		t.Fatalf("BuildIntentPlanUserPrompt: %v", err)
+	}
+	if len(prompt) <= DiffCap {
+		t.Fatalf("user prompt len=%d <= DiffCap=%d; large captured diff was truncated", len(prompt), DiffCap)
+	}
+	if !strings.Contains(prompt, "payload-line") {
+		t.Fatalf("user prompt missing payload-line substring; threading dropped diff body")
+	}
+}
+
 // TestBuildIntentPlanUserPromptIncludesRetryCorrection verifies the user
 // prompt builder appends the correction block when RetryCorrection is set,
 // and omits it on first-attempt requests.
