@@ -39,7 +39,9 @@ func TestStatus_PlannerErrorRateRecent_EmptyLedger(t *testing.T) {
 // TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator asserts
 // that with 50 decisions of which all 50 are planner errors, the rate is
 // 50/100 = 0.5 (NOT 50/50 = 1.0). Documents the fixed-denominator policy
-// chosen for sub-window ledgers.
+// chosen for sub-window ledgers. The warn flag MUST stay false at this
+// row count: see TestStatus_PlannerErrorRateWarnRequiresFullWindow for
+// the gating rationale.
 func TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -65,10 +67,9 @@ func TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator(t *testing.T)
 		t.Fatalf("PlannerErrorRateRecent=%v want %v (fixed denominator: 50/%d)",
 			got, want, IntentRecentDecisionWindow)
 	}
-	if !report.IntentStrategy.PlannerErrorRateRecentWarn {
-		t.Fatalf("PlannerErrorRateRecentWarn must be true when rate=%v exceeds %v",
-			report.IntentStrategy.PlannerErrorRateRecent,
-			IntentPlannerErrorRateWarnThreshold)
+	if report.IntentStrategy.PlannerErrorRateRecentWarn {
+		t.Fatalf("PlannerErrorRateRecentWarn must stay false until ledger reaches %d rows; got true with 50",
+			IntentRecentDecisionWindow)
 	}
 }
 
