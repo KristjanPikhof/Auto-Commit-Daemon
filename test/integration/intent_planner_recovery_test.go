@@ -250,17 +250,27 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
-		seqs := offeredIntentSeqs(t, req)
-		if len(seqs) < 2 {
+		captures := offeredIntentCaptures(t, req)
+		if len(captures) < 2 {
 			http.Error(w, "expected at least two offered captures", http.StatusBadRequest)
 			return
 		}
-		// Select the FIRST offered seq (the helper file, "warm.txt"), defer
-		// the rest (which includes the Go file we want to forced-singleton).
-		// ValidateIntentPlan requires non-empty selected_seqs, so we cannot
-		// "defer everything" through openai-compat.
-		selected := seqs[:1]
-		deferred := seqs[1:]
+		// Find overdue.go and defer it; select everything else. We MUST key
+		// on path (not seq order) because capture enumeration is path-sorted
+		// — a basename-alphabetical comparison would put overdue.go ahead of
+		// warm.txt regardless of write order.
+		var selected, deferred []int64
+		for _, c := range captures {
+			if c.Path == "overdue.go" {
+				deferred = append(deferred, c.Seq)
+			} else {
+				selected = append(selected, c.Seq)
+			}
+		}
+		if len(selected) == 0 || len(deferred) == 0 {
+			http.Error(w, "expected at least one selected and one deferred capture", http.StatusBadRequest)
+			return
+		}
 		plan := map[string]any{
 			"selected_seqs":    selected,
 			"deferred_seqs":    deferred,
