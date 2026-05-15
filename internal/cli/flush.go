@@ -155,8 +155,30 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 		return fmt.Errorf("acd flush: touch client: %w", err)
 	}
 	if !ok {
-		// Lazy-register: matches `acd wake` behaviour. Pure heartbeat for
-		// callers that only want to register the session before flushing.
+		if logical {
+			// Logical-flush MUST NOT lazy-register. Bypassing
+			// IntentMinPending and forcing the daemon to drain on demand
+			// is a privileged operation; allowing any same-user process
+			// to invent an arbitrary session-id and trigger a commit
+			// boundary would let unrelated processes interleave commits
+			// into an active agent session. Heartbeat-only mode keeps
+			// the existing wake/touch lazy-register semantics — only the
+			// drain-bypass surface is gated on a pre-existing
+			// registered client.
+			res := flushResult{
+				OK:            true,
+				Logical:       true,
+				Skipped:       true,
+				SkippedReason: "unknown_session",
+				RefusedReason: "unknown_session",
+				Repo:          repo,
+				SessionID:     sessionID,
+			}
+			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush (session %s not registered; pass --session-id from the harness or run a heartbeat-only flush first)", sessionID))
+		}
+		// Heartbeat-only mode: lazy-register matches `acd wake`
+		// semantics so callers that only want to register the session
+		// before flushing keep working.
 		if err := state.RegisterClient(ctx, db, state.Client{
 			SessionID:    sessionID,
 			Harness:      "other",
