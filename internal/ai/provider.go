@@ -224,13 +224,23 @@ func logIntentPlanNormalization(provider string, dropped, synthesized []int64) {
 // to deterministic.
 func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanner, req IntentPlanRequest) (IntentPlan, error) {
 	const maxAttempts = 2
+	retryEnabled := intentRetryOnInvalidEnabled()
 	currentReq := req
-	var lastErr error
+	var (
+		lastErr      error
+		dropped      []int64
+		synthesized  []int64
+	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		plan, err := primary.PlanIntent(ctx, currentReq)
 		if err == nil {
 			plan = NormalizeIntentPlanReasons(plan)
-			plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+			// Pre-declared `dropped` / `synthesized` so the assignment uses
+			// `=` (not `:=`) and does NOT shadow the outer `plan` declared
+			// by the for-loop's `plan, err := primary.PlanIntent(...)`.
+			// The earlier `:=` form silently created a fresh inner binding
+			// that the surrounding return paths could never observe.
+			plan, dropped, synthesized = NormalizeIntentPlanDeferredReasons(plan)
 			logIntentPlanNormalization(c.primary.Name(), dropped, synthesized)
 			err = ValidateIntentPlan(req, plan)
 			if err == nil {
@@ -247,7 +257,28 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		if attempt >= maxAttempts || !errors.As(err, &typed) {
 			break
 		}
-		slog.Info("intent planner: retrying after validation error",
+		// Operator opt-out: ACD_INTENT_RETRY_ON_INVALID=0|false|no|off
+		// disables the retry loop so the daemon falls straight through to
+		// deterministic. Useful when an upstream gateway bills per call
+		// and the operator prefers to skip the second round-trip.
+		if !retryEnabled {
+			break
+		}
+		// Skip retry for codes the provider-side normalizer is supposed to
+		// heal. If validation still fails after NormalizeIntentPlanDeferredReasons
+		// ran on these codes, the planner output is in a worse state than
+		// the error code suggests; a second round-trip would burn budget
+		// without changing the outcome.
+		if typed.Code == IntentPlanValidationDeferredReasonNotDeferred ||
+			typed.Code == IntentPlanValidationDeferredReasonMissing {
+			slog.Info("intent planner: skipping retry for healed code",
+				slog.String("provider", c.primary.Name()),
+				slog.Int("code", int(typed.Code)),
+				slog.Int64("seq", typed.Seq),
+			)
+			break
+		}
+		slog.Info("intent planner: retry attempted",
 			slog.String("provider", c.primary.Name()),
 			slog.Int("code", int(typed.Code)),
 			slog.Int64("seq", typed.Seq),
@@ -257,4 +288,18 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		currentReq.RetryCorrection = typed.Message
 	}
 	return IntentPlan{}, lastErr
+}
+
+// intentRetryOnInvalidEnabled reports whether the composed retry loop
+// should re-prompt the primary planner after a typed validation error.
+// Default is enabled. The operator can opt out with
+// ACD_INTENT_RETRY_ON_INVALID set to "0", "false", "no", or "off"
+// (case-insensitive). Other values keep the default.
+func intentRetryOnInvalidEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ACD_INTENT_RETRY_ON_INVALID"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
