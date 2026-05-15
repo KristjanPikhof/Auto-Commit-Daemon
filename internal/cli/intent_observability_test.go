@@ -61,7 +61,7 @@ func TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator(t *testing.T)
 	want := 0.5
 	if got := report.IntentStrategy.PlannerErrorRateRecent; got != want {
 		t.Fatalf("PlannerErrorRateRecent=%v want %v (fixed denominator: 50/%d)",
-			got, want, ai.IntentRecentDecisionWindowOrFallback())
+			got, want, IntentRecentDecisionWindow)
 	}
 	if !report.IntentStrategy.PlannerErrorRateRecentWarn {
 		t.Fatalf("PlannerErrorRateRecentWarn must be true when rate=%v exceeds %v",
