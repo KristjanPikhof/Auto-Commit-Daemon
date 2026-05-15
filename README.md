@@ -433,7 +433,7 @@ export ACD_INTENT_WINDOW=10                     # max pending captures offered t
 export ACD_INTENT_MIN_PENDING=4                 # preferred count gate before a normal planner pass starts (lower for sparse repos)
 export ACD_INTENT_MAX_PENDING_AGE=5m            # age escape hatch when pending count never reaches MIN_PENDING
 export ACD_INTENT_RECENT_COMMITS=5              # recent branch/path commits sent to planner as context
-export ACD_INTENT_DEFER_LIMIT=2                 # deferrals allowed before the overdue capture is forced into a one-item commit
+export ACD_INTENT_DEFER_LIMIT=1                 # deferrals allowed before the overdue capture is forced into a one-item commit (Wave 2 default)
 ~~~
 
 Notes:
