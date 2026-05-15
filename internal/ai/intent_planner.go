@@ -238,25 +238,44 @@ type IntentPlanValidationError struct {
 func (e *IntentPlanValidationError) Error() string { return e.Message }
 
 // ValidateIntentPlan rejects malformed or incomplete planner output before it
-// can influence replay.
+// can influence replay. All failures return *IntentPlanValidationError so the
+// composed retry loop can quote the message back to the planner; the Code
+// field classifies the failure for telemetry and future provider-side
+// normalization.
 func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	if len(plan.SelectedSeqs) == 0 {
-		return errors.New("intent planner: selected_seqs must be non-empty")
+		return &IntentPlanValidationError{
+			Code:    IntentPlanValidationShape,
+			Message: "intent planner: selected_seqs must be non-empty",
+		}
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
-		return errors.New("intent planner: subject must be non-empty")
+		return &IntentPlanValidationError{
+			Code:    IntentPlanValidationShape,
+			Message: "intent planner: subject must be non-empty",
+		}
 	}
 	if strings.TrimSpace(plan.GroupingReason) == "" {
-		return errors.New("intent planner: grouping_reason must be non-empty")
+		return &IntentPlanValidationError{
+			Code:    IntentPlanValidationShape,
+			Message: "intent planner: grouping_reason must be non-empty",
+		}
 	}
 
 	offered := make(map[int64]struct{}, len(req.OfferedCaptures))
 	for _, capture := range req.OfferedCaptures {
 		if capture.Seq == 0 {
-			return errors.New("intent planner: offered capture seq must be non-zero")
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: "intent planner: offered capture seq must be non-zero",
+			}
 		}
 		if _, exists := offered[capture.Seq]; exists {
-			return fmt.Errorf("intent planner: duplicate offered seq %d", capture.Seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     capture.Seq,
+				Message: fmt.Sprintf("intent planner: duplicate offered seq %d", capture.Seq),
+			}
 		}
 		offered[capture.Seq] = struct{}{}
 	}
@@ -264,10 +283,18 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	selected := make(map[int64]struct{}, len(plan.SelectedSeqs))
 	for _, seq := range plan.SelectedSeqs {
 		if _, ok := offered[seq]; !ok {
-			return fmt.Errorf("intent planner: selected seq %d outside offered window", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationOfferedWindow,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: selected seq %d outside offered window", seq),
+			}
 		}
 		if _, exists := selected[seq]; exists {
-			return fmt.Errorf("intent planner: duplicate selected seq %d", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: duplicate selected seq %d", seq),
+			}
 		}
 		selected[seq] = struct{}{}
 	}
@@ -275,13 +302,25 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
 	for _, seq := range plan.DeferredSeqs {
 		if _, ok := offered[seq]; !ok {
-			return fmt.Errorf("intent planner: deferred seq %d is unknown", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationOfferedWindow,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: deferred seq %d is unknown", seq),
+			}
 		}
 		if _, exists := deferred[seq]; exists {
-			return fmt.Errorf("intent planner: duplicate deferred seq %d", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: duplicate deferred seq %d", seq),
+			}
 		}
 		if _, overlap := selected[seq]; overlap {
-			return fmt.Errorf("intent planner: seq %d appears in selected and deferred", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: seq %d appears in selected and deferred", seq),
+			}
 		}
 		deferred[seq] = struct{}{}
 	}
@@ -294,9 +333,16 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 			if _, ok := deferred[seq]; ok {
 				continue
 			}
-			return fmt.Errorf("intent planner: offered seq %d omitted from selected/deferred", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: offered seq %d omitted from selected/deferred", seq),
+			}
 		}
-		return errors.New("intent planner: selected/deferred coverage mismatch")
+		return &IntentPlanValidationError{
+			Code:    IntentPlanValidationShape,
+			Message: "intent planner: selected/deferred coverage mismatch",
+		}
 	}
 
 	reasons := make(map[int64]struct{}, len(plan.DeferredReasons))
@@ -314,16 +360,28 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 			}
 		}
 		if _, exists := reasons[reason.Seq]; exists {
-			return fmt.Errorf("intent planner: duplicate deferred reason for seq %d", reason.Seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     reason.Seq,
+				Message: fmt.Sprintf("intent planner: duplicate deferred reason for seq %d", reason.Seq),
+			}
 		}
 		if strings.TrimSpace(reason.Reason) == "" {
-			return fmt.Errorf("intent planner: deferred seq %d reason must be non-empty", reason.Seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationDeferredReasonMissing,
+				Seq:     reason.Seq,
+				Message: fmt.Sprintf("intent planner: deferred seq %d reason must be non-empty", reason.Seq),
+			}
 		}
 		reasons[reason.Seq] = struct{}{}
 	}
 	for seq := range deferred {
 		if _, ok := reasons[seq]; !ok {
-			return fmt.Errorf("intent planner: deferred seq %d missing reason", seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationDeferredReasonMissing,
+				Seq:     seq,
+				Message: fmt.Sprintf("intent planner: deferred seq %d missing reason", seq),
+			}
 		}
 	}
 
