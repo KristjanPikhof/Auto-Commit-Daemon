@@ -190,4 +190,3 @@ func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
 		t.Fatalf("refused flush enqueued %s rows; expected 0\nrows: %s", pending, body)
 	}
 }
-

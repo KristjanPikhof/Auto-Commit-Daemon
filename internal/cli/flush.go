@@ -47,18 +47,18 @@ import (
 
 // flushResult is the JSON payload returned by `acd flush --json`.
 type flushResult struct {
-	OK              bool    `json:"ok"`
-	LastSeenTS      float64 `json:"last_seen_ts"`
-	Logical         bool    `json:"logical,omitempty"`
-	FlushRequestID  int64   `json:"flush_request_id,omitempty"`
-	DaemonPID       int     `json:"daemon_pid,omitempty"`
-	SentSignal      bool    `json:"sent_signal,omitempty"`
-	Skipped         bool    `json:"skipped,omitempty"`
-	SkippedReason   string  `json:"skipped_reason,omitempty"`
-	RefusedReason   string  `json:"refused_reason,omitempty"`
-	Repo            string  `json:"repo"`
-	SessionID       string  `json:"session_id"`
-	BypassMinPending bool   `json:"bypass_min_pending,omitempty"`
+	OK               bool    `json:"ok"`
+	LastSeenTS       float64 `json:"last_seen_ts"`
+	Logical          bool    `json:"logical,omitempty"`
+	FlushRequestID   int64   `json:"flush_request_id,omitempty"`
+	DaemonPID        int     `json:"daemon_pid,omitempty"`
+	SentSignal       bool    `json:"sent_signal,omitempty"`
+	Skipped          bool    `json:"skipped,omitempty"`
+	SkippedReason    string  `json:"skipped_reason,omitempty"`
+	RefusedReason    string  `json:"refused_reason,omitempty"`
+	Repo             string  `json:"repo"`
+	SessionID        string  `json:"session_id"`
+	BypassMinPending bool    `json:"bypass_min_pending,omitempty"`
 }
 
 func newFlushCmd() *cobra.Command {
