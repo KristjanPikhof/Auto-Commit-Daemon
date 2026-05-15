@@ -736,3 +736,228 @@ func TestBuildIntentPlanUserPromptIncludesRetryCorrection(t *testing.T) {
 		t.Fatalf("retry prompt missing corrective instruction:\n%s", second)
 	}
 }
+
+// TestNormalizeIntentPlanDeferredReasonsSynthesizesMissingEntries covers the
+// two-missing-seqs synth path: deferred_seqs has two entries, deferred_reasons
+// is empty, normalize synthesizes both with the marker text and reports them
+// in DeferredSeqs order.
+func TestNormalizeIntentPlanDeferredReasonsSynthesizesMissingEntries(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10},
+		DeferredSeqs: []int64{11, 12},
+		// DeferredReasons intentionally empty.
+	}
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 0 {
+		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(synthesized) != 2 || synthesized[0] != 11 || synthesized[1] != 12 {
+		t.Fatalf("synthesized=%v want [11 12]", synthesized)
+	}
+	if len(cleaned.DeferredReasons) != 2 {
+		t.Fatalf("cleaned reasons len=%d want 2", len(cleaned.DeferredReasons))
+	}
+	for i, want := range []int64{11, 12} {
+		if cleaned.DeferredReasons[i].Seq != want {
+			t.Fatalf("cleaned[%d].Seq=%d want %d", i, cleaned.DeferredReasons[i].Seq, want)
+		}
+		if cleaned.DeferredReasons[i].Reason != IntentPlanReasonMarker {
+			t.Fatalf("cleaned[%d].Reason=%q want %q", i, cleaned.DeferredReasons[i].Reason, IntentPlanReasonMarker)
+		}
+	}
+}
+
+// TestNormalizeIntentPlanDeferredReasonsMixedDropAndSynth covers the case
+// where the planner emits one spurious entry (drop) and omits a real one
+// (synth); both lists are populated and the cleaned plan reflects the fix.
+func TestNormalizeIntentPlanDeferredReasonsMixedDropAndSynth(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10},
+		DeferredSeqs: []int64{11, 12},
+		DeferredReasons: []DeferredReason{
+			{Seq: 11, Reason: "docs change is independent"},
+			{Seq: 99, Reason: "spurious entry"},
+		},
+	}
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 1 || dropped[0] != 99 {
+		t.Fatalf("dropped=%v want [99]", dropped)
+	}
+	if len(synthesized) != 1 || synthesized[0] != 12 {
+		t.Fatalf("synthesized=%v want [12]", synthesized)
+	}
+	// Cleaned should preserve the original valid entry then append the
+	// synthesized marker entry.
+	if len(cleaned.DeferredReasons) != 2 {
+		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+	if cleaned.DeferredReasons[0].Seq != 11 || cleaned.DeferredReasons[0].Reason != "docs change is independent" {
+		t.Fatalf("cleaned[0]=%+v want preserved entry for 11", cleaned.DeferredReasons[0])
+	}
+	if cleaned.DeferredReasons[1].Seq != 12 || cleaned.DeferredReasons[1].Reason != IntentPlanReasonMarker {
+		t.Fatalf("cleaned[1]=%+v want synthesized marker for 12", cleaned.DeferredReasons[1])
+	}
+}
+
+// TestNormalizeIntentPlanDeferredReasonsIdempotentOnSecondCall verifies the
+// double-invocation property required by the defense-in-depth pass in
+// planIntentWithFallback: after one normalization, a second call must
+// return empty dropped/synthesized so we never duplicate the slog.Warn.
+func TestNormalizeIntentPlanDeferredReasonsIdempotentOnSecondCall(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10},
+		DeferredSeqs: []int64{11, 12},
+		DeferredReasons: []DeferredReason{
+			{Seq: 99, Reason: "spurious"},
+		},
+	}
+	cleaned1, dropped1, synthesized1 := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped1) != 1 || len(synthesized1) != 2 {
+		t.Fatalf("first pass dropped=%v synthesized=%v", dropped1, synthesized1)
+	}
+	cleaned2, dropped2, synthesized2 := NormalizeIntentPlanDeferredReasons(cleaned1)
+	if dropped2 != nil {
+		t.Fatalf("second pass dropped=%v want nil", dropped2)
+	}
+	if synthesized2 != nil {
+		t.Fatalf("second pass synthesized=%v want nil", synthesized2)
+	}
+	if len(cleaned2.DeferredReasons) != len(cleaned1.DeferredReasons) {
+		t.Fatalf("second pass altered reasons: %+v vs %+v", cleaned1.DeferredReasons, cleaned2.DeferredReasons)
+	}
+}
+
+// TestComposedPlanIntentMixedNormalizeEmitsSingleWarn drives a mixed
+// drop+synth response through Compose(scriptedPrimary, deterministic) and
+// asserts the composed layer emits exactly one warn line naming both the
+// dropped and synthesized seqs.
+func TestComposedPlanIntentMixedNormalizeEmitsSingleWarn(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			// Drop: seq 101 is selected, not deferred.
+			{Seq: 101, Reason: "spurious"},
+			// (No entry for 102 so synth fires too.)
+		},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{plan},
+	}
+	logs := captureSlogDefault(t)
+	planner := Compose(primary, DeterministicProvider{})
+	got, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if primary.calls != 1 {
+		t.Fatalf("primary calls=%d want 1 (no retry needed after normalize)", primary.calls)
+	}
+	if len(got.DeferredReasons) != 1 || got.DeferredReasons[0].Seq != 102 || got.DeferredReasons[0].Reason != IntentPlanReasonMarker {
+		t.Fatalf("normalized plan reasons=%+v want one synth marker for 102", got.DeferredReasons)
+	}
+	lines := logs()
+	warns := 0
+	for _, line := range lines {
+		if strings.Contains(line, "intent planner: normalized deferred_reasons") {
+			warns++
+			if !strings.Contains(line, "dropped_seqs") {
+				t.Fatalf("warn line missing dropped_seqs: %s", line)
+			}
+			if !strings.Contains(line, "synthesized_seqs") {
+				t.Fatalf("warn line missing synthesized_seqs: %s", line)
+			}
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("normalize warns=%d want exactly 1 per response\nlogs:\n%s", warns, strings.Join(lines, "\n"))
+	}
+}
+
+// TestComposedPlanIntentNormalizeStaysSilentOnCleanPlan asserts the no-op
+// path: when the planner output already validates, neither the provider-side
+// normalize nor the composed-layer normalize emits a warn.
+func TestComposedPlanIntentNormalizeStaysSilentOnCleanPlan(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	clean := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			{Seq: 102, Reason: "documentation change is separate"},
+		},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{clean},
+	}
+	logs := captureSlogDefault(t)
+	planner := Compose(primary, DeterministicProvider{})
+	if _, err := planner.(IntentPlanner).PlanIntent(context.Background(), req); err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	for _, line := range logs() {
+		if strings.Contains(line, "intent planner: normalized deferred_reasons") {
+			t.Fatalf("unexpected normalize warn for clean plan: %s", line)
+		}
+	}
+}
+
+// TestNormalizeIntentPlanDeferredReasonsSynthEmptyReasons exercises the
+// minimal synth path: deferred_seqs=[X], deferred_reasons empty, the planner
+// supplied a perfectly valid plan minus the reason. After normalize, the
+// plan validates without any drop.
+func TestNormalizeIntentPlanDeferredReasonsSynthEmptyReasons(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10},
+		DeferredSeqs: []int64{11},
+	}
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 0 {
+		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(synthesized) != 1 || synthesized[0] != 11 {
+		t.Fatalf("synthesized=%v want [11]", synthesized)
+	}
+	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Reason != IntentPlanReasonMarker {
+		t.Fatalf("cleaned=%+v want one synth marker entry", cleaned.DeferredReasons)
+	}
+}
+
+// TestComposedPlanIntentSynthMarkerSurfacesInDeferredReasons end-to-ends the
+// marker visibility contract: the marker survives Compose's normalize +
+// validate pipeline and lands in the returned plan's DeferredReasons.Reason.
+// This is the value daemon/replay.go writes into decision_records.reason via
+// recordIntentDeferrals (line 1349) and AppendDecision (line 1380); a
+// daemon-side test in replay_test.go can re-assert the column round-trip.
+func TestComposedPlanIntentSynthMarkerSurfacesInDeferredReasons(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		// DeferredReasons missing the entry for 102.
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{plan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	got, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if len(got.DeferredReasons) != 1 || got.DeferredReasons[0].Seq != 102 {
+		t.Fatalf("deferred reasons=%+v", got.DeferredReasons)
+	}
+	if got.DeferredReasons[0].Reason != IntentPlanReasonMarker {
+		t.Fatalf("returned reason=%q want marker %q for round-trip into decision_records.reason",
+			got.DeferredReasons[0].Reason, IntentPlanReasonMarker)
+	}
+}
