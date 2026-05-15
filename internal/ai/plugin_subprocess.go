@@ -340,13 +340,19 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 {
-		p.logger.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 {
+		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("plugin", p.name),
-			slog.Any("dropped_seqs", dropped),
-		)
+		}
+		if len(dropped) > 0 {
+			attrs = append(attrs, slog.Any("dropped_seqs", dropped))
+		}
+		if len(synthesized) > 0 {
+			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		p.logger.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
