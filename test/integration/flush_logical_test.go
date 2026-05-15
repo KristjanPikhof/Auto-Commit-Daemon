@@ -191,13 +191,3 @@ func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
 	}
 }
 
-// shutdownDaemon is the same teardown used by adapter_e2e_test.go's runs.
-// We re-declare it locally only if it's not already package-visible — go
-// will fail compilation if both are defined, so this stub references the
-// existing helper indirectly. (No-op if already in scope.)
-
-func init() {
-	// Keep the import block live in this file even when the helper is
-	// defined elsewhere — `fmt` is otherwise unused in some build slices.
-	_ = fmt.Sprintf
-}
