@@ -763,6 +763,18 @@ type intentReplayConfig struct {
 	deferLimit      int
 	includeDiffs    bool
 	bypassBatchWait bool
+	// pathQuiescence is the per-path silence window read from
+	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
+	// disables the gate; any positive value defers offering pending
+	// captures for path P to the planner until P has been quiet for at
+	// least that long.
+	pathQuiescence time.Duration
+	// recentCommitAffinity is the prior-commit affinity window read from
+	// ACD_RECENT_COMMIT_AFFINITY_SECONDS. Zero disables the hint; any
+	// positive value populates IntentPlanRequest.PathRecentCommits with
+	// the matching HEAD commit for any offered path whose most recent
+	// HEAD commit landed within the window.
+	recentCommitAffinity time.Duration
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
