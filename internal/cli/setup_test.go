@@ -585,6 +585,80 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	}
 }
 
+// TestSetup_ClaudeCode_StopHookCallsFlushLogical guards the d1 rewire: the
+// Claude Code Stop hook must call `acd flush --logical` rather than the
+// legacy `acd touch`. The rewire is the whole point of the d1 task — Stop
+// fires when Claude finishes a turn, and we want pending captures to
+// commit immediately rather than wait the full IntentMaxPendingAge timer.
+// Regression target: a future template edit reverting to acd touch would
+// silently re-introduce the 5-minute commit lag.
+func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 {
+		t.Fatalf("no JSON block")
+	}
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	stop := settings.Hooks["Stop"]
+	if len(stop) == 0 || len(stop[0].Hooks) == 0 {
+		t.Fatalf("Stop hook missing")
+	}
+	cmd := stop[0].Hooks[0].Command
+	if !strings.Contains(cmd, "acd flush --logical") {
+		t.Errorf("Stop hook must call `acd flush --logical`, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "acd touch") {
+		t.Errorf("Stop hook still calls legacy `acd touch` — rewire incomplete: %s", cmd)
+	}
+	// Same fail-soft pattern as the legacy touch body: stderr lands in $LOG.
+	if !strings.Contains(cmd, `2>>"$LOG"`) {
+		t.Errorf("Stop hook missing stderr->LOG redirect: %s", cmd)
+	}
+}
+
+// TestSetup_OpenCode_IdleHookCallsFlushLogical mirrors the claude-code rewire
+// guard for the OpenCode session.idle event: it must call `acd flush
+// --logical` (under the new acd-flush-idle id) instead of the legacy
+// acd-touch-idle / `acd touch` body.
+func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
+	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	if strings.Contains(body, "- id: acd-touch-idle") {
+		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+	}
+	block := yamlHookBlock(t, body, "acd-flush-idle")
+	if !strings.Contains(block, "acd flush --logical") {
+		t.Errorf("opencode acd-flush-idle must call `acd flush --logical`:\n%s", block)
+	}
+	if !strings.Contains(block, "session.idle") {
+		t.Errorf("opencode acd-flush-idle must bind to session.idle event:\n%s", block)
+	}
+}
+
+// TestSetup_Pi_IdleHookCallsFlushLogical mirrors the OpenCode case for Pi.
+func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	if strings.Contains(body, "- id: acd-touch-idle") {
+		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+	}
+	block := yamlHookBlock(t, body, "acd-flush-idle")
+	if !strings.Contains(block, "acd flush --logical") {
+		t.Errorf("pi acd-flush-idle must call `acd flush --logical`:\n%s", block)
+	}
+	if !strings.Contains(block, "session.idle") {
+		t.Errorf("pi acd-flush-idle must bind to session.idle event:\n%s", block)
+	}
+}
+
 // TestSetup_OpenCode_AllHooksGateMkdir guards that every opencode YAML hook
 // body gates `mkdir -p` behind a `[ -d "$LOG_DIR" ]` check, mirroring the
 // codex template invariant. Unconditional `mkdir -p` on every hook event
