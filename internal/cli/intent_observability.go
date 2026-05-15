@@ -45,12 +45,17 @@ type intentStrategyReport struct {
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
 	// many decisions have actually been recorded — the rate moves smoothly
 	// as the ledger fills rather than oscillating wildly during the first
-	// few decisions. Empty ledgers report 0.0 (no errors observed in a
-	// 100-decision window). The `,omitzero` tag keeps the field absent from
-	// JSON when no decisions have ever been recorded so that downstream
-	// tooling can distinguish "never observed" (absent) from "observed,
-	// rate is exactly zero" (present, value 0.0). A non-zero rate is
-	// always present.
+	// few decisions.
+	//
+	// JSON encoding: the field uses `,omitempty` so a zero rate is
+	// absent from the payload. Operators consuming this metric should
+	// treat absent and 0.0 identically — both mean "no planner errors
+	// observed in the most recent window". The decision_records table
+	// existence check upstream (see loadIntentRecentRates) already gates
+	// the field off when no decisions have ever been recorded, so the
+	// "never observed" vs "observed, exactly zero" distinction is not
+	// meaningful from the JSON shape and operators should not try to
+	// infer it.
 	PlannerErrorRateRecent float64 `json:"planner_error_rate_recent,omitempty"`
 	// SingletonCommitRateRecent is the share of one-event commits in the
 	// most recent IntentRecentCommitWindow distinct commit OIDs. The
