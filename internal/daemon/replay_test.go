@@ -2826,6 +2826,10 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	}
 
 	planner := &recordingIntentPlanner{
+		// Only the first replay reaches the planner: the first call defers
+		// pending[1] and selects pending[0]. The second replay falls into
+		// the forced-aging singleton fast path (provider skipped), so the
+		// second plan in this slice is never consumed.
 		plans: []ai.IntentPlan{
 			{
 				SelectedSeqs:   []int64{pending[0].Seq},
@@ -2835,11 +2839,6 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 				DeferredReasons: []ai.DeferredReason{
 					{Seq: pending[1].Seq, Reason: "waiting for related edit"},
 				},
-			},
-			{
-				SelectedSeqs:   []int64{pending[1].Seq},
-				Subject:        "Publish aged capture",
-				GroupingReason: "forced aging",
 			},
 		},
 	}
