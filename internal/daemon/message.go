@@ -354,19 +354,19 @@ func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp, outer
 
 	switch op.Op {
 	case "create":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: emptyBlobOID, afterOID: afterOID,
 			newFileMode: afterMode,
 		})
 	case "delete":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: emptyBlobOID,
 			deletedFileMode: beforeMode,
 		})
 	case "modify":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			oldMode: beforeMode, newMode: afterMode,
@@ -376,14 +376,14 @@ func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp, outer
 		if from == "" {
 			from = path
 		}
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: from, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			renameFrom: from, renameTo: path,
 			oldMode: beforeMode, newMode: afterMode,
 		})
 	case "mode":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			oldMode: beforeMode, newMode: afterMode,
