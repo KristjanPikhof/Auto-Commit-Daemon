@@ -24,10 +24,8 @@ Common workflow:
 Diagnostics and recovery:
   acd diagnose     Inspect replay blockers and branch anchors
   acd doctor       Run diagnostics and optionally bundle a support zip
-  acd recover      Retarget stale replay state after branch incidents
   acd pause        Pause capture and replay
   acd resume       Resume capture and replay
-  acd purge-events Delete non-published queued events
 
 Setup:
   acd setup        Print harness install snippets
