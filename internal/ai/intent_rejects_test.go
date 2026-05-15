@@ -315,6 +315,149 @@ func TestLogRejectedIntentPlan_PersistsTypedCode(t *testing.T) {
 	}
 }
 
+// TestLogRejectedIntentPlan_DefaultsToRedacted asserts that without the
+// ACD_INTENT_REJECTS_RAW opt-in, the rejects log row carries a redacted
+// RawResponse (empty), the redaction marker is set, and size + sha256 of
+// the original payload are still recorded for forensic cross-check.
+func TestLogRejectedIntentPlan_DefaultsToRedacted(t *testing.T) {
+	dir := t.TempDir()
+	w := NewIntentRejectsWriter(dir, time.Now)
+	prev := SetIntentRejectsLoggerForTest(w)
+	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+
+	// Ensure the env opt-in is unset for this test.
+	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
+	resetIntentRejectsRawWarnOnceForTest(t)
+
+	raw := `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan","arguments":"{\"selected_seqs\":[101],\"deferred_seqs\":[102,103],\"subject\":\"x\",\"body\":\"\",\"grouping_reason\":\"y\",\"deferred_reasons\":[]}"}}]}}]}`
+	LogRejectedIntentPlan(context.Background(), "openai-compat",
+		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}, {Seq: 103}}},
+		raw,
+		&IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonMissing, Seq: 102, Message: "missing reason"},
+	)
+
+	body, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var got IntentRejectedPlan
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &got); err != nil {
+		t.Fatalf("Unmarshal: %v body=%q", err, string(body))
+	}
+	if got.RawResponse != "" {
+		t.Fatalf("RawResponse must be empty by default, got %q", got.RawResponse)
+	}
+	if !got.RawResponseRedacted {
+		t.Fatalf("RawResponseRedacted=false want true (default redaction)")
+	}
+	if got.RawResponseSizeBytes != len(raw) {
+		t.Fatalf("RawResponseSizeBytes=%d want %d", got.RawResponseSizeBytes, len(raw))
+	}
+	if got.RawResponseSHA256 == "" {
+		t.Fatalf("RawResponseSHA256 must be populated alongside redacted body")
+	}
+	// sha256 hex is 64 chars.
+	if len(got.RawResponseSHA256) != 64 {
+		t.Fatalf("RawResponseSHA256 len=%d want 64", len(got.RawResponseSHA256))
+	}
+}
+
+// TestLogRejectedIntentPlan_VerbatimOnEnvOptIn asserts that
+// ACD_INTENT_REJECTS_RAW=1 (or true/yes/on) populates RawResponse verbatim,
+// flips RawResponseRedacted off, and still records size + sha256 so
+// downstream tooling can cross-check the body.
+func TestLogRejectedIntentPlan_VerbatimOnEnvOptIn(t *testing.T) {
+	for _, val := range []string{"1", "true", "TRUE", "yes", "on"} {
+		t.Run("env="+val, func(t *testing.T) {
+			dir := t.TempDir()
+			w := NewIntentRejectsWriter(dir, time.Now)
+			prev := SetIntentRejectsLoggerForTest(w)
+			t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+
+			t.Setenv("ACD_INTENT_REJECTS_RAW", val)
+			resetIntentRejectsRawWarnOnceForTest(t)
+
+			raw := `{"selected_seqs":[101],"deferred_seqs":[]}`
+			LogRejectedIntentPlan(context.Background(), "openai-compat",
+				IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}}},
+				raw,
+				&IntentPlanValidationError{Code: IntentPlanValidationShape, Message: "missing seq"},
+			)
+			body, err := os.ReadFile(w.Path())
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			var got IntentRejectedPlan
+			if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &got); err != nil {
+				t.Fatalf("Unmarshal: %v body=%q", err, string(body))
+			}
+			if got.RawResponse != raw {
+				t.Fatalf("RawResponse=%q want %q (verbatim)", got.RawResponse, raw)
+			}
+			if got.RawResponseRedacted {
+				t.Fatalf("RawResponseRedacted=true want false (verbatim opt-in)")
+			}
+			if got.RawResponseSizeBytes != len(raw) {
+				t.Fatalf("RawResponseSizeBytes=%d want %d (cross-check)", got.RawResponseSizeBytes, len(raw))
+			}
+			if got.RawResponseSHA256 == "" {
+				t.Fatalf("RawResponseSHA256 empty; verbatim path must still record sha256 for cross-check")
+			}
+		})
+	}
+}
+
+// TestLogRejectedIntentPlan_RedactedRoundTripsParsedPlanSummary asserts
+// that even with the raw response stripped, the rejected-plan record
+// carries a ParsedPlanSummary so operators can see the plan shape that
+// triggered rejection.
+func TestLogRejectedIntentPlan_RedactedRoundTripsParsedPlanSummary(t *testing.T) {
+	dir := t.TempDir()
+	w := NewIntentRejectsWriter(dir, time.Now)
+	prev := SetIntentRejectsLoggerForTest(w)
+	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+
+	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
+	resetIntentRejectsRawWarnOnceForTest(t)
+
+	raw := `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan","arguments":"{\"selected_seqs\":[101,102],\"deferred_seqs\":[103],\"subject\":\"x\",\"body\":\"\",\"grouping_reason\":\"y\",\"deferred_reasons\":[]}"}}]}}]}`
+	LogRejectedIntentPlan(context.Background(), "openai-compat",
+		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}, {Seq: 103}}},
+		raw,
+		&IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonMissing, Seq: 103, Message: "missing reason"},
+	)
+	body, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var got IntentRejectedPlan
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(body))), &got); err != nil {
+		t.Fatalf("Unmarshal: %v body=%q", err, string(body))
+	}
+	if got.RawResponse != "" {
+		t.Fatalf("RawResponse must be empty under default redaction, got %q", got.RawResponse)
+	}
+	if got.ParsedPlanSummary == nil {
+		t.Fatalf("ParsedPlanSummary nil; redacted record must still carry plan shape")
+	}
+	if got.ParsedPlanSummary.SelectedCount != 2 {
+		t.Fatalf("SelectedCount=%d want 2", got.ParsedPlanSummary.SelectedCount)
+	}
+	if got.ParsedPlanSummary.DeferredCount != 1 {
+		t.Fatalf("DeferredCount=%d want 1", got.ParsedPlanSummary.DeferredCount)
+	}
+}
+
+// resetIntentRejectsRawWarnOnceForTest swaps the package-level sync.Once
+// so each verbatim-opt-in test sees the warn fire (at most once per test
+// invocation). Callers register cleanup automatically.
+func resetIntentRejectsRawWarnOnceForTest(t *testing.T) {
+	t.Helper()
+	prev := intentRejectsRawWarnOnce
+	intentRejectsRawWarnOnce = sync.Once{}
+	t.Cleanup(func() { intentRejectsRawWarnOnce = prev })
+}
+
 // TestConfigureIntentRejectsLogger_EmptyDirDisables asserts that
 // configuring with an empty gitDir clears the writer so subsequent calls
 // no-op. The CLI / pre-daemon paths use this to disable the writer in
