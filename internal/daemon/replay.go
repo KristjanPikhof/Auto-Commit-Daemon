@@ -1772,7 +1772,7 @@ func publishIntentSelection(
 		if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 			return sum, fmt.Errorf("daemon: replay reseed index after grouped no-op tree: %w", err)
 		}
-		sum.Published += len(selected)
+		sum.Published += intentSelectionPublishedCount(selected)
 		sum.BaseHead = sourceHead
 		traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_no_op_tree", map[string]any{
 			"commit": sourceHead,
