@@ -4,6 +4,33 @@
 
 ### Added
 
+- `acd flush --logical` is the explicit drain entrypoint installed at
+  harness Stop / idle hooks. It refreshes the heartbeat, enqueues a
+  `flush_logical` flush_request, and signals the daemon so the next
+  replay tick evaluates the visible pending window without waiting for
+  `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. Refuses on
+  detached HEAD, in-progress git operations (rebase/merge/cherry-pick/
+  bisect), and manual pause markers — refusals keep the heartbeat
+  refresh and surface `refused_reason` in JSON output without blocking
+  the harness hook. Without `--logical` the command degrades to
+  `acd touch` semantics (heartbeat refresh only, no signal, no flush).
+
+- Claude Code Stop hook, OpenCode `session.idle`, and Pi `session.idle`
+  templates rewired from `acd touch` to `acd flush --logical`. The
+  rewire makes partial work commit promptly when an agent finishes a
+  reply rather than waiting the full 5-minute `IntentMaxPendingAge`
+  timer. Codex Stop deliberately stays on `acd touch` because its Stop
+  event fires on every tool turn — a logical flush per Stop would
+  commit per tool run instead of per agent reply. See the harness
+  notes in `CLAUDE.md` for the full trade-off.
+
+  **Migration**: existing users on the legacy snippet still receive
+  heartbeat refreshes but their partial work waits the full
+  `ACD_INTENT_MAX_PENDING_AGE` (default 5m) before committing. Re-run
+  `acd setup <harness>` and replace the installed hooks block to opt
+  into prompt commits at agent turn boundaries; `acd doctor` flags the
+  drift.
+
 - Intent planner system prompt now carries three additional guarantees:
   (1) **same-path causality** — deferring an offered seq for path P forces
   every later offered seq touching P to also be deferred, so a same-path
