@@ -540,7 +540,7 @@ func TestLogRejectedIntentPlan_RedactedRoundTripsParsedPlanSummary(t *testing.T)
 func resetIntentRejectsRawWarnOnceForTest(t *testing.T) {
 	t.Helper()
 	prev := intentRejectsRawWarnOnce
-	intentRejectsRawWarnOnce = sync.Once{}
+	intentRejectsRawWarnOnce = &sync.Once{}
 	t.Cleanup(func() { intentRejectsRawWarnOnce = prev })
 }
 
