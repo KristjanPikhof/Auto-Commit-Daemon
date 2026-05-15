@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -80,6 +81,72 @@ func LatestBranchCommitSummaries(ctx context.Context, repoDir, ref string, limit
 		return nil, err
 	}
 	return summariesForOIDs(ctx, repoDir, oids, nil)
+}
+
+// PathHeadCommit describes the latest commit reachable from a ref that
+// touched a single repo-relative path. It is intentionally narrower than
+// CommitSummary — the recent-commit-affinity hint only needs the OID and
+// commit timestamp to compute the age window.
+type PathHeadCommit struct {
+	OID         string // full 40-char commit OID; empty when not found.
+	CommitTSSec int64  // committer timestamp, Unix seconds; 0 when not found.
+}
+
+// LatestPathHeadCommit returns the most recent commit reachable from ref
+// that touched the supplied repo-relative path, plus its committer
+// timestamp. Returns (PathHeadCommit{}, false, nil) when no commit reachable
+// from ref touches the path; ErrRefNotFound / ErrRefAmbiguous propagate so
+// callers can degrade gracefully when ref is missing.
+//
+// Why a dedicated helper rather than reusing LatestPathCommitSummaries:
+// callers building the planner's prior-commit affinity hint only need OID +
+// committer timestamp per offered path, never the touched-path list or
+// subject. Reusing LatestPathCommitSummaries would shell out an extra
+// `git diff-tree` per OID per path, which the planner request does not
+// consume; this helper bounds the work to one `git log -1 --format=%H %ct`
+// per path.
+func LatestPathHeadCommit(ctx context.Context, repoDir, ref, path string) (PathHeadCommit, bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return PathHeadCommit{}, false, nil
+	}
+	commit, err := resolveHistoryCommit(ctx, repoDir, ref)
+	if err != nil {
+		return PathHeadCommit{}, false, err
+	}
+	args := []string{
+		"log",
+		"-1",
+		"--no-merges",
+		"--format=%H %ct",
+		commit,
+		"--",
+		LiteralPathspec(path),
+	}
+	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		// Full SHA + space + epoch + LF easily fits in 128 bytes; leave headroom.
+		256, args...)
+	if err != nil {
+		return PathHeadCommit{}, false, fmt.Errorf("git history path-head: %w", err)
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return PathHeadCommit{}, false, nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return PathHeadCommit{}, false, nil
+	}
+	oid := strings.TrimSpace(fields[0])
+	if oid == "" {
+		return PathHeadCommit{}, false, nil
+	}
+	ts, perr := strconv.ParseInt(fields[1], 10, 64)
+	if perr != nil {
+		// Treat malformed timestamp as "not found" — never poison the hint.
+		return PathHeadCommit{}, false, nil
+	}
+	return PathHeadCommit{OID: oid, CommitTSSec: ts}, true, nil
 }
 
 // LatestPathCommitSummaries returns recent commits reachable from ref that

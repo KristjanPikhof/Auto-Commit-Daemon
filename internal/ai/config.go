@@ -62,7 +62,17 @@ const (
 	DefaultIntentMinPending    = 10
 	DefaultIntentMaxPendingAge = 5 * time.Minute
 	DefaultIntentRecentCommits = 5
-	DefaultIntentDeferLimit    = 2
+	// DefaultIntentDeferLimit was 2 prior to the Wave 2 planner-atomicity
+	// epic. The retry loop in composed.PlanIntent (typed validation error
+	// triggers one re-prompt) plus the rejects-log forensic surface mean
+	// an event that has already been deferred once is overwhelmingly
+	// likely to be planner churn rather than a legitimate "wait for
+	// related work" decision. Lowering the default to 1 forces the
+	// daemon's forced-aging singleton path sooner so deferred work lands
+	// promptly. Operators who want the historical behaviour can still set
+	// ACD_INTENT_DEFER_LIMIT=2 (or higher) explicitly; the env override
+	// is unchanged.
+	DefaultIntentDeferLimit = 1
 )
 
 // CommitStrategy selects how pending capture events are turned into commits.

@@ -70,8 +70,24 @@ const SubjectCap = 72
 const BodyWrap = 72
 
 // DiffCap is the byte cap callers should apply after RedactDiffSecrets before
-// handing a unified diff to a network-bound provider.
+// handing a unified diff to a network-bound provider on the per-event
+// commit-message path. Kept at 4 KiB to bound the legacy single-event commit
+// prompt. Intent-stage planner requests use IntentStageDiffCap instead, which
+// is intentionally larger so the planner has enough context to group
+// multi-file changes — see IntentStageDiffCap.
 const DiffCap = 4000
+
+// IntentStageDiffCap is the per-stage byte cap applied to each captured
+// diff handed to the intent planner. The planner reasons across multiple
+// captures at once, so a 4 KiB cap (which works well for one-event commit
+// messages) routinely truncated the second/third captured diff before the
+// planner could see the file-level signature. The Wave 2 planner-atomicity
+// epic raises the per-stage cap to 16 KiB while leaving DiffCap unchanged
+// for the per-event commit path. Total payload size is still bounded by
+// the planner window size (ACD_INTENT_WINDOW, default 10) multiplied by
+// this cap, which stays comfortably under the openai-compat 1 MiB body
+// limit even at the upper window value.
+const IntentStageDiffCap = 16000
 
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
@@ -80,11 +96,13 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"You must return every offered seq as either selected or deferred. " +
 	"Do not group unrelated captures. " +
 	"Do not invent intent beyond the supplied evidence. " +
-	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture. " +
+	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture and leave deferred_seqs and deferred_reasons empty. " +
+	"Same-path causality: when you defer an offered seq for path P, every later offered seq that touches P must also be deferred (or the entire same-path chain must be selected together); never split a same-path chain by selecting a later seq while deferring an earlier one. " +
+	"Defer_count guidance: prefer captures whose defer_count >= 1 for inclusion when the evidence permits, so a capture deferred in earlier windows does not churn forever. " +
 	"Every deferred_reasons[i].seq must appear in deferred_seqs. " +
 	"Do not emit a reason for a seq that is selected, and do not reference seqs outside the offered window. " +
 	"Each deferred seq needs exactly one reason; selected seqs get no reason entry. " +
-	"Worked example: offered=[10,11,12], selected=[10,11], deferred=[12]; deferred_reasons must contain exactly one entry with seq=12."
+	"Worked example: offered=[10,11,12] where 10 and 11 touch internal/checkout/service.go and 12 touches docs/checkout.md; valid plan selected=[10,11], deferred=[12], deferred_reasons=[{seq:12,reason:\"docs change is independent\"}]; invalid plan selected=[11], deferred=[10,12] would split the same-path chain on internal/checkout/service.go and is forbidden."
 
 var (
 	// reBulletPrefix strips a leading `-` / `*` plus whitespace from a
@@ -104,13 +122,23 @@ func IntentPlannerSystemPrompt() string {
 	return intentPlannerSystemPrompt
 }
 
-// BuildIntentPlanUserPrompt serializes req into the planner user message.
+// BuildIntentPlanUserPrompt serializes req into the planner user message. When
+// req.RetryCorrection is non-empty (set by composed.PlanIntent's retry loop on
+// a typed *IntentPlanValidationError), the validator error is quoted verbatim
+// in a follow-up correction block so the planner can fix the prior mistake
+// without losing offered-capture context.
 func BuildIntentPlanUserPrompt(req IntentPlanRequest) (string, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return "", fmt.Errorf("intent planner: marshal request: %w", err)
 	}
-	return "Plan the next commit intent for these offered captures:\n" + string(body), nil
+	out := "Plan the next commit intent for these offered captures:\n" + string(body)
+	if correction := strings.TrimSpace(req.RetryCorrection); correction != "" {
+		out += "\n\nYour previous capture_intent_plan tool call failed validation with this error:\n" +
+			correction +
+			"\n\nReturn a corrected capture_intent_plan tool call that fixes the listed problem. Keep every offered seq accounted for as either selected or deferred, and ensure every deferred_reasons[i].seq appears in deferred_seqs."
+	}
+	return out, nil
 }
 
 // Truncate caps a unified diff to `max` bytes. Mirrors the legacy 4000-char

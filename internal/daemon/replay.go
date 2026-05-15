@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,40 @@ func shouldEmitPauseWarn(key string) bool {
 	}
 	stored.(*atomic.Int64).Store(now)
 	return true
+}
+
+// EnvRecentCommitAffinitySeconds names the operator knob that decides how
+// recent a HEAD commit must be for the planner to receive a
+// `path_recent_commits` hint linking the offered path back to that commit.
+// Default 0 (disabled). Restart the daemon for changes to apply.
+const EnvRecentCommitAffinitySeconds = "ACD_RECENT_COMMIT_AFFINITY_SECONDS"
+
+// DefaultRecentCommitAffinitySeconds is the default
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS when the env var is unset or
+// unparseable. Defaults to 0 (hint disabled) until the per-path HEAD
+// lookup is cached/batched — buildPathRecentCommits otherwise pays one
+// `git log` per offered path on every replay pass, which is excessive
+// for the marginal information the hint adds. Operators who want the
+// hint can opt in by setting a positive value.
+const DefaultRecentCommitAffinitySeconds = 0
+
+// resolveRecentCommitAffinitySeconds parses
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS into a time.Duration. Negative or
+// unparseable values fall back to DefaultRecentCommitAffinitySeconds; an
+// explicit "0" disables the hint.
+func resolveRecentCommitAffinitySeconds() time.Duration {
+	env := os.Getenv(EnvRecentCommitAffinitySeconds)
+	if env == "" {
+		return time.Duration(DefaultRecentCommitAffinitySeconds) * time.Second
+	}
+	n, err := strconv.Atoi(env)
+	if err != nil {
+		return time.Duration(DefaultRecentCommitAffinitySeconds) * time.Second
+	}
+	if n < 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 // resetPauseWarnForTest clears all keys and overrides the interval. Test-only.
@@ -763,6 +798,18 @@ type intentReplayConfig struct {
 	deferLimit      int
 	includeDiffs    bool
 	bypassBatchWait bool
+	// pathQuiescence is the per-path silence window read from
+	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
+	// disables the gate; any positive value defers offering pending
+	// captures for path P to the planner until P has been quiet for at
+	// least that long.
+	pathQuiescence time.Duration
+	// recentCommitAffinity is the prior-commit affinity window read from
+	// ACD_RECENT_COMMIT_AFFINITY_SECONDS. Zero disables the hint; any
+	// positive value populates IntentPlanRequest.PathRecentCommits with
+	// the matching HEAD commit for any offered path whose most recent
+	// HEAD commit landed within the window.
+	recentCommitAffinity time.Duration
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -780,14 +827,16 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 
 	out := intentReplayConfig{
-		enabled:         true,
-		window:          cfg.IntentWindow,
-		minPending:      cfg.IntentMinPending,
-		maxPendingAge:   cfg.IntentMaxPendingAge,
-		recent:          cfg.IntentRecentCommits,
-		deferLimit:      cfg.IntentDeferLimit,
-		includeDiffs:    opts.IntentIncludeDiffs,
-		bypassBatchWait: opts.IntentBypassBatchWait,
+		enabled:              true,
+		window:               cfg.IntentWindow,
+		minPending:           cfg.IntentMinPending,
+		maxPendingAge:        cfg.IntentMaxPendingAge,
+		recent:               cfg.IntentRecentCommits,
+		deferLimit:           cfg.IntentDeferLimit,
+		includeDiffs:         opts.IntentIncludeDiffs,
+		bypassBatchWait:      opts.IntentBypassBatchWait,
+		pathQuiescence:       resolvePathQuiescenceSeconds(),
+		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
@@ -862,6 +911,33 @@ type intentReplayItem struct {
 	event      state.CaptureEvent
 	ops        []state.CaptureOp
 	deferCount int
+	// coalesce, when non-nil, records the additional capture events folded
+	// into this offer by the same-path coalesce pass. The representative
+	// event lives in `event` above; `coalesce.Covered` carries every other
+	// event in the run (always sorted by seq ascending). For a non-
+	// coalesced item, coalesce remains nil so existing single-event code
+	// paths stay byte-identical.
+	coalesce *coalesceToken
+}
+
+// allCoveredEvents returns the representative event followed by every event
+// the coalesce token absorbed (empty slice safe for non-coalesced items).
+// Useful at publish time when every covered event must be settled with the
+// same commit_oid and decision row.
+func (item intentReplayItem) allCoveredEvents() []state.CaptureEvent {
+	out := make([]state.CaptureEvent, 0, 1+coverLen(item.coalesce))
+	out = append(out, item.event)
+	if item.coalesce != nil {
+		out = append(out, item.coalesce.Covered...)
+	}
+	return out
+}
+
+func coverLen(tok *coalesceToken) int {
+	if tok == nil {
+		return 0
+	}
+	return len(tok.Covered)
 }
 
 func replayIntentBatch(
@@ -877,6 +953,37 @@ func replayIntentBatch(
 	parentTree string,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
+	// Per-path quiescence gate (ACD_PATH_QUIESCENCE_SECONDS). When non-zero
+	// we hold back pending captures whose path was written within the
+	// configured quiet window; the capture row is still durable, only the
+	// planner-offer is gated. We persist a snapshot of the gated count to
+	// daemon_meta so `acd status --json` can render visible_pending_events
+	// as the post-gate population while oldest_pending_age stays anchored
+	// to captured_ts (the persistence timestamp).
+	// Multi-op gating needs the head event's ops to detect the case where
+	// only the header path is quiescent but a sibling op path is still hot.
+	// We load lazily and ONLY for the head: a gated head short-circuits the
+	// whole batch, so paying for additional loader calls would be wasted.
+	var headOpsByPath map[int64][]state.CaptureOp
+	if cfg.pathQuiescence > 0 && len(pending) > 0 {
+		headOps, err := state.LoadCaptureOps(ctx, db, pending[0].Seq)
+		if err != nil {
+			return sum, fmt.Errorf("daemon: replay: load head ops for quiescence gate: %w", err)
+		}
+		headOpsByPath = map[int64][]state.CaptureOp{pending[0].Seq: headOps}
+	}
+	pending, gated := filterPendingByPathQuiescence(pending, cfg.pathQuiescence, pathQuiescenceNow(), headOpsByPath)
+	persistPathQuiescenceSnapshot(ctx, db, gated, cfg.pathQuiescence)
+	if len(pending) == 0 {
+		// Everything in the visible queue is held back behind the gate;
+		// treat the pass as a batch wait so the run loop ticks again
+		// rather than minting an empty commit.
+		if gated > 0 {
+			sum.Skipped = true
+			sum.SkippedReason = "skipped_due_path_quiescence"
+		}
+		return sum, nil
+	}
 	window, forced, waitReason, err := selectIntentWindow(ctx, db, pending, cfg)
 	if err != nil {
 		return sum, err
@@ -916,6 +1023,55 @@ func replayIntentBatch(
 		}
 	}
 
+	// Forced-aging singleton fast path: when the planner window has been
+	// narrowed to one capture by forced aging (the only seq the planner
+	// could possibly select), there is nothing for the planner to decide.
+	// Synthesize the plan locally with a diff-aware subject and skip the
+	// planner call entirely. This:
+	//   - guarantees the captured event ships even if the AI provider is
+	//     unreachable, slow, or returning malformed plans,
+	//   - avoids spending an API request on a fully-determined choice,
+	//   - prevents intent_planner_error decisions from accumulating for
+	//     captures where validation could only ever pass.
+	// The forced_aging marker still lands via recordIntentForcedDecision
+	// above; planIntentSingletonFastPath returns an IntentPlan that flows
+	// through the same publish + decision path as a normal plan.
+	if forced && len(items) == 1 {
+		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
+		// Defense in depth: even though forced-aging narrows the window to
+		// one self-determined seq, run the safety + plan validators before
+		// publishing. A future regression in planIntentSingletonFastPath or
+		// upstream coalesce that produced an unsafe plan must NOT bypass
+		// the same checks normal planner output goes through. On any
+		// failure, fall through to the standard planner path which records
+		// the error decision and degrades to the deterministic fallback.
+		if safetyErr := validateIntentSelectionSafety(items, plan); safetyErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, safetyErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, safetyErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, safetyErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else if planErr := ai.ValidateIntentPlan(req, plan); planErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, planErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, planErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, planErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else {
+			traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+			selected := []intentReplayItem{items[0]}
+			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+		}
+		// Validation failure: fall through to the standard deterministic
+		// path. We replace the planner with the deterministic provider so
+		// PlanIntent below cannot produce another bad plan.
+		cfg.planner = ai.DeterministicProvider{}
+	}
+
 	plannerCtx := ctx
 	if opts.PromptTrace != nil {
 		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
@@ -925,7 +1081,10 @@ func replayIntentBatch(
 			BranchRef:    activeCtx.BranchRef,
 			Generation:   activeCtx.BranchGeneration,
 			DiffIncluded: intentRequestIncludesDiff(req),
-			DiffCap:      ai.DiffCap,
+			// Intent planner stage uses the larger per-stage diff cap so the
+			// planner sees enough context to group multi-file changes; the
+			// per-event commit-message path retains the legacy DiffCap.
+			DiffCap: ai.IntentStageDiffCap,
 		})
 	}
 	plan, validationFailure, err := planIntentWithFallback(plannerCtx, db, cfg.planner, req, items, activeCtx, nowSec)
@@ -1032,6 +1191,128 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	return pending[:n], false, "", nil
 }
 
+// MetaKeyPathQuiescenceGatedCount surfaces the most recent count of pending
+// capture events held back by the per-path quiescence gate. `acd status`
+// reads it (best-effort) and subtracts from the raw visible-pending count
+// so operators see the planner-visible window rather than the durable
+// FIFO depth.
+const MetaKeyPathQuiescenceGatedCount = "path_quiescence.gated_count"
+
+// MetaKeyPathQuiescenceUpdatedAt records the RFC3339 UTC timestamp of the
+// most recent gated-count snapshot so stale data is recognizable when the
+// daemon stops without clearing it.
+const MetaKeyPathQuiescenceUpdatedAt = "path_quiescence.updated_at"
+
+// filterPendingByPathQuiescence enforces the per-path silence window in a
+// strict-FIFO manner: if the FIRST pending event in the window is gated
+// (its path was written within the quiescence window), the entire batch is
+// held back so cross-path causality is preserved. We never compact around
+// the head — doing so would let a later event jump ahead of an earlier
+// gated peer that touches an unrelated path the next event depends on.
+//
+// Returns the filtered pending slice plus the count that was held back.
+// quiescence == 0 short-circuits to (pending, 0). When the head is gated
+// the gated count equals the total number of held-back rows starting at
+// the head and including any subsequent rows the gate would have rejected
+// anyway (computed lazily so callers can render an accurate snapshot).
+//
+// Production callers do not pass an ops loader for non-head events: the
+// only event whose multi-op paths must be inspected is the head, because a
+// gated head short-circuits the batch immediately. opsByPath supplies the
+// already-loaded ops for the head when available; nil falls back to the
+// header-path-only check (used by callers that have not yet loaded ops).
+func filterPendingByPathQuiescence(pending []state.CaptureEvent, quiescence time.Duration, now time.Time, opsByPath map[int64][]state.CaptureOp) ([]state.CaptureEvent, int) {
+	if quiescence <= 0 || len(pending) == 0 {
+		return pending, 0
+	}
+	head := pending[0]
+	var headOps []state.CaptureOp
+	if opsByPath != nil {
+		headOps = opsByPath[head.Seq]
+	}
+	if !pathQuiescentForEvent(head, headOps, quiescence, now) {
+		// FIFO head is gated: hold back the entire batch. Count it as one
+		// gated row so the daemon_meta snapshot reflects "at least one
+		// pending row is behind the gate" without forcing every caller to
+		// re-walk the queue.
+		return nil, 1
+	}
+	return pending, 0
+}
+
+// pathQuiescentForEvent returns true when every path the event will touch
+// (primary path, rename counterpart, and any additional op paths) has been
+// quiet for the configured window. Rename events that touch two paths must
+// wait for both; multi-op events must wait until every touched path is
+// quiet so the planner never sees a partial view.
+//
+// ops may be nil: callers without a loader fall back to the header-path-
+// only check (preserves prior single-path behavior for non-head events).
+func pathQuiescentForEvent(ev state.CaptureEvent, ops []state.CaptureOp, quiescence time.Duration, now time.Time) bool {
+	if ev.Path != "" && !IsPathQuiescent(ev.Path, quiescence, now) {
+		return false
+	}
+	if ev.OldPath.Valid && ev.OldPath.String != "" {
+		if !IsPathQuiescent(ev.OldPath.String, quiescence, now) {
+			return false
+		}
+	}
+	for _, p := range touchedPaths(ops) {
+		if !IsPathQuiescent(p, quiescence, now) {
+			return false
+		}
+	}
+	return true
+}
+
+// lastPersistedQuiescenceGated caches the most recent gated_count we wrote
+// to daemon_meta so a steady-state run loop (the gate is OFF, so gated is
+// always zero) does not re-write identical key/value pairs every pass.
+// -1 means "no value persisted yet" — the first pass with quiescence>0
+// always writes so cross-process readers see a fresh snapshot.
+var lastPersistedQuiescenceGated atomic.Int64
+
+func init() {
+	lastPersistedQuiescenceGated.Store(-1)
+}
+
+// resetLastPersistedQuiescenceGatedForTest restores the sentinel so tests
+// that assert "no writes happened" start from a clean slate.
+func resetLastPersistedQuiescenceGatedForTest(t interface{ Helper() }) {
+	t.Helper()
+	lastPersistedQuiescenceGated.Store(-1)
+}
+
+// persistPathQuiescenceSnapshot records the most recent gated-count snapshot
+// to daemon_meta. Best-effort: meta writes never block the replay loop.
+//
+// Write amplification guard: we skip the write entirely when the gate is
+// disabled (quiescence == 0) and we skip same-value rewrites when the gate
+// is active but the gated count has not changed since the last persisted
+// snapshot. Cross-process readers still see a stable timestamp+count when
+// the gate is on, but we no longer mint a daemon_meta UPSERT every poll
+// tick.
+func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int, quiescence time.Duration) {
+	if db == nil {
+		return
+	}
+	if quiescence <= 0 {
+		// Gate disabled this pass: do not refresh the snapshot. Operators
+		// distinguish "gate inactive" from "no snapshot ever" by reading
+		// the existing path_quiescence.updated_at timestamp; an
+		// always-rewriting snapshot would mask that distinction.
+		return
+	}
+	g64 := int64(gated)
+	if last := lastPersistedQuiescenceGated.Load(); last == g64 {
+		return
+	}
+	if err := state.MetaSet(ctx, db, MetaKeyPathQuiescenceGatedCount, strconv.Itoa(gated)); err == nil {
+		lastPersistedQuiescenceGated.Store(g64)
+	}
+	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceUpdatedAt, time.Now().UTC().Format(time.RFC3339))
+}
+
 func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
 		return false
@@ -1095,14 +1376,20 @@ func buildIntentPlanRequest(
 	forced bool,
 	cfg intentReplayConfig,
 ) ([]intentReplayItem, ai.IntentPlanRequest, error) {
-	items := make([]intentReplayItem, 0, len(events))
-	offered := make([]ai.OfferedCapture, 0, len(events))
+	// Same-path coalesce runs ahead of the planner offer so a burst of
+	// edits to one file folds into one offered entry. Default ON; opt out
+	// via ACD_INTENT_PATH_COALESCE=0|false|no|off (restart to apply).
+	offers, err := coalesceIntentWindow(ctx, db, events, pathCoalesceEnabled(), state.LoadCaptureOps)
+	if err != nil {
+		return nil, ai.IntentPlanRequest{}, err
+	}
+
+	items := make([]intentReplayItem, 0, len(offers))
+	offered := make([]ai.OfferedCapture, 0, len(offers))
 	paths := map[string]struct{}{}
-	for _, ev := range events {
-		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
-		if err != nil {
-			return nil, ai.IntentPlanRequest{}, fmt.Errorf("daemon: load ops seq=%d for intent planning: %w", ev.Seq, err)
-		}
+	for _, offer := range offers {
+		ev := offer.Primary
+		ops := offer.MergedOps
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
 			return nil, ai.IntentPlanRequest{}, err
@@ -1121,7 +1408,20 @@ func buildIntentPlanRequest(
 				diff = rendered
 			}
 		}
-		items = append(items, intentReplayItem{event: ev, ops: ops, deferCount: deferCount})
+		// Attach the coalesce token only for true multi-event runs so
+		// non-coalesced items keep a nil token and existing single-event
+		// code paths read identical to the pre-coalesce world.
+		var token *coalesceToken
+		if len(offer.Token.Covered) > 0 {
+			tok := offer.Token
+			token = &tok
+		}
+		items = append(items, intentReplayItem{
+			event:      ev,
+			ops:        ops,
+			deferCount: deferCount,
+			coalesce:   token,
+		})
 		offered = append(offered, ai.OfferedCapture{
 			Seq:          ev.Seq,
 			Path:         ev.Path,
@@ -1144,12 +1444,14 @@ func buildIntentPlanRequest(
 		latest = aiCommitSummary(commits[0])
 	}
 	pathContext := buildIntentPathContext(ctx, repoRoot, cctx.BaseHead, paths, cfg.recent)
+	pathRecent := buildPathRecentCommits(ctx, repoRoot, cctx.BaseHead, paths, cfg.recentCommitAffinity, time.Now())
 	req, err := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{
 		LatestCommit:         latest,
 		PathCommitContext:    pathContext,
 		OfferedCaptures:      offered,
 		ForcedAging:          forced,
 		IncludeCapturedDiffs: cfg.includeDiffs,
+		PathRecentCommits:    pathRecent,
 	})
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
@@ -1175,6 +1477,58 @@ func intentRequestIncludesDiff(req ai.IntentPlanRequest) bool {
 		}
 	}
 	return false
+}
+
+// buildPathRecentCommits walks the offered paths, asks git for the most
+// recent HEAD commit that touched each, and returns one PathRecentCommit
+// hint per path whose commit landed within the affinity window. Empty
+// slice when the affinity window is disabled (window <= 0), no path
+// matches, or no offered path resolves to a HEAD commit. Errors degrade
+// silently per path — the hint is informational only.
+//
+// Ordering is deterministic (paths sorted lexicographically) so the
+// composed primary + fallback both observe identical request payloads
+// when re-invoked with the same inputs.
+func buildPathRecentCommits(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, window time.Duration, now time.Time) []ai.PathRecentCommit {
+	if window <= 0 || len(paths) == 0 || ref == "" {
+		return nil
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		if path == "" {
+			continue
+		}
+		ordered = append(ordered, path)
+	}
+	if len(ordered) == 0 {
+		return nil
+	}
+	sort.Strings(ordered)
+	out := make([]ai.PathRecentCommit, 0, len(ordered))
+	cutoff := now.Add(-window).Unix()
+	for _, path := range ordered {
+		head, ok, err := git.LatestPathHeadCommit(ctx, repoRoot, ref, path)
+		if err != nil || !ok {
+			continue
+		}
+		if head.CommitTSSec < cutoff {
+			continue
+		}
+		age := now.Unix() - head.CommitTSSec
+		if age < 0 {
+			age = 0
+		}
+		out = append(out, ai.PathRecentCommit{
+			Path:            path,
+			OID:             head.OID,
+			AgeSeconds:      age,
+			SuggestedAction: ai.PathRecentCommitSuggestionExtendOrWait,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func buildIntentPathContext(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, limit int) []ai.PathCommitContext {
@@ -1209,6 +1563,161 @@ func aiCommitSummary(commit git.CommitSummary) *ai.CommitSummary {
 	}
 }
 
+// planIntentSingletonFastPath synthesizes the IntentPlan for a forced-aging
+// window of length one. It does not call any planner; the chosen seq is
+// fully determined by selectIntentWindow (forced aging produced exactly one
+// offered capture) so there is nothing left to plan. The subject is built
+// from a per-language symbol extracted out of the captured diff, falling
+// back to "Verb basename" when no symbol is recoverable. Source is stamped
+// "deterministic" so downstream telemetry and ledger writers attribute the
+// commit message to the local fallback rather than a phantom planner call.
+//
+// Diff rendering uses the per-op git-diff machinery shared with the
+// network-bound providers; render failures fall back to an empty diff,
+// which DiffAwareSubject treats as "no symbol available".
+// forcedSingletonSubjectBudget caps the wall-clock spent rendering a
+// diff-aware subject on the forced-aging fast path. Forced aging is meant
+// to FORCE progress; if BuildOpsDiff stalls (huge blob, gc contention,
+// foreign odb), we fall back to the cheap per-op subject so the commit
+// still ships within the bounded replay-pass budget.
+const forcedSingletonSubjectBudget = time.Second
+
+// forcedSingletonSubjectBudgetOverride lets tests pin a tiny budget so
+// the timeout fallback is exercised without touching real disk. <=0 means
+// "use forcedSingletonSubjectBudget".
+var forcedSingletonSubjectBudgetOverride atomic.Int64
+
+func setForcedSingletonSubjectBudgetForTest(t interface {
+	Helper()
+	Cleanup(func())
+}, d time.Duration) {
+	t.Helper()
+	forcedSingletonSubjectBudgetOverride.Store(int64(d))
+	t.Cleanup(func() { forcedSingletonSubjectBudgetOverride.Store(0) })
+}
+
+func forcedSingletonSubjectBudgetEffective() time.Duration {
+	if v := forcedSingletonSubjectBudgetOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return forcedSingletonSubjectBudget
+}
+
+// buildOpsDiffForForcedSingleton wraps BuildOpsDiff with the bounded
+// forced-singleton budget. Override hook lets tests inject a sleep without
+// rewriting BuildOpsDiff itself. Stored in an atomic.Pointer so concurrent
+// test cleanup cannot race with an in-flight goroutine reading the
+// previous value.
+var buildOpsDiffForForcedSingletonPtr atomic.Pointer[func(context.Context, string, []state.CaptureOp) (string, error)]
+
+func init() {
+	defaultDiff := func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+		return BuildOpsDiff(ctx, repoRoot, ops)
+	}
+	buildOpsDiffForForcedSingletonPtr.Store(&defaultDiff)
+}
+
+func buildOpsDiffForForcedSingleton(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	if fn := buildOpsDiffForForcedSingletonPtr.Load(); fn != nil && *fn != nil {
+		return (*fn)(ctx, repoRoot, ops)
+	}
+	return BuildOpsDiff(ctx, repoRoot, ops)
+}
+
+// setBuildOpsDiffForForcedSingletonForTest swaps the renderer atomically.
+// Returns the previous value so the caller can restore it.
+func setBuildOpsDiffForForcedSingletonForTest(fn func(context.Context, string, []state.CaptureOp) (string, error)) func(context.Context, string, []state.CaptureOp) (string, error) {
+	prev := buildOpsDiffForForcedSingletonPtr.Load()
+	cp := fn
+	buildOpsDiffForForcedSingletonPtr.Store(&cp)
+	if prev != nil {
+		return *prev
+	}
+	return nil
+}
+
+// planIntentSingletonFastPathFn lets tests stub the forced-singleton fast
+// path so the validator branches in replayIntentBatch can be exercised
+// against a deliberately invalid plan. nil falls through to the real
+// planIntentSingletonFastPath.
+var planIntentSingletonFastPathFn atomic.Pointer[func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan]
+
+func planIntentSingletonFastPathHook(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+	if fn := planIntentSingletonFastPathFn.Load(); fn != nil && *fn != nil {
+		return (*fn)(ctx, repoRoot, item)
+	}
+	return planIntentSingletonFastPath(ctx, repoRoot, item)
+}
+
+func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+	op := singletonFallbackOp(item)
+	subject := ""
+	// Bounded subject budget: a slow BuildOpsDiff on the forced-aging path
+	// must not stall the run loop. context.WithTimeout fires inside the
+	// nested git invocations and the soft per-op error branch swallows the
+	// resulting cancel, so we treat any timeout/error as "no diff
+	// available" and fall back to the per-op subject helper.
+	subjectCtx, cancel := context.WithTimeout(ctx, forcedSingletonSubjectBudgetEffective())
+	defer cancel()
+	type diffResult struct {
+		diff string
+		err  error
+	}
+	diffCh := make(chan diffResult, 1)
+	go func() {
+		rendered, err := buildOpsDiffForForcedSingleton(subjectCtx, repoRoot, item.ops)
+		diffCh <- diffResult{diff: rendered, err: err}
+	}()
+	select {
+	case res := <-diffCh:
+		if res.err != nil || subjectCtx.Err() != nil {
+			subject = ai.DiffAwareSubject(op, "")
+		} else {
+			subject = ai.DiffAwareSubject(op, res.diff)
+		}
+	case <-subjectCtx.Done():
+		// Timed out: do NOT block waiting for the goroutine to finish; the
+		// renderer will observe the cancelled context on its next git
+		// invocation and exit on its own. Use the cheap subject so the
+		// commit still ships within the forced-aging budget.
+		subject = ai.DiffAwareSubject(op, "")
+	}
+	return ai.IntentPlan{
+		SelectedSeqs:   []int64{item.event.Seq},
+		Subject:        subject,
+		GroupingReason: "forced-aging singleton: provider skipped",
+		Source:         (ai.DeterministicProvider{}).Name(),
+	}
+}
+
+// singletonFallbackOp picks the OpItem fed to DiffAwareSubject. For a
+// single captured op (the common case) we use it directly. For events
+// that came in with multiple ops we fall back to the event-level shape
+// because singleOpSubject handles the multi-op event-class path itself.
+func singletonFallbackOp(item intentReplayItem) ai.OpItem {
+	if len(item.ops) == 1 {
+		op := item.ops[0]
+		oldPath := ""
+		if op.OldPath.Valid {
+			oldPath = op.OldPath.String
+		}
+		return ai.OpItem{
+			Path:    op.Path,
+			Op:      op.Op,
+			OldPath: oldPath,
+		}
+	}
+	oldPath := ""
+	if item.event.OldPath.Valid {
+		oldPath = item.event.OldPath.String
+	}
+	return ai.OpItem{
+		Path:    item.event.Path,
+		Op:      item.event.Operation,
+		OldPath: oldPath,
+	}
+}
+
 func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
 	if planner == nil {
 		planner = ai.DeterministicProvider{}
@@ -1217,7 +1726,10 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 	plan, err := planner.PlanIntent(ctx, req)
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
-		plan, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
+		// Discard the dropped/synthesized lists: provider-side warns already
+		// fired upstream; emitting another warn here would duplicate the
+		// log entry for the same response.
+		plan, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
 		err = ai.ValidateIntentPlan(req, plan)
 	}
 	if err == nil {
@@ -1342,13 +1854,34 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 		reasons[item.Seq] = item.Reason
 	}
 	events := make(map[int64]state.CaptureEvent, len(items))
+	itemBySeq := make(map[int64]intentReplayItem, len(items))
 	for _, item := range items {
 		events[item.event.Seq] = item.event
+		itemBySeq[item.event.Seq] = item
 	}
 	for _, seq := range plan.DeferredSeqs {
 		reason := reasons[seq]
-		if err := state.RecordPlannerDefer(ctx, db, seq, ts, reason); err != nil {
-			return err
+		// Coalesced offers absorb additional capture events under one
+		// representative seq. When the planner defers a coalesced offer
+		// we MUST advance defer_count for every covered seq, mirroring
+		// the publish-side per-coverage walk in settleIntentPublished.
+		// Otherwise a later external publish of the representative seq
+		// leaves the covered seqs at defer_count=0 and the aging clock
+		// silently resets.
+		coveredSeqs := []int64{seq}
+		if item, ok := itemBySeq[seq]; ok && item.coalesce != nil {
+			coveredSeqs = append([]int64(nil), item.coalesce.OriginalSeqs...)
+			// OriginalSeqs always includes the representative seq as the
+			// first element; defensive bail-out if a future regression
+			// produces an empty list.
+			if len(coveredSeqs) == 0 {
+				coveredSeqs = []int64{seq}
+			}
+		}
+		for _, coveredSeq := range coveredSeqs {
+			if err := state.RecordPlannerDefer(ctx, db, coveredSeq, ts, reason); err != nil {
+				return err
+			}
 		}
 		if ev, ok := events[seq]; ok {
 			msgReason := strings.TrimSpace(reason)
@@ -1511,14 +2044,18 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 func intentTraceOffered(items []intentReplayItem) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"seq":         item.event.Seq,
 			"path":        item.event.Path,
 			"operation":   item.event.Operation,
 			"fidelity":    item.event.Fidelity,
 			"defer_count": item.deferCount,
 			"ops":         len(item.ops),
-		})
+		}
+		if item.coalesce != nil && len(item.coalesce.OriginalSeqs) > 1 {
+			entry["coalesced_seqs"] = append([]int64(nil), item.coalesce.OriginalSeqs...)
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -1636,7 +2173,7 @@ func publishIntentSelection(
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped idempotent publish: %w", err)
 				}
-				sum.Published += len(selected)
+				sum.Published += intentSelectionPublishedCount(selected)
 				sum.BaseHead = headOID
 				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "already_published_by_external_committer", map[string]any{
 					"commit": headOID,
@@ -1685,7 +2222,7 @@ func publishIntentSelection(
 				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped superseded external: %w", err)
 				}
-				sum.Published++
+				sum.Published += intentSelectionPublishedCount(selected)
 				sum.BaseHead = sourceHead
 				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, reason, map[string]any{
 					"commit": sourceHead,
@@ -1722,7 +2259,7 @@ func publishIntentSelection(
 		if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 			return sum, fmt.Errorf("daemon: replay reseed index after grouped no-op tree: %w", err)
 		}
-		sum.Published += len(selected)
+		sum.Published += intentSelectionPublishedCount(selected)
 		sum.BaseHead = sourceHead
 		traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_no_op_tree", map[string]any{
 			"commit": sourceHead,
@@ -1769,7 +2306,7 @@ func publishIntentSelection(
 			if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 				return sum, fmt.Errorf("daemon: replay reseed index after grouped cas idempotent publish: %w", err)
 			}
-			sum.Published += len(selected)
+			sum.Published += intentSelectionPublishedCount(selected)
 			sum.BaseHead = headOID
 			traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_after_cas_exhaustion", map[string]any{
 				"commit": headOID,
@@ -1809,13 +2346,14 @@ func publishIntentSelection(
 		return sum, err
 	}
 	reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
-	sum.Published += len(selected)
+	publishedCount := intentSelectionPublishedCount(selected)
+	sum.Published += publishedCount
 	sum.BaseHead = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
 		"group":  true,
-		"events": len(selected),
+		"events": publishedCount,
 	})
 	return sum, nil
 }
@@ -1852,21 +2390,51 @@ func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg s
 	return commitOID, nil
 }
 
+// intentSelectionPublishedCount totals the number of capture events a
+// selected intent slice will mark as published — counting the
+// representative AND any events folded into it by the same-path coalesce
+// pass. ReplaySummary.Published reports operator-visible event count
+// (not commit count), so a 4-event coalesced run counts as 4 even though
+// it produces one commit.
+func intentSelectionPublishedCount(items []intentReplayItem) int {
+	total := 0
+	for _, item := range items {
+		total += 1 + coverLen(item.coalesce)
+	}
+	return total
+}
+
 func settleIntentPublished(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason, message string) error {
 	for _, item := range items {
-		ev := item.event
-		ev.Message = sql.NullString{String: message, Valid: message != ""}
-		if err := settlePublishedEvent(ctx, db, ev, cctx, sourceHead, commitOID, decisionKind, decisionReason); err != nil {
-			return err
-		}
-		if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
-			slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
+		// Coalesced items absorb additional capture events under one
+		// representative. Every covered event must land as published with
+		// the same commit_oid + decision row so `acd events --json`
+		// surfaces grouped_seqs covering the full run (the cli derives
+		// grouped_seqs from decision_records joined by commit_oid).
+		// Settling the events in seq order keeps the decision ledger
+		// monotonic and matches what readers expect for a multi-event
+		// publish.
+		for _, covered := range item.allCoveredEvents() {
+			ev := covered
+			ev.Message = sql.NullString{String: message, Valid: message != ""}
+			if err := settlePublishedEvent(ctx, db, ev, cctx, sourceHead, commitOID, decisionKind, decisionReason); err != nil {
+				return err
+			}
+			if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
+				slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
+			}
 		}
 	}
 	return nil
 }
 
 func reconcileIntentLiveIndex(ctx context.Context, repoRoot string, logger acdtrace.Logger, cctx CaptureContext, items []intentReplayItem) {
+	// For coalesced items the merged ops on the representative already
+	// describe the squashed before/after state, so a single reconcile per
+	// item brings the live index to the same final shape as the published
+	// commit. Walking the additional covered events would trigger
+	// redundant re-stages against an unrelated stale before-state and
+	// could spuriously skip paths.
 	for _, item := range items {
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, logger, cctx, item.event, item.ops)
 	}

@@ -46,6 +46,20 @@ const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 // DefaultMaxFileBytes is the default per-file size cap (5 MiB).
 const DefaultMaxFileBytes int64 = 5 << 20
 
+// EnvPathQuiescenceSeconds names the operator knob that defers planner offers
+// for a captured path until that path has been quiet for the configured
+// number of seconds. The capture row itself is still persisted to
+// capture_events immediately for durability — the gate only changes WHEN the
+// pending event becomes visible to the intent planner. Default 0 disables
+// the gate so existing deployments behave unchanged. Restart the daemon for
+// changes to apply.
+const EnvPathQuiescenceSeconds = "ACD_PATH_QUIESCENCE_SECONDS"
+
+// DefaultPathQuiescenceSeconds is the default ACD_PATH_QUIESCENCE_SECONDS
+// when the env var is unset or unparseable. Zero preserves current
+// behavior — the gate is opt-in.
+const DefaultPathQuiescenceSeconds = 0
+
 // EnvMaxPendingEvents bounds capture_events FIFO depth for the active
 // (branch_ref, branch_generation). When the depth meets or exceeds the cap
 // the new event is dropped (history is preserved; only the *new* tail is
@@ -792,6 +806,23 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
 		recordCapturedDecision(ctx, db, cctx, seq, op)
+		// Stamp the per-path quiescence tracker AFTER the row durably
+		// lands. The planner-offer gate keyed by ACD_PATH_QUIESCENCE_SECONDS
+		// reads from this map; the capture row itself is unaffected by the
+		// gate and is already pending in the FIFO. A rename also touches
+		// the OldPath so a deferred rename source/dest pair stays paired
+		// from the gate's perspective.
+		//
+		// Hot-path: skip the (mutex-bound) write entirely when the gate is
+		// disabled — RecordPathWrite would early-return anyway, but we
+		// avoid even computing pathQuiescenceNow() in the common case.
+		if pathQuiescenceEnabled.Load() {
+			nowQ := pathQuiescenceNow()
+			RecordPathWrite(op.Path, nowQ)
+			if op.OldPath != "" {
+				RecordPathWrite(op.OldPath, nowQ)
+			}
+		}
 		summary.EventsAppended++
 		if pendingCap > 0 {
 			pending++
@@ -1400,6 +1431,228 @@ func gitModeFor(m os.FileMode) string {
 		return git.ExecutableFileMode
 	}
 	return git.RegularFileMode
+}
+
+// pathQuiescenceTracker tracks the most recent capture timestamp per path
+// across the daemon's lifetime. The intent planner consults the tracker
+// before deciding whether a captured path is "ready" to ship: a path that
+// just received a write is held back until ACD_PATH_QUIESCENCE_SECONDS of
+// silence has elapsed. The capture row itself is persisted immediately so
+// durability is unchanged; only the planner-offer is gated.
+//
+// The map is intentionally process-local: persisting per-path timestamps to
+// SQLite would add a write per capture event and cross-process status
+// queries already see the gated counts via the `path_quiescence.*`
+// daemon_meta keys we stamp at the end of each replay pass.
+//
+// pathQuiescenceEnabled is a hot-path gate: capture stamps a path on every
+// captured op, so when ACD_PATH_QUIESCENCE_SECONDS is unset (the default)
+// we want RecordPathWrite to return without acquiring the mutex. The
+// daemon flips the gate via SetPathQuiescenceEnabled at startup once the
+// env value is resolved; resolvePathQuiescenceSeconds also flips it on
+// when it parses a positive value so a test that wires only the env var
+// (no daemon startup) still exercises the tracker.
+//
+// pathQuiescenceMaxEntries bounds the map at ~4096 entries. When the
+// limit is exceeded, RecordPathWrite evicts entries older than 2x the
+// current quiescence window (or 1 hour when quiescence is zero) under the
+// already-held write lock. Worst-case memory: ~4096 entries * 256B/entry
+// (path + time.Time + map overhead) ≈ 1 MiB.
+//
+// Tests can substitute the wall clock via SetPathQuiescenceClockForTest and
+// reset the tracker via ResetPathQuiescenceForTest.
+const pathQuiescenceMaxEntries = 4096
+
+var (
+	pathQuiescenceMu        sync.RWMutex
+	pathQuiescenceWrites    = map[string]time.Time{}
+	pathQuiescenceNowFn     atomic.Pointer[func() time.Time]
+	pathQuiescenceEnabled   atomic.Bool
+	pathQuiescenceWindowSec atomic.Int64 // current ACD_PATH_QUIESCENCE_SECONDS for eviction
+)
+
+func pathQuiescenceNow() time.Time {
+	if fn := pathQuiescenceNowFn.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return time.Now()
+}
+
+// SetPathQuiescenceClockForTest swaps the clock the tracker consults. Pass
+// nil to restore time.Now. Test-only.
+func SetPathQuiescenceClockForTest(t interface{ Helper() }, fn func() time.Time) {
+	t.Helper()
+	if fn == nil {
+		pathQuiescenceNowFn.Store(nil)
+		return
+	}
+	cp := fn
+	pathQuiescenceNowFn.Store(&cp)
+}
+
+// ResetPathQuiescenceForTest empties the tracker so adjacent tests do not
+// share path state. Test-only. Also resets the enable gate so the next
+// test starts from a known-disabled state.
+func ResetPathQuiescenceForTest(t interface{ Helper() }) {
+	t.Helper()
+	pathQuiescenceMu.Lock()
+	pathQuiescenceWrites = map[string]time.Time{}
+	pathQuiescenceMu.Unlock()
+	pathQuiescenceEnabled.Store(false)
+	pathQuiescenceWindowSec.Store(0)
+}
+
+// SetPathQuiescenceEnabled flips the hot-path gate. The daemon calls this
+// at startup once it has resolved ACD_PATH_QUIESCENCE_SECONDS so capture
+// can short-circuit RecordPathWrite when the gate is off. Idempotent.
+func SetPathQuiescenceEnabled(enabled bool) {
+	pathQuiescenceEnabled.Store(enabled)
+}
+
+// PathQuiescenceTrackerSize returns the current number of tracked paths.
+// Surface for diagnose/observability and tests.
+func PathQuiescenceTrackerSize() int {
+	pathQuiescenceMu.RLock()
+	n := len(pathQuiescenceWrites)
+	pathQuiescenceMu.RUnlock()
+	return n
+}
+
+// RecordPathWrite stamps `now` as the most recent capture timestamp for
+// `path`. Empty paths are ignored. Concurrent capture passes serialize on
+// the tracker's write lock. Exported so callers outside this package
+// (currently none, but the intent-planner replay loop reads it) can keep
+// the API discoverable.
+//
+// Callers MUST pass repo-relative slash-separated paths matching the
+// canonicalization used for capture_ops.path (see touchedPaths). Defensive
+// normalization here would mask caller bugs; we trust the producer.
+//
+// Hot-path short-circuit: when SetPathQuiescenceEnabled has not been
+// flipped on (the default for ACD_PATH_QUIESCENCE_SECONDS=0 deployments),
+// RecordPathWrite returns immediately without acquiring the mutex. Callers
+// in capture.go run this on every captured op, so the cheap atomic Load
+// keeps the no-gate steady state at the same cost as the prior code path.
+func RecordPathWrite(path string, now time.Time) {
+	if path == "" {
+		return
+	}
+	if !pathQuiescenceEnabled.Load() {
+		return
+	}
+	pathQuiescenceMu.Lock()
+	pathQuiescenceWrites[path] = now
+	if len(pathQuiescenceWrites) > pathQuiescenceMaxEntries {
+		// Always evict relative to the wall clock (or the test clock
+		// when one is installed), NOT the per-write `now` argument
+		// callers pass — RecordPathWrite is sometimes invoked with a
+		// back-dated timestamp (rename pairs, replay re-stamps) and
+		// using that as the eviction reference would fail to prune
+		// entries older than the cutoff.
+		evictStalePathQuiescenceLocked(pathQuiescenceNow())
+	}
+	pathQuiescenceMu.Unlock()
+}
+
+// evictStalePathQuiescenceLocked prunes tracker entries older than 2x the
+// configured quiescence window (or 1 hour when the window is zero). Caller
+// must hold pathQuiescenceMu in write mode.
+func evictStalePathQuiescenceLocked(now time.Time) {
+	windowSec := pathQuiescenceWindowSec.Load()
+	cutoff := time.Hour
+	if windowSec > 0 {
+		cutoff = 2 * time.Duration(windowSec) * time.Second
+	}
+	threshold := now.Add(-cutoff)
+	for k, v := range pathQuiescenceWrites {
+		if v.Before(threshold) {
+			delete(pathQuiescenceWrites, k)
+		}
+	}
+	// If eviction was insufficient (every entry is fresh), drop the
+	// oldest 25% to keep the cap honored. This only fires under
+	// pathological churn where 4k distinct paths are stamped within the
+	// quiescence window — practically: nothing falls out of the eviction
+	// branch under normal load.
+	if len(pathQuiescenceWrites) > pathQuiescenceMaxEntries {
+		type kv struct {
+			k string
+			t time.Time
+		}
+		entries := make([]kv, 0, len(pathQuiescenceWrites))
+		for k, v := range pathQuiescenceWrites {
+			entries = append(entries, kv{k: k, t: v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].t.Before(entries[j].t) })
+		drop := len(entries) / 4
+		if drop < 1 {
+			drop = 1
+		}
+		for i := 0; i < drop; i++ {
+			delete(pathQuiescenceWrites, entries[i].k)
+		}
+	}
+}
+
+// PathLastWrite returns the most recent recorded write timestamp for `path`,
+// and `ok=false` when no capture has stamped the path during this daemon
+// lifetime. Used by the planner-offer gate to compute quiescence.
+func PathLastWrite(path string) (time.Time, bool) {
+	if path == "" {
+		return time.Time{}, false
+	}
+	pathQuiescenceMu.RLock()
+	ts, ok := pathQuiescenceWrites[path]
+	pathQuiescenceMu.RUnlock()
+	return ts, ok
+}
+
+// IsPathQuiescent returns true when `path` is eligible to be offered to the
+// planner under a `quiescence` gate. Quiescence == 0 short-circuits to true
+// (gate disabled). When the path has no recorded write (e.g. captured by a
+// previous daemon run before restart) we treat it as quiescent so a stale
+// pending row never gets stranded behind a tracker miss.
+func IsPathQuiescent(path string, quiescence time.Duration, now time.Time) bool {
+	if quiescence <= 0 || path == "" {
+		return true
+	}
+	last, ok := PathLastWrite(path)
+	if !ok {
+		return true
+	}
+	return now.Sub(last) >= quiescence
+}
+
+// resolvePathQuiescenceSeconds parses ACD_PATH_QUIESCENCE_SECONDS into a
+// time.Duration. Negative or unparseable values fall back to the default
+// (zero, i.e. gate disabled).
+//
+// Side effect: when the parsed value is positive we flip the
+// pathQuiescenceEnabled gate ON so capture's RecordPathWrite hot path
+// starts stamping. The gate is reset to OFF when parsing yields zero so
+// tests that toggle the env mid-suite see the corresponding behavior
+// flip on the next replay-config resolve.
+func resolvePathQuiescenceSeconds() time.Duration {
+	env := os.Getenv(EnvPathQuiescenceSeconds)
+	if env == "" {
+		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
+		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
+	}
+	n, err := strconv.Atoi(env)
+	if err != nil || n < 0 {
+		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
+		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
+	}
+	d := time.Duration(n) * time.Second
+	applyPathQuiescenceWindow(d)
+	return d
+}
+
+// applyPathQuiescenceWindow records the active window and flips the
+// hot-path gate. Idempotent.
+func applyPathQuiescenceWindow(d time.Duration) {
+	pathQuiescenceWindowSec.Store(int64(d / time.Second))
+	SetPathQuiescenceEnabled(d > 0)
 }
 
 // recordOversize stores a daemon_meta breadcrumb so operators can see why a

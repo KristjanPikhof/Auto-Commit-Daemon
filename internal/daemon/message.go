@@ -220,20 +220,49 @@ func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot strin
 // returns an error when the underlying git binary is unreachable in a
 // way that should surface up to the caller.
 //
-// The returned text is capped to ai.DiffCap while sections are appended,
-// so large multi-op events stop rendering once the provider budget is
-// consumed. Callers still apply redaction + ai.Truncate before handing the
-// diff to a provider because redaction can change the final byte length.
+// The returned text is capped to ai.DiffCap (the per-event commit-message
+// budget) while sections are appended, so large multi-op events stop
+// rendering once the provider budget is consumed. Callers still apply
+// redaction + ai.Truncate before handing the diff to a provider because
+// redaction can change the final byte length.
+//
+// Intent-stage callers MUST use BuildOpsDiffWithCap with
+// ai.IntentStageDiffCap so the larger planner budget actually applies;
+// passing the captured diff through this function silently truncates at
+// the per-event cap, which is the bug fixed alongside this docstring.
 func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	return BuildOpsDiffWithCap(ctx, repoRoot, ops, ai.DiffCap)
+}
+
+// BuildOpsDiffWithCap is the cap-aware variant of BuildOpsDiff. It accepts
+// a per-call byte cap so the intent-planner stage can request its larger
+// IntentStageDiffCap (16 KiB) budget without resurrecting the dead-code
+// truncation that the original BuildOpsDiff performed at the legacy 4 KiB
+// per-event DiffCap.
+//
+// Contract for the daemon-side caller (replay.go):
+//   - per-event commit-message rendering: pass ai.DiffCap (or call
+//     BuildOpsDiff which forwards that constant).
+//   - intent-planner staging: pass ai.IntentStageDiffCap. The
+//     DAEMON-lane caller in replay.go is responsible for using this entry
+//     point on the intent path so the planner sees enough of each captured
+//     diff to reason about multi-file grouping.
+//
+// `cap` <= 0 is treated as ai.DiffCap so a zero-valued caller cannot
+// silently disable the cap.
+func BuildOpsDiffWithCap(ctx context.Context, repoRoot string, ops []state.CaptureOp, cap int) (string, error) {
 	if repoRoot == "" || len(ops) == 0 {
 		return "", nil
 	}
-	var buf cappedDiffBuffer
+	if cap <= 0 {
+		cap = ai.DiffCap
+	}
+	buf := newCappedDiffBuffer(cap)
 	for _, op := range ops {
 		if buf.Full() {
 			break
 		}
-		section, err := buildOpDiff(ctx, repoRoot, op)
+		section, err := buildOpDiff(ctx, repoRoot, op, cap)
 		if err != nil {
 			// Soft per-op failure: skip this op but keep going so the
 			// model still sees the other ops in a multi-op event.
@@ -250,8 +279,19 @@ func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (
 	return buf.String(), nil
 }
 
+// cappedDiffBuffer caps appends at the per-call budget supplied to
+// newCappedDiffBuffer. Use BuildOpsDiff for the per-event default and
+// BuildOpsDiffWithCap for the intent-stage 16 KiB budget.
 type cappedDiffBuffer struct {
 	buf bytes.Buffer
+	cap int
+}
+
+func newCappedDiffBuffer(cap int) *cappedDiffBuffer {
+	if cap <= 0 {
+		cap = ai.DiffCap
+	}
+	return &cappedDiffBuffer{cap: cap}
 }
 
 func (b *cappedDiffBuffer) Len() int {
@@ -259,7 +299,7 @@ func (b *cappedDiffBuffer) Len() int {
 }
 
 func (b *cappedDiffBuffer) Full() bool {
-	return b.buf.Len() >= ai.DiffCap
+	return b.buf.Len() >= b.cap
 }
 
 func (b *cappedDiffBuffer) HasTrailingNewline() bool {
@@ -268,7 +308,7 @@ func (b *cappedDiffBuffer) HasTrailingNewline() bool {
 }
 
 func (b *cappedDiffBuffer) WriteString(s string) {
-	remaining := ai.DiffCap - b.buf.Len()
+	remaining := b.cap - b.buf.Len()
 	if remaining <= 0 {
 		return
 	}
@@ -285,8 +325,11 @@ func (b *cappedDiffBuffer) String() string {
 // buildOpDiff produces a unified diff section for one captured op.
 // Returns "" + nil when the op carries no usable OIDs (e.g. an oversize
 // metadata-only op), or the textual diff with rewritten path headers
-// for every other case.
-func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (string, error) {
+// for every other case. `outerCap` is the BuildOpsDiffWithCap byte budget
+// the caller supplied so the per-op git-stdout cap scales with the
+// outer buffer (intent stage gets a larger cap; per-event keeps the
+// legacy 4 KiB).
+func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp, outerCap int) (string, error) {
 	path := op.Path
 	oldPath := ""
 	if op.OldPath.Valid {
@@ -311,19 +354,19 @@ func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (stri
 
 	switch op.Op {
 	case "create":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: emptyBlobOID, afterOID: afterOID,
 			newFileMode: afterMode,
 		})
 	case "delete":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: emptyBlobOID,
 			deletedFileMode: beforeMode,
 		})
 	case "modify":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			oldMode: beforeMode, newMode: afterMode,
@@ -333,14 +376,14 @@ func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (stri
 		if from == "" {
 			from = path
 		}
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: from, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			renameFrom: from, renameTo: path,
 			oldMode: beforeMode, newMode: afterMode,
 		})
 	case "mode":
-		return renderDiff(ctx, repoRoot, diffSpec{
+		return renderDiff(ctx, repoRoot, outerCap, diffSpec{
 			oldPath: path, newPath: path,
 			beforeOID: beforeOID, afterOID: afterOID,
 			oldMode: beforeMode, newMode: afterMode,
@@ -368,7 +411,7 @@ type diffSpec struct {
 // stripped and replaced by header lines that reflect the captured path
 // + mode. Anything past the first hunk header (`@@`) is forwarded
 // verbatim so binary-file markers or "No newline" trailers survive.
-func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error) {
+func renderDiff(ctx context.Context, repoRoot string, outerCap int, s diffSpec) (string, error) {
 	if err := ensureEmptyBlob(ctx, repoRoot, s); err != nil {
 		return "", err
 	}
@@ -407,16 +450,20 @@ func renderDiff(ctx context.Context, repoRoot string, s diffSpec) (string, error
 	// enforced at the git layer via DiffBlobsLimited so an oversize blob
 	// truncates at ai.DiffCap rather than after we've already buffered the
 	// full payload.
-	// Per-op git-layer cap. ai.DiffCap (4 KiB) is the AI provider budget
-	// applied via cappedDiffBuffer at the BuildOpsDiff outer layer; we
-	// give git 2× that so the preamble + first hunk never starve the
-	// rendered diff (git's `diff --git` + `index` + `--- /dev/null` +
-	// `+++` headers can eat ~200 bytes before the first hunk lands).
-	// Without the headroom, a giant blob's git output gets truncated mid-
-	// preamble and the outer buffer never reaches its cap, letting later
-	// ops render past the budget. The legacy code used DefaultDiffCap
-	// (1 MiB) so this is a tighten, not a regression.
-	const perOpGitCap = int64(ai.DiffCap * 2)
+	// Per-op git-layer cap. The outer cappedDiffBuffer enforces the AI
+	// provider budget at BuildOpsDiffWithCap; we give git 2× that so the
+	// preamble + first hunk never starve the rendered diff (git's
+	// `diff --git` + `index` + `--- /dev/null` + `+++` headers can eat
+	// ~200 bytes before the first hunk lands). Without the headroom, a
+	// giant blob's git output gets truncated mid-preamble and the outer
+	// buffer never reaches its cap, letting later ops render past the
+	// budget. The legacy code used DefaultDiffCap (1 MiB) so this is a
+	// tighten, not a regression.
+	gitCap := int64(outerCap) * 2
+	if gitCap <= 0 {
+		gitCap = int64(ai.DiffCap) * 2
+	}
+	perOpGitCap := gitCap
 	diffCtx, cancel := context.WithTimeout(ctx, diffBlobsTimeout())
 	body, err := git.DiffBlobsLimited(diffCtx, repoRoot, s.beforeOID, s.afterOID, perOpGitCap)
 	cancel()

@@ -726,6 +726,30 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	})
 	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
 
+	// Stop hook (d1 rewire): now calls `acd flush --logical` rather than the
+	// legacy `acd touch`. Exit must be 0 and the daemon must remain alive
+	// (Stop fires when Claude finishes a turn — the agent is not exiting,
+	// only pausing). The flush request itself drives the bypass-min-pending
+	// commit; we cover the commit-within-2s timing in the dedicated
+	// flush_logical integration test.
+	turnStopHook := pickHookByEvent(t, hooks, "Stop")
+	if turnStopHook.Command == "" {
+		t.Fatalf("claude-code snippet missing Stop hook entry")
+	}
+	if !strings.Contains(turnStopHook.Command, "acd flush --logical") {
+		t.Fatalf("claude-code Stop hook must call `acd flush --logical`, got: %s", turnStopHook.Command)
+	}
+	if strings.Contains(turnStopHook.Command, "acd touch") {
+		t.Fatalf("claude-code Stop hook still calls legacy `acd touch`; rewire incomplete: %s", turnStopHook.Command)
+	}
+	if turnRes := runBash(t, ctx, env, stdin, turnStopHook.Command); turnRes.ExitCode != 0 {
+		t.Fatalf("claude-code Stop (turn end) exit=%d\nstdout=%s\nstderr=%s",
+			turnRes.ExitCode, turnRes.Stdout, turnRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("claude-code daemon mode after Stop=%q; want running (Stop must flush, not stop)", mode)
+	}
+
 	// SessionEnd → acd stop. The daemon should shut down because this is
 	// the only registered session.
 	stopHook := pickHookByEvent(t, hooks, "SessionEnd")
@@ -1066,6 +1090,24 @@ func runOpencodeE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "opencode", ctx, env, repo, sessionID, "opencode", wakeHook, "")
 
+	// Idle hook (d1 rewire): now calls `acd flush --logical` rather than
+	// the legacy `acd touch`. Daemon must remain alive — session.idle does
+	// not end the session.
+	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
+	if idleHook.Command == "" {
+		t.Fatalf("opencode snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
+	}
+	if !strings.Contains(idleHook.Command, "acd flush --logical") {
+		t.Fatalf("opencode acd-flush-idle must call `acd flush --logical`, got: %s", idleHook.Command)
+	}
+	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
+		t.Fatalf("opencode acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
+			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("opencode daemon mode after idle=%q; want running", mode)
+	}
+
 	stopHook := pickHookByEvent(t, hooks, "acd-stop")
 	stopRes := runBash(t, ctx, env, "", stopHook.Command)
 	if stopRes.ExitCode != 0 {
@@ -1107,6 +1149,23 @@ func runPiE2E(t *testing.T, bin string) {
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
 	assertActiveHookSelfHeals(t, "pi", ctx, env, repo, sessionID, "pi", wakeHook, "")
+
+	// Idle hook (d1 rewire): now calls `acd flush --logical` rather than
+	// the legacy `acd touch`. Daemon must remain alive after idle.
+	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
+	if idleHook.Command == "" {
+		t.Fatalf("pi snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
+	}
+	if !strings.Contains(idleHook.Command, "acd flush --logical") {
+		t.Fatalf("pi acd-flush-idle must call `acd flush --logical`, got: %s", idleHook.Command)
+	}
+	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
+		t.Fatalf("pi acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
+			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("pi daemon mode after idle=%q; want running", mode)
+	}
 
 	stopHook := pickHookByEvent(t, hooks, "acd-stop")
 	stopRes := runBash(t, ctx, env, "", stopHook.Command)

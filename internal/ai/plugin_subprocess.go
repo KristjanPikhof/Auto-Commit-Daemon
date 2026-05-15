@@ -282,7 +282,10 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		Strategy:     "intent",
 		OfferedSeqs:  offeredSeqs(plannerReq),
 		DiffIncluded: intentDiffIncluded(plannerReq),
-		DiffCap:      DiffCap,
+		// Intent stage uses IntentStageDiffCap so the planner sees enough
+		// per-capture context to group multi-file changes; per-event
+		// commit messages still cap at the legacy DiffCap.
+		DiffCap: IntentStageDiffCap,
 	})
 
 	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
@@ -340,16 +343,31 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 {
-		p.logger.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 {
+		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("plugin", p.name),
-			slog.Any("dropped_seqs", dropped),
-		)
+		}
+		if len(dropped) > 0 {
+			attrs = append(attrs, slog.Any("dropped_seqs", dropped))
+		}
+		if len(synthesized) > 0 {
+			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		p.logger.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
+		// Best-effort: serialize the plugin response for forensic replay.
+		// Marshal failure means the raw payload stays empty in the rejects
+		// log entry; the validator code/message are still persisted so an
+		// operator can always recover the validation context.
+		var rawBytes []byte
+		if marshaled, mErr := json.Marshal(resp); mErr == nil {
+			rawBytes = marshaled
+		}
+		LogRejectedIntentPlan(ctx, p.Name(), plannerReq, string(rawBytes), err)
 		return IntentPlan{}, err
 	}
 	p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{

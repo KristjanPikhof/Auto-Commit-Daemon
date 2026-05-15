@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2669,11 +2670,12 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	if sum.Published != 1 || sum.Skipped {
 		t.Fatalf("summary=%+v want forced aging publish despite batch wait", sum)
 	}
-	if planner.calls != 1 {
-		t.Fatalf("planner calls=%d want 1", planner.calls)
-	}
-	if !planner.requests[0].ForcedAging {
-		t.Fatal("ForcedAging=false want true")
+	// Forced-aging windows of length 1 take the planIntentSingletonFastPath
+	// in replay.go and never call the planner — there is nothing left to
+	// decide once the window is narrowed to one capture. Provider-side call
+	// counter must remain 0.
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 (forced-aging singleton must skip provider)", planner.calls)
 	}
 }
 
@@ -2824,6 +2826,10 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	}
 
 	planner := &recordingIntentPlanner{
+		// Only the first replay reaches the planner: the first call defers
+		// pending[1] and selects pending[0]. The second replay falls into
+		// the forced-aging singleton fast path (provider skipped), so the
+		// second plan in this slice is never consumed.
 		plans: []ai.IntentPlan{
 			{
 				SelectedSeqs:   []int64{pending[0].Seq},
@@ -2833,11 +2839,6 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 				DeferredReasons: []ai.DeferredReason{
 					{Seq: pending[1].Seq, Reason: "waiting for related edit"},
 				},
-			},
-			{
-				SelectedSeqs:   []int64{pending[1].Seq},
-				Subject:        "Publish aged capture",
-				GroupingReason: "forced aging",
 			},
 		},
 	}
@@ -2882,18 +2883,125 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
 		t.Fatalf("summary 2=%+v want forced publish", sum)
 	}
-	if planner.calls != 2 {
-		t.Fatalf("planner calls=%d want 2", planner.calls)
-	}
-	if !planner.requests[1].ForcedAging {
-		t.Fatalf("second request ForcedAging=false want true")
-	}
-	if got := planner.requests[1].OfferedCaptures; len(got) != 1 || got[0].Seq != pending[1].Seq {
-		t.Fatalf("forced window offered=%+v want only seq %d", got, pending[1].Seq)
+	// First replay called the planner once (selects pending[0], defers
+	// pending[1]). Second replay narrows to a single forced-aging seq and
+	// publishes via planIntentSingletonFastPath without invoking the
+	// planner — call counter must stay at 1.
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1 (forced-aging singleton must skip provider)", planner.calls)
 	}
 	if _, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[1].Seq); err != nil || ok {
 		t.Fatalf("selected planner state after publish ok=%v err=%v, want cleared", ok, err)
 	}
+}
+
+// TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject
+// verifies the planIntentSingletonFastPath gate end-to-end:
+//
+//   - the planner is never invoked when the forced-aging window contains a
+//     single capture (zero provider calls in the recordingIntentPlanner
+//     counter);
+//   - the published commit message uses a diff-aware subject derived from
+//     the captured Go source (a function name) rather than the legacy
+//     "Update <basename>" placeholder;
+//   - decision_records carries both the intent_forced marker (recorded by
+//     recordIntentForcedDecision before the gate) and the
+//     intent_group_committed action (recorded by publishIntentSelection
+//     after the synthesized plan is committed).
+func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Body shaped like real Go source so DiffAwareSubject extracts the
+	// function name from the captured diff. The legacy fallback would
+	// have produced "Update overdue.go"; the diff-aware fallback yields
+	// "Update HandleOverdueCapture".
+	body := "package overdue\n\nfunc HandleOverdueCapture(ctx context.Context) error {\n\treturn nil\n}\n"
+	captureOnePendingFile(t, ctx, f, "overdue.go", body)
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, pending[0].Seq, 1, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		// Intentionally empty plan: if the gate misfires and the planner
+		// gets called, the empty SelectedSeqs will fail validation and the
+		// test surfaces the regression as a fallback decision instead of
+		// a clean publish.
+		plan: ai.IntentPlan{},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Skipped || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want clean forced-aging publish", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 (gate must skip provider on forced singleton)", planner.calls)
+	}
+	if len(planner.requests) != 0 {
+		t.Fatalf("planner requests=%d want 0", len(planner.requests))
+	}
+
+	// Inspect the published commit message to confirm the diff-aware
+	// subject landed. The Go source above has one func declaration so
+	// extractGoSymbol returns the function name.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	subject, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "-1", "--pretty=%s", head)
+	if err != nil {
+		t.Fatalf("git log subject: %v", err)
+	}
+	got := strings.TrimSpace(string(subject))
+	// First capture for a new path is a create op, so the verb is "Add".
+	// The function name comes from extractGoSymbol against the captured
+	// post-image diff.
+	if got != "Add HandleOverdueCapture" {
+		t.Fatalf("commit subject=%q want %q (diff-aware fallback should extract Go symbol)", got, "Add HandleOverdueCapture")
+	}
+
+	// Forced-aging marker must still appear (recorded ahead of the gate).
+	assertIntentForcedDecision(t, ctx, f.db, pending[0].Seq)
+	// Publish path records the intent_group_committed action via the
+	// committed decision kind plus an "intent_group:" reason prefix.
+	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: forced-aging singleton: provider skipped")
+}
+
+// assertIntentForcedDecision finds the intent_forced ledger row for a seq.
+// The forced marker is recorded before the commit lands so it has no
+// commit_oid; assertReplayDecision is too strict for this case.
+func assertIntentForcedDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64) {
+	t.Helper()
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindIntentForced {
+			return
+		}
+	}
+	t.Fatalf("missing intent_forced decision for seq %d: %+v", seq, decisions)
 }
 
 func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
@@ -4640,5 +4748,1194 @@ func TestRun_PauseStateReadFailClosed(t *testing.T) {
 	wg.Wait()
 	if runErr != nil {
 		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
+// captureSamePathEdit writes new content to path and runs one capture pass.
+// Returns the seq of the new pending event for the targeted path. Used by the
+// same-path coalesce tests to build a clean burst of consecutive modifies on
+// the same file.
+func captureSamePathEdit(t *testing.T, ctx context.Context, f *captureFixture, path, body string) int64 {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatalf("expected a pending event after writing %q", path)
+	}
+	// Return the highest-seq pending event for this path — that's the row
+	// the most recent capture pass produced.
+	var newest int64
+	for _, ev := range pending {
+		if ev.Path == path && ev.Seq > newest {
+			newest = ev.Seq
+		}
+	}
+	if newest == 0 {
+		t.Fatalf("no pending event for path %q after capture; pending=%+v", path, pending)
+	}
+	return newest
+}
+
+// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer: four sequential
+// modifies on the same path produce one offered window entry, one commit, and
+// four decision_records rows joined by commit_oid (so the CLI's grouped_seqs
+// derivation reports len 4).
+func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Seed the file as a tracked file so subsequent writes capture as
+	// modifies (not creates), giving us a clean modify→modify→modify chain
+	// to coalesce. Bootstrap AFTER the seed so the shadow reflects the
+	// committed v0 baseline.
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	seq1 := captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
+	seq3 := captureSamePathEdit(t, ctx, f, "burst.txt", "v3\n")
+	seq4 := captureSamePathEdit(t, ctx, f, "burst.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 4 {
+		t.Fatalf("pending=%d want 4 same-path captures", len(pending))
+	}
+
+	planner := &recordingIntentPlanner{}
+	// Plan the single coalesced offer the planner is expected to see.
+	planner.plan = ai.IntentPlan{
+		SelectedSeqs:   []int64{seq1},
+		Subject:        "Coalesced burst",
+		GroupingReason: "single-path edit chain",
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 4,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// All four covered events must land as published.
+	if sum.Published != 4 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 4 published, 0 conflicts/failed", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
+		t.Fatalf("offered captures=%d want 1 (coalesced)", len(got))
+	}
+	// One commit on top of the seed for the coalesced burst.
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		// seed (gitignore) + seed (burst.txt v0) + 1 coalesced commit = 3
+		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 coalesced)", got)
+	}
+	// HEAD's blob for burst.txt must be v4 (the LAST captured after-state).
+	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "burst.txt")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD burst.txt: %v", err)
+	}
+	v4OID, err := git.HashObjectStdin(ctx, f.dir, []byte("v4\n"))
+	if err != nil {
+		t.Fatalf("hash v4: %v", err)
+	}
+	if headOID != v4OID {
+		t.Fatalf("HEAD blob=%s want v4 %s (squash must land last after-state)", headOID, v4OID)
+	}
+	// Every event row points at the same commit_oid.
+	rows, err := f.db.SQL().QueryContext(ctx,
+		`SELECT seq, state, commit_oid FROM capture_events WHERE seq IN (?, ?, ?, ?) ORDER BY seq ASC`,
+		seq1, seq2, seq3, seq4)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var commit string
+	count := 0
+	for rows.Next() {
+		var seq int64
+		var st string
+		var oid sql.NullString
+		if err := rows.Scan(&seq, &st, &oid); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if st != state.EventStatePublished {
+			t.Fatalf("seq=%d state=%q want published", seq, st)
+		}
+		if !oid.Valid || oid.String == "" {
+			t.Fatalf("seq=%d missing commit_oid", seq)
+		}
+		if commit == "" {
+			commit = oid.String
+		} else if oid.String != commit {
+			t.Fatalf("seq=%d commit_oid=%s mismatches first commit_oid=%s (must share commit)",
+				seq, oid.String, commit)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("settled events=%d want 4", count)
+	}
+	// Decision ledger must carry one row per original seq for the same commit.
+	group, err := state.DecisionGroupForCommit(ctx, f.db, commit, 100)
+	if err != nil {
+		t.Fatalf("DecisionGroupForCommit: %v", err)
+	}
+	wantSeqs := []int64{seq1, seq2, seq3, seq4}
+	if !reflect.DeepEqual(group.EventSeqs, wantSeqs) {
+		t.Fatalf("decision group EventSeqs=%v want %v (grouped_seqs must cover every original seq)",
+			group.EventSeqs, wantSeqs)
+	}
+}
+
+// TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce: a same-path capture
+// surrounded by an other-path capture stays as 3 separate offers.
+func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "p.txt", "p0\n")
+	seedTrackedFileCommit(t, ctx, f, "q.txt", "q0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	captureSamePathEdit(t, ctx, f, "p.txt", "p1\n")
+	captureSamePathEdit(t, ctx, f, "q.txt", "q1\n")
+	captureSamePathEdit(t, ctx, f, "p.txt", "p2\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3 (P/Q/P sequence)", len(pending))
+	}
+	// Plan: select all three offers as a group (we just need to verify the
+	// planner sees 3 distinct offers).
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq},
+			Subject:        "PQP",
+			GroupingReason: "verify 3 offers",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 3 {
+		t.Fatalf("summary=%+v want 3 published", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 3 {
+		t.Fatalf("planner offered captures=%d want 3 (P/Q/P must split)", len(got))
+	}
+	// Verify each offer is a distinct seq (no coalesce_token) — read from
+	// the offered captures' seqs.
+	offeredSeqs := make([]int64, 0, 3)
+	for _, c := range planner.requests[0].OfferedCaptures {
+		offeredSeqs = append(offeredSeqs, c.Seq)
+	}
+	wantOffered := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq}
+	if !reflect.DeepEqual(offeredSeqs, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v", offeredSeqs, wantOffered)
+	}
+}
+
+// TestReplay_IntentPathCoalesce_DisabledViaEnv: with the env disabled, four
+// same-path captures show up as four separate offers (regression baseline).
+func TestReplay_IntentPathCoalesce_DisabledViaEnv(t *testing.T) {
+	t.Setenv(envIntentPathCoalesce, "0")
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v3\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 4 {
+		t.Fatalf("pending=%d want 4", len(pending))
+	}
+	allSeqs := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq, pending[3].Seq}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   allSeqs,
+			Subject:        "Disabled coalesce",
+			GroupingReason: "regression baseline",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 4,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 4 {
+		t.Fatalf("summary=%+v want 4 published", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 4 {
+		t.Fatalf("planner offered=%d want 4 (env-disabled coalesce keeps fan-out)", len(got))
+	}
+}
+
+// TestReplay_IntentPathCoalesce_BarrierStopsCoalesce: a blocked_conflict
+// barrier between two same-path captures keeps the suffix invisible to the
+// planner (state.PendingEvents already filters past the barrier), so coalesce
+// cannot fold across it.
+func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "barrier.txt", "v0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	seq1 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v2\n")
+
+	// Force seq2 into a terminal blocked_conflict state. Subsequent captures
+	// stay pending but PendingEvents must hide them behind seq2.
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET state = ?, error = ? WHERE seq = ?`,
+		state.EventStateBlockedConflict, "synthetic barrier for test", seq2); err != nil {
+		t.Fatalf("force blocked seq=%d: %v", seq2, err)
+	}
+	captureSamePathEdit(t, ctx, f, "barrier.txt", "v3\n")
+	captureSamePathEdit(t, ctx, f, "barrier.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1 (only seq1 should survive past the synthetic barrier)", len(pending))
+	}
+	if pending[0].Seq != seq1 {
+		t.Fatalf("pending[0].Seq=%d want %d (barrier hides later rows)", pending[0].Seq, seq1)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{seq1},
+			Subject:        "Pre-barrier",
+			GroupingReason: "barrier blocks suffix",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 1 published (barrier hides rest)", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
+		t.Fatalf("offered captures=%d want 1 (no coalesce across barrier)", len(got))
+	}
+	if planner.requests[0].OfferedCaptures[0].Seq != seq1 {
+		t.Fatalf("offered seq=%d want %d", planner.requests[0].OfferedCaptures[0].Seq, seq1)
+	}
+}
+
+// TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses runs the
+// scenario the task spec calls out: with quiescence=30s, two writes 5s
+// apart on path P only release P to the planner-offer pipeline once 30s
+// of silence has elapsed. The capture rows persist immediately for
+// durability — only the planner-offer is gated.
+func TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	// Enable the gate BEFORE captures so RecordPathWrite stamps land
+	// in the tracker. The hot-path short-circuit returns immediately
+	// when the gate is off, which would otherwise leave PathLastWrite
+	// empty and the gate inactive at replay time.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	clock := struct {
+		mu  sync.Mutex
+		now time.Time
+	}{now: t0}
+	SetPathQuiescenceClockForTest(t, func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	})
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	advance := func(d time.Duration) {
+		clock.mu.Lock()
+		clock.now = clock.now.Add(d)
+		clock.mu.Unlock()
+	}
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Write 1 at t=0.
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v1\n")
+	// Write 2 at t=5s.
+	advance(5 * time.Second)
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v2\n")
+
+	// At t=10s a replay tick under a 30s quiescence window must hold back
+	// the path: PathLastWrite=5, now=10, elapsed=5 < 30 → gated. We expect
+	// Skipped + skipped_due_path_quiescence and zero published commits.
+	advance(5 * time.Second) // now = t=10s
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			Subject:        "should not be called",
+			GroupingReason: "should not be called",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay (gated): %v", err)
+	}
+	if !sum.Skipped || sum.SkippedReason != "skipped_due_path_quiescence" {
+		t.Fatalf("expected skipped_due_path_quiescence at t=10s; summary=%+v", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner.calls=%d want 0 while gated", planner.calls)
+	}
+	pendingMid, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pendingMid) < 2 {
+		t.Fatalf("pending=%d want >=2 — capture rows must persist for durability under the gate", len(pendingMid))
+	}
+
+	// Advance past the 30s quiescence window relative to the second write.
+	// Second write was at t=5s, so now must be >= t=35s. Advance 26s more
+	// to land at t=36s.
+	advance(26 * time.Second)
+	planner = &recordingIntentPlanner{}
+
+	pendingPost, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents pre-second-replay: %v", err)
+	}
+	planner.plan = ai.IntentPlan{
+		SelectedSeqs:   captureEventSeqs(pendingPost),
+		Subject:        "Quiet path released",
+		GroupingReason: "quiescence elapsed",
+	}
+	sum2, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay (released): %v", err)
+	}
+	if sum2.Skipped {
+		t.Fatalf("expected release after window elapsed; summary=%+v", sum2)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1 after release", planner.calls)
+	}
+}
+
+// captureEventSeqs returns the seqs from a slice of capture events in
+// the input order. Used by the quiescence release test where we hand the
+// recording planner a SelectedSeqs slice that matches every visible
+// pending row.
+func captureEventSeqs(evs []state.CaptureEvent) []int64 {
+	out := make([]int64, 0, len(evs))
+	for _, ev := range evs {
+		out = append(out, ev.Seq)
+	}
+	return out
+}
+
+// TestReplay_PathQuiescenceDisabledRegressionBaseline asserts the gate is
+// off when ACD_PATH_QUIESCENCE_SECONDS is unset / zero — captures still
+// flow to the planner on the very next replay pass without waiting for any
+// silence window. This is the regression baseline that protects existing
+// deployments from accidental behavior change.
+func TestReplay_PathQuiescenceDisabledRegressionBaseline(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t.Setenv(EnvPathQuiescenceSeconds, "")
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "fast.txt", "v1\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "Direct ship",
+			GroupingReason: "no quiescence gate",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Skipped {
+		t.Fatalf("baseline must not skip with gate disabled; summary=%+v", sum)
+	}
+	if sum.Published != 1 {
+		t.Fatalf("Published=%d want 1; summary=%+v", sum.Published, sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+}
+
+// TestReplay_PathQuiescenceSnapshotRecordsGatedCount confirms the daemon
+// stamps daemon_meta.path_quiescence.gated_count after every replay pass
+// under the gate. The CLI status path reads the same key (covered by an
+// intent_observability_test) so this test asserts the daemon-side write,
+// not the read.
+func TestReplay_PathQuiescenceSnapshotRecordsGatedCount(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	resetLastPersistedQuiescenceGatedForTest(t)
+	// Enable the gate before captures so RecordPathWrite stamps land.
+	t.Setenv(EnvPathQuiescenceSeconds, "60")
+	_ = resolvePathQuiescenceSeconds()
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return t0 })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "snap.txt", "v1\n")
+
+	planner := &recordingIntentPlanner{}
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner.calls=%d want 0 (gated)", planner.calls)
+	}
+	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceGatedCount)
+	if err != nil {
+		t.Fatalf("MetaGet gated_count: %v", err)
+	}
+	if !ok {
+		t.Fatalf("daemon_meta missing %s after gated pass", MetaKeyPathQuiescenceGatedCount)
+	}
+	if v == "0" {
+		t.Fatalf("gated_count=0 after gated pass; want >0")
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAttachedWhenWindowMatches stages a
+// HEAD commit that touches path P, captures a fresh write to P, runs
+// replay with affinity=120s, and asserts the planner request now carries
+// PathRecentCommits[0] referring to that HEAD commit. The hint is shaped
+// so future amend support can switch on SuggestedAction; v1 only adds the
+// hint without taking action.
+func TestReplay_RecentCommitAffinityHintAttachedWhenWindowMatches(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Land a real HEAD commit that touches the path. We commit the file via
+	// raw git so the ACD daemon doesn't fold it into the test capture stream.
+	const path = "affinity.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package affinity\n"), 0o644); err != nil {
+		t.Fatalf("write affinity: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed affinity.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	captureOnePendingFile(t, ctx, f, path, "package affinity\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatalf("no pending after capture")
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "Affinity hint exposed",
+			GroupingReason: "verify hint serialization",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "3600")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+	got := planner.requests[0].PathRecentCommits
+	if len(got) != 1 {
+		t.Fatalf("PathRecentCommits len=%d want 1; got=%+v", len(got), got)
+	}
+	if got[0].Path != path {
+		t.Fatalf("PathRecentCommits[0].Path=%q want %q", got[0].Path, path)
+	}
+	if got[0].OID != headOID {
+		t.Fatalf("PathRecentCommits[0].OID=%q want HEAD %q", got[0].OID, headOID)
+	}
+	if got[0].SuggestedAction != ai.PathRecentCommitSuggestionExtendOrWait {
+		t.Fatalf("SuggestedAction=%q want %q", got[0].SuggestedAction, ai.PathRecentCommitSuggestionExtendOrWait)
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAbsentWhenDisabled asserts setting
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS=0 disables the hint even when a
+// matching HEAD commit exists. Mirror baseline for env-disable.
+func TestReplay_RecentCommitAffinityHintAbsentWhenDisabled(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	const path = "no-hint.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package nohint\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "seed no-hint.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, path, "package nohint\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "no hint",
+			GroupingReason: "env disabled",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "0")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner.calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].PathRecentCommits; len(got) != 0 {
+		t.Fatalf("PathRecentCommits=%+v want empty when env=0", got)
+	}
+}
+
+// TestReplay_RecentCommitAffinityHintAbsentWhenStale verifies an older HEAD
+// commit (older than the affinity window) does NOT generate a hint. Use a
+// short window of 5s and rely on the fact that the seeded commit is already
+// older than 5s by the time replay runs (we sleep briefly to be safe).
+func TestReplay_RecentCommitAffinityHintAbsentWhenStale(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	const path = "stale.go"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("package stale\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", path); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	// Commit with a back-dated committer timestamp (1 hour ago) so the
+	// affinity window can never include it without flake risk.
+	past := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	pastEnv := map[string]string{
+		"GIT_COMMITTER_DATE": past,
+		"GIT_AUTHOR_DATE":    past,
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir, ExtraEnv: pastEnv}, "commit", "-q", "-m", "seed stale.go"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse HEAD: %v", err)
+	}
+	f.cctx.BaseHead = headOID
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, path, "package stale\n// edit\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq},
+			Subject:        "stale skip",
+			GroupingReason: "older than window",
+		},
+	}
+	t.Setenv("ACD_RECENT_COMMIT_AFFINITY_SECONDS", "60")
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	}); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if got := planner.requests[0].PathRecentCommits; len(got) != 0 {
+		t.Fatalf("PathRecentCommits=%+v want empty when HEAD commit is older than the window", got)
+	}
+}
+
+// TestReplay_PathQuiescence_GatedHeadBlocksBatch covers the FIFO-preserving
+// fix: when the FIRST pending event in the window is gated, the entire
+// batch is held back so cross-path causality is preserved. We never
+// compact around the head — that would let a later event jump ahead of
+// an earlier gated peer that touches an unrelated path the next event
+// depends on.
+func TestReplay_PathQuiescence_GatedHeadBlocksBatch(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	clock := struct {
+		mu  sync.Mutex
+		now time.Time
+	}{now: t0}
+	SetPathQuiescenceClockForTest(t, func() time.Time {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		return clock.now
+	})
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	advance := func(d time.Duration) {
+		clock.mu.Lock()
+		clock.now = clock.now.Add(d)
+		clock.mu.Unlock()
+	}
+
+	// IMPORTANT: enable the gate before captures so RecordPathWrite
+	// inside Capture stamps both files. ResetPathQuiescenceForTest
+	// above cleared the gate flag.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	// seqA: capture "hot.txt" at t=0.
+	captureOnePendingFile(t, ctx, f, "hot.txt", "v1\n")
+	// Advance 60s and capture "cool.txt" at t=60s. Both writes stamp
+	// the per-path tracker via Capture's RecordPathWrite call.
+	advance(60 * time.Second)
+	captureOnePendingFile(t, ctx, f, "cool.txt", "v1\n")
+	pendingDB, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents pre-replay: %v", err)
+	}
+	if len(pendingDB) < 2 {
+		t.Fatalf("expected >=2 pending rows, got %d", len(pendingDB))
+	}
+	// Re-stamp hot.txt to a recent timestamp (now-5s) so it falls
+	// inside the 30s gate window, while cool.txt's last stamp at
+	// t=60s is now 0s old which is also inside the gate window. We
+	// want hot.txt gated AND cool.txt also gated — but the FIFO fix
+	// only requires the HEAD to be gated. So make cool.txt (the tail)
+	// quiescent by re-stamping it far in the past.
+	RecordPathWrite("hot.txt", clock.now.Add(-5*time.Second))
+	RecordPathWrite("cool.txt", clock.now.Add(-1*time.Hour))
+	// Sanity checks.
+	if IsPathQuiescent("hot.txt", 30*time.Second, clock.now) {
+		t.Fatalf("test setup error: hot.txt must be hot at this point")
+	}
+	if !IsPathQuiescent("cool.txt", 30*time.Second, clock.now) {
+		t.Fatalf("test setup error: cool.txt must be cool at this point")
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			Subject:        "should not be called",
+			GroupingReason: "head gated must short-circuit batch",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if !sum.Skipped || sum.SkippedReason != "skipped_due_path_quiescence" {
+		t.Fatalf("FIFO violation: head gated but batch not held back; summary=%+v", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner must not be called when head is gated; calls=%d", planner.calls)
+	}
+	// Both pending rows must still be in the durable queue — the gate
+	// only blocks the planner-offer, not capture persistence.
+	pendingPost, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents post-replay: %v", err)
+	}
+	if len(pendingPost) < 2 {
+		t.Fatalf("durable rows lost; post=%d want >=2", len(pendingPost))
+	}
+}
+
+// TestReplay_PathQuiescence_MultiOpEventGatesOnAllPaths verifies the
+// multi-op gap fix: an event whose ops touch two paths (A, B) must be
+// gated when EITHER path is hot, not just when the header path is hot.
+// Previously pathQuiescentForEvent only inspected ev.Path + ev.OldPath
+// and let the multi-op-touched-path slip through.
+func TestReplay_PathQuiescence_MultiOpEventGatesOnAllPaths(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+	// Enable the gate so RecordPathWrite stamps below take effect.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+
+	// Header path "header.txt" was quiet (no recent write) but op path
+	// "hot.txt" was just written. The event below carries ops touching
+	// both paths.
+	RecordPathWrite("hot.txt", now.Add(-1*time.Second))
+
+	ev := state.CaptureEvent{Seq: 42, Path: "header.txt"}
+	ops := []state.CaptureOp{
+		{EventSeq: 42, Path: "header.txt", Op: "modify"},
+		{EventSeq: 42, Path: "hot.txt", Op: "modify"},
+	}
+	if pathQuiescentForEvent(ev, ops, 30*time.Second, now) {
+		t.Fatalf("multi-op gap: hot op-path was not gated")
+	}
+	// Sanity: the legacy single-path check (no ops) would have passed.
+	if !pathQuiescentForEvent(ev, nil, 30*time.Second, now) {
+		t.Fatalf("regression: header-only check unexpectedly gated; pre-fix behavior expected for nil ops")
+	}
+}
+
+// TestReplay_PathQuiescence_SnapshotSkipsWritesWhenDisabled verifies the
+// write-amplification fix: persistPathQuiescenceSnapshot must NOT touch
+// daemon_meta when the gate is disabled (quiescence == 0).
+func TestReplay_PathQuiescence_SnapshotSkipsWritesWhenDisabled(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	resetLastPersistedQuiescenceGatedForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	// Pre-stamp a known value so we can detect any rewrite.
+	const sentinel = "test-sentinel-7"
+	if err := state.MetaSet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt, sentinel); err != nil {
+		t.Fatalf("MetaSet sentinel: %v", err)
+	}
+
+	// Run snapshot with gate disabled (quiescence=0). Writes must not
+	// happen — sentinel must survive untouched.
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 0)
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 0)
+	persistPathQuiescenceSnapshot(ctx, f.db, 5, 0) // gated count > 0 still skipped
+
+	v, ok, err := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if err != nil {
+		t.Fatalf("MetaGet updated_at: %v", err)
+	}
+	if !ok || v != sentinel {
+		t.Fatalf("sentinel was overwritten when gate disabled; got=%q want=%q", v, sentinel)
+	}
+
+	// Now active gate (quiescence>0) and unchanged count: only the FIRST
+	// call should rewrite (sentinel→0 transition); subsequent identical
+	// values should NOT touch the gated_count key. We verify by
+	// re-stamping the timestamp sentinel between calls and checking
+	// only one rewrite occurred.
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 30*time.Second) // first write happens
+	if err := state.MetaSet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt, sentinel); err != nil {
+		t.Fatalf("MetaSet sentinel re-stamp: %v", err)
+	}
+	persistPathQuiescenceSnapshot(ctx, f.db, 0, 30*time.Second) // same count, must skip
+	v2, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if v2 != sentinel {
+		t.Fatalf("repeat call with unchanged count rewrote timestamp; got=%q", v2)
+	}
+
+	// Different count must rewrite both keys.
+	persistPathQuiescenceSnapshot(ctx, f.db, 3, 30*time.Second)
+	gv, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceGatedCount)
+	if gv != "3" {
+		t.Fatalf("gated_count not refreshed on change; got=%q want=3", gv)
+	}
+	v3, _, _ := state.MetaGet(ctx, f.db, MetaKeyPathQuiescenceUpdatedAt)
+	if v3 == sentinel {
+		t.Fatalf("updated_at not refreshed on change")
+	}
+}
+
+// TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath verifies the
+// forced-aging fast path runs the same selection-safety validator as the
+// normal planner path. We synthesize an items list whose paths overlap so
+// any plan selecting the second item while the first is "deferred" fails
+// validation. The fast path always selects items[0], so we instead test
+// the wider invariant: the validator IS invoked, and its failure path
+// records a planner error decision.
+//
+// The most direct way to exercise the fallback is to inject a planner
+// fast-path plan that nominates a seq NOT in items via a safety override.
+// Since the production planIntentSingletonFastPath always selects
+// items[0].event.Seq, this test instead asserts the validators fire at
+// all — by checking that a malformed plan would land an error decision.
+// We do that by stubbing planIntentSingletonFastPath to return a plan
+// claiming a seq the items list does not contain.
+func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+
+	// The forced-singleton fast path is exercised below by:
+	//   - capturing one event,
+	//   - bumping its planner_state.defer_count past the limit,
+	//   - running replay with deferLimit=1 so selectIntentWindow yields
+	//     a single forced item.
+	// We then override planIntentSingletonFastPath to return an invalid
+	// plan (claims a seq absent from items) so ai.ValidateIntentPlan
+	// rejects it. The test asserts the deterministic fallback fires
+	// (planner_error decision recorded, deterministic plan publishes).
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "force.txt", "v1\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	seq := pending[0].Seq
+	// Defer the row past the limit so selectIntentWindow forces it.
+	if err := state.RecordPlannerOffer(ctx, f.db, seq, 1); err != nil {
+		t.Fatalf("RecordPlannerOffer: %v", err)
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, seq, 2, "test-defer"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, seq, 3, "test-defer"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	// Stub the fast path to return an unsafe plan: claims a seq absent
+	// from items. ai.ValidateIntentPlan rejects this in the
+	// "selected_seqs not in offered" path, exercising the fast-path
+	// validator branch.
+	prev := planIntentSingletonFastPathFn.Load()
+	bad := func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+		return ai.IntentPlan{
+			SelectedSeqs:   []int64{item.event.Seq + 999}, // not offered
+			Subject:        "unsafe forced-singleton plan",
+			GroupingReason: "synthetic unsafe plan",
+			Source:         (ai.DeterministicProvider{}).Name(),
+		}
+	}
+	planIntentSingletonFastPathFn.Store(&bad)
+	t.Cleanup(func() { planIntentSingletonFastPathFn.Store(prev) })
+
+	planner := &recordingIntentPlanner{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+		IntentDeferLimit: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// Either path should land a deterministic commit (one published) or
+	// at minimum NOT publish the unsafe plan. We accept Published>=1
+	// because the deterministic fallback ships the event.
+	if sum.Published == 0 && sum.Failed == 0 && sum.Conflicts == 0 {
+		t.Fatalf("expected forced-aging fallback to advance the row; sum=%+v", sum)
+	}
+	// Verify a planner_error decision exists for the seq.
+	rows, err := state.DecisionsForEvent(ctx, f.db, seq, 16)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	hasErr := false
+	for _, row := range rows {
+		if row.Kind == state.DecisionKindIntentPlannerError {
+			hasErr = true
+			break
+		}
+	}
+	if !hasErr {
+		t.Fatalf("expected intent_planner_error decision after fast-path validator failed; rows=%+v", rows)
+	}
+}
+
+// TestReplay_CoalescedDeferAdvancesAllCoveredEvents verifies the
+// coalesce-defer fix: when the planner defers a coalesced offer,
+// recordIntentDeferrals must advance defer_count for EVERY covered seq,
+// not just the representative. Otherwise the aging clock silently resets
+// for covered seqs after an external publish of the representative.
+func TestReplay_CoalescedDeferAdvancesAllCoveredEvents(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Two captures on the SAME path → coalesced into one offer with the
+	// first seq as representative and the second seq covered.
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v1\n")
+	captureOnePendingFile(t, ctx, f, "burst.txt", "v2\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+	repSeq := pending[0].Seq
+	covSeq := pending[1].Seq
+
+	// Construct an items list that mirrors what buildIntentPlanRequest
+	// would produce after coalesce: representative seq carries a
+	// coalesce token covering both seqs.
+	items := []intentReplayItem{
+		{
+			event: pending[0],
+			coalesce: &coalesceToken{
+				OriginalSeqs: []int64{repSeq, covSeq},
+				Covered:      []state.CaptureEvent{pending[1]},
+			},
+		},
+	}
+	plan := ai.IntentPlan{
+		DeferredSeqs:    []int64{repSeq},
+		DeferredReasons: []ai.DeferredReason{{Seq: repSeq, Reason: "coalesce-defer-test"}},
+	}
+	if err := recordIntentDeferrals(ctx, f.db, plan, items, f.cctx, 100); err != nil {
+		t.Fatalf("recordIntentDeferrals: %v", err)
+	}
+
+	// Both representative AND covered must have defer_count == 1.
+	for _, seq := range []int64{repSeq, covSeq} {
+		ps, ok, err := state.PlannerStateForEvent(ctx, f.db, seq)
+		if err != nil {
+			t.Fatalf("PlannerStateForEvent seq=%d: %v", seq, err)
+		}
+		if !ok {
+			t.Fatalf("seq=%d missing planner_state row after coalesced defer", seq)
+		}
+		if ps.DeferCount != 1 {
+			t.Fatalf("seq=%d defer_count=%d want 1; covered seq must advance with representative", seq, ps.DeferCount)
+		}
+	}
+}
+
+// TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout verifies the
+// bounded subject-extraction budget on the forced-aging fast path: a
+// slow BuildOpsDiff stand-in must not stall the run loop; the fast path
+// falls back to the cheap singleOpSubject when the budget elapses.
+func TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	setForcedSingletonSubjectBudgetForTest(t, 50*time.Millisecond)
+
+	// Inject a deliberately slow diff renderer. Use the atomic helper so
+	// the cleanup restoration cannot race with the in-flight goroutine
+	// that the fast path spawns to bound the rendering call.
+	prev := setBuildOpsDiffForForcedSingletonForTest(func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+		select {
+		case <-time.After(2 * time.Second):
+			return "diff that should never reach the subject", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	})
+	t.Cleanup(func() { setBuildOpsDiffForForcedSingletonForTest(prev) })
+
+	item := intentReplayItem{
+		event: state.CaptureEvent{Seq: 1, Path: "slow.go", Operation: "modify"},
+		ops:   []state.CaptureOp{{EventSeq: 1, Path: "slow.go", Op: "modify"}},
+	}
+	start := time.Now()
+	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item)
+	elapsed := time.Since(start)
+	if elapsed > time.Second {
+		t.Fatalf("subject budget exceeded; elapsed=%s want <= ~50ms+overhead", elapsed)
+	}
+	if plan.Subject == "" {
+		t.Fatalf("Subject empty after timeout; expected fallback to singleOpSubject")
+	}
+	// The cheap subject for an "Update slow.go" should resolve via
+	// DiffAwareSubject(op, "") to a non-diff-derived line.
+	if !strings.Contains(plan.Subject, "slow.go") {
+		t.Fatalf("Subject=%q does not reference path; budget fallback may have produced unexpected text", plan.Subject)
+	}
+	if plan.SelectedSeqs[0] != item.event.Seq {
+		t.Fatalf("SelectedSeqs[0]=%d want %d", plan.SelectedSeqs[0], item.event.Seq)
+	}
+}
+
+// TestPathQuiescence_DisabledDoesNotStamp verifies the capture hot-path
+// short-circuit: when ACD_PATH_QUIESCENCE_SECONDS is unset (default), no
+// path entry is recorded by RecordPathWrite, so the tracker stays empty.
+func TestPathQuiescence_DisabledDoesNotStamp(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	// Default-disabled: env unset, gate flag must remain false.
+	t.Setenv(EnvPathQuiescenceSeconds, "")
+	_ = resolvePathQuiescenceSeconds()
+
+	for i := 0; i < 100; i++ {
+		RecordPathWrite("file-"+strconv.Itoa(i)+".go", time.Now())
+	}
+	if got := PathQuiescenceTrackerSize(); got != 0 {
+		t.Fatalf("tracker size=%d want 0 when gate disabled", got)
+	}
+}
+
+// TestPathQuiescence_EvictionBoundsMapSize verifies the eviction guard:
+// after pathQuiescenceMaxEntries entries have been stamped, the next
+// stamp triggers eviction of stale entries (older than 2x window) and
+// keeps the map under the cap.
+func TestPathQuiescence_EvictionBoundsMapSize(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t.Setenv(EnvPathQuiescenceSeconds, "1")
+	_ = resolvePathQuiescenceSeconds()
+
+	// Stamp pathQuiescenceMaxEntries+200 entries with old timestamps so
+	// every one is older than 2x the 1s window. Eviction must fire and
+	// drop the map back below the cap.
+	stale := time.Now().Add(-1 * time.Hour)
+	for i := 0; i < pathQuiescenceMaxEntries+200; i++ {
+		RecordPathWrite("stale-"+strconv.Itoa(i)+".go", stale)
+	}
+	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries {
+		t.Fatalf("tracker size=%d exceeds cap=%d", got, pathQuiescenceMaxEntries)
+	}
+
+	// Every entry was stale and should have been eligible for eviction;
+	// after the over-cap stamp the map should be much smaller than the
+	// hard cap (eviction drops everything older than 2*window). We
+	// tolerate up to 25% of the cap because eviction only fires when
+	// the cap is exceeded, and the post-eviction adds accumulate up to
+	// the next over-cap event.
+	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries/4 {
+		t.Fatalf("eviction did not prune stale entries; size=%d", got)
 	}
 }

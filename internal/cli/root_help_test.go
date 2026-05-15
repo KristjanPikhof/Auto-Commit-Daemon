@@ -32,8 +32,9 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"acd fix --dry-run",
 		"acd list --watch",
 		"acd diagnose",
-		"acd recover",
 		"acd doctor",
+		"acd pause",
+		"acd resume",
 		"acd setup",
 		"--repo string",
 		"--json",
@@ -51,6 +52,13 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"acd daemon",
 		"acd hook-stdin-extract",
 		"acd completion",
+		// Deprecated commands must not be advertised in the hand-written
+		// help. The cobra deprecation warnings on actual invocation still
+		// fire (recover.go / purge.go log to stderr), but the discovery
+		// path should steer new users to the supported `acd fix`
+		// entrypoint instead. Regression target: g1.
+		"acd recover",
+		"acd purge-events",
 	} {
 		if strings.Contains(got, noisy) {
 			t.Fatalf("root help contains internal/generated noise %q:\n%s", noisy, got)

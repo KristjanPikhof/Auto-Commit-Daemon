@@ -585,6 +585,114 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	}
 }
 
+// TestSetup_ClaudeCode_StopHookCallsFlushLogical guards the d1 rewire: the
+// Claude Code Stop hook must call `acd flush --logical` rather than the
+// legacy `acd touch`. The rewire is the whole point of the d1 task — Stop
+// fires when Claude finishes a turn, and we want pending captures to
+// commit immediately rather than wait the full IntentMaxPendingAge timer.
+// Regression target: a future template edit reverting to acd touch would
+// silently re-introduce the 5-minute commit lag.
+func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "claude-code")
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 {
+		t.Fatalf("no JSON block")
+	}
+	jsonBlock := out[start : end+1]
+	// Top-level JSON marker check (P2 #18). The acd-managed marker
+	// shape is format-specific: JSON harnesses (Claude Code, Codex)
+	// use the boolean key `_acd_managed: true` at the top level. Doctor
+	// and setup both rely on this exact marker shape; a future template
+	// edit that drops it would silently break drift detection.
+	var markerCheck map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonBlock), &markerCheck); err != nil {
+		t.Fatalf("parse JSON for marker check: %v", err)
+	}
+	rawMarker, present := markerCheck["_acd_managed"]
+	if !present {
+		t.Errorf("claude-code settings snippet missing top-level _acd_managed marker:\n%s", jsonBlock)
+	} else {
+		var managed bool
+		if err := json.Unmarshal(rawMarker, &managed); err != nil || !managed {
+			t.Errorf("claude-code _acd_managed must be JSON true; got %s (err=%v)", string(rawMarker), err)
+		}
+	}
+
+	var settings struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(jsonBlock), &settings); err != nil {
+		t.Fatalf("parse JSON: %v", err)
+	}
+	stop := settings.Hooks["Stop"]
+	if len(stop) == 0 || len(stop[0].Hooks) == 0 {
+		t.Fatalf("Stop hook missing")
+	}
+	cmd := stop[0].Hooks[0].Command
+	if !strings.Contains(cmd, "acd flush --logical") {
+		t.Errorf("Stop hook must call `acd flush --logical`, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "acd touch") {
+		t.Errorf("Stop hook still calls legacy `acd touch` — rewire incomplete: %s", cmd)
+	}
+	// Same fail-soft pattern as the legacy touch body: stderr lands in $LOG.
+	if !strings.Contains(cmd, `2>>"$LOG"`) {
+		t.Errorf("Stop hook missing stderr->LOG redirect: %s", cmd)
+	}
+}
+
+// TestSetup_OpenCode_IdleHookCallsFlushLogical mirrors the claude-code rewire
+// guard for the OpenCode session.idle event: it must call `acd flush
+// --logical` (under the new acd-flush-idle id) instead of the legacy
+// acd-touch-idle / `acd touch` body.
+func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
+	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	// YAML harnesses use a comment-prefixed marker `# acd-managed: true`
+	// at the top of the snippet. The `# ` prefix is load-bearing — a
+	// hand-edited bare `acd-managed: true` is intentionally NOT
+	// detected (see internal/cli/doctor.go). Catch a regression that
+	// drops or alters the marker on the OpenCode YAML template.
+	const yamlMarker = "# acd-managed: true"
+	if !strings.Contains(body, yamlMarker) {
+		t.Errorf("opencode snippet missing %q marker:\n%s", yamlMarker, body)
+	}
+	if strings.Contains(body, "- id: acd-touch-idle") {
+		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+	}
+	block := yamlHookBlock(t, body, "acd-flush-idle")
+	if !strings.Contains(block, "acd flush --logical") {
+		t.Errorf("opencode acd-flush-idle must call `acd flush --logical`:\n%s", block)
+	}
+	if !strings.Contains(block, "session.idle") {
+		t.Errorf("opencode acd-flush-idle must bind to session.idle event:\n%s", block)
+	}
+}
+
+// TestSetup_Pi_IdleHookCallsFlushLogical mirrors the OpenCode case for Pi.
+func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
+	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	// Same YAML marker contract as opencode (P2 #18).
+	const yamlMarker = "# acd-managed: true"
+	if !strings.Contains(body, yamlMarker) {
+		t.Errorf("pi snippet missing %q marker:\n%s", yamlMarker, body)
+	}
+	if strings.Contains(body, "- id: acd-touch-idle") {
+		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+	}
+	block := yamlHookBlock(t, body, "acd-flush-idle")
+	if !strings.Contains(block, "acd flush --logical") {
+		t.Errorf("pi acd-flush-idle must call `acd flush --logical`:\n%s", block)
+	}
+	if !strings.Contains(block, "session.idle") {
+		t.Errorf("pi acd-flush-idle must bind to session.idle event:\n%s", block)
+	}
+}
+
 // TestSetup_OpenCode_AllHooksGateMkdir guards that every opencode YAML hook
 // body gates `mkdir -p` behind a `[ -d "$LOG_DIR" ]` check, mirroring the
 // codex template invariant. Unconditional `mkdir -p` on every hook event
@@ -593,7 +701,7 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 // between codex and opencode/pi snippets).
 func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, "mkdir -p") {
 			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
@@ -609,7 +717,7 @@ func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 // directory-exists check.
 func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, "mkdir -p") {
 			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
@@ -701,7 +809,7 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 // neither setting PI_SESSION_ID would still collapse on that event.
 func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) {
 			t.Errorf("%s: must use per-process unique SID fallback (pi-$$-$(date +%%s)):\n%s", id, block)

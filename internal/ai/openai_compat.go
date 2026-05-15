@@ -283,7 +283,10 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		Strategy:     "intent",
 		OfferedSeqs:  offeredSeqs(plannerReq),
 		DiffIncluded: intentDiffIncluded(plannerReq),
-		DiffCap:      DiffCap,
+		// Intent stage uses IntentStageDiffCap so the planner sees enough
+		// per-capture context to group multi-file changes; per-event
+		// commit messages still cap at the legacy DiffCap.
+		DiffCap: IntentStageDiffCap,
 	})
 
 	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
@@ -334,17 +337,24 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 {
-		slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 {
+		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("model", model),
-			slog.Any("dropped_seqs", dropped),
-		)
+		}
+		if len(dropped) > 0 {
+			attrs = append(attrs, slog.Any("dropped_seqs", dropped))
+		}
+		if len(synthesized) > 0 {
+			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		LogRejectedIntentPlan(ctx, p.Name(), plannerReq, string(raw), err)
 		return IntentPlan{}, err
 	}
 	p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{

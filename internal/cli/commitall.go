@@ -326,10 +326,10 @@ func loadCommitAllGeneration(ctx context.Context, db *state.DB) (int64, error) {
 	// it would build a parallel shadow the daemon will not consume.
 	parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is not a valid integer; run `acd recover --auto` to repair state", v)
+		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is not a valid integer; run `acd fix --clear-pause` to repair state", v)
 	}
 	if parsed <= 0 {
-		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is non-positive; run `acd recover --auto` to repair state", v)
+		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is non-positive; run `acd fix --clear-pause` to repair state", v)
 	}
 	return parsed, nil
 }
