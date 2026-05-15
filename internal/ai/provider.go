@@ -229,9 +229,9 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 	retryEnabled := intentRetryOnInvalidEnabled()
 	currentReq := req
 	var (
-		lastErr      error
-		dropped      []int64
-		synthesized  []int64
+		lastErr     error
+		dropped     []int64
+		synthesized []int64
 	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		plan, err := primary.PlanIntent(ctx, currentReq)

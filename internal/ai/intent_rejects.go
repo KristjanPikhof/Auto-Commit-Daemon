@@ -89,16 +89,16 @@ const IntentRejectsKept = 1
 // is enabled, RawResponse is populated AND size + sha256 are still recorded
 // so downstream tooling can cross-check that the on-disk payload matches.
 type IntentRejectedPlan struct {
-	TS                   string                   `json:"ts"`
-	Provider             string                   `json:"provider,omitempty"`
-	OfferedSeqs          []int64                  `json:"offered_seqs"`
-	RawResponse          string                   `json:"raw_response,omitempty"`
-	RawResponseRedacted  bool                     `json:"raw_response_redacted,omitempty"`
-	RawResponseSizeBytes int                      `json:"raw_response_size_bytes,omitempty"`
-	RawResponseSHA256    string                   `json:"raw_response_sha256,omitempty"`
+	TS                   string                         `json:"ts"`
+	Provider             string                         `json:"provider,omitempty"`
+	OfferedSeqs          []int64                        `json:"offered_seqs"`
+	RawResponse          string                         `json:"raw_response,omitempty"`
+	RawResponseRedacted  bool                           `json:"raw_response_redacted,omitempty"`
+	RawResponseSizeBytes int                            `json:"raw_response_size_bytes,omitempty"`
+	RawResponseSHA256    string                         `json:"raw_response_sha256,omitempty"`
 	ParsedPlanSummary    *IntentRejectedPlanPlanSummary `json:"parsed_plan_summary,omitempty"`
-	Code                 IntentPlanValidationCode `json:"code"`
-	Message              string                   `json:"message"`
+	Code                 IntentPlanValidationCode       `json:"code"`
+	Message              string                         `json:"message"`
 }
 
 // IntentRejectedPlanPlanSummary records the post-parse shape of the

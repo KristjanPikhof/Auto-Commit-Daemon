@@ -230,9 +230,9 @@ func extractGoSymbol(lines []string) string {
 // default`, and `async`. Arrow-function const declarations are picked up
 // via the const branch.
 var (
-	tsClassRE  = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsFuncRE   = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[\(\<]`)
-	tsConstRE  = regexp.MustCompile(`^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*[:=]`)
+	tsClassRE = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
+	tsFuncRE  = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[\(\<]`)
+	tsConstRE = regexp.MustCompile(`^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*[:=]`)
 	// tsMethodRE requires at least one modifier prefix (public/private/
 	// protected/static/async). Without the requirement the regex matches
 	// any `someCallback(opts): void {` line in arbitrary code, producing
