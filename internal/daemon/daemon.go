@@ -342,6 +342,11 @@ func Run(ctx context.Context, opts Options) error {
 
 	providerCfg := ai.LoadProviderConfigFromEnv()
 	providerCfg.Logger = logger
+	// Install the package-level rejects logger before any planner call can
+	// fire. The logger is best-effort: any write failure surfaces as a
+	// slog.Warn rather than blocking replay. ConfigureIntentRejectsLogger
+	// is idempotent and accepts re-installation across restart.
+	ai.ConfigureIntentRejectsLogger(opts.GitDir)
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
 		"commit.strategy":        string(providerCfg.CommitStrategy),
 		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
