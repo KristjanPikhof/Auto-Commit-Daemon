@@ -493,6 +493,22 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	if oldestPath.Valid {
 		report.OldestPendingPath = oldestPath.String
 	}
+	// Path-quiescence aware reporting: when the daemon stamped a recent
+	// gated-count snapshot we subtract it from VisiblePendingEvents so the
+	// number reflects the planner-visible window, not the durable FIFO
+	// depth. OldestPendingAgeSeconds is intentionally NOT adjusted —
+	// quiescence does not change the persistence timestamp on the oldest
+	// row, only when the planner is offered the captures behind it.
+	if v, ok, err := metaLookup(ctx, conn, "path_quiescence.gated_count"); err == nil && ok {
+		if gated, perr := strconv.Atoi(strings.TrimSpace(v)); perr == nil && gated > 0 {
+			report.PathQuiescenceGatedEvents = gated
+			adjusted := report.VisiblePendingEvents - gated
+			if adjusted < 0 {
+				adjusted = 0
+			}
+			report.VisiblePendingEvents = adjusted
+		}
+	}
 	if !oldestCaptured.Valid || report.VisiblePendingEvents == 0 || report.MaxPendingAgeSeconds <= 0 {
 		return nil
 	}
