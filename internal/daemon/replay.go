@@ -1574,15 +1574,74 @@ func aiCommitSummary(commit git.CommitSummary) *ai.CommitSummary {
 // Diff rendering uses the per-op git-diff machinery shared with the
 // network-bound providers; render failures fall back to an empty diff,
 // which DiffAwareSubject treats as "no symbol available".
+// forcedSingletonSubjectBudget caps the wall-clock spent rendering a
+// diff-aware subject on the forced-aging fast path. Forced aging is meant
+// to FORCE progress; if BuildOpsDiff stalls (huge blob, gc contention,
+// foreign odb), we fall back to the cheap per-op subject so the commit
+// still ships within the bounded replay-pass budget.
+const forcedSingletonSubjectBudget = time.Second
+
+// forcedSingletonSubjectBudgetOverride lets tests pin a tiny budget so
+// the timeout fallback is exercised without touching real disk. <=0 means
+// "use forcedSingletonSubjectBudget".
+var forcedSingletonSubjectBudgetOverride atomic.Int64
+
+func setForcedSingletonSubjectBudgetForTest(t interface{ Helper() }, d time.Duration) {
+	t.Helper()
+	forcedSingletonSubjectBudgetOverride.Store(int64(d))
+	t.Cleanup(func() { forcedSingletonSubjectBudgetOverride.Store(0) })
+}
+
+func forcedSingletonSubjectBudgetEffective() time.Duration {
+	if v := forcedSingletonSubjectBudgetOverride.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return forcedSingletonSubjectBudget
+}
+
+// buildOpsDiffForForcedSingleton wraps BuildOpsDiff with the bounded
+// forced-singleton budget. Override hook lets tests inject a sleep without
+// rewriting BuildOpsDiff itself.
+var buildOpsDiffForForcedSingleton = func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	return BuildOpsDiff(ctx, repoRoot, ops)
+}
+
 func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
 	op := singletonFallbackOp(item)
-	diff := ""
-	if rendered, err := BuildOpsDiff(ctx, repoRoot, item.ops); err == nil {
-		diff = rendered
+	subject := ""
+	// Bounded subject budget: a slow BuildOpsDiff on the forced-aging path
+	// must not stall the run loop. context.WithTimeout fires inside the
+	// nested git invocations and the soft per-op error branch swallows the
+	// resulting cancel, so we treat any timeout/error as "no diff
+	// available" and fall back to the per-op subject helper.
+	subjectCtx, cancel := context.WithTimeout(ctx, forcedSingletonSubjectBudgetEffective())
+	defer cancel()
+	type diffResult struct {
+		diff string
+		err  error
+	}
+	diffCh := make(chan diffResult, 1)
+	go func() {
+		rendered, err := buildOpsDiffForForcedSingleton(subjectCtx, repoRoot, item.ops)
+		diffCh <- diffResult{diff: rendered, err: err}
+	}()
+	select {
+	case res := <-diffCh:
+		if res.err != nil || subjectCtx.Err() != nil {
+			subject = ai.DiffAwareSubject(op, "")
+		} else {
+			subject = ai.DiffAwareSubject(op, res.diff)
+		}
+	case <-subjectCtx.Done():
+		// Timed out: do NOT block waiting for the goroutine to finish; the
+		// renderer will observe the cancelled context on its next git
+		// invocation and exit on its own. Use the cheap subject so the
+		// commit still ships within the forced-aging budget.
+		subject = ai.DiffAwareSubject(op, "")
 	}
 	return ai.IntentPlan{
 		SelectedSeqs:   []int64{item.event.Seq},
-		Subject:        ai.DiffAwareSubject(op, diff),
+		Subject:        subject,
 		GroupingReason: "forced-aging singleton: provider skipped",
 		Source:         (ai.DeterministicProvider{}).Name(),
 	}
