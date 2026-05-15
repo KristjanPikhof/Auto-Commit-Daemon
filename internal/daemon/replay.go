@@ -1275,6 +1275,60 @@ func aiCommitSummary(commit git.CommitSummary) *ai.CommitSummary {
 	}
 }
 
+// planIntentSingletonFastPath synthesizes the IntentPlan for a forced-aging
+// window of length one. It does not call any planner; the chosen seq is
+// fully determined by selectIntentWindow (forced aging produced exactly one
+// offered capture) so there is nothing left to plan. The subject is built
+// from a per-language symbol extracted out of the captured diff, falling
+// back to "Verb basename" when no symbol is recoverable. Source is stamped
+// "deterministic" so downstream telemetry and ledger writers attribute the
+// commit message to the local fallback rather than a phantom planner call.
+//
+// Diff rendering uses the per-op git-diff machinery shared with the
+// network-bound providers; render failures fall back to an empty diff,
+// which DiffAwareSubject treats as "no symbol available".
+func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+	op := singletonFallbackOp(item)
+	diff := ""
+	if rendered, err := BuildOpsDiff(ctx, repoRoot, item.ops); err == nil {
+		diff = rendered
+	}
+	return ai.IntentPlan{
+		SelectedSeqs:   []int64{item.event.Seq},
+		Subject:        ai.DiffAwareSubject(op, diff),
+		GroupingReason: "forced-aging singleton: provider skipped",
+		Source:         (ai.DeterministicProvider{}).Name(),
+	}
+}
+
+// singletonFallbackOp picks the OpItem fed to DiffAwareSubject. For a
+// single captured op (the common case) we use it directly. For events
+// that came in with multiple ops we fall back to the event-level shape
+// because singleOpSubject handles the multi-op event-class path itself.
+func singletonFallbackOp(item intentReplayItem) ai.OpItem {
+	if len(item.ops) == 1 {
+		op := item.ops[0]
+		oldPath := ""
+		if op.OldPath.Valid {
+			oldPath = op.OldPath.String
+		}
+		return ai.OpItem{
+			Path:    op.Path,
+			Op:      op.Op,
+			OldPath: oldPath,
+		}
+	}
+	oldPath := ""
+	if item.event.OldPath.Valid {
+		oldPath = item.event.OldPath.String
+	}
+	return ai.OpItem{
+		Path:    item.event.Path,
+		Op:      item.event.Operation,
+		OldPath: oldPath,
+	}
+}
+
 func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
 	if planner == nil {
 		planner = ai.DeterministicProvider{}
