@@ -1859,13 +1859,14 @@ func publishIntentSelection(
 		return sum, err
 	}
 	reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
-	sum.Published += len(selected)
+	publishedCount := intentSelectionPublishedCount(selected)
+	sum.Published += publishedCount
 	sum.BaseHead = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
 		"group":  true,
-		"events": len(selected),
+		"events": publishedCount,
 	})
 	return sum, nil
 }
