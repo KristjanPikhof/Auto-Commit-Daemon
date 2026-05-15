@@ -39,26 +39,26 @@ import (
 	"time"
 )
 
-// TestIntentPlannerRecovery_RetryAbsorbsValidationError simulates an
-// openai-compat planner whose first response is structurally valid JSON but
-// semantically invalid (deferred_reasons.seq references a selected seq —
-// the same shape as ai/testdata/intent_planner/bad_deferred_reason.json
-// before normalization). The composed retry loop must:
+// TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError simulates an
+// openai-compat planner whose first response trips the typed validator
+// with IntentPlanValidationEmptySelected — selected_seqs comes back as
+// an empty array which normalization cannot heal. The composed retry
+// loop must:
 //
-//  1. Detect the *IntentPlanValidationError on attempt 1.
+//  1. Detect the *IntentPlanValidationError{Code:
+//     IntentPlanValidationEmptySelected} on attempt 1.
 //  2. Re-prompt the same provider with the validator message appended.
 //  3. Accept the valid plan returned on attempt 2.
 //  4. Publish the grouped commit WITHOUT recording an intent_planner_error
 //     row (the retry suppresses the failure inside Compose).
 //
-// The provider-side normalization pass actually drops the spurious entry
-// for the FIRST response shape today (see
-// intent_planner_normalization_test.go), so to exercise the retry path
-// proper this test returns a different first-attempt failure: an empty
-// selected_seqs (validator code IntentPlanValidationEmptySelected) that
-// normalization cannot heal. The second attempt then returns the full
-// selection and the commit lands cleanly.
-func TestIntentPlannerRecovery_RetryAbsorbsValidationError(t *testing.T) {
+// We deliberately do NOT exercise the bad_deferred_reason shape here:
+// the openai-compat provider's NormalizeIntentPlanDeferredReasons pass
+// drops spurious entries before ValidateIntentPlan ever runs (see
+// intent_planner_normalization_test.go), so that path never reaches
+// the typed-error retry surface. EmptySelected is a clean proxy for
+// "real semantic failure that the retry path absorbs".
+func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
