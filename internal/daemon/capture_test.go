@@ -1628,6 +1628,11 @@ func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
 // the tracker now reports the path as recently-written.
 func TestCapture_PathQuiescenceTrackerStampsLastWriteTimes(t *testing.T) {
 	ResetPathQuiescenceForTest(t)
+	// Enable the gate; the hot-path RecordPathWrite short-circuits when
+	// the gate is off, so a test that asserts a stamp landed must opt in
+	// to the gate first.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
 	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
 	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
 	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
