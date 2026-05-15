@@ -233,7 +233,13 @@ var (
 	tsClassRE  = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
 	tsFuncRE   = regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*[\(\<]`)
 	tsConstRE  = regexp.MustCompile(`^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*[:=]`)
-	tsMethodRE = regexp.MustCompile(`^(?:public\s+|private\s+|protected\s+|static\s+|async\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*[:{]`)
+	// tsMethodRE requires at least one modifier prefix (public/private/
+	// protected/static/async). Without the requirement the regex matches
+	// any `someCallback(opts): void {` line in arbitrary code, producing
+	// noisy or wrong subjects. Real class methods almost always carry a
+	// visibility/static/async modifier in TS; bare-name method declarations
+	// fall through to the basename verb form, which is harmless.
+	tsMethodRE = regexp.MustCompile(`^(?:public|private|protected|static|async)(?:\s+(?:public|private|protected|static|async))*\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*[:{]`)
 )
 
 func extractTSJSSymbol(lines []string) string {
