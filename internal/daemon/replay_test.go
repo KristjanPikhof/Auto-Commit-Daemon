@@ -2895,6 +2895,112 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	}
 }
 
+// TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject
+// verifies the planIntentSingletonFastPath gate end-to-end:
+//
+//   - the planner is never invoked when the forced-aging window contains a
+//     single capture (zero provider calls in the recordingIntentPlanner
+//     counter);
+//   - the published commit message uses a diff-aware subject derived from
+//     the captured Go source (a function name) rather than the legacy
+//     "Update <basename>" placeholder;
+//   - decision_records carries both the intent_forced marker (recorded by
+//     recordIntentForcedDecision before the gate) and the
+//     intent_group_committed action (recorded by publishIntentSelection
+//     after the synthesized plan is committed).
+func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Body shaped like real Go source so DiffAwareSubject extracts the
+	// function name from the captured diff. The legacy fallback would
+	// have produced "Update overdue.go"; the diff-aware fallback yields
+	// "Update HandleOverdueCapture".
+	body := "package overdue\n\nfunc HandleOverdueCapture(ctx context.Context) error {\n\treturn nil\n}\n"
+	captureOnePendingFile(t, ctx, f, "overdue.go", body)
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, pending[0].Seq, 1, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	planner := &recordingIntentPlanner{
+		// Intentionally empty plan: if the gate misfires and the planner
+		// gets called, the empty SelectedSeqs will fail validation and the
+		// test surfaces the regression as a fallback decision instead of
+		// a clean publish.
+		plan: ai.IntentPlan{},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Skipped || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want clean forced-aging publish", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 (gate must skip provider on forced singleton)", planner.calls)
+	}
+	if len(planner.requests) != 0 {
+		t.Fatalf("planner requests=%d want 0", len(planner.requests))
+	}
+
+	// Inspect the published commit message to confirm the diff-aware
+	// subject landed. The Go source above has one func declaration so
+	// extractGoSymbol returns the function name.
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	subject, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "-1", "--pretty=%s", head)
+	if err != nil {
+		t.Fatalf("git log subject: %v", err)
+	}
+	got := strings.TrimSpace(string(subject))
+	if got != "Update HandleOverdueCapture" {
+		t.Fatalf("commit subject=%q want %q (diff-aware fallback should extract Go symbol)", got, "Update HandleOverdueCapture")
+	}
+
+	// Forced-aging marker must still appear (recorded ahead of the gate).
+	assertIntentForcedDecision(t, ctx, f.db, pending[0].Seq)
+	// Publish path records the intent_group_committed action via the
+	// committed decision kind plus an "intent_group:" reason prefix.
+	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: forced-aging singleton: provider skipped")
+}
+
+// assertIntentForcedDecision finds the intent_forced ledger row for a seq.
+// The forced marker is recorded before the commit lands so it has no
+// commit_oid; assertReplayDecision is too strict for this case.
+func assertIntentForcedDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64) {
+	t.Helper()
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindIntentForced {
+			return
+		}
+	}
+	t.Fatalf("missing intent_forced decision for seq %d: %+v", seq, decisions)
+}
+
 func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
