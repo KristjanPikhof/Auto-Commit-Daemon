@@ -599,6 +599,26 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 	if start == -1 || end == -1 {
 		t.Fatalf("no JSON block")
 	}
+	jsonBlock := out[start : end+1]
+	// Top-level JSON marker check (P2 #18). The acd-managed marker
+	// shape is format-specific: JSON harnesses (Claude Code, Codex)
+	// use the boolean key `_acd_managed: true` at the top level. Doctor
+	// and setup both rely on this exact marker shape; a future template
+	// edit that drops it would silently break drift detection.
+	var markerCheck map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonBlock), &markerCheck); err != nil {
+		t.Fatalf("parse JSON for marker check: %v", err)
+	}
+	rawMarker, present := markerCheck["_acd_managed"]
+	if !present {
+		t.Errorf("claude-code settings snippet missing top-level _acd_managed marker:\n%s", jsonBlock)
+	} else {
+		var managed bool
+		if err := json.Unmarshal(rawMarker, &managed); err != nil || !managed {
+			t.Errorf("claude-code _acd_managed must be JSON true; got %s (err=%v)", string(rawMarker), err)
+		}
+	}
+
 	var settings struct {
 		Hooks map[string][]struct {
 			Hooks []struct {
@@ -606,7 +626,7 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
+	if err := json.Unmarshal([]byte(jsonBlock), &settings); err != nil {
 		t.Fatalf("parse JSON: %v", err)
 	}
 	stop := settings.Hooks["Stop"]
