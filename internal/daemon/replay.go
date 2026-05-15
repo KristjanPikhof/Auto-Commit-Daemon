@@ -1819,7 +1819,7 @@ func publishIntentSelection(
 			if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 				return sum, fmt.Errorf("daemon: replay reseed index after grouped cas idempotent publish: %w", err)
 			}
-			sum.Published += len(selected)
+			sum.Published += intentSelectionPublishedCount(selected)
 			sum.BaseHead = headOID
 			traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "already_published_after_cas_exhaustion", map[string]any{
 				"commit": headOID,
