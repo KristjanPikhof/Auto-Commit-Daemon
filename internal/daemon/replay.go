@@ -1923,6 +1923,12 @@ func settleIntentPublished(ctx context.Context, db *state.DB, items []intentRepl
 }
 
 func reconcileIntentLiveIndex(ctx context.Context, repoRoot string, logger acdtrace.Logger, cctx CaptureContext, items []intentReplayItem) {
+	// For coalesced items the merged ops on the representative already
+	// describe the squashed before/after state, so a single reconcile per
+	// item brings the live index to the same final shape as the published
+	// commit. Walking the additional covered events would trigger
+	// redundant re-stages against an unrelated stale before-state and
+	// could spuriously skip paths.
 	for _, item := range items {
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, logger, cctx, item.event, item.ops)
 	}
