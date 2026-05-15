@@ -1614,16 +1614,33 @@ func IsPathQuiescent(path string, quiescence time.Duration, now time.Time) bool 
 // resolvePathQuiescenceSeconds parses ACD_PATH_QUIESCENCE_SECONDS into a
 // time.Duration. Negative or unparseable values fall back to the default
 // (zero, i.e. gate disabled).
+//
+// Side effect: when the parsed value is positive we flip the
+// pathQuiescenceEnabled gate ON so capture's RecordPathWrite hot path
+// starts stamping. The gate is reset to OFF when parsing yields zero so
+// tests that toggle the env mid-suite see the corresponding behavior
+// flip on the next replay-config resolve.
 func resolvePathQuiescenceSeconds() time.Duration {
 	env := os.Getenv(EnvPathQuiescenceSeconds)
 	if env == "" {
+		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
 		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
 	}
 	n, err := strconv.Atoi(env)
 	if err != nil || n < 0 {
+		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
 		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
 	}
-	return time.Duration(n) * time.Second
+	d := time.Duration(n) * time.Second
+	applyPathQuiescenceWindow(d)
+	return d
+}
+
+// applyPathQuiescenceWindow records the active window and flips the
+// hot-path gate. Idempotent.
+func applyPathQuiescenceWindow(d time.Duration) {
+	pathQuiescenceWindowSec.Store(int64(d / time.Second))
+	SetPathQuiescenceEnabled(d > 0)
 }
 
 // recordOversize stores a daemon_meta breadcrumb so operators can see why a
