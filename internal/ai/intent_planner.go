@@ -388,38 +388,77 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	return nil
 }
 
-// NormalizeIntentPlanDeferredReasons drops DeferredReason entries whose Seq
-// is not present in plan.DeferredSeqs. Providers call this before
-// ValidateIntentPlan so a planner that emits a reason for a selected (or
-// unknown) seq does not collapse the entire plan to deterministic fallback.
-// Returns the cleaned plan and the dropped seqs in input order so callers can
-// log a single deterministic warning.
+// IntentPlanReasonMarker is the synthesized reason text used by
+// NormalizeIntentPlanDeferredReasons when a deferred seq has no planner-
+// supplied reason. Persisting a fixed marker into decision_records.reason
+// keeps the user-facing column non-blank so operators inspecting deferred
+// captures see "planner omitted reason" rather than an empty string. The
+// constant is exported so daemon-side ledger writers can reference it from
+// tests and downstream renderers can recognize the marker.
+const IntentPlanReasonMarker = "planner omitted reason"
+
+// NormalizeIntentPlanDeferredReasons normalizes plan.DeferredReasons against
+// plan.DeferredSeqs in two ways:
 //
-// Aliasing: on the no-drop path the returned plan.DeferredReasons still
-// aliases the caller's backing array; callers must not mutate the slice in
-// place. On the drop path the slice is freshly allocated.
-func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64) {
-	if len(plan.DeferredReasons) == 0 {
-		return plan, nil
+//  1. Drops DeferredReason entries whose Seq is not present in DeferredSeqs
+//     (planner emitted a reason for a selected or non-offered seq). Providers
+//     call this before ValidateIntentPlan so the spurious entry does not
+//     collapse the entire plan to deterministic fallback.
+//  2. Synthesizes DeferredReason entries for deferred seqs that have no
+//     matching reason from the planner. The synthesized Reason carries the
+//     IntentPlanReasonMarker so the marker round-trips into the decision
+//     ledger and operators see "planner omitted reason" instead of blank.
+//
+// Returns the cleaned plan, the dropped seqs in input order (over-emitted by
+// the planner), and the synthesized seqs in DeferredSeqs order (planner
+// omitted them). Callers emit a single slog.Warn naming both lists when
+// either is non-empty so double-normalize defense-in-depth runs (e.g., the
+// daemon's planIntentWithFallback) stay silent on the second pass.
+//
+// Aliasing: on the no-op path the returned plan.DeferredReasons still aliases
+// the caller's backing array; callers must not mutate the slice in place. On
+// the drop or synth path the slice is freshly allocated.
+func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64, []int64) {
+	if len(plan.DeferredReasons) == 0 && len(plan.DeferredSeqs) == 0 {
+		return plan, nil, nil
 	}
 	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
 	for _, seq := range plan.DeferredSeqs {
 		deferred[seq] = struct{}{}
 	}
 	cleaned := make([]DeferredReason, 0, len(plan.DeferredReasons))
+	have := make(map[int64]struct{}, len(plan.DeferredReasons))
 	var dropped []int64
 	for _, r := range plan.DeferredReasons {
 		if _, ok := deferred[r.Seq]; !ok {
 			dropped = append(dropped, r.Seq)
 			continue
 		}
+		// First reason wins; subsequent duplicates fall through to the
+		// validator which rejects them. Synthesis only runs for seqs
+		// that have no entry at all.
+		if _, exists := have[r.Seq]; !exists {
+			have[r.Seq] = struct{}{}
+		}
 		cleaned = append(cleaned, r)
 	}
-	if len(dropped) == 0 {
-		return plan, nil
+	var synthesized []int64
+	for _, seq := range plan.DeferredSeqs {
+		if _, ok := have[seq]; ok {
+			continue
+		}
+		synthesized = append(synthesized, seq)
+		cleaned = append(cleaned, DeferredReason{
+			Seq:    seq,
+			Reason: IntentPlanReasonMarker,
+		})
+		have[seq] = struct{}{}
+	}
+	if len(dropped) == 0 && len(synthesized) == 0 {
+		return plan, nil, nil
 	}
 	plan.DeferredReasons = cleaned
-	return plan, dropped
+	return plan, dropped, synthesized
 }
 
 // PlanIntent provides the deterministic fallback planner. It selects exactly
