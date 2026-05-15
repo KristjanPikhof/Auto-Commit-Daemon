@@ -4,6 +4,22 @@
 
 ### Added
 
+- Same-path pre-coalesce of consecutive captures for intent planning. The
+  replay window builder now folds runs of consecutive captures touching
+  exactly one shared path into a single offered planner entry. The squashed
+  entry carries the run's first observed `BeforeOID`/`BeforeMode` and the
+  run's last observed `AfterOID`/`AfterMode`, so write-tree builds the same
+  final blob as the unmerged chain. Renames, deletes, multi-path captures,
+  and any divergence in branch_token (`branch_ref`, `branch_generation`,
+  `base_head`) close a run; `state.PendingEvents` already filters past
+  publish/blocked_conflict/failed barriers so terminal rows never appear in
+  the input. On commit success every original seq absorbed by the
+  representative is marked published with the same `commit_oid` and gets
+  its own `decision_records` row, so `acd events --json grouped_seqs`
+  reports the full coverage. `ACD_INTENT_PATH_COALESCE` controls the
+  feature; default ON. Set to `0|false|no|off` to opt out (restart the
+  daemon to apply, matching the existing env-restart pattern).
+
 - `acd flush --logical` is the explicit drain entrypoint installed at
   harness Stop / idle hooks. It refreshes the heartbeat, enqueues a
   `flush_logical` flush_request, and signals the daemon so the next
