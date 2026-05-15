@@ -187,13 +187,8 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 		return IntentPlan{}, err
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 {
-		slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
-			slog.String("provider", c.fallback.Name()),
-			slog.Any("dropped_seqs", dropped),
-		)
-	}
+	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	logIntentPlanNormalization(c.fallback.Name(), dropped, synthesized)
 	if err := ValidateIntentPlan(req, plan); err != nil {
 		return IntentPlan{}, err
 	}
@@ -201,6 +196,24 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 		plan.Source = c.fallback.Name()
 	}
 	return plan, nil
+}
+
+// logIntentPlanNormalization emits a single deterministic slog.Warn naming
+// both dropped and synthesized seqs from a NormalizeIntentPlanDeferredReasons
+// call. No-op when both lists are empty so defense-in-depth re-normalization
+// stays silent on the second pass.
+func logIntentPlanNormalization(provider string, dropped, synthesized []int64) {
+	if len(dropped) == 0 && len(synthesized) == 0 {
+		return
+	}
+	attrs := []any{slog.String("provider", provider)}
+	if len(dropped) > 0 {
+		attrs = append(attrs, slog.Any("dropped_seqs", dropped))
+	}
+	if len(synthesized) > 0 {
+		attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+	}
+	slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 }
 
 // runPrimaryWithRetry runs the primary planner up to twice. On a typed
