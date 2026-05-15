@@ -1605,9 +1605,35 @@ func forcedSingletonSubjectBudgetEffective() time.Duration {
 
 // buildOpsDiffForForcedSingleton wraps BuildOpsDiff with the bounded
 // forced-singleton budget. Override hook lets tests inject a sleep without
-// rewriting BuildOpsDiff itself.
-var buildOpsDiffForForcedSingleton = func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+// rewriting BuildOpsDiff itself. Stored in an atomic.Pointer so concurrent
+// test cleanup cannot race with an in-flight goroutine reading the
+// previous value.
+var buildOpsDiffForForcedSingletonPtr atomic.Pointer[func(context.Context, string, []state.CaptureOp) (string, error)]
+
+func init() {
+	defaultDiff := func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+		return BuildOpsDiff(ctx, repoRoot, ops)
+	}
+	buildOpsDiffForForcedSingletonPtr.Store(&defaultDiff)
+}
+
+func buildOpsDiffForForcedSingleton(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	if fn := buildOpsDiffForForcedSingletonPtr.Load(); fn != nil && *fn != nil {
+		return (*fn)(ctx, repoRoot, ops)
+	}
 	return BuildOpsDiff(ctx, repoRoot, ops)
+}
+
+// setBuildOpsDiffForForcedSingletonForTest swaps the renderer atomically.
+// Returns the previous value so the caller can restore it.
+func setBuildOpsDiffForForcedSingletonForTest(fn func(context.Context, string, []state.CaptureOp) (string, error)) func(context.Context, string, []state.CaptureOp) (string, error) {
+	prev := buildOpsDiffForForcedSingletonPtr.Load()
+	cp := fn
+	buildOpsDiffForForcedSingletonPtr.Store(&cp)
+	if prev != nil {
+		return *prev
+	}
+	return nil
 }
 
 // planIntentSingletonFastPathFn lets tests stub the forced-singleton fast

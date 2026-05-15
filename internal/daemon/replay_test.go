@@ -5848,17 +5848,18 @@ func TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout(t *testing.T) {
 	ResetPathQuiescenceForTest(t)
 	setForcedSingletonSubjectBudgetForTest(t, 50*time.Millisecond)
 
-	// Inject a deliberately slow diff renderer.
-	prev := buildOpsDiffForForcedSingleton
-	buildOpsDiffForForcedSingleton = func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	// Inject a deliberately slow diff renderer. Use the atomic helper so
+	// the cleanup restoration cannot race with the in-flight goroutine
+	// that the fast path spawns to bound the rendering call.
+	prev := setBuildOpsDiffForForcedSingletonForTest(func(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
 		select {
 		case <-time.After(2 * time.Second):
 			return "diff that should never reach the subject", nil
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
-	}
-	t.Cleanup(func() { buildOpsDiffForForcedSingleton = prev })
+	})
+	t.Cleanup(func() { setBuildOpsDiffForForcedSingletonForTest(prev) })
 
 	item := intentReplayItem{
 		event: state.CaptureEvent{Seq: 1, Path: "slow.go", Operation: "modify"},
