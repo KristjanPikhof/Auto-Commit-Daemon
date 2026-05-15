@@ -156,6 +156,92 @@ func TestNewIntentRejectsWriter_TwoFileRetention(t *testing.T) {
 	}
 }
 
+// TestIntentRejectsWriter_RotateAtomicityNoIntermediateGap asserts that the
+// rotated archive (.1) is always observable by a concurrent reader during
+// the writer's append+rotate cycle. The previous implementation did
+// os.Remove(rotated) followed by os.Rename(current, rotated); a stat call
+// in between would briefly observe a missing .1. The atomic os.Rename
+// (POSIX rename(2) overwrites the destination) closes the gap.
+//
+// The test races a stat goroutine against rotation appends; once the .1
+// archive has been seen at least once, every subsequent stat must succeed.
+// A regression to the remove+rename pattern surfaces as a transient
+// fs.ErrNotExist after the file appeared.
+func TestIntentRejectsWriter_RotateAtomicityNoIntermediateGap(t *testing.T) {
+	dir := t.TempDir()
+	w := NewIntentRejectsWriter(dir, time.Now)
+	w.limit = 1024 // tiny so each append rotates promptly
+	rotated := w.Path() + ".1"
+	pad := strings.Repeat("X", 700) // > limit/2 so two appends rotate
+
+	// Seed two rotations so .1 already exists before the racing goroutine
+	// starts watching for the no-gap invariant.
+	for i := 0; i < 2; i++ {
+		rec := IntentRejectedPlan{
+			Provider:    "openai-compat",
+			OfferedSeqs: []int64{int64(i + 1)},
+			RawResponse: pad,
+			Code:        IntentPlanValidationShape,
+			Message:     fmt.Sprintf("seed-%d", i+1),
+		}
+		if _, err := w.Append(rec); err != nil {
+			t.Fatalf("seed Append %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(rotated); err != nil {
+		t.Fatalf("rotated must exist after seed: %v", err)
+	}
+
+	const writes = 30
+	stop := make(chan struct{})
+	gapErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		seenOnce := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, err := os.Stat(rotated)
+			if err == nil {
+				seenOnce = true
+				continue
+			}
+			if seenOnce && errors.Is(err, os.ErrNotExist) {
+				select {
+				case gapErr <- fmt.Errorf("rotated .1 disappeared mid-rotation: %w", err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < writes; i++ {
+		rec := IntentRejectedPlan{
+			Provider:    "openai-compat",
+			OfferedSeqs: []int64{int64(i + 100)},
+			RawResponse: pad,
+			Code:        IntentPlanValidationShape,
+			Message:     fmt.Sprintf("rot-%d", i+1),
+		}
+		if _, err := w.Append(rec); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-gapErr:
+		t.Fatalf("rotation gap detected: %v", err)
+	default:
+	}
+}
+
 // TestNewIntentRejectsWriter_NoRotateBelowThreshold asserts the writer
 // does not rotate when projected size stays at or below the configured
 // limit. Guards against an off-by-one regression that would rotate every
