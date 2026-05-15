@@ -4,6 +4,58 @@
 
 ### Added
 
+- Intent planner system prompt now carries three additional guarantees:
+  (1) **same-path causality** — deferring an offered seq for path P forces
+  every later offered seq touching P to also be deferred, so a same-path
+  chain never gets split; (2) **defer_count guidance** — captures whose
+  `defer_count >= 1` should be preferred for inclusion when evidence
+  permits, preventing endless churn; (3) the **forced_aging singleton
+  rule** is restated explicitly with empty deferred lists. The worked
+  example demonstrates the same-path scenario end to end. Network and
+  plugin planner providers pick this up automatically through
+  `IntentPlannerSystemPrompt()`.
+
+- `composed.PlanIntent` retries the primary planner once when
+  `ValidateIntentPlan` returns a typed `*IntentPlanValidationError`. The
+  retry quotes the validator message verbatim into a new
+  `IntentPlanRequest.RetryCorrection` field that providers fold into their
+  user prompt as a "your previous tool call failed validation; correct it"
+  follow-up. Transport errors (timeouts, HTTP errors, context cancellation,
+  network failures) and plain (non-typed) errors skip the retry entirely
+  so deterministic fallback fires immediately. The retry is capped at one
+  attempt; a second invalid response surfaces the typed error so replay
+  records the existing `intent_planner_error` decision and runs its
+  deterministic one-capture fallback.
+
+- `ValidateIntentPlan` now returns `*IntentPlanValidationError` for every
+  failure path, with new `IntentPlanValidationCode` values
+  (`IntentPlanValidationShape`, `IntentPlanValidationOfferedWindow`,
+  `IntentPlanValidationDeferredReasonMissing`) covering shape errors,
+  out-of-window seqs, and missing deferred reasons. The existing
+  `IntentPlanValidationDeferredReasonNotDeferred` code is unchanged.
+  Callers that only check the error message continue to work; new callers
+  can `errors.As` to inspect the typed code and seq.
+
+### Changed
+
+- `NormalizeIntentPlanDeferredReasons` now also synthesizes a
+  `DeferredReason` entry for any deferred seq the planner omitted, using
+  the constant marker text `IntentPlanReasonMarker = "planner omitted
+  reason"`. The marker round-trips into `decision_records.reason` so
+  operators inspecting deferred captures see a non-blank explanation
+  instead of an empty cell. The function now returns
+  `(IntentPlan, dropped []int64, synthesized []int64)`; callers emit a
+  single `slog.Warn` (`"intent planner: normalized deferred_reasons"`)
+  naming both lists, and the daemon's defense-in-depth re-normalization
+  in `planIntentWithFallback` discards both return values so the second
+  pass stays silent. Combined with the existing drop behaviour, this
+  keeps grouped commits running for planners that emit a partial
+  `deferred_reasons` block instead of collapsing to deterministic
+  one-capture fallback. The previous spurious-entry warn message
+  (`"intent planner: dropped deferred_reasons referencing non-deferred
+  seqs"`) is replaced by the new combined message; downstream log
+  scrapers should match on the new substring.
+
 - Intent planner tolerates spurious `deferred_reasons` entries. The
   `openai-compat` and `subprocess` providers drop entries whose seq is
   selected or non-offered, log one `slog.Warn` naming the dropped seqs, and
