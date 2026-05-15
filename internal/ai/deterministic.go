@@ -59,8 +59,13 @@ func (p DeterministicProvider) Generate(ctx context.Context, cc CommitContext) (
 		}, nil
 	}
 	if len(ops) == 1 {
+		// Diff-aware fallback: when DiffText is populated and a per-language
+		// symbol extracts cleanly, prefer the symbol over the basename. With
+		// an empty DiffText (existing callers, tests) DiffAwareSubject is a
+		// pure pass-through to singleOpSubject so byte-identical legacy
+		// output is preserved.
 		return Result{
-			Subject: singleOpSubject(ops[0]),
+			Subject: DiffAwareSubject(ops[0], cc.DiffText),
 			Source:  p.Name(),
 		}, nil
 	}
