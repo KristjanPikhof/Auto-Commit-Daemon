@@ -211,6 +211,14 @@ func extractGoSymbol(lines []string) string {
 	for _, line := range lines {
 		trim := strings.TrimLeft(line, " \t")
 		if m := goFuncRE.FindStringSubmatch(trim); len(m) >= 2 {
+			// Skip "main" — the package entrypoint name carries no
+			// information in a commit subject ("Update main" tells the
+			// reader nothing about the change). Fall through to the next
+			// matchable line so a sibling decl wins; if no other symbol
+			// extracts, the caller falls back to the basename verb form.
+			if m[1] == "main" {
+				continue
+			}
 			return m[1]
 		}
 	}
