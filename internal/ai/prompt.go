@@ -70,8 +70,24 @@ const SubjectCap = 72
 const BodyWrap = 72
 
 // DiffCap is the byte cap callers should apply after RedactDiffSecrets before
-// handing a unified diff to a network-bound provider.
+// handing a unified diff to a network-bound provider on the per-event
+// commit-message path. Kept at 4 KiB to bound the legacy single-event commit
+// prompt. Intent-stage planner requests use IntentStageDiffCap instead, which
+// is intentionally larger so the planner has enough context to group
+// multi-file changes — see IntentStageDiffCap.
 const DiffCap = 4000
+
+// IntentStageDiffCap is the per-stage byte cap applied to each captured
+// diff handed to the intent planner. The planner reasons across multiple
+// captures at once, so a 4 KiB cap (which works well for one-event commit
+// messages) routinely truncated the second/third captured diff before the
+// planner could see the file-level signature. The Wave 2 planner-atomicity
+// epic raises the per-stage cap to 16 KiB while leaving DiffCap unchanged
+// for the per-event commit path. Total payload size is still bounded by
+// the planner window size (ACD_INTENT_WINDOW, default 10) multiplied by
+// this cap, which stays comfortably under the openai-compat 1 MiB body
+// limit even at the upper window value.
+const IntentStageDiffCap = 16000
 
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
