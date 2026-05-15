@@ -329,8 +329,12 @@ commit context, branch/repo metadata, and whether the window is forced aging.
 
 Every offered seq must appear in either `selected_seqs` or `deferred_seqs`.
 `selected_seqs` must be non-empty. Add one `{ "seq": <id>, "reason": "..." }`
-entry to `deferred_reasons` for every deferred seq. Invalid responses are
-recorded as planner errors and fall back to safe one-capture planning.
+entry to `deferred_reasons` for every deferred seq. ACD normalizes the
+response before validation: spurious `deferred_reasons` entries (seq is
+selected, or not in the offered window) are dropped with a single warning
+and the cleaned plan continues. Responses that are still invalid after
+normalization are recorded as `intent_planner_error` and fall back to safe
+one-capture planning.
 
 ### Lifecycle
 
