@@ -53,6 +53,15 @@ type IntentPlanRequest struct {
 	OfferedCaptures       []OfferedCapture              `json:"offered_captures"`
 	ForcedAging           bool                          `json:"forced_aging,omitempty"`
 	CapturedDiffTransform prompttrace.TransformMetadata `json:"-"`
+	// RetryCorrection carries a verbatim validation error from the previous
+	// attempt when the composed planner is asking the provider to correct an
+	// invalid plan. Providers append it to the planner user prompt as a
+	// follow-up correction request so the planner can fix its mistake without
+	// blowing away the captured context. Empty on first attempts; set only by
+	// composed.PlanIntent's retry loop. The field is not serialized into the
+	// shared wire payload — it is surfaced separately by the user-prompt
+	// builder.
+	RetryCorrection string `json:"-"`
 }
 
 // IntentPlanRequestOptions carries raw captured diffs before the request is
