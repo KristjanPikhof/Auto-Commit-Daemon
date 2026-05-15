@@ -57,7 +57,7 @@ hooks:
               exit 1
             }
 
-  - id: acd-touch-idle
+  - id: acd-flush-idle
     event: session.idle
     actions:
       - bash: |
@@ -65,7 +65,7 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd touch \
+          acd flush --logical \
             --session-id "$SID" \
             --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG"
 
