@@ -5512,6 +5512,12 @@ func TestReplay_PathQuiescence_GatedHeadBlocksBatch(t *testing.T) {
 		clock.mu.Unlock()
 	}
 
+	// IMPORTANT: enable the gate before captures so RecordPathWrite
+	// inside Capture stamps both files. ResetPathQuiescenceForTest
+	// above cleared the gate flag.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5519,25 +5525,12 @@ func TestReplay_PathQuiescence_GatedHeadBlocksBatch(t *testing.T) {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
 
-	// seqA: hot path "hot.txt" written at t=0, will still be inside the
-	// 30s window when replay runs.
-	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	// seqA: capture "hot.txt" at t=0.
 	captureOnePendingFile(t, ctx, f, "hot.txt", "v1\n")
-	// seqB: cool path "cool.txt" written 60s later — cool.txt itself
-	// would pass the gate, but it sits behind seqA in FIFO order.
+	// Advance 60s and capture "cool.txt" at t=60s. Both writes stamp
+	// the per-path tracker via Capture's RecordPathWrite call.
 	advance(60 * time.Second)
 	captureOnePendingFile(t, ctx, f, "cool.txt", "v1\n")
-	// Now advance only 5s further so hot.txt is still hot (gate=30s,
-	// elapsed since hot.txt write=65s? no — wait. Let me re-think:
-	// hot.txt written at t=0; we need now < t=30s to keep hot.txt gated.
-	// But we already advanced by 60s before writing cool.txt. So at
-	// "now" hot.txt has been quiet for 60s and IS quiescent.
-	//
-	// Restart: write hot.txt first, advance only to t=10s, write
-	// cool.txt at t=10s, advance to t=20s. At t=20s:
-	//   hot.txt last write = t=10s? NO — only one write each.
-	// The captureOnePendingFile call records a path write at the
-	// CURRENT clock value. Let me reset and redo precisely.
 	pendingDB, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
 		t.Fatalf("PendingEvents pre-replay: %v", err)
@@ -5545,19 +5538,15 @@ func TestReplay_PathQuiescence_GatedHeadBlocksBatch(t *testing.T) {
 	if len(pendingDB) < 2 {
 		t.Fatalf("expected >=2 pending rows, got %d", len(pendingDB))
 	}
-	// To keep hot.txt under the 30s gate we need the wall clock minus
-	// hot.txt's last write to be < 30s. hot.txt was written at t=0;
-	// cool.txt was written at t=60s. After captureOnePendingFile for
-	// cool.txt, advance the clock only 5s so:
-	//   now = t=65s
-	//   PathLastWrite("hot.txt") = t=0; elapsed=65s >= 30s -> quiescent
-	// That defeats the test. Re-stamp hot.txt to "now-5s" so it's
-	// still inside the gate window when replay runs. Use
-	// SetPathQuiescenceClockForTest to back-date the stamp by calling
-	// RecordPathWrite directly with a fresh timestamp.
-	advance(5 * time.Second)
-	RecordPathWrite("hot.txt", clock.now.Add(-10*time.Second))
-	// Sanity check: hot.txt should be NOT quiescent under 30s gate at "now".
+	// Re-stamp hot.txt to a recent timestamp (now-5s) so it falls
+	// inside the 30s gate window, while cool.txt's last stamp at
+	// t=60s is now 0s old which is also inside the gate window. We
+	// want hot.txt gated AND cool.txt also gated — but the FIFO fix
+	// only requires the HEAD to be gated. So make cool.txt (the tail)
+	// quiescent by re-stamping it far in the past.
+	RecordPathWrite("hot.txt", clock.now.Add(-5*time.Second))
+	RecordPathWrite("cool.txt", clock.now.Add(-1*time.Hour))
+	// Sanity checks.
 	if IsPathQuiescent("hot.txt", 30*time.Second, clock.now) {
 		t.Fatalf("test setup error: hot.txt must be hot at this point")
 	}
