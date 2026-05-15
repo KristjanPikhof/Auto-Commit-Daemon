@@ -1341,12 +1341,14 @@ func buildIntentPlanRequest(
 		latest = aiCommitSummary(commits[0])
 	}
 	pathContext := buildIntentPathContext(ctx, repoRoot, cctx.BaseHead, paths, cfg.recent)
+	pathRecent := buildPathRecentCommits(ctx, repoRoot, cctx.BaseHead, paths, cfg.recentCommitAffinity, time.Now())
 	req, err := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{
 		LatestCommit:         latest,
 		PathCommitContext:    pathContext,
 		OfferedCaptures:      offered,
 		ForcedAging:          forced,
 		IncludeCapturedDiffs: cfg.includeDiffs,
+		PathRecentCommits:    pathRecent,
 	})
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
