@@ -110,6 +110,29 @@
 
 ### Changed
 
+- `ACD_INTENT_DEFER_LIMIT` default is now **1** (was 2). The Wave 2 retry
+  loop in `composed.PlanIntent` (typed validation errors trigger one
+  re-prompt) plus the new `<gitDir>/acd/planner-rejects.jsonl` forensic
+  surface mean an event that has already been deferred once is
+  overwhelmingly more likely to be planner churn than a legitimate "wait
+  for related work" signal. Lowering the default forces the forced-aging
+  singleton path sooner so deferred work lands promptly. Operators who
+  want the historical behaviour can still set `ACD_INTENT_DEFER_LIMIT=2`
+  (or higher) explicitly; the env override is unchanged.
+
+- Intent planner stage now uses a dedicated 16 KiB diff cap (the new
+  `ai.IntentStageDiffCap` constant) per offered capture instead of the
+  legacy 4 KiB `ai.DiffCap`. The per-event commit-message path
+  (`Generate`) is unchanged — only the `PlanIntent` path uses the larger
+  cap so the planner has enough context to group multi-file changes
+  without truncating the second/third captured diff before it ever sees a
+  function signature. Trace records and prompt-trace metadata now report
+  the stage cap (16000) on intent requests so operators inspecting
+  per-stage payload sizes see the active budget. Total payload stays
+  bounded by the planner window size (`ACD_INTENT_WINDOW`, default 10)
+  multiplied by this cap, comfortably under the openai-compat 1 MiB body
+  limit at the upper window value.
+
 - `NormalizeIntentPlanDeferredReasons` now also synthesizes a
   `DeferredReason` entry for any deferred seq the planner omitted, using
   the constant marker text `IntentPlanReasonMarker = "planner omitted
