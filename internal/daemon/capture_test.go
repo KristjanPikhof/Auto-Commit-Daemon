@@ -1653,16 +1653,11 @@ func TestCapture_PathQuiescenceTrackerStampsLastWriteTimes(t *testing.T) {
 	if !got.Equal(now) {
 		t.Fatalf("PathLastWrite=%v want %v", got, now)
 	}
-	if !IsPathQuiescent("tracked.txt", 30*time.Second, now) {
-		// At t=now the path was just written, so it must NOT be quiescent
-		// under a 30s window.
-		t.Fatalf("IsPathQuiescent unexpectedly true immediately after write")
+	if IsPathQuiescent("tracked.txt", 30*time.Second, now) {
+		t.Fatalf("IsPathQuiescent unexpectedly true immediately after write (zero elapsed < 30s)")
 	}
-	if IsPathQuiescent("tracked.txt", 30*time.Second, now.Add(31*time.Second)) {
-		// 31s later it must be quiescent.
-		// (>=30s elapsed)
-	} else {
-		t.Fatalf("IsPathQuiescent unexpectedly false 31s after write")
+	if !IsPathQuiescent("tracked.txt", 30*time.Second, now.Add(31*time.Second)) {
+		t.Fatalf("IsPathQuiescent unexpectedly false 31s after write (>=30s elapsed)")
 	}
 }
 
