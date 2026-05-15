@@ -1903,6 +1903,20 @@ func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg s
 	return commitOID, nil
 }
 
+// intentSelectionPublishedCount totals the number of capture events a
+// selected intent slice will mark as published — counting the
+// representative AND any events folded into it by the same-path coalesce
+// pass. ReplaySummary.Published reports operator-visible event count
+// (not commit count), so a 4-event coalesced run counts as 4 even though
+// it produces one commit.
+func intentSelectionPublishedCount(items []intentReplayItem) int {
+	total := 0
+	for _, item := range items {
+		total += 1 + coverLen(item.coalesce)
+	}
+	return total
+}
+
 func settleIntentPublished(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, sourceHead, commitOID, decisionKind, decisionReason, message string) error {
 	for _, item := range items {
 		// Coalesced items absorb additional capture events under one
