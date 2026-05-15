@@ -1752,13 +1752,34 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 		reasons[item.Seq] = item.Reason
 	}
 	events := make(map[int64]state.CaptureEvent, len(items))
+	itemBySeq := make(map[int64]intentReplayItem, len(items))
 	for _, item := range items {
 		events[item.event.Seq] = item.event
+		itemBySeq[item.event.Seq] = item
 	}
 	for _, seq := range plan.DeferredSeqs {
 		reason := reasons[seq]
-		if err := state.RecordPlannerDefer(ctx, db, seq, ts, reason); err != nil {
-			return err
+		// Coalesced offers absorb additional capture events under one
+		// representative seq. When the planner defers a coalesced offer
+		// we MUST advance defer_count for every covered seq, mirroring
+		// the publish-side per-coverage walk in settleIntentPublished.
+		// Otherwise a later external publish of the representative seq
+		// leaves the covered seqs at defer_count=0 and the aging clock
+		// silently resets.
+		coveredSeqs := []int64{seq}
+		if item, ok := itemBySeq[seq]; ok && item.coalesce != nil {
+			coveredSeqs = append([]int64(nil), item.coalesce.OriginalSeqs...)
+			// OriginalSeqs always includes the representative seq as the
+			// first element; defensive bail-out if a future regression
+			// produces an empty list.
+			if len(coveredSeqs) == 0 {
+				coveredSeqs = []int64{seq}
+			}
+		}
+		for _, coveredSeq := range coveredSeqs {
+			if err := state.RecordPlannerDefer(ctx, db, coveredSeq, ts, reason); err != nil {
+				return err
+			}
 		}
 		if ev, ok := events[seq]; ok {
 			msgReason := strings.TrimSpace(reason)
