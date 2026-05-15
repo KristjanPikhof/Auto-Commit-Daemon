@@ -44,22 +44,25 @@ const subjectFallbackLineCap = 200
 // `singleOpSubject(op)` — preserving the legacy default that existing tests
 // depend on.
 func DiffAwareSubject(op OpItem, diff string) string {
-	verb := opVerb(op)
-	if verb == "" {
-		// Rename and other ops without a clean verb fall through to the
-		// legacy renderer which already handles them.
+	// Rename ops carry their own dedicated verb format ("Rename a to b")
+	// in the legacy renderer. The post-image diff for a rename is often
+	// just the new name; substituting an extracted symbol would lose the
+	// from→to information that callers depend on.
+	if op.Op == "rename" {
 		return singleOpSubject(op)
 	}
-
+	verb := opVerb(op)
+	if verb == "" {
+		return singleOpSubject(op)
+	}
 	if symbol := extractSymbol(op.Path, diff); symbol != "" {
 		return verb + " " + symbol
 	}
 	return singleOpSubject(op)
 }
 
-// opVerb maps an op kind to its leading verb. Returns "" when the op is
-// rename or unrecognized — the caller falls back to singleOpSubject which
-// has the full legacy switch.
+// opVerb maps an op kind to its leading verb. Rename is handled separately
+// by the caller because it has a dedicated two-name format.
 func opVerb(op OpItem) string {
 	switch op.Op {
 	case "create":
