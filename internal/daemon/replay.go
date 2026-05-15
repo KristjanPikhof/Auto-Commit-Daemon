@@ -1235,16 +1235,51 @@ func pathQuiescentForEvent(ev state.CaptureEvent, ops []state.CaptureOp, quiesce
 	return true
 }
 
+// lastPersistedQuiescenceGated caches the most recent gated_count we wrote
+// to daemon_meta so a steady-state run loop (the gate is OFF, so gated is
+// always zero) does not re-write identical key/value pairs every pass.
+// -1 means "no value persisted yet" — the first pass with quiescence>0
+// always writes so cross-process readers see a fresh snapshot.
+var lastPersistedQuiescenceGated atomic.Int64
+
+func init() {
+	lastPersistedQuiescenceGated.Store(-1)
+}
+
+// resetLastPersistedQuiescenceGatedForTest restores the sentinel so tests
+// that assert "no writes happened" start from a clean slate.
+func resetLastPersistedQuiescenceGatedForTest(t interface{ Helper() }) {
+	t.Helper()
+	lastPersistedQuiescenceGated.Store(-1)
+}
+
 // persistPathQuiescenceSnapshot records the most recent gated-count snapshot
-// to daemon_meta. Best-effort: meta writes never block the replay loop. We
-// always write the count (even zero) so cross-process readers can tell the
-// difference between "no gate active this pass" (zero) and "no replay pass
-// has ever recorded a snapshot" (key missing).
-func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int) {
+// to daemon_meta. Best-effort: meta writes never block the replay loop.
+//
+// Write amplification guard: we skip the write entirely when the gate is
+// disabled (quiescence == 0) and we skip same-value rewrites when the gate
+// is active but the gated count has not changed since the last persisted
+// snapshot. Cross-process readers still see a stable timestamp+count when
+// the gate is on, but we no longer mint a daemon_meta UPSERT every poll
+// tick.
+func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int, quiescence time.Duration) {
 	if db == nil {
 		return
 	}
-	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceGatedCount, strconv.Itoa(gated))
+	if quiescence <= 0 {
+		// Gate disabled this pass: do not refresh the snapshot. Operators
+		// distinguish "gate inactive" from "no snapshot ever" by reading
+		// the existing path_quiescence.updated_at timestamp; an
+		// always-rewriting snapshot would mask that distinction.
+		return
+	}
+	g64 := int64(gated)
+	if last := lastPersistedQuiescenceGated.Load(); last == g64 {
+		return
+	}
+	if err := state.MetaSet(ctx, db, MetaKeyPathQuiescenceGatedCount, strconv.Itoa(gated)); err == nil {
+		lastPersistedQuiescenceGated.Store(g64)
+	}
 	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceUpdatedAt, time.Now().UTC().Format(time.RFC3339))
 }
 
