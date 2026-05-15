@@ -1037,9 +1037,38 @@ func replayIntentBatch(
 	// through the same publish + decision path as a normal plan.
 	if forced && len(items) == 1 {
 		plan := planIntentSingletonFastPath(ctx, repoRoot, items[0])
-		traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
-		selected := []intentReplayItem{items[0]}
-		return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+		// Defense in depth: even though forced-aging narrows the window to
+		// one self-determined seq, run the safety + plan validators before
+		// publishing. A future regression in planIntentSingletonFastPath or
+		// upstream coalesce that produced an unsafe plan must NOT bypass
+		// the same checks normal planner output goes through. On any
+		// failure, fall through to the standard planner path which records
+		// the error decision and degrades to the deterministic fallback.
+		if safetyErr := validateIntentSelectionSafety(items, plan); safetyErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, safetyErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, safetyErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, safetyErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else if planErr := ai.ValidateIntentPlan(req, plan); planErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, planErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, planErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, planErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else {
+			traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+			selected := []intentReplayItem{items[0]}
+			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+		}
+		// Validation failure: fall through to the standard deterministic
+		// path. We replace the planner with the deterministic provider so
+		// PlanIntent below cannot produce another bad plan.
+		cfg.planner = ai.DeterministicProvider{}
 	}
 
 	plannerCtx := ctx
