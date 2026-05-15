@@ -1439,12 +1439,30 @@ func gitModeFor(m os.FileMode) string {
 // queries already see the gated counts via the `path_quiescence.*`
 // daemon_meta keys we stamp at the end of each replay pass.
 //
+// pathQuiescenceEnabled is a hot-path gate: capture stamps a path on every
+// captured op, so when ACD_PATH_QUIESCENCE_SECONDS is unset (the default)
+// we want RecordPathWrite to return without acquiring the mutex. The
+// daemon flips the gate via SetPathQuiescenceEnabled at startup once the
+// env value is resolved; resolvePathQuiescenceSeconds also flips it on
+// when it parses a positive value so a test that wires only the env var
+// (no daemon startup) still exercises the tracker.
+//
+// pathQuiescenceMaxEntries bounds the map at ~4096 entries. When the
+// limit is exceeded, RecordPathWrite evicts entries older than 2x the
+// current quiescence window (or 1 hour when quiescence is zero) under the
+// already-held write lock. Worst-case memory: ~4096 entries * 256B/entry
+// (path + time.Time + map overhead) ≈ 1 MiB.
+//
 // Tests can substitute the wall clock via SetPathQuiescenceClockForTest and
 // reset the tracker via ResetPathQuiescenceForTest.
+const pathQuiescenceMaxEntries = 4096
+
 var (
-	pathQuiescenceMu     sync.RWMutex
-	pathQuiescenceWrites = map[string]time.Time{}
-	pathQuiescenceNowFn  atomic.Pointer[func() time.Time]
+	pathQuiescenceMu        sync.RWMutex
+	pathQuiescenceWrites    = map[string]time.Time{}
+	pathQuiescenceNowFn     atomic.Pointer[func() time.Time]
+	pathQuiescenceEnabled   atomic.Bool
+	pathQuiescenceWindowSec atomic.Int64 // current ACD_PATH_QUIESCENCE_SECONDS for eviction
 )
 
 func pathQuiescenceNow() time.Time {
