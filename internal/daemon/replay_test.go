@@ -4921,10 +4921,10 @@ func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	seedTrackedFileCommit(t, ctx, f, "barrier.txt", "v0\n")
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
-	seedTrackedFileCommit(t, ctx, f, "barrier.txt", "v0\n")
 
 	seq1 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v1\n")
 	seq2 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v2\n")
