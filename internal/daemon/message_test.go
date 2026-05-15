@@ -611,6 +611,67 @@ func writeFileForTest(dir, rel, body string) error {
 	return os.WriteFile(full, []byte(body), 0o644)
 }
 
+// TestBuildOpsDiffWithCap_RespectsCustomCap pins the cap-propagation
+// contract for the intent-stage caller. A synthetic ~12 KiB diff fed
+// through BuildOpsDiffWithCap with a 16 KiB cap must produce output that
+// exceeds the legacy ai.DiffCap (4 KiB) ceiling — proving the larger cap
+// actually applies and the cappedDiffBuffer is no longer hard-wired to
+// the per-event budget. Belt+suspenders: the same diff via the legacy
+// BuildOpsDiff (which forwards ai.DiffCap) still truncates near the small
+// cap so per-event callers do not regress.
+func TestBuildOpsDiffWithCap_RespectsCustomCap(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	// 12 KiB target: each `large line\n` is 11 bytes; ~1100 lines lands
+	// well above ai.DiffCap (4 KiB) and below ai.IntentStageDiffCap (16 KiB).
+	beforeOID := hashContent(t, f.dir, strings.Repeat("alpha line\n", 1100))
+	afterOID := hashContent(t, f.dir, strings.Repeat("beta line\n", 1100))
+
+	op := state.CaptureOp{
+		Op:         "modify",
+		Path:       "src/foo.go",
+		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterOID, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		Fidelity:   "rescan",
+	}
+
+	smallCap := ai.DiffCap
+	bigCap := ai.IntentStageDiffCap
+
+	smallDiff, err := BuildOpsDiffWithCap(ctx, f.dir, []state.CaptureOp{op}, smallCap)
+	if err != nil {
+		t.Fatalf("BuildOpsDiffWithCap small cap: %v", err)
+	}
+	bigDiff, err := BuildOpsDiffWithCap(ctx, f.dir, []state.CaptureOp{op}, bigCap)
+	if err != nil {
+		t.Fatalf("BuildOpsDiffWithCap big cap: %v", err)
+	}
+
+	if len(smallDiff) > smallCap {
+		t.Fatalf("small-cap diff len=%d exceeds per-event cap %d", len(smallDiff), smallCap)
+	}
+	// Big cap must let the buffer carry meaningfully more than the small cap;
+	// a strict > smallCap proves the cap actually propagated.
+	if len(bigDiff) <= smallCap {
+		t.Fatalf("big-cap diff len=%d did not exceed per-event cap %d; cap propagation failed",
+			len(bigDiff), smallCap)
+	}
+	if len(bigDiff) > bigCap {
+		t.Fatalf("big-cap diff len=%d exceeds intent-stage cap %d", len(bigDiff), bigCap)
+	}
+
+	// Belt+suspenders: legacy BuildOpsDiff still honors ai.DiffCap.
+	legacyDiff, err := BuildOpsDiff(ctx, f.dir, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatalf("BuildOpsDiff: %v", err)
+	}
+	if len(legacyDiff) > ai.DiffCap {
+		t.Fatalf("legacy BuildOpsDiff len=%d > ai.DiffCap=%d", len(legacyDiff), ai.DiffCap)
+	}
+}
+
 // TestBuildOpsDiff_DiffBlobsTimeoutFallback pins the per-DiffBlobs 5s
 // timeout. When `git diff <before> <after>` would otherwise stall longer
 // than the per-op budget, BuildOpsDiff falls back to header-only for the
