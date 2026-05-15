@@ -406,3 +406,31 @@ func buildDeferredReasons(seqs []int64) []map[string]any {
 	}
 	return out
 }
+
+// offeredIntentSeqsLenient is the retry-aware variant of offeredIntentSeqs.
+// On a retry attempt the composed planner appends a free-text correction
+// block AFTER the embedded JSON, which breaks json.Unmarshal of the entire
+// payload. We use json.Decoder so we can stop reading at the end of the
+// embedded object.
+func offeredIntentSeqsLenient(t *testing.T, req intentChatRequest) []int64 {
+	t.Helper()
+	const marker = "Plan the next commit intent for these offered captures:\n"
+	for _, msg := range req.Messages {
+		if !strings.HasPrefix(msg.Content, marker) {
+			continue
+		}
+		body := strings.TrimPrefix(msg.Content, marker)
+		dec := json.NewDecoder(strings.NewReader(body))
+		var payload intentPlanPromptPayload
+		if err := dec.Decode(&payload); err != nil {
+			t.Fatalf("decode intent prompt payload (lenient): %v\nbody=%s", err, body)
+		}
+		seqs := make([]int64, 0, len(payload.OfferedCaptures))
+		for _, capture := range payload.OfferedCaptures {
+			seqs = append(seqs, capture.Seq)
+		}
+		return seqs
+	}
+	t.Fatalf("intent planner user prompt not found in request: %+v", req)
+	return nil
+}
