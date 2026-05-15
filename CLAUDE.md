@@ -174,12 +174,14 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 ```
 
 - `acd start` failure is no longer masked by wake; active hook exits nonzero. AdapterE2E covers stop-all self-heal and corrupt-DB negatives.
-- Existing-user migration: re-run `acd setup <harness>` and replace installed hooks block. `acd doctor` flags drift.
+- Existing-user migration: re-run `acd setup <harness>` and replace installed hooks block. `acd doctor` flags drift. The d1 rewire moved Stop / `session.idle` from `acd touch` to `acd flush --logical`; users on the legacy snippet still get heartbeat refreshes but their partial work waits the full `ACD_INTENT_MAX_PENDING_AGE` (default 5m) before the daemon publishes a commit. Re-run setup to opt into prompt commits at agent turn boundaries.
 - Markers are format-specific: TOML/YAML use leading `# acd-managed: true`; JSON detects `"_acd_managed": true` with/without space. Keep hookhelper, setup tests, templates, AdapterE2E in sync.
 - Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted; `_acd_managed: true` is top-level JSON; `acd doctor` warns when both Codex files carry acd markers because events double.
+- Codex Stop hook deliberately stays on `acd touch` rather than rewiring to `acd flush --logical`. Codex's Stop event fires on every assistant turn and includes mid-conversation tool runs (the same matcher window as `PostToolUse`), so a per-Stop logical flush would chain a commit per tool turn instead of per agent reply. Claude Code's Stop semantics differ — it fires once at the natural end of an agent message — which is why only Claude Code's Stop and the OpenCode/Pi `session.idle` events were rewired. If a future Codex hook semantics change adds a true session-idle event, mirror the d1 rewire there.
 - Codex `/hooks` re-approval is required after every `~/.codex/hooks.json` change; until approved, `SessionStart` never fires. `acd setup codex --raw > ~/.codex/hooks.json` destroys non-acd entries; custom-hook users must merge manually.
 - Codex hooks need the Codex feature flag in `~/.codex/config.toml`; official docs currently show `[features].codex_hooks = true`. `hooks.json` carries hook bodies, not feature flags.
 - Codex `cwd` comes from stdin via `acd hook-stdin-extract session_id cwd? <&0`; missing `cwd` falls back to `$PWD`. `CODEX_PROJECT_DIR`/`printf "{}\n"` are gone. Bash bodies use `|| exit 0` after helper so missing `acd` does not block hook.
+- `acd flush --logical` is the explicit drain entrypoint installed at Stop / idle hooks. It refreshes the heartbeat, enqueues a `flush_logical` flush_request, and signals SIGUSR1 to the daemon. The daemon's existing flush-drain path treats any non-empty drain as `IntentBypassBatchWait=true`, which makes the next replay tick evaluate the visible window without waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. Refusals (detached HEAD, in-progress git op, manual pause marker) keep the heartbeat refresh and report `refused_reason` in JSON output but never block the harness hook.
 
 ## Env
 
