@@ -1037,7 +1037,7 @@ func replayIntentBatch(
 	// above; planIntentSingletonFastPath returns an IntentPlan that flows
 	// through the same publish + decision path as a normal plan.
 	if forced && len(items) == 1 {
-		plan := planIntentSingletonFastPath(ctx, repoRoot, items[0])
+		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
 		// Defense in depth: even though forced-aging narrows the window to
 		// one self-determined seq, run the safety + plan validators before
 		// publishing. A future regression in planIntentSingletonFastPath or
