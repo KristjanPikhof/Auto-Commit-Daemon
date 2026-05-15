@@ -535,15 +535,24 @@ func (p *scriptedIntentPlanner) PlanIntent(_ context.Context, req IntentPlanRequ
 // error verbatim into RetryCorrection, and the second attempt returns a
 // valid plan. The composed call succeeds with the corrected plan; no
 // fallback to deterministic is triggered.
+//
+// Uses a planner-hallucination case (selected seq outside offered window)
+// because the missing-deferred-reason case is now silently coerced by
+// NormalizeIntentPlanDeferredReasons and never surfaces to the retry path.
 func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	invalidPlan := IntentPlan{
-		// Missing reason for deferred seq 102 -> typed
-		// IntentPlanValidationDeferredReasonMissing.
-		SelectedSeqs:   []int64{101},
+		// Selected seq 999 is not in the offered window -> typed
+		// IntentPlanValidationOfferedWindow error that synth/drop
+		// normalization cannot fix.
+		SelectedSeqs:   []int64{999},
 		DeferredSeqs:   []int64{102},
 		Subject:        "Tighten checkout flow",
 		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
 	}
 	validPlan := IntentPlan{
 		SelectedSeqs:   []int64{101},
@@ -585,7 +594,7 @@ func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
 	if correction == "" {
 		t.Fatalf("second attempt missing RetryCorrection")
 	}
-	if !strings.Contains(correction, "deferred seq 102 missing reason") {
+	if !strings.Contains(correction, "selected seq 999 outside offered window") {
 		t.Fatalf("RetryCorrection=%q does not quote validator", correction)
 	}
 }
@@ -597,11 +606,17 @@ func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
 func TestComposedPlanIntentRetryGivesUpAfterSecondInvalid(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	invalidPlan := IntentPlan{
-		SelectedSeqs:   []int64{101},
+		// Selected seq 999 is not in the offered window; the planner
+		// repeats the same hallucination on both attempts so retry
+		// caps at 1 and returns the typed validation error.
+		SelectedSeqs:   []int64{999},
 		DeferredSeqs:   []int64{102},
 		Subject:        "Tighten checkout flow",
 		GroupingReason: "single focused checkout change",
-		// Missing deferred reason -> typed error; same on both attempts.
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
 	}
 	primary := &scriptedIntentPlanner{
 		name:  "scripted-primary",
@@ -619,8 +634,8 @@ func TestComposedPlanIntentRetryGivesUpAfterSecondInvalid(t *testing.T) {
 	if !errors.As(err, &typed) {
 		t.Fatalf("error %v not *IntentPlanValidationError", err)
 	}
-	if typed.Code != IntentPlanValidationDeferredReasonMissing {
-		t.Fatalf("code=%v want DeferredReasonMissing", typed.Code)
+	if typed.Code != IntentPlanValidationOfferedWindow {
+		t.Fatalf("code=%v want OfferedWindow", typed.Code)
 	}
 }
 
