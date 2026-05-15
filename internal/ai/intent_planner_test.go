@@ -481,3 +481,208 @@ func TestComposedPlanIntentReturnsPrimaryProviderError(t *testing.T) {
 		t.Fatalf("error=%v want %v", err, primaryErr)
 	}
 }
+
+// scriptedIntentPlanner returns successive plans/errors from a script. Each
+// PlanIntent call advances the script index. The captured RetryCorrection
+// from the inbound request is recorded so tests can assert that the retry
+// hand-off includes the verbatim validator message.
+type scriptedIntentPlanner struct {
+	name        string
+	plans       []IntentPlan
+	errs        []error
+	calls       int
+	corrections []string
+}
+
+func (p *scriptedIntentPlanner) Name() string { return p.name }
+
+func (p *scriptedIntentPlanner) Generate(context.Context, CommitContext) (Result, error) {
+	return Result{}, nil
+}
+
+func (p *scriptedIntentPlanner) PlanIntent(_ context.Context, req IntentPlanRequest) (IntentPlan, error) {
+	idx := p.calls
+	p.calls++
+	p.corrections = append(p.corrections, req.RetryCorrection)
+	if idx < len(p.errs) && p.errs[idx] != nil {
+		return IntentPlan{}, p.errs[idx]
+	}
+	if idx >= len(p.plans) {
+		return IntentPlan{}, errors.New("scriptedIntentPlanner: out of scripted plans")
+	}
+	plan := p.plans[idx]
+	plan.Source = p.name
+	return plan, nil
+}
+
+// TestComposedPlanIntentRetriesOnTypedValidationError covers the happy retry
+// path: the primary returns an invalid plan that fails ValidateIntentPlan
+// with a typed *IntentPlanValidationError, the composed retry quotes the
+// error verbatim into RetryCorrection, and the second attempt returns a
+// valid plan. The composed call succeeds with the corrected plan; no
+// fallback to deterministic is triggered.
+func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	invalidPlan := IntentPlan{
+		// Missing reason for deferred seq 102 -> typed
+		// IntentPlanValidationDeferredReasonMissing.
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+	}
+	validPlan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, validPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if primary.calls != 2 {
+		t.Fatalf("primary calls=%d want 2", primary.calls)
+	}
+	if plan.Source != "scripted-primary" {
+		t.Fatalf("source=%q want scripted-primary (no deterministic fallback expected)", plan.Source)
+	}
+	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected=%v want [101]", plan.SelectedSeqs)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 102 {
+		t.Fatalf("deferred reasons=%+v", plan.DeferredReasons)
+	}
+	// First attempt sees no correction; the second attempt receives the
+	// verbatim validator message.
+	if got := primary.corrections[0]; got != "" {
+		t.Fatalf("first attempt RetryCorrection=%q want empty", got)
+	}
+	correction := primary.corrections[1]
+	if correction == "" {
+		t.Fatalf("second attempt missing RetryCorrection")
+	}
+	if !strings.Contains(correction, "deferred seq 102 missing reason") {
+		t.Fatalf("RetryCorrection=%q does not quote validator", correction)
+	}
+}
+
+// TestComposedPlanIntentRetryGivesUpAfterSecondInvalid pins the retry cap at
+// one. If the second attempt is also invalid, the composed planner returns
+// the validation error so replay records intent_planner_error and runs its
+// deterministic fallback.
+func TestComposedPlanIntentRetryGivesUpAfterSecondInvalid(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	invalidPlan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		// Missing deferred reason -> typed error; same on both attempts.
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, invalidPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error after second attempt")
+	}
+	if primary.calls != 2 {
+		t.Fatalf("primary calls=%d want exactly 2 (cap retries at 1)", primary.calls)
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("error %v not *IntentPlanValidationError", err)
+	}
+	if typed.Code != IntentPlanValidationDeferredReasonMissing {
+		t.Fatalf("code=%v want DeferredReasonMissing", typed.Code)
+	}
+}
+
+// TestComposedPlanIntentSkipsRetryOnTransportError ensures transport errors
+// (timeouts, network failures, HTTP errors) bypass the retry loop entirely
+// — they fall through immediately so the daemon's deterministic fallback
+// path runs without a wasted round-trip.
+func TestComposedPlanIntentSkipsRetryOnTransportError(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	// Two consecutive timeout-shaped errors: if the retry loop fired we
+	// would see two calls. The cap-at-1 + skip-transport rule means we
+	// must see exactly one call.
+	timeoutErr := context.DeadlineExceeded
+	primary := &scriptedIntentPlanner{
+		name: "scripted-primary",
+		errs: []error{timeoutErr, timeoutErr},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if !errors.Is(err, timeoutErr) {
+		t.Fatalf("error=%v want context.DeadlineExceeded", err)
+	}
+	if primary.calls != 1 {
+		t.Fatalf("primary calls=%d want 1 (transport errors skip retry)", primary.calls)
+	}
+}
+
+// TestComposedPlanIntentSkipsRetryOnUntypedError ensures plain (non-typed)
+// validation errors do not trigger a retry. Only *IntentPlanValidationError
+// qualifies — this protects against future planner errors that surface as
+// fmt.Errorf strings.
+func TestComposedPlanIntentSkipsRetryOnUntypedError(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	primary := &scriptedIntentPlanner{
+		name: "scripted-primary",
+		errs: []error{errors.New("openai-compat: http 500: upstream"), nil},
+		plans: []IntentPlan{
+			{}, // unused
+			{SelectedSeqs: []int64{101}, DeferredSeqs: []int64{102}, Subject: "x", GroupingReason: "y", DeferredReasons: []DeferredReason{{Seq: 102, Reason: "ok"}}},
+		},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected primary error")
+	}
+	if primary.calls != 1 {
+		t.Fatalf("primary calls=%d want 1 (untyped error skips retry)", primary.calls)
+	}
+}
+
+// TestBuildIntentPlanUserPromptIncludesRetryCorrection verifies the user
+// prompt builder appends the correction block when RetryCorrection is set,
+// and omits it on first-attempt requests.
+func TestBuildIntentPlanUserPromptIncludesRetryCorrection(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	first, err := BuildIntentPlanUserPrompt(req)
+	if err != nil {
+		t.Fatalf("first BuildIntentPlanUserPrompt: %v", err)
+	}
+	if strings.Contains(first, "Your previous capture_intent_plan") {
+		t.Fatalf("first attempt prompt unexpectedly carries correction block:\n%s", first)
+	}
+
+	req.RetryCorrection = "intent planner: deferred seq 102 missing reason"
+	second, err := BuildIntentPlanUserPrompt(req)
+	if err != nil {
+		t.Fatalf("retry BuildIntentPlanUserPrompt: %v", err)
+	}
+	if !strings.Contains(second, "Your previous capture_intent_plan tool call failed validation") {
+		t.Fatalf("retry prompt missing correction header:\n%s", second)
+	}
+	if !strings.Contains(second, "intent planner: deferred seq 102 missing reason") {
+		t.Fatalf("retry prompt missing verbatim validator message:\n%s", second)
+	}
+	if !strings.Contains(second, "Return a corrected capture_intent_plan tool call") {
+		t.Fatalf("retry prompt missing corrective instruction:\n%s", second)
+	}
+}
