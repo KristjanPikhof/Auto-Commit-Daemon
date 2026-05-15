@@ -652,6 +652,15 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 // acd-touch-idle / `acd touch` body.
 func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
+	// YAML harnesses use a comment-prefixed marker `# acd-managed: true`
+	// at the top of the snippet. The `# ` prefix is load-bearing — a
+	// hand-edited bare `acd-managed: true` is intentionally NOT
+	// detected (see internal/cli/doctor.go). Catch a regression that
+	// drops or alters the marker on the OpenCode YAML template.
+	const yamlMarker = "# acd-managed: true"
+	if !strings.Contains(body, yamlMarker) {
+		t.Errorf("opencode snippet missing %q marker:\n%s", yamlMarker, body)
+	}
 	if strings.Contains(body, "- id: acd-touch-idle") {
 		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
@@ -667,6 +676,11 @@ func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
 // TestSetup_Pi_IdleHookCallsFlushLogical mirrors the OpenCode case for Pi.
 func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
+	// Same YAML marker contract as opencode (P2 #18).
+	const yamlMarker = "# acd-managed: true"
+	if !strings.Contains(body, yamlMarker) {
+		t.Errorf("pi snippet missing %q marker:\n%s", yamlMarker, body)
+	}
 	if strings.Contains(body, "- id: acd-touch-idle") {
 		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
