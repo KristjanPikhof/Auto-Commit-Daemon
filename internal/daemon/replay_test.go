@@ -4871,10 +4871,10 @@ func TestReplay_IntentPathCoalesce_DisabledViaEnv(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatalf("BootstrapShadow: %v", err)
 	}
-	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
 	captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
 	captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
 	captureSamePathEdit(t, ctx, f, "burst.txt", "v3\n")
