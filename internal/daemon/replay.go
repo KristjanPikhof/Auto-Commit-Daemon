@@ -1735,7 +1735,7 @@ func publishIntentSelection(
 				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped superseded external: %w", err)
 				}
-				sum.Published++
+				sum.Published += intentSelectionPublishedCount(selected)
 				sum.BaseHead = sourceHead
 				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, reason, map[string]any{
 					"commit": sourceHead,
