@@ -368,7 +368,7 @@ the investigation is complete.
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal intent planning pass starts. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact planner context. |
-| `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before ACD forces the overdue capture into a one-item planning window. |
+| `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals allowed before ACD forces the overdue capture into a one-item planning window. Lowered from `2` in the Wave 2 planner-atomicity epic — the validation retry loop in `composed.PlanIntent` plus the `<gitDir>/acd/planner-rejects.jsonl` forensic surface make a single deferral overwhelmingly more likely to be planner churn than legitimate "wait for related work". Set `=2` (or higher) to restore the prior tolerance. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs to network AI providers. Off by default; metadata-only payload otherwise. See [docs/ai-providers.md](docs/ai-providers.md). |
 
 ACD also skips common generated dependency/cache trees even when a project has
