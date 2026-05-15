@@ -76,21 +76,21 @@ const IntentRejectsKept = 1
 // String representation, so that telemetry can match on the integer code
 // even after the message text changes.
 type IntentRejectedPlan struct {
-	TS           string                   `json:"ts"`
-	Provider     string                   `json:"provider,omitempty"`
-	OfferedSeqs  []int64                  `json:"offered_seqs"`
-	RawResponse  string                   `json:"raw_response,omitempty"`
-	Code         IntentPlanValidationCode `json:"code"`
-	Message      string                   `json:"message"`
+	TS          string                   `json:"ts"`
+	Provider    string                   `json:"provider,omitempty"`
+	OfferedSeqs []int64                  `json:"offered_seqs"`
+	RawResponse string                   `json:"raw_response,omitempty"`
+	Code        IntentPlanValidationCode `json:"code"`
+	Message     string                   `json:"message"`
 }
 
 // IntentRejectsWriter encapsulates the append-and-rotate JSONL writer.
 type IntentRejectsWriter struct {
-	mu      sync.Mutex
-	dir     string
-	limit   int64
-	kept    int
-	clock   func() time.Time
+	mu    sync.Mutex
+	dir   string
+	limit int64
+	kept  int
+	clock func() time.Time
 }
 
 // NewIntentRejectsWriter returns a writer rooted at acdDir; the file is not
