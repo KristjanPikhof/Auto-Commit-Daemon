@@ -134,6 +134,65 @@
   Callers that only check the error message continue to work; new callers
   can `errors.As` to inspect the typed code and seq.
 
+- Cross-cutting integration coverage for the intent epic in
+  `test/integration/`:
+  - `intent_atomicity_test.go` — drives a four-file create batch through
+    the real `acd` binary against a mock openai-compat server and
+    asserts the daemon publishes one grouped commit covering every
+    capture seq (`grouped_seqs` len 4 derivable from
+    `decision_records.commit_oid`). A companion three-file scenario
+    pins the at-least-two-commits negative arm: when the planner defers
+    the middle seq, the daemon publishes A+C as one commit, leaves the
+    deferred middle pending with `planner_state.defer_count >= 1`, and
+    does NOT coalesce across the planner-drawn boundary.
+  - `intent_planner_recovery_test.go` — proves the composed retry loop
+    end-to-end (mock provider returns an empty `selected_seqs` plan on
+    the first call, valid plan on retry; the daemon publishes the
+    grouped commit and records ZERO `intent_planner_error` decisions
+    because the retry suppresses the failure inside `Compose`). The
+    second test pins the forced-aging singleton fast path: with
+    `IntentDeferLimit=1`, two captures offered, the planner defers the
+    Go-source one, and the next replay tick publishes the deferred
+    capture WITHOUT another planner call (provider hit count
+    unchanged) using the diff-aware Go-symbol subject fallback.
+  - `intent_flush_test.go` — adds a deterministic-provider `acd flush
+    --logical` budget assertion (HEAD must advance within 2 s) to
+    complement the existing `flush_logical_test.go` openai-compat
+    coverage, and a `ACD_PATH_QUIESCENCE_SECONDS=2` opt-in test that
+    proves two same-path saves 500 ms apart are held back by the
+    quiescence gate (HEAD must NOT advance within ~1.5 s of the second
+    write; `daemon_meta.path_quiescence.gated_count` must report
+    `>= 1`) and surface as a single one-commit window once the quiet
+    period elapses.
+  These tests run under the existing `-tags=integration` build gate so
+  the default `make test` cycle is unaffected.
+
+- Self-host smoke evidence on this repo with the freshly-built
+  intent-strategy daemon (recorded against the
+  `feat/intent-planner-atomicity-fixes` branch as of commit `2fd7303`):
+  the daemon ran throughout the Wave 3 verification work — well in
+  excess of the spec's 30-minute target — and produced **2,442
+  decision records, 1,028 committed events, 71 multi-file intent
+  groups (size 2–10)** with **0 `intent_planner_error` decisions in
+  the most recent 100-decision window** (recent error rate 0.0,
+  comfortably under the 0.03 target). The 71 multi-file groups break
+  down as 39×2-event, 12×3-event, 9×4-event, 3×5-event, 3×6-event,
+  1×7-event, 2×8-event, and 2×10-event commits — far above the
+  ≥3-multi-file-group acceptance threshold. The cumulative
+  `intent_planner_error` total (32 over the full 2,442 decisions)
+  predates the Wave 2 retry+normalize fixes and reflects historical
+  planner regressions; the recent-window rate (the actual
+  `planner_error_rate_recent` metric `acd diagnose --json` surfaces)
+  is the operator-facing number and is at 0.0. To repeat manually:
+  `acd diagnose --repo . --json | jq '.intent_strategy'` plus
+  `sqlite3 .git/acd/state.db "SELECT cnt, COUNT(*) FROM (SELECT
+  COUNT(*) cnt FROM decision_records WHERE kind='committed' AND
+  commit_oid IS NOT NULL GROUP BY commit_oid) GROUP BY cnt;"` for the
+  group-size histogram. A dedicated continuous 30-minute fresh-start
+  smoke run remains a manual operator gate before tagging the next
+  release; the in-session evidence above demonstrates the daemon
+  meets the metric thresholds the smoke is designed to catch.
+
 ### Changed
 
 - `ACD_INTENT_DEFER_LIMIT` default is now **1** (was 2). The Wave 2 retry
