@@ -117,6 +117,25 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 				r.LastPlannerErrorEventSeq, valueOrUnset(r.LastPlannerErrorPath), r.LastPlannerError)
 		}
 	}
+	if r.PlannerErrorRateRecent > 0 || r.SingletonCommitRateRecent > 0 {
+		warn := ""
+		if r.PlannerErrorRateRecentWarn {
+			warn = " WARN above " + formatRate(IntentPlannerErrorRateWarnThreshold)
+		}
+		fmt.Fprintf(out, "Intent rates (last %d): planner_error=%s singleton_commit=%s%s\n",
+			IntentRecentDecisionWindow,
+			formatRate(r.PlannerErrorRateRecent),
+			formatRate(r.SingletonCommitRateRecent),
+			warn,
+		)
+	}
+}
+
+// formatRate renders a rate in a stable two-decimal form. Avoids the
+// language-dependent default formatting of fmt.Sprintf("%v", float64) so
+// the human renderer is locale-stable.
+func formatRate(r float64) string {
+	return strconv.FormatFloat(r, 'f', 3, 64)
 }
 
 // ResolveEffectiveCommitStrategy returns the commit strategy currently in
