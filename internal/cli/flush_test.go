@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
-	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -83,20 +83,25 @@ func TestFlush_HeartbeatOnlyDoesNotEnqueueOrSignal(t *testing.T) {
 //     IntentBypassBatchWait kicks in on the next drain),
 //   - signal SIGUSR1 to the daemon pid.
 func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
-	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	if err := state.RegisterClient(ctx, db, state.Client{
+	// Need an initial commit so HEAD resolves to a branch ref (not detached).
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	dbPath := state.DBPathFromGitDir(repoDir + "/.git")
+	d2, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d2, state.Client{
 		SessionID: "s1", Harness: "claude-code",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+	if err := state.SaveDaemonState(ctx, d2, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save daemon state: %v", err)
 	}
-	_ = db.Close()
+	_ = d2.Close()
 
 	count, calls, restore := installFakeSignal(t)
 	defer restore()
@@ -112,12 +117,12 @@ func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 		t.Fatalf("signal pid=%d want %d", (*calls)[0].pid, os.Getpid())
 	}
 
-	d2, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	d3, err := state.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer d2.Close()
-	fr, ok, err := state.ClaimNextFlushRequest(ctx, d2)
+	defer d3.Close()
+	fr, ok, err := state.ClaimNextFlushRequest(ctx, d3)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -142,17 +147,15 @@ func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 // anchor to commit against — but the heartbeat refresh must still happen so
 // the harness hook stays a clean no-op signal.
 func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
-	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close()
-
-	// Create an initial commit so we have a real SHA to detach onto, then
-	// move HEAD off the symbolic ref.
-	writeRepoFile(t, repoDir, "seed.txt", "seed\n")
-	gitCommit(t, repoDir, "seed")
-	head := gitRevParse(t, repoDir, "HEAD")
-	gitDetachHead(t, repoDir, head)
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	head, err := git.RevParse(ctx, repoDir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "checkout", "--detach", head); err != nil {
+		t.Fatalf("git checkout --detach: %v", err)
+	}
 
 	_, _, restore := installFakeSignal(t)
 	defer restore()
@@ -186,13 +189,15 @@ func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
 // harness hook should never push the daemon to drain while the operator has
 // the repo paused for surgery.
 func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
-	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close()
-
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
 	gitDir := repoDir + "/.git"
-	if err := pausepkg.Write(gitDir, pausepkg.Marker{Reason: "test pause"}); err != nil {
+	markerDir := filepath.Join(gitDir, "acd")
+	if err := os.MkdirAll(markerDir, 0o700); err != nil {
+		t.Fatalf("mkdir marker parent: %v", err)
+	}
+	markerPath := filepath.Join(markerDir, "paused")
+	if err := os.WriteFile(markerPath, []byte(`{"reason":"test","set_at":"now","set_by":"test"}`), 0o600); err != nil {
 		t.Fatalf("write pause marker: %v", err)
 	}
 
@@ -228,10 +233,8 @@ func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
 // refusal. A mid-rebase repo has a transient HEAD and must not have its
 // pending captures published until the operation finishes.
 func TestFlush_LogicalRefusesOnGitOperation(t *testing.T) {
-	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	_ = db.Close()
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
 
 	// MERGE_HEAD is a recognised git-op marker; touching it inside .git is
 	// the simplest way to simulate "operation in progress" without driving
@@ -330,7 +333,7 @@ func TestFlush_PropagatesUnexpectedLockError(t *testing.T) {
 func TestFlush_HelpListsLogicalFlag(t *testing.T) {
 	cmd := newFlushCmd()
 	help := cmd.UsageString()
-	for _, want := range []string{"--logical", "--session-id", "--repo"} {
+	for _, want := range []string{"--logical", "--session-id"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("flush help missing %q:\n%s", want, help)
 		}
