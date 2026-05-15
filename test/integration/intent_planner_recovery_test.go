@@ -424,6 +424,27 @@ func buildDeferredReasons(seqs []int64) []map[string]any {
 // embedded object.
 func offeredIntentSeqsLenient(t *testing.T, req intentChatRequest) []int64 {
 	t.Helper()
+	captures := offeredIntentCaptures(t, req)
+	out := make([]int64, 0, len(captures))
+	for _, c := range captures {
+		out = append(out, c.Seq)
+	}
+	return out
+}
+
+// offeredIntentCapture is the {seq,path} subset of intentPlanPromptPayload
+// the recovery test needs to address captures by path rather than by
+// arbitrary capture order.
+type offeredIntentCapture struct {
+	Seq  int64
+	Path string
+}
+
+// offeredIntentCaptures parses the planner user prompt and returns the
+// list of offered captures with their paths. Lenient about trailing
+// non-JSON content (e.g. composed retry's Correction: block).
+func offeredIntentCaptures(t *testing.T, req intentChatRequest) []offeredIntentCapture {
+	t.Helper()
 	const marker = "Plan the next commit intent for these offered captures:\n"
 	for _, msg := range req.Messages {
 		if !strings.HasPrefix(msg.Content, marker) {
@@ -431,15 +452,20 @@ func offeredIntentSeqsLenient(t *testing.T, req intentChatRequest) []int64 {
 		}
 		body := strings.TrimPrefix(msg.Content, marker)
 		dec := json.NewDecoder(strings.NewReader(body))
-		var payload intentPlanPromptPayload
+		var payload struct {
+			OfferedCaptures []struct {
+				Seq  int64  `json:"seq"`
+				Path string `json:"path"`
+			} `json:"offered_captures"`
+		}
 		if err := dec.Decode(&payload); err != nil {
-			t.Fatalf("decode intent prompt payload (lenient): %v\nbody=%s", err, body)
+			t.Fatalf("decode intent prompt payload (captures): %v\nbody=%s", err, body)
 		}
-		seqs := make([]int64, 0, len(payload.OfferedCaptures))
-		for _, capture := range payload.OfferedCaptures {
-			seqs = append(seqs, capture.Seq)
+		out := make([]offeredIntentCapture, 0, len(payload.OfferedCaptures))
+		for _, c := range payload.OfferedCaptures {
+			out = append(out, offeredIntentCapture{Seq: c.Seq, Path: c.Path})
 		}
-		return seqs
+		return out
 	}
 	t.Fatalf("intent planner user prompt not found in request: %+v", req)
 	return nil
