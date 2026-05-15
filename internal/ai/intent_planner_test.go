@@ -527,6 +527,10 @@ type scriptedIntentPlanner struct {
 	errs        []error
 	calls       int
 	corrections []string
+	// requests captures every IntentPlanRequest the composed layer hands
+	// the planner so tests can assert hint propagation across retries and
+	// fallback paths. Retain insertion order; never mutated by PlanIntent.
+	requests []IntentPlanRequest
 }
 
 func (p *scriptedIntentPlanner) Name() string { return p.name }
@@ -539,6 +543,7 @@ func (p *scriptedIntentPlanner) PlanIntent(_ context.Context, req IntentPlanRequ
 	idx := p.calls
 	p.calls++
 	p.corrections = append(p.corrections, req.RetryCorrection)
+	p.requests = append(p.requests, req)
 	if idx < len(p.errs) && p.errs[idx] != nil {
 		return IntentPlan{}, p.errs[idx]
 	}
