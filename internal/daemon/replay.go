@@ -952,6 +952,25 @@ func replayIntentBatch(
 	parentTree string,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
+	// Per-path quiescence gate (ACD_PATH_QUIESCENCE_SECONDS). When non-zero
+	// we hold back pending captures whose path was written within the
+	// configured quiet window; the capture row is still durable, only the
+	// planner-offer is gated. We persist a snapshot of the gated count to
+	// daemon_meta so `acd status --json` can render visible_pending_events
+	// as the post-gate population while oldest_pending_age stays anchored
+	// to captured_ts (the persistence timestamp).
+	pending, gated := filterPendingByPathQuiescence(pending, cfg.pathQuiescence, pathQuiescenceNow())
+	persistPathQuiescenceSnapshot(ctx, db, gated)
+	if len(pending) == 0 {
+		// Everything in the visible queue is held back behind the gate;
+		// treat the pass as a batch wait so the run loop ticks again
+		// rather than minting an empty commit.
+		if gated > 0 {
+			sum.Skipped = true
+			sum.SkippedReason = "skipped_due_path_quiescence"
+		}
+		return sum, nil
+	}
 	window, forced, waitReason, err := selectIntentWindow(ctx, db, pending, cfg)
 	if err != nil {
 		return sum, err
