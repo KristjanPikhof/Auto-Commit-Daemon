@@ -47,7 +47,7 @@ After wiring, sanity-check with `acd doctor`. It checks the snippet matches the 
 | Harness | Hook engine | Source |
 |---|---|---|
 | `claude-code` | Native | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
-| `codex` | Native (run `/hooks` after each install to re-approve) | OpenAI Codex |
+| `codex` | Native (run `/hooks` after each install to re-approve) | [OpenAI Codex](https://developers.openai.com/codex/hooks) |
 | `opencode` | External: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) | KristjanPikhof |
 | `pi` | External: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) | KristjanPikhof |
 | `shell` | direnv `.envrc` or shell rc | n/a |
