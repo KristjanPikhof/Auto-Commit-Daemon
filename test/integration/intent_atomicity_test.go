@@ -159,7 +159,7 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 		}
 		if !ok {
 			rows := sqliteScalar(t, dbPath,
-				"SELECT IFNULL(GROUP_CONCAT(seq||':'||state||':'||op), '<none>') FROM capture_events WHERE path='burst.txt'")
+				"SELECT IFNULL(GROUP_CONCAT(seq||':'||state||':'||operation), '<none>') FROM capture_events WHERE path='burst.txt'")
 			t.Fatalf("after edit %d: pending burst.txt count=%s want %s; rows=%s", i+1, got, want, rows)
 		}
 	}
