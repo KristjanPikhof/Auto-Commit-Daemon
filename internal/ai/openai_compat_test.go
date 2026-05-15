@@ -713,11 +713,13 @@ func TestOpenAIIntentPlan_NormalizesSpuriousDeferredReason(t *testing.T) {
 	}
 }
 
-// TestOpenAIIntentPlan_AllBadDeferredReasonsFallsBackThroughCompose exercises
-// case (b): if normalization leaves at least one real deferred seq without a
-// reason (because the only reason emitted was spurious), validation fails and
-// Compose surfaces the error so replay's deterministic fallback path runs.
-func TestOpenAIIntentPlan_AllBadDeferredReasonsFallsBackThroughCompose(t *testing.T) {
+// TestOpenAIIntentPlan_AllBadDeferredReasonsSynthesizesMarker exercises the
+// coercion path: when every emitted deferred_reasons entry is spurious (here
+// the only reason references the selected seq 101), the openai-compat
+// provider drops the spurious entry and synthesizes a marker reason for the
+// real deferred seq 102. The plan then validates and the grouped commit
+// proceeds rather than collapsing to the deterministic fallback.
+func TestOpenAIIntentPlan_AllBadDeferredReasonsSynthesizesMarker(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 200, cannedIntentPlanToolCall(IntentPlan{
@@ -731,12 +733,15 @@ func TestOpenAIIntentPlan_AllBadDeferredReasonsFallsBackThroughCompose(t *testin
 		})
 	})
 	planner := Compose(p, DeterministicProvider{})
-	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
-	if err == nil {
-		t.Fatalf("expected validation error after normalization leaves deferred seq 102 without a reason")
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
 	}
-	if !strings.Contains(err.Error(), "deferred seq 102 missing reason") {
-		t.Fatalf("error=%v", err)
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 102 {
+		t.Fatalf("normalized deferred reasons=%+v", plan.DeferredReasons)
+	}
+	if plan.DeferredReasons[0].Reason != IntentPlanReasonMarker {
+		t.Fatalf("synthesized reason=%q want %q", plan.DeferredReasons[0].Reason, IntentPlanReasonMarker)
 	}
 }
 
