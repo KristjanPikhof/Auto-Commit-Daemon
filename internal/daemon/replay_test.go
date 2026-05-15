@@ -5774,9 +5774,9 @@ func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
 		t.Fatalf("expected forced-aging fallback to advance the row; sum=%+v", sum)
 	}
 	// Verify a planner_error decision exists for the seq.
-	rows, err := state.RecentDecisionsByEventSeq(ctx, f.db, seq, 16)
+	rows, err := state.DecisionsForEvent(ctx, f.db, seq, 16)
 	if err != nil {
-		t.Fatalf("RecentDecisionsByEventSeq: %v", err)
+		t.Fatalf("DecisionsForEvent: %v", err)
 	}
 	hasErr := false
 	for _, row := range rows {
