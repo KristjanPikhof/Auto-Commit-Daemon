@@ -1263,7 +1263,10 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 	plan, err := planner.PlanIntent(ctx, req)
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
-		plan, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
+		// Discard the dropped/synthesized lists: provider-side warns already
+		// fired upstream; emitting another warn here would duplicate the
+		// log entry for the same response.
+		plan, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
 		err = ai.ValidateIntentPlan(req, plan)
 	}
 	if err == nil {
