@@ -1,0 +1,55 @@
+{
+  "_comment": "Synthesized from real planner output observed in Trekoon and Gitlab-Issues-Creator repo trace logs (intent_planner_error >= 60 by 2026-05-12). The planner selected seqs 5017+5018 and deferred 5019, then emitted a deferred_reasons entry referencing seq 5018 (which is selected, not deferred). Today this trips ValidateIntentPlan with 'deferred reason references non-deferred seq 5018' and the daemon falls back to the deterministic one-item provider for the entire window.",
+  "offered_captures": [
+    {
+      "seq": 5017,
+      "path": "internal/checkout/service.go",
+      "op": "modify",
+      "timestamp": "2026-05-12T10:00:00Z",
+      "fidelity": "full",
+      "defer_count": 0
+    },
+    {
+      "seq": 5018,
+      "path": "internal/checkout/handler.go",
+      "op": "modify",
+      "timestamp": "2026-05-12T10:00:01Z",
+      "fidelity": "full",
+      "defer_count": 0
+    },
+    {
+      "seq": 5019,
+      "path": "docs/checkout.md",
+      "op": "modify",
+      "timestamp": "2026-05-12T10:00:02Z",
+      "fidelity": "metadata",
+      "defer_count": 1
+    }
+  ],
+  "openai_response": {
+    "id": "chatcmpl-bad-deferred-reason",
+    "object": "chat.completion",
+    "created": 1778795200,
+    "model": "gpt-4o-mini",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_intent_plan_bad",
+              "type": "function",
+              "function": {
+                "name": "capture_intent_plan",
+                "arguments": "{\"selected_seqs\":[5017,5018],\"deferred_seqs\":[5019],\"subject\":\"Tighten checkout validation\",\"body\":\"- align service and handler on shared validator\",\"grouping_reason\":\"both files target the checkout validator and share a contract change\",\"deferred_reasons\":[{\"seq\":5019,\"reason\":\"docs change is independent and can ship later\"},{\"seq\":5018,\"reason\":\"handler edit is part of the selected group; noting it here for traceability\"}]}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ]
+  }
+}

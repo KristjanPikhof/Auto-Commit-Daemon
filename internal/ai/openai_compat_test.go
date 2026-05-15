@@ -678,6 +678,94 @@ func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
 	}
 }
 
+// TestOpenAIIntentPlan_NormalizesSpuriousDeferredReason exercises case (a)
+// from the [Tests] task: when the planner emits a deferred_reasons entry whose
+// seq is selected (not deferred), the openai-compat provider drops the
+// spurious entry and returns a valid plan. The grouped commit goes ahead
+// instead of collapsing to deterministic one-item fallback.
+func TestOpenAIIntentPlan_NormalizesSpuriousDeferredReason(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{101},
+			DeferredSeqs:   []int64{102},
+			Subject:        "Tighten checkout flow",
+			Body:           "- align validator",
+			GroupingReason: "single focused checkout change",
+			DeferredReasons: []DeferredReason{
+				{Seq: 102, Reason: "documentation change is separate"},
+				{Seq: 101, Reason: "spurious entry referencing selected seq"},
+			},
+		})
+	})
+	plan, err := p.PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 102 {
+		t.Fatalf("normalized deferred reasons=%+v", plan.DeferredReasons)
+	}
+	if plan.SelectedSeqs[0] != 101 || plan.DeferredSeqs[0] != 102 {
+		t.Fatalf("plan seqs not preserved: %+v", plan)
+	}
+	if plan.Source != "openai-compat" {
+		t.Fatalf("source=%q", plan.Source)
+	}
+}
+
+// TestOpenAIIntentPlan_AllBadDeferredReasonsFallsBackThroughCompose exercises
+// case (b): if normalization leaves at least one real deferred seq without a
+// reason (because the only reason emitted was spurious), validation fails and
+// Compose surfaces the error so replay's deterministic fallback path runs.
+func TestOpenAIIntentPlan_AllBadDeferredReasonsFallsBackThroughCompose(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{101},
+			DeferredSeqs:   []int64{102},
+			Subject:        "Tighten checkout flow",
+			GroupingReason: "single focused checkout change",
+			DeferredReasons: []DeferredReason{
+				{Seq: 101, Reason: "all reasons are spurious"},
+			},
+		})
+	})
+	planner := Compose(p, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error after normalization leaves deferred seq 102 without a reason")
+	}
+	if !strings.Contains(err.Error(), "deferred seq 102 missing reason") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+// TestOpenAIIntentPlan_FixtureNormalizesAndProceeds wires the
+// bad_deferred_reason.json repro fixture through the full openai-compat
+// PlanIntent path. The mock returns the recorded planner JSON; provider-side
+// normalization drops the spurious deferred_reasons entry and the resulting
+// plan validates without collapsing to deterministic.
+func TestOpenAIIntentPlan_FixtureNormalizesAndProceeds(t *testing.T) {
+	fx := loadBadDeferredReasonFixture(t)
+	req := badDeferredReasonRequest(t, fx)
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, string(fx.OpenAIResponse)
+	})
+	plan, err := p.PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if len(plan.SelectedSeqs) != 2 || plan.SelectedSeqs[0] != 5017 || plan.SelectedSeqs[1] != 5018 {
+		t.Fatalf("selected=%v want [5017 5018]", plan.SelectedSeqs)
+	}
+	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 5019 {
+		t.Fatalf("deferred=%v want [5019]", plan.DeferredSeqs)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 5019 {
+		t.Fatalf("deferred reasons=%+v want one entry for seq 5019", plan.DeferredReasons)
+	}
+}
+
 func TestOpenAIIntentPlan_InvalidPlanReturnsErrorWhenComposed(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {

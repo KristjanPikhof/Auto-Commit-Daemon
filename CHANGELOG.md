@@ -4,6 +4,21 @@
 
 ### Added
 
+- Intent planner tolerates spurious `deferred_reasons` entries. The
+  `openai-compat` and `subprocess` providers drop entries whose seq is
+  selected or non-offered, log one `slog.Warn` naming the dropped seqs, and
+  proceed with the cleaned plan. `composed.PlanIntent` runs the same
+  normalize-then-warn on both primary and fallback paths so any third-party
+  `IntentPlanner` wired through `Compose` is covered; the replay loop runs
+  the normalizer one more time without a warn as defense in depth. Plans
+  that still fail `ValidateIntentPlan` after normalization continue to fall
+  back to deterministic one-capture commits with an `intent_planner_error`
+  ledger entry. `ValidateIntentPlan` now returns a typed
+  `*IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonNotDeferred}`
+  for this case; existing untyped error paths are unchanged. Restores intent
+  grouping for repos that hit this planner output instead of silently
+  collapsing to deterministic commits.
+
 - Self-heal for blocked replay barriers. The daemon's replay pass now probes
   `blocked_conflict` rows before draining pending captures and promotes any
   row whose captured after-state already matches HEAD. No new commit is

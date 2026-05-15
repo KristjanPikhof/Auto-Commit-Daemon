@@ -4,10 +4,48 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type badDeferredReasonFixture struct {
+	OfferedCaptures []OfferedCapture `json:"offered_captures"`
+	OpenAIResponse  json.RawMessage  `json:"openai_response"`
+}
+
+func loadBadDeferredReasonFixture(t *testing.T) badDeferredReasonFixture {
+	t.Helper()
+	path := filepath.Join("testdata", "intent_planner", "bad_deferred_reason.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fx badDeferredReasonFixture
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	if len(fx.OfferedCaptures) == 0 {
+		t.Fatalf("fixture missing offered_captures")
+	}
+	if len(fx.OpenAIResponse) == 0 {
+		t.Fatalf("fixture missing openai_response")
+	}
+	return fx
+}
+
+func badDeferredReasonRequest(t *testing.T, fx badDeferredReasonFixture) IntentPlanRequest {
+	t.Helper()
+	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
+		OfferedCaptures: fx.OfferedCaptures,
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequest: %v", err)
+	}
+	return req
+}
 
 func sampleIntentPlanRequest(t *testing.T) IntentPlanRequest {
 	t.Helper()
@@ -147,6 +185,8 @@ func TestIntentPlannerPromptContainsPlannerRules(t *testing.T) {
 		"Do not group unrelated captures",
 		"Do not invent intent beyond the supplied evidence",
 		"Forced-aging windows contain only the overdue capture",
+		"Every deferred_reasons[i].seq must appear in deferred_seqs",
+		"Worked example",
 	}
 	for _, want := range required {
 		if !strings.Contains(prompt, want) {
@@ -310,6 +350,118 @@ func TestComposedPlanIntentReturnsPrimaryValidationError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "omitted from selected/deferred") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsDropsNonDeferredEntries(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs: []int64{10, 11},
+		DeferredSeqs: []int64{12},
+		DeferredReasons: []DeferredReason{
+			{Seq: 12, Reason: "docs change is independent"},
+			{Seq: 11, Reason: "spurious entry for selected seq"},
+			{Seq: 99, Reason: "spurious entry for unknown seq"},
+		},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 2 || dropped[0] != 11 || dropped[1] != 99 {
+		t.Fatalf("dropped=%v want [11 99]", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Seq != 12 {
+		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
+	plan := IntentPlan{
+		DeferredSeqs:    []int64{12, 13},
+		DeferredReasons: []DeferredReason{{Seq: 12, Reason: "a"}, {Seq: 13, Reason: "b"}},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 0 {
+		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 2 {
+		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsEmptyPlanEarlyReturn(t *testing.T) {
+	plan := IntentPlan{DeferredSeqs: []int64{12}}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if dropped != nil {
+		t.Fatalf("dropped=%v want nil", dropped)
+	}
+	if cleaned.DeferredReasons != nil {
+		t.Fatalf("cleaned reasons=%+v want nil", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsPreservesInputOrder(t *testing.T) {
+	plan := IntentPlan{
+		DeferredSeqs: []int64{12, 13},
+		DeferredReasons: []DeferredReason{
+			{Seq: 12, Reason: "valid"},
+			{Seq: 99, Reason: "drop first"},
+			{Seq: 13, Reason: "valid"},
+			{Seq: 11, Reason: "drop second"},
+		},
+	}
+	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) != 2 || dropped[0] != 99 || dropped[1] != 11 {
+		t.Fatalf("dropped=%v want [99 11]", dropped)
+	}
+	if len(cleaned.DeferredReasons) != 2 || cleaned.DeferredReasons[0].Seq != 12 || cleaned.DeferredReasons[1].Seq != 13 {
+		t.Fatalf("cleaned=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestValidateIntentPlanReturnsTypedErrorForDeferredReasonNotDeferred(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			{Seq: 102, Reason: "documentation change is separate"},
+			{Seq: 101, Reason: "spurious entry referencing selected seq"},
+		},
+	}
+	err := ValidateIntentPlan(req, plan)
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("expected *IntentPlanValidationError, got %T: %v", err, err)
+	}
+	if typed.Code != IntentPlanValidationDeferredReasonNotDeferred {
+		t.Fatalf("code=%v want IntentPlanValidationDeferredReasonNotDeferred", typed.Code)
+	}
+	if typed.Seq != 101 {
+		t.Fatalf("seq=%d want 101", typed.Seq)
+	}
+}
+
+// TestBadDeferredReasonFixtureReproducesValidatorError pins the upstream
+// planner bug captured in the Trekoon and Gitlab-Issues-Creator repo trace
+// logs: the planner emits a deferred_reasons entry whose seq is a selected
+// (not deferred) capture. parseIntentPlanToolCall accepts the JSON, but
+// ValidateIntentPlan rejects it and the daemon falls back to deterministic
+// one-item commits for the entire window. The fixture is the input to the
+// provider-side normalization implemented later in this file.
+func TestBadDeferredReasonFixtureReproducesValidatorError(t *testing.T) {
+	fx := loadBadDeferredReasonFixture(t)
+	req := badDeferredReasonRequest(t, fx)
+	plan, err := parseIntentPlanToolCall(fx.OpenAIResponse)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	if err := ValidateIntentPlan(req, plan); err == nil {
+		t.Fatalf("expected validator to reject fixture plan, got nil")
+	} else if !strings.Contains(err.Error(), "deferred reason references non-deferred seq") {
+		t.Fatalf("unexpected validator error: %v", err)
 	}
 }
 

@@ -131,6 +131,18 @@ If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
 containing only that overdue capture. That keeps intent grouping from starving
 small or hard-to-name edits.
 
+Planner contract: every entry in `deferred_reasons` must reference a seq that
+appears in `deferred_seqs`. Reasons attached to a selected seq, or to a seq
+outside the offered window, are invalid by contract. The `openai-compat` and
+`subprocess` providers normalize their own response before returning: if a
+planner emits a spurious `deferred_reasons` entry, the provider drops that
+entry, logs a single warning naming the affected seqs, and hands the cleaned
+plan to the validator. The same normalization also runs at the `Compose`
+layer (so any third-party `IntentPlanner` wired through `Compose` is covered)
+and once more inside the replay loop as defense in depth. A plan that still
+fails validation after normalization is surfaced as `intent_planner_error`
+and replay falls back to deterministic one-capture commits as before.
+
 Batching behavior is deliberately bounded:
 
 - `ACD_INTENT_WINDOW` is a ceiling, not a target. A normal pass offers at most
@@ -317,8 +329,12 @@ commit context, branch/repo metadata, and whether the window is forced aging.
 
 Every offered seq must appear in either `selected_seqs` or `deferred_seqs`.
 `selected_seqs` must be non-empty. Add one `{ "seq": <id>, "reason": "..." }`
-entry to `deferred_reasons` for every deferred seq. Invalid responses are
-recorded as planner errors and fall back to safe one-capture planning.
+entry to `deferred_reasons` for every deferred seq. ACD normalizes the
+response before validation: spurious `deferred_reasons` entries (seq is
+selected, or not in the offered window) are dropped with a single warning
+and the cleaned plan continues. Responses that are still invalid after
+normalization are recorded as `intent_planner_error` and fall back to safe
+one-capture planning.
 
 ### Lifecycle
 

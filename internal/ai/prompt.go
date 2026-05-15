@@ -80,7 +80,11 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"You must return every offered seq as either selected or deferred. " +
 	"Do not group unrelated captures. " +
 	"Do not invent intent beyond the supplied evidence. " +
-	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture."
+	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture. " +
+	"Every deferred_reasons[i].seq must appear in deferred_seqs. " +
+	"Do not emit a reason for a seq that is selected, and do not reference seqs outside the offered window. " +
+	"Each deferred seq needs exactly one reason; selected seqs get no reason entry. " +
+	"Worked example: offered=[10,11,12], selected=[10,11], deferred=[12]; deferred_reasons must contain exactly one entry with seq=12."
 
 var (
 	// reBulletPrefix strips a leading `-` / `*` plus whitespace from a

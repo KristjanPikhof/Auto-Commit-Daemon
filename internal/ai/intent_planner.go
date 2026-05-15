@@ -182,6 +182,34 @@ func NormalizeIntentReason(reason string) string {
 	return string(runes[:IntentReasonCap])
 }
 
+// IntentPlanValidationCode classifies planner-output validation failures so
+// providers can decide whether to normalize the plan locally or hard-fail.
+// New codes must be appended to keep the wire-style ordering stable for any
+// future telemetry mapping.
+type IntentPlanValidationCode int
+
+const (
+	// IntentPlanValidationUnknown is the zero-value catch-all.
+	IntentPlanValidationUnknown IntentPlanValidationCode = iota
+	// IntentPlanValidationDeferredReasonNotDeferred fires when a
+	// DeferredReason carries a seq that is not present in DeferredSeqs
+	// (the seq is selected, or absent from the offered window). Providers
+	// can normalize by dropping the spurious entry; see
+	// NormalizeIntentPlanDeferredReasons.
+	IntentPlanValidationDeferredReasonNotDeferred
+)
+
+// IntentPlanValidationError is the typed error returned by ValidateIntentPlan
+// when the failure is one providers may normalize. Untyped errors keep using
+// fmt.Errorf so existing string matches stay green.
+type IntentPlanValidationError struct {
+	Code    IntentPlanValidationCode
+	Seq     int64
+	Message string
+}
+
+func (e *IntentPlanValidationError) Error() string { return e.Message }
+
 // ValidateIntentPlan rejects malformed or incomplete planner output before it
 // can influence replay.
 func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
@@ -246,8 +274,17 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 
 	reasons := make(map[int64]struct{}, len(plan.DeferredReasons))
 	for _, reason := range plan.DeferredReasons {
+		// Cross-check: every DeferredReason.Seq must appear in DeferredSeqs.
+		// Planners that emit a reason for a selected seq, or for a seq not in
+		// the offered window, get rejected here. Providers can pre-normalize
+		// via NormalizeIntentPlanDeferredReasons to drop the spurious entry
+		// and keep the rest of the plan.
 		if _, ok := deferred[reason.Seq]; !ok {
-			return fmt.Errorf("intent planner: deferred reason references non-deferred seq %d", reason.Seq)
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationDeferredReasonNotDeferred,
+				Seq:     reason.Seq,
+				Message: fmt.Sprintf("intent planner: deferred reason references non-deferred seq %d", reason.Seq),
+			}
 		}
 		if _, exists := reasons[reason.Seq]; exists {
 			return fmt.Errorf("intent planner: duplicate deferred reason for seq %d", reason.Seq)
@@ -264,6 +301,40 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	}
 
 	return nil
+}
+
+// NormalizeIntentPlanDeferredReasons drops DeferredReason entries whose Seq
+// is not present in plan.DeferredSeqs. Providers call this before
+// ValidateIntentPlan so a planner that emits a reason for a selected (or
+// unknown) seq does not collapse the entire plan to deterministic fallback.
+// Returns the cleaned plan and the dropped seqs in input order so callers can
+// log a single deterministic warning.
+//
+// Aliasing: on the no-drop path the returned plan.DeferredReasons still
+// aliases the caller's backing array; callers must not mutate the slice in
+// place. On the drop path the slice is freshly allocated.
+func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64) {
+	if len(plan.DeferredReasons) == 0 {
+		return plan, nil
+	}
+	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
+	for _, seq := range plan.DeferredSeqs {
+		deferred[seq] = struct{}{}
+	}
+	cleaned := make([]DeferredReason, 0, len(plan.DeferredReasons))
+	var dropped []int64
+	for _, r := range plan.DeferredReasons {
+		if _, ok := deferred[r.Seq]; !ok {
+			dropped = append(dropped, r.Seq)
+			continue
+		}
+		cleaned = append(cleaned, r)
+	}
+	if len(dropped) == 0 {
+		return plan, nil
+	}
+	plan.DeferredReasons = cleaned
+	return plan, dropped
 }
 
 // PlanIntent provides the deterministic fallback planner. It selects exactly

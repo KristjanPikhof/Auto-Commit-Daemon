@@ -15,6 +15,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
@@ -167,6 +168,13 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 			return IntentPlan{}, err
 		}
 		plan = NormalizeIntentPlanReasons(plan)
+		plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
+		if len(dropped) > 0 {
+			slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+				slog.String("provider", c.primary.Name()),
+				slog.Any("dropped_seqs", dropped),
+			)
+		}
 		if err := ValidateIntentPlan(req, plan); err != nil {
 			return IntentPlan{}, err
 		}
@@ -184,6 +192,13 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 		return IntentPlan{}, err
 	}
 	plan = NormalizeIntentPlanReasons(plan)
+	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 {
+		slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+			slog.String("provider", c.fallback.Name()),
+			slog.Any("dropped_seqs", dropped),
+		)
+	}
 	if err := ValidateIntentPlan(req, plan); err != nil {
 		return IntentPlan{}, err
 	}
