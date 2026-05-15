@@ -220,15 +220,44 @@ func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot strin
 // returns an error when the underlying git binary is unreachable in a
 // way that should surface up to the caller.
 //
-// The returned text is capped to ai.DiffCap while sections are appended,
-// so large multi-op events stop rendering once the provider budget is
-// consumed. Callers still apply redaction + ai.Truncate before handing the
-// diff to a provider because redaction can change the final byte length.
+// The returned text is capped to ai.DiffCap (the per-event commit-message
+// budget) while sections are appended, so large multi-op events stop
+// rendering once the provider budget is consumed. Callers still apply
+// redaction + ai.Truncate before handing the diff to a provider because
+// redaction can change the final byte length.
+//
+// Intent-stage callers MUST use BuildOpsDiffWithCap with
+// ai.IntentStageDiffCap so the larger planner budget actually applies;
+// passing the captured diff through this function silently truncates at
+// the per-event cap, which is the bug fixed alongside this docstring.
 func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (string, error) {
+	return BuildOpsDiffWithCap(ctx, repoRoot, ops, ai.DiffCap)
+}
+
+// BuildOpsDiffWithCap is the cap-aware variant of BuildOpsDiff. It accepts
+// a per-call byte cap so the intent-planner stage can request its larger
+// IntentStageDiffCap (16 KiB) budget without resurrecting the dead-code
+// truncation that the original BuildOpsDiff performed at the legacy 4 KiB
+// per-event DiffCap.
+//
+// Contract for the daemon-side caller (replay.go):
+//   - per-event commit-message rendering: pass ai.DiffCap (or call
+//     BuildOpsDiff which forwards that constant).
+//   - intent-planner staging: pass ai.IntentStageDiffCap. The
+//     DAEMON-lane caller in replay.go is responsible for using this entry
+//     point on the intent path so the planner sees enough of each captured
+//     diff to reason about multi-file grouping.
+//
+// `cap` <= 0 is treated as ai.DiffCap so a zero-valued caller cannot
+// silently disable the cap.
+func BuildOpsDiffWithCap(ctx context.Context, repoRoot string, ops []state.CaptureOp, cap int) (string, error) {
 	if repoRoot == "" || len(ops) == 0 {
 		return "", nil
 	}
-	var buf cappedDiffBuffer
+	if cap <= 0 {
+		cap = ai.DiffCap
+	}
+	buf := newCappedDiffBuffer(cap)
 	for _, op := range ops {
 		if buf.Full() {
 			break
@@ -250,8 +279,19 @@ func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (
 	return buf.String(), nil
 }
 
+// cappedDiffBuffer caps appends at the per-call budget supplied to
+// newCappedDiffBuffer. Use BuildOpsDiff for the per-event default and
+// BuildOpsDiffWithCap for the intent-stage 16 KiB budget.
 type cappedDiffBuffer struct {
 	buf bytes.Buffer
+	cap int
+}
+
+func newCappedDiffBuffer(cap int) *cappedDiffBuffer {
+	if cap <= 0 {
+		cap = ai.DiffCap
+	}
+	return &cappedDiffBuffer{cap: cap}
 }
 
 func (b *cappedDiffBuffer) Len() int {
@@ -259,7 +299,7 @@ func (b *cappedDiffBuffer) Len() int {
 }
 
 func (b *cappedDiffBuffer) Full() bool {
-	return b.buf.Len() >= ai.DiffCap
+	return b.buf.Len() >= b.cap
 }
 
 func (b *cappedDiffBuffer) HasTrailingNewline() bool {
@@ -268,7 +308,7 @@ func (b *cappedDiffBuffer) HasTrailingNewline() bool {
 }
 
 func (b *cappedDiffBuffer) WriteString(s string) {
-	remaining := ai.DiffCap - b.buf.Len()
+	remaining := b.cap - b.buf.Len()
 	if remaining <= 0 {
 		return
 	}
