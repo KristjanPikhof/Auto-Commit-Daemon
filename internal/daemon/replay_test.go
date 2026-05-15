@@ -2973,8 +2973,11 @@ func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubjec
 		t.Fatalf("git log subject: %v", err)
 	}
 	got := strings.TrimSpace(string(subject))
-	if got != "Update HandleOverdueCapture" {
-		t.Fatalf("commit subject=%q want %q (diff-aware fallback should extract Go symbol)", got, "Update HandleOverdueCapture")
+	// First capture for a new path is a create op, so the verb is "Add".
+	// The function name comes from extractGoSymbol against the captured
+	// post-image diff.
+	if got != "Add HandleOverdueCapture" {
+		t.Fatalf("commit subject=%q want %q (diff-aware fallback should extract Go symbol)", got, "Add HandleOverdueCapture")
 	}
 
 	// Forced-aging marker must still appear (recorded ahead of the gate).
