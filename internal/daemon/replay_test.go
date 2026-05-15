@@ -5260,6 +5260,10 @@ func TestReplay_PathQuiescenceDisabledRegressionBaseline(t *testing.T) {
 // not the read.
 func TestReplay_PathQuiescenceSnapshotRecordsGatedCount(t *testing.T) {
 	ResetPathQuiescenceForTest(t)
+	resetLastPersistedQuiescenceGatedForTest(t)
+	// Enable the gate before captures so RecordPathWrite stamps land.
+	t.Setenv(EnvPathQuiescenceSeconds, "60")
+	_ = resolvePathQuiescenceSeconds()
 	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
 	SetPathQuiescenceClockForTest(t, func() time.Time { return t0 })
 	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
@@ -5271,7 +5275,6 @@ func TestReplay_PathQuiescenceSnapshotRecordsGatedCount(t *testing.T) {
 	}
 	captureOnePendingFile(t, ctx, f, "snap.txt", "v1\n")
 
-	t.Setenv(EnvPathQuiescenceSeconds, "60")
 	planner := &recordingIntentPlanner{}
 	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
