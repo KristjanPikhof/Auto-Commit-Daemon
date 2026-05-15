@@ -4642,3 +4642,336 @@ func TestRun_PauseStateReadFailClosed(t *testing.T) {
 		t.Fatalf("Run returned %v", runErr)
 	}
 }
+
+// captureSamePathEdit writes new content to path and runs one capture pass.
+// Returns the seq of the new pending event for the targeted path. Used by the
+// same-path coalesce tests to build a clean burst of consecutive modifies on
+// the same file.
+func captureSamePathEdit(t *testing.T, ctx context.Context, f *captureFixture, path, body string) int64 {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatalf("expected a pending event after writing %q", path)
+	}
+	// Return the highest-seq pending event for this path — that's the row
+	// the most recent capture pass produced.
+	var newest int64
+	for _, ev := range pending {
+		if ev.Path == path && ev.Seq > newest {
+			newest = ev.Seq
+		}
+	}
+	if newest == 0 {
+		t.Fatalf("no pending event for path %q after capture; pending=%+v", path, pending)
+	}
+	return newest
+}
+
+// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer: four sequential
+// modifies on the same path produce one offered window entry, one commit, and
+// four decision_records rows joined by commit_oid (so the CLI's grouped_seqs
+// derivation reports len 4).
+func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	// Seed the file as a tracked file so subsequent writes capture as
+	// modifies (not creates), giving us a clean modify→modify→modify chain
+	// to coalesce.
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
+
+	seq1 := captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
+	seq3 := captureSamePathEdit(t, ctx, f, "burst.txt", "v3\n")
+	seq4 := captureSamePathEdit(t, ctx, f, "burst.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 4 {
+		t.Fatalf("pending=%d want 4 same-path captures", len(pending))
+	}
+
+	planner := &recordingIntentPlanner{}
+	// Plan the single coalesced offer the planner is expected to see.
+	planner.plan = ai.IntentPlan{
+		SelectedSeqs:   []int64{seq1},
+		Subject:        "Coalesced burst",
+		GroupingReason: "single-path edit chain",
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 4,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// All four covered events must land as published.
+	if sum.Published != 4 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 4 published, 0 conflicts/failed", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
+		t.Fatalf("offered captures=%d want 1 (coalesced)", len(got))
+	}
+	// One commit on top of the seed for the coalesced burst.
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		// seed (gitignore) + seed (burst.txt v0) + 1 coalesced commit = 3
+		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 coalesced)", got)
+	}
+	// HEAD's blob for burst.txt must be v4 (the LAST captured after-state).
+	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "burst.txt")
+	if err != nil {
+		t.Fatalf("ls-tree HEAD burst.txt: %v", err)
+	}
+	v4OID, err := git.HashObjectStdin(ctx, f.dir, []byte("v4\n"))
+	if err != nil {
+		t.Fatalf("hash v4: %v", err)
+	}
+	if headOID != v4OID {
+		t.Fatalf("HEAD blob=%s want v4 %s (squash must land last after-state)", headOID, v4OID)
+	}
+	// Every event row points at the same commit_oid.
+	rows, err := f.db.SQL().QueryContext(ctx,
+		`SELECT seq, state, commit_oid FROM capture_events WHERE seq IN (?, ?, ?, ?) ORDER BY seq ASC`,
+		seq1, seq2, seq3, seq4)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var commit string
+	count := 0
+	for rows.Next() {
+		var seq int64
+		var st string
+		var oid sql.NullString
+		if err := rows.Scan(&seq, &st, &oid); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if st != state.EventStatePublished {
+			t.Fatalf("seq=%d state=%q want published", seq, st)
+		}
+		if !oid.Valid || oid.String == "" {
+			t.Fatalf("seq=%d missing commit_oid", seq)
+		}
+		if commit == "" {
+			commit = oid.String
+		} else if oid.String != commit {
+			t.Fatalf("seq=%d commit_oid=%s mismatches first commit_oid=%s (must share commit)",
+				seq, oid.String, commit)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("settled events=%d want 4", count)
+	}
+	// Decision ledger must carry one row per original seq for the same commit.
+	group, err := state.DecisionGroupForCommit(ctx, f.db, commit, 100)
+	if err != nil {
+		t.Fatalf("DecisionGroupForCommit: %v", err)
+	}
+	wantSeqs := []int64{seq1, seq2, seq3, seq4}
+	if !reflect.DeepEqual(group.EventSeqs, wantSeqs) {
+		t.Fatalf("decision group EventSeqs=%v want %v (grouped_seqs must cover every original seq)",
+			group.EventSeqs, wantSeqs)
+	}
+}
+
+// TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce: a same-path capture
+// surrounded by an other-path capture stays as 3 separate offers.
+func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	seedTrackedFileCommit(t, ctx, f, "p.txt", "p0\n")
+	seedTrackedFileCommit(t, ctx, f, "q.txt", "q0\n")
+
+	captureSamePathEdit(t, ctx, f, "p.txt", "p1\n")
+	captureSamePathEdit(t, ctx, f, "q.txt", "q1\n")
+	captureSamePathEdit(t, ctx, f, "p.txt", "p2\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3 (P/Q/P sequence)", len(pending))
+	}
+	// Plan: select all three offers as a group (we just need to verify the
+	// planner sees 3 distinct offers).
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq},
+			Subject:        "PQP",
+			GroupingReason: "verify 3 offers",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 3 {
+		t.Fatalf("summary=%+v want 3 published", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 3 {
+		t.Fatalf("planner offered captures=%d want 3 (P/Q/P must split)", len(got))
+	}
+	// Verify each offer is a distinct seq (no coalesce_token) — read from
+	// the offered captures' seqs.
+	offeredSeqs := make([]int64, 0, 3)
+	for _, c := range planner.requests[0].OfferedCaptures {
+		offeredSeqs = append(offeredSeqs, c.Seq)
+	}
+	wantOffered := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq}
+	if !reflect.DeepEqual(offeredSeqs, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v", offeredSeqs, wantOffered)
+	}
+}
+
+// TestReplay_IntentPathCoalesce_DisabledViaEnv: with the env disabled, four
+// same-path captures show up as four separate offers (regression baseline).
+func TestReplay_IntentPathCoalesce_DisabledViaEnv(t *testing.T) {
+	t.Setenv(envIntentPathCoalesce, "0")
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	seedTrackedFileCommit(t, ctx, f, "burst.txt", "v0\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v1\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v2\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v3\n")
+	captureSamePathEdit(t, ctx, f, "burst.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 4 {
+		t.Fatalf("pending=%d want 4", len(pending))
+	}
+	allSeqs := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq, pending[3].Seq}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   allSeqs,
+			Subject:        "Disabled coalesce",
+			GroupingReason: "regression baseline",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 4,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 4 {
+		t.Fatalf("summary=%+v want 4 published", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 4 {
+		t.Fatalf("planner offered=%d want 4 (env-disabled coalesce keeps fan-out)", len(got))
+	}
+}
+
+// TestReplay_IntentPathCoalesce_BarrierStopsCoalesce: a blocked_conflict
+// barrier between two same-path captures keeps the suffix invisible to the
+// planner (state.PendingEvents already filters past the barrier), so coalesce
+// cannot fold across it.
+func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	seedTrackedFileCommit(t, ctx, f, "barrier.txt", "v0\n")
+
+	seq1 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v2\n")
+
+	// Force seq2 into a terminal blocked_conflict state. Subsequent captures
+	// stay pending but PendingEvents must hide them behind seq2.
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET state = ?, error = ? WHERE seq = ?`,
+		state.EventStateBlockedConflict, "synthetic barrier for test", seq2); err != nil {
+		t.Fatalf("force blocked seq=%d: %v", seq2, err)
+	}
+	captureSamePathEdit(t, ctx, f, "barrier.txt", "v3\n")
+	captureSamePathEdit(t, ctx, f, "barrier.txt", "v4\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1 (only seq1 should survive past the synthetic barrier)", len(pending))
+	}
+	if pending[0].Seq != seq1 {
+		t.Fatalf("pending[0].Seq=%d want %d (barrier hides later rows)", pending[0].Seq, seq1)
+	}
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{seq1},
+			Subject:        "Pre-barrier",
+			GroupingReason: "barrier blocks suffix",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 1 published (barrier hides rest)", sum)
+	}
+	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
+		t.Fatalf("offered captures=%d want 1 (no coalesce across barrier)", len(got))
+	}
+	if planner.requests[0].OfferedCaptures[0].Seq != seq1 {
+		t.Fatalf("offered seq=%d want %d", planner.requests[0].OfferedCaptures[0].Seq, seq1)
+	}
+}
