@@ -283,7 +283,10 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		Strategy:     "intent",
 		OfferedSeqs:  offeredSeqs(plannerReq),
 		DiffIncluded: intentDiffIncluded(plannerReq),
-		DiffCap:      DiffCap,
+		// Intent stage uses IntentStageDiffCap so the planner sees enough
+		// per-capture context to group multi-file changes; per-event
+		// commit messages still cap at the legacy DiffCap.
+		DiffCap: IntentStageDiffCap,
 	})
 
 	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
