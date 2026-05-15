@@ -334,13 +334,19 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 {
-		slog.Warn("intent planner: dropped deferred_reasons referencing non-deferred seqs",
+	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 {
+		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("model", model),
-			slog.Any("dropped_seqs", dropped),
-		)
+		}
+		if len(dropped) > 0 {
+			attrs = append(attrs, slog.Any("dropped_seqs", dropped))
+		}
+		if len(synthesized) > 0 {
+			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}
 	plan.Source = p.Name()
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
