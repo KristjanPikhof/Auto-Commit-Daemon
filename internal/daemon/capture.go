@@ -46,6 +46,20 @@ const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 // DefaultMaxFileBytes is the default per-file size cap (5 MiB).
 const DefaultMaxFileBytes int64 = 5 << 20
 
+// EnvPathQuiescenceSeconds names the operator knob that defers planner offers
+// for a captured path until that path has been quiet for the configured
+// number of seconds. The capture row itself is still persisted to
+// capture_events immediately for durability — the gate only changes WHEN the
+// pending event becomes visible to the intent planner. Default 0 disables
+// the gate so existing deployments behave unchanged. Restart the daemon for
+// changes to apply.
+const EnvPathQuiescenceSeconds = "ACD_PATH_QUIESCENCE_SECONDS"
+
+// DefaultPathQuiescenceSeconds is the default ACD_PATH_QUIESCENCE_SECONDS
+// when the env var is unset or unparseable. Zero preserves current
+// behavior — the gate is opt-in.
+const DefaultPathQuiescenceSeconds = 0
+
 // EnvMaxPendingEvents bounds capture_events FIFO depth for the active
 // (branch_ref, branch_generation). When the depth meets or exceeds the cap
 // the new event is dropped (history is preserved; only the *new* tail is
