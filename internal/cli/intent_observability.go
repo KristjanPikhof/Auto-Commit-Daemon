@@ -358,7 +358,20 @@ func loadIntentRecentRates(ctx context.Context, conn *sql.DB, report *intentStra
 		return err
 	}
 	if report.PlannerErrorRateRecent > IntentPlannerErrorRateWarnThreshold {
-		report.PlannerErrorRateRecentWarn = true
+		// Suppress the warn flag while the ledger is still filling toward
+		// IntentRecentDecisionWindow. With a fixed denominator a small
+		// number of early errors dilutes against the full window — but a
+		// burst of 5 errors in the first 5 decisions also reaches the
+		// 0.05 threshold and is indistinguishable from sustained noise.
+		// Wait for a representative sample before surfacing the
+		// remediation hint to operators.
+		var total int
+		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM decision_records`).Scan(&total); err != nil {
+			return fmt.Errorf("planner error rate full-window check: %w", err)
+		}
+		if total >= IntentRecentDecisionWindow {
+			report.PlannerErrorRateRecentWarn = true
+		}
 	}
 	return nil
 }
