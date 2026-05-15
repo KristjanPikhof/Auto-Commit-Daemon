@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd hook-stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd touch --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd hook-stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd flush --logical --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\"'"
           }
         ]
       }
