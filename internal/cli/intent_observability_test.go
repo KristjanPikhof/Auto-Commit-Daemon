@@ -372,9 +372,21 @@ func TestStatus_PathQuiescenceGatedCountAdjustsVisiblePending(t *testing.T) {
 	}
 
 	// Stamp a gated_count snapshot — daemon would normally do this at the
-	// end of every replay pass under the gate.
+	// end of every replay pass under the gate. The freshness gate in
+	// pathQuiescenceSnapshotFresh requires both a live daemon (we use
+	// our own pid so identity.Alive returns true) and a recent
+	// path_quiescence.updated_at timestamp.
 	if err := state.MetaSet(ctx, d, "path_quiescence.gated_count", "1"); err != nil {
 		t.Fatalf("MetaSet gated_count: %v", err)
+	}
+	if err := state.MetaSet(ctx, d, "path_quiescence.updated_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("MetaSet updated_at: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
 	}
 
 	report := runStatusJSON(ctx, t, repo)
@@ -391,5 +403,120 @@ func TestStatus_PathQuiescenceGatedCountAdjustsVisiblePending(t *testing.T) {
 	if report.IntentStrategy.OldestPendingPath != "file-0.go" {
 		t.Fatalf("OldestPendingPath=%q want file-0.go (gate must not change persistence-derived fields)",
 			report.IntentStrategy.OldestPendingPath)
+	}
+}
+
+// TestStatus_PathQuiescenceStaleGatedCountIgnored covers the freshness
+// gate added with P2 #17: when the gated_count value is present but the
+// path_quiescence.updated_at snapshot is older than
+// pathQuiescenceStaleness (or the daemon is not alive), status must
+// still surface PathQuiescenceGatedEvents (the raw value is useful for
+// forensic inspection) but MUST NOT subtract it from
+// VisiblePendingEvents. Otherwise a dead daemon's frozen snapshot would
+// chronically under-count pending work.
+func TestStatus_PathQuiescenceStaleGatedCountIgnored(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	now := float64(1_000_000)
+	for i := 0; i < 2; i++ {
+		ev := state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         "deadbeef",
+			Operation:        "modify",
+			Path:             fmt.Sprintf("file-%d.go", i),
+			Fidelity:         "full",
+			CapturedTS:       now + float64(i),
+		}
+		if _, err := state.AppendCaptureEvent(ctx, d, ev, []state.CaptureOp{{
+			Op: "modify", Path: ev.Path, Fidelity: "full",
+		}}); err != nil {
+			t.Fatalf("AppendCaptureEvent: %v", err)
+		}
+	}
+
+	if err := state.MetaSet(ctx, d, "path_quiescence.gated_count", "1"); err != nil {
+		t.Fatalf("MetaSet gated_count: %v", err)
+	}
+	// updated_at is present but ancient — well past pathQuiescenceStaleness.
+	if err := state.MetaSet(ctx, d, "path_quiescence.updated_at",
+		time.Now().Add(-1*time.Hour).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("MetaSet stale updated_at: %v", err)
+	}
+	// Daemon state stamped with our pid so identity.Alive returns true;
+	// the staleness gate must still trip on the timestamp alone.
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	if report.IntentStrategy.PathQuiescenceGatedEvents != 1 {
+		t.Fatalf("PathQuiescenceGatedEvents=%d want 1 (raw value still surfaced for forensics); report=%+v",
+			report.IntentStrategy.PathQuiescenceGatedEvents, report.IntentStrategy)
+	}
+	if report.IntentStrategy.VisiblePendingEvents != 2 {
+		t.Fatalf("VisiblePendingEvents=%d want 2 (stale gated_count must not be subtracted); report=%+v",
+			report.IntentStrategy.VisiblePendingEvents, report.IntentStrategy)
+	}
+}
+
+// TestStatus_PlannerErrorRateWarnRequiresFullWindow asserts the warn
+// flag stays false while decision_records holds fewer than
+// IntentRecentDecisionWindow rows even when the rate exceeds the
+// threshold. With a fixed denominator early errors are easily
+// indistinguishable from sustained noise (5 errors in 5 decisions =
+// 0.05 = threshold), so we wait for a representative sample.
+func TestStatus_PlannerErrorRateWarnRequiresFullWindow(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	// 50 rows, all planner errors. Rate = 50/100 = 0.5, well above
+	// IntentPlannerErrorRateWarnThreshold (0.05). But with only 50 rows
+	// in the ledger the warn flag MUST stay false.
+	for i := 0; i < 50; i++ {
+		if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+			DecisionTS:  float64(8_000_000 + i),
+			Kind:        state.DecisionKindIntentPlannerError,
+			Path:        sqlNullStr(fmt.Sprintf("err-%d.go", i)),
+			ActionTaken: sqlNullStr("intent_planner_error"),
+		}); err != nil {
+			t.Fatalf("AppendDecision: %v", err)
+		}
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	if got := report.IntentStrategy.PlannerErrorRateRecent; got != 0.5 {
+		t.Fatalf("PlannerErrorRateRecent=%v want 0.5", got)
+	}
+	if report.IntentStrategy.PlannerErrorRateRecentWarn {
+		t.Fatalf("PlannerErrorRateRecentWarn must stay false until ledger reaches %d rows; got true with 50",
+			IntentRecentDecisionWindow)
+	}
+
+	// Add 50 more decisions to cross the window threshold. After the
+	// 100-row mark the warn flag MUST flip on (rate is still >threshold
+	// in the most recent window).
+	for i := 0; i < 50; i++ {
+		if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+			DecisionTS:  float64(9_000_000 + i),
+			Kind:        state.DecisionKindIntentPlannerError,
+			Path:        sqlNullStr(fmt.Sprintf("err-late-%d.go", i)),
+			ActionTaken: sqlNullStr("intent_planner_error"),
+		}); err != nil {
+			t.Fatalf("AppendDecision late: %v", err)
+		}
+	}
+	report = runStatusJSON(ctx, t, repo)
+	if !report.IntentStrategy.PlannerErrorRateRecentWarn {
+		t.Fatalf("PlannerErrorRateRecentWarn must flip true after ledger reaches %d rows; report=%+v",
+			IntentRecentDecisionWindow, report.IntentStrategy)
 	}
 }
