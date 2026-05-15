@@ -144,11 +144,24 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 		// Each wake should land a new pending event for burst.txt before the
 		// next write races the capture pass. Poll briefly so the test does
 		// not depend on absolute wall-clock pacing.
-		waitFor(t, "pending burst.txt event", 5*time.Second, func() bool {
-			n := sqliteScalar(t, dbPath,
+		want := intToString(i + 1)
+		ok := false
+		deadline := time.Now().Add(5 * time.Second)
+		var got string
+		for time.Now().Before(deadline) {
+			got = sqliteScalar(t, dbPath,
 				"SELECT COUNT(*) FROM capture_events WHERE path='burst.txt' AND state='pending'")
-			return n == intToString(i+1)
-		})
+			if got == want {
+				ok = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !ok {
+			rows := sqliteScalar(t, dbPath,
+				"SELECT IFNULL(GROUP_CONCAT(seq||':'||state||':'||op), '<none>') FROM capture_events WHERE path='burst.txt'")
+			t.Fatalf("after edit %d: pending burst.txt count=%s want %s; rows=%s", i+1, got, want, rows)
+		}
 	}
 
 	// Trip the planner: the count gate is now satisfied (4 >= IntentMinPending).
