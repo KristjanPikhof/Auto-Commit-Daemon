@@ -943,6 +943,26 @@ func replayIntentBatch(
 		}
 	}
 
+	// Forced-aging singleton fast path: when the planner window has been
+	// narrowed to one capture by forced aging (the only seq the planner
+	// could possibly select), there is nothing for the planner to decide.
+	// Synthesize the plan locally with a diff-aware subject and skip the
+	// planner call entirely. This:
+	//   - guarantees the captured event ships even if the AI provider is
+	//     unreachable, slow, or returning malformed plans,
+	//   - avoids spending an API request on a fully-determined choice,
+	//   - prevents intent_planner_error decisions from accumulating for
+	//     captures where validation could only ever pass.
+	// The forced_aging marker still lands via recordIntentForcedDecision
+	// above; planIntentSingletonFastPath returns an IntentPlan that flows
+	// through the same publish + decision path as a normal plan.
+	if forced && len(items) == 1 {
+		plan := planIntentSingletonFastPath(ctx, repoRoot, items[0])
+		traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+		selected := []intentReplayItem{items[0]}
+		return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+	}
+
 	plannerCtx := ctx
 	if opts.PromptTrace != nil {
 		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
