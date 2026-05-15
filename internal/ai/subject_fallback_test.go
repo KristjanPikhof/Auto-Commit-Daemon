@@ -197,6 +197,64 @@ func TestDiffAwareSubject_LineCapBoundsScan(t *testing.T) {
 	}
 }
 
+// TestDiffAwareSubject_GoMainSkipped verifies the Go extractor skips the
+// `main` symbol because "Update main" is uninformative; the helper falls
+// back to the basename verb form.
+func TestDiffAwareSubject_GoMainSkipped(t *testing.T) {
+	op := OpItem{Op: "modify", Path: "cmd/acd/main.go"}
+	diff := "@@\n+func main() {}\n"
+	if got := DiffAwareSubject(op, diff); got != "Update main.go" {
+		t.Fatalf("subject=%q want %q (main symbol must be skipped)", got, "Update main.go")
+	}
+}
+
+// TestDiffAwareSubject_GoMainFallsThroughToSibling verifies that when
+// `main` appears alongside another extractable Go symbol, the sibling
+// wins and `main` is skipped.
+func TestDiffAwareSubject_GoMainFallsThroughToSibling(t *testing.T) {
+	op := OpItem{Op: "modify", Path: "cmd/acd/main.go"}
+	diff := "@@\n+func main() {}\n+func runOnce() error { return nil }\n"
+	if got := DiffAwareSubject(op, diff); got != "Update runOnce" {
+		t.Fatalf("subject=%q want %q (sibling symbol should win over main)", got, "Update runOnce")
+	}
+}
+
+// TestDiffAwareSubject_TSMethodRequiresModifier verifies the tightened
+// tsMethodRE: a bare callback-shaped line without modifier prefixes must
+// not be picked up as a method symbol. Falls back to basename.
+func TestDiffAwareSubject_TSMethodRequiresModifier(t *testing.T) {
+	op := OpItem{Op: "modify", Path: "src/handler.ts"}
+	// No modifier — should be ignored by the second-pass method regex.
+	diff := "@@\n+  someCallback(opts): void {\n+    return;\n+  }\n"
+	if got := DiffAwareSubject(op, diff); got != "Update handler.ts" {
+		t.Fatalf("subject=%q want %q (bare method-shaped line must not match)", got, "Update handler.ts")
+	}
+}
+
+// TestDiffAwareSubject_TSMethodWithModifierStillMatches verifies the
+// method-extraction path still works once a real modifier is present.
+func TestDiffAwareSubject_TSMethodWithModifierStillMatches(t *testing.T) {
+	cases := []struct {
+		name string
+		diff string
+		want string
+	}{
+		{name: "public", diff: "@@\n+  public refresh(token: string): void {\n", want: "Update refresh"},
+		{name: "private", diff: "@@\n+  private rotate(): void {\n", want: "Update rotate"},
+		{name: "static", diff: "@@\n+  static factory(opts: Opts): Foo {\n", want: "Update factory"},
+		{name: "async", diff: "@@\n+  async fetchAll(): Promise<Foo[]> {\n", want: "Update fetchAll"},
+		{name: "public-async", diff: "@@\n+  public async load(id: string): Promise<Foo> {\n", want: "Update load"},
+	}
+	op := OpItem{Op: "modify", Path: "src/svc.ts"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DiffAwareSubject(op, tc.diff); got != tc.want {
+				t.Fatalf("subject=%q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDiffAwareSubject_DeterministicAcrossCalls confirms the helper is
 // pure: identical input must produce identical output every call.
 func TestDiffAwareSubject_DeterministicAcrossCalls(t *testing.T) {
