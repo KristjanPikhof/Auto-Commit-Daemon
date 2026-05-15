@@ -48,10 +48,10 @@ const PathRecentCommitSuggestionExtendOrWait = "extend or wait"
 // extending the existing commit's intent rather than splitting a related
 // change across two commits. Empty slice when no path matches.
 type PathRecentCommit struct {
-	Path             string `json:"path"`
-	OID              string `json:"oid"`
-	AgeSeconds       int64  `json:"age_seconds"`
-	SuggestedAction  string `json:"suggested_action"`
+	Path            string `json:"path"`
+	OID             string `json:"oid"`
+	AgeSeconds      int64  `json:"age_seconds"`
+	SuggestedAction string `json:"suggested_action"`
 }
 
 // OfferedCapture is one capture the planner may either select or defer.
@@ -68,10 +68,10 @@ type OfferedCapture struct {
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible
 // providers and subprocess plugins.
 type IntentPlanRequest struct {
-	LatestCommit          *CommitSummary                `json:"latest_commit,omitempty"`
-	PathCommitContext     []PathCommitContext           `json:"path_commit_context,omitempty"`
-	OfferedCaptures       []OfferedCapture              `json:"offered_captures"`
-	ForcedAging           bool                          `json:"forced_aging,omitempty"`
+	LatestCommit      *CommitSummary      `json:"latest_commit,omitempty"`
+	PathCommitContext []PathCommitContext `json:"path_commit_context,omitempty"`
+	OfferedCaptures   []OfferedCapture    `json:"offered_captures"`
+	ForcedAging       bool                `json:"forced_aging,omitempty"`
 	// PathRecentCommits surfaces the prior-commit affinity hint computed by
 	// the daemon (see ACD_RECENT_COMMIT_AFFINITY_SECONDS). The planner is
 	// expected to read it as guidance only — v1 does not amend; the hint
