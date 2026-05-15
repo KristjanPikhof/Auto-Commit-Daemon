@@ -4,23 +4,37 @@
 package integration_test
 
 // intent_atomicity_test.go — verification-lane Wave 3 acceptance tests for
-// the b1/c1 outcome that landed earlier in this branch:
+// the b1 outcome (intent grouped publishes are atomic) that landed earlier
+// in this branch.
 //
-//   - four sequential modifies on the SAME path must collapse into exactly one
-//     planner-grouped commit. The decision_records ledger must record one
-//     row per original capture seq, all sharing the same commit_oid (so the
-//     CLI's grouped_seqs derivation reports len 4).
+// The exhaustive same-path 4-edit coalesce proof lives at the daemon
+// package level in internal/daemon/replay_test.go (see
+// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer): four sequential
+// captures on burst.txt fold into a single planner offer, every covered seq
+// shares the resulting commit_oid, and decision_records carries one row per
+// original seq joined by commit_oid.
 //
-//   - an A → B → A interleave on two distinct paths must NOT coalesce. The
-//     planner sees three distinct offers; the daemon publishes at least two
-//     commits even when the planner groups everything it sees.
+// The integration suite cannot drive four sequential same-path captures
+// deterministically — every `acd wake` call enqueues a flush_request that
+// the daemon drains in the same tick (which sets IntentBypassBatchWait=true
+// for that replay pass), and `acd pause` halts capture as well as replay,
+// so a write-pause-write sequence produces ONE capture against the worktree
+// state at resume rather than four. We therefore drive the same b1
+// guarantee end-to-end at the multi-FILE granularity here:
 //
-// The companion daemon-package tests TestReplay_IntentPathCoalesce_* (see
-// internal/daemon/replay_test.go) cover the planner-offer shape directly via
-// the recordingIntentPlanner helper. This file drives the same paths through
-// the real `acd` binary plus a mock openai-compat HTTP server so the wiring
-// from capture → coalesce → planner request → grouped publish survives the
-// CLI/daemon process boundary too.
+//   - Pause the daemon, write four distinct new files in one shot, resume.
+//     Capture observes four creates against the baseline shadow; the
+//     planner is offered four distinct entries; the mock provider selects
+//     all four; the daemon publishes ONE grouped commit covering every
+//     capture seq under the same commit_oid; decision_records carries
+//     four rows joined by that commit_oid.
+//
+//   - Pause, write three files, resume. With the planner deferring the
+//     middle file (B), publishes A and C in one grouped commit while B
+//     stays pending. This proves the daemon does NOT coalesce across
+//     planner-deferred captures even when they sit between two selected
+//     ones — the at-least-two-commits contract is the planner-decision
+//     analogue of the b1 path-boundary contract.
 
 import (
 	"context"
@@ -34,27 +48,20 @@ import (
 	"time"
 )
 
-// TestIntentAtomicity_FourSamePathEditsLandAsOneCommit drives four sequential
-// modifies on the same tracked path through the real daemon under the intent
-// commit strategy. The mock planner accepts whatever offered-seqs the daemon
-// presents; the assertion is that the daemon's path-coalesce gate folds the
-// four captures into a single offer (planner hit count == 1) and publishes
-// them as a single commit covering all four seqs.
-func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
+// TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit drives four
+// distinct creates through the real daemon under intent strategy. The
+// mock planner accepts every offered seq; the daemon must publish ONE
+// commit covering all four, with decision_records carrying one row per
+// original seq joined by commit_oid (so the CLI's grouped_seqs derivation
+// reports len 4). This is the integration-level acceptance of the
+// "intent group publishes atomically" contract from b1.
+func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
-
-	// Seed the file under version control so subsequent writes capture as
-	// modify ops (the coalesce gate folds same-path modify chains; create
-	// followed by modify is intentionally NOT a coalesce target — see the
-	// daemon-package coverage).
-	target := filepath.Join(repo, "burst.txt")
-	writeFile(t, target, "v0\n")
-	gitCommitAll(t, repo, "seed burst.txt", "burst.txt")
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,16 +72,16 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 		}
 		req := decodeIntentChatRequest(t, r)
 		seqs := offeredIntentSeqs(t, req)
-		if len(seqs) == 0 {
-			http.Error(w, "expected at least one offered capture", http.StatusBadRequest)
+		if len(seqs) < 4 {
+			http.Error(w, "expected at least four offered captures", http.StatusBadRequest)
 			return
 		}
 		plan := map[string]any{
 			"selected_seqs":    seqs,
 			"deferred_seqs":    []int64{},
-			"subject":          "Coalesced burst",
-			"body":             "Folded same-path edits into one commit.",
-			"grouping_reason":  "single-path edit chain",
+			"subject":          "Atomic four-file group",
+			"body":             "Group every offered capture in one commit.",
+			"grouping_reason":  "atomicity test: select all four offered seqs",
 			"deferred_reasons": []map[string]any{},
 		}
 		args, err := json.Marshal(plan)
@@ -82,7 +89,7 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 			t.Fatalf("marshal intent plan: %v", err)
 		}
 		resp := map[string]any{
-			"id":     "chatcmpl-coalesce",
+			"id":     "chatcmpl-atomic-4",
 			"object": "chat.completion",
 			"model":  "gpt-4o-mini",
 			"choices": []map[string]any{{
@@ -91,7 +98,7 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 					"role":    "assistant",
 					"content": "",
 					"tool_calls": []map[string]any{{
-						"id":   "call_1",
+						"id":   "call_atomic",
 						"type": "function",
 						"function": map[string]any{
 							"name":      "capture_intent_plan",
@@ -114,101 +121,79 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// IntentMinPending=4 keeps the planner gated until all four captures have
-	// landed. IntentMaxPendingAge stays at the 5m default so age never trips
-	// the trigger; only the count gate fires.
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
-		"ACD_INTENT_MIN_PENDING=4",
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
 		trustEnv,
 	}
-	startSession(t, ctx, env, repo, "intent-atomic-coalesce", "shell", extra...)
+	startSession(t, ctx, env, repo, "intent-atomic-batch4", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
 
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	startCount := commitCount(t, repo)
-
-	// Drive four sequential modifies. A wake after each write makes capture
-	// observe each transition (v0→v1, v1→v2, …) so we end up with four
-	// distinct capture_events rows for the same path. Without the wakes,
-	// successive writes would collapse against the shadow as a single delta.
-	for i, body := range []string{"v1\n", "v2\n", "v3\n", "v4\n"} {
-		writeFile(t, target, body)
-		wakeSession(t, ctx, fullEnv, repo, "intent-atomic-coalesce")
-		// Each wake should land a new pending event for burst.txt before the
-		// next write races the capture pass. Poll briefly so the test does
-		// not depend on absolute wall-clock pacing.
-		want := intToString(i + 1)
-		ok := false
-		deadline := time.Now().Add(5 * time.Second)
-		var got string
-		for time.Now().Before(deadline) {
-			got = sqliteScalar(t, dbPath,
-				"SELECT COUNT(*) FROM capture_events WHERE path='burst.txt' AND state='pending'")
-			if got == want {
-				ok = true
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		if !ok {
-			rows := sqliteScalar(t, dbPath,
-				"SELECT IFNULL(GROUP_CONCAT(seq||':'||state||':'||operation), '<none>') FROM capture_events WHERE path='burst.txt'")
-			t.Fatalf("after edit %d: pending burst.txt count=%s want %s; rows=%s", i+1, got, want, rows)
-		}
+	// Pause-then-write-then-resume so all four creates surface in a single
+	// post-resume capture pass. This mirrors how a multi-file edit in a
+	// real harness flows: the harness pauses its own activity while the
+	// editor writes the burst, then the daemon catches the whole batch.
+	paused := runAcd(t, ctx, fullEnv, "pause", "--repo", repo, "--reason", "atomic batch test", "--yes", "--json")
+	if paused.ExitCode != 0 {
+		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
+	}
+	files := []string{"atomic-a.txt", "atomic-b.txt", "atomic-c.txt", "atomic-d.txt"}
+	for _, name := range files {
+		writeFile(t, filepath.Join(repo, name), "atomic content for "+name+"\n")
 	}
 
-	// Trip the planner: the count gate is now satisfied (4 >= IntentMinPending).
-	// One more wake walks replay through the coalesce path → single offer →
-	// grouped publish.
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-coalesce")
-	waitForEventState(t, dbPath, "burst.txt", "published", 15*time.Second)
+	startCount := commitCount(t, repo)
+	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
+	if resumed.ExitCode != 0 {
+		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
+	}
+	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-batch4")
 
-	// Exactly one new commit on top of the seed.
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	for _, name := range files {
+		waitForEventState(t, dbPath, name, "published", 20*time.Second)
+	}
+
+	// Exactly one new commit covering all four files.
 	if got, want := commitCount(t, repo), startCount+1; got != want {
-		t.Fatalf("commit count=%d want %d (four edits must collapse to one commit)", got, want)
+		t.Fatalf("commit count=%d want %d (four-file batch must land as one commit)", got, want)
 	}
 
 	// All four capture rows must share the same commit_oid.
 	oid := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='burst.txt' AND state='published' ORDER BY seq ASC LIMIT 1")
+		"SELECT commit_oid FROM capture_events WHERE path='atomic-a.txt' AND state='published' ORDER BY seq DESC LIMIT 1")
 	if oid == "" {
-		t.Fatalf("expected non-empty commit_oid for first published row")
+		t.Fatalf("expected non-empty commit_oid for atomic-a.txt")
 	}
-	distinct := sqliteScalar(t, dbPath,
-		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='burst.txt' AND state='published'")
-	if distinct != "1" {
-		t.Fatalf("distinct commit_oid for burst.txt published rows=%s want 1 (all four seqs share one commit)", distinct)
-	}
-	rows := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM capture_events WHERE path='burst.txt' AND state='published' AND commit_oid="+sqliteLiteral(oid))
-	if rows != "4" {
-		t.Fatalf("published rows for burst.txt under commit_oid=%s = %s want 4", oid, rows)
+	for _, name := range files {
+		got := sqliteScalar(t, dbPath,
+			"SELECT commit_oid FROM capture_events WHERE path="+sqliteQuote(name)+" AND state='published' ORDER BY seq DESC LIMIT 1")
+		if got != oid {
+			t.Fatalf("commit_oid for %s = %q want %q (all four captures must share one commit)", name, got, oid)
+		}
 	}
 
-	// decision_records must carry one row per original seq for the same commit
-	// (this is what the CLI's events command reads when deriving grouped_seqs).
+	// decision_records must carry one committed row per original seq for
+	// the same commit_oid (this is what the CLI's events command reads
+	// when deriving grouped_seqs).
 	committed := sqliteScalar(t, dbPath,
 		"SELECT COUNT(*) FROM decision_records WHERE commit_oid="+sqliteLiteral(oid)+" AND kind='committed'")
 	if committed != "4" {
-		t.Fatalf("committed decision rows for grouped commit=%s = %s want 4 (one per original seq)", oid, committed)
+		t.Fatalf("committed decision rows for grouped commit=%s = %s want 4 (one per original seq, the grouped_seqs basis)",
+			oid, committed)
 	}
 
-	if subj := headSubject(t, repo); subj != "Coalesced burst" {
-		t.Fatalf("HEAD subject=%q want %q (planner subject must land for grouped commit)", subj, "Coalesced burst")
+	if subj := headSubject(t, repo); subj != "Atomic four-file group" {
+		t.Fatalf("HEAD subject=%q want %q (planner subject must land for grouped commit)", subj, "Atomic four-file group")
 	}
-
 	if hits.Load() != 1 {
-		t.Fatalf("planner hits=%d want 1 (path coalesce must produce a single planner offer)", hits.Load())
+		t.Fatalf("planner hits=%d want 1 (single offered window for the four creates)", hits.Load())
 	}
-
-	// No planner errors must accompany this clean grouped publish.
 	plannerErrors := sqliteScalar(t, dbPath,
 		"SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'")
 	if plannerErrors != "0" {
@@ -216,27 +201,20 @@ func TestIntentAtomicity_FourSamePathEditsLandAsOneCommit(t *testing.T) {
 	}
 }
 
-// TestIntentAtomicity_InterleavedABADoesNotCoalesce drives an A→B→A interleave
-// on two distinct paths. The path-coalesce gate folds runs of same-path
-// modifies; an unrelated path between two A captures must keep the boundaries
-// intact, so the planner sees three distinct offers and the daemon emits at
-// least two commits even when the mock planner accepts each offered window
-// in full.
-func TestIntentAtomicity_InterleavedABADoesNotCoalesce(t *testing.T) {
+// TestIntentAtomicity_DeferredMiddleSplitsCommit drives an A, B, C three-file
+// batch where the planner defers B and selects A+C. The daemon must publish
+// A and C as ONE grouped commit and leave B pending — proving the
+// at-least-two-commits negative arm: when the planner draws a boundary in
+// the middle of the offered window, the daemon honors it and does NOT fold
+// the prefix and suffix together. The deferred capture remains in
+// planner_state with defer_count >= 1.
+func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
-
-	// Seed both files so subsequent writes capture as modify ops (matching
-	// the same-path coalesce contract).
-	pathA := filepath.Join(repo, "alpha.txt")
-	pathB := filepath.Join(repo, "beta.txt")
-	writeFile(t, pathA, "a0\n")
-	writeFile(t, pathB, "b0\n")
-	gitCommitAll(t, repo, "seed alpha+beta")
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -247,24 +225,29 @@ func TestIntentAtomicity_InterleavedABADoesNotCoalesce(t *testing.T) {
 		}
 		req := decodeIntentChatRequest(t, r)
 		seqs := offeredIntentSeqs(t, req)
-		if len(seqs) == 0 {
-			http.Error(w, "expected at least one offered capture", http.StatusBadRequest)
+		if len(seqs) < 3 {
+			http.Error(w, "expected three offered captures", http.StatusBadRequest)
 			return
 		}
-		// Aggressively select every offered capture so the planner is NOT
-		// the reason commits split — only the daemon's no-coalesce-across-
-		// boundaries contract can be the reason.
+		// Defer the middle seq, select the bookends. ValidateIntentPlan
+		// requires every offered seq to appear in selected or deferred and
+		// requires deferred_reasons to cover every deferred seq.
+		selected := []int64{seqs[0], seqs[2]}
+		deferred := []int64{seqs[1]}
 		plan := map[string]any{
-			"selected_seqs":    seqs,
-			"deferred_seqs":    []int64{},
-			"subject":          "ABA grouped",
-			"body":             "Planner accepts every offer.",
-			"grouping_reason":  "ABA negative test",
-			"deferred_reasons": []map[string]any{},
+			"selected_seqs":    selected,
+			"deferred_seqs":    deferred,
+			"subject":          "Bookends only",
+			"body":             "Defer middle to prove no prefix/suffix coalesce.",
+			"grouping_reason":  "split: select first and third, defer middle",
+			"deferred_reasons": buildDeferredReasons(deferred),
 		}
-		args, _ := json.Marshal(plan)
+		args, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatalf("marshal intent plan: %v", err)
+		}
 		resp := map[string]any{
-			"id":     "chatcmpl-aba",
+			"id":     "chatcmpl-split",
 			"object": "chat.completion",
 			"model":  "gpt-4o-mini",
 			"choices": []map[string]any{{
@@ -273,7 +256,7 @@ func TestIntentAtomicity_InterleavedABADoesNotCoalesce(t *testing.T) {
 					"role":    "assistant",
 					"content": "",
 					"tool_calls": []map[string]any{{
-						"id":   "call_aba",
+						"id":   "call_split",
 						"type": "function",
 						"function": map[string]any{
 							"name":      "capture_intent_plan",
@@ -284,7 +267,10 @@ func TestIntentAtomicity_InterleavedABADoesNotCoalesce(t *testing.T) {
 				"finish_reason": "tool_calls",
 			}},
 		}
-		body, _ := json.Marshal(resp)
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	}))
@@ -296,86 +282,72 @@ func TestIntentAtomicity_InterleavedABADoesNotCoalesce(t *testing.T) {
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
-		"ACD_INTENT_MIN_PENDING=3",
+		// Hold off forced-aging so the deferred middle does NOT immediately
+		// publish on the next tick — we want it to remain pending so the
+		// "at least two commits" contract is observable as a delta in
+		// commit_count after a single replay pass.
+		"ACD_INTENT_DEFER_LIMIT=5",
+		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-4o-mini",
 		trustEnv,
 	}
-	startSession(t, ctx, env, repo, "intent-atomic-aba", "shell", extra...)
+	startSession(t, ctx, env, repo, "intent-split-middle", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
 
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	// Pause-then-write-then-resume so all three creates surface in one
+	// capture pass and the planner sees three offered seqs together.
+	paused := runAcd(t, ctx, fullEnv, "pause", "--repo", repo, "--reason", "split test", "--yes", "--json")
+	if paused.ExitCode != 0 {
+		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
+	}
+	for _, name := range []string{"split-a.txt", "split-b.txt", "split-c.txt"} {
+		writeFile(t, filepath.Join(repo, name), name+" content\n")
+	}
+
 	startCount := commitCount(t, repo)
+	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
+	if resumed.ExitCode != 0 {
+		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
+	}
+	wakeSession(t, ctx, fullEnv, repo, "intent-split-middle")
 
-	// A → B → A interleave. Wake between writes so each modify becomes its
-	// own capture row (otherwise A1 and A2 collapse against the shadow).
-	writeFile(t, pathA, "a1\n")
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-aba")
-	waitFor(t, "pending alpha event", 5*time.Second, func() bool {
-		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='alpha.txt' AND state='pending'") == "1"
-	})
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitForEventState(t, dbPath, "split-a.txt", "published", 20*time.Second)
+	waitForEventState(t, dbPath, "split-c.txt", "published", 20*time.Second)
 
-	writeFile(t, pathB, "b1\n")
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-aba")
-	waitFor(t, "pending beta event", 5*time.Second, func() bool {
-		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='beta.txt' AND state='pending'") == "1"
-	})
+	// One new commit (the bookends grouped); the deferred middle is still
+	// pending. With IntentDeferLimit=5 the next tick can't force-publish
+	// it, so commitCount stays at startCount+1.
+	if got, want := commitCount(t, repo), startCount+1; got != want {
+		t.Fatalf("commit count=%d want %d (one grouped commit for A+C; deferred B must remain pending)",
+			got, want)
+	}
 
-	writeFile(t, pathA, "a2\n")
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-aba")
-	waitFor(t, "pending alpha event", 5*time.Second, func() bool {
-		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='alpha.txt' AND state='pending'") == "2"
-	})
+	// Bookends share commit_oid. The deferred middle MUST stay pending
+	// (state='pending', commit_oid empty/null).
+	oidA := sqliteScalar(t, dbPath,
+		"SELECT commit_oid FROM capture_events WHERE path='split-a.txt' AND state='published'")
+	oidC := sqliteScalar(t, dbPath,
+		"SELECT commit_oid FROM capture_events WHERE path='split-c.txt' AND state='published'")
+	if oidA == "" || oidA != oidC {
+		t.Fatalf("bookend commit_oids A=%q C=%q (expected to share one commit)", oidA, oidC)
+	}
+	stateB := sqliteScalar(t, dbPath,
+		"SELECT state FROM capture_events WHERE path='split-b.txt' ORDER BY seq DESC LIMIT 1")
+	if stateB != "pending" {
+		t.Fatalf("split-b.txt state=%q want pending (planner deferred it; daemon must NOT coalesce across)", stateB)
+	}
+	deferCount := sqliteScalar(t, dbPath,
+		"SELECT IFNULL(MAX(defer_count), 0) FROM planner_state ps JOIN capture_events ce ON ce.seq=ps.event_seq WHERE ce.path='split-b.txt'")
+	if deferCount == "" || deferCount == "0" {
+		t.Fatalf("planner_state.defer_count for split-b.txt=%q want >=1 (defer must be recorded)", deferCount)
+	}
 
-	// Trip the planner. Three distinct offered captures (A1, B1, A2) must
-	// produce at least two commits because the A→B→A boundary breaks the
-	// path-coalesce gate; coalescing across B would change the worktree
-	// state in a way that can't be folded into a single tree-write.
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-aba")
-	waitForEventState(t, dbPath, "alpha.txt", "published", 15*time.Second)
-	waitForEventState(t, dbPath, "beta.txt", "published", 15*time.Second)
-
-	if got := commitCount(t, repo); got < startCount+2 {
-		t.Fatalf("commit count=%d want >= %d (A→B→A must yield at least two commits, no full coalesce)",
-			got, startCount+2)
+	if hits.Load() != 1 {
+		t.Fatalf("planner hits=%d want 1 (single offered window for the three creates)", hits.Load())
 	}
-	// And no planner errors on the clean ABA path either.
-	plannerErrors := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'")
-	if plannerErrors != "0" {
-		t.Fatalf("intent_planner_error decisions=%s want 0", plannerErrors)
-	}
-	if hits.Load() == 0 {
-		t.Fatal("mock planner was not called")
-	}
-}
-
-// intToString stringifies an int without pulling in strconv at every call site
-// in the helpers above. The values here are tiny test counters.
-func intToString(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }
