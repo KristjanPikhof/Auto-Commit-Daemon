@@ -109,6 +109,8 @@ acd diagnose            # read-only branch anchor + blocked_conflict report
 acd pause --reason "resetting branch" --yes   # durable manual replay pause
 acd resume --yes          # remove the manual pause marker
 acd wake --session-id X # heartbeat refresh + nudge daemon for low-latency replay
+acd flush --session-id X --logical # heartbeat + drain pending captures NOW (intent gate bypassed)
+acd flush --session-id X           # heartbeat-only (alias for acd touch)
 acd gc                  # prune stale central-registry entries
 acd stop                # graceful stop for the current repo daemon
 acd stop --session-id X # harness/refcount stop; exits only when no peers remain
