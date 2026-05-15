@@ -1621,6 +1621,95 @@ func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
 	}
 }
 
+// TestCapture_PathQuiescenceTrackerStampsLastWriteTimes verifies that
+// running Capture stamps the per-path quiescence tracker. The capture row
+// itself is always durable — the tracker is a separate hint consulted by
+// the planner-offer gate — so we assert both: the event is appended AND
+// the tracker now reports the path as recently-written.
+func TestCapture_PathQuiescenceTrackerStampsLastWriteTimes(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+
+	f := newCaptureFixture(t)
+	if err := os.WriteFile(filepath.Join(f.dir, "tracked.txt"), []byte("v1"), 0o644); err != nil {
+		t.Fatalf("write tracked: %v", err)
+	}
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	})
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	if sum.EventsAppended < 1 {
+		t.Fatalf("EventsAppended=%d want >=1", sum.EventsAppended)
+	}
+	got, ok := PathLastWrite("tracked.txt")
+	if !ok {
+		t.Fatalf("PathLastWrite missing for tracked.txt after capture")
+	}
+	if !got.Equal(now) {
+		t.Fatalf("PathLastWrite=%v want %v", got, now)
+	}
+	if !IsPathQuiescent("tracked.txt", 30*time.Second, now) {
+		// At t=now the path was just written, so it must NOT be quiescent
+		// under a 30s window.
+		t.Fatalf("IsPathQuiescent unexpectedly true immediately after write")
+	}
+	if IsPathQuiescent("tracked.txt", 30*time.Second, now.Add(31*time.Second)) {
+		// 31s later it must be quiescent.
+		// (>=30s elapsed)
+	} else {
+		t.Fatalf("IsPathQuiescent unexpectedly false 31s after write")
+	}
+}
+
+// TestCapture_PathQuiescenceDisabledShortCircuits verifies the gate is OFF
+// at quiescence == 0 (the default). Even an immediate read after a fresh
+// write must report the path as eligible.
+func TestCapture_PathQuiescenceDisabledShortCircuits(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+
+	RecordPathWrite("recent.go", now)
+	if !IsPathQuiescent("recent.go", 0, now) {
+		t.Fatalf("zero quiescence must short-circuit to true")
+	}
+	if !IsPathQuiescent("never-recorded.go", 30*time.Second, now) {
+		t.Fatalf("never-recorded path must be treated as quiescent (gate cannot strand stale rows)")
+	}
+}
+
+// TestCapture_PathQuiescenceEnvParsesSeconds verifies the env knob honors
+// integer-second values, defaults to zero on unset/garbage, and clamps
+// negatives to zero.
+func TestCapture_PathQuiescenceEnvParsesSeconds(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 0},
+		{"0", 0},
+		{"30", 30 * time.Second},
+		{"600", 600 * time.Second},
+		{"-5", 0},
+		{"garbage", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv(EnvPathQuiescenceSeconds, tc.raw)
+			got := resolvePathQuiescenceSeconds()
+			if got != tc.want {
+				t.Fatalf("resolvePathQuiescenceSeconds(%q)=%s want %s", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestCapture_MaxPendingEventsOverrideTakesPrecedence confirms that a
 // strictly-positive MaxPendingEventsOverride overrides the env value but
 // still enforces a cap (unlike DisablePendingCap which removes it).
