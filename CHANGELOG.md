@@ -4,6 +4,35 @@
 
 ### Added
 
+- Planner rejects forensic log at `<gitDir>/acd/planner-rejects.jsonl`. Every
+  `ValidateIntentPlan` failure on the `openai-compat` and `subprocess`
+  providers now persists one JSON line carrying the timestamp (RFC3339Nano),
+  provider name, offered seqs, the verbatim model response, the typed
+  `IntentPlanValidationCode` integer, and the validator message. The log
+  rotates at 5 MiB to `planner-rejects.jsonl.1` and keeps at most one
+  archive (current + `.1`). Writes are best-effort behind a mutex — a
+  rotation or write failure surfaces as a `slog.Warn` and never blocks the
+  planner path. The daemon configures the writer at startup via
+  `ai.ConfigureIntentRejectsLogger(opts.GitDir)`; tests can inject a
+  scoped writer with `ai.SetIntentRejectsLoggerForTest`. Operators
+  inspecting sustained planner-error rates point at this file directly to
+  recover the model output that triggered the deterministic fallback.
+
+- `acd status --json` and `acd diagnose --json` `intent_strategy` block
+  gain `planner_error_rate_recent` (share of `intent_planner_error` rows
+  over the most recent 100 decisions) and `singleton_commit_rate_recent`
+  (share of one-event commits over the most recent 100 distinct commit
+  OIDs). Both denominators are fixed at 100 regardless of how many rows
+  the ledger actually holds, so the rates dilute toward zero while the
+  ledger fills rather than oscillating during the first few decisions.
+  `acd diagnose` surfaces a new remediation hint when
+  `planner_error_rate_recent` exceeds the 0.05 (5%) threshold, pointing
+  the operator at the rejects log. The status human renderer adds a
+  one-line `Intent rates (last 100): ...` summary when either rate is
+  non-zero. `intent_strategy.intent_stage_diff_cap` is also surfaced so
+  operators can confirm the active per-stage planner diff budget without
+  re-deriving the constant.
+
 - Same-path pre-coalesce of consecutive captures for intent planning. The
   replay window builder now folds runs of consecutive captures touching
   exactly one shared path into a single offered planner entry. The squashed
