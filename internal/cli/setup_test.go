@@ -593,7 +593,7 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 // between codex and opencode/pi snippets).
 func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, "mkdir -p") {
 			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
@@ -609,7 +609,7 @@ func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 // directory-exists check.
 func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, "mkdir -p") {
 			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
@@ -701,7 +701,7 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 // neither setting PI_SESSION_ID would still collapse on that event.
 func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-touch-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) {
 			t.Errorf("%s: must use per-process unique SID fallback (pi-$$-$(date +%%s)):\n%s", id, block)
