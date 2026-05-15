@@ -149,6 +149,19 @@ func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
 	ctx := context.Background()
 	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	// Pre-register the session so the new --logical security gate (P1
+	// #6) does not short-circuit before the detached-HEAD refusal
+	// fires. The refusal-by-state path is what this test exercises.
+	d, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("open db for register: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID: "s1", Harness: "claude-code",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	_ = d.Close()
 	head, err := git.RevParse(ctx, repoDir, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
