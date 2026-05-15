@@ -325,8 +325,11 @@ func (b *cappedDiffBuffer) String() string {
 // buildOpDiff produces a unified diff section for one captured op.
 // Returns "" + nil when the op carries no usable OIDs (e.g. an oversize
 // metadata-only op), or the textual diff with rewritten path headers
-// for every other case.
-func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp) (string, error) {
+// for every other case. `outerCap` is the BuildOpsDiffWithCap byte budget
+// the caller supplied so the per-op git-stdout cap scales with the
+// outer buffer (intent stage gets a larger cap; per-event keeps the
+// legacy 4 KiB).
+func buildOpDiff(ctx context.Context, repoRoot string, op state.CaptureOp, outerCap int) (string, error) {
 	path := op.Path
 	oldPath := ""
 	if op.OldPath.Valid {
