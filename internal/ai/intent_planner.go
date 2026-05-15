@@ -471,7 +471,15 @@ func (p DeterministicProvider) PlanIntent(ctx context.Context, req IntentPlanReq
 		return IntentPlan{}, errors.New("deterministic: no captures offered")
 	}
 	selected := req.OfferedCaptures[0]
-	result, err := p.Generate(ctx, CommitContext{Path: selected.Path, Op: selected.Op})
+	// DiffText is fed into Generate so the deterministic single-op path can
+	// extract a symbol via DiffAwareSubject. When CapturedDiff is empty
+	// (most fallback paths) this is a no-op and the subject stays at the
+	// legacy basename verb form.
+	result, err := p.Generate(ctx, CommitContext{
+		Path:     selected.Path,
+		Op:       selected.Op,
+		DiffText: selected.CapturedDiff,
+	})
 	if err != nil {
 		return IntentPlan{}, err
 	}
