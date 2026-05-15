@@ -1543,7 +1543,13 @@ func RecordPathWrite(path string, now time.Time) {
 	pathQuiescenceMu.Lock()
 	pathQuiescenceWrites[path] = now
 	if len(pathQuiescenceWrites) > pathQuiescenceMaxEntries {
-		evictStalePathQuiescenceLocked(now)
+		// Always evict relative to the wall clock (or the test clock
+		// when one is installed), NOT the per-write `now` argument
+		// callers pass — RecordPathWrite is sometimes invoked with a
+		// back-dated timestamp (rename pairs, replay re-stamps) and
+		// using that as the eviction reference would fail to prune
+		// entries older than the cutoff.
+		evictStalePathQuiescenceLocked(pathQuiescenceNow())
 	}
 	pathQuiescenceMu.Unlock()
 }
