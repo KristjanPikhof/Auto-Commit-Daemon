@@ -2883,14 +2883,12 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
 		t.Fatalf("summary 2=%+v want forced publish", sum)
 	}
-	if planner.calls != 2 {
-		t.Fatalf("planner calls=%d want 2", planner.calls)
-	}
-	if !planner.requests[1].ForcedAging {
-		t.Fatalf("second request ForcedAging=false want true")
-	}
-	if got := planner.requests[1].OfferedCaptures; len(got) != 1 || got[0].Seq != pending[1].Seq {
-		t.Fatalf("forced window offered=%+v want only seq %d", got, pending[1].Seq)
+	// First replay called the planner once (selects pending[0], defers
+	// pending[1]). Second replay narrows to a single forced-aging seq and
+	// publishes via planIntentSingletonFastPath without invoking the
+	// planner — call counter must stay at 1.
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1 (forced-aging singleton must skip provider)", planner.calls)
 	}
 	if _, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[1].Seq); err != nil || ok {
 		t.Fatalf("selected planner state after publish ok=%v err=%v, want cleared", ok, err)
