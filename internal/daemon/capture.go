@@ -806,6 +806,17 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			return summary, fmt.Errorf("daemon: append capture event %s %s: %w", op.Op, op.Path, err)
 		}
 		recordCapturedDecision(ctx, db, cctx, seq, op)
+		// Stamp the per-path quiescence tracker AFTER the row durably
+		// lands. The planner-offer gate keyed by ACD_PATH_QUIESCENCE_SECONDS
+		// reads from this map; the capture row itself is unaffected by the
+		// gate and is already pending in the FIFO. A rename also touches
+		// the OldPath so a deferred rename source/dest pair stays paired
+		// from the gate's perspective.
+		nowQ := pathQuiescenceNow()
+		RecordPathWrite(op.Path, nowQ)
+		if op.OldPath != "" {
+			RecordPathWrite(op.OldPath, nowQ)
+		}
 		summary.EventsAppended++
 		if pendingCap > 0 {
 			pending++
