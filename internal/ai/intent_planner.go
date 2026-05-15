@@ -118,6 +118,7 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 		PathCommitContext: clonePathCommitContext(opts.PathCommitContext),
 		OfferedCaptures:   make([]OfferedCapture, 0, len(opts.OfferedCaptures)),
 		ForcedAging:       opts.ForcedAging,
+		PathRecentCommits: clonePathRecentCommits(opts.PathRecentCommits),
 	}
 	for _, offered := range opts.OfferedCaptures {
 		cp := offered
