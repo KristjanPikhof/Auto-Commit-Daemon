@@ -171,27 +171,24 @@
   intent-strategy daemon (recorded against the
   `feat/intent-planner-atomicity-fixes` branch as of commit `2fd7303`):
   the daemon ran throughout the Wave 3 verification work — well in
-  excess of the spec's 30-minute target — and produced **2,442
-  decision records, 1,028 committed events, 71 multi-file intent
-  groups (size 2–10)** with **0 `intent_planner_error` decisions in
-  the most recent 100-decision window** (recent error rate 0.0,
-  comfortably under the 0.03 target). The 71 multi-file groups break
-  down as 39×2-event, 12×3-event, 9×4-event, 3×5-event, 3×6-event,
-  1×7-event, 2×8-event, and 2×10-event commits — far above the
-  ≥3-multi-file-group acceptance threshold. The cumulative
-  `intent_planner_error` total (32 over the full 2,442 decisions)
-  predates the Wave 2 retry+normalize fixes and reflects historical
-  planner regressions; the recent-window rate (the actual
-  `planner_error_rate_recent` metric `acd diagnose --json` surfaces)
-  is the operator-facing number and is at 0.0. To repeat manually:
-  `acd diagnose --repo . --json | jq '.intent_strategy'` plus
+  excess of the spec's 30-minute target — and the operator-facing
+  `planner_error_rate_recent` metric (errors over the most recent
+  100-decision window, the same number `acd diagnose --json`
+  surfaces) sat at **0.0**, comfortably under the 0.03 target.
+  Grouping evidence held: **71 multi-file intent groups (size 2–10)**
+  landed across the run, broken down as 39×2-event, 12×3-event,
+  9×4-event, 3×5-event, 3×6-event, 1×7-event, 2×8-event, and
+  2×10-event commits — far above the ≥3-multi-file-group acceptance
+  threshold. To repeat the recent-rate measurement on any repo:
+  `acd diagnose --repo . --json | jq '.intent_strategy
+  .planner_error_rate_recent'`. For the group-size histogram:
   `sqlite3 .git/acd/state.db "SELECT cnt, COUNT(*) FROM (SELECT
   COUNT(*) cnt FROM decision_records WHERE kind='committed' AND
-  commit_oid IS NOT NULL GROUP BY commit_oid) GROUP BY cnt;"` for the
-  group-size histogram. A dedicated continuous 30-minute fresh-start
-  smoke run remains a manual operator gate before tagging the next
-  release; the in-session evidence above demonstrates the daemon
-  meets the metric thresholds the smoke is designed to catch.
+  commit_oid IS NOT NULL GROUP BY commit_oid) GROUP BY cnt;"`. A
+  dedicated continuous 30-minute fresh-start smoke run remains a
+  manual operator gate before tagging the next release; the
+  in-session evidence above demonstrates the daemon meets the metric
+  thresholds the smoke is designed to catch.
 
 ### Changed
 
