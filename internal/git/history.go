@@ -141,23 +141,12 @@ func LatestPathHeadCommit(ctx context.Context, repoDir, ref, path string) (PathH
 	if oid == "" {
 		return PathHeadCommit{}, false, nil
 	}
-	ts, perr := parseInt64(fields[1])
+	ts, perr := strconv.ParseInt(fields[1], 10, 64)
 	if perr != nil {
 		// Treat malformed timestamp as "not found" — never poison the hint.
 		return PathHeadCommit{}, false, nil
 	}
 	return PathHeadCommit{OID: oid, CommitTSSec: ts}, true, nil
-}
-
-func parseInt64(s string) (int64, error) {
-	var n int64
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return 0, fmt.Errorf("non-digit %q", r)
-		}
-		n = n*10 + int64(r-'0')
-	}
-	return n, nil
 }
 
 // LatestPathCommitSummaries returns recent commits reachable from ref that
