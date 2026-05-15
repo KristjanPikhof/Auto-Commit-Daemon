@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 2026-05-14
+
 ### Added
 
 - Intent planner tolerates spurious `deferred_reasons`. The `openai-compat`
