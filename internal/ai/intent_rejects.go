@@ -74,17 +74,40 @@ const IntentRejectsKept = 1
 // field names are stable for downstream tooling that scrapes the log for
 // trend analysis. RawResponse may be empty when the provider could not
 // stringify the plan (e.g., subprocess transport error before the response
-// was buffered). Code and Message together identify the validator failure;
-// callers should always pass the IntentPlanValidationCode value, not its
-// String representation, so that telemetry can match on the integer code
-// even after the message text changes.
+// was buffered) or — by default — when the raw response was redacted before
+// persistence (see RawResponseRedacted, RawResponseSizeBytes,
+// RawResponseSHA256, ParsedPlanSummary). Code and Message together identify
+// the validator failure; callers should always pass the
+// IntentPlanValidationCode value, not its String representation, so that
+// telemetry can match on the integer code even after the message text
+// changes.
+//
+// Redaction policy: by default LogRejectedIntentPlan strips RawResponse and
+// records size + sha256 + a small ParsedPlanSummary instead. Operators can
+// opt back in to verbatim retention by setting ACD_INTENT_REJECTS_RAW=1 (or
+// true/yes/on); a single startup warn announces the opt-in. When verbatim
+// is enabled, RawResponse is populated AND size + sha256 are still recorded
+// so downstream tooling can cross-check that the on-disk payload matches.
 type IntentRejectedPlan struct {
-	TS          string                   `json:"ts"`
-	Provider    string                   `json:"provider,omitempty"`
-	OfferedSeqs []int64                  `json:"offered_seqs"`
-	RawResponse string                   `json:"raw_response,omitempty"`
-	Code        IntentPlanValidationCode `json:"code"`
-	Message     string                   `json:"message"`
+	TS                   string                   `json:"ts"`
+	Provider             string                   `json:"provider,omitempty"`
+	OfferedSeqs          []int64                  `json:"offered_seqs"`
+	RawResponse          string                   `json:"raw_response,omitempty"`
+	RawResponseRedacted  bool                     `json:"raw_response_redacted,omitempty"`
+	RawResponseSizeBytes int                      `json:"raw_response_size_bytes,omitempty"`
+	RawResponseSHA256    string                   `json:"raw_response_sha256,omitempty"`
+	ParsedPlanSummary    *IntentRejectedPlanPlanSummary `json:"parsed_plan_summary,omitempty"`
+	Code                 IntentPlanValidationCode `json:"code"`
+	Message              string                   `json:"message"`
+}
+
+// IntentRejectedPlanPlanSummary records the post-parse shape of the
+// rejected plan when raw retention is disabled. Operators inspecting the
+// log can still see how many seqs the planner selected vs deferred, even
+// without the verbatim model output.
+type IntentRejectedPlanPlanSummary struct {
+	SelectedCount int `json:"selected_count"`
+	DeferredCount int `json:"deferred_count"`
 }
 
 // IntentRejectsWriter encapsulates the append-and-rotate JSONL writer.
