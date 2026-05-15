@@ -75,17 +75,18 @@ func TestIntentPlannerRecovery_RetryAbsorbsValidationError(t *testing.T) {
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
-		seqs := offeredIntentSeqs(t, req)
+		seqs := offeredIntentSeqsLenient(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "expected at least two offered captures", http.StatusBadRequest)
 			return
 		}
 
 		// On retry the composed loop appends the validator message into the
-		// user prompt as a "Correction:" block. Detect it so we can prove
-		// the retry path actually fired.
+		// user prompt as a "Your previous capture_intent_plan tool call
+		// failed validation" block. Detect that suffix so we can prove the
+		// retry path actually fired.
 		for _, msg := range req.Messages {
-			if strings.Contains(msg.Content, "Correction:") {
+			if strings.Contains(msg.Content, "previous capture_intent_plan tool call failed validation") {
 				sawRetryCorrection.Store(true)
 			}
 		}
