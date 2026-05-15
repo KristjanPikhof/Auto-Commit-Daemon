@@ -93,7 +93,10 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 		if opts.IncludeCapturedDiffs {
 			input := cp.CapturedDiff
 			redacted := RedactDiffSecrets(input)
-			cp.CapturedDiff = Truncate(redacted, DiffCap)
+			// Intent planner stage uses IntentStageDiffCap (16 KiB) rather
+			// than the per-event DiffCap (4 KiB) so the planner sees enough
+			// of each captured diff to reason about multi-file grouping.
+			cp.CapturedDiff = Truncate(redacted, IntentStageDiffCap)
 			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))
 		} else {
 			cp.CapturedDiff = ""
