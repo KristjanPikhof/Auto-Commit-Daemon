@@ -259,6 +259,17 @@ func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
 func TestFlush_LogicalRefusesOnGitOperation(t *testing.T) {
 	ctx := context.Background()
 	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	// Pre-register the session — see TestFlush_LogicalRefusesOnDetachedHEAD.
+	d, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("open db for register: %v", err)
+	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID: "s1", Harness: "claude-code",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	_ = d.Close()
 
 	// MERGE_HEAD is a recognised git-op marker; touching it inside .git is
 	// the simplest way to simulate "operation in progress" without driving
