@@ -356,6 +356,15 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	}
 	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
+		// Best-effort: serialize the plugin response for forensic replay.
+		// Marshal failure means the raw payload stays empty in the rejects
+		// log entry; the validator code/message are still persisted so an
+		// operator can always recover the validation context.
+		var rawBytes []byte
+		if marshaled, mErr := json.Marshal(resp); mErr == nil {
+			rawBytes = marshaled
+		}
+		LogRejectedIntentPlan(ctx, p.Name(), plannerReq, string(rawBytes), err)
 		return IntentPlan{}, err
 	}
 	p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{
