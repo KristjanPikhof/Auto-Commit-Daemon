@@ -46,9 +46,18 @@ import (
 )
 
 // flushResult is the JSON payload returned by `acd flush --json`.
+//
+// LastSeenTS uses `omitempty` so the field is absent from the JSON
+// payload when no fresh heartbeat was written on this call (the most
+// common case is the control-lock-held skip branch where we never
+// actually touched daemon_clients). Encoding 0 there would render as the
+// 1970 epoch and mislead any downstream parser computing freshness from
+// the value. Callers that need to distinguish "absent" from "zero
+// timestamp on disk" must inspect the field with json.RawMessage rather
+// than the float zero.
 type flushResult struct {
 	OK               bool    `json:"ok"`
-	LastSeenTS       float64 `json:"last_seen_ts"`
+	LastSeenTS       float64 `json:"last_seen_ts,omitempty"`
 	Logical          bool    `json:"logical,omitempty"`
 	FlushRequestID   int64   `json:"flush_request_id,omitempty"`
 	DaemonPID        int     `json:"daemon_pid,omitempty"`
