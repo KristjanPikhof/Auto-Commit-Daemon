@@ -812,10 +812,16 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		// gate and is already pending in the FIFO. A rename also touches
 		// the OldPath so a deferred rename source/dest pair stays paired
 		// from the gate's perspective.
-		nowQ := pathQuiescenceNow()
-		RecordPathWrite(op.Path, nowQ)
-		if op.OldPath != "" {
-			RecordPathWrite(op.OldPath, nowQ)
+		//
+		// Hot-path: skip the (mutex-bound) write entirely when the gate is
+		// disabled — RecordPathWrite would early-return anyway, but we
+		// avoid even computing pathQuiescenceNow() in the common case.
+		if pathQuiescenceEnabled.Load() {
+			nowQ := pathQuiescenceNow()
+			RecordPathWrite(op.Path, nowQ)
+			if op.OldPath != "" {
+				RecordPathWrite(op.OldPath, nowQ)
+			}
 		}
 		summary.EventsAppended++
 		if pendingCap > 0 {
