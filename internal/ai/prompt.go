@@ -80,11 +80,13 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"You must return every offered seq as either selected or deferred. " +
 	"Do not group unrelated captures. " +
 	"Do not invent intent beyond the supplied evidence. " +
-	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture. " +
+	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture and leave deferred_seqs and deferred_reasons empty. " +
+	"Same-path causality: when you defer an offered seq for path P, every later offered seq that touches P must also be deferred (or the entire same-path chain must be selected together); never split a same-path chain by selecting a later seq while deferring an earlier one. " +
+	"Defer_count guidance: prefer captures whose defer_count >= 1 for inclusion when the evidence permits, so a capture deferred in earlier windows does not churn forever. " +
 	"Every deferred_reasons[i].seq must appear in deferred_seqs. " +
 	"Do not emit a reason for a seq that is selected, and do not reference seqs outside the offered window. " +
 	"Each deferred seq needs exactly one reason; selected seqs get no reason entry. " +
-	"Worked example: offered=[10,11,12], selected=[10,11], deferred=[12]; deferred_reasons must contain exactly one entry with seq=12."
+	"Worked example: offered=[10,11,12] where 10 and 11 touch internal/checkout/service.go and 12 touches docs/checkout.md; valid plan selected=[10,11], deferred=[12], deferred_reasons=[{seq:12,reason:\"docs change is independent\"}]; invalid plan selected=[11], deferred=[10,12] would split the same-path chain on internal/checkout/service.go and is forbidden."
 
 var (
 	// reBulletPrefix strips a leading `-` / `*` plus whitespace from a
