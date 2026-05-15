@@ -1557,14 +1557,18 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 func intentTraceOffered(items []intentReplayItem) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"seq":         item.event.Seq,
 			"path":        item.event.Path,
 			"operation":   item.event.Operation,
 			"fidelity":    item.event.Fidelity,
 			"defer_count": item.deferCount,
 			"ops":         len(item.ops),
-		})
+		}
+		if item.coalesce != nil && len(item.coalesce.OriginalSeqs) > 1 {
+			entry["coalesced_seqs"] = append([]int64(nil), item.coalesce.OriginalSeqs...)
+		}
+		out = append(out, entry)
 	}
 	return out
 }
