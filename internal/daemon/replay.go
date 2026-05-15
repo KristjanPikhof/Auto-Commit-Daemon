@@ -89,6 +89,39 @@ func shouldEmitPauseWarn(key string) bool {
 	return true
 }
 
+// EnvRecentCommitAffinitySeconds names the operator knob that decides how
+// recent a HEAD commit must be for the planner to receive a
+// `path_recent_commits` hint linking the offered path back to that commit.
+// Default 120 seconds. Zero disables the hint. Restart the daemon for
+// changes to apply.
+const EnvRecentCommitAffinitySeconds = "ACD_RECENT_COMMIT_AFFINITY_SECONDS"
+
+// DefaultRecentCommitAffinitySeconds is the default
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS when the env var is unset or
+// unparseable. 120 seconds is wide enough to cover the typical "agent
+// finished a tool turn N seconds ago, then made one more change" window
+// without polluting the planner with stale commit references.
+const DefaultRecentCommitAffinitySeconds = 120
+
+// resolveRecentCommitAffinitySeconds parses
+// ACD_RECENT_COMMIT_AFFINITY_SECONDS into a time.Duration. Negative or
+// unparseable values fall back to DefaultRecentCommitAffinitySeconds; an
+// explicit "0" disables the hint.
+func resolveRecentCommitAffinitySeconds() time.Duration {
+	env := os.Getenv(EnvRecentCommitAffinitySeconds)
+	if env == "" {
+		return time.Duration(DefaultRecentCommitAffinitySeconds) * time.Second
+	}
+	n, err := strconv.Atoi(env)
+	if err != nil {
+		return time.Duration(DefaultRecentCommitAffinitySeconds) * time.Second
+	}
+	if n < 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
+
 // resetPauseWarnForTest clears all keys and overrides the interval. Test-only.
 func resetPauseWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
 	t.Helper()
