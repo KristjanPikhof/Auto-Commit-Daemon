@@ -596,6 +596,19 @@ func diagnoseRemediation(report diagnoseReport) []string {
 			fmt.Sprintf("intent planner last failed validation for seq %d (%s); replay will use deterministic fallback until planner output is valid.",
 				report.IntentStrategy.LastPlannerErrorEventSeq, report.IntentStrategy.LastPlannerError))
 	}
+	if report.IntentStrategy.PlannerErrorRateRecentWarn {
+		// Surfaces sustained planner-error rates above the noise floor.
+		// Operators inspecting <gitDir>/acd/planner-rejects.jsonl get the
+		// raw model output for the last rotation window (5 MiB current +
+		// 5 MiB .1) so they can root-cause without re-running the planner.
+		remediation = append(remediation,
+			fmt.Sprintf("planner_error_rate_recent %s exceeds %s threshold (last %d decisions); review .git/acd/%s for rejected planner outputs.",
+				strconv.FormatFloat(report.IntentStrategy.PlannerErrorRateRecent, 'f', 3, 64),
+				strconv.FormatFloat(IntentPlannerErrorRateWarnThreshold, 'f', 3, 64),
+				IntentRecentDecisionWindow,
+				ai.IntentRejectsFileName,
+			))
+	}
 	if report.IntentStrategy.ForcedAgingReady > 0 {
 		remediation = append(remediation,
 			fmt.Sprintf("%d pending capture(s) reached the intent defer limit and are eligible for forced one-item planning windows.",
