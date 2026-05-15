@@ -347,6 +347,12 @@ func Run(ctx context.Context, opts Options) error {
 	// slog.Warn rather than blocking replay. ConfigureIntentRejectsLogger
 	// is idempotent and accepts re-installation across restart.
 	ai.ConfigureIntentRejectsLogger(opts.GitDir)
+	// Resolve ACD_PATH_QUIESCENCE_SECONDS once at startup so capture's
+	// hot-path RecordPathWrite gate is set before any capture pass runs.
+	// The replay loop also resolves the env per-pass, but doing it here
+	// ensures a daemon spawned with a positive value never sees a window
+	// where capture skips the stamp before the first replay tick.
+	_ = resolvePathQuiescenceSeconds()
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
 		"commit.strategy":        string(providerCfg.CommitStrategy),
 		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
