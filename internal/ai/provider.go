@@ -16,6 +16,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
