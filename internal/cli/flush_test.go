@@ -339,3 +339,149 @@ func TestFlush_HelpListsLogicalFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestFlush_LogicalRequiresRegisteredClient pins the security gate added
+// for P1 #6: --logical must NOT lazy-register an unknown session-id.
+// Bypassing IntentMinPending and forcing the daemon to drain on demand
+// is privileged; allowing any same-user process to invent an arbitrary
+// session id and trigger a commit boundary would let unrelated
+// processes interleave commits into an active agent session. The hook
+// surface stays clean (ok=true with refused_reason=unknown_session,
+// nothing enqueued, nothing signalled).
+func TestFlush_LogicalRequiresRegisteredClient(t *testing.T) {
+	ctx := context.Background()
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	// Note: no RegisterClient call. The session_id passed to runFlush
+	// below has never appeared in daemon_clients.
+
+	count, _, restore := installFakeSignal(t)
+	defer restore()
+
+	var out bytes.Buffer
+	if err := runFlush(ctx, &out, repoDir, "unregistered-session", true, true); err != nil {
+		t.Fatalf("runFlush logical with unknown session: %v", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("logical flush with unknown session must not signal, got %d signal calls", count.Load())
+	}
+
+	d2, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if _, ok, err := state.ClaimNextFlushRequest(ctx, d2); err != nil {
+		t.Fatalf("claim: %v", err)
+	} else if ok {
+		t.Fatalf("logical flush with unknown session must not enqueue flush_request")
+	}
+
+	// Lazy-register MUST NOT have happened.
+	clients, err := state.ListClients(ctx, d2)
+	if err != nil {
+		t.Fatalf("list clients: %v", err)
+	}
+	for _, c := range clients {
+		if c.SessionID == "unregistered-session" {
+			t.Fatalf("logical flush lazy-registered an unknown session: %+v", c)
+		}
+	}
+
+	var got flushResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.OK || !got.Skipped || got.RefusedReason != "unknown_session" {
+		t.Fatalf("expected ok+skipped+refused=unknown_session, got %+v", got)
+	}
+	if got.FlushRequestID != 0 || got.SentSignal {
+		t.Fatalf("logical flush with unknown session must not enqueue or signal, got %+v", got)
+	}
+}
+
+// TestFlush_HeartbeatOnlyStillLazyRegisters complements the security
+// gate above: heartbeat-only mode (no --logical) keeps the existing
+// wake/touch lazy-register semantics so callers that only want to
+// register the session before flushing keep working. Only the
+// drain-bypass surface is gated.
+func TestFlush_HeartbeatOnlyStillLazyRegisters(t *testing.T) {
+	ctx := context.Background()
+	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+
+	count, _, restore := installFakeSignal(t)
+	defer restore()
+
+	var out bytes.Buffer
+	if err := runFlush(ctx, &out, repoDir, "fresh-heartbeat-session", false, true); err != nil {
+		t.Fatalf("runFlush heartbeat-only with unknown session: %v", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("heartbeat-only flush must not signal, got %d signal calls", count.Load())
+	}
+
+	d2, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	clients, err := state.ListClients(ctx, d2)
+	if err != nil {
+		t.Fatalf("list clients: %v", err)
+	}
+	var seen bool
+	for _, c := range clients {
+		if c.SessionID == "fresh-heartbeat-session" {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		t.Fatalf("heartbeat-only flush must lazy-register fresh session; got clients=%+v", clients)
+	}
+
+	var got flushResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.OK || got.Logical || got.RefusedReason != "" {
+		t.Fatalf("expected ok+!logical+no refusal, got %+v", got)
+	}
+}
+
+// TestFlush_SkippedJSONOmitsZeroLastSeenTS pins the JSON shape change
+// from P1 #8: on the control-lock-held skip branch the heartbeat does
+// not actually update daemon_clients.last_seen_ts, so the field must be
+// absent from JSON output rather than serialized as 0 (which downstream
+// parsers would render as the 1970 epoch).
+func TestFlush_SkippedJSONOmitsZeroLastSeenTS(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	_ = db.Close()
+
+	_, _, restore := installFakeSignal(t)
+	defer restore()
+
+	held, err := daemon.AcquireControlLock(repoDir + "/.git")
+	if err != nil {
+		t.Fatalf("pre-acquire control.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runFlush(ctx, &out, repoDir, "s1", true, true); err != nil {
+		t.Fatalf("runFlush must not error on control.lock contention, got: %v", err)
+	}
+	// Decode raw to inspect field presence — Unmarshal into a typed
+	// struct would silently treat absent and zero as identical.
+	var raw map[string]any
+	if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := raw["last_seen_ts"]; present {
+		t.Fatalf("control-lock-held skip path must omit last_seen_ts; got JSON: %s", out.String())
+	}
+	if got, _ := raw["skipped_reason"].(string); got != "control_lock_held" {
+		t.Fatalf("skipped_reason=%q want control_lock_held; full JSON: %s", got, out.String())
+	}
+}
