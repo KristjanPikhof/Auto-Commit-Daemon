@@ -157,6 +157,15 @@ func cloneCommitSummary(in *CommitSummary) *CommitSummary {
 	return &out
 }
 
+func clonePathRecentCommits(in []PathRecentCommit) []PathRecentCommit {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]PathRecentCommit, len(in))
+	copy(out, in)
+	return out
+}
+
 func clonePathCommitContext(in []PathCommitContext) []PathCommitContext {
 	if len(in) == 0 {
 		return nil
