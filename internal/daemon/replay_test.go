@@ -2670,11 +2670,12 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	if sum.Published != 1 || sum.Skipped {
 		t.Fatalf("summary=%+v want forced aging publish despite batch wait", sum)
 	}
-	if planner.calls != 1 {
-		t.Fatalf("planner calls=%d want 1", planner.calls)
-	}
-	if !planner.requests[0].ForcedAging {
-		t.Fatal("ForcedAging=false want true")
+	// Forced-aging windows of length 1 take the planIntentSingletonFastPath
+	// in replay.go and never call the planner — there is nothing left to
+	// decide once the window is narrowed to one capture. Provider-side call
+	// counter must remain 0.
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 (forced-aging singleton must skip provider)", planner.calls)
 	}
 }
 
