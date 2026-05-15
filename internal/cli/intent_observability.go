@@ -97,6 +97,13 @@ const IntentRecentCommitWindow = 100
 // observed noise floor of healthy planner deployments under the Wave 2
 // retry+normalize stack; sustained rates above this are an operator signal
 // to inspect <gitDir>/acd/planner-rejects.jsonl.
+//
+// Warn gating: PlannerErrorRateRecentWarn is only set when the
+// decision_records table holds at least IntentRecentDecisionWindow
+// rows. Below the window a fresh ledger can trip the threshold simply
+// because the dilution denominator and the row count match (5 errors
+// out of 5 decisions = 0.05 = threshold), which is a noise signal, not
+// an operator-actionable regression.
 const IntentPlannerErrorRateWarnThreshold = 0.05
 
 func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
