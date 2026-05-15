@@ -137,9 +137,11 @@ outside the offered window, are invalid by contract. The `openai-compat` and
 `subprocess` providers normalize their own response before returning: if a
 planner emits a spurious `deferred_reasons` entry, the provider drops that
 entry, logs a single warning naming the affected seqs, and hands the cleaned
-plan to the validator. A plan that still fails validation after normalization
-is surfaced as `intent_planner_error` and replay falls back to deterministic
-one-capture commits as before.
+plan to the validator. The same normalization also runs at the `Compose`
+layer (so any third-party `IntentPlanner` wired through `Compose` is covered)
+and once more inside the replay loop as defense in depth. A plan that still
+fails validation after normalization is surfaced as `intent_planner_error`
+and replay falls back to deterministic one-capture commits as before.
 
 Batching behavior is deliberately bounded:
 
