@@ -11,8 +11,41 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// pathQuiescenceStaleness is the maximum age of a
+// daemon_meta.path_quiescence.updated_at snapshot before status stops
+// applying the gated_count subtraction. 30s is comfortably beyond a
+// healthy daemon's replay tick (10s default + slack); a value older
+// than this almost certainly means the daemon is dead and the snapshot
+// is no longer tracking the live pending queue.
+const pathQuiescenceStaleness = 30 * time.Second
+
+// pathQuiescenceSnapshotFresh returns true when the daemon is alive AND
+// the path_quiescence.updated_at meta value is newer than
+// pathQuiescenceStaleness. A missing or unparseable timestamp is treated
+// as stale: we would rather under-report the gated subtraction than
+// over-count when the daemon is dead and meta is frozen.
+func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
+	st, ok, err := state.LoadDaemonState(ctx, conn)
+	if err != nil || !ok || st.PID <= 0 || !identity.Alive(st.PID) {
+		return false
+	}
+	v, ok, err := metaLookup(ctx, conn, "path_quiescence.updated_at")
+	if err != nil || !ok {
+		return false
+	}
+	ts, perr := time.Parse(time.RFC3339, strings.TrimSpace(v))
+	if perr != nil {
+		return false
+	}
+	if time.Since(ts) > pathQuiescenceStaleness {
+		return false
+	}
+	return true
+}
 
 type intentStrategyReport struct {
 	Strategy                 string `json:"strategy"`
