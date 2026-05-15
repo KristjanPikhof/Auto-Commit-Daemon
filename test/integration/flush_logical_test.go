@@ -11,7 +11,6 @@ package integration_test
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
