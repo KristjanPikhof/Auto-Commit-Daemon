@@ -959,8 +959,20 @@ func replayIntentBatch(
 	// daemon_meta so `acd status --json` can render visible_pending_events
 	// as the post-gate population while oldest_pending_age stays anchored
 	// to captured_ts (the persistence timestamp).
-	pending, gated := filterPendingByPathQuiescence(pending, cfg.pathQuiescence, pathQuiescenceNow())
-	persistPathQuiescenceSnapshot(ctx, db, gated)
+	// Multi-op gating needs the head event's ops to detect the case where
+	// only the header path is quiescent but a sibling op path is still hot.
+	// We load lazily and ONLY for the head: a gated head short-circuits the
+	// whole batch, so paying for additional loader calls would be wasted.
+	var headOpsByPath map[int64][]state.CaptureOp
+	if cfg.pathQuiescence > 0 && len(pending) > 0 {
+		headOps, err := state.LoadCaptureOps(ctx, db, pending[0].Seq)
+		if err != nil {
+			return sum, fmt.Errorf("daemon: replay: load head ops for quiescence gate: %w", err)
+		}
+		headOpsByPath = map[int64][]state.CaptureOp{pending[0].Seq: headOps}
+	}
+	pending, gated := filterPendingByPathQuiescence(pending, cfg.pathQuiescence, pathQuiescenceNow(), headOpsByPath)
+	persistPathQuiescenceSnapshot(ctx, db, gated, cfg.pathQuiescence)
 	if len(pending) == 0 {
 		// Everything in the visible queue is held back behind the gate;
 		// treat the pass as a batch wait so the run loop ticks again
