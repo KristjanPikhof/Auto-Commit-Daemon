@@ -287,8 +287,107 @@ LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlock
 	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
 		return report, err
 	}
+	if err := loadIntentRecentRates(ctx, conn, &report); err != nil {
+		return report, err
+	}
 
 	return report, nil
+}
+
+// loadIntentRecentRates populates PlannerErrorRateRecent and
+// SingletonCommitRateRecent on report. Reads are best-effort: a missing
+// decision_records table (fresh repo, never committed) leaves both fields at
+// their zero value rather than aborting the report.
+//
+// Denominator policy: both rates use a fixed denominator
+// (IntentRecentDecisionWindow / IntentRecentCommitWindow). When the ledger
+// holds fewer rows than the window, the rate dilutes toward zero — this
+// keeps the metric stable and comparable across repos at the cost of
+// understating short-term spikes during the first 100 decisions.
+func loadIntentRecentRates(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fmt.Errorf("intent rate decision table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	if err := loadIntentPlannerErrorRate(ctx, conn, report); err != nil {
+		return err
+	}
+	if err := loadIntentSingletonCommitRate(ctx, conn, report); err != nil {
+		return err
+	}
+	if report.PlannerErrorRateRecent > IntentPlannerErrorRateWarnThreshold {
+		report.PlannerErrorRateRecentWarn = true
+	}
+	return nil
+}
+
+// loadIntentPlannerErrorRate counts intent_planner_error rows in the most
+// recent IntentRecentDecisionWindow decisions. Uses a window-bounded
+// subquery so the planner-error count never re-scans the full ledger.
+func loadIntentPlannerErrorRate(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	const q = `
+SELECT COUNT(*)
+FROM (
+    SELECT id, kind
+    FROM decision_records
+    ORDER BY id DESC
+    LIMIT ?
+) recent
+WHERE recent.kind = ?`
+	var errs int
+	if err := conn.QueryRowContext(ctx, q, IntentRecentDecisionWindow, state.DecisionKindIntentPlannerError).Scan(&errs); err != nil {
+		return fmt.Errorf("planner error rate: %w", err)
+	}
+	report.PlannerErrorRateRecent = float64(errs) / float64(IntentRecentDecisionWindow)
+	return nil
+}
+
+// loadIntentSingletonCommitRate counts singleton commits among the most
+// recent IntentRecentCommitWindow distinct commit OIDs. A singleton commit
+// is defined as a committed-decision commit_oid that maps to exactly one
+// committed decision row — i.e. exactly one capture event landed in that
+// commit.
+//
+// The query first windows the commit OID list to the recent IntentRecentCommitWindow,
+// then GROUP BYs to count rows per OID and counts how many groups have
+// exactly one row. The denominator is the fixed IntentRecentCommitWindow
+// (not the actual count of recent commits) so the rate dilutes toward zero
+// while the ledger fills, mirroring the planner-error rate policy.
+func loadIntentSingletonCommitRate(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	const q = `
+SELECT COUNT(*)
+FROM (
+    SELECT commit_oid
+    FROM decision_records
+    WHERE commit_oid IS NOT NULL
+      AND commit_oid != ''
+      AND kind = ?
+      AND commit_oid IN (
+          SELECT commit_oid
+          FROM decision_records
+          WHERE commit_oid IS NOT NULL
+            AND commit_oid != ''
+            AND kind = ?
+          GROUP BY commit_oid
+          ORDER BY MAX(id) DESC
+          LIMIT ?
+      )
+    GROUP BY commit_oid
+    HAVING COUNT(*) = 1
+)`
+	var singletons int
+	if err := conn.QueryRowContext(ctx, q,
+		state.DecisionKindCommitted,
+		state.DecisionKindCommitted,
+		IntentRecentCommitWindow,
+	).Scan(&singletons); err != nil {
+		return fmt.Errorf("singleton commit rate: %w", err)
+	}
+	report.SingletonCommitRateRecent = float64(singletons) / float64(IntentRecentCommitWindow)
+	return nil
 }
 
 func loadLastIntentPlannerError(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
