@@ -298,10 +298,12 @@ func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanR
 	if w == nil {
 		return
 	}
+	verbatim := intentRejectsRawVerbatim()
+	notifyIntentRejectsRawOptIn(verbatim)
+
 	rec := IntentRejectedPlan{
 		Provider:    provider,
 		OfferedSeqs: offeredSeqsCopy(req),
-		RawResponse: raw,
 		Message:     valErr.Error(),
 	}
 	var typed *IntentPlanValidationError
@@ -310,6 +312,25 @@ func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanR
 	} else {
 		rec.Code = IntentPlanValidationUnknown
 	}
+
+	// Always populate size + sha256 so verbatim opt-in can be cross-checked
+	// against later forensic copies and so the redacted default still
+	// carries enough fingerprint to spot duplicate planner outputs across
+	// distinct rejection events.
+	rec.RawResponseSizeBytes = len(raw)
+	if raw != "" {
+		sum := sha256.Sum256([]byte(raw))
+		rec.RawResponseSHA256 = hex.EncodeToString(sum[:])
+	}
+	rec.ParsedPlanSummary = parsedPlanSummaryFromRaw(raw)
+
+	if verbatim {
+		rec.RawResponse = raw
+		rec.RawResponseRedacted = false
+	} else {
+		rec.RawResponseRedacted = true
+	}
+
 	if _, err := w.Append(rec); err != nil {
 		slog.Warn("intent planner: rejects log write failed",
 			slog.String("provider", provider),
@@ -317,6 +338,64 @@ func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanR
 			slog.String("err", err.Error()),
 		)
 	}
+}
+
+// intentRejectsRawVerbatim reports whether the operator opted in to
+// persisting the verbatim model RawResponse in the rejects log via
+// ACD_INTENT_REJECTS_RAW. The default (unset / 0 / false / no / off) keeps
+// the response redacted; truthy values ("1", "true", "yes", "on") enable
+// verbatim retention. Casing is ignored. Other values fall back to the
+// safe (redacted) default.
+func intentRejectsRawVerbatim() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ACD_INTENT_REJECTS_RAW"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+var intentRejectsRawWarnOnce sync.Once
+
+// notifyIntentRejectsRawOptIn emits a one-shot startup warn so an operator
+// who flipped on verbatim retention sees a visible reminder that planner
+// payloads are now durably persisted unredacted. No-op when the opt-in is
+// off.
+func notifyIntentRejectsRawOptIn(enabled bool) {
+	if !enabled {
+		return
+	}
+	intentRejectsRawWarnOnce.Do(func() {
+		slog.Warn("intent planner: ACD_INTENT_REJECTS_RAW=1; raw planner responses will be persisted verbatim in the rejects log")
+	})
+}
+
+// parsedPlanSummaryFromRaw best-effort decodes the planner output enough
+// to record SelectedCount / DeferredCount in the rejected-plan record.
+// Returns nil when the raw payload is empty or cannot be parsed; callers
+// must tolerate the absent summary because malformed planner output is
+// the common rejection path.
+func parsedPlanSummaryFromRaw(raw string) *IntentRejectedPlanPlanSummary {
+	if raw == "" {
+		return nil
+	}
+	// Try the openai-compat tool-call shape first (common case for
+	// LogRejectedIntentPlan callers). Fall through to bare-IntentPlan JSON
+	// for subprocess plugins that already serialized just the plan body.
+	if plan, err := parseIntentPlanToolCall([]byte(raw)); err == nil {
+		return &IntentRejectedPlanPlanSummary{
+			SelectedCount: len(plan.SelectedSeqs),
+			DeferredCount: len(plan.DeferredSeqs),
+		}
+	}
+	var bare IntentPlan
+	if err := json.Unmarshal([]byte(raw), &bare); err == nil {
+		return &IntentRejectedPlanPlanSummary{
+			SelectedCount: len(bare.SelectedSeqs),
+			DeferredCount: len(bare.DeferredSeqs),
+		}
+	}
+	return nil
 }
 
 func offeredSeqsCopy(req IntentPlanRequest) []int64 {
