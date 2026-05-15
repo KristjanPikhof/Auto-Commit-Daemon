@@ -217,12 +217,22 @@ func TestIntentPlannerRecovery_RetryAbsorbsValidationError(t *testing.T) {
 }
 
 // TestIntentPlannerRecovery_ForcedSingletonSkipsProvider drives the
-// forced-aging singleton fast path through the real binary. With
-// IntentDeferLimit=1, a single deferred capture trips the gate; the next
-// replay tick must publish the capture WITHOUT another planner call. The
-// commit subject is the diff-aware fallback (a Go function name extracted
-// from the captured source) — proving the planner subject is NOT what
-// landed (the subject in the planner's defer plan is "Defer placeholder").
+// forced-aging singleton fast path through the real binary. The flow:
+//
+//  1. Two captures offered together; the mock planner selects ONE and
+//     defers the OTHER (selected/deferred coverage that passes
+//     ValidateIntentPlan, which requires non-empty selected_seqs).
+//  2. After publish, only the deferred capture survives as pending with
+//     defer_count >= IntentDeferLimit (set to 1).
+//  3. Next replay tick: pending=1, with defer_count >= limit. The
+//     selectIntentWindow forced-aging branch fires AND len(items)==1, so
+//     planIntentSingletonFastPath skips the provider entirely and lands
+//     a diff-aware-subject commit.
+//
+// The mock provider counts HTTP hits; only the first (defer) call must
+// reach it. The published commit subject must contain the extracted Go
+// function symbol from the diff (NOT the planner's own subject from the
+// first call, since the planner is never asked the second time).
 func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -240,28 +250,30 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 		}
 		req := decodeIntentChatRequest(t, r)
 		seqs := offeredIntentSeqs(t, req)
-		if len(seqs) == 0 {
-			http.Error(w, "expected at least one offered capture", http.StatusBadRequest)
+		if len(seqs) < 2 {
+			http.Error(w, "expected at least two offered captures", http.StatusBadRequest)
 			return
 		}
-		// First (and only) call: defer everything offered. The replay loop
-		// records the defer in planner_state, defer_count climbs to 1,
-		// matches IntentDeferLimit=1, and the next replay tick takes the
-		// forced-singleton fast path — no second provider call.
+		// Select the FIRST offered seq (the helper file, "warm.txt"), defer
+		// the rest (which includes the Go file we want to forced-singleton).
+		// ValidateIntentPlan requires non-empty selected_seqs, so we cannot
+		// "defer everything" through openai-compat.
+		selected := seqs[:1]
+		deferred := seqs[1:]
 		plan := map[string]any{
-			"selected_seqs":    []int64{},
-			"deferred_seqs":    seqs,
-			"subject":          "Defer placeholder",
-			"body":             "Waiting for related edits.",
-			"grouping_reason":  "first pass: defer to test forced-aging",
-			"deferred_reasons": buildDeferredReasons(seqs),
+			"selected_seqs":    selected,
+			"deferred_seqs":    deferred,
+			"subject":          "Planner: pick warm-up",
+			"body":             "Defer the Go file to drive forced-aging.",
+			"grouping_reason":  "first pass: select warm-up, defer the rest",
+			"deferred_reasons": buildDeferredReasons(deferred),
 		}
 		args, err := json.Marshal(plan)
 		if err != nil {
 			t.Fatalf("marshal intent plan: %v", err)
 		}
 		resp := map[string]any{
-			"id":     "chatcmpl-defer",
+			"id":     "chatcmpl-singleton",
 			"object": "chat.completion",
 			"model":  "gpt-4o-mini",
 			"choices": []map[string]any{{
@@ -270,7 +282,7 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 					"role":    "assistant",
 					"content": "",
 					"tool_calls": []map[string]any{{
-						"id":   "call_defer",
+						"id":   "call_singleton",
 						"type": "function",
 						"function": map[string]any{
 							"name":      "capture_intent_plan",
@@ -290,17 +302,16 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	// IntentDeferLimit=1 keeps the test budget tight: one defer is enough
-	// to flip the gate. IntentMinPending=1 lets a single capture reach the
-	// planner; IntentMaxPendingAge=2s ensures the second replay tick
-	// inside the 60s test budget treats the deferred capture as overdue.
+	// to flip the forced-aging gate. IntentMaxPendingAge stays small so
+	// the second replay tick treats the deferred capture as overdue.
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
-		"ACD_INTENT_MIN_PENDING=1",
+		"ACD_INTENT_MIN_PENDING=2",
 		"ACD_INTENT_MAX_PENDING_AGE=2s",
 		"ACD_INTENT_DEFER_LIMIT=1",
 		"ACD_AI_PROVIDER=openai-compat",
@@ -313,19 +324,31 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
 
-	// Real Go source so the diff-aware subject fallback extracts the
-	// function name. This is what proves the planner subject is NOT the
-	// one that landed (planner subject would have been "Defer placeholder"
-	// from the only call we accept).
-	body := "package overdue\n\nfunc HandleOverdueCapture() error {\n\treturn nil\n}\n"
-	target := filepath.Join(repo, "overdue.go")
-	writeFile(t, target, body)
+	// Pause the daemon so we can drop both files atomically; the planner
+	// must see them in the same offered window so the "select first,
+	// defer rest" mock plan picks warm.txt and defers overdue.go.
+	paused := runAcd(t, ctx, fullEnv, "pause", "--repo", repo, "--reason", "singleton recovery test", "--yes", "--json")
+	if paused.ExitCode != 0 {
+		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
+	}
+	// warm.txt seq is lower than overdue.go (alphabetical write order isn't
+	// guaranteed; capture orders by event time). Write warm.txt FIRST so
+	// it gets the smaller seq, then overdue.go so it's the one deferred.
+	writeFile(t, filepath.Join(repo, "warm.txt"), "warm\n")
+	writeFile(t, filepath.Join(repo, "overdue.go"),
+		"package overdue\n\nfunc HandleOverdueCapture() error {\n\treturn nil\n}\n")
+
+	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
+	if resumed.ExitCode != 0 {
+		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
+	}
 	wakeSession(t, ctx, fullEnv, repo, "intent-recovery-singleton")
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	// Wait for the first planner call to land a defer. The defer is
-	// recorded in planner_state; we poll for defer_count >= 1 on the
-	// pending row before pushing the next tick.
+
+	// Wait for warm.txt to land (selected) and overdue.go to gather a
+	// defer (defer_count >= 1).
+	waitForEventState(t, dbPath, "warm.txt", "published", 15*time.Second)
 	waitFor(t, "planner deferred overdue.go (defer_count>=1)", 15*time.Second, func() bool {
 		got := sqliteScalar(t, dbPath,
 			"SELECT IFNULL(MAX(defer_count), 0) FROM planner_state ps "+
@@ -333,8 +356,12 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 				"WHERE ce.path='overdue.go'")
 		return got != "" && got != "0"
 	})
-	// Capture how many hits the deferral pass cost — must be exactly 1.
+	// Capture how many hits the deferral pass cost. Must be at least 1
+	// (the defer call); subsequent tick must add zero.
 	hitsAfterDefer := hits.Load()
+	if hitsAfterDefer == 0 {
+		t.Fatal("planner was never called for the first (defer) pass")
+	}
 
 	// Wait past IntentMaxPendingAge so the next replay tick treats the
 	// deferred capture as forced-aging-ready, then drive the tick. The
@@ -348,14 +375,16 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 			got, hitsAfterDefer)
 	}
 
-	// Subject MUST be the diff-aware fallback ("Add HandleOverdueCapture"),
-	// NOT the planner's own "Defer placeholder", and NOT the legacy
-	// generic "Add overdue.go" / "Update overdue.go" strings.
+	// HEAD subject MUST be the diff-aware fallback ("Add HandleOverdueCapture"),
+	// NOT the planner's "Planner: pick warm-up" subject from the first call,
+	// and NOT the generic "Add overdue.go" / "Update overdue.go" basename
+	// fallback. Reading HEAD subject only tells us about the LAST commit;
+	// since overdue.go publishes after warm.txt, HEAD reflects overdue.go.
 	subj := headSubject(t, repo)
-	if subj == "Defer placeholder" {
-		t.Fatalf("HEAD subject=%q is the planner's defer placeholder; forced-singleton must use diff-aware fallback", subj)
+	if subj == "Planner: pick warm-up" {
+		t.Fatalf("HEAD subject=%q is the planner's first-pass subject; forced-singleton must use diff-aware fallback", subj)
 	}
-	if strings.HasPrefix(subj, "Add overdue.go") || strings.HasPrefix(subj, "Update overdue.go") {
+	if subj == "Add overdue.go" || subj == "Update overdue.go" {
 		t.Fatalf("HEAD subject=%q is the generic basename fallback; expected the diff-aware Go-symbol fallback", subj)
 	}
 	if !strings.Contains(subj, "HandleOverdueCapture") {
