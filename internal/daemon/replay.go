@@ -1610,6 +1610,19 @@ var buildOpsDiffForForcedSingleton = func(ctx context.Context, repoRoot string, 
 	return BuildOpsDiff(ctx, repoRoot, ops)
 }
 
+// planIntentSingletonFastPathFn lets tests stub the forced-singleton fast
+// path so the validator branches in replayIntentBatch can be exercised
+// against a deliberately invalid plan. nil falls through to the real
+// planIntentSingletonFastPath.
+var planIntentSingletonFastPathFn atomic.Pointer[func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan]
+
+func planIntentSingletonFastPathHook(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+	if fn := planIntentSingletonFastPathFn.Load(); fn != nil && *fn != nil {
+		return (*fn)(ctx, repoRoot, item)
+	}
+	return planIntentSingletonFastPath(ctx, repoRoot, item)
+}
+
 func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
 	op := singletonFallbackOp(item)
 	subject := ""
