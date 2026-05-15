@@ -34,6 +34,26 @@ type PathCommitContext struct {
 	Commits []CommitSummary `json:"commits"`
 }
 
+// PathRecentCommitSuggestionExtendOrWait is the only suggested-action value
+// surfaced today. v1 limits the planner hint to "extend the recent commit or
+// wait for more captures"; future actions (e.g. an explicit amend trigger)
+// will arrive alongside actual amend support.
+const PathRecentCommitSuggestionExtendOrWait = "extend or wait"
+
+// PathRecentCommit is a hint added to IntentPlanRequest when the captured
+// path matches a HEAD commit landed within the affinity window
+// (ACD_RECENT_COMMIT_AFFINITY_SECONDS). The hint is informational only —
+// v1 does NOT amend on the planner's behalf; SuggestedAction is fixed at
+// PathRecentCommitSuggestionExtendOrWait so the planner can lean toward
+// extending the existing commit's intent rather than splitting a related
+// change across two commits. Empty slice when no path matches.
+type PathRecentCommit struct {
+	Path             string `json:"path"`
+	OID              string `json:"oid"`
+	AgeSeconds       int64  `json:"age_seconds"`
+	SuggestedAction  string `json:"suggested_action"`
+}
+
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
 	Seq          int64     `json:"seq"`
