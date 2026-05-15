@@ -217,9 +217,13 @@ func (w *IntentRejectsWriter) rotateIfNeededLocked(current string, incoming int6
 		}
 	}
 	rotated := current + ".1"
-	if err := os.Remove(rotated); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("ai: clear prior rotated rejects log: %w", err)
-	}
+	// Atomic rotation: rely on POSIX os.Rename to overwrite an existing
+	// rotated archive in a single step. The previous code did
+	// os.Remove(rotated) followed by os.Rename(current, rotated); a crash
+	// between those two calls would lose the prior .1 entirely. On Linux
+	// (any FS) and macOS APFS, rename(2) is atomic and replaces the
+	// destination if it exists, so observers always see either the old
+	// .1 or the new .1 — never an absent file.
 	if err := os.Rename(current, rotated); err != nil {
 		return fmt.Errorf("ai: rotate rejects log: %w", err)
 	}
