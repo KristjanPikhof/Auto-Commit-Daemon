@@ -1376,6 +1376,58 @@ func intentRequestIncludesDiff(req ai.IntentPlanRequest) bool {
 	return false
 }
 
+// buildPathRecentCommits walks the offered paths, asks git for the most
+// recent HEAD commit that touched each, and returns one PathRecentCommit
+// hint per path whose commit landed within the affinity window. Empty
+// slice when the affinity window is disabled (window <= 0), no path
+// matches, or no offered path resolves to a HEAD commit. Errors degrade
+// silently per path — the hint is informational only.
+//
+// Ordering is deterministic (paths sorted lexicographically) so the
+// composed primary + fallback both observe identical request payloads
+// when re-invoked with the same inputs.
+func buildPathRecentCommits(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, window time.Duration, now time.Time) []ai.PathRecentCommit {
+	if window <= 0 || len(paths) == 0 || ref == "" {
+		return nil
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		if path == "" {
+			continue
+		}
+		ordered = append(ordered, path)
+	}
+	if len(ordered) == 0 {
+		return nil
+	}
+	sort.Strings(ordered)
+	out := make([]ai.PathRecentCommit, 0, len(ordered))
+	cutoff := now.Add(-window).Unix()
+	for _, path := range ordered {
+		head, ok, err := git.LatestPathHeadCommit(ctx, repoRoot, ref, path)
+		if err != nil || !ok {
+			continue
+		}
+		if head.CommitTSSec < cutoff {
+			continue
+		}
+		age := now.Unix() - head.CommitTSSec
+		if age < 0 {
+			age = 0
+		}
+		out = append(out, ai.PathRecentCommit{
+			Path:            path,
+			OID:             head.OID,
+			AgeSeconds:      age,
+			SuggestedAction: ai.PathRecentCommitSuggestionExtendOrWait,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func buildIntentPathContext(ctx context.Context, repoRoot, ref string, paths map[string]struct{}, limit int) []ai.PathCommitContext {
 	if len(paths) == 0 || limit <= 0 {
 		return nil
