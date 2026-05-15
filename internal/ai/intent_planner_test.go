@@ -689,6 +689,76 @@ func TestComposedPlanIntentSkipsRetryOnTransportError(t *testing.T) {
 	}
 }
 
+// TestComposedRetry_SkipsForHealedCodes pins the contract that typed
+// validation errors whose codes are normally healed by
+// NormalizeIntentPlanDeferredReasons (DeferredReasonNotDeferred,
+// DeferredReasonMissing) skip the retry round-trip when validation still
+// fails after normalization. A second call would burn provider budget
+// without changing the outcome because the planner is in a worse state
+// than the error code suggests.
+func TestComposedRetry_SkipsForHealedCodes(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	codes := []IntentPlanValidationCode{
+		IntentPlanValidationDeferredReasonNotDeferred,
+		IntentPlanValidationDeferredReasonMissing,
+	}
+	for _, code := range codes {
+		t.Run(fmt.Sprintf("code-%d", code), func(t *testing.T) {
+			primary := &scriptedIntentPlanner{
+				name: "scripted-primary",
+				errs: []error{
+					&IntentPlanValidationError{Code: code, Seq: 102, Message: "synthetic"},
+					nil,
+				},
+				plans: []IntentPlan{
+					{},
+					{SelectedSeqs: []int64{101}, DeferredSeqs: []int64{102},
+						Subject: "x", GroupingReason: "y",
+						DeferredReasons: []DeferredReason{{Seq: 102, Reason: "ok"}}},
+				},
+			}
+			planner := Compose(primary, DeterministicProvider{})
+			_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+			if err == nil {
+				t.Fatalf("expected typed validation error to surface")
+			}
+			if primary.calls != 1 {
+				t.Fatalf("primary calls=%d want 1 (healed-code retry must be skipped)", primary.calls)
+			}
+		})
+	}
+}
+
+// TestComposedRetry_DisabledByEnv verifies ACD_INTENT_RETRY_ON_INVALID=0
+// disables the retry loop entirely; even a typically-retryable code
+// (OfferedWindow hallucination) collapses to a single primary call.
+func TestComposedRetry_DisabledByEnv(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	t.Setenv("ACD_INTENT_RETRY_ON_INVALID", "0")
+	invalidPlan := IntentPlan{
+		SelectedSeqs:   []int64{999},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, invalidPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error after primary attempt")
+	}
+	if primary.calls != 1 {
+		t.Fatalf("primary calls=%d want 1 (env opt-out must skip retry)", primary.calls)
+	}
+}
+
 // TestComposedPlanIntentSkipsRetryOnUntypedError ensures plain (non-typed)
 // validation errors do not trigger a retry. Only *IntentPlanValidationError
 // qualifies — this protects against future planner errors that surface as
