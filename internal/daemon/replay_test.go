@@ -5092,6 +5092,12 @@ func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 // durability — only the planner-offer is gated.
 func TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses(t *testing.T) {
 	ResetPathQuiescenceForTest(t)
+	// Enable the gate BEFORE captures so RecordPathWrite stamps land
+	// in the tracker. The hot-path short-circuit returns immediately
+	// when the gate is off, which would otherwise leave PathLastWrite
+	// empty and the gate inactive at replay time.
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
 	t0 := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
 	clock := struct {
 		mu  sync.Mutex
@@ -5131,7 +5137,6 @@ func TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses(t *testing.T) {
 			GroupingReason: "should not be called",
 		},
 	}
-	t.Setenv(EnvPathQuiescenceSeconds, "30")
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
 		CommitStrategy:   ai.CommitStrategyIntent,
