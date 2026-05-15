@@ -370,9 +370,12 @@ func TestNormalizeIntentPlanDeferredReasonsDropsNonDeferredEntries(t *testing.T)
 			{Seq: 99, Reason: "spurious entry for unknown seq"},
 		},
 	}
-	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 2 || dropped[0] != 11 || dropped[1] != 99 {
 		t.Fatalf("dropped=%v want [11 99]", dropped)
+	}
+	if len(synthesized) != 0 {
+		t.Fatalf("synthesized=%v want empty", synthesized)
 	}
 	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Seq != 12 {
 		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
@@ -384,9 +387,12 @@ func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
 		DeferredSeqs:    []int64{12, 13},
 		DeferredReasons: []DeferredReason{{Seq: 12, Reason: "a"}, {Seq: 13, Reason: "b"}},
 	}
-	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 0 {
 		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(synthesized) != 0 {
+		t.Fatalf("synthesized=%v want empty", synthesized)
 	}
 	if len(cleaned.DeferredReasons) != 2 {
 		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
@@ -394,10 +400,15 @@ func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
 }
 
 func TestNormalizeIntentPlanDeferredReasonsEmptyPlanEarlyReturn(t *testing.T) {
-	plan := IntentPlan{DeferredSeqs: []int64{12}}
-	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	// No deferred seqs and no reasons -> nothing to do; early return keeps
+	// aliasing on caller's nil slice.
+	plan := IntentPlan{}
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
 	if dropped != nil {
 		t.Fatalf("dropped=%v want nil", dropped)
+	}
+	if synthesized != nil {
+		t.Fatalf("synthesized=%v want nil", synthesized)
 	}
 	if cleaned.DeferredReasons != nil {
 		t.Fatalf("cleaned reasons=%+v want nil", cleaned.DeferredReasons)
@@ -414,9 +425,12 @@ func TestNormalizeIntentPlanDeferredReasonsPreservesInputOrder(t *testing.T) {
 			{Seq: 11, Reason: "drop second"},
 		},
 	}
-	cleaned, dropped := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 2 || dropped[0] != 99 || dropped[1] != 11 {
 		t.Fatalf("dropped=%v want [99 11]", dropped)
+	}
+	if len(synthesized) != 0 {
+		t.Fatalf("synthesized=%v want empty", synthesized)
 	}
 	if len(cleaned.DeferredReasons) != 2 || cleaned.DeferredReasons[0].Seq != 12 || cleaned.DeferredReasons[1].Seq != 13 {
 		t.Fatalf("cleaned=%+v", cleaned.DeferredReasons)
