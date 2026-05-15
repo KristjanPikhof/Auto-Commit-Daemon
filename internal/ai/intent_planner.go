@@ -72,6 +72,13 @@ type IntentPlanRequest struct {
 	PathCommitContext     []PathCommitContext           `json:"path_commit_context,omitempty"`
 	OfferedCaptures       []OfferedCapture              `json:"offered_captures"`
 	ForcedAging           bool                          `json:"forced_aging,omitempty"`
+	// PathRecentCommits surfaces the prior-commit affinity hint computed by
+	// the daemon (see ACD_RECENT_COMMIT_AFFINITY_SECONDS). The planner is
+	// expected to read it as guidance only — v1 does not amend; the hint
+	// merely informs the planner that an offered path matches a recent
+	// HEAD commit so it can lean toward extending the existing commit
+	// rather than splitting related work.
+	PathRecentCommits     []PathRecentCommit            `json:"path_recent_commits,omitempty"`
 	CapturedDiffTransform prompttrace.TransformMetadata `json:"-"`
 	// RetryCorrection carries a verbatim validation error from the previous
 	// attempt when the composed planner is asking the provider to correct an
@@ -93,6 +100,10 @@ type IntentPlanRequestOptions struct {
 	OfferedCaptures      []OfferedCapture
 	ForcedAging          bool
 	IncludeCapturedDiffs bool
+	// PathRecentCommits forwards the daemon's prior-commit affinity hint
+	// into IntentPlanRequest. The slice is shallow-cloned so callers can
+	// reuse the input without observing in-place mutation.
+	PathRecentCommits []PathRecentCommit
 }
 
 // NewIntentPlanRequest builds a planner request and applies the egress policy
