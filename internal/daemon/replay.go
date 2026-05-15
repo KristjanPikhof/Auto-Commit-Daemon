@@ -862,6 +862,33 @@ type intentReplayItem struct {
 	event      state.CaptureEvent
 	ops        []state.CaptureOp
 	deferCount int
+	// coalesce, when non-nil, records the additional capture events folded
+	// into this offer by the same-path coalesce pass. The representative
+	// event lives in `event` above; `coalesce.Covered` carries every other
+	// event in the run (always sorted by seq ascending). For a non-
+	// coalesced item, coalesce remains nil so existing single-event code
+	// paths stay byte-identical.
+	coalesce *coalesceToken
+}
+
+// allCoveredEvents returns the representative event followed by every event
+// the coalesce token absorbed (empty slice safe for non-coalesced items).
+// Useful at publish time when every covered event must be settled with the
+// same commit_oid and decision row.
+func (item intentReplayItem) allCoveredEvents() []state.CaptureEvent {
+	out := make([]state.CaptureEvent, 0, 1+coverLen(item.coalesce))
+	out = append(out, item.event)
+	if item.coalesce != nil {
+		out = append(out, item.coalesce.Covered...)
+	}
+	return out
+}
+
+func coverLen(tok *coalesceToken) int {
+	if tok == nil {
+		return 0
+	}
+	return len(tok.Covered)
 }
 
 func replayIntentBatch(
