@@ -39,6 +39,11 @@ Tool hooks run idempotent `acd start` before `acd wake`, so later tool activity
 can recover if you manually ran `acd stop` while the Pi session stayed open.
 `session.deleted` still deregisters the session with `acd stop --session-id`.
 
+`acd wake` refreshes the heartbeat and nudges capture/replay, but it does not
+bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. The
+`session.idle` hook uses `acd flush --logical` for the prompt-end commit
+boundary; re-run `acd setup pi` if your installed snippet predates that hook.
+
 ## Verify
 
 - Open Pi in any git repo
