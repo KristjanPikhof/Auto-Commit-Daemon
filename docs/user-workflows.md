@@ -194,7 +194,7 @@ Intent-mode inspection:
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
-# make enough changes for a batch, or use acd wake to flush the visible queue
+# make enough changes for a batch, or use acd flush --logical to drain now
 acd prompt --last
 acd prompt --seq 42
 ~~~
