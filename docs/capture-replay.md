@@ -244,19 +244,22 @@ if the visible pending queue is below `ACD_INTENT_MIN_PENDING` and the oldest
 visible capture is younger than `ACD_INTENT_MAX_PENDING_AGE`, replay records a
 `skipped_due_intent_batch_wait` no-op instead of planning. Reaching the count
 trigger offers up to `ACD_INTENT_WINDOW`; reaching the age trigger offers the
-currently visible pending rows up to that same maximum. Explicit `acd wake` /
-flush requests bypass only this wait, so a user-requested flush plans whatever
-is visible immediately. Flush does not bypass planner validation, terminal
-barriers, safe ordering checks, or the forced-aging path for captures that were
-already deferred too many times.
+currently visible pending rows up to that same maximum. `acd flush --logical`
+bypasses only this wait, so a prompt-end flush plans whatever is visible
+immediately. Plain `acd wake` refreshes the heartbeat and nudges capture/replay,
+but it does not bypass `ACD_INTENT_MIN_PENDING` or
+`ACD_INTENT_MAX_PENDING_AGE`. Neither command bypasses planner validation,
+terminal barriers, safe ordering checks, or the forced-aging path for captures
+that were already deferred too many times.
 
 `acd status`, `acd diagnose`, and `acd doctor` surface this wait state when
 intent mode is active. The reports include the visible pending count,
 `min_pending`, oldest visible pending age, `max_pending_age`, and the estimated
 age-trigger countdown when available. `doctor` also suggests the operational
-choices: wait for another capture or the age trigger, flush/wake to publish the
-current visible batch, lower the intent batching thresholds for sparse repos, or
-switch back to `ACD_COMMIT_STRATEGY=event` for immediate one-event commits.
+choices: wait for another capture or the age trigger, run `acd flush --logical`
+to publish the current visible batch, lower the intent batching thresholds for
+sparse repos, or switch back to `ACD_COMMIT_STRATEGY=event` for immediate
+one-event commits.
 
 ACD remains the authority on safety. It rejects malformed plans, unknown seqs,
 omissions, duplicate seqs, overlapping selected/deferred seqs, and selected
