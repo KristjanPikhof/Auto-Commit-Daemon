@@ -622,7 +622,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 			need = 0
 		}
 		remediation = append(remediation,
-			fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd wake` / flush to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
+			fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
 				need,
 				formatDurationCompact(time.Duration(report.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
 				wait))

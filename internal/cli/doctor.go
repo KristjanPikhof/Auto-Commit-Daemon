@@ -1077,7 +1077,7 @@ func doctorIntentStrategyNotes(r intentStrategyReport) []string {
 	}
 	return []string{
 		fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining)", need, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), wait),
-		"to publish now, run acd wake for the active session or request a flush; explicit flushes bypass intent batch wait",
+		"to publish now, run acd flush --logical for the active session; explicit flushes bypass intent batch wait",
 		"for sparse repos, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE and restart acd",
 		"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
 	}
