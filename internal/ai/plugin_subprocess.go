@@ -343,8 +343,8 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 || len(synthesized) > 0 {
+	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 || len(overlapRemoved) > 0 {
 		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("plugin", p.name),
@@ -354,6 +354,9 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		}
 		if len(synthesized) > 0 {
 			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		if len(overlapRemoved) > 0 {
+			attrs = append(attrs, slog.Any("overlap_removed_seqs", overlapRemoved))
 		}
 		p.logger.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}

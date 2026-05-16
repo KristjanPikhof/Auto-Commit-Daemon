@@ -713,6 +713,39 @@ func TestOpenAIIntentPlan_NormalizesSpuriousDeferredReason(t *testing.T) {
 	}
 }
 
+func TestOpenAIIntentPlan_NormalizesSelectedDeferredOverlap(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedIntentPlanToolCall(IntentPlan{
+			SelectedSeqs:   []int64{101},
+			DeferredSeqs:   []int64{101, 102},
+			Subject:        "Tighten checkout flow",
+			Body:           "- align validator",
+			GroupingReason: "single focused checkout change",
+			DeferredReasons: []DeferredReason{
+				{Seq: 101, Reason: "overlap emitted by planner"},
+				{Seq: 102, Reason: "documentation change is separate"},
+			},
+		})
+	})
+	plan, err := p.PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected=%v want [101]", plan.SelectedSeqs)
+	}
+	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 102 {
+		t.Fatalf("deferred=%v want [102]", plan.DeferredSeqs)
+	}
+	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 102 {
+		t.Fatalf("normalized deferred reasons=%+v want one entry for 102", plan.DeferredReasons)
+	}
+	if plan.Source != "openai-compat" {
+		t.Fatalf("source=%q", plan.Source)
+	}
+}
+
 // TestOpenAIIntentPlan_AllBadDeferredReasonsSynthesizesMarker exercises the
 // coercion path: when every emitted deferred_reasons entry is spurious (here
 // the only reason references the selected seq 101), the openai-compat

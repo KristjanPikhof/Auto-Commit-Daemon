@@ -189,8 +189,8 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 		return IntentPlan{}, err
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
-	logIntentPlanNormalization(c.fallback.Name(), dropped, synthesized)
+	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
+	logIntentPlanNormalization(c.fallback.Name(), dropped, synthesized, overlapRemoved)
 	if err := ValidateIntentPlan(req, plan); err != nil {
 		return IntentPlan{}, err
 	}
@@ -204,8 +204,8 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 // both dropped and synthesized seqs from a NormalizeIntentPlanDeferredReasons
 // call. No-op when both lists are empty so defense-in-depth re-normalization
 // stays silent on the second pass.
-func logIntentPlanNormalization(provider string, dropped, synthesized []int64) {
-	if len(dropped) == 0 && len(synthesized) == 0 {
+func logIntentPlanNormalization(provider string, dropped, synthesized, overlapRemoved []int64) {
+	if len(dropped) == 0 && len(synthesized) == 0 && len(overlapRemoved) == 0 {
 		return
 	}
 	attrs := []any{slog.String("provider", provider)}
@@ -214,6 +214,9 @@ func logIntentPlanNormalization(provider string, dropped, synthesized []int64) {
 	}
 	if len(synthesized) > 0 {
 		attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+	}
+	if len(overlapRemoved) > 0 {
+		attrs = append(attrs, slog.Any("overlap_removed_seqs", overlapRemoved))
 	}
 	slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 }
@@ -229,9 +232,10 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 	retryEnabled := intentRetryOnInvalidEnabled()
 	currentReq := req
 	var (
-		lastErr     error
-		dropped     []int64
-		synthesized []int64
+		lastErr        error
+		dropped        []int64
+		synthesized    []int64
+		overlapRemoved []int64
 	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		plan, err := primary.PlanIntent(ctx, currentReq)
@@ -242,8 +246,8 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 			// by the for-loop's `plan, err := primary.PlanIntent(...)`.
 			// The earlier `:=` form silently created a fresh inner binding
 			// that the surrounding return paths could never observe.
-			plan, dropped, synthesized = NormalizeIntentPlanDeferredReasons(plan)
-			logIntentPlanNormalization(c.primary.Name(), dropped, synthesized)
+			plan, dropped, synthesized, overlapRemoved = NormalizeIntentPlanDeferredReasons(plan)
+			logIntentPlanNormalization(c.primary.Name(), dropped, synthesized, overlapRemoved)
 			err = ValidateIntentPlan(req, plan)
 			if err == nil {
 				if plan.Source == "" {

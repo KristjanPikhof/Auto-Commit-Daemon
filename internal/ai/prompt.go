@@ -99,6 +99,7 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture and leave deferred_seqs and deferred_reasons empty. " +
 	"Same-path causality: when you defer an offered seq for path P, every later offered seq that touches P must also be deferred (or the entire same-path chain must be selected together); never split a same-path chain by selecting a later seq while deferring an earlier one. " +
 	"Defer_count guidance: prefer captures whose defer_count >= 1 for inclusion when the evidence permits, so a capture deferred in earlier windows does not churn forever. " +
+	"selected_seqs and deferred_seqs MUST be disjoint and their union MUST equal offered_seqs. " +
 	"Every deferred_reasons[i].seq must appear in deferred_seqs. " +
 	"Do not emit a reason for a seq that is selected, and do not reference seqs outside the offered window. " +
 	"Each deferred seq needs exactly one reason; selected seqs get no reason entry. " +
@@ -136,7 +137,7 @@ func BuildIntentPlanUserPrompt(req IntentPlanRequest) (string, error) {
 	if correction := strings.TrimSpace(req.RetryCorrection); correction != "" {
 		out += "\n\nYour previous capture_intent_plan tool call failed validation with this error:\n" +
 			correction +
-			"\n\nReturn a corrected capture_intent_plan tool call that fixes the listed problem. Keep every offered seq accounted for as either selected or deferred, and ensure every deferred_reasons[i].seq appears in deferred_seqs."
+			"\n\nReturn a corrected capture_intent_plan tool call that fixes the listed problem. Keep every offered seq accounted for as either selected or deferred, ensure selected_seqs and deferred_seqs are disjoint, and ensure every deferred_reasons[i].seq appears in deferred_seqs."
 	}
 	return out, nil
 }
