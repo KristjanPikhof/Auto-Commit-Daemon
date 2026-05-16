@@ -329,8 +329,9 @@ Intent-planner atomicity: same-path coalesce, validation retry, planner-rejects 
   Codex. Codex re-flags all hook entries as review-required after every
   `hooks.json` content change, so re-run `/hooks` after any re-install too.
   `acd doctor` now warns when both old and new Codex hook configs are installed,
-  because Codex will run both. Keep Codex lifecycle hooks enabled in
-  `~/.codex/config.toml` with `[features].codex_hooks = true`. See
+  because Codex will run both. Codex hooks are enabled by default; if
+  `~/.codex/config.toml` pins feature flags, keep lifecycle hooks enabled with
+  `[features].hooks = true` (`codex_hooks` is only a deprecated alias). See
   [templates/codex/README.md](templates/codex/README.md) for full details.
 - Codex hooks now read `cwd` from hook stdin, no longer require
   `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the

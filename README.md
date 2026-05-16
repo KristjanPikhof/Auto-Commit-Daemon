@@ -35,12 +35,16 @@ acd setup pi            # → ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
-Codex needs one extra line in `~/.codex/config.toml`:
+Codex hooks are enabled by default. If your `~/.codex/config.toml` pins feature
+flags, keep lifecycle hooks enabled with the canonical key:
 
 ~~~toml
 [features]
-codex_hooks = true
+hooks = true
 ~~~
+
+Do not set `hooks = false`; that disables Codex lifecycle hooks. The older
+`codex_hooks` key still works as a deprecated alias.
 
 After wiring, sanity-check with `acd doctor`. It checks the snippet matches the current template and tells you what to fix.
 

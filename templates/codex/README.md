@@ -3,11 +3,14 @@
 ## Install
 
 1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Enable Codex lifecycle hooks in `~/.codex/config.toml`:
+2. Ensure Codex lifecycle hooks are enabled. They are on by default, but if
+   your `~/.codex/config.toml` pins feature flags, use the canonical key:
    ~~~toml
    [features]
-   codex_hooks = true
+   hooks = true
    ~~~
+   Do not set `hooks = false`; that disables Codex lifecycle hooks. The older
+   `codex_hooks` key still works as a deprecated alias.
 3. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
 
    **Overwrite warning:** the shell redirect above replaces the entire file. If
@@ -35,9 +38,9 @@ legacy block in place causes every event to fire twice — doubled
 `acd start`/`acd wake`/`acd touch` per turn. `acd doctor` warns when the JSON
 file and a legacy TOML config both carry an acd marker.
 
-Note: the official Codex hooks docs currently show `[features].codex_hooks =
-true`. Keep that flag in `config.toml`; the new `hooks.json` install only moves
-the hook bodies out of TOML.
+Note: the official Codex hooks docs use `[features].hooks` as the canonical
+feature key and keep `codex_hooks` only as a deprecated alias. The
+`hooks.json` install carries hook bodies, not feature flags.
 
 ## Wired events
 
@@ -49,9 +52,9 @@ the hook bodies out of TOML.
 - `PostToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 15s)
 - `Stop` -> `acd touch` (timeout 5s)
 
-`Stop` calls `acd touch` (mirrors the claude-code adapter) so the daemon is
-not killed mid-replay drain. The refcount sweep on the `watch_pid` still
-cleans up once Codex exits.
+`Stop` calls `acd touch` because Codex fires `Stop` at turn scope rather than
+only at true session idle. The refcount sweep on the `watch_pid` still cleans
+up once Codex exits.
 
 The active wake hooks call `acd start` first so a later prompt or tool event can
 recover if you manually ran `acd stop` while the Codex session stayed open.
