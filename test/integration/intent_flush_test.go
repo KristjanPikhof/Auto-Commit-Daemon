@@ -91,6 +91,11 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 		t.Fatalf("acd wake exit=%d\nstdout=%s\nstderr=%s",
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitForEventState(t, dbPath, "deterministic-flush.txt", "pending", 5*time.Second)
+	if headAfterWake := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfterWake != headBefore {
+		t.Fatalf("wake-only drain bypassed intent batch gate: HEAD=%s want %s", headAfterWake, headBefore)
+	}
 
 	flushStart := time.Now()
 	flushRes := runAcd(t, ctx, env, "flush",
