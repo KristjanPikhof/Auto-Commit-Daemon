@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- Singleton intent windows now use the normal per-event commit-message
+  provider instead of the structured intent planner. One-capture commits keep
+  their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
+  trace records.
+- Integration coverage now exercises wake-gate behavior, selected/deferred
+  planner overlap normalization, planner-rejects creation and rotation, and the
+  singleton short-circuit path.
+
+### Changed
+
+- Plain `acd wake` no longer bypasses `ACD_INTENT_MIN_PENDING` or
+  `ACD_INTENT_MAX_PENDING_AGE`. It still refreshes the session heartbeat and
+  nudges capture/replay, but only `acd flush --logical` forces the current
+  visible intent window through the batch gate.
+- Wake flush-request acknowledgements moved to debug logs with a periodic
+  summary, so active tool hooks no longer flood daemon logs during busy
+  sessions.
+
+### Fixed
+
+- Planner output that puts the same seq in both `selected_seqs` and
+  `deferred_seqs` is normalized before validation. Selected wins, the stale
+  deferred reason is dropped, and the grouped commit can proceed without a
+  deterministic fallback.
+- Planner rejects logging is wired at daemon startup and covered by live daemon
+  tests, including 5 MiB rotation.
+
+### Docs
+
+- README, `CLAUDE.md`, harness notes, and intent docs now state the wake versus
+  logical-flush behavior explicitly. If you preferred the old wake-only cadence,
+  lower `ACD_INTENT_MAX_PENDING_AGE` (for example, `60s`) or install the current
+  harness snippets so turn boundaries call `acd flush --logical`.
+
 ## v2026-05-16
 
 Intent-planner atomicity: same-path coalesce, validation retry, planner-rejects forensics, Stop-hook rewire.
