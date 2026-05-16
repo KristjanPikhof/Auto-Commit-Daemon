@@ -3149,6 +3149,91 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	}
 }
 
+func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	t.Setenv(ai.EnvIntentMinPending, "4")
+	t.Setenv(ai.EnvIntentMaxPendingAge, "1h")
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+	planner := &recordingIntentPlanner{}
+	trace := &memoryTraceLogger{}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     manual,
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			Trace:         trace,
+			IntentPlanner: planner,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "wake-only.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write wake-only: %v", err)
+	}
+	if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false, sql.NullString{}); err != nil {
+		t.Fatalf("enqueue wake flush request: %v", err)
+	}
+	wakeCh <- struct{}{}
+
+	waitFor(t, 2*time.Second, "wake flush request completed", func() bool {
+		return countFlushByStatus(t, f.db, "completed") >= 1
+	})
+	waitFor(t, 2*time.Second, "capture event remains pending", func() bool {
+		pending, err := state.PendingEvents(context.Background(), f.db, 0)
+		return err == nil && len(pending) == 1
+	})
+	waitFor(t, 2*time.Second, "intent batch wait trace", func() bool {
+		return len(traceEventsByClass(trace.Events(), "intent.batch_wait")) == 1
+	})
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 for wake-only drain below MinPending", planner.calls)
+	}
+	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse after wake: %v", err)
+	}
+	if head != startHead {
+		t.Fatalf("HEAD advanced on wake-only drain below MinPending: got %s want %s", head, startHead)
+	}
+	if events := traceEventsByClass(trace.Events(), "replay.intent.wake_drained"); len(events) != 1 {
+		t.Fatalf("wake_drained trace=%+v want exactly one event", events)
+	}
+	if events := traceEventsByClass(trace.Events(), "intent.batch_wait"); len(events) != 1 {
+		t.Fatalf("intent.batch_wait trace=%+v want exactly one event", events)
+	}
+}
+
 // waitFor polls cond until it returns true or the deadline elapses, then
 // fails. The 20ms granularity keeps the test responsive without burning
 // CPU on a tight loop. Used by deterministic tests to wait for the daemon
