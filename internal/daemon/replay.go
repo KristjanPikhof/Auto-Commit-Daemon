@@ -1010,9 +1010,9 @@ func replayIntentBatch(
 	if err != nil {
 		return sum, err
 	}
-	traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	if forced {
+		traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
 		if err := recordIntentForcedDecision(ctx, db, items, activeCtx, nowSec, cfg.deferLimit); err != nil {
 			return sum, err
 		}
@@ -1096,12 +1096,14 @@ func replayIntentBatch(
 			}
 		} else {
 			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
-			traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
 		}
 		cfg.planner = ai.DeterministicProvider{}
 	}
 
+	if !forced {
+		traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
+	}
 	plannerCtx := ctx
 	if opts.PromptTrace != nil {
 		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
