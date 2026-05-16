@@ -154,9 +154,10 @@ visible pending count is below `min_pending` and the oldest pending capture is
 younger than `max_pending_age`, ACD waits instead of asking the planner. The
 status, diagnose, and doctor reports show how many more captures are needed or
 how long remains until the age trigger. To publish the current visible batch
-now, run `acd wake --repo . --session-id "$ACD_SESSION_ID"` from a harness shell
-or otherwise request a flush; that bypasses only the batch wait, not validation
-or replay safety checks.
+now, run `acd flush --logical --repo . --session-id "$ACD_SESSION_ID"` from a
+harness shell. Plain `acd wake` nudges capture/replay but still honors the
+intent batch gate. Logical flush bypasses only the batch wait, not validation or
+replay safety checks.
 
 If deferrals keep growing after planning starts, reduce the batching thresholds,
 check provider health, or temporarily return to `ACD_COMMIT_STRATEGY=event`.
