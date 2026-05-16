@@ -107,7 +107,10 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 	if resumed.ExitCode != 0 {
 		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
 	}
-	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-group")
+	flushed := runAcd(t, ctx, envWith(env, extra...), "flush", "--repo", repo, "--session-id", "intent-group", "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s", flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "intent-one.txt", "published", 10*time.Second)
