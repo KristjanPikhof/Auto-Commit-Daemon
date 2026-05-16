@@ -2699,6 +2699,12 @@ func TestReplay_IntentStrategySingletonShortCircuitUsesPerEventMessage(t *testin
 	if events := traceEventsByClass(trace.Events(), "replay.intent.singleton_shortcircuit"); len(events) != 1 {
 		t.Fatalf("singleton_shortcircuit trace=%+v want one event", events)
 	}
+	if events := traceEventsByClass(trace.Events(), "intent.planner.input"); len(events) != 0 {
+		t.Fatalf("planner input trace=%+v want none for singleton short-circuit", events)
+	}
+	if events := traceEventsByClass(trace.Events(), "intent.planner.output"); len(events) != 0 {
+		t.Fatalf("planner output trace=%+v want none for singleton short-circuit", events)
+	}
 }
 
 func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
