@@ -216,6 +216,11 @@ type Options struct {
 	// Trace receives best-effort decision records. Nil uses ACD_TRACE env
 	// wiring; disabled env returns a no-op logger.
 	Trace acdtrace.Logger
+
+	// IntentPlanner overrides the intent planner used by Replay. Production
+	// leaves this nil; tests inject a recorder to assert run-loop gate
+	// behavior without involving network or subprocess providers.
+	IntentPlanner ai.IntentPlanner
 }
 
 // resolveClientTTL honors EnvClientTTLSeconds + opt.
@@ -1340,6 +1345,10 @@ func Run(ctx context.Context, opts Options) error {
 		return true
 	}
 
+	wakeAckLogNext := now().Add(time.Minute)
+	var wakeAckCount int
+	var wakeAckLastID int64
+
 	for {
 		branchTransitionBlocked = false
 
@@ -1526,7 +1535,9 @@ func Run(ctx context.Context, opts Options) error {
 		if flushLimit <= 0 {
 			flushLimit = DefaultFlushLimit
 		}
-		flushed := 0
+		flushedTotal := 0
+		flushedLogical := 0
+		flushedWake := 0
 		for {
 			if err := ctx.Err(); err != nil {
 				break
@@ -1545,16 +1556,50 @@ func Run(ctx context.Context, opts Options) error {
 			if !ok {
 				break
 			}
-			flushed++
-			logger.Info("flush request acked",
+			flushedTotal++
+			if fr.Command == "flush_logical" {
+				flushedLogical++
+			}
+			if fr.Command == "wake" {
+				flushedWake++
+				wakeAckCount++
+				wakeAckLastID = fr.ID
+			}
+			logger.Debug("flush request acked",
 				"id", fr.ID, "command", fr.Command)
 			if err := state.CompleteFlushRequest(ctx, opts.DB, fr.ID, true,
 				sql.NullString{String: "flushed", Valid: true}); err != nil {
 				logger.Warn("complete flush", "err", err.Error())
 			}
-			if flushed >= flushLimit {
+			if flushedTotal >= flushLimit {
 				break
 			}
+		}
+		if flushedWake > 0 && flushedLogical == 0 {
+			recordTrace(tracer, acdtrace.Event{
+				Repo:       opts.RepoPath,
+				BranchRef:  cctx.BranchRef,
+				HeadSHA:    cctx.BaseHead,
+				EventClass: "replay.intent.wake_drained",
+				Decision:   "wake_drained",
+				Reason:     "wake flush_requests drained without logical flush",
+				Input: map[string]any{
+					"flushed_total": flushedTotal,
+					"flushed_wake":  flushedWake,
+				},
+				Generation: cctx.BranchGeneration,
+			})
+		}
+		if tickNow := now(); !tickNow.Before(wakeAckLogNext) {
+			if wakeAckCount > 0 {
+				logger.Info("wake flush requests acked",
+					"count", wakeAckCount,
+					"last_id", wakeAckLastID,
+					"window", time.Minute.String())
+				wakeAckCount = 0
+				wakeAckLastID = 0
+			}
+			wakeAckLogNext = tickNow.Add(time.Minute)
 		}
 		// Re-check the branch token AFTER the flush drain. The drain can
 		// iterate up to DefaultFlushLimit (256) rows, and operator git
@@ -1670,7 +1715,8 @@ func Run(ctx context.Context, opts Options) error {
 				IntentMaxPendingAge:   providerCfg.IntentMaxPendingAge,
 				IntentRecentCommits:   providerCfg.IntentRecentCommits,
 				IntentDeferLimit:      providerCfg.IntentDeferLimit,
-				IntentBypassBatchWait: flushed > 0,
+				IntentBypassBatchWait: flushedLogical > 0,
+				IntentPlanner:         opts.IntentPlanner,
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
@@ -1704,7 +1750,7 @@ func Run(ctx context.Context, opts Options) error {
 		// pending work still visible beyond DefaultReplayLimit. Treat it as
 		// work so the scheduler resets to the base interval and the next
 		// iteration drains the remainder without waiting for the idle ceiling.
-		hadWork := flushed > 0 || capSum.EventsAppended > 0 || repSum.Published > 0 || repSum.HasMore
+		hadWork := flushedTotal > 0 || capSum.EventsAppended > 0 || repSum.Published > 0 || repSum.HasMore
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
