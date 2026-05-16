@@ -103,9 +103,14 @@ Source of truth: `internal/ai/config.go` and `internal/daemon/message.go`.
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending-count gate before a normal planner window starts. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Bounded wait escape hatch for sparse pending queues that have not reached `ACD_INTENT_MIN_PENDING`. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent branch/path commits included as compact context. |
-| `ACD_INTENT_DEFER_LIMIT` | `2` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. |
+| `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals allowed before the oldest overdue capture is forced into a one-capture window. Raise to `2` to restore the earlier tolerance. |
 | `ACD_AI_DIFF_EGRESS` | unset | Truthy (`1`/`true`/`yes`) opts in to sending reconstructed diffs. Off by default; metadata-only payload otherwise. Has no effect for `deterministic`. |
 | `ACD_AI_PROMPT_TRACE` | unset | Truthy (`1`/`true`/`yes`) writes local AI prompt diagnostics to `<gitDir>/acd/prompt-trace/` when a non-deterministic provider sends a request. Treat as sensitive: records are post-redaction/truncation but may still contain source text. |
+| `ACD_INTENT_PATH_COALESCE` | `1` | Folds consecutive same-path captures into one planner offer. Set `0`/`false`/`no`/`off` to disable; restart the daemon to apply. |
+| `ACD_INTENT_RETRY_ON_INVALID` | `1` | Retries the primary planner once after a typed validation error. Set `0`/`false`/`no`/`off` to disable. |
+| `ACD_INTENT_REJECTS_RAW` | unset | Off keeps validator-rejected planner responses redacted in `planner-rejects.jsonl`. Truthy stores raw model output for debugging; treat as sensitive. |
+| `ACD_PATH_QUIESCENCE_SECONDS` | `0` | When non-zero, waits until a touched path has been quiet for that many seconds before offering it to the planner. Capture remains durable. |
+| `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | When non-zero, adds a recent-HEAD-commit hint for matching paths. Default is off because it costs extra `git log` lookups. |
 
 Unrecognized `ACD_AI_PROVIDER` values degrade to `deterministic` with a warning log; the daemon never silently disables commit-message generation.
 
