@@ -8,11 +8,13 @@
 // commonly leave work uncommitted on disk for the full age trigger.
 //
 // `acd flush --logical` rewires that to: refresh the heartbeat, enqueue a
-// flush_request labeled "flush_logical", and signal the daemon. The daemon's
-// existing flush-drain path already sets IntentBypassBatchWait=true on any
-// non-empty drain, which causes the planner to evaluate the visible window
-// without waiting for IntentMinPending or IntentMaxPendingAge — exactly the
+// flush_request labeled "flush_logical", and signal the daemon. The daemon
+// treats only "flush_logical" drains as IntentBypassBatchWait=true, causing
+// the planner to evaluate the visible window without waiting for
+// IntentMinPending or IntentMaxPendingAge — exactly the
 // "treat as age-trigger-now" semantics the harness Stop/idle hooks need.
+// Plain `acd wake` drains are acknowledged, but still honor the intent batch
+// gate.
 //
 // Without --logical the command behaves like `acd touch`: heartbeat refresh
 // only, no signal, no flush enqueue. This keeps the flag explicit so a
