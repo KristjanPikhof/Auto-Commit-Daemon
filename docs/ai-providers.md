@@ -152,9 +152,11 @@ Batching behavior is deliberately bounded:
 - `ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch. Sparse repos publish
   when the oldest visible pending capture reaches that age even if the count
   trigger was not met.
-- `acd wake` and other explicit flush requests bypass only the batch wait. They
-  do not bypass planner validation, ordering checks, terminal replay barriers,
-  or the forced-aging rules.
+- `acd flush --logical` bypasses only the batch wait. Plain `acd wake` refreshes
+  the heartbeat and nudges capture/replay, but it still honors
+  `ACD_INTENT_MIN_PENDING` and `ACD_INTENT_MAX_PENDING_AGE`.
+- Neither command bypasses planner validation, ordering checks, terminal replay
+  barriers, or the forced-aging rules.
 - Forced aging can still select a one-capture window after repeated deferrals;
   if an earlier related-path capture must land first, ACD preserves that order.
 
