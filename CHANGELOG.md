@@ -14,6 +14,10 @@
 
 ### Changed
 
+- AI-generated commit messages now follow the snapshot-worker style: a
+  50-character imperative subject, a blank line, and wrapped `- ` bullets for
+  context. The prompt also steers subjects toward semantic changes instead of
+  filenames.
 - Plain `acd wake` no longer bypasses `ACD_INTENT_MIN_PENDING` or
   `ACD_INTENT_MAX_PENDING_AGE`. It still refreshes the session heartbeat and
   nudges capture/replay, but only `acd flush --logical` forces the current
@@ -28,6 +32,9 @@
   `deferred_seqs` is normalized before validation. Selected wins, the stale
   deferred reason is dropped, and the grouped commit can proceed without a
   deterministic fallback.
+- Intent-planner grouping rationale now stays in `grouping_reason` instead of
+  leaking into the commit body. Commit bodies are reserved for practical
+  why/context bullets.
 - Planner rejects logging is wired at daemon startup and covered by live daemon
   tests, including 5 MiB rotation.
 
