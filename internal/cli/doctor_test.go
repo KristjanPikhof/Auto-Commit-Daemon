@@ -486,6 +486,11 @@ func TestDoctor_IntentBatchWaitAddsOperationalNotes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
+	if err := state.RegisterClient(ctx, d, state.Client{
+		SessionID: "intent-session", Harness: "codex", LastSeenTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("register client: %v", err)
+	}
 	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
 		t.Fatalf("set commit.strategy: %v", err)
 	}
@@ -514,13 +519,18 @@ func TestDoctor_IntentBatchWaitAddsOperationalNotes(t *testing.T) {
 	notes := strings.Join(rr.Notes, "\n")
 	for _, want := range []string{
 		"intent replay is waiting",
+		"acd flush --logical --repo " + repo + " --session-id intent-session",
 		"explicit flushes bypass intent batch wait",
+		"registered active session id",
 		"lower ACD_INTENT_MIN_PENDING",
 		"ACD_COMMIT_STRATEGY=event",
 	} {
 		if !strings.Contains(notes, want) {
 			t.Fatalf("doctor notes missing %q: %v", want, rr.Notes)
 		}
+	}
+	if strings.Contains(notes, "run acd flush --logical for the active session") {
+		t.Fatalf("doctor notes still include bare logical flush hint: %v", rr.Notes)
 	}
 
 	var humanOut bytes.Buffer
