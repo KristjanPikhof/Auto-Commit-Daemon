@@ -62,6 +62,16 @@ func TestSanitize_SubjectCap(t *testing.T) {
 	}
 }
 
+func TestSanitize_SubjectCapIsFiftyCharacters(t *testing.T) {
+	if SubjectCap != 50 {
+		t.Fatalf("SubjectCap=%d want 50", SubjectCap)
+	}
+	got := SanitizeMessage("Refactor admin moderation workspace tables and detail panels")
+	if len([]rune(got)) > 50 {
+		t.Fatalf("got len=%d > 50 (%q)", len([]rune(got)), got)
+	}
+}
+
 // TestSanitize_BodyBullets: a multi-line body is normalized into "- "
 // prefixed bullets with hanging indent on long bullets.
 func TestSanitize_BodyBullets(t *testing.T) {

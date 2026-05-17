@@ -200,6 +200,15 @@ func TestOpenAI_PromptTraceRecordsExactEventRequest(t *testing.T) {
 	if !strings.Contains(got.SystemMessage, "git commit message generator") {
 		t.Fatalf("system message not recorded: %q", got.SystemMessage)
 	}
+	for _, want := range []string{
+		"max 50 characters",
+		"Line 3+: bullet list for why/context",
+		"Do not mention filenames in line 1",
+	} {
+		if !strings.Contains(got.SystemMessage, want) {
+			t.Fatalf("system message missing %q: %q", want, got.SystemMessage)
+		}
+	}
 	if !strings.Contains(got.UserMessage, "Generate a commit message") {
 		t.Fatalf("user message not recorded: %q", got.UserMessage)
 	}
@@ -581,6 +590,9 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 				Name       string `json:"name"`
 				Parameters struct {
 					Required []string `json:"required"`
+					Properties map[string]struct {
+						Description string `json:"description"`
+					} `json:"properties"`
 				} `json:"parameters"`
 			} `json:"function"`
 		} `json:"tools"`
@@ -605,10 +617,33 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 			t.Fatalf("schema required fields %q missing %q", required, field)
 		}
 	}
+	props := sent.Tools[0].Function.Parameters.Properties
+	for field, want := range map[string]string{
+		"subject":         "<= 50 chars",
+		"body":            "Do not explain why selected captures fit together",
+		"grouping_reason": "not part of the git commit message",
+	} {
+		if !strings.Contains(props[field].Description, want) {
+			t.Fatalf("%s description missing %q: %q", field, want, props[field].Description)
+		}
+	}
+	var systemContent string
 	var userContent string
 	for _, m := range sent.Messages {
+		if m.Role == "system" {
+			systemContent = m.Content
+		}
 		if m.Role == "user" {
 			userContent = m.Content
+		}
+	}
+	for _, want := range []string{
+		"max 50 characters",
+		"Keep grouping rationale in grouping_reason, not in body",
+		"never write prose explaining why the selected captures fit together",
+	} {
+		if !strings.Contains(systemContent, want) {
+			t.Fatalf("intent system message missing %q: %q", want, systemContent)
 		}
 	}
 	if !strings.Contains(userContent, `"latest_commit"`) ||

@@ -64,7 +64,7 @@ type Result struct {
 
 // SubjectCap is the maximum subject length any sanitized commit message
 // will reach. Anything longer is truncated at a word boundary with `…`.
-const SubjectCap = 72
+const SubjectCap = 50
 
 // BodyWrap is the line width used when re-wrapping bullet bodies.
 const BodyWrap = 72
@@ -89,6 +89,17 @@ const DiffCap = 4000
 // limit even at the upper window value.
 const IntentStageDiffCap = 16000
 
+const commitMessageFormatInstructions = "Commit message format: " +
+	"Line 1: <imperative verb> <what changed>, max 50 characters, no trailing period. " +
+	"Line 2: blank. " +
+	"Line 3+: bullet list for why/context; each bullet starts with '- '; max 72 characters per line; wrapped continuation lines must not start with '- '. " +
+	"Line 1 must start with an imperative verb such as Add, Fix, Refactor, Remove, Rename, Simplify, Update, or Document. " +
+	"Describe the semantic change, not just the filename. " +
+	"Prefer a concise subject and practical body focused on what changed and why. " +
+	"The body should explain why, intent, impact, or context, not restate the diff. " +
+	"Avoid generic messages such as Update file, WIP, or changes. " +
+	"Do not mention filenames in line 1 unless the change is specifically about that file itself."
+
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
 	"You may select exactly one capture or any larger non-empty subset. " +
@@ -103,6 +114,10 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"Every deferred_reasons[i].seq must appear in deferred_seqs. " +
 	"Do not emit a reason for a seq that is selected, and do not reference seqs outside the offered window. " +
 	"Each deferred seq needs exactly one reason; selected seqs get no reason entry. " +
+	"The subject and body fields are the final git commit message and must follow this format. " +
+	commitMessageFormatInstructions + " " +
+	"Keep grouping rationale in grouping_reason, not in body. " +
+	"Body must be empty or contain only commit-message bullets for why/context; never write prose explaining why the selected captures fit together. " +
 	"Worked example: offered=[10,11,12] where 10 and 11 touch internal/checkout/service.go and 12 touches docs/checkout.md; valid plan selected=[10,11], deferred=[12], deferred_reasons=[{seq:12,reason:\"docs change is independent\"}]; invalid plan selected=[11], deferred=[10,12] would split the same-path chain on internal/checkout/service.go and is forbidden."
 
 var (
