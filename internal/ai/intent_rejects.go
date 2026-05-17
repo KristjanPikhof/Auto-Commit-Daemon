@@ -3,12 +3,13 @@ package ai
 // intent_rejects.go — durable JSONL log of rejected intent plans.
 //
 // Whenever a planner provider's call to ValidateIntentPlan fails, the
-// provider records the raw model output, the offered seqs, and the typed
-// validator code/message to <gitDir>/acd/planner-rejects.jsonl. The log is
-// the operator's primary forensic surface for "why does the daemon keep
-// falling back to deterministic commits": it captures the wire-level model
-// response immediately before the daemon's deterministic fallback fires,
-// which is the data we need to reproduce planner errors offline.
+// provider records the offered seqs, typed validator code/message, raw
+// response size + sha256, and a small parsed-plan summary to
+// <gitDir>/acd/planner-rejects.jsonl. Raw model output is redacted by default;
+// ACD_INTENT_REJECTS_RAW=1 opts back into verbatim retention. The log is the
+// operator's primary forensic surface for "why does the daemon keep falling
+// back to deterministic commits" without durably retaining raw planner
+// payloads unless the operator explicitly asks for that debugging mode.
 //
 // Path layout follows the project convention (DBPathFromGitDir et al.) and
 // is configured once at daemon startup via ConfigureIntentRejectsLogger.
