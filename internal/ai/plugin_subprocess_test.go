@@ -135,6 +135,41 @@ done
 	}
 }
 
+func TestSubprocess_PlanIntentRejectsSelectedDeferredOverlap(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"intent_plan"'*'"planner_request"'*)
+      printf '%s\n' '{"version":1,"selected_seqs":[101],"deferred_seqs":[101,102],"subject":"Update checkout flow","body":"","grouping_reason":"single focused checkout change","deferred_reasons":[{"seq":101,"reason":"overlap"},{"seq":102,"reason":"separate documentation change"}],"error":""}'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing planner request"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	_, err := p.PlanIntent(context.Background(), sampleIntentPlanRequest(t))
+	if err == nil {
+		t.Fatalf("expected selected/deferred overlap validation error")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("error=%T %v want *IntentPlanValidationError", err, err)
+	}
+	if typed.Code != IntentPlanValidationSelectedDeferredOverlap || typed.Seq != 101 {
+		t.Fatalf("typed error code=%v seq=%d want overlap seq 101", typed.Code, typed.Seq)
+	}
+}
+
 func TestSubprocess_PromptTraceRecordsIntentCapturedDiffTransform(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -349,7 +384,7 @@ done
 `)
 	p := NewSubprocessProvider("slow", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-slow", slowBin),
-		Timeout:  200 * time.Millisecond,
+		Timeout:  time.Second,
 		Stderr:   io.Discard,
 	})
 	t.Cleanup(func() { _ = p.Close() })
