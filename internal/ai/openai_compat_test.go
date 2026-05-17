@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -713,7 +714,7 @@ func TestOpenAIIntentPlan_NormalizesSpuriousDeferredReason(t *testing.T) {
 	}
 }
 
-func TestOpenAIIntentPlan_NormalizesSelectedDeferredOverlap(t *testing.T) {
+func TestOpenAIIntentPlan_RejectsSelectedDeferredOverlap(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 200, cannedIntentPlanToolCall(IntentPlan{
@@ -728,21 +729,16 @@ func TestOpenAIIntentPlan_NormalizesSelectedDeferredOverlap(t *testing.T) {
 			},
 		})
 	})
-	plan, err := p.PlanIntent(context.Background(), req)
-	if err != nil {
-		t.Fatalf("PlanIntent: %v", err)
+	_, err := p.PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected selected/deferred overlap validation error")
 	}
-	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
-		t.Fatalf("selected=%v want [101]", plan.SelectedSeqs)
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("error=%T %v want *IntentPlanValidationError", err, err)
 	}
-	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 102 {
-		t.Fatalf("deferred=%v want [102]", plan.DeferredSeqs)
-	}
-	if len(plan.DeferredReasons) != 1 || plan.DeferredReasons[0].Seq != 102 {
-		t.Fatalf("normalized deferred reasons=%+v want one entry for 102", plan.DeferredReasons)
-	}
-	if plan.Source != "openai-compat" {
-		t.Fatalf("source=%q", plan.Source)
+	if typed.Code != IntentPlanValidationSelectedDeferredOverlap || typed.Seq != 101 {
+		t.Fatalf("typed error code=%v seq=%d want overlap seq 101", typed.Code, typed.Seq)
 	}
 }
 
