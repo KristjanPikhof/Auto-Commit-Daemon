@@ -157,7 +157,8 @@ Batching behavior is deliberately bounded:
 - `ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch. Sparse repos publish
   when the oldest visible pending capture reaches that age even if the count
   trigger was not met.
-- `acd flush --logical` bypasses only the batch wait. Plain `acd wake` refreshes
+- `acd flush --logical --session-id <active-session>` bypasses only the batch
+  wait and requires an existing registered session. Plain `acd wake` refreshes
   the heartbeat and nudges capture/replay, but it still honors
   `ACD_INTENT_MIN_PENDING` and `ACD_INTENT_MAX_PENDING_AGE`.
 - Neither command bypasses planner validation, ordering checks, terminal replay
