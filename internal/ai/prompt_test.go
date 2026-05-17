@@ -52,7 +52,7 @@ func TestSanitize_ControlChars(t *testing.T) {
 // TestSanitize_SubjectCap: subjects longer than SubjectCap are truncated
 // at a word boundary with `…`.
 func TestSanitize_SubjectCap(t *testing.T) {
-	long := "This is an extremely long commit subject that absolutely exceeds the seventy-two character cap"
+	long := "This is an extremely long commit subject that absolutely exceeds the fifty character cap"
 	got := SanitizeMessage(long)
 	if !strings.HasSuffix(got, "…") {
 		t.Fatalf("got=%q want trailing ellipsis", got)
