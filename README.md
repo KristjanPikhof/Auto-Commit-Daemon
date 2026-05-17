@@ -90,7 +90,7 @@ export ACD_INTENT_WINDOW=10
 export ACD_INTENT_MIN_PENDING=4        # 4 for sparse repos, 10 for heavy edit bursts
 export ACD_INTENT_MAX_PENDING_AGE=5m
 export ACD_INTENT_RECENT_COMMITS=5
-export ACD_INTENT_DEFER_LIMIT=1        # Wave 2 default
+export ACD_INTENT_DEFER_LIMIT=2
 ~~~
 
 Why these defaults? `MIN_PENDING=4` keeps sparse repos from waiting on a 10-edit batch that never arrives. `DEFER_LIMIT=1` matches the Wave 2 retry+normalize stack: a single deferral is more often planner churn than a real "wait for related work" signal. Raise to `2` if you see legit grouping decisions getting forced into singletons.
