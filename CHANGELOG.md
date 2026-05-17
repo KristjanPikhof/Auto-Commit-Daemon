@@ -9,7 +9,7 @@
   their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
   trace records.
 - Integration coverage now exercises wake-gate behavior, selected/deferred
-  planner overlap normalization, planner-rejects creation and rotation, and the
+  planner overlap rejection, planner-rejects creation and rotation, and the
   singleton short-circuit path.
 
 ### Changed
@@ -29,9 +29,9 @@
 ### Fixed
 
 - Planner output that puts the same seq in both `selected_seqs` and
-  `deferred_seqs` is normalized before validation. Selected wins, the stale
-  deferred reason is dropped, and the grouped commit can proceed without a
-  deterministic fallback.
+  `deferred_seqs` now stays invalid after deferred-reason cleanup. ACD retries
+  with a typed validation error, then falls back safely and records a planner
+  reject if the provider does not repair the overlap.
 - Intent-planner grouping rationale now stays in `grouping_reason` instead of
   leaking into the commit body. Commit bodies are reserved for practical
   why/context bullets.
