@@ -272,6 +272,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if msgFn == nil {
 		msgFn = DeterministicMessage
 	}
+	opts.MessageFn = msgFn
 
 	if paused, err := daemonPauseState(ctx, opts.GitDir, db); err != nil {
 		return sum, err
@@ -1009,9 +1010,9 @@ func replayIntentBatch(
 	if err != nil {
 		return sum, err
 	}
-	traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
 	nowSec := float64(time.Now().UnixNano()) / 1e9
 	if forced {
+		traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
 		if err := recordIntentForcedDecision(ctx, db, items, activeCtx, nowSec, cfg.deferLimit); err != nil {
 			return sum, err
 		}
@@ -1072,6 +1073,37 @@ func replayIntentBatch(
 		cfg.planner = ai.DeterministicProvider{}
 	}
 
+	if !forced && isSingletonProviderFastPath(items) {
+		plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0])
+		if err != nil {
+			return sum, err
+		}
+		if safetyErr := validateIntentSelectionSafety(items, plan); safetyErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, safetyErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, safetyErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, safetyErr.Error(), "singleton fast path validation failed", "Singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else if planErr := ai.ValidateIntentPlan(req, plan); planErr != nil {
+			recordIntentPromptFallback(ctx, cfg.planner, planErr.Error())
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, planErr.Error()); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, planErr.Error(), "singleton fast path validation failed", "Singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+				return sum, err
+			}
+		} else {
+			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
+			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
+		}
+		cfg.planner = ai.DeterministicProvider{}
+	}
+
+	if !forced {
+		traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items, req, cfg)
+	}
 	plannerCtx := ctx
 	if opts.PromptTrace != nil {
 		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
@@ -1690,6 +1722,42 @@ func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item inte
 	}
 }
 
+func isSingletonProviderFastPath(items []intentReplayItem) bool {
+	if len(items) != 1 {
+		return false
+	}
+	item := items[0]
+	return item.coalesce == nil || len(item.coalesce.OriginalSeqs) <= 1
+}
+
+func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item intentReplayItem) (ai.IntentPlan, error) {
+	if msgFn == nil {
+		msgFn = DeterministicMessage
+	}
+	msg, err := msgFn(ctx, EventContext{Event: item.event, Ops: item.ops})
+	if err != nil {
+		return ai.IntentPlan{}, fmt.Errorf("singleton fast path message: %w", err)
+	}
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		msg = "Update files"
+	}
+	parts := strings.SplitN(msg, "\n\n", 2)
+	plan := ai.IntentPlan{
+		SelectedSeqs:   []int64{item.event.Seq},
+		Subject:        strings.TrimSpace(parts[0]),
+		GroupingReason: "singleton fast path",
+		Source:         "per-event",
+	}
+	if len(parts) == 2 {
+		plan.Body = strings.TrimSpace(parts[1])
+	}
+	if plan.Subject == "" {
+		plan.Subject = "Update files"
+	}
+	return plan, nil
+}
+
 // singletonFallbackOp picks the OpItem fed to DiffAwareSubject. For a
 // single captured op (the common case) we use it directly. For events
 // that came in with multiple ops we fall back to the event-level shape
@@ -1729,7 +1797,7 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		// Discard the dropped/synthesized lists: provider-side warns already
 		// fired upstream; emitting another warn here would duplicate the
 		// log entry for the same response.
-		plan, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
+		plan, _, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
 		err = ai.ValidateIntentPlan(req, plan)
 	}
 	if err == nil {
@@ -2035,6 +2103,29 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 		Output: map[string]any{
 			"selected_seqs": plan.SelectedSeqs,
 			"deferred_seqs": plan.DeferredSeqs,
+			"source":        plan.Source,
+		},
+		Generation: cctx.BranchGeneration,
+	})
+}
+
+func traceIntentSingletonShortCircuit(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, item intentReplayItem, plan ai.IntentPlan) {
+	if logger == nil {
+		return
+	}
+	logger.Record(acdtrace.Event{
+		Repo:       repoRoot,
+		BranchRef:  cctx.BranchRef,
+		HeadSHA:    cctx.BaseHead,
+		EventClass: "replay.intent.singleton_shortcircuit",
+		Decision:   "selected",
+		Reason:     plan.GroupingReason,
+		Input: map[string]any{
+			"offered_seq": item.event.Seq,
+			"path":        item.event.Path,
+		},
+		Output: map[string]any{
+			"selected_seqs": plan.SelectedSeqs,
 			"source":        plan.Source,
 		},
 		Generation: cctx.BranchGeneration,

@@ -35,12 +35,16 @@ acd setup pi            # → ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
-Codex needs one extra line in `~/.codex/config.toml`:
+Codex hooks are enabled by default. If your `~/.codex/config.toml` pins feature
+flags, keep lifecycle hooks enabled with the canonical key:
 
 ~~~toml
 [features]
-codex_hooks = true
+hooks = true
 ~~~
+
+Do not set `hooks = false`; that disables Codex lifecycle hooks. The older
+`codex_hooks` key still works as a deprecated alias.
 
 After wiring, sanity-check with `acd doctor`. It checks the snippet matches the current template and tells you what to fix.
 
@@ -91,6 +95,8 @@ export ACD_INTENT_DEFER_LIMIT=1        # Wave 2 default
 
 Why these defaults? `MIN_PENDING=4` keeps sparse repos from waiting on a 10-edit batch that never arrives. `DEFER_LIMIT=1` matches the Wave 2 retry+normalize stack: a single deferral is more often planner churn than a real "wait for related work" signal. Raise to `2` if you see legit grouping decisions getting forced into singletons.
 
+Claude Code, OpenCode, and Pi snippets now use `acd flush --logical` at the natural turn boundary, so this profile still commits promptly with `MAX_PENDING_AGE=5m`. If you keep an older wake-only snippet or want faster background commits between turn boundaries, lower `ACD_INTENT_MAX_PENDING_AGE` to `60s`.
+
 `ACD_AI_DIFF_EGRESS=1` is the one knob that materially improves grouping. Without it the planner sees metadata only and groups poorly. Only leave it off if your endpoint is untrusted.
 
 ### When to skip intent
@@ -116,7 +122,7 @@ acd explain --path FILE            # why was this captured / skipped / blocked?
 acd explain --commit HEAD          # why did these captures land in this commit?
 
 acd flush --session-id X --logical # drain pending captures NOW (bypasses MIN_PENDING / age)
-acd wake --session-id X            # heartbeat refresh + low-latency replay nudge
+acd wake --session-id X            # heartbeat refresh + capture/replay nudge; does not bypass intent gates
 acd stop --session-id X            # refcount-aware stop (stays alive while peers are connected)
 acd stop                           # stop the current repo daemon
 acd stop --all                     # stop every registered daemon
@@ -167,7 +173,7 @@ Refuses on detached HEAD, in-progress git operations (rebase, merge, cherry-pick
 
 ## Migrating from prior releases
 
-Re-run `acd setup <harness>` after upgrading. The Stop / `session.idle` hook for Claude Code, OpenCode, and Pi changed from `acd touch` to `acd flush --logical` so partial work commits when the AI session ends instead of waiting up to 5 minutes for the age trigger. Existing snippets keep working but lose the new prompt-end commit boundary. `acd doctor` flags the drift.
+Re-run `acd setup <harness>` after upgrading. The Stop / `session.idle` hook for Claude Code, OpenCode, and Pi changed from `acd touch` to `acd flush --logical` so partial work commits when the AI session ends instead of waiting up to 5 minutes for the age trigger. Existing snippets keep working but lose the new prompt-end commit boundary; plain `acd wake` only nudges capture/replay and does not bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. `acd doctor` flags the drift. If you intentionally keep wake-only hooks and want faster commits, set `ACD_INTENT_MAX_PENDING_AGE=60s`.
 
 `acd flush --logical` is the new explicit drain entrypoint:
 

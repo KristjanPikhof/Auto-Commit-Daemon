@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+- Singleton intent windows now use the normal per-event commit-message
+  provider instead of the structured intent planner. One-capture commits keep
+  their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
+  trace records.
+- Integration coverage now exercises wake-gate behavior, selected/deferred
+  planner overlap rejection, planner-rejects creation and rotation, and the
+  singleton short-circuit path.
+
+### Changed
+
+- AI-generated commit messages now follow the snapshot-worker style: a
+  50-character imperative subject, a blank line, and wrapped `- ` bullets for
+  context. The prompt also steers subjects toward semantic changes instead of
+  filenames.
+- Plain `acd wake` no longer bypasses `ACD_INTENT_MIN_PENDING` or
+  `ACD_INTENT_MAX_PENDING_AGE`. It still refreshes the session heartbeat and
+  nudges capture/replay, but only `acd flush --logical` forces the current
+  visible intent window through the batch gate.
+- Wake flush-request acknowledgements moved to debug logs with a periodic
+  summary, so active tool hooks no longer flood daemon logs during busy
+  sessions.
+
+### Fixed
+
+- Planner output that puts the same seq in both `selected_seqs` and
+  `deferred_seqs` now stays invalid after deferred-reason cleanup. ACD retries
+  with a typed validation error, then falls back safely and records a planner
+  reject if the provider does not repair the overlap.
+- Intent-planner grouping rationale now stays in `grouping_reason` instead of
+  leaking into the commit body. Commit bodies are reserved for practical
+  why/context bullets.
+- Planner rejects logging is wired at daemon startup and covered by live daemon
+  tests, including 5 MiB rotation.
+
+### Docs
+
+- README, `CLAUDE.md`, harness notes, and intent docs now state the wake versus
+  logical-flush behavior explicitly. If you preferred the old wake-only cadence,
+  lower `ACD_INTENT_MAX_PENDING_AGE` (for example, `60s`) or install the current
+  harness snippets so turn boundaries call `acd flush --logical`.
+
 ## v2026-05-16
 
 Intent-planner atomicity: same-path coalesce, validation retry, planner-rejects forensics, Stop-hook rewire.
@@ -293,8 +336,9 @@ Intent-planner atomicity: same-path coalesce, validation retry, planner-rejects 
   Codex. Codex re-flags all hook entries as review-required after every
   `hooks.json` content change, so re-run `/hooks` after any re-install too.
   `acd doctor` now warns when both old and new Codex hook configs are installed,
-  because Codex will run both. Keep Codex lifecycle hooks enabled in
-  `~/.codex/config.toml` with `[features].codex_hooks = true`. See
+  because Codex will run both. Codex hooks are enabled by default; if
+  `~/.codex/config.toml` pins feature flags, keep lifecycle hooks enabled with
+  `[features].hooks = true` (`codex_hooks` is only a deprecated alias). See
   [templates/codex/README.md](templates/codex/README.md) for full details.
 - Codex hooks now read `cwd` from hook stdin, no longer require
   `CODEX_PROJECT_DIR`, and use `acd hook-stdin-extract session_id cwd?` for the

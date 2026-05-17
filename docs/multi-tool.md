@@ -15,10 +15,11 @@ conflict-resolution mechanics this document references.
 `pending` events in SQLite. The replay loop drains the queue on each poll tick.
 With `ACD_COMMIT_STRATEGY=event`, it considers one event at a time. With
 `ACD_COMMIT_STRATEGY=intent`, it may wait for `ACD_INTENT_MIN_PENDING`, the
-`ACD_INTENT_MAX_PENDING_AGE` escape hatch, or an explicit flush before offering
-at most `ACD_INTENT_WINDOW` visible captures to the planner. It may then publish
-a selected group as one commit, but the same safety checks and idempotent settle
-rules still apply to each selected capture.
+`ACD_INTENT_MAX_PENDING_AGE` escape hatch, or an explicit logical flush before
+offering at most `ACD_INTENT_WINDOW` visible captures to the planner. Plain
+`acd wake` nudges capture/replay but still honors the intent batch gate. It may
+then publish a selected group as one commit, but the same safety checks and
+idempotent settle rules still apply to each selected capture.
 When another tool (Claude Code hook, Codex hook, or any `git commit` call) lands
 a commit *before* `acd`'s replay tick, the branch ref has already advanced. On
 the next replay pass `acd` detects this via its idempotent publish probe

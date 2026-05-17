@@ -268,6 +268,11 @@ const (
 	// Often a planner hallucination; retry quotes the validator message
 	// back so the planner can drop the spurious seq.
 	IntentPlanValidationOfferedWindow
+	// IntentPlanValidationSelectedDeferredOverlap fires when the planner
+	// places the same seq in both selected_seqs and deferred_seqs. Providers
+	// can normalize this by letting selected_seqs win and removing the seq
+	// from deferred_seqs.
+	IntentPlanValidationSelectedDeferredOverlap
 )
 
 // IntentPlanValidationError is the typed error returned by ValidateIntentPlan
@@ -361,7 +366,7 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 		}
 		if _, overlap := selected[seq]; overlap {
 			return &IntentPlanValidationError{
-				Code:    IntentPlanValidationShape,
+				Code:    IntentPlanValidationSelectedDeferredOverlap,
 				Seq:     seq,
 				Message: fmt.Sprintf("intent planner: seq %d appears in selected and deferred", seq),
 			}
@@ -441,8 +446,8 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 // tests and downstream renderers can recognize the marker.
 const IntentPlanReasonMarker = "planner omitted reason"
 
-// NormalizeIntentPlanDeferredReasons normalizes plan.DeferredReasons against
-// plan.DeferredSeqs in two ways:
+// NormalizeIntentPlanDeferredReasons normalizes plan.DeferredReasons in two
+// ways:
 //
 //  1. Drops DeferredReason entries whose Seq is not present in DeferredSeqs
 //     (planner emitted a reason for a selected or non-offered seq). Providers
@@ -453,18 +458,25 @@ const IntentPlanReasonMarker = "planner omitted reason"
 //     IntentPlanReasonMarker so the marker round-trips into the decision
 //     ledger and operators see "planner omitted reason" instead of blank.
 //
-// Returns the cleaned plan, the dropped seqs in input order (over-emitted by
-// the planner), and the synthesized seqs in DeferredSeqs order (planner
-// omitted them). Callers emit a single slog.Warn naming both lists when
-// either is non-empty so double-normalize defense-in-depth runs (e.g., the
-// daemon's planIntentWithFallback) stay silent on the second pass.
+// It deliberately does not normalize a seq that appears in both SelectedSeqs
+// and DeferredSeqs. That contradictory planner output must remain visible to
+// ValidateIntentPlan as IntentPlanValidationSelectedDeferredOverlap so the
+// composed retry and deterministic fallback paths can handle it safely.
+//
+// Returns the cleaned plan, the dropped reason seqs in input order
+// (over-emitted by the planner), the synthesized seqs in DeferredSeqs order
+// (planner omitted them), and a legacy overlap-removed result. The final
+// return is retained for compatibility and is always nil.
+// Callers emit a single slog.Warn naming all non-empty lists so
+// double-normalize defense-in-depth runs (e.g., the daemon's
+// planIntentWithFallback) stay silent on the second pass.
 //
 // Aliasing: on the no-op path the returned plan.DeferredReasons still aliases
 // the caller's backing array; callers must not mutate the slice in place. On
-// the drop or synth path the slice is freshly allocated.
-func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64, []int64) {
+// the drop or synth path the changed slices are freshly allocated.
+func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64, []int64, []int64) {
 	if len(plan.DeferredReasons) == 0 && len(plan.DeferredSeqs) == 0 {
-		return plan, nil, nil
+		return plan, nil, nil, nil
 	}
 	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
 	for _, seq := range plan.DeferredSeqs {
@@ -499,10 +511,10 @@ func NormalizeIntentPlanDeferredReasons(plan IntentPlan) (IntentPlan, []int64, [
 		have[seq] = struct{}{}
 	}
 	if len(dropped) == 0 && len(synthesized) == 0 {
-		return plan, nil, nil
+		return plan, nil, nil, nil
 	}
 	plan.DeferredReasons = cleaned
-	return plan, dropped, synthesized
+	return plan, dropped, synthesized, nil
 }
 
 // PlanIntent provides the deterministic fallback planner. It selects exactly

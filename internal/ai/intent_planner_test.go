@@ -212,6 +212,8 @@ func TestIntentPlannerPromptContainsPlannerRules(t *testing.T) {
 		"never split a same-path chain",
 		"Defer_count guidance",
 		"defer_count >= 1",
+		"selected_seqs and deferred_seqs MUST be disjoint",
+		"union MUST equal offered_seqs",
 		"Every deferred_reasons[i].seq must appear in deferred_seqs",
 		"Worked example",
 		"internal/checkout/service.go",
@@ -295,6 +297,31 @@ func TestValidateIntentPlanRejectsInvalidShapes(t *testing.T) {
 				t.Fatalf("expected validation error")
 			}
 		})
+	}
+}
+
+func TestValidateIntentPlanReturnsTypedErrorForSelectedDeferredOverlap(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:    []int64{101},
+		DeferredSeqs:    []int64{101, 102},
+		Subject:         "Update checkout flow",
+		GroupingReason:  "single focused checkout change",
+		DeferredReasons: []DeferredReason{{Seq: 101, Reason: "overlap"}, {Seq: 102, Reason: "docs"}},
+	}
+	err := ValidateIntentPlan(req, plan)
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("expected *IntentPlanValidationError, got %T: %v", err, err)
+	}
+	if typed.Code != IntentPlanValidationSelectedDeferredOverlap {
+		t.Fatalf("code=%v want IntentPlanValidationSelectedDeferredOverlap", typed.Code)
+	}
+	if typed.Seq != 101 {
+		t.Fatalf("seq=%d want 101", typed.Seq)
 	}
 }
 
@@ -392,15 +419,69 @@ func TestNormalizeIntentPlanDeferredReasonsDropsNonDeferredEntries(t *testing.T)
 			{Seq: 99, Reason: "spurious entry for unknown seq"},
 		},
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 2 || dropped[0] != 11 || dropped[1] != 99 {
 		t.Fatalf("dropped=%v want [11 99]", dropped)
 	}
 	if len(synthesized) != 0 {
 		t.Fatalf("synthesized=%v want empty", synthesized)
 	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
+	}
 	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Seq != 12 {
 		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
+	}
+}
+
+func TestNormalizeIntentPlanDeferredReasonsPreservesSelectedDeferredOverlap(t *testing.T) {
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{10, 11},
+		DeferredSeqs:   []int64{11, 12},
+		Subject:        "Update checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			{Seq: 11, Reason: "overlap"},
+			{Seq: 12, Reason: "valid defer"},
+		},
+	}
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("dropped=%v want empty", dropped)
+	}
+	if len(synthesized) != 0 {
+		t.Fatalf("synthesized=%v want empty", synthesized)
+	}
+	if len(cleaned.DeferredSeqs) != 2 || cleaned.DeferredSeqs[0] != 11 || cleaned.DeferredSeqs[1] != 12 {
+		t.Fatalf("deferred seqs=%v want [11 12]", cleaned.DeferredSeqs)
+	}
+	if len(cleaned.DeferredReasons) != 2 || cleaned.DeferredReasons[0].Seq != 11 || cleaned.DeferredReasons[1].Seq != 12 {
+		t.Fatalf("deferred reasons=%+v want entries for 11 and 12", cleaned.DeferredReasons)
+	}
+
+	req := sampleIntentPlanRequest(t)
+	req.OfferedCaptures[0].Seq = 10
+	req.OfferedCaptures[1].Seq = 11
+	req.OfferedCaptures = append(req.OfferedCaptures, OfferedCapture{
+		Seq:       12,
+		Path:      "docs/checkout.md",
+		Op:        "modify",
+		Timestamp: req.OfferedCaptures[1].Timestamp,
+		Fidelity:  "full",
+	})
+	err := ValidateIntentPlan(req, cleaned)
+	if err == nil {
+		t.Fatalf("expected overlap validation error after normalization")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) {
+		t.Fatalf("error=%T %v want *IntentPlanValidationError", err, err)
+	}
+	if typed.Code != IntentPlanValidationSelectedDeferredOverlap || typed.Seq != 11 {
+		t.Fatalf("typed error code=%v seq=%d want overlap seq 11", typed.Code, typed.Seq)
 	}
 }
 
@@ -409,12 +490,15 @@ func TestNormalizeIntentPlanDeferredReasonsNoOpWhenAllValid(t *testing.T) {
 		DeferredSeqs:    []int64{12, 13},
 		DeferredReasons: []DeferredReason{{Seq: 12, Reason: "a"}, {Seq: 13, Reason: "b"}},
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 0 {
 		t.Fatalf("dropped=%v want empty", dropped)
 	}
 	if len(synthesized) != 0 {
 		t.Fatalf("synthesized=%v want empty", synthesized)
+	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
 	}
 	if len(cleaned.DeferredReasons) != 2 {
 		t.Fatalf("cleaned reasons=%+v", cleaned.DeferredReasons)
@@ -425,12 +509,15 @@ func TestNormalizeIntentPlanDeferredReasonsEmptyPlanEarlyReturn(t *testing.T) {
 	// No deferred seqs and no reasons -> nothing to do; early return keeps
 	// aliasing on caller's nil slice.
 	plan := IntentPlan{}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if dropped != nil {
 		t.Fatalf("dropped=%v want nil", dropped)
 	}
 	if synthesized != nil {
 		t.Fatalf("synthesized=%v want nil", synthesized)
+	}
+	if overlapRemoved != nil {
+		t.Fatalf("overlapRemoved=%v want nil", overlapRemoved)
 	}
 	if cleaned.DeferredReasons != nil {
 		t.Fatalf("cleaned reasons=%+v want nil", cleaned.DeferredReasons)
@@ -447,12 +534,15 @@ func TestNormalizeIntentPlanDeferredReasonsPreservesInputOrder(t *testing.T) {
 			{Seq: 11, Reason: "drop second"},
 		},
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 2 || dropped[0] != 99 || dropped[1] != 11 {
 		t.Fatalf("dropped=%v want [99 11]", dropped)
 	}
 	if len(synthesized) != 0 {
 		t.Fatalf("synthesized=%v want empty", synthesized)
+	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
 	}
 	if len(cleaned.DeferredReasons) != 2 || cleaned.DeferredReasons[0].Seq != 12 || cleaned.DeferredReasons[1].Seq != 13 {
 		t.Fatalf("cleaned=%+v", cleaned.DeferredReasons)
@@ -623,6 +713,49 @@ func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
 	}
 	if !strings.Contains(correction, "selected seq 999 outside offered window") {
 		t.Fatalf("RetryCorrection=%q does not quote validator", correction)
+	}
+}
+
+func TestComposedPlanIntentRetriesOnSelectedDeferredOverlap(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	invalidPlan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{101, 102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{
+			{Seq: 101, Reason: "contradictory overlap"},
+			{Seq: 102, Reason: "documentation change is separate"},
+		},
+	}
+	validPlan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, validPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if primary.calls != 2 {
+		t.Fatalf("primary calls=%d want 2", primary.calls)
+	}
+	if len(plan.DeferredSeqs) != 1 || plan.DeferredSeqs[0] != 102 {
+		t.Fatalf("deferred=%v want [102]", plan.DeferredSeqs)
+	}
+	correction := primary.corrections[1]
+	if !strings.Contains(correction, "seq 101 appears in selected and deferred") {
+		t.Fatalf("RetryCorrection=%q does not quote overlap validator", correction)
 	}
 }
 
@@ -854,6 +987,9 @@ func TestBuildIntentPlanUserPromptIncludesRetryCorrection(t *testing.T) {
 	if !strings.Contains(second, "Return a corrected capture_intent_plan tool call") {
 		t.Fatalf("retry prompt missing corrective instruction:\n%s", second)
 	}
+	if !strings.Contains(second, "selected_seqs and deferred_seqs are disjoint") {
+		t.Fatalf("retry prompt missing disjoint seq instruction:\n%s", second)
+	}
 }
 
 // TestNormalizeIntentPlanDeferredReasonsSynthesizesMissingEntries covers the
@@ -866,12 +1002,15 @@ func TestNormalizeIntentPlanDeferredReasonsSynthesizesMissingEntries(t *testing.
 		DeferredSeqs: []int64{11, 12},
 		// DeferredReasons intentionally empty.
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 0 {
 		t.Fatalf("dropped=%v want empty", dropped)
 	}
 	if len(synthesized) != 2 || synthesized[0] != 11 || synthesized[1] != 12 {
 		t.Fatalf("synthesized=%v want [11 12]", synthesized)
+	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
 	}
 	if len(cleaned.DeferredReasons) != 2 {
 		t.Fatalf("cleaned reasons len=%d want 2", len(cleaned.DeferredReasons))
@@ -898,12 +1037,15 @@ func TestNormalizeIntentPlanDeferredReasonsMixedDropAndSynth(t *testing.T) {
 			{Seq: 99, Reason: "spurious entry"},
 		},
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 1 || dropped[0] != 99 {
 		t.Fatalf("dropped=%v want [99]", dropped)
 	}
 	if len(synthesized) != 1 || synthesized[0] != 12 {
 		t.Fatalf("synthesized=%v want [12]", synthesized)
+	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
 	}
 	// Cleaned should preserve the original valid entry then append the
 	// synthesized marker entry.
@@ -930,16 +1072,22 @@ func TestNormalizeIntentPlanDeferredReasonsIdempotentOnSecondCall(t *testing.T) 
 			{Seq: 99, Reason: "spurious"},
 		},
 	}
-	cleaned1, dropped1, synthesized1 := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned1, dropped1, synthesized1, overlapRemoved1 := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped1) != 1 || len(synthesized1) != 2 {
 		t.Fatalf("first pass dropped=%v synthesized=%v", dropped1, synthesized1)
 	}
-	cleaned2, dropped2, synthesized2 := NormalizeIntentPlanDeferredReasons(cleaned1)
+	if len(overlapRemoved1) != 0 {
+		t.Fatalf("first pass overlapRemoved=%v want empty", overlapRemoved1)
+	}
+	cleaned2, dropped2, synthesized2, overlapRemoved2 := NormalizeIntentPlanDeferredReasons(cleaned1)
 	if dropped2 != nil {
 		t.Fatalf("second pass dropped=%v want nil", dropped2)
 	}
 	if synthesized2 != nil {
 		t.Fatalf("second pass synthesized=%v want nil", synthesized2)
+	}
+	if overlapRemoved2 != nil {
+		t.Fatalf("second pass overlapRemoved=%v want nil", overlapRemoved2)
 	}
 	if len(cleaned2.DeferredReasons) != len(cleaned1.DeferredReasons) {
 		t.Fatalf("second pass altered reasons: %+v vs %+v", cleaned1.DeferredReasons, cleaned2.DeferredReasons)
@@ -1036,12 +1184,15 @@ func TestNormalizeIntentPlanDeferredReasonsSynthEmptyReasons(t *testing.T) {
 		SelectedSeqs: []int64{10},
 		DeferredSeqs: []int64{11},
 	}
-	cleaned, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
+	cleaned, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) != 0 {
 		t.Fatalf("dropped=%v want empty", dropped)
 	}
 	if len(synthesized) != 1 || synthesized[0] != 11 {
 		t.Fatalf("synthesized=%v want [11]", synthesized)
+	}
+	if len(overlapRemoved) != 0 {
+		t.Fatalf("overlapRemoved=%v want empty", overlapRemoved)
 	}
 	if len(cleaned.DeferredReasons) != 1 || cleaned.DeferredReasons[0].Reason != IntentPlanReasonMarker {
 		t.Fatalf("cleaned=%+v want one synth marker entry", cleaned.DeferredReasons)

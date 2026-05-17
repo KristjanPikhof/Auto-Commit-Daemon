@@ -15,11 +15,9 @@ package integration_test
 // original seq joined by commit_oid.
 //
 // The integration suite cannot drive four sequential same-path captures
-// deterministically — every `acd wake` call enqueues a flush_request that
-// the daemon drains in the same tick (which sets IntentBypassBatchWait=true
-// for that replay pass), and `acd pause` halts capture as well as replay,
-// so a write-pause-write sequence produces ONE capture against the worktree
-// state at resume rather than four. We therefore drive the same b1
+// deterministically: `acd pause` halts capture as well as replay, so a
+// write-pause-write sequence produces ONE capture against the worktree state
+// at resume rather than four. We therefore drive the same b1
 // guarantee end-to-end at the multi-FILE granularity here:
 //
 //   - Pause the daemon, write four distinct new files in one shot, resume.
@@ -152,7 +150,10 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 	if resumed.ExitCode != 0 {
 		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
 	}
-	wakeSession(t, ctx, fullEnv, repo, "intent-atomic-batch4")
+	flushed := runAcd(t, ctx, fullEnv, "flush", "--repo", repo, "--session-id", "intent-atomic-batch4", "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s", flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	for _, name := range files {
@@ -313,7 +314,10 @@ func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 	if resumed.ExitCode != 0 {
 		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
 	}
-	wakeSession(t, ctx, fullEnv, repo, "intent-split-middle")
+	flushed := runAcd(t, ctx, fullEnv, "flush", "--repo", repo, "--session-id", "intent-split-middle", "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s", flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "split-a.txt", "published", 20*time.Second)

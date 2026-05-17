@@ -77,19 +77,18 @@ const DefaultOpenAITimeout = 15 * time.Second
 // models hallucinate boilerplate the sanitizer then has to strip.
 const openAISystemPrompt = "You are a git commit message generator. " +
 	"Always call the commit_message function. " +
-	"Subject is imperative, concise, no trailing period. " +
-	"Body (optional) is a bullet list describing what changed and why."
+	commitMessageFormatInstructions
 
 var openAICommitMessageParameters = map[string]any{
 	"type": "object",
 	"properties": map[string]any{
 		"subject": map[string]any{
 			"type":        "string",
-			"description": "Imperative subject line; <= 72 chars; no trailing period.",
+			"description": "Line 1 only: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
 		},
 		"body": map[string]any{
 			"type":        "string",
-			"description": "Optional bullet body explaining what/why; may be empty.",
+			"description": "Optional commit body bullets for why/context/impact. Each bullet starts with '- ', max 72 chars per line, continuation lines are indented and do not start with '- '. Do not restate the diff.",
 		},
 	},
 	"required":             []string{"subject"},
@@ -111,15 +110,15 @@ var openAIIntentPlanParameters = map[string]any{
 		},
 		"subject": map[string]any{
 			"type":        "string",
-			"description": "Imperative subject line for the selected captures; <= 72 chars; no trailing period.",
+			"description": "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
 		},
 		"body": map[string]any{
 			"type":        "string",
-			"description": "Optional bullet body explaining what/why; may be empty.",
+			"description": "Optional final commit body bullets for why/context/impact. Do not explain why selected captures fit together; put that rationale only in grouping_reason.",
 		},
 		"grouping_reason": map[string]any{
 			"type":        "string",
-			"description": "Evidence-grounded reason these selected captures belong together.",
+			"description": "Evidence-grounded rationale for why the selected captures belong together. This is not part of the git commit message.",
 		},
 		"deferred_reasons": map[string]any{
 			"type":        "array",
@@ -337,8 +336,8 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		plan.Body = ""
 	}
 	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped, synthesized := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 || len(synthesized) > 0 {
+	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
+	if len(dropped) > 0 || len(synthesized) > 0 || len(overlapRemoved) > 0 {
 		attrs := []any{
 			slog.String("provider", p.Name()),
 			slog.String("model", model),
@@ -348,6 +347,9 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		}
 		if len(synthesized) > 0 {
 			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
+		}
+		if len(overlapRemoved) > 0 {
+			attrs = append(attrs, slog.Any("overlap_removed_seqs", overlapRemoved))
 		}
 		slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 	}

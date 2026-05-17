@@ -182,7 +182,10 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	if resumed.ExitCode != 0 {
 		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s", resumed.ExitCode, resumed.Stdout, resumed.Stderr)
 	}
-	wakeSession(t, ctx, fullEnv, repo, "intent-recovery-retry")
+	flushed := runAcd(t, ctx, fullEnv, "flush", "--repo", repo, "--session-id", "intent-recovery-retry", "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s", flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "recovery-one.txt", "published", 15*time.Second)
