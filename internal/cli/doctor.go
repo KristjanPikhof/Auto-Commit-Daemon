@@ -65,6 +65,7 @@ type doctorRepoReport struct {
 	LastReplayFailurePath  string               `json:"last_replay_failure_path,omitempty"`
 	LastReplayFailureErr   string               `json:"last_replay_failure_error,omitempty"`
 	Notes                  []string             `json:"notes,omitempty"`
+	FlushSessionID         string               `json:"-"`
 }
 
 type doctorHarnessReport struct {
@@ -966,6 +967,11 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	}
 	if n, err := countDoctorClients(ctx, conn); err == nil {
 		rr.Clients = n
+		if n > 0 {
+			if sessionID, err := latestDoctorClientSession(ctx, conn); err == nil {
+				rr.FlushSessionID = sessionID
+			}
+		}
 	}
 
 	// fsnotify diagnostics — defensive: missing keys mean "not yet
@@ -1015,7 +1021,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	}
 	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
 		rr.IntentStrategy = intentStrategy
-		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy)...)
+		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy, repoPath, rr.FlushSessionID)...)
 	} else {
 		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
 	}
@@ -1066,7 +1072,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	return true
 }
 
-func doctorIntentStrategyNotes(r intentStrategyReport) []string {
+func doctorIntentStrategyNotes(r intentStrategyReport, repoPath, sessionID string) []string {
 	if !r.BatchWaitActive {
 		return nil
 	}
@@ -1075,9 +1081,13 @@ func doctorIntentStrategyNotes(r intentStrategyReport) []string {
 	if need < 0 {
 		need = 0
 	}
+	sessionHint := sessionID
+	if sessionHint == "" {
+		sessionHint = "<active-session-id>"
+	}
 	return []string{
 		fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining)", need, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), wait),
-		"to publish now, run acd flush --logical for the active session; explicit flushes bypass intent batch wait",
+		fmt.Sprintf("to publish now, run acd flush --logical --repo %s --session-id %s; explicit flushes bypass intent batch wait and require a registered active session id", repoPath, sessionHint),
 		"for sparse repos, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE and restart acd",
 		"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
 	}
@@ -1089,6 +1099,14 @@ func countDoctorClients(ctx context.Context, conn *sql.DB) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+func latestDoctorClientSession(ctx context.Context, conn *sql.DB) (string, error) {
+	var sessionID string
+	if err := conn.QueryRowContext(ctx, `SELECT session_id FROM daemon_clients ORDER BY last_seen_ts DESC LIMIT 1`).Scan(&sessionID); err != nil {
+		return "", err
+	}
+	return sessionID, nil
 }
 
 func countEventsByStateSQL(ctx context.Context, conn *sql.DB, stateName string) (int, error) {
