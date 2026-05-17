@@ -10,9 +10,8 @@
 // notes vs the legacy:
 //   - subject is stripped of leading bullet/whitespace markers, trimmed,
 //     and any trailing periods removed (legacy: `rstrip(".")` once);
-//   - the subject cap is 72 chars (task brief — the legacy used 50 because
-//     snapshot-worker followed the kernel-style hard cap; v1 widens this
-//     to fit modern commit-log conventions while still truncating with `…`);
+//   - the subject cap is 50 chars, matching the snapshot-worker style while
+//     still truncating at a word boundary with `…`;
 //   - body bullets are normalized (single `-` prefix, hanging indent for
 //     wrap continuations) and re-wrapped at 72 chars.
 //
