@@ -589,7 +589,7 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 			Function struct {
 				Name       string `json:"name"`
 				Parameters struct {
-					Required []string `json:"required"`
+					Required   []string `json:"required"`
 					Properties map[string]struct {
 						Description string `json:"description"`
 					} `json:"properties"`
