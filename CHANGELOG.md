@@ -4,56 +4,32 @@
 
 ### Added
 
-- `acd repo init`, `acd repo list`, and `acd repo remove` manage explicit repo
-  registration for users who want to disable automatic repo discovery.
-- Singleton intent windows now use the normal per-event commit-message
-  provider instead of the structured intent planner. One-capture commits keep
-  their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
-  trace records.
-- Integration coverage now exercises wake-gate behavior, selected/deferred
-  planner overlap rejection, planner-rejects creation and rotation, and the
-  singleton short-circuit path.
+- Explicit repo lifecycle commands: `acd repo init`, `acd repo list`, and
+  `acd repo remove`. Autodiscovery stays on by default, but can be disabled
+  with `~/.config/acd/config.json` or `ACD_REPO_AUTODISCOVERY`.
+- Singleton intent windows now use the per-event commit-message provider,
+  keeping one-capture commits cheaper while still emitting
+  `replay.intent.singleton_shortcircuit` traces.
 
 ### Changed
 
-- AI-generated commit messages now follow the snapshot-worker style: a
-  50-character imperative subject, a blank line, and wrapped `- ` bullets for
-  context. The prompt also steers subjects toward semantic changes instead of
-  filenames.
-- Plain `acd wake` no longer bypasses `ACD_INTENT_MIN_PENDING` or
-  `ACD_INTENT_MAX_PENDING_AGE`. It still refreshes the session heartbeat and
-  nudges capture/replay, but only `acd flush --logical` forces the current
-  visible intent window through the batch gate.
-- Wake flush-request acknowledgements moved to debug logs with a periodic
-  summary, so active tool hooks no longer flood daemon logs during busy
-  sessions.
-- Repo autodiscovery can be disabled through `~/.config/acd/config.json` or
-  `ACD_REPO_AUTODISCOVERY`; unregistered hook paths then skip without creating
-  repo state, while manual starts point at `acd repo init`.
-- Human `acd repo list` output no longer prints the `STATE_DB` column, keeping
-  the table focused on repo, daemon, queue, and status fields. JSON output
-  still includes `state_db` for scripts.
+- AI-generated commit messages now use a semantic subject plus wrapped `- `
+  context bullets.
+- Plain `acd wake` now only refreshes heartbeat and nudges capture/replay. Use
+  `acd flush --logical` to force the current intent window through the batch
+  gate.
+- Hook wake acknowledgements moved to debug logs with periodic summaries.
+- Human `acd repo list` output hides `STATE_DB`; `--json` still includes
+  `state_db` for scripts.
 
 ### Fixed
 
-- Planner output that puts the same seq in both `selected_seqs` and
-  `deferred_seqs` now stays invalid after deferred-reason cleanup. ACD retries
-  with a typed validation error, then falls back safely and records a planner
-  reject if the provider does not repair the overlap.
-- Intent-planner grouping rationale now stays in `grouping_reason` instead of
-  leaking into the commit body. Commit bodies are reserved for practical
-  why/context bullets.
-- Planner rejects logging is wired at daemon startup and covered by live daemon
-  tests, including 5 MiB rotation.
-
-### Docs
-
-- README, `CLAUDE.md`, harness notes, and intent docs now state the wake versus
-  logical-flush behavior explicitly. If you preferred the old wake-only cadence,
-  lower `ACD_INTENT_MAX_PENDING_AGE` (for example, `60s`) or install the current
-  harness snippets so turn boundaries call `acd flush --logical`.
-- README, workflow docs, and harness notes now document explicit repo lifecycle
-  commands, autodiscovery disablement, and preserve-vs-purge removal behavior.
+- Planner overlap between `selected_seqs` and `deferred_seqs` is now rejected
+  reliably, retried with a typed error, then safely falls back with reject
+  logging.
+- Intent grouping rationale stays in `grouping_reason` instead of leaking into
+  commit bodies.
+- Planner reject logging is wired at daemon startup, including 5 MiB rotation.
 
 ## v2026-05-16
 
