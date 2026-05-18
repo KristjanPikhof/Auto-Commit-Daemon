@@ -78,13 +78,28 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 	if sessionID == "" {
 		return errors.New("acd wake: --session-id is required")
 	}
-	repo, err := resolveRepo(repoFlag)
+	policy, err := evaluateRepoAutodiscoveryPolicy(ctx, "wake", repoFlag, hookAutodiscoveryCaller())
 	if err != nil {
 		return err
 	}
-	gitDir, err := resolveGitDir(ctx, repo)
-	if err != nil {
-		return fmt.Errorf("acd wake: resolve git dir: %w", err)
+	repo := policy.Worktree.Root
+	gitDir := policy.Worktree.GitDir
+	if !policy.allowsImplicitState() {
+		res := wakeResult{
+			OK:            true,
+			Skipped:       true,
+			SkippedReason: policy.skipReason(),
+			Repo:          repo,
+			SessionID:     sessionID,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
+			repo, policy.skipReason(), repo)
+		return nil
 	}
 
 	clock, err := daemon.AcquireControlLock(gitDir)

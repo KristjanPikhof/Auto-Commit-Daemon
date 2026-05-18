@@ -29,6 +29,8 @@ type startResult struct {
 	Started     bool   `json:"started"`
 	Duplicate   bool   `json:"duplicate"`
 	DaemonPID   int    `json:"daemon_pid,omitempty"`
+	Skipped     bool   `json:"skipped,omitempty"`
+	SkipReason  string `json:"skipped_reason,omitempty"`
 	Repo        string `json:"repo"`
 	RepoHash    string `json:"repo_hash"`
 	SessionID   string `json:"session_id"`
@@ -119,6 +121,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if sessionID == "" && harness != "" {
 		return errors.New("acd start: --session-id is required when --harness is set")
 	}
+	caller := startAutodiscoveryCaller(harness)
 	if harness == "" {
 		harness = "other"
 	}
@@ -135,13 +138,11 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			return nil
 		}
 	}
-	wt, err := git.ResolveWorktree(ctx, repoFlag)
+	policy, err := evaluateRepoAutodiscoveryPolicy(ctx, "start", repoFlag, caller)
 	if err != nil {
-		if errors.Is(err, git.ErrNotWorktree) {
-			return fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repoFlag, err)
-		}
 		return err
 	}
+	wt := policy.Worktree
 	repo := wt.Root
 	gitDir := wt.GitDir
 	repoHash, err := paths.RepoHash(repo)
@@ -150,6 +151,29 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	if sessionID == "" {
 		sessionID = humanStartSessionID(repoHash)
+	}
+	if !policy.allowsImplicitState() {
+		if isManualAutodiscoveryCaller(caller) {
+			return repoInitRequiredError("start", policy)
+		}
+		res := startResult{
+			Started:    false,
+			Duplicate:  false,
+			Skipped:    true,
+			SkipReason: policy.skipReason(),
+			Repo:       repo,
+			RepoHash:   repoHash,
+			SessionID:  sessionID,
+			Harness:    harness,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd start: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
+			repo, policy.skipReason(), repo)
+		return nil
 	}
 	if err := ensureAttachedHEAD(ctx, repo); err != nil {
 		return err

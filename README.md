@@ -159,6 +159,59 @@ acd fix --force --yes              # also purge blocked barriers with pending su
 
 If a parallel committer (Claude Code's atomic-commit hook, Codex ACD hook, your own script) lands the change before ACD's replay tick, you'll see `handled_external` or `superseded_external` in `acd events`. That's normal. Real content mismatches still surface as `blocked_conflict`.
 
+## Repo lifecycle and autodiscovery
+
+The default path is still automatic: open a Git repo, let a harness hook run
+`acd start`, and ACD creates `<gitDir>/acd/state.db` plus the central registry
+row for that repo. This keeps existing installs working without a separate
+setup step per repo.
+
+Use the explicit lifecycle path when you want to manage registered repos
+yourself:
+
+~~~bash
+acd repo init                      # create .git/acd/state.db and register this repo
+acd repo list                      # show registered repos, daemon state, queue counts, and status
+acd repo remove --dry-run          # preview registry removal; preserve state by default
+acd repo remove                    # interactive registry manager
+acd repo remove --yes              # scriptable removal; preserve .git/acd
+acd repo remove --yes --purge-state # also delete this repo's .git/acd state
+~~~
+
+`acd repo remove` always removes the central registry row and clears matching
+start caches. It preserves `<gitDir>/acd` unless you explicitly choose
+`--purge-state`. Bare `acd repo remove` is interactive: select one or more
+repos, review the preview, type `remove`, and type `purge` only when deleting
+the repo-local `.git/acd` state is intended.
+
+To require explicit registration for new repos, disable autodiscovery in
+`~/.config/acd/config.json`:
+
+~~~json
+{
+  "repo_lifecycle": {
+    "autodiscovery": false
+  }
+}
+~~~
+
+The environment override wins over the config file for one shell:
+
+~~~bash
+ACD_REPO_AUTODISCOVERY=disabled acd start
+ACD_REPO_AUTODISCOVERY=enabled acd start
+~~~
+
+Accepted enabled values are `1`, `true`, `yes`, `on`, `enable`, and
+`enabled`. Accepted disabled values are `0`, `false`, `no`, `off`, `disable`,
+and `disabled`.
+
+When autodiscovery is disabled, unregistered hook-driven paths no-op without
+creating `.git/acd` or registry rows. Manual `acd start` is intentionally
+louder and tells you to run `acd repo init --repo <path>` or re-enable
+`repo_lifecycle.autodiscovery`. Top-level `acd init` remains a compatibility
+alias for `acd setup`; use `acd repo init` for repo lifecycle registration.
+
 ## Cold start: dirty worktree, daemon was off
 
 When files accumulated without ACD running:
@@ -217,8 +270,11 @@ The Wave 2 planner-atomicity epic added two operator-facing surfaces:
 | `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps defaults; never disables them. |
 | `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
 | `ACD_REWIND_GRACE_SECONDS` | `60` | Pause replay this long after a same-branch rewind. `0` disables. |
+| `ACD_REPO_AUTODISCOVERY` | unset | Overrides `repo_lifecycle.autodiscovery` for implicit repo registration. Enabled: `1`, `true`, `yes`, `on`, `enable`, `enabled`. Disabled: `0`, `false`, `no`, `off`, `disable`, `disabled`. |
 
-Env changes are read at daemon start. Restart an existing daemon to pick them up.
+Daemon runtime env changes are read at daemon start. Restart an existing daemon
+to pick them up. `ACD_REPO_AUTODISCOVERY` is read by CLI lifecycle and hook
+commands, so it can be changed per shell invocation.
 
 ## Docs
 

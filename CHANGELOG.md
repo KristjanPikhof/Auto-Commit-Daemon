@@ -4,237 +4,94 @@
 
 ### Added
 
-- Singleton intent windows now use the normal per-event commit-message
-  provider instead of the structured intent planner. One-capture commits keep
-  their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
-  trace records.
-- Integration coverage now exercises wake-gate behavior, selected/deferred
-  planner overlap rejection, planner-rejects creation and rotation, and the
-  singleton short-circuit path.
+- Explicit repo lifecycle commands: `acd repo init`, `acd repo list`, and
+  `acd repo remove`. Autodiscovery stays on by default, but can be disabled
+  with `~/.config/acd/config.json` or `ACD_REPO_AUTODISCOVERY`.
+- Singleton intent windows now use the per-event commit-message provider,
+  keeping one-capture commits cheaper while still emitting
+  `replay.intent.singleton_shortcircuit` traces.
 
 ### Changed
 
-- AI-generated commit messages now follow the snapshot-worker style: a
-  50-character imperative subject, a blank line, and wrapped `- ` bullets for
-  context. The prompt also steers subjects toward semantic changes instead of
-  filenames.
-- Plain `acd wake` no longer bypasses `ACD_INTENT_MIN_PENDING` or
-  `ACD_INTENT_MAX_PENDING_AGE`. It still refreshes the session heartbeat and
-  nudges capture/replay, but only `acd flush --logical` forces the current
-  visible intent window through the batch gate.
-- Wake flush-request acknowledgements moved to debug logs with a periodic
-  summary, so active tool hooks no longer flood daemon logs during busy
-  sessions.
+- AI-generated commit messages now use a semantic subject plus wrapped `- `
+  context bullets.
+- Plain `acd wake` now only refreshes heartbeat and nudges capture/replay. Use
+  `acd flush --logical` to force the current intent window through the batch
+  gate.
+- Hook wake acknowledgements moved to debug logs with periodic summaries.
 
 ### Fixed
 
-- Planner output that puts the same seq in both `selected_seqs` and
-  `deferred_seqs` now stays invalid after deferred-reason cleanup. ACD retries
-  with a typed validation error, then falls back safely and records a planner
-  reject if the provider does not repair the overlap.
-- Intent-planner grouping rationale now stays in `grouping_reason` instead of
-  leaking into the commit body. Commit bodies are reserved for practical
-  why/context bullets.
-- Planner rejects logging is wired at daemon startup and covered by live daemon
-  tests, including 5 MiB rotation.
-
-### Docs
-
-- README, `CLAUDE.md`, harness notes, and intent docs now state the wake versus
-  logical-flush behavior explicitly. If you preferred the old wake-only cadence,
-  lower `ACD_INTENT_MAX_PENDING_AGE` (for example, `60s`) or install the current
-  harness snippets so turn boundaries call `acd flush --logical`.
+- Planner overlap between `selected_seqs` and `deferred_seqs` is now rejected
+  reliably, retried with a typed error, then safely falls back with reject
+  logging.
+- Intent grouping rationale stays in `grouping_reason` instead of leaking into
+  commit bodies.
+- Planner reject logging is wired at daemon startup, including 5 MiB rotation.
 
 ## v2026-05-16
 
-Intent-planner atomicity: same-path coalesce, validation retry, planner-rejects forensics, Stop-hook rewire.
+Intent planner reliability, explicit flush boundaries, and safer recovery.
 
 ### Added
 
-- `acd flush --logical`: explicit drain entrypoint for harness Stop / idle
-  hooks. Refreshes heartbeat, enqueues a `flush_logical` request, signals the
-  daemon to evaluate the pending window without waiting for `MIN_PENDING` or
-  `MAX_PENDING_AGE`. Refuses on detached HEAD, in-progress git ops, or
-  manual pause (heartbeat still runs). `--logical` requires an existing
-  registered session; heartbeat-only mode keeps `acd touch` semantics.
-- Stop-hook rewire for Claude Code, OpenCode `session.idle`, and Pi
-  `session.idle`: now call `acd flush --logical` instead of `acd touch`.
-  Partial work commits at agent-reply boundary, not the 5-minute age
-  trigger. Codex Stop stays on `acd touch` (its Stop fires per tool turn).
-  **Migration:** re-run `acd setup <harness>`; `acd doctor` flags drift.
-- Same-path coalesce: replay folds runs of consecutive single-path captures
-  into one planner offer with squashed before/after state. Stops at branch
-  transitions, multi-path interleave, and barriers. On commit, every
-  original seq publishes with the same `commit_oid` and gets its own
-  `decision_records` row. Coalesced deferrals advance `defer_count` for
-  every covered seq so external publish of the representative cannot reset
-  the forced-aging clock. `ACD_INTENT_PATH_COALESCE` (default ON) toggles.
-- Composed planner retry-on-invalid: `composed.PlanIntent` retries the
-  primary once on typed `*IntentPlanValidationError`, quoting the validator
-  message into a new `RetryCorrection` field. Skips retry on transport
-  errors and on validator codes the normalizer already heals, so retries
-  do not double-bill the provider. `ACD_INTENT_RETRY_ON_INVALID` (default
-  ON) toggles.
-- Forced-aging singleton fast path: when the offered window is length 1
-  and the capture is overdue, the daemon synthesizes the plan locally
-  with no provider call. Subject comes from a new diff-aware fallback
-  (Go func, TS class/function, Python def, Markdown heading; basename
-  verb form otherwise). `validateIntentSelectionSafety` and
-  `ValidateIntentPlan` still run; subject extraction is bounded by a
-  1-second budget.
-- `<gitDir>/acd/planner-rejects.jsonl`: rotating forensic log of
-  validator-rejected planner responses. 5 MiB per file, 2 retained. **Raw
-  model output is redacted by default** (only code, message, offered
-  seqs, size, sha256, parsed-plan summary persisted). Set
-  `ACD_INTENT_REJECTS_RAW=1` to opt into verbatim capture (one-shot
-  startup warning emitted). Treat the file as sensitive either way.
-- `ACD_PATH_QUIESCENCE_SECONDS` (default `0`, off): defers planner-offer
-  for path P until P has been quiet that long. Capture rows persist
-  immediately. FIFO-preserving (gated head blocks the batch) and
-  multi-op aware (gates on union of all touched op paths). Tracker
-  bounded at 4096 entries with `2 * window` eviction; pays zero cost
-  when disabled. `path_quiescence_gated_events` surfaces in `acd
-  status`. Restart daemon to apply.
-- `ACD_RECENT_COMMIT_AFFINITY_SECONDS` (default `0`, off): when `>0` and
-  the most recent HEAD commit touched an offered path within the
-  window, planner request carries a `path_recent_commits` hint
-  suggesting `"extend or wait"`. Hint-only; no amend implemented.
-- Intent system prompt adds three guarantees: same-path causality
-  (deferring path P forces every later P seq to also defer), defer_count
-  guidance (prefer captures with `defer_count >= 1`), forced_aging
-  singleton rule restated explicitly. Worked example included.
-- `ValidateIntentPlan` returns typed `*IntentPlanValidationError` with new
-  codes (`IntentPlanValidationShape`, `IntentPlanValidationOfferedWindow`,
-  `IntentPlanValidationDeferredReasonMissing`). Callers can `errors.As`
-  to inspect code and seq. Existing untyped error paths unchanged.
-- `acd status --json` and `acd diagnose --json` `intent_strategy` block
-  gain `planner_error_rate_recent`, `singleton_commit_rate_recent`,
-  `intent_stage_diff_cap`, and `path_quiescence_gated_events`. Both
-  rate denominators fixed at 100 decisions; warn fires only once the
-  ledger reaches a full window. `acd diagnose` surfaces a remediation
-  hint above 5% planner-error rate, pointing at the rejects log.
-- New integration tests in `test/integration/`:
-  `intent_atomicity_test.go` (grouped commit + deferred-middle split),
-  `intent_planner_recovery_test.go` (retry absorbs validation error +
-  forced-singleton skips provider), `intent_flush_test.go` (`acd flush
-  --logical` 2s budget + quiescence release timing),
-  `flush_logical_test.go` (openai-compat flush coverage). Run under
-  `-tags=integration`; default `make test` cycle unaffected.
+- `acd flush --logical` forces the current intent window through the batch
+  gate for registered sessions. Claude Code, OpenCode, and Pi idle hooks now
+  use it; Codex Stop stays on `acd touch`.
+- Intent mode now handles same-path coalescing, retry-on-invalid planner
+  output, forced singleton commits, and typed planner validation errors.
+- Planner rejects are written to `<gitDir>/acd/planner-rejects.jsonl` with
+  5 MiB rotation. Raw model output is redacted unless
+  `ACD_INTENT_REJECTS_RAW=1`.
+- New tuning knobs: `ACD_PATH_QUIESCENCE_SECONDS`,
+  `ACD_RECENT_COMMIT_AFFINITY_SECONDS`, `ACD_INTENT_PATH_COALESCE`, and
+  `ACD_INTENT_RETRY_ON_INVALID`.
+- `acd status --json` and `acd diagnose --json` now report planner error
+  rates, singleton commit rates, intent diff cap, and path-quiescence gates.
 
 ### Changed
 
-- `ACD_INTENT_DEFER_LIMIT` default `1` (was `2`). With the retry loop
-  and forensic rejects log in place, a single deferral is more often
-  planner churn than a real "wait for related work" signal. Set `=2`
-  to restore prior tolerance.
-- Intent planner stage uses a dedicated 16 KiB diff cap
-  (`ai.IntentStageDiffCap`) per offered capture instead of the legacy
-  4 KiB `ai.DiffCap`. Per-event commit-message path unchanged. New
-  `BuildOpsDiffWithCap(ctx, repoRoot, ops, cap)` wraps the legacy
-  `BuildOpsDiff` and threads the cap through `cappedDiffBuffer` so
-  the larger budget actually applies on the wire.
-- `NormalizeIntentPlanDeferredReasons` synthesizes a `DeferredReason`
-  entry for any deferred seq the planner omitted, using the marker
-  `IntentPlanReasonMarker = "planner omitted reason"`. Round-trips
-  into `decision_records.reason` so operators see a non-blank
-  explanation. Returns `(IntentPlan, dropped []int64, synthesized
-  []int64)`; callers emit a single `slog.Warn` naming both lists.
-  The `openai-compat` and `subprocess` providers also drop spurious
-  entries; `composed.PlanIntent` runs the same normalize on primary
-  and fallback paths.
+- `ACD_INTENT_DEFER_LIMIT` now defaults to `1`; set it to `2` to restore the
+  previous tolerance.
+- Intent planner requests get a dedicated 16 KiB diff budget through
+  `ai.IntentStageDiffCap`; per-event commit messages still use the smaller
+  event diff cap.
+- Missing deferred reasons are normalized into visible decision records, and
+  spurious deferred-reason entries are dropped with one warning.
 
 ### Fixed
 
-- Path-quiescence FIFO ordering: removed in-place compaction of gated
-  rows that could publish later events ahead of gated earlier events.
-  The gate now skips the entire batch when the head is gated,
-  preserving capture-seq as the canonical happened-before relation.
-- Path-quiescence multi-op gap: gate previously checked only the
-  header path. Now folds `touchedPaths(ops)` into the decision so all
-  op paths must be quiescent.
-- Unbounded `pathQuiescenceWrites` map growth. Now gated behind a
-  startup-resolved atomic bool (zero cost when disabled), bounded at
-  4096 entries with `2 * window` eviction when active.
-- `persistPathQuiescenceSnapshot` write amplification: two `daemon_meta`
-  writes per replay pass even when disabled. Now skips entirely when
-  `pathQuiescence == 0` and only writes when the gated count differs
-  from the last persisted value.
-- `IntentStageDiffCap` was effectively dead before this release —
-  `cappedDiffBuffer` hardcoded `ai.DiffCap` (4 KiB). The new
-  `BuildOpsDiffWithCap` makes the 16 KiB budget actually apply.
-- `acd flush --logical` authorization: previously lazy-registered any
-  session-id and let any same-user process force commit boundaries.
-  Now requires an existing registered client; unknown sessions return
-  `refused_reason=unknown_session` with no enqueue.
-- `acd flush` JSON `last_seen_ts` no longer serializes as `0` on the
-  control-lock-held skip path. JSON tag now `omitempty`.
-- Planner-rejects raw response is redacted by default. Models can echo
-  prompt content (paths, diff text); verbatim persistence leaks via
-  repo handoff, backups, or support bundles. Opt back in with
-  `ACD_INTENT_REJECTS_RAW=1`.
-- Planner-rejects rotation is now atomic via a single `os.Rename`. The
-  prior `os.Remove` + `os.Rename` window could lose the `.1` archive
-  on a crash between the two calls.
-- Forced-aging singleton fast path now runs `validateIntentSelectionSafety`
-  and `ValidateIntentPlan` on the synthesized plan; failures fall
-  through to the deterministic slow path with `intent_planner_error`
-  recorded.
-- `runPrimaryWithRetry` no longer shadows the outer `plan` variable
-  inside the success block.
-- `acd status` no longer over-subtracts the path-quiescence gated
-  count from `visible_pending_events` when the daemon is dead or the
-  snapshot is stale (>30s old).
-- `planner_error_rate_recent_warn` no longer fires during the first
-  100 decisions: dilution against the fixed-100 denominator could
-  trip the threshold on 5 errors in 5 rows. Warn requires a full
-  window.
-- `subject_fallback`: skips Go `func main(` as a low-value symbol;
-  `tsMethodRE` now requires at least one modifier prefix
-  (`public|private|protected|static|async`) so call expressions do
-  not hijack the subject.
-- Setup tests now assert format-specific managed markers
-  (`_acd_managed: true` in JSON, `# acd-managed: true` in YAML) so a
-  future template edit cannot silently break `acd doctor` drift
-  detection.
-- `acd commit-all` error messages point at `acd fix --clear-pause`
-  instead of deprecated `acd recover --auto`.
-- Self-heal for blocked replay barriers: the daemon probes
-  `blocked_conflict` rows before draining pending captures and
-  promotes any row whose captured after-state already matches HEAD.
-  No new commit minted; ledger records `handled_external_after_block`.
-- Codex install detection recognizes repo-local `.codex/hooks.json`
-  and `.codex/config.toml` from the current Git worktree root,
-  alongside user-level paths.
-- `internal/git/history.go`: replaced custom `parseInt64` with
-  `strconv.ParseInt`.
+- Path quiescence now preserves FIFO ordering, checks every path in multi-op
+  captures, avoids extra metadata writes, and keeps its tracker bounded.
+- `acd flush --logical` now requires an existing registered client; unknown
+  sessions return `refused_reason=unknown_session`.
+- Planner-reject logging now redacts raw responses by default and rotates
+  atomically.
+- Forced singleton plans now run the same safety validation as planner output.
+- `acd status` no longer over-subtracts stale path-quiescence counts, and
+  planner-error warnings wait for a full 100-decision window.
+- Blocked replay barriers self-heal when the captured after-state already
+  matches `HEAD`, recording `handled_external_after_block`.
+- Codex install detection now includes repo-local `.codex/hooks.json` and
+  `.codex/config.toml`.
 
 ### Recovery
 
-- `acd fix` is the single recovery entrypoint. Planner covers
-  resolve-already-landed-barrier, retarget-stale-anchor,
-  delete-obsolete-barrier, mark-external-published,
-  clear-expired-manual-pause, clear-drained-backpressure under
-  `--yes`. Add `--force` to also purge blocked barriers with pending
-  successors. `state.db` is backed up before any mutation; refuses
-  while a live daemon owns the database.
+- `acd fix` is the recovery entrypoint. `--yes` applies safe repairs, and
+  `--force` can purge blocked barriers with pending successors. The command
+  backs up `state.db` and refuses to run while a live daemon owns it.
 - `acd diagnose --json` reports `auto_resolvable_blocked_count` and
-  `barrier_with_successors_count`. Human output points at the right
-  `acd fix` invocation.
+  `barrier_with_successors_count`.
 
 ### Deprecated
 
-- `acd recover` and `acd purge-events` remain deprecated and hidden
-  from help. Both print a one-line deprecation warning to stderr and
-  keep working. Switch to `acd fix` (and `acd fix --force` for
-  purge). Hard removal is tracked separately and will land on a
-  dedicated branch on top of the next release tag.
+- `acd recover` and `acd purge-events` remain hidden, deprecated aliases.
+  Use `acd fix` and `acd fix --force` instead.
 
 ### Docs
 
-- README rewritten for clarity. Side-by-side recommended configs
-  (deterministic event vs intent gpt-5.4-mini), "When commits stop
-  appearing" recovery flow, "Migrating from prior releases" section,
-  full env table covering every new var.
+- README now covers recommended configs, recovery, migration, and the new
+  environment variables.
 
 ## v2026-05-13
 

@@ -116,6 +116,9 @@ func TestRoots_RepoStateDirAndLog(t *testing.T) {
 	if roots.StatsDBPath() != "/tmp/share/acd/stats.db" {
 		t.Errorf("StatsDBPath = %q", roots.StatsDBPath())
 	}
+	if roots.ConfigPath() != "/tmp/config/acd/config.json" {
+		t.Errorf("ConfigPath = %q", roots.ConfigPath())
+	}
 }
 
 func TestRepoHash_Deterministic(t *testing.T) {

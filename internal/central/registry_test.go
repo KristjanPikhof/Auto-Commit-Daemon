@@ -14,6 +14,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // rootsForTest returns a paths.Roots whose Share dir lives under t.TempDir(),
@@ -168,6 +169,158 @@ func TestRegistry_UpsertHarnessesDedupAndSort(t *testing.T) {
 	want := []string{"claude-code", "codex", "pi"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("harnesses=%v, want %v", got, want)
+	}
+}
+
+func TestRegistry_RegisterResolvedRepoRefreshPreservesFirstTimestamp(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	wantHash, err := paths.RepoHash(wt.Root)
+	if err != nil {
+		t.Fatalf("RepoHash: %v", err)
+	}
+	wantStateDB := state.DBPathFromGitDir(wt.GitDir)
+
+	reg := NewRegistry()
+	first, err := reg.RegisterResolvedRepo(wt, "codex", 10)
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if !first.Inserted || first.Refreshed {
+		t.Fatalf("first result=%+v, want inserted only", first)
+	}
+	second, err := reg.RegisterResolvedRepo(wt, "pi", 30)
+	if err != nil {
+		t.Fatalf("second register: %v", err)
+	}
+	if second.Inserted || !second.Refreshed {
+		t.Fatalf("second result=%+v, want refreshed only", second)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := second.Record
+	if rec.Path != wt.Root || rec.RepoHash != wantHash || rec.StateDB != wantStateDB {
+		t.Fatalf("record=%+v, want resolved worktree metadata", rec)
+	}
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 30 {
+		t.Fatalf("timestamps=%d/%d want 10/30", rec.FirstRegisteredTS, rec.LastSeenTS)
+	}
+	wantHarnesses := []string{"codex", "pi"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
+func TestRegistry_RemoveRepoByPathReturnsSafetyMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	dbPath := state.DBPathFromGitDir(wt.GitDir)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running"}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+
+	reg := NewRegistry()
+	reg.UpsertRepo(wt.Root, "repo-hash", dbPath, "codex", 10)
+	reg.UpsertRepo("/tmp/other", "other-hash", "/tmp/other/.git/acd/state.db", "pi", 20)
+
+	res := reg.RemoveRepoByPath(ctx, wt.Root)
+	if !res.Removed || res.NotFound {
+		t.Fatalf("result=%+v, want removed", res)
+	}
+	if res.RemovedRecord == nil {
+		t.Fatal("removed record is nil")
+	}
+	if res.RemovedRecord.Path != wt.Root || res.RemovedRecord.StateDB != dbPath {
+		t.Fatalf("removed=%+v, want target row", res.RemovedRecord)
+	}
+	if len(reg.Repos) != 1 || reg.Repos[0].Path != "/tmp/other" {
+		t.Fatalf("remaining repos=%+v, want only other row", reg.Repos)
+	}
+	safety := res.Safety
+	if safety.Path != wt.Root || safety.StateDB != dbPath || safety.GitDir != wt.GitDir {
+		t.Fatalf("safety paths=%+v, want target metadata", safety)
+	}
+	if safety.StateDir != filepath.Join(wt.GitDir, "acd") || safety.StartCacheDir != filepath.Join(wt.GitDir, "acd") {
+		t.Fatalf("state/cache dirs=%q/%q, want git acd dir", safety.StateDir, safety.StartCacheDir)
+	}
+	if !safety.StateDBExists || !safety.StateDirExists {
+		t.Fatalf("state existence=%+v, want present", safety)
+	}
+	if !safety.DaemonStateKnown || safety.DaemonMode != "running" || safety.DaemonPID != os.Getpid() || !safety.DaemonAlive {
+		t.Fatalf("daemon safety=%+v, want live current process", safety)
+	}
+	if safety.DaemonStateError != "" {
+		t.Fatalf("daemon state error=%q", safety.DaemonStateError)
+	}
+}
+
+func TestRegistry_RemoveRepoByStateDB(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry()
+	stateDB := filepath.Join(t.TempDir(), "repo", ".git", "acd", "state.db")
+	reg.Repos = []RepoRecord{
+		{Path: "/tmp/repo/subdir", RepoHash: "legacy", StateDB: stateDB, FirstRegisteredTS: 10, LastSeenTS: 20, Harnesses: []string{"codex"}},
+		{Path: "/tmp/other", RepoHash: "other", StateDB: "/tmp/other/.git/acd/state.db", FirstRegisteredTS: 30, LastSeenTS: 40, Harnesses: []string{"pi"}},
+	}
+
+	res := reg.RemoveRepoByStateDB(ctx, filepath.Join(filepath.Dir(stateDB), ".", filepath.Base(stateDB)))
+	if !res.Removed || res.NotFound {
+		t.Fatalf("result=%+v, want removed", res)
+	}
+	if res.RemovedRecord == nil {
+		t.Fatal("removed record is nil")
+	}
+	if res.RemovedRecord.RepoHash != "legacy" {
+		t.Fatalf("removed=%+v, want legacy row", res.RemovedRecord)
+	}
+	if len(reg.Repos) != 1 || reg.Repos[0].RepoHash != "other" {
+		t.Fatalf("remaining repos=%+v, want other row", reg.Repos)
+	}
+	if res.Safety.StateDB != stateDB || res.Safety.StateDBExists {
+		t.Fatalf("safety=%+v, want missing target state DB metadata", res.Safety)
+	}
+}
+
+func TestRegistry_RemoveUnknownRepoIsStructuredNoOp(t *testing.T) {
+	ctx := context.Background()
+	reg := NewRegistry()
+	reg.UpsertRepo("/tmp/known", "hash", "/tmp/known/.git/acd/state.db", "codex", 10)
+
+	res := reg.RemoveRepoByPath(ctx, "/tmp/missing")
+	if res.Removed || !res.NotFound {
+		t.Fatalf("result=%+v, want not-found no-op", res)
+	}
+	if len(reg.Repos) != 1 || reg.Repos[0].Path != "/tmp/known" {
+		t.Fatalf("repos=%+v, want unchanged", reg.Repos)
+	}
+	if res.Safety.Path != "/tmp/missing" {
+		t.Fatalf("safety path=%q, want target", res.Safety.Path)
 	}
 }
 

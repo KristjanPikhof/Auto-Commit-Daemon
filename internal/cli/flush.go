@@ -114,13 +114,28 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 	if sessionID == "" {
 		return errors.New("acd flush: --session-id is required")
 	}
-	repo, err := resolveRepo(repoFlag)
+	policy, err := evaluateRepoAutodiscoveryPolicy(ctx, "flush", repoFlag, hookAutodiscoveryCaller())
 	if err != nil {
 		return err
 	}
-	gitDir, err := resolveGitDir(ctx, repo)
-	if err != nil {
-		return fmt.Errorf("acd flush: resolve git dir: %w", err)
+	repo := policy.Worktree.Root
+	gitDir := policy.Worktree.GitDir
+	if !policy.allowsImplicitState() {
+		res := flushResult{
+			OK:        true,
+			Logical:   logical,
+			Skipped:   true,
+			Repo:      repo,
+			SessionID: sessionID,
+		}
+		if logical {
+			res.SkippedReason = "unknown_session"
+			res.RefusedReason = "unknown_session"
+			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush (session %s not registered; run `acd repo init --repo %s` before using logical flush)", sessionID, repo))
+		}
+		res.SkippedReason = policy.skipReason()
+		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)",
+			repo, policy.skipReason(), repo))
 	}
 
 	clock, err := daemon.AcquireControlLock(gitDir)

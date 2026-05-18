@@ -13,6 +13,9 @@ Common workflow:
   acd prompt --last                 Inspect the last recorded AI prompt request
   acd explain --path FILE           Explain why ACD did or did not commit a path
   acd fix --dry-run                 Plan safe remediation for a stuck repo
+  acd repo init                     Explicitly initialize ACD state for this repo
+  acd repo list                     List all registry rows for lifecycle management
+  acd repo remove --dry-run          Preview registry removal and state preservation
   acd list                          List known repo daemons
   acd list --watch --interval 5s     Watch known repo daemons live
   acd logs --lines 200              Tail the current repo daemon log as raw JSONL
