@@ -49,6 +49,13 @@ bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. The
 boundary; re-run `acd setup opencode` if your installed snippet predates that
 hook.
 
+Repo autodiscovery is enabled by default. If you disable it with
+`repo_lifecycle.autodiscovery` in `~/.config/acd/config.json` or with
+`ACD_REPO_AUTODISCOVERY=disabled`, OpenCode hooks in unregistered repos skip
+without creating `.git/acd`. Run `acd repo init` in each repo you want OpenCode
+to manage, or temporarily set `ACD_REPO_AUTODISCOVERY=enabled` before starting
+the session.
+
 ## Verify
 
 - Open OpenCode in any git repo

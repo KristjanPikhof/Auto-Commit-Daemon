@@ -45,6 +45,51 @@ does not contain full AI prompts; prompt traces live separately under
 `<gitDir>/acd/prompt-trace/` and are visible only after you opt in with
 `ACD_AI_PROMPT_TRACE=1`.
 
+## Managing repo registration
+
+Most repos need no manual registration. By default, `acd start` and harness
+hooks auto-create the repo-local state database at `<gitDir>/acd/state.db` and
+add the repo to the central registry.
+
+Use explicit repo lifecycle commands when autodiscovery is disabled or when you
+want to clean up old registry rows:
+
+~~~bash
+acd repo init
+acd repo list
+acd repo remove --dry-run
+acd repo remove
+acd repo remove --yes
+acd repo remove --yes --purge-state
+~~~
+
+| Command | Use it for |
+|---|---|
+| `acd repo init` | Create `.git/acd/state.db` and register the current Git repo without starting the daemon. |
+| `acd repo list` | Inspect all registered repos, including stopped, missing, or state-missing rows. |
+| `acd repo remove --dry-run` | Preview registry removal while preserving registry and state. |
+| `acd repo remove` | Open an interactive registry manager with selection, preview, and confirmation. |
+| `acd repo remove --yes` | Scriptable registry removal; repo-local `.git/acd` state is preserved. |
+| `acd repo remove --yes --purge-state` | Remove the registry row and delete that repo's `.git/acd` state. |
+
+Configure explicit-only mode in `~/.config/acd/config.json`:
+
+~~~json
+{
+  "repo_lifecycle": {
+    "autodiscovery": false
+  }
+}
+~~~
+
+`ACD_REPO_AUTODISCOVERY` overrides the file for the current process. Enabled
+forms are `1`, `true`, `yes`, `on`, `enable`, and `enabled`; disabled forms
+are `0`, `false`, `no`, `off`, `disable`, and `disabled`.
+
+When autodiscovery is disabled, harness hooks in unregistered repos skip
+without creating `.git/acd`. A manual `acd start` prints a repo-init-required
+message that points at `acd repo init --repo <path>`.
+
 ## File was not committed
 
 Start with the path, not SQLite:

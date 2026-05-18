@@ -59,6 +59,13 @@ up once Codex exits.
 The active wake hooks call `acd start` first so a later prompt or tool event can
 recover if you manually ran `acd stop` while the Codex session stayed open.
 
+Repo autodiscovery is enabled by default. If you disable it with
+`repo_lifecycle.autodiscovery` in `~/.config/acd/config.json` or with
+`ACD_REPO_AUTODISCOVERY=disabled`, Codex hooks in unregistered repos skip
+without creating `.git/acd`. Run `acd repo init` in each repo you want Codex to
+manage, or temporarily set `ACD_REPO_AUTODISCOVERY=enabled` before starting the
+session.
+
 The repo path is read from the JSON `cwd` field on stdin (consumed in one
 pass via `acd hook-stdin-extract session_id cwd?`). When `cwd` is missing,
 the hook falls back to the hook process working directory; `CODEX_PROJECT_DIR`

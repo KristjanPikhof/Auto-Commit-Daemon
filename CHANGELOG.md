@@ -4,6 +4,8 @@
 
 ### Added
 
+- `acd repo init`, `acd repo list`, and `acd repo remove` manage explicit repo
+  registration for users who want to disable automatic repo discovery.
 - Singleton intent windows now use the normal per-event commit-message
   provider instead of the structured intent planner. One-capture commits keep
   their cheaper 4 KiB diff budget and emit `replay.intent.singleton_shortcircuit`
@@ -25,6 +27,9 @@
 - Wake flush-request acknowledgements moved to debug logs with a periodic
   summary, so active tool hooks no longer flood daemon logs during busy
   sessions.
+- Repo autodiscovery can be disabled through `~/.config/acd/config.json` or
+  `ACD_REPO_AUTODISCOVERY`; unregistered hook paths then skip without creating
+  repo state, while manual starts point at `acd repo init`.
 
 ### Fixed
 
@@ -44,6 +49,8 @@
   logical-flush behavior explicitly. If you preferred the old wake-only cadence,
   lower `ACD_INTENT_MAX_PENDING_AGE` (for example, `60s`) or install the current
   harness snippets so turn boundaries call `acd flush --logical`.
+- README, workflow docs, and harness notes now document explicit repo lifecycle
+  commands, autodiscovery disablement, and preserve-vs-purge removal behavior.
 
 ## v2026-05-16
 

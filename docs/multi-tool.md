@@ -80,6 +80,12 @@ itself also has an auto-commit plugin active, the same idempotent publish logic
 applies: `acd` detects the already-landed commit and settles without creating a
 duplicate.
 
+If repo autodiscovery is disabled, hook-driven `acd start` calls only manage
+repos that were registered with `acd repo init`. In an unregistered repo the
+hook path skips without creating `.git/acd` or a central registry row. Run
+`acd repo init` in that repo, or temporarily set
+`ACD_REPO_AUTODISCOVERY=enabled`, before expecting harness hooks to manage it.
+
 ---
 
 ## Edge cases that still produce `blocked_conflict`
