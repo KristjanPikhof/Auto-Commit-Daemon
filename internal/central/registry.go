@@ -30,9 +30,11 @@ package central
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,7 +44,9 @@ import (
 	"syscall"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // RegistryVersion is the current schema version. Future bumps must be paired
@@ -68,6 +72,48 @@ type RepoRecord struct {
 	FirstRegisteredTS int64    `json:"first_registered_ts"`
 	LastSeenTS        int64    `json:"last_seen_ts"`
 	Harnesses         []string `json:"harnesses"`
+}
+
+// RepoRegistrationResult describes an explicit registry insert or refresh.
+type RepoRegistrationResult struct {
+	Record    RepoRecord `json:"record"`
+	Inserted  bool       `json:"inserted"`
+	Refreshed bool       `json:"refreshed"`
+}
+
+// RepoRemovalTarget identifies the registry row to remove. Path should be a
+// canonical worktree root when known; StateDB may be supplied to remove legacy
+// rows whose path is stale but whose state DB still identifies the repo.
+type RepoRemovalTarget struct {
+	Path    string `json:"path,omitempty"`
+	StateDB string `json:"state_db,omitempty"`
+}
+
+// RepoRemovalResult is returned by registry removal helpers. RemovedRecord is
+// populated only when Removed is true; Safety is non-destructive metadata for
+// the CLI to decide whether to stop daemons, clear caches, or purge state.
+type RepoRemovalResult struct {
+	Removed       bool              `json:"removed"`
+	NotFound      bool              `json:"not_found"`
+	RemovedRecord *RepoRecord       `json:"removed_record,omitempty"`
+	Safety        RepoRemovalSafety `json:"safety"`
+}
+
+// RepoRemovalSafety captures state paths and best-effort daemon liveness for
+// a registry row. It never deletes files or opens state.db read-write.
+type RepoRemovalSafety struct {
+	Path             string `json:"path,omitempty"`
+	StateDB          string `json:"state_db,omitempty"`
+	GitDir           string `json:"git_dir,omitempty"`
+	StateDir         string `json:"state_dir,omitempty"`
+	StartCacheDir    string `json:"start_cache_dir,omitempty"`
+	StateDBExists    bool   `json:"state_db_exists"`
+	StateDirExists   bool   `json:"state_dir_exists"`
+	DaemonStateKnown bool   `json:"daemon_state_known"`
+	DaemonMode       string `json:"daemon_mode,omitempty"`
+	DaemonPID        int    `json:"daemon_pid,omitempty"`
+	DaemonAlive      bool   `json:"daemon_alive"`
+	DaemonStateError string `json:"daemon_state_error,omitempty"`
 }
 
 // LegacyDuplicateChange describes one registry row removed by
@@ -232,6 +278,150 @@ func (r *Registry) UpsertRepo(path, repoHash, stateDB, harness string, now int64
 		rec.Harnesses = []string{}
 	}
 	r.Repos = append(r.Repos, rec)
+}
+
+// RegisterResolvedRepo inserts or refreshes the registry row for an already
+// resolved Git worktree. Call this from inside WithLock when persisting the
+// mutation. It preserves the original first_registered_ts on refresh.
+func (r *Registry) RegisterResolvedRepo(wt git.Worktree, harness string, now int64) (RepoRegistrationResult, error) {
+	if r == nil {
+		return RepoRegistrationResult{}, fmt.Errorf("central: RegisterResolvedRepo: nil registry")
+	}
+	if wt.Root == "" {
+		return RepoRegistrationResult{}, fmt.Errorf("central: RegisterResolvedRepo: empty worktree root")
+	}
+	if wt.GitDir == "" {
+		return RepoRegistrationResult{}, fmt.Errorf("central: RegisterResolvedRepo: empty git dir")
+	}
+	repoHash, err := paths.RepoHash(wt.Root)
+	if err != nil {
+		return RepoRegistrationResult{}, fmt.Errorf("central: repo hash: %w", err)
+	}
+	stateDB := state.DBPathFromGitDir(wt.GitDir)
+	_, existed := r.FindRepo(wt.Root, stateDB)
+	r.UpsertRepo(wt.Root, repoHash, stateDB, harness, now)
+	rec, ok := r.FindRepo(wt.Root, stateDB)
+	if !ok {
+		return RepoRegistrationResult{}, fmt.Errorf("central: registered repo row not found after upsert")
+	}
+	return RepoRegistrationResult{
+		Record:    rec,
+		Inserted:  !existed,
+		Refreshed: existed,
+	}, nil
+}
+
+// FindRepo returns the row matching path or any supplied state DB path. It
+// does not mutate the registry; callers that need persistence should use
+// RegisterResolvedRepo or UpsertRepo under WithLock.
+func (r *Registry) FindRepo(path string, stateDBs ...string) (RepoRecord, bool) {
+	idx, ok := r.findRepoIndex(path, stateDBs...)
+	if !ok {
+		return RepoRecord{}, false
+	}
+	return r.Repos[idx], true
+}
+
+// RemoveRepoByPath removes the row whose Path matches path. Call this from
+// inside WithLock when persisting the mutation.
+func (r *Registry) RemoveRepoByPath(ctx context.Context, path string) RepoRemovalResult {
+	return r.RemoveRepo(ctx, RepoRemovalTarget{Path: path})
+}
+
+// RemoveRepoByStateDB removes the row whose StateDB matches stateDB. Call this
+// from inside WithLock when persisting the mutation.
+func (r *Registry) RemoveRepoByStateDB(ctx context.Context, stateDB string) RepoRemovalResult {
+	return r.RemoveRepo(ctx, RepoRemovalTarget{StateDB: stateDB})
+}
+
+// RemoveRepo removes exactly one matching registry row by canonical path or
+// state DB. It is intentionally non-destructive: it only mutates Registry.Repos
+// and returns safety metadata for the removed row. Call this from inside
+// WithLock when persisting the mutation.
+func (r *Registry) RemoveRepo(ctx context.Context, target RepoRemovalTarget) RepoRemovalResult {
+	if r == nil {
+		return RepoRemovalResult{NotFound: true}
+	}
+	idx, ok := r.findRepoIndex(target.Path, target.StateDB)
+	if !ok {
+		return RepoRemovalResult{
+			NotFound: true,
+			Safety:   removalSafetyFromTarget(ctx, target),
+		}
+	}
+	removed := r.Repos[idx]
+	r.Repos = append(r.Repos[:idx], r.Repos[idx+1:]...)
+	return RepoRemovalResult{
+		Removed:       true,
+		RemovedRecord: &removed,
+		Safety:        ProbeRepoRemovalSafety(ctx, removed),
+	}
+}
+
+func (r *Registry) findRepoIndex(path string, stateDBs ...string) (int, bool) {
+	if r == nil {
+		return -1, false
+	}
+	for i, rec := range r.Repos {
+		if path != "" && SameRepoPath(rec.Path, path) {
+			return i, true
+		}
+		if matchesAnyStateDB(rec.StateDB, stateDBs) {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+func matchesAnyStateDB(actual string, expected []string) bool {
+	actual = canonicalStateDB(actual)
+	if actual == "" {
+		return false
+	}
+	for _, want := range expected {
+		want = canonicalStateDB(want)
+		if want != "" && sameCleanPath(actual, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func removalSafetyFromTarget(ctx context.Context, target RepoRemovalTarget) RepoRemovalSafety {
+	return ProbeRepoRemovalSafety(ctx, RepoRecord{Path: target.Path, StateDB: target.StateDB})
+}
+
+// ProbeRepoRemovalSafety returns non-destructive metadata for repo removal
+// previews. It opens state.db read-only when present and records probe errors
+// in the result instead of failing the registry mutation.
+func ProbeRepoRemovalSafety(ctx context.Context, rec RepoRecord) RepoRemovalSafety {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s := RepoRemovalSafety{
+		Path:    rec.Path,
+		StateDB: canonicalStateDB(rec.StateDB),
+	}
+	if s.StateDB != "" {
+		s.StateDir = filepath.Dir(s.StateDB)
+		s.GitDir = filepath.Dir(s.StateDir)
+		s.StartCacheDir = s.StateDir
+		s.StateDBExists = fileExists(s.StateDB)
+		s.StateDirExists = fileExists(s.StateDir)
+	}
+	if !s.StateDBExists {
+		return s
+	}
+	pid, mode, known, err := readDaemonStateReadOnly(ctx, s.StateDB)
+	if err != nil {
+		s.DaemonStateError = err.Error()
+		return s
+	}
+	s.DaemonStateKnown = known
+	s.DaemonPID = pid
+	s.DaemonMode = mode
+	s.DaemonAlive = identity.AliveContext(ctx, pid)
+	return s
 }
 
 // Normalize merges duplicate repo records that refer to the same repository.
@@ -442,6 +632,28 @@ func canonicalStateDB(path string) string {
 		path = filepath.Clean(realPath)
 	}
 	return path
+}
+
+func readDaemonStateReadOnly(ctx context.Context, dbPath string) (pid int, mode string, known bool, err error) {
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("mode", "ro")
+	conn, err := sql.Open("sqlite", "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return 0, "", false, fmt.Errorf("open state.db read-only: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.PingContext(ctx); err != nil {
+		return 0, "", false, fmt.Errorf("ping state.db read-only: %w", err)
+	}
+	const query = `SELECT pid, mode FROM daemon_state WHERE id = 1`
+	row := conn.QueryRowContext(ctx, query)
+	if err := row.Scan(&pid, &mode); errors.Is(err, sql.ErrNoRows) {
+		return 0, "stopped", false, nil
+	} else if err != nil {
+		return 0, "", false, fmt.Errorf("load daemon_state read-only: %w", err)
+	}
+	return pid, mode, true, nil
 }
 
 func fileExists(path string) bool {

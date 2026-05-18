@@ -83,6 +83,11 @@ func (r Roots) StatsDBPath() string {
 	return filepath.Join(r.Share, "stats.db")
 }
 
+// ConfigPath returns ~/.config/acd/config.json.
+func (r Roots) ConfigPath() string {
+	return filepath.Join(r.Config, "config.json")
+}
+
 // xdgRoot reads an XDG_*_HOME env var. If unset, empty, or not absolute,
 // it falls back to the supplied default. Per the XDG spec, "If $XDG_...
 // is either not set or empty, a default ... should be used. ... All paths
