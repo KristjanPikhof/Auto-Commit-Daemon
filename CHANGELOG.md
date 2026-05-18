@@ -30,6 +30,9 @@
 - Repo autodiscovery can be disabled through `~/.config/acd/config.json` or
   `ACD_REPO_AUTODISCOVERY`; unregistered hook paths then skip without creating
   repo state, while manual starts point at `acd repo init`.
+- Human `acd repo list` output no longer prints the `STATE_DB` column, keeping
+  the table focused on repo, daemon, queue, and status fields. JSON output
+  still includes `state_db` for scripts.
 
 ### Fixed
 

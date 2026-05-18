@@ -171,7 +171,7 @@ yourself:
 
 ~~~bash
 acd repo init                      # create .git/acd/state.db and register this repo
-acd repo list                      # show registered repos, daemon state, queue counts, and state paths
+acd repo list                      # show registered repos, daemon state, queue counts, and status
 acd repo remove --dry-run          # preview registry removal; preserve state by default
 acd repo remove                    # interactive registry manager
 acd repo remove --yes              # scriptable removal; preserve .git/acd

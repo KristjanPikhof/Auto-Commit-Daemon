@@ -221,15 +221,14 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 		}{Repos: entries})
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tSTATE_DB\tSTATUS")
+	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tSTATUS")
 	for _, entry := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%s\n",
 			homeShort(entry.Path),
 			repoEntryDaemon(entry),
 			entry.Clients,
 			entry.PendingEvents,
 			entry.BlockedConflicts,
-			entry.StateDB,
 			entry.Status)
 	}
 	if err := tw.Flush(); err != nil {

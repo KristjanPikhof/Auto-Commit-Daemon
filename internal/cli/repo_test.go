@@ -434,6 +434,33 @@ func TestRepoList_IncludesStoppedAndMissingRows(t *testing.T) {
 	}
 }
 
+func TestRepoList_HumanOutputOmitsStateDBColumn(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: 0, Mode: "stopped", HeartbeatTS: nowFloat()}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoList(ctx, &out, false); err != nil {
+		t.Fatalf("runRepoList: %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{"REPO", "DAEMON", "CLIENTS", "PENDING", "BLOCKED", "STATUS", repo, "stopped"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("human repo list output missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"STATE_DB", stateDB} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("human repo list output includes %q:\n%s", unwanted, text)
+		}
+	}
+}
+
 func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
