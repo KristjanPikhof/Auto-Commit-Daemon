@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-18
+
 ### Added
 
 - Explicit repo lifecycle commands: `acd repo init`, `acd repo list`, and
