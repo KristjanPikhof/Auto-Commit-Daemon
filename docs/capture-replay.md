@@ -410,11 +410,13 @@ acd resume --repo . --yes
 ~~~
 
 `acd fix` is the single recovery entrypoint. Review the dry-run plan before
-applying with `--yes`; `--force` opts into purging blocked barriers that still
-have pending successors (use only when the captured changes already exist in
-HEAD via an external committer). The legacy `acd recover` and
-`acd purge-events` commands remain as hidden, deprecated aliases that forward
-into `acd fix` for one release.
+applying with `--yes`; safe apply backs up `state.db` and performs only cleanup
+ACD can verify. `--force` opts into purging blocked barriers that still have
+pending successors, and is deliberately explicit: run `acd fix --force
+--dry-run` first, then apply only after you verify the captured changes already
+exist in `HEAD` via an external committer or should be discarded. The legacy
+`acd recover` and `acd purge-events` commands remain as hidden, deprecated
+aliases that forward into `acd fix` for one release.
 
 ACD keys lifecycle state by the canonical Git worktree root. `acd start` from
 `repo/sub/dir` registers `repo`, not the subdirectory, and later `acd status` or
@@ -595,11 +597,13 @@ the pause fields:
 
 | Value | Meaning |
 |---|---|
-| `"OK"` | Daemon running, no pause, no stale heartbeat |
+| `"OK"` | Daemon running, no pause, no stale heartbeat, and no queued or blocked work. |
+| `"pending"` | Work is queued but not blocked. In intent mode this can be a normal batch wait; wait for more captures or the age trigger, or run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session. |
+| `"blocked"` | A terminal barrier is holding replay. Operator action is required: diagnose, dry-run `acd fix`, then choose safe or explicit force apply. |
 | `"paused"` | Replay paused (operator or rewind grace). Takes priority over `stale`. |
-| `"stale"` | Daemon heartbeat expired or PID dead, at least one live client present |
-| `"missing"` | Repo directory or `state.db` not found on disk |
-| `"unreadable"` | `state.db` exists but could not be opened |
+| `"stale"` | Daemon heartbeat expired or PID dead, at least one live client present. |
+| `"missing"` | Repo directory or `state.db` not found on disk. |
+| `"unreadable"` | `state.db` exists but could not be opened. |
 
 `status_note` combines the pause source and stale information into a human-readable
 string when both apply (e.g. `"manual; daemon stale 3h"`). `stale_heartbeat` is
@@ -761,16 +765,19 @@ version lives in [user-workflows.md](user-workflows.md).
    ~~~bash
    acd diagnose --repo .
    acd fix --dry-run
+   acd fix --yes
    acd fix --force --dry-run
+   acd fix --force --yes
    ~~~
 
-   If the dry-run plan is correct, rerun with `--yes`. `acd fix` covers safe
-   cleanup (resolve_already_landed_barrier promotes blocked rows whose
-   captured after-state already exists at HEAD; retarget_stale_anchor handles
-   branch surgery; delete_obsolete_barrier removes barriers without pending
-   successors; mark_external_published settles externally-handled rows).
-   `acd fix --force --yes` adds purge_barrier_with_successors for terminal
-   barriers that still block later pending rows.
+   First dry-run, then use safe apply when the plan matches what happened.
+   `acd fix` covers safe cleanup (resolve_already_landed_barrier promotes
+   blocked rows whose captured after-state already exists at HEAD;
+   retarget_stale_anchor handles branch surgery; delete_obsolete_barrier
+   removes barriers without pending successors; mark_external_published settles
+   externally-handled rows). Use `acd fix --force --yes` only after the forced
+   dry-run and an operator check; it adds purge_barrier_with_successors for
+   terminal barriers that still block later pending rows.
 
    After clearing the blockers, trigger a replay:
    `acd wake --session-id "$ACD_SESSION_ID"`.

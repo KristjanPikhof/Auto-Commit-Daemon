@@ -90,6 +90,16 @@ When autodiscovery is disabled, harness hooks in unregistered repos skip
 without creating `.git/acd`. A manual `acd start` prints a repo-init-required
 message that points at `acd repo init --repo <path>`.
 
+## Recovery decision ladder
+
+When commits stop appearing, move from observation to mutation in this order:
+
+1. **Diagnose.** Run `acd status`, then `acd events --watch` and `acd explain --path <file>` for the affected path. If the repo table is easier, `acd list` shows whether a repo is `OK`, `pending`, `blocked`, `paused`, `stale`, `missing`, or `unreadable`.
+2. **Dry-run.** Run `acd diagnose --json`, then `acd fix --dry-run`. Read the plan before changing state.
+3. **Safe apply.** Run `acd fix --yes` only when the dry-run plan matches what happened. Safe apply backs up `state.db`, refuses a live daemon owner, and applies only cleanup ACD can verify.
+4. **Explicit force apply.** If the dry-run says terminal barriers still have pending successors, rerun `acd fix --force --dry-run`. Apply with `acd fix --force --yes` only after you verify the blocked captured changes are already in `HEAD` or should be discarded. Force is never implied by safe apply.
+5. **Post-check.** Run `acd status` or `acd list` again. `blocked` means action is still required. `pending` means work remains queued; in intent mode, a pending-only queue may be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`, so wait, lower thresholds, or use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session.
+
 ## File was not committed
 
 Start with the path, not SQLite:
@@ -140,17 +150,21 @@ Expected decisions:
 | `superseded_external` | External history made the queued event obsolete, usually because `HEAD` now matches the captured before-state or otherwise proves replay would be redundant. |
 
 No action is needed when `acd explain` says the external commit already
-contains the change. If the queue remains blocked after an external commit, use:
+contains the change. If the queue remains blocked after an external commit, use the ladder:
 
 ~~~bash
 acd fix --dry-run
 acd fix --yes
+acd fix --force --dry-run
+acd fix --force --yes
 ~~~
 
 `fix --yes` refuses unsafe mutations and backs up `state.db` first. Stop the
 daemon before applying a plan if the command tells you a live daemon owns the
-state database. If the plan reports barriers with pending successors, add
-`--force` to include the purge.
+state database. If the plan reports barriers with pending successors, `--force`
+adds that purge only when you request it explicitly; inspect the forced dry-run
+and verify the blocked changes are already represented in `HEAD` or are safe to
+discard before applying.
 
 ## Intent grouping deferred or forced a change
 
@@ -440,7 +454,7 @@ artifact for issue reports.
 |---|---|
 | `captured` | ACD noticed a change and queued it for replay. |
 | `committed` | ACD published the queued change as a commit. |
-| `intent_deferred` | Intent planning left the capture pending for a later commit. |
+| `intent_deferred` | Intent planning left the capture pending for a later commit. Pending-only intent queues may need more captures, the age trigger, or an explicit logical flush. |
 | `intent_forced` | ACD forced an over-deferred capture through a one-item planning window. |
 | `intent_planner_error` | The planner failed validation; ACD used a safe fallback plan. |
 | `skipped` | ACD intentionally left a path uncommitted, usually due to ignore or policy. |
@@ -448,7 +462,7 @@ artifact for issue reports.
 | `handled_external` | Another commit already contains the captured after-state. |
 | `handled_external_after_block` | A `blocked_conflict` row was self-healed: an external committer landed the captured after-state, so the daemon promoted the row to `published` without a new commit. |
 | `superseded_external` | External history made the queued work obsolete. |
-| `blocked` | Replay stopped because applying the event was not provably safe. |
+| `blocked` | Replay stopped because applying the event was not provably safe; operator action is required. |
 | `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
 
 ## Cold start commit cleanup
