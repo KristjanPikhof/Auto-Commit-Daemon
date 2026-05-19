@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Recovery views now separate waiting queues from blocked repos, so `acd list`,
+  `acd status`, and `acd diagnose` point to the right next command.
+
+### Fixed
+
+- `acd fix --force --yes` now self-verifies cleanup and reports remaining
+  blockers instead of looking successful when a barrier still needs attention.
+
 ## v2026-05-18
 
 ### Added
