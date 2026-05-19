@@ -202,15 +202,15 @@ type DeferredReason struct {
 // IntentPlan is the structured planner response. Every offered capture seq must
 // appear in exactly one of SelectedSeqs or DeferredSeqs.
 type IntentPlan struct {
-	SelectedSeqs    []int64          `json:"selected_seqs"`
-	DeferredSeqs    []int64          `json:"deferred_seqs"`
-	Subject         string           `json:"subject"`
-	Body            string           `json:"body,omitempty"`
-	GroupingReason  string           `json:"grouping_reason"`
-	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
-	Source          string           `json:"-"`
-	MessageQuality  MessageQualityAction `json:"-"`
-	MessageQualityReason string           `json:"-"`
+	SelectedSeqs         []int64              `json:"selected_seqs"`
+	DeferredSeqs         []int64              `json:"deferred_seqs"`
+	Subject              string               `json:"subject"`
+	Body                 string               `json:"body,omitempty"`
+	GroupingReason       string               `json:"grouping_reason"`
+	DeferredReasons      []DeferredReason     `json:"deferred_reasons,omitempty"`
+	Source               string               `json:"-"`
+	MessageQuality       MessageQualityAction `json:"-"`
+	MessageQualityReason string               `json:"-"`
 }
 
 // IntentMessageRewriteRequest is a locked message-only rewrite request. The
