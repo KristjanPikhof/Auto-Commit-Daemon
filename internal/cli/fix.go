@@ -164,6 +164,18 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 			}
 			return err
 		}
+	} else if force {
+		conn, err := openStateDBReadOnly(ctx, rec.StateDB)
+		if err != nil {
+			return fmt.Errorf("acd fix: open state.db read-only for post-apply verification: %w", err)
+		}
+		defer conn.Close()
+		if err := verifyFixPostApply(ctx, conn, &plan); err != nil {
+			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
+				return rerr
+			}
+			return err
+		}
 	}
 	return renderFix(out, plan, jsonOut)
 }

@@ -532,6 +532,10 @@ func TestFix_YesAloneRefusesToIncludePurge(t *testing.T) {
 	if !plan.ForceRequired {
 		t.Fatalf("plan.force_required=false with active force-only barrier: %+v", plan)
 	}
+	got := countCaptureRowsByState(t, db)
+	if got[state.EventStateBlockedConflict] != 1 || got[state.EventStatePending] != 1 {
+		t.Fatalf("normal fix must not destructively purge barrier rows: %v", got)
+	}
 }
 
 func TestFix_SafePlanPrintsExactForceCommandWithRepoPath(t *testing.T) {
@@ -639,6 +643,18 @@ func TestFix_ForceYesPurgesBeforeRetargetResetsBlockedRows(t *testing.T) {
 	got := countCaptureRowsByState(t, db)
 	if got[state.EventStateBlockedConflict] != 0 {
 		t.Fatalf("blocked rows remain after order-safe force fix: %v", got)
+	}
+	if got[state.EventStatePending] != 1 {
+		t.Fatalf("barrier must be deleted, not reset to pending; row counts: %v", got)
+	}
+	var barrierRows int
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE path = 'barrier.txt'`,
+	).Scan(&barrierRows); err != nil {
+		t.Fatalf("query barrier rows: %v", err)
+	}
+	if barrierRows != 0 {
+		t.Fatalf("force purge must delete barrier row, got %d barrier rows", barrierRows)
 	}
 }
 

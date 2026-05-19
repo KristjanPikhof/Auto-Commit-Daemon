@@ -143,19 +143,23 @@ ACD refuses lifecycle commands outside a Git worktree. `start`, `status`, `diagn
 
 ## When commits stop appearing
 
-In order:
+Use the recovery ladder in order:
 
 ~~~bash
-acd status                         # any pause? failed barriers? blocked conflicts?
-acd events --watch                 # what is the daemon deciding right now?
-acd explain --path path/to/file    # why is this file stuck?
-acd diagnose --json                # branch anchor + barrier report
+acd status                         # diagnose: pause, failed barriers, blocked conflicts, intent wait
+acd events --watch                 # inspect: what is the daemon deciding right now?
+acd explain --path path/to/file    # inspect: why is this file stuck?
+acd diagnose --json                # inspect: branch anchor + barrier report
 acd fix --dry-run                  # plan safe remediation; read it before applying
-acd fix --yes                      # apply the safe plan
-acd fix --force --yes              # also purge blocked barriers with pending successors
+acd fix --yes                      # apply only the safe plan
+acd fix --force --dry-run          # explicit force plan for blocked barriers with pending successors
+acd fix --force --yes              # explicit force apply after you verify the plan
+acd status                         # post-check: confirm pending/blocked counts and status terms
 ~~~
 
-`acd fix` is the single recovery entrypoint. It backs up `state.db` before mutating, refuses to run while a live daemon owns the database, and won't lift a manual pause unless you pass `--clear-pause`. Use `acd resume --yes` when the only problem is a stale pause marker.
+`acd fix` is the single recovery entrypoint. It backs up `state.db` before mutating, refuses to run while a live daemon owns the database, and won't lift a manual pause unless you pass `--clear-pause`. Safe apply (`acd fix --yes`) handles only self-verifiable cleanup. Force apply is explicit: use `--force` only after the dry-run shows terminal barriers with pending successors and you have verified the captured changes are already represented in `HEAD` or are intentionally being discarded. Use `acd resume --yes` when the only problem is a stale pause marker.
+
+After recovery, `acd list` status `blocked` means operator action is still required; `pending` means queued work remains. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
 
 If a parallel committer (Claude Code's atomic-commit hook, Codex ACD hook, your own script) lands the change before ACD's replay tick, you'll see `handled_external` or `superseded_external` in `acd events`. That's normal. Real content mismatches still surface as `blocked_conflict`.
 
