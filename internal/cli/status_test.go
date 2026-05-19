@@ -188,6 +188,66 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 	}
 }
 
+func TestStatus_BlockedBarrierGuidance(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+		BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "barrier.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "barrier.go", Fidelity: "exact"}})
+	if err != nil {
+		t.Fatalf("append blocked event: %v", err)
+	}
+	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
+		sql.NullString{String: "refs/heads/main", Valid: true},
+		sql.NullInt64{Int64: 1, Valid: true},
+		sql.NullString{String: "deadbeef", Valid: true},
+	); err != nil {
+		t.Fatalf("mark blocked: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "later.go",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "modify", Path: "later.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending successor: %v", err)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	human := humanOut.String()
+	for _, want := range []string{"Blocked conflicts: 1", "acd fix --dry-run", "Blocked barriers with pending replay: 1", "acd fix --force --dry-run"} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("status human missing %q in:\n%s", want, human)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.ActiveBarriers != 1 || rep.BlockedConflicts != 1 || rep.PendingEvents != 1 {
+		t.Fatalf("status counts = blocked %d active %d pending %d, want 1/1/1", rep.BlockedConflicts, rep.ActiveBarriers, rep.PendingEvents)
+	}
+}
+
 func TestStatus_FailedBarrierGuidance(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
