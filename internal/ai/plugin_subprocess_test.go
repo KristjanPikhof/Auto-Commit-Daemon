@@ -181,6 +181,62 @@ done
 	}
 }
 
+func TestSubprocess_RewriteIntentMessagePromptTraceUsesRewriteStrategy(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"intent_message_rewrite"'*'"message_rewrite_request"'*)
+      printf '%s\n' '{"version":1,"subject":"Tighten checkout validation","body":"","error":""}'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing rewrite request"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{
+		Strategy:     string(CommitStrategyIntent),
+		OfferedSeqs:  []int64{101, 102},
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+	if _, err := p.RewriteIntentMessage(ctx, rewriteReq); err != nil {
+		t.Fatalf("RewriteIntentMessage: %v", err)
+	}
+	got := promptTraceRecordByStage(t, records(), "request")
+	if got.Strategy != "intent_message_rewrite" {
+		t.Fatalf("strategy=%q want intent_message_rewrite", got.Strategy)
+	}
+	if strings.Join(int64sToStrings(got.OfferedSeqs), ",") != "101" {
+		t.Fatalf("offered seqs=%v want selected seq only", got.OfferedSeqs)
+	}
+	if got.DiffCap != IntentStageDiffCap || !got.DiffIncluded {
+		t.Fatalf("diff metadata cap=%d included=%v", got.DiffCap, got.DiffIncluded)
+	}
+}
+
 func TestSubprocess_PlanIntentRejectsSelectedDeferredOverlap(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
