@@ -2759,7 +2759,11 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	if len(output) != 1 {
 		t.Fatalf("planner output trace count=%d want 1", len(output))
 	}
-	if source, _ := output[0].Output["source"].(string); source != "openai-compat" {
+	outputMap, ok := output[0].Output.(map[string]any)
+	if !ok {
+		t.Fatalf("planner output payload=%T want map", output[0].Output)
+	}
+	if source, _ := outputMap["source"].(string); source != "openai-compat" {
 		t.Fatalf("planner output source=%q want openai-compat", source)
 	}
 }
