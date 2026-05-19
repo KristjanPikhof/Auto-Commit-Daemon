@@ -220,24 +220,23 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	}
 }
 
-// TestIntentPlannerRecovery_ForcedSingletonSkipsProvider drives the
-// forced-aging singleton fast path through the real binary. The flow:
+// TestIntentPlannerRecovery_ForcedSingletonUsesProvider drives the
+// forced-aging singleton provider path through the real binary. The flow:
 //
 //  1. Two captures offered together; the mock planner selects ONE and
 //     defers the OTHER (selected/deferred coverage that passes
 //     ValidateIntentPlan, which requires non-empty selected_seqs).
 //  2. After publish, only the deferred capture survives as pending with
 //     defer_count >= IntentDeferLimit (set to 1).
-//  3. Next replay tick: pending=1, with defer_count >= limit. The
-//     selectIntentWindow forced-aging branch fires AND len(items)==1, so
-//     planIntentSingletonFastPath skips the provider entirely and lands
-//     a diff-aware-subject commit.
+//  3. Next replay tick: pending=1, with defer_count >= limit. Because the
+//     configured planner is not deterministic, replay asks the provider for
+//     the overdue singleton so message-quality policy can run.
 //
-// The mock provider counts HTTP hits; only the first (defer) call must
-// reach it. The published commit subject must contain the extracted Go
-// function symbol from the diff (NOT the planner's own subject from the
-// first call, since the planner is never asked the second time).
-func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
+// The mock provider counts HTTP hits; the first call defers overdue.go, and
+// the second call returns a semantic singleton message. The published commit
+// subject must be the second provider subject, not the first-pass subject and
+// not a generic basename fallback.
+func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -254,10 +253,23 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 		}
 		req := decodeIntentChatRequest(t, r)
 		captures := offeredIntentCaptures(t, req)
-		if len(captures) < 2 {
-			http.Error(w, "expected at least two offered captures", http.StatusBadRequest)
+		if len(captures) == 0 {
+			http.Error(w, "expected offered captures", http.StatusBadRequest)
 			return
 		}
+		if len(captures) == 1 {
+			plan := map[string]any{
+				"selected_seqs":    []int64{captures[0].Seq},
+				"deferred_seqs":    []int64{},
+				"subject":          "Add overdue capture handler",
+				"body":             "",
+				"grouping_reason":  "forced-aging singleton: publish overdue capture",
+				"deferred_reasons": []map[string]any{},
+			}
+			writeIntentPlanResponse(t, w, "call_singleton_forced", plan)
+			return
+		}
+
 		// Find overdue.go and defer it; select everything else. We MUST key
 		// on path (not seq order) because capture enumeration is path-sorted
 		// — a basename-alphabetical comparison would put overdue.go ahead of
@@ -282,37 +294,7 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 			"grouping_reason":  "first pass: select warm-up, defer the rest",
 			"deferred_reasons": buildDeferredReasons(deferred),
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-singleton",
-			"object": "chat.completion",
-			"model":  "gpt-4o-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_singleton",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_singleton_defer", plan)
 	}))
 	defer server.Close()
 
@@ -371,7 +353,7 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 		return got != "" && got != "0"
 	})
 	// Capture how many hits the deferral pass cost. Must be at least 1
-	// (the defer call); subsequent tick must add zero.
+	// (the defer call); subsequent tick must add one forced-singleton call.
 	hitsAfterDefer := hits.Load()
 	if hitsAfterDefer == 0 {
 		t.Fatal("planner was never called for the first (defer) pass")
@@ -379,31 +361,66 @@ func TestIntentPlannerRecovery_ForcedSingletonSkipsProvider(t *testing.T) {
 
 	// Wait past IntentMaxPendingAge so the next replay tick treats the
 	// deferred capture as forced-aging-ready, then drive the tick. The
-	// planner must NOT be called again (planIntentSingletonFastPath gate).
+	// provider must be called again so message-quality policy can inspect
+	// the singleton commit message.
 	time.Sleep(2500 * time.Millisecond)
 	wakeSession(t, ctx, fullEnv, repo, "intent-recovery-singleton")
 	waitForEventState(t, dbPath, "overdue.go", "published", 15*time.Second)
 
-	if got := hits.Load(); got != hitsAfterDefer {
-		t.Fatalf("planner hits after forced-singleton tick=%d want %d (forced-aging singleton must skip provider)",
-			got, hitsAfterDefer)
+	if got, want := hits.Load(), hitsAfterDefer+1; got != want {
+		t.Fatalf("planner hits after forced-singleton tick=%d want %d (forced-aging singleton must use provider)",
+			got, want)
 	}
 
-	// HEAD subject MUST be the diff-aware fallback ("Add HandleOverdueCapture"),
-	// NOT the planner's "Planner: pick warm-up" subject from the first call,
-	// and NOT the generic "Add overdue.go" / "Update overdue.go" basename
-	// fallback. Reading HEAD subject only tells us about the LAST commit;
-	// since overdue.go publishes after warm.txt, HEAD reflects overdue.go.
+	// HEAD subject MUST be the second provider response, NOT the planner's
+	// first-pass subject, and NOT the generic basename fallback. Reading HEAD
+	// subject only tells us about the LAST commit; since overdue.go publishes
+	// after warm.txt, HEAD reflects overdue.go.
 	subj := headSubject(t, repo)
 	if subj == "Planner: pick warm-up" {
-		t.Fatalf("HEAD subject=%q is the planner's first-pass subject; forced-singleton must use diff-aware fallback", subj)
+		t.Fatalf("HEAD subject=%q is the planner's first-pass subject; forced-singleton must use second provider response", subj)
 	}
 	if subj == "Add overdue.go" || subj == "Update overdue.go" {
-		t.Fatalf("HEAD subject=%q is the generic basename fallback; expected the diff-aware Go-symbol fallback", subj)
+		t.Fatalf("HEAD subject=%q is the generic basename fallback; expected semantic provider subject", subj)
 	}
-	if !strings.Contains(subj, "HandleOverdueCapture") {
-		t.Fatalf("HEAD subject=%q must contain the extracted Go symbol HandleOverdueCapture", subj)
+	if subj != "Add overdue capture handler" {
+		t.Fatalf("HEAD subject=%q want semantic provider subject", subj)
 	}
+}
+
+func writeIntentPlanResponse(t *testing.T, w http.ResponseWriter, callID string, plan map[string]any) {
+	t.Helper()
+	args, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal intent plan: %v", err)
+	}
+	resp := map[string]any{
+		"id":     "chatcmpl-singleton",
+		"object": "chat.completion",
+		"model":  "gpt-4o-mini",
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []map[string]any{{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      "capture_intent_plan",
+						"arguments": string(args),
+					},
+				}},
+			},
+			"finish_reason": "tool_calls",
+		}},
+	}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }
 
 // buildDeferredReasons emits the deferred_reasons array OpenAI-style for the
