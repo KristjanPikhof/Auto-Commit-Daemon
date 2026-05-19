@@ -1991,6 +1991,35 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 	return nil
 }
 
+func recordIntentMessageQualityDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, plan ai.IntentPlan) error {
+	if plan.MessageQuality == "" {
+		return nil
+	}
+	events := make(map[int64]state.CaptureEvent, len(items))
+	for _, item := range items {
+		events[item.event.Seq] = item.event
+	}
+	reason := strings.TrimSpace(plan.MessageQualityReason)
+	if reason == "" {
+		reason = string(plan.MessageQuality)
+	}
+	action := "message quality " + string(plan.MessageQuality)
+	for _, seq := range plan.SelectedSeqs {
+		ev, ok := events[seq]
+		if !ok {
+			continue
+		}
+		if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts,
+			state.DecisionKindMessageQualityRewrite,
+			reason,
+			action,
+			"Message quality policy adjusted the selected commit message before publish."); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func recordIntentForcedDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, deferLimit int) error {
 	if len(items) != 1 {
 		return nil

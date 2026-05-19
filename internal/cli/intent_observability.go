@@ -81,6 +81,12 @@ type intentStrategyReport struct {
 	LastPlannerErrorEventSeq int64  `json:"last_planner_error_event_seq,omitempty"`
 	LastPlannerErrorPath     string `json:"last_planner_error_path,omitempty"`
 	LastPlannerError         string `json:"last_planner_error,omitempty"`
+	MessageQualityRewriteCountRecent  int    `json:"message_quality_rewrite_count_recent,omitempty"`
+	MessageQualityFallbackCountRecent int    `json:"message_quality_fallback_count_recent,omitempty"`
+	LastMessageQualityEventSeq        int64  `json:"last_message_quality_event_seq,omitempty"`
+	LastMessageQualityPath            string `json:"last_message_quality_path,omitempty"`
+	LastMessageQualityAction          string `json:"last_message_quality_action,omitempty"`
+	LastMessageQualityReason          string `json:"last_message_quality_reason,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
@@ -176,6 +182,17 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		if r.LastPlannerError != "" {
 			fmt.Fprintf(out, "  Last planner error: seq %d %s (%s)\n",
 				r.LastPlannerErrorEventSeq, valueOrUnset(r.LastPlannerErrorPath), r.LastPlannerError)
+		}
+	}
+	if r.MessageQualityRewriteCountRecent > 0 || r.MessageQualityFallbackCountRecent > 0 || r.LastMessageQualityReason != "" {
+		fmt.Fprintf(out, "Message quality: rewrites=%d fallbacks=%d\n",
+			r.MessageQualityRewriteCountRecent, r.MessageQualityFallbackCountRecent)
+		if r.LastMessageQualityReason != "" {
+			fmt.Fprintf(out, "  Last message quality action: seq %d %s %s (%s)\n",
+				r.LastMessageQualityEventSeq,
+				valueOrUnset(r.LastMessageQualityPath),
+				valueOrUnset(r.LastMessageQualityAction),
+				r.LastMessageQualityReason)
 		}
 	}
 	if r.PlannerErrorRateRecent > 0 || r.SingletonCommitRateRecent > 0 {

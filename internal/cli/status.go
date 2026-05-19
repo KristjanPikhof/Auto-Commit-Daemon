@@ -601,6 +601,8 @@ func formatDecisionCounts(counts map[string]int) string {
 		state.DecisionKindIntentDeferred,
 		state.DecisionKindIntentForced,
 		state.DecisionKindIntentPlannerError,
+		state.DecisionKindMessageQualityRewrite,
+		state.DecisionKindMessageQualityFallback,
 	}
 	seen := make(map[string]bool, len(counts))
 	var parts []string
