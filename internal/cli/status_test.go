@@ -196,7 +196,7 @@ func TestStatus_BlockedBarrierGuidance(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-		BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
 		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
 	}); err != nil {
 		t.Fatalf("save state: %v", err)
