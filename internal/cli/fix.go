@@ -32,26 +32,26 @@ const (
 )
 
 type fixPlan struct {
-	Repo               string      `json:"repo"`
-	StateDB            string      `json:"state_db"`
-	GitDir             string      `json:"git_dir,omitempty"`
-	CurrentBranchRef   string      `json:"current_branch_ref,omitempty"`
-	CurrentHead        string      `json:"current_head,omitempty"`
-	Generation         int64       `json:"generation,omitempty"`
-	DryRun             bool        `json:"dry_run"`
-	Force              bool        `json:"force,omitempty"`
-	ClearPause         bool        `json:"clear_pause,omitempty"`
-	BackupPath         string      `json:"backup_path,omitempty"`
-	Actions            []fixAction `json:"actions"`
-	Unsafe             []string    `json:"unsafe,omitempty"`
-	Suggestions        []string    `json:"suggestions,omitempty"`
-	RowsChanged        int64       `json:"rows_changed"`
-	ForceRequired      bool        `json:"force_required,omitempty"`
-	Incomplete         bool        `json:"incomplete,omitempty"`
-	VerifyErrors       []string    `json:"verify_errors,omitempty"`
+	Repo               string                  `json:"repo"`
+	StateDB            string                  `json:"state_db"`
+	GitDir             string                  `json:"git_dir,omitempty"`
+	CurrentBranchRef   string                  `json:"current_branch_ref,omitempty"`
+	CurrentHead        string                  `json:"current_head,omitempty"`
+	Generation         int64                   `json:"generation,omitempty"`
+	DryRun             bool                    `json:"dry_run"`
+	Force              bool                    `json:"force,omitempty"`
+	ClearPause         bool                    `json:"clear_pause,omitempty"`
+	BackupPath         string                  `json:"backup_path,omitempty"`
+	Actions            []fixAction             `json:"actions"`
+	Unsafe             []string                `json:"unsafe,omitempty"`
+	Suggestions        []string                `json:"suggestions,omitempty"`
+	RowsChanged        int64                   `json:"rows_changed"`
+	ForceRequired      bool                    `json:"force_required,omitempty"`
+	Incomplete         bool                    `json:"incomplete,omitempty"`
+	VerifyErrors       []string                `json:"verify_errors,omitempty"`
 	RemainingBlockers  *fixBlockerVerification `json:"remaining_blockers,omitempty"`
-	ManualPauseRemoved bool        `json:"manual_pause_removed,omitempty"`
-	ManualPausePath    string      `json:"manual_pause_path,omitempty"`
+	ManualPauseRemoved bool                    `json:"manual_pause_removed,omitempty"`
+	ManualPausePath    string                  `json:"manual_pause_path,omitempty"`
 	// Retarget bookkeeping (mirrors recoverPlan fields so JSON callers can
 	// follow ported acd recover semantics without losing data).
 	ManualMarkerRemoved     bool   `json:"manual_marker_removed,omitempty"`
@@ -63,10 +63,10 @@ type fixPlan struct {
 }
 
 type fixBlockerVerification struct {
-	TotalBlockedConflicts                 int `json:"total_blocked_conflicts"`
-	ActiveBlockedBarriersWithSuccessors   int `json:"active_blocked_barriers_with_successors"`
-	FailedBarriersWithSuccessors          int `json:"failed_barriers_with_successors"`
-	PendingOnlyIntentDepth                int `json:"pending_only_intent_depth"`
+	TotalBlockedConflicts               int `json:"total_blocked_conflicts"`
+	ActiveBlockedBarriersWithSuccessors int `json:"active_blocked_barriers_with_successors"`
+	FailedBarriersWithSuccessors        int `json:"failed_barriers_with_successors"`
+	PendingOnlyIntentDepth              int `json:"pending_only_intent_depth"`
 }
 
 type fixAction struct {
