@@ -376,6 +376,7 @@ func (p *OpenAIProvider) RewriteIntentMessage(ctx context.Context, rewriteReq In
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
+	ctx = withPromptTraceStrategy(ctx, "intent_message_rewrite", rewriteReq.LockedPlan.SelectedSeqs, intentDiffIncluded(rewriteReq.PlannerRequest), IntentStageDiffCap)
 	if strings.TrimSpace(p.APIKey) == "" {
 		return Result{}, errors.New("openai-compat: missing API key")
 	}

@@ -711,6 +711,47 @@ func TestOpenAIIntentMessageRewrite_HappyPath(t *testing.T) {
 	}
 }
 
+func TestOpenAIIntentMessageRewrite_PromptTraceUsesRewriteStrategy(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, cannedToolCall("Tighten checkout validation", "")
+	})
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{
+		Strategy:     string(CommitStrategyIntent),
+		OfferedSeqs:  []int64{101, 102},
+		BranchRef:    "refs/heads/main",
+		Generation:   11,
+		DiffIncluded: true,
+		DiffCap:      DiffCap,
+	})
+
+	if _, err := p.RewriteIntentMessage(ctx, rewriteReq); err != nil {
+		t.Fatalf("RewriteIntentMessage: %v", err)
+	}
+	got := promptTraceRecordByStage(t, records(), "request")
+	if got.Strategy != "intent_message_rewrite" {
+		t.Fatalf("strategy=%q want intent_message_rewrite", got.Strategy)
+	}
+	if strings.Join(int64sToStrings(got.OfferedSeqs), ",") != "101" {
+		t.Fatalf("offered seqs=%v want selected seq only", got.OfferedSeqs)
+	}
+	if got.DiffCap != IntentStageDiffCap || !got.DiffIncluded {
+		t.Fatalf("diff metadata cap=%d included=%v", got.DiffCap, got.DiffIncluded)
+	}
+}
+
 func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {

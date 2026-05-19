@@ -390,6 +390,7 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
+	ctx = withPromptTraceStrategy(ctx, "intent_message_rewrite", rewriteReq.LockedPlan.SelectedSeqs, intentDiffIncluded(rewriteReq.PlannerRequest), IntentStageDiffCap)
 	if p.resolveErr != nil {
 		return Result{}, p.resolveErr
 	}

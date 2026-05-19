@@ -356,6 +356,18 @@ func messageQualitySummary(report MessageQualityReport) string {
 	return strings.Join(codes, ",")
 }
 
+func withPromptTraceStrategy(ctx context.Context, strategy string, offeredSeqs []int64, diffIncluded bool, diffCap int) context.Context {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return ctx
+	}
+	meta.Strategy = strategy
+	meta.OfferedSeqs = append([]int64(nil), offeredSeqs...)
+	meta.DiffIncluded = diffIncluded
+	meta.DiffCap = diffCap
+	return prompttrace.With(ctx, logger, meta)
+}
+
 // intentRetryOnInvalidEnabled reports whether the composed retry loop
 // should re-prompt the primary planner after a typed validation error.
 // Default is enabled. The operator can opt out with
