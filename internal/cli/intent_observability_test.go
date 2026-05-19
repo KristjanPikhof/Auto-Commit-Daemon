@@ -36,6 +36,48 @@ func TestStatus_PlannerErrorRateRecent_EmptyLedger(t *testing.T) {
 	}
 }
 
+func TestStatus_MessageQualitySummary(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  1,
+		Kind:        state.DecisionKindMessageQualityRewrite,
+		EventSeq:    sql.NullInt64{Int64: 10, Valid: true},
+		Path:        sqlNullStr("internal/ai/provider.go"),
+		Reason:      sqlNullStr("generic_subject"),
+		ActionTaken: sqlNullStr("message quality rewrite"),
+	}); err != nil {
+		t.Fatalf("AppendDecision rewrite: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
+		DecisionTS:  2,
+		Kind:        state.DecisionKindMessageQualityFallback,
+		EventSeq:    sql.NullInt64{Int64: 11, Valid: true},
+		Path:        sqlNullStr("internal/daemon/replay.go"),
+		Reason:      sqlNullStr("body_required"),
+		ActionTaken: sqlNullStr("message quality fallback"),
+	}); err != nil {
+		t.Fatalf("AppendDecision fallback: %v", err)
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	if got := report.IntentStrategy.MessageQualityRewriteCountRecent; got != 1 {
+		t.Fatalf("MessageQualityRewriteCountRecent=%d want 1", got)
+	}
+	if got := report.IntentStrategy.MessageQualityFallbackCountRecent; got != 1 {
+		t.Fatalf("MessageQualityFallbackCountRecent=%d want 1", got)
+	}
+	if report.IntentStrategy.LastMessageQualityEventSeq != 11 ||
+		report.IntentStrategy.LastMessageQualityPath != "internal/daemon/replay.go" ||
+		report.IntentStrategy.LastMessageQualityAction != "message quality fallback" ||
+		report.IntentStrategy.LastMessageQualityReason != "body_required" {
+		t.Fatalf("last message quality summary=%+v", report.IntentStrategy)
+	}
+}
+
 // TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator asserts
 // that with 50 decisions of which all 50 are planner errors, the rate is
 // 50/100 = 0.5 (NOT 50/50 = 1.0). Documents the fixed-denominator policy

@@ -281,7 +281,9 @@ Intent-specific observability:
 
 - `acd status` shows the active commit strategy and planner deferral summary.
 - `acd diagnose --json` reports deferred count, forced-aging readiness, and the
-  last planner error without mutating state.
+  last planner error without mutating state. Both surfaces also expose recent
+  intent message-quality rewrite/fallback counts and the latest
+  message-quality reason when the gate rewrites or rejects a planner message.
 - `acd events` and `acd explain` expose grouped seqs, deferral reasons,
   forced-aging windows, and planner validation failures from
   `decision_records`.
@@ -289,11 +291,12 @@ Intent-specific observability:
   seqs, batch-wait skips, and validation failures without writing captured
   source diffs, full AI prompts, or provider request envelopes.
 - `ACD_AI_PROMPT_TRACE=1` records provider prompt/request diagnostics when a
-  non-deterministic AI provider sends a request. The default deterministic
-  provider emits no prompt trace because it does not send an AI request. Records
-  live under `<gitDir>/acd/prompt-trace/` after redaction/truncation, but may
-  still contain source code; inspect them with `acd prompt --last` or
-  `acd prompt --seq <seq>`.
+  non-deterministic AI provider sends a request, including message-only rewrite
+  attempts for valid intent groupings whose subject/body failed the quality
+  gate. The default deterministic provider emits no prompt trace because it
+  does not send an AI request. Records live under `<gitDir>/acd/prompt-trace/`
+  after redaction/truncation, but may still contain source code; inspect them
+  with `acd prompt --last` or `acd prompt --seq <seq>`.
 
 ### One-shot path-sorted capture (`acd commit-all`)
 
@@ -497,7 +500,9 @@ pruning.
     "defer_limit": 2,
     "deferred_events": 1,
     "max_defer_count": 1,
-    "forced_aging_ready": 0
+    "forced_aging_ready": 0,
+    "message_quality_rewrite_count_recent": 1,
+    "last_message_quality_reason": "generic_subject"
   },
   "decision_counts": {
     "captured": 8,
@@ -548,7 +553,8 @@ that recent set and can be passed to `acd events --since`.
 `intent_strategy` is always present. In `event` mode it reports
 `{"strategy":"event","active":false}` plus resolved planner defaults. In
 `intent` mode it includes active window settings, pending deferral counts,
-forced-aging readiness, and last planner error fields when available.
+forced-aging readiness, message-quality rewrite/fallback fields, and last
+planner error fields when available.
 
 `paused` and `pause` are omitted when replay is not paused. The `pause` object fields:
 

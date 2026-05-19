@@ -133,8 +133,21 @@ scratch-index path, writes one commit, and marks all selected events with the
 same `commit_oid`.
 
 If a capture is deferred repeatedly, ACD eventually sends a forced-aging window
-containing only that overdue capture. That keeps intent grouping from starving
-small or hard-to-name edits.
+containing only that overdue capture. Non-deterministic providers still receive
+that locked one-capture request so the commit message can pass the same quality
+and rewrite policy as normal intent commits. If the provider is unavailable or
+the rewrite remains unsafe, ACD falls back to the bounded deterministic
+forced-aging path. That keeps intent grouping from starving small or hard-to-name
+edits.
+
+Intent commit messages pass a quality gate after the grouping plan is valid.
+Small single-file commits may use a semantic subject without a body. Body
+bullets are required for multi-file changes, larger diffs, mixed code/test/docs
+changes, CLI/config/migration/recovery/public-API paths, and other
+release-sensitive changes. Generic subjects such as `Update file`,
+`Update parsed`, or filename-only subjects such as `Update effort.ts` trigger a
+message-only rewrite request that preserves `selected_seqs`, `deferred_seqs`,
+`grouping_reason`, and `deferred_reasons`.
 
 Planner contract: every entry in `deferred_reasons` must reference a seq that
 appears in `deferred_seqs`. Reasons attached to a selected seq, or to a seq
@@ -192,7 +205,8 @@ export ACD_AI_DIFF_EGRESS=1
 Troubleshooting:
 
 - `acd status` and `acd diagnose --json` show active strategy, deferred count,
-  forced-aging readiness, and the last planner error.
+  forced-aging readiness, recent message-quality rewrite/fallback counts, the
+  latest message-quality reason, and the last planner error.
 - When commits are waiting for a larger batch, `acd status`, `acd diagnose`,
   and `acd doctor` show visible pending count, `min_pending`, oldest pending
   age, `max_pending_age`, and the age-trigger countdown.
@@ -235,8 +249,9 @@ acd prompt --seq 42
 
 In `intent` mode, `--seq` matches either the event seq or any offered seq in an
 intent planner window. The trace shows `offered_seqs`, selected/deferred seqs,
-grouping reason, validation errors, and deterministic fallback records when the
-planner output cannot be trusted.
+grouping reason, validation errors, message-only rewrite request/response
+records, and deterministic fallback records when the planner output cannot be
+trusted.
 
 Trace files are stored locally as JSONL under `<gitDir>/acd/prompt-trace/`.
 They are captured after ACD redacts and truncates outbound payloads, but they
