@@ -38,6 +38,7 @@ type listEntry struct {
 	HeartbeatAgeSecs float64    `json:"heartbeat_age_seconds,omitempty"`
 	PendingEvents    int        `json:"pending_events"`
 	BlockedConflicts int        `json:"blocked_conflicts"`
+	ActiveBarriers   int        `json:"active_barriers,omitempty"`
 	Status           string     `json:"status"`
 	StatusNote       string     `json:"status_note,omitempty"`
 	Paused           bool       `json:"paused,omitempty"`
@@ -193,6 +194,14 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 		e.HeartbeatAgeSecs = summary.heartbeatAge.Seconds()
 		e.PendingEvents = summary.pendingEvents
 		e.BlockedConflicts = summary.blockedConflicts
+		e.ActiveBarriers = summary.activeBarriers
+		if summary.blockedConflicts > 0 || summary.activeBarriers > 0 {
+			e.Status = "blocked"
+			e.StatusNote = blockedListStatusNote(summary.blockedConflicts, summary.activeBarriers)
+		} else if summary.pendingEvents > 0 {
+			e.Status = "waiting"
+			e.StatusNote = "pending captures queued; no recovery blockers"
+		}
 		if summary.pause != nil {
 			e.Status = "paused"
 			e.StatusNote = pauseStatusNote(summary.pause)
@@ -294,6 +303,7 @@ type repoSummary struct {
 	heartbeatTS      float64
 	pendingEvents    int
 	blockedConflicts int
+	activeBarriers   int
 	pause            *pauseInfo
 }
 
@@ -398,6 +408,7 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 		return repoSummary{}, fmt.Errorf("recovery blocker counts: %w", err)
 	}
 	s.blockedConflicts = blockers.TotalBlockedConflicts
+	s.activeBarriers = blockers.ActiveBlockedBarriersWithSuccessors
 	if info, err := pauseInfoForRepo(ctx, conn, dbPath, now); err != nil {
 		return repoSummary{}, fmt.Errorf("pause state: %w", err)
 	} else {

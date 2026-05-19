@@ -46,6 +46,10 @@ type fixPlan struct {
 	Unsafe             []string    `json:"unsafe,omitempty"`
 	Suggestions        []string    `json:"suggestions,omitempty"`
 	RowsChanged        int64       `json:"rows_changed"`
+	ForceRequired      bool        `json:"force_required,omitempty"`
+	Incomplete         bool        `json:"incomplete,omitempty"`
+	VerifyErrors       []string    `json:"verify_errors,omitempty"`
+	RemainingBlockers  *fixBlockerVerification `json:"remaining_blockers,omitempty"`
 	ManualPauseRemoved bool        `json:"manual_pause_removed,omitempty"`
 	ManualPausePath    string      `json:"manual_pause_path,omitempty"`
 	// Retarget bookkeeping (mirrors recoverPlan fields so JSON callers can
@@ -56,6 +60,13 @@ type fixPlan struct {
 	LiveIndexCandidates     int    `json:"live_index_candidates,omitempty"`
 	LiveIndexApplied        int    `json:"live_index_applied,omitempty"`
 	LiveIndexSkipped        int    `json:"live_index_skipped,omitempty"`
+}
+
+type fixBlockerVerification struct {
+	TotalBlockedConflicts                 int `json:"total_blocked_conflicts"`
+	ActiveBlockedBarriersWithSuccessors   int `json:"active_blocked_barriers_with_successors"`
+	FailedBarriersWithSuccessors          int `json:"failed_barriers_with_successors"`
+	PendingOnlyIntentDepth                int `json:"pending_only_intent_depth"`
 }
 
 type fixAction struct {
@@ -148,6 +159,9 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	}
 	if len(plan.Actions) > 0 {
 		if err := applyFixPlan(ctx, rec.StateDB, &plan); err != nil {
+			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
+				return rerr
+			}
 			return err
 		}
 	}
@@ -240,10 +254,10 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		return fixPlan{}, err
 	}
 	if branchRef != "" {
-		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
-			return fixPlan{}, err
-		}
 		if force {
+			// Destructive purges must be applied before retarget_stale_anchor can
+			// reset blocked_conflict rows back to pending. Keep this order in the
+			// action list so --force --yes is order-safe.
 			if err := planPurgeBarrierWithSuccessors(ctx, conn, branchRef, plan.Generation, &plan); err != nil {
 				return fixPlan{}, err
 			}
@@ -255,9 +269,13 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 				return fixPlan{}, err
 			}
 			if n > 0 {
+				plan.ForceRequired = true
 				plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-					"%d blocked barrier row(s) still have pending successors; rerun with --force to plan purge_barrier_with_successors.", n))
+					"%d blocked barrier row(s) still have pending successors; run `acd fix --repo %s --force --yes` to purge them.", n, plan.Repo))
 			}
+		}
+		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
+			return fixPlan{}, err
 		}
 	}
 	return plan, nil
@@ -735,6 +753,9 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		if err := finalizeRetargetPostCommit(ctx, db, plan); err != nil {
 			return err
 		}
+	}
+	if err := verifyFixPostApply(ctx, db.SQL(), plan); err != nil {
+		return err
 	}
 	return nil
 }
