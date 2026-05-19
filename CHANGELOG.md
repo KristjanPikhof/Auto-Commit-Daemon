@@ -6,6 +6,9 @@
 
 - Recovery views now separate waiting queues from blocked repos, so `acd list`,
   `acd status`, and `acd diagnose` point to the right next command.
+- Intent mode now rewrites generic planner commit messages while preserving the
+  accepted grouping, and status/diagnose expose message-quality rewrite and
+  fallback reasons.
 
 ### Fixed
 
