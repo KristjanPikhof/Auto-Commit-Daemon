@@ -324,9 +324,11 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	var mode string
 	var heartbeat float64
 	var note sql.NullString
+	var branchRef sql.NullString
+	var branchGeneration sql.NullInt64
 	row := conn.QueryRowContext(ctx,
-		`SELECT pid, mode, heartbeat_ts, note FROM daemon_state WHERE id = 1`)
-	if err := row.Scan(&pid, &mode, &heartbeat, &note); err != nil {
+		`SELECT pid, mode, heartbeat_ts, note, branch_ref, branch_generation FROM daemon_state WHERE id = 1`)
+	if err := row.Scan(&pid, &mode, &heartbeat, &note, &branchRef, &branchGeneration); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			s.daemon = "stopped"
 		} else {
@@ -376,17 +378,26 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 
 	// Pending FIFO depth + terminal blocked-conflict count. Same RO conn
-	// already in hand — read both directly so list/status/doctor agree.
+	// already in hand — read through the shared recovery predicates so list,
+	// status, diagnose, and fix-facing counts stay aligned.
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStatePending).Scan(&s.pendingEvents); err != nil {
 		return repoSummary{}, fmt.Errorf("pending events: %w", err)
 	}
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
-		state.EventStateBlockedConflict).Scan(&s.blockedConflicts); err != nil {
-		return repoSummary{}, fmt.Errorf("blocked conflicts: %w", err)
+	activeBranchRef := ""
+	if branchRef.Valid {
+		activeBranchRef = branchRef.String
 	}
+	activeGen := int64(0)
+	if branchGeneration.Valid {
+		activeGen = branchGeneration.Int64
+	}
+	blockers, err := loadRecoveryBlockerCounts(ctx, conn, activeBranchRef, activeGen)
+	if err != nil {
+		return repoSummary{}, fmt.Errorf("recovery blocker counts: %w", err)
+	}
+	s.blockedConflicts = blockers.TotalBlockedConflicts
 	if info, err := pauseInfoForRepo(ctx, conn, dbPath, now); err != nil {
 		return repoSummary{}, fmt.Errorf("pause state: %w", err)
 	} else {

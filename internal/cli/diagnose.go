@@ -283,10 +283,10 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
 		return fmt.Errorf("failed events: %w", err)
 	}
-	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
+	if blockers, err := loadRecoveryBlockerCounts(ctx, conn, "", 0); err != nil {
 		return fmt.Errorf("failed blocking pending: %w", err)
 	} else {
-		report.FailedBlockingPending = n
+		report.FailedBlockingPending = blockers.FailedBarriersWithSuccessors
 	}
 
 	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
@@ -490,11 +490,11 @@ func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, re
 	}
 
 	// BarrierWithSuccessorsCount is a pure SQL count — no git needed.
-	n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, generation)
+	blockers, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, generation)
 	if err != nil {
 		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
 	}
-	report.BarrierWithSuccessorsCount = n
+	report.BarrierWithSuccessorsCount = blockers.ActiveBlockedBarriersWithSuccessors
 
 	// AutoResolvableBlockedCount requires a live HEAD to probe blobs.
 	head, err := git.RevParse(ctx, repoDir, "HEAD")

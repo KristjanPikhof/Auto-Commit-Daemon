@@ -184,9 +184,10 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	var mode string
 	var heartbeatTS, updatedTS float64
 	var branchRef sql.NullString
+	var branchGeneration sql.NullInt64
 	row := conn.QueryRowContext(ctx,
-		`SELECT pid, mode, heartbeat_ts, branch_ref, updated_ts FROM daemon_state WHERE id = 1`)
-	if err := row.Scan(&pid, &mode, &heartbeatTS, &branchRef, &updatedTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		`SELECT pid, mode, heartbeat_ts, branch_ref, branch_generation, updated_ts FROM daemon_state WHERE id = 1`)
+	if err := row.Scan(&pid, &mode, &heartbeatTS, &branchRef, &branchGeneration, &updatedTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return report, fmt.Errorf("daemon_state: %w", err)
 	} else if err == nil {
 		report.PID = pid
@@ -251,29 +252,29 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	}
 	rows.Close()
 
-	// Pending events (FIFO queue depth) and blocked-conflict count
-	// (terminal replay blockers — distinct from pending so the operator
-	// can spot a stuck row that the daemon will not retry on its own).
+	// Pending events (FIFO queue depth) and blocker counts. Shared recovery
+	// predicates keep status/list/diagnose aligned while preserving the total
+	// blocked_conflicts field as a global terminal stuck-row count.
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return report, fmt.Errorf("pending events: %w", err)
 	}
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
-		state.EventStateBlockedConflict).Scan(&report.BlockedConflicts); err != nil {
-		return report, fmt.Errorf("blocked conflicts: %w", err)
+	activeGen := int64(0)
+	if branchGeneration.Valid {
+		activeGen = branchGeneration.Int64
 	}
+	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGen)
+	if err != nil {
+		return report, fmt.Errorf("recovery blocker counts: %w", err)
+	}
+	report.BlockedConflicts = blockers.TotalBlockedConflicts
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
 		return report, fmt.Errorf("failed events: %w", err)
 	}
-	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
-		return report, fmt.Errorf("failed blocking pending: %w", err)
-	} else {
-		report.FailedBlockingPending = n
-	}
+	report.FailedBlockingPending = blockers.FailedBarriersWithSuccessors
 
 	// Last commit (latest seq with commit_oid).
 	var lastOID sql.NullString
@@ -433,23 +434,7 @@ func sqliteTableExists(ctx context.Context, conn *sql.DB, name string) (bool, er
 }
 
 func countBlockingTerminalEvents(ctx context.Context, conn *sql.DB, terminalState string) (int, error) {
-	var n int
-	err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM capture_events e
-WHERE e.state = ?
-  AND EXISTS (
-      SELECT 1
-      FROM capture_events pending
-      WHERE pending.branch_ref = e.branch_ref
-        AND pending.branch_generation = e.branch_generation
-        AND pending.seq > e.seq
-        AND pending.state = ?
-  )`, terminalState, state.EventStatePending).Scan(&n)
-	if err != nil {
-		return 0, err
-	}
-	return n, nil
+	return countTerminalBarriersWithSuccessors(ctx, conn, terminalState, "", 0)
 }
 
 // metaLookup is the read-only equivalent of state.MetaGet against a raw
