@@ -305,9 +305,21 @@ func isTokenOnlySubject(subject string) bool {
 	if strings.Contains(tail, "_") || strings.Contains(tail, "-") {
 		return true
 	}
+	if hasInternalUpper(tail) && tail[0] >= 'a' && tail[0] <= 'z' {
+		return true
+	}
 	switch strings.ToLower(tail) {
 	case "parsed", "total", "value", "data", "state", "result", "item", "items", "helper", "logic", "flow":
 		return true
+	}
+	return false
+}
+
+func hasInternalUpper(s string) bool {
+	for i := 1; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
+		}
 	}
 	return false
 }
