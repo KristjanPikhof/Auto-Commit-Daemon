@@ -383,6 +383,80 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	return plan, nil
 }
 
+// RewriteIntentMessage asks the plugin to rewrite only subject/body for a
+// locked intent plan. The request_type keeps this distinct from intent_plan so
+// plugins cannot accidentally change grouping fields.
+func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteReq IntentMessageRewriteRequest) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	if p.resolveErr != nil {
+		return Result{}, p.resolveErr
+	}
+
+	req := subprocessRequest{
+		Version:               pluginProtocolVersion,
+		RequestType:           "intent_message_rewrite",
+		MessageRewriteRequest: &rewriteReq,
+	}
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return Result{}, err
+	}
+	p.recordSubprocessRequest(ctx, body, rewriteReq.PlannerRequest.CapturedDiffTransform, prompttrace.Metadata{
+		Strategy:     "intent_message_rewrite",
+		OfferedSeqs:  append([]int64(nil), rewriteReq.LockedPlan.SelectedSeqs...),
+		DiffIncluded: intentDiffIncluded(rewriteReq.PlannerRequest),
+		DiffCap:      IntentStageDiffCap,
+	})
+
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	var resp subprocessResponse
+	for attempt := 0; attempt < 2; attempt++ {
+		var session *pluginSession
+		session, err = p.acquire()
+		if err != nil {
+			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
+			return Result{}, err
+		}
+		resp, err = session.exchangeBytes(reqCtx, body)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markCrashed(session)
+			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
+			return Result{}, err
+		}
+		p.markCrashed(session)
+	}
+	if err != nil {
+		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
+		return Result{}, err
+	}
+	if strings.TrimSpace(resp.Error) != "" {
+		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
+		return Result{}, err
+	}
+
+	cleaned := SanitizeMessage(resp.Subject + "\n\n" + resp.Body)
+	parts := strings.SplitN(cleaned, "\n\n", 2)
+	result := Result{Subject: parts[0], Source: p.Name()}
+	if len(parts) == 2 {
+		result.Body = parts[1]
+	}
+	if strings.TrimSpace(result.Subject) == "" {
+		err := fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name)
+		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: err.Error()})
+		return Result{}, err
+	}
+	p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Subject: result.Subject, Body: result.Body})
+	return result, nil
+}
+
 // Close shuts down the plugin process if running. Idempotent and safe to
 // call from any goroutine. After Close, Generate returns an error.
 func (p *SubprocessProvider) Close() error {
@@ -510,6 +584,7 @@ type subprocessRequest struct {
 	MultiOp        []subprocessOp     `json:"multi_op,omitempty"`
 	Now            string             `json:"now,omitempty"`
 	PlannerRequest *IntentPlanRequest `json:"planner_request,omitempty"`
+	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire
