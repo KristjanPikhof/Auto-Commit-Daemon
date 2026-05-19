@@ -100,7 +100,7 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if body == "" && ctx.bodyRequired {
 		report.add(MessageQualityReasonBodyRequired, "selected captures require body bullets")
 	}
-	if body != "" && !wellFormedBulletBody(body) {
+	if strings.TrimSpace(plan.Body) != "" && !wellFormedBulletBody(strings.TrimSpace(plan.Body)) {
 		report.add(MessageQualityReasonMalformedBody, "body must contain only '- ' bullets with indented continuations")
 	}
 	if isGenericSubject(subject) {

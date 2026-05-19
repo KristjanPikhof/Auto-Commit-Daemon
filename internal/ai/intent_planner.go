@@ -18,6 +18,13 @@ type IntentPlanner interface {
 	PlanIntent(ctx context.Context, req IntentPlanRequest) (IntentPlan, error)
 }
 
+// IntentMessageRewriter can repair only the commit subject/body for a valid
+// intent plan. It must not change selected/deferred seqs or grouping reasons.
+type IntentMessageRewriter interface {
+	Name() string
+	RewriteIntentMessage(ctx context.Context, req IntentMessageRewriteRequest) (Result, error)
+}
+
 // CommitSummary provides recent commit context to the planner.
 type CommitSummary struct {
 	OID       string    `json:"oid,omitempty"`
@@ -202,6 +209,80 @@ type IntentPlan struct {
 	GroupingReason  string           `json:"grouping_reason"`
 	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
 	Source          string           `json:"-"`
+}
+
+// IntentMessageRewriteRequest is a locked message-only rewrite request. The
+// plan grouping fields are immutable context; providers may return only a new
+// subject/body pair.
+type IntentMessageRewriteRequest struct {
+	PlannerRequest    IntentPlanRequest     `json:"planner_request"`
+	LockedPlan        IntentPlan            `json:"locked_plan"`
+	PriorSubject      string                `json:"prior_subject"`
+	PriorBody         string                `json:"prior_body,omitempty"`
+	QualityFailures   []MessageQualityReason `json:"quality_failures"`
+	BodyRequired      bool                  `json:"body_required"`
+	SelectedCaptures  []OfferedCapture      `json:"selected_captures"`
+	SanitizedSubject  string                `json:"sanitized_subject,omitempty"`
+	SanitizedBody     string                `json:"sanitized_body,omitempty"`
+	QualityAction     MessageQualityAction  `json:"quality_action"`
+}
+
+// NewIntentMessageRewriteRequest builds the message-only rewrite payload from
+// an already shape-valid plan and its quality report.
+func NewIntentMessageRewriteRequest(plannerReq IntentPlanRequest, plan IntentPlan, report MessageQualityReport) IntentMessageRewriteRequest {
+	locked := plan
+	locked.Source = ""
+	return IntentMessageRewriteRequest{
+		PlannerRequest:   plannerReq,
+		LockedPlan:       locked,
+		PriorSubject:     plan.Subject,
+		PriorBody:        plan.Body,
+		QualityFailures:  append([]MessageQualityReason(nil), report.Reasons...),
+		BodyRequired:     report.BodyRequired,
+		SelectedCaptures: selectedCaptures(plannerReq, plan.SelectedSeqs),
+		SanitizedSubject: report.SanitizedSubject,
+		SanitizedBody:    report.SanitizedBody,
+		QualityAction:    report.Action,
+	}
+}
+
+func selectedCaptures(req IntentPlanRequest, selectedSeqs []int64) []OfferedCapture {
+	if len(selectedSeqs) == 0 || len(req.OfferedCaptures) == 0 {
+		return nil
+	}
+	bySeq := make(map[int64]OfferedCapture, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		bySeq[capture.Seq] = capture
+	}
+	out := make([]OfferedCapture, 0, len(selectedSeqs))
+	for _, seq := range selectedSeqs {
+		if capture, ok := bySeq[seq]; ok {
+			out = append(out, capture)
+		}
+	}
+	return out
+}
+
+// MessageQualityError is returned when a valid plan's message cannot be
+// accepted and no acceptable rewrite was produced.
+type MessageQualityError struct {
+	Provider string
+	Report   MessageQualityReport
+	Cause    error
+}
+
+func (e *MessageQualityError) Error() string {
+	if e == nil {
+		return ""
+	}
+	reason := "message quality failed"
+	if len(e.Report.Reasons) > 0 {
+		reason = string(e.Report.Reasons[0].Code)
+	}
+	if e.Cause != nil {
+		return fmt.Sprintf("intent planner: %s: %s: %v", e.Provider, reason, e.Cause)
+	}
+	return fmt.Sprintf("intent planner: %s: %s", e.Provider, reason)
 }
 
 // IntentReasonCap bounds planner explanation fields before they are persisted

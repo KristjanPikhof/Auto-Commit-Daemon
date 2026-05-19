@@ -156,6 +156,21 @@ func BuildIntentPlanUserPrompt(req IntentPlanRequest) (string, error) {
 	return out, nil
 }
 
+// BuildIntentMessageRewriteUserPrompt serializes a locked, message-only
+// rewrite request. The prompt deliberately repeats that selected/deferred
+// fields are immutable so providers cannot drift from the accepted grouping.
+func BuildIntentMessageRewriteUserPrompt(req IntentMessageRewriteRequest) (string, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("intent message rewrite: marshal request: %w", err)
+	}
+	return "Rewrite only the git commit subject and body for this accepted intent plan.\n" +
+		"Do not change selected_seqs, deferred_seqs, grouping_reason, deferred_reasons, or any offered capture data.\n" +
+		"Return only the commit_message tool output with a replacement subject and body that fixes the listed quality_failures.\n" +
+		"If body_required is true, include body bullets. Keep grouping rationale out of the body.\n" +
+		string(body), nil
+}
+
 // Truncate caps a unified diff to `max` bytes. Mirrors the legacy 4000-char
 // cutoff; tries to preserve the header block at the top so a downstream
 // model still sees the file paths it is reasoning about.

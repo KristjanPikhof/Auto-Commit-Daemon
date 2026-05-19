@@ -253,6 +253,11 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 				if plan.Source == "" {
 					plan.Source = c.primary.Name()
 				}
+				plan, err = applyIntentMessageQuality(ctx, c.primary, req, plan)
+				if err != nil {
+					lastErr = err
+					break
+				}
 				return plan, nil
 			}
 		}
@@ -294,6 +299,44 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		currentReq.RetryCorrection = typed.Message
 	}
 	return IntentPlan{}, lastErr
+}
+
+func applyIntentMessageQuality(ctx context.Context, provider Provider, req IntentPlanRequest, plan IntentPlan) (IntentPlan, error) {
+	report := EvaluateIntentPlanMessageQuality(req, plan)
+	switch report.Action {
+	case MessageQualityClean:
+		return plan, nil
+	case MessageQualitySanitizeAccept:
+		plan.Subject = report.SanitizedSubject
+		plan.Body = report.SanitizedBody
+		return plan, nil
+	case MessageQualityRewrite:
+		rewriter, ok := provider.(IntentMessageRewriter)
+		if !ok {
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report}
+		}
+		rewriteReq := NewIntentMessageRewriteRequest(req, plan, report)
+		result, err := rewriter.RewriteIntentMessage(ctx, rewriteReq)
+		if err != nil {
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report, Cause: err}
+		}
+		candidate := plan
+		candidate.Subject = result.Subject
+		candidate.Body = result.Body
+		next := EvaluateIntentPlanMessageQuality(req, candidate)
+		switch next.Action {
+		case MessageQualityClean:
+			return candidate, nil
+		case MessageQualitySanitizeAccept:
+			candidate.Subject = next.SanitizedSubject
+			candidate.Body = next.SanitizedBody
+			return candidate, nil
+		default:
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: next}
+		}
+	default:
+		return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report}
+	}
 }
 
 // intentRetryOnInvalidEnabled reports whether the composed retry loop
