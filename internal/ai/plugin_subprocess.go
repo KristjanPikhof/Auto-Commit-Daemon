@@ -573,17 +573,17 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 // names so the JSON shape matches the contract regardless of struct
 // renames.
 type subprocessRequest struct {
-	Version        int                `json:"version"`
-	RequestType    string             `json:"request_type,omitempty"`
-	Path           string             `json:"path,omitempty"`
-	Op             string             `json:"op,omitempty"`
-	OldPath        string             `json:"old_path,omitempty"`
-	Diff           string             `json:"diff,omitempty"`
-	RepoRoot       string             `json:"repo_root,omitempty"`
-	Branch         string             `json:"branch,omitempty"`
-	MultiOp        []subprocessOp     `json:"multi_op,omitempty"`
-	Now            string             `json:"now,omitempty"`
-	PlannerRequest *IntentPlanRequest `json:"planner_request,omitempty"`
+	Version               int                          `json:"version"`
+	RequestType           string                       `json:"request_type,omitempty"`
+	Path                  string                       `json:"path,omitempty"`
+	Op                    string                       `json:"op,omitempty"`
+	OldPath               string                       `json:"old_path,omitempty"`
+	Diff                  string                       `json:"diff,omitempty"`
+	RepoRoot              string                       `json:"repo_root,omitempty"`
+	Branch                string                       `json:"branch,omitempty"`
+	MultiOp               []subprocessOp               `json:"multi_op,omitempty"`
+	Now                   string                       `json:"now,omitempty"`
+	PlannerRequest        *IntentPlanRequest           `json:"planner_request,omitempty"`
 	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
 }
 

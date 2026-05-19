@@ -215,16 +215,16 @@ type IntentPlan struct {
 // plan grouping fields are immutable context; providers may return only a new
 // subject/body pair.
 type IntentMessageRewriteRequest struct {
-	PlannerRequest    IntentPlanRequest     `json:"planner_request"`
-	LockedPlan        IntentPlan            `json:"locked_plan"`
-	PriorSubject      string                `json:"prior_subject"`
-	PriorBody         string                `json:"prior_body,omitempty"`
-	QualityFailures   []MessageQualityReason `json:"quality_failures"`
-	BodyRequired      bool                  `json:"body_required"`
-	SelectedCaptures  []OfferedCapture      `json:"selected_captures"`
-	SanitizedSubject  string                `json:"sanitized_subject,omitempty"`
-	SanitizedBody     string                `json:"sanitized_body,omitempty"`
-	QualityAction     MessageQualityAction  `json:"quality_action"`
+	PlannerRequest   IntentPlanRequest      `json:"planner_request"`
+	LockedPlan       IntentPlan             `json:"locked_plan"`
+	PriorSubject     string                 `json:"prior_subject"`
+	PriorBody        string                 `json:"prior_body,omitempty"`
+	QualityFailures  []MessageQualityReason `json:"quality_failures"`
+	BodyRequired     bool                   `json:"body_required"`
+	SelectedCaptures []OfferedCapture       `json:"selected_captures"`
+	SanitizedSubject string                 `json:"sanitized_subject,omitempty"`
+	SanitizedBody    string                 `json:"sanitized_body,omitempty"`
+	QualityAction    MessageQualityAction   `json:"quality_action"`
 }
 
 // NewIntentMessageRewriteRequest builds the message-only rewrite payload from

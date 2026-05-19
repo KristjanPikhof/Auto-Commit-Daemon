@@ -613,15 +613,19 @@ func TestComposedPlanIntentReturnsPrimaryProviderError(t *testing.T) {
 // from the inbound request is recorded so tests can assert that the retry
 // hand-off includes the verbatim validator message.
 type scriptedIntentPlanner struct {
-	name        string
-	plans       []IntentPlan
-	errs        []error
-	calls       int
-	corrections []string
+	name         string
+	plans        []IntentPlan
+	errs         []error
+	rewrites     []Result
+	rewriteErrs  []error
+	calls        int
+	rewriteCalls int
+	corrections  []string
 	// requests captures every IntentPlanRequest the composed layer hands
 	// the planner so tests can assert hint propagation across retries and
 	// fallback paths. Retain insertion order; never mutated by PlanIntent.
-	requests []IntentPlanRequest
+	requests        []IntentPlanRequest
+	rewriteRequests []IntentMessageRewriteRequest
 }
 
 func (p *scriptedIntentPlanner) Name() string { return p.name }
@@ -644,6 +648,21 @@ func (p *scriptedIntentPlanner) PlanIntent(_ context.Context, req IntentPlanRequ
 	plan := p.plans[idx]
 	plan.Source = p.name
 	return plan, nil
+}
+
+func (p *scriptedIntentPlanner) RewriteIntentMessage(_ context.Context, req IntentMessageRewriteRequest) (Result, error) {
+	idx := p.rewriteCalls
+	p.rewriteCalls++
+	p.rewriteRequests = append(p.rewriteRequests, req)
+	if idx < len(p.rewriteErrs) && p.rewriteErrs[idx] != nil {
+		return Result{}, p.rewriteErrs[idx]
+	}
+	if idx >= len(p.rewrites) {
+		return Result{}, errors.New("scriptedIntentPlanner: out of scripted rewrites")
+	}
+	result := p.rewrites[idx]
+	result.Source = p.name
+	return result, nil
 }
 
 // TestComposedPlanIntentRetriesOnTypedValidationError covers the happy retry
@@ -989,6 +1008,171 @@ func TestBuildIntentPlanUserPromptIncludesRetryCorrection(t *testing.T) {
 	}
 	if !strings.Contains(second, "selected_seqs and deferred_seqs are disjoint") {
 		t.Fatalf("retry prompt missing disjoint seq instruction:\n%s", second)
+	}
+}
+
+func TestBuildIntentMessageRewriteUserPromptLocksGrouping(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	report := EvaluateIntentPlanMessageQuality(req, plan)
+	rewriteReq := NewIntentMessageRewriteRequest(req, plan, report)
+	prompt, err := BuildIntentMessageRewriteUserPrompt(rewriteReq)
+	if err != nil {
+		t.Fatalf("BuildIntentMessageRewriteUserPrompt: %v", err)
+	}
+	required := []string{
+		"Rewrite only the git commit subject and body",
+		"Do not change selected_seqs, deferred_seqs, grouping_reason, deferred_reasons",
+		"commit_message tool output",
+		`"selected_seqs":[101]`,
+		`"deferred_seqs":[102]`,
+		`"prior_subject":"Update parsed"`,
+		`"quality_failures"`,
+		`"selected_captures"`,
+	}
+	for _, want := range required {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestComposedPlanIntentRewritesGenericMessageOnly(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:     "scripted-primary",
+		plans:    []IntentPlan{plan},
+		rewrites: []Result{{Subject: "Tighten checkout validation"}},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	got, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if primary.calls != 1 || primary.rewriteCalls != 1 {
+		t.Fatalf("calls=%d rewriteCalls=%d want 1/1", primary.calls, primary.rewriteCalls)
+	}
+	if got.Subject != "Tighten checkout validation" {
+		t.Fatalf("subject=%q", got.Subject)
+	}
+	if len(got.SelectedSeqs) != 1 || got.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected changed: %v", got.SelectedSeqs)
+	}
+	if len(got.DeferredSeqs) != 1 || got.DeferredSeqs[0] != 102 {
+		t.Fatalf("deferred changed: %v", got.DeferredSeqs)
+	}
+	rewriteReq := primary.rewriteRequests[0]
+	if rewriteReq.LockedPlan.Subject != "Update parsed" || rewriteReq.PriorSubject != "Update parsed" {
+		t.Fatalf("rewrite request lost prior subject: %+v", rewriteReq)
+	}
+	if len(rewriteReq.SelectedCaptures) != 1 || rewriteReq.SelectedCaptures[0].Seq != 101 {
+		t.Fatalf("selected capture evidence=%+v", rewriteReq.SelectedCaptures)
+	}
+	if rewriteReq.QualityAction != MessageQualityRewrite {
+		t.Fatalf("rewrite quality action=%s want %s", rewriteReq.QualityAction, MessageQualityRewrite)
+	}
+}
+
+func TestComposedPlanIntentRejectsStillGenericRewrite(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:     "scripted-primary",
+		plans:    []IntentPlan{plan},
+		rewrites: []Result{{Subject: "Update file"}},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected quality error")
+	}
+	var qerr *MessageQualityError
+	if !errors.As(err, &qerr) {
+		t.Fatalf("error=%T %v want MessageQualityError", err, err)
+	}
+	if !qerr.Report.HasReason(MessageQualityReasonGenericSubject) {
+		t.Fatalf("quality report missing generic reason: %+v", qerr.Report.Reasons)
+	}
+}
+
+func TestComposedPlanIntentRejectsMalformedRewriteBody(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101, 102},
+		Subject:        "Update 2 files",
+		GroupingReason: "checkout docs and code must land together",
+	}
+	primary := &scriptedIntentPlanner{
+		name:     "scripted-primary",
+		plans:    []IntentPlan{plan},
+		rewrites: []Result{{Subject: "Update checkout docs and validation", Body: "body without bullet"}},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected quality error")
+	}
+	var qerr *MessageQualityError
+	if !errors.As(err, &qerr) {
+		t.Fatalf("error=%T %v want MessageQualityError", err, err)
+	}
+	if !qerr.Report.HasReason(MessageQualityReasonMalformedBody) {
+		t.Fatalf("quality report missing malformed body reason: %+v", qerr.Report.Reasons)
+	}
+}
+
+func TestComposedPlanIntentSurfacesRewriteProviderError(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:        "scripted-primary",
+		plans:       []IntentPlan{plan},
+		rewriteErrs: []error{errors.New("rewrite unavailable")},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected quality error")
+	}
+	if !strings.Contains(err.Error(), "rewrite unavailable") {
+		t.Fatalf("error=%v missing provider cause", err)
 	}
 }
 
