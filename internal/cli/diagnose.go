@@ -585,7 +585,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
-			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume or acd fix --dry-run to inspect.")
+			"capture pending depth is non-zero; queue is waiting/draining. If depth keeps climbing toward ACD_MAX_PENDING_EVENTS, wait for replay, run acd flush --logical for intentional batch waits, or run acd resume if capture/replay is paused.")
 	}
 	if report.BackpressurePaused {
 		remediation = append(remediation,

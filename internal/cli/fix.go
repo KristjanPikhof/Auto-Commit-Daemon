@@ -769,6 +769,39 @@ func planHasAction(plan *fixPlan, kind string) bool {
 	return false
 }
 
+func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
+	var errs []string
+	for _, action := range plan.Actions {
+		if action.Kind == fixActionPurgeBarrierWithSuccessors && action.RowsChanged == 0 {
+			errs = append(errs, fmt.Sprintf("planned purge seq=%d changed zero rows", action.Seq))
+		}
+	}
+	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
+	if err != nil {
+		return fmt.Errorf("acd fix: verify post-apply blockers: %w", err)
+	}
+	if counts.ActiveBlockedBarriersWithSuccessors > 0 || counts.FailedBarriersWithSuccessors > 0 {
+		plan.RemainingBlockers = &fixBlockerVerification{
+			TotalBlockedConflicts:               counts.TotalBlockedConflicts,
+			ActiveBlockedBarriersWithSuccessors: counts.ActiveBlockedBarriersWithSuccessors,
+			FailedBarriersWithSuccessors:        counts.FailedBarriersWithSuccessors,
+			PendingOnlyIntentDepth:              counts.PendingOnlyIntentDepth,
+		}
+		if counts.ActiveBlockedBarriersWithSuccessors > 0 {
+			errs = append(errs, fmt.Sprintf("%d active blocked barrier row(s) still have pending successors", counts.ActiveBlockedBarriersWithSuccessors))
+		}
+		if counts.FailedBarriersWithSuccessors > 0 {
+			errs = append(errs, fmt.Sprintf("%d failed barrier row(s) still have pending successors", counts.FailedBarriersWithSuccessors))
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	plan.Incomplete = true
+	plan.VerifyErrors = errs
+	return fmt.Errorf("acd fix: post-apply verification incomplete: %s", strings.Join(errs, "; "))
+}
+
 func preflightFixFS(plan *fixPlan) error {
 	for _, action := range plan.Actions {
 		if action.Kind != fixActionClearExpiredManualPause {
@@ -1288,6 +1321,19 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintln(out, "Suggested manual steps:")
 		for _, item := range plan.Suggestions {
 			fmt.Fprintf(out, "- %s\n", item)
+		}
+	}
+	if plan.Incomplete || len(plan.VerifyErrors) > 0 {
+		fmt.Fprintln(out, "Fix incomplete:")
+		for _, item := range plan.VerifyErrors {
+			fmt.Fprintf(out, "- %s\n", item)
+		}
+		if plan.RemainingBlockers != nil {
+			fmt.Fprintf(out, "Remaining blockers: total_blocked_conflicts=%d active_blocked_barriers_with_successors=%d failed_barriers_with_successors=%d pending_only_intent_depth=%d\n",
+				plan.RemainingBlockers.TotalBlockedConflicts,
+				plan.RemainingBlockers.ActiveBlockedBarriersWithSuccessors,
+				plan.RemainingBlockers.FailedBarriersWithSuccessors,
+				plan.RemainingBlockers.PendingOnlyIntentDepth)
 		}
 	}
 	if !plan.DryRun {

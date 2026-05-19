@@ -291,6 +291,13 @@ func dashIfMissing(status, val string) string {
 	return val
 }
 
+func blockedListStatusNote(blockedConflicts, activeBarriers int) string {
+	if activeBarriers > 0 {
+		return fmt.Sprintf("blocked conflicts=%d; active barriers=%d; run acd diagnose; preview safe fix with acd fix --dry-run or force purge plan with acd fix --force --dry-run", blockedConflicts, activeBarriers)
+	}
+	return fmt.Sprintf("blocked conflicts=%d; run acd diagnose; preview safe fix with acd fix --dry-run", blockedConflicts)
+}
+
 // repoSummary is the subset of state.db fields the CLI needs.
 type repoSummary struct {
 	daemon           string

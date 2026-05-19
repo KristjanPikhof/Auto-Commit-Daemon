@@ -49,6 +49,7 @@ type statusReport struct {
 	Clients               []statusClient       `json:"clients"`
 	PendingEvents         int                  `json:"pending_events"`
 	BlockedConflicts      int                  `json:"blocked_conflicts"`
+	ActiveBarriers        int                  `json:"active_barriers,omitempty"`
 	FailedEvents          int                  `json:"failed_events"`
 	FailedBlockingPending int                  `json:"failed_blocking_pending"`
 	LastCommitOID         string               `json:"last_commit_oid,omitempty"`
@@ -269,6 +270,7 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		return report, fmt.Errorf("recovery blocker counts: %w", err)
 	}
 	report.BlockedConflicts = blockers.TotalBlockedConflicts
+	report.ActiveBarriers = blockers.ActiveBlockedBarriersWithSuccessors
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
@@ -491,7 +493,10 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 
 	fmt.Fprintf(out, "Pending events: %d\n", r.PendingEvents)
 	if r.BlockedConflicts > 0 {
-		fmt.Fprintf(out, "Blocked conflicts: %d\n", r.BlockedConflicts)
+		fmt.Fprintf(out, "Blocked conflicts: %d (inspect with `acd diagnose`; preview safe cleanup with `acd fix --dry-run`)\n", r.BlockedConflicts)
+		if r.ActiveBarriers > 0 {
+			fmt.Fprintf(out, "Blocked barriers with pending replay: %d (force purge preview: `acd fix --force --dry-run`)\n", r.ActiveBarriers)
+		}
 	}
 	if r.FailedEvents > 0 {
 		fmt.Fprintf(out, "Failed terminal events: %d\n", r.FailedEvents)
