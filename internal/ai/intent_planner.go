@@ -209,6 +209,8 @@ type IntentPlan struct {
 	GroupingReason  string           `json:"grouping_reason"`
 	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
 	Source          string           `json:"-"`
+	MessageQuality  MessageQualityAction `json:"-"`
+	MessageQualityReason string           `json:"-"`
 }
 
 // IntentMessageRewriteRequest is a locked message-only rewrite request. The

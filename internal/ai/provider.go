@@ -309,6 +309,8 @@ func applyIntentMessageQuality(ctx context.Context, provider Provider, req Inten
 	case MessageQualitySanitizeAccept:
 		plan.Subject = report.SanitizedSubject
 		plan.Body = report.SanitizedBody
+		plan.MessageQuality = MessageQualitySanitizeAccept
+		plan.MessageQualityReason = messageQualitySummary(report)
 		return plan, nil
 	case MessageQualityRewrite:
 		rewriter, ok := provider.(IntentMessageRewriter)
@@ -326,10 +328,14 @@ func applyIntentMessageQuality(ctx context.Context, provider Provider, req Inten
 		next := EvaluateIntentPlanMessageQuality(req, candidate)
 		switch next.Action {
 		case MessageQualityClean:
+			candidate.MessageQuality = MessageQualityRewrite
+			candidate.MessageQualityReason = messageQualitySummary(report)
 			return candidate, nil
 		case MessageQualitySanitizeAccept:
 			candidate.Subject = next.SanitizedSubject
 			candidate.Body = next.SanitizedBody
+			candidate.MessageQuality = MessageQualityRewrite
+			candidate.MessageQualityReason = messageQualitySummary(report)
 			return candidate, nil
 		default:
 			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: next}
@@ -337,6 +343,17 @@ func applyIntentMessageQuality(ctx context.Context, provider Provider, req Inten
 	default:
 		return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report}
 	}
+}
+
+func messageQualitySummary(report MessageQualityReport) string {
+	if len(report.Reasons) == 0 {
+		return string(report.Action)
+	}
+	codes := make([]string, 0, len(report.Reasons))
+	for _, reason := range report.Reasons {
+		codes = append(codes, string(reason.Code))
+	}
+	return strings.Join(codes, ",")
 }
 
 // intentRetryOnInvalidEnabled reports whether the composed retry loop

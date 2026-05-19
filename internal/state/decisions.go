@@ -28,6 +28,8 @@ const (
 	DecisionKindIntentDeferred            = "intent_deferred"
 	DecisionKindIntentForced              = "intent_forced"
 	DecisionKindIntentPlannerError        = "intent_planner_error"
+	DecisionKindMessageQualityRewrite     = "message_quality_rewrite"
+	DecisionKindMessageQualityFallback    = "message_quality_fallback"
 )
 
 const (

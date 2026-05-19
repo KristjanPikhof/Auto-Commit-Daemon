@@ -1120,6 +1120,11 @@ func replayIntentBatch(
 		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
 	}
 	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if plan.MessageQuality != "" {
+		if err := recordIntentMessageQualityDecision(ctx, db, items, activeCtx, nowSec, plan); err != nil {
+			return sum, err
+		}
+	}
 	if err := recordIntentDeferrals(ctx, db, plan, items, activeCtx, nowSec); err != nil {
 		return sum, err
 	}
@@ -1814,6 +1819,18 @@ func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, 
 		}
 		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, err.Error(), "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
+		}
+	}
+	var qualityErr *ai.MessageQualityError
+	if errors.As(err, &qualityErr) {
+		for _, item := range items {
+			if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts,
+				state.DecisionKindMessageQualityFallback,
+				string(qualityErr.Report.Action),
+				"message quality fallback",
+				"Message quality validation failed; deterministic fallback will choose a safe one-item plan: "+validationFailure); recErr != nil {
+				return ai.IntentPlan{}, validationFailure, recErr
+			}
 		}
 	}
 	if req.ForcedAging && len(items) == 1 {
