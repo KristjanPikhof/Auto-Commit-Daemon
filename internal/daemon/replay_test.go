@@ -2724,14 +2724,18 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	}
 
 	planner := &recordingIntentPlanner{
+		name: "openai-compat",
 		plan: ai.IntentPlan{
 			SelectedSeqs:   []int64{pending[0].Seq},
 			Subject:        "Publish overdue capture",
 			GroupingReason: "forced aging",
+			Source:         "openai-compat",
 		},
 	}
+	trace := &memoryTraceLogger{}
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:              f.gitDir,
+		Trace:               trace,
 		CommitStrategy:      ai.CommitStrategyIntent,
 		IntentPlanner:       planner,
 		IntentWindow:        10,
@@ -2745,12 +2749,18 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	if sum.Published != 1 || sum.Skipped {
 		t.Fatalf("summary=%+v want forced aging publish despite batch wait", sum)
 	}
-	// Forced-aging windows of length 1 take the planIntentSingletonFastPath
-	// in replay.go and never call the planner — there is nothing left to
-	// decide once the window is narrowed to one capture. Provider-side call
-	// counter must remain 0.
-	if planner.calls != 0 {
-		t.Fatalf("planner calls=%d want 0 (forced-aging singleton must skip provider)", planner.calls)
+	// Forced-aging still bypasses the batch wait, but non-deterministic
+	// planners now receive the locked one-capture request so message quality
+	// and rewrite policy can run before publish.
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1 for forced-aging provider path", planner.calls)
+	}
+	output := traceEventsByClass(trace.Events(), "intent.planner.output")
+	if len(output) != 1 {
+		t.Fatalf("planner output trace count=%d want 1", len(output))
+	}
+	if source, _ := output[0].Output["source"].(string); source != "openai-compat" {
+		t.Fatalf("planner output source=%q want openai-compat", source)
 	}
 }
 
@@ -2901,10 +2911,9 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	}
 
 	planner := &recordingIntentPlanner{
-		// Only the first replay reaches the planner: the first call defers
-		// pending[1] and selects pending[0]. The second replay falls into
-		// the forced-aging singleton fast path (provider skipped), so the
-		// second plan in this slice is never consumed.
+		// First replay defers pending[1] and selects pending[0]. The second
+		// replay narrows to the forced-aging singleton and still asks the
+		// non-deterministic planner for the final message.
 		plans: []ai.IntentPlan{
 			{
 				SelectedSeqs:   []int64{pending[0].Seq},
@@ -2914,6 +2923,12 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 				DeferredReasons: []ai.DeferredReason{
 					{Seq: pending[1].Seq, Reason: "waiting for related edit"},
 				},
+			},
+			{
+				SelectedSeqs:   []int64{pending[1].Seq},
+				Subject:        "Publish forced capture",
+				GroupingReason: "forced overdue capture",
+				Source:         "recording-intent-planner",
 			},
 		},
 	}
@@ -2958,24 +2973,20 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
 		t.Fatalf("summary 2=%+v want forced publish", sum)
 	}
-	// First replay called the planner once (selects pending[0], defers
-	// pending[1]). Second replay narrows to a single forced-aging seq and
-	// publishes via planIntentSingletonFastPath without invoking the
-	// planner — call counter must stay at 1.
-	if planner.calls != 1 {
-		t.Fatalf("planner calls=%d want 1 (forced-aging singleton must skip provider)", planner.calls)
+	// First replay selected+deferred. Second replay used the provider path for
+	// the forced-aging singleton so the message quality policy can run.
+	if planner.calls != 2 {
+		t.Fatalf("planner calls=%d want 2 with forced-aging provider path", planner.calls)
 	}
 	if _, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[1].Seq); err != nil || ok {
 		t.Fatalf("selected planner state after publish ok=%v err=%v, want cleared", ok, err)
 	}
 }
 
-// TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject
-// verifies the planIntentSingletonFastPath gate end-to-end:
+// TestReplay_IntentStrategyForcedAgingSingletonDeterministicUsesDiffSubject
+// verifies the deterministic planIntentSingletonFastPath gate end-to-end:
 //
-//   - the planner is never invoked when the forced-aging window contains a
-//     single capture (zero provider calls in the recordingIntentPlanner
-//     counter);
+//   - deterministic intent mode still uses the bounded forced-aging fast path;
 //   - the published commit message uses a diff-aware subject derived from
 //     the captured Go source (a function name) rather than the legacy
 //     "Update <basename>" placeholder;
@@ -2983,7 +2994,7 @@ func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T)
 //     recordIntentForcedDecision before the gate) and the
 //     intent_group_committed action (recorded by publishIntentSelection
 //     after the synthesized plan is committed).
-func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubject(t *testing.T) {
+func TestReplay_IntentStrategyForcedAgingSingletonDeterministicUsesDiffSubject(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3007,17 +3018,10 @@ func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubjec
 		t.Fatalf("RecordPlannerDefer: %v", err)
 	}
 
-	planner := &recordingIntentPlanner{
-		// Intentionally empty plan: if the gate misfires and the planner
-		// gets called, the empty SelectedSeqs will fail validation and the
-		// test surfaces the regression as a fallback decision instead of
-		// a clean publish.
-		plan: ai.IntentPlan{},
-	}
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:              f.gitDir,
 		CommitStrategy:      ai.CommitStrategyIntent,
-		IntentPlanner:       planner,
+		IntentPlanner:       ai.DeterministicProvider{},
 		IntentWindow:        10,
 		IntentMinPending:    3,
 		IntentMaxPendingAge: time.Hour,
@@ -3028,12 +3032,6 @@ func TestReplay_IntentStrategyForcedAgingSingletonSkipsProviderAndUsesDiffSubjec
 	}
 	if sum.Published != 1 || sum.Skipped || sum.Conflicts != 0 || sum.Failed != 0 {
 		t.Fatalf("summary=%+v want clean forced-aging publish", sum)
-	}
-	if planner.calls != 0 {
-		t.Fatalf("planner calls=%d want 0 (gate must skip provider on forced singleton)", planner.calls)
-	}
-	if len(planner.requests) != 0 {
-		t.Fatalf("planner requests=%d want 0", len(planner.requests))
 	}
 
 	// Inspect the published commit message to confirm the diff-aware
@@ -5847,11 +5845,10 @@ func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
 	planIntentSingletonFastPathFn.Store(&bad)
 	t.Cleanup(func() { planIntentSingletonFastPathFn.Store(prev) })
 
-	planner := &recordingIntentPlanner{}
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
 		CommitStrategy:   ai.CommitStrategyIntent,
-		IntentPlanner:    planner,
+		IntentPlanner:    ai.DeterministicProvider{},
 		IntentWindow:     10,
 		IntentMinPending: 1,
 		IntentDeferLimit: 1,
