@@ -106,7 +106,7 @@ The default repo is the current working directory. Diagnose opens state read-onl
   acd diagnose --repo /path/to/repo
   acd diagnose --json
   acd fix --dry-run
-  acd fix --json`, 
+  acd fix --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
