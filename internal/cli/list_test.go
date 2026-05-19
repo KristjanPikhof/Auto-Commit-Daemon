@@ -377,6 +377,52 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 	if got.Repos[0].BlockedConflicts != 1 {
 		t.Fatalf("BlockedConflicts=%d, want 1", got.Repos[0].BlockedConflicts)
 	}
+	if got.Repos[0].Status != "blocked" || strings.Contains(human, " OK") {
+		t.Fatalf("blocked repo status = %q; human must not show STATUS OK:\n%s", got.Repos[0].Status, human)
+	}
+	if !strings.Contains(got.Repos[0].StatusNote, "acd fix --dry-run") {
+		t.Fatalf("blocked status note lacks safe fix guidance: %q", got.Repos[0].StatusNote)
+	}
+}
+
+func TestList_PendingOnlyShowsWaitingNotBlocked(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "waiting.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, []state.CaptureOp{{Op: "modify", Path: "waiting.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	var jsonOut, jsonErr bytes.Buffer
+	if err := runList(ctx, &jsonOut, &jsonErr, true); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(got.Repos))
+	}
+	if got.Repos[0].Status != "waiting" || got.Repos[0].BlockedConflicts != 0 {
+		t.Fatalf("pending-only status=%q blocked=%d, want waiting/0", got.Repos[0].Status, got.Repos[0].BlockedConflicts)
+	}
+	if strings.Contains(got.Repos[0].StatusNote, "fix") {
+		t.Fatalf("pending-only waiting note should not imply fix/corruption: %q", got.Repos[0].StatusNote)
+	}
 }
 
 func TestList_MissingStateDB_Reported(t *testing.T) {

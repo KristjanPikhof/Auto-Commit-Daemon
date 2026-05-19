@@ -101,24 +101,23 @@ matches the captured intent. The following scenarios bypass it and become
 | **Symlink target mismatch** | Symlink (mode `120000`) blob encodes the target string; an external tool that wrote a different target produces a different OID, failing the probe. |
 | **Ancestry divergence** | `HEAD` does not descend from the replay parent (force-push, hard reset to an unrelated commit); the ancestry guard returns `false` before the tree is even checked. |
 
-Resolve `blocked_conflict` rows with the standard workflow:
+Resolve `blocked_conflict` rows with the standard recovery ladder:
 
 ~~~bash
-acd status
-acd events --watch
-acd explain --path path/to/file
-acd diagnose --repo .
-acd fix --dry-run
-acd fix --yes
+acd status                         # diagnose counts and status terms
+acd events --watch                 # inspect current decisions
+acd explain --path path/to/file    # inspect the affected path
+acd diagnose --repo .              # inspect blockers and branch anchors
+acd fix --dry-run                  # plan safe cleanup
+acd fix --yes                      # apply safe cleanup only if the plan matches
+acd fix --force --dry-run          # explicit force plan for barriers with pending successors
+acd fix --force --yes              # apply only after verifying HEAD already has the change or discard is intended
 ~~~
 
-If `fix --dry-run` reports barriers with pending successors, add `--force` to
-include the purge in the plan:
-
-~~~bash
-acd fix --force --dry-run
-acd fix --force --yes
-~~~
+`blocked` in `acd list` means action is still required. If only `pending`
+remains under intent strategy, ACD may be waiting for more captures or the age
+trigger; use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an
+active harness session when you want to drain the visible batch now.
 
 After applying, nudge the daemon if you are inside a harness shell:
 

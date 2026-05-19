@@ -529,6 +529,28 @@ func TestFix_YesAloneRefusesToIncludePurge(t *testing.T) {
 	if !foundNudge {
 		t.Fatalf("plan must surface --force nudge in Suggestions: %+v", plan.Suggestions)
 	}
+	if !plan.ForceRequired {
+		t.Fatalf("plan.force_required=false with active force-only barrier: %+v", plan)
+	}
+	got := countCaptureRowsByState(t, db)
+	if got[state.EventStateBlockedConflict] != 1 || got[state.EventStatePending] != 1 {
+		t.Fatalf("normal fix must not destructively purge barrier rows: %v", got)
+	}
+}
+
+func TestFix_SafePlanPrintsExactForceCommandWithRepoPath(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	stageBarrierWithSuccessors(t, ctx, repo, db)
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, true, false, false, false, false); err != nil {
+		t.Fatalf("runFix dry-run human: %v\n%s", err, out.String())
+	}
+	want := "acd fix --repo " + repo + " --force --yes"
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("human output missing exact force command %q:\n%s", want, out.String())
+	}
 }
 
 // TestFix_ForceDryRunListsPurge confirms --force without --yes still plans
@@ -584,6 +606,135 @@ func TestFix_ForceYesAppliesPurge(t *testing.T) {
 	}
 	if got[state.EventStatePending] == 0 {
 		t.Fatalf("pending successors should remain: %v", got)
+	}
+}
+
+func TestFix_ForceYesPurgesBeforeRetargetResetsBlockedRows(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	stageBarrierWithSuccessors(t, ctx, repo, db)
+	if err := state.MetaSet(ctx, db, "last_replay_error", "stale breadcrumb"); err != nil {
+		t.Fatalf("MetaSet: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, false, true, true, false, true); err != nil {
+		t.Fatalf("runFix --force --yes: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	purgeIdx, retargetIdx := -1, -1
+	for i, action := range plan.Actions {
+		switch action.Kind {
+		case fixActionPurgeBarrierWithSuccessors:
+			purgeIdx = i
+			if action.RowsChanged != 1 {
+				t.Fatalf("purge rows=%d want 1: %+v", action.RowsChanged, plan.Actions)
+			}
+		case fixActionRetargetStaleAnchor:
+			retargetIdx = i
+		}
+	}
+	if purgeIdx < 0 || retargetIdx < 0 || purgeIdx > retargetIdx {
+		t.Fatalf("purge must be planned/applied before retarget: purge=%d retarget=%d actions=%+v", purgeIdx, retargetIdx, plan.Actions)
+	}
+	got := countCaptureRowsByState(t, db)
+	if got[state.EventStateBlockedConflict] != 0 {
+		t.Fatalf("blocked rows remain after order-safe force fix: %v", got)
+	}
+	if got[state.EventStatePending] != 1 {
+		t.Fatalf("barrier must be deleted, not reset to pending; row counts: %v", got)
+	}
+	var barrierRows int
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE path = 'barrier.txt'`,
+	).Scan(&barrierRows); err != nil {
+		t.Fatalf("query barrier rows: %v", err)
+	}
+	if barrierRows != 0 {
+		t.Fatalf("force purge must delete barrier row, got %d barrier rows", barrierRows)
+	}
+}
+
+func TestFix_ForceYesReportsIncompleteWhenBlockersRemain(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         head,
+		Operation:        "modify",
+		Path:             "failed-barrier.txt",
+		Fidelity:         "exact",
+		State:            state.EventStateFailed,
+		Error:            sql.NullString{String: "old failure", Valid: true},
+	}, nil); err != nil {
+		t.Fatalf("seed failed barrier: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         head,
+		Operation:        "modify",
+		Path:             "pending-behind-failed.txt",
+		Fidelity:         "exact",
+		State:            state.EventStatePending,
+	}, nil); err != nil {
+		t.Fatalf("seed pending successor: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = runFix(ctx, &out, repo, false, true, true, false, true)
+	if err == nil {
+		t.Fatalf("runFix --force --yes succeeded despite remaining failed barrier:\n%s", out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !plan.Incomplete || len(plan.VerifyErrors) == 0 || plan.RemainingBlockers == nil {
+		t.Fatalf("plan did not report incomplete remaining blockers: %+v", plan)
+	}
+	if plan.RemainingBlockers.FailedBarriersWithSuccessors != 1 {
+		t.Fatalf("failed blocker count=%+v want 1", plan.RemainingBlockers)
+	}
+}
+
+func TestFix_ForceYesReportsIncompleteWhenPlannedPurgeChangesZeroRows(t *testing.T) {
+	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	plan := fixPlan{
+		Repo:             repo,
+		StateDB:          stateDB,
+		GitDir:           filepath.Join(repo, ".git"),
+		CurrentBranchRef: "refs/heads/main",
+		CurrentHead:      head,
+		Generation:       1,
+		Force:            true,
+		Actions: []fixAction{{
+			ID:               fixActionPurgeBarrierWithSuccessors + ":9999",
+			Kind:             fixActionPurgeBarrierWithSuccessors,
+			Seq:              9999,
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			RequiresForce:    true,
+		}},
+	}
+	if err := applyFixPlan(ctx, stateDB, &plan); err == nil {
+		t.Fatalf("applyFixPlan succeeded despite zero-row planned purge: %+v", plan)
+	}
+	if !plan.Incomplete || len(plan.VerifyErrors) == 0 {
+		t.Fatalf("plan missing zero-row incomplete verification: %+v", plan)
 	}
 }
 

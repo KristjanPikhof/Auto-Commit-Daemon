@@ -553,6 +553,11 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	); err != nil {
 		return fmt.Errorf("intent batch wait summary: %w", err)
 	}
+	if blockers, err := loadRecoveryBlockerCounts(ctx, conn, "", 0); err != nil {
+		return fmt.Errorf("intent blocker counts: %w", err)
+	} else {
+		report.VisiblePendingEvents = blockers.PendingOnlyIntentDepth
+	}
 	if oldestSeq.Valid {
 		report.OldestPendingEventSeq = oldestSeq.Int64
 	}

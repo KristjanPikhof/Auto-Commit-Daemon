@@ -101,11 +101,12 @@ func newDiagnoseCmd() *cobra.Command {
 		Short: "Inspect replay blockers and branch anchors without mutating state",
 		Long: `Inspect replay blockers, pending depth, branch anchor state, git-operation markers, and remediation hints for one repo.
 
-The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Use acd recover --auto --dry-run to preview a repair when diagnose points to stale replay state.`,
+The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Pending-only intent queues are reported as waiting/draining, while terminal barriers point to acd fix --dry-run and force-only purge previews when needed.`,
 		Example: `  acd diagnose
   acd diagnose --repo /path/to/repo
   acd diagnose --json
-  acd recover --repo . --auto --dry-run --json`,
+  acd fix --dry-run
+  acd fix --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -283,10 +284,10 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
 		return fmt.Errorf("failed events: %w", err)
 	}
-	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err != nil {
+	if blockers, err := loadRecoveryBlockerCounts(ctx, conn, "", 0); err != nil {
 		return fmt.Errorf("failed blocking pending: %w", err)
 	} else {
-		report.FailedBlockingPending = n
+		report.FailedBlockingPending = blockers.FailedBarriersWithSuccessors
 	}
 
 	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
@@ -490,11 +491,11 @@ func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, re
 	}
 
 	// BarrierWithSuccessorsCount is a pure SQL count — no git needed.
-	n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, generation)
+	blockers, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, generation)
 	if err != nil {
 		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
 	}
-	report.BarrierWithSuccessorsCount = n
+	report.BarrierWithSuccessorsCount = blockers.ActiveBlockedBarriersWithSuccessors
 
 	// AutoResolvableBlockedCount requires a live HEAD to probe blobs.
 	head, err := git.RevParse(ctx, repoDir, "HEAD")
@@ -585,7 +586,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
-			"capture pending depth is non-zero; if depth keeps climbing toward ACD_MAX_PENDING_EVENTS, run acd resume or acd fix --dry-run to inspect.")
+			"capture pending depth is non-zero; queue is waiting/draining. If depth keeps climbing toward ACD_MAX_PENDING_EVENTS, wait for replay, run acd flush --logical for intentional batch waits, or run acd resume if capture/replay is paused.")
 	}
 	if report.BackpressurePaused {
 		remediation = append(remediation,

@@ -12,7 +12,7 @@ Common workflow:
   acd events --watch                Stream appended product decisions
   acd prompt --last                 Inspect the last recorded AI prompt request
   acd explain --path FILE           Explain why ACD did or did not commit a path
-  acd fix --dry-run                 Plan safe remediation for a stuck repo
+  acd fix --dry-run                 Preview safe remediation for a stuck repo (use --force dry-run for barrier purge plans)
   acd repo init                     Explicitly initialize ACD state for this repo
   acd repo list                     List all registry rows for lifecycle management
   acd repo remove --dry-run          Preview registry removal and state preservation
@@ -25,7 +25,7 @@ Common workflow:
   acd stop                          Stop the repo daemon or deregister a session
 
 Diagnostics and recovery:
-  acd diagnose     Inspect replay blockers and branch anchors
+  acd diagnose     Inspect replay blockers, waiting queues, and branch anchors
   acd doctor       Run diagnostics and optionally bundle a support zip
   acd pause        Pause capture and replay
   acd resume       Resume capture and replay

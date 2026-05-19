@@ -553,9 +553,11 @@ func TestDiagnose_CapacityRemediation_FiresOnDepthAlone(t *testing.T) {
 	}
 	var sawHint bool
 	for _, r := range rep.Remediation {
-		if strings.Contains(r, "pending depth is non-zero") {
+		if strings.Contains(r, "pending depth is non-zero") && strings.Contains(r, "waiting/draining") {
 			sawHint = true
-			break
+		}
+		if strings.Contains(r, "acd fix") {
+			t.Fatalf("pending-only remediation should not imply corruption/fix: %v", rep.Remediation)
 		}
 	}
 	if !sawHint {

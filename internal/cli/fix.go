@@ -32,22 +32,26 @@ const (
 )
 
 type fixPlan struct {
-	Repo               string      `json:"repo"`
-	StateDB            string      `json:"state_db"`
-	GitDir             string      `json:"git_dir,omitempty"`
-	CurrentBranchRef   string      `json:"current_branch_ref,omitempty"`
-	CurrentHead        string      `json:"current_head,omitempty"`
-	Generation         int64       `json:"generation,omitempty"`
-	DryRun             bool        `json:"dry_run"`
-	Force              bool        `json:"force,omitempty"`
-	ClearPause         bool        `json:"clear_pause,omitempty"`
-	BackupPath         string      `json:"backup_path,omitempty"`
-	Actions            []fixAction `json:"actions"`
-	Unsafe             []string    `json:"unsafe,omitempty"`
-	Suggestions        []string    `json:"suggestions,omitempty"`
-	RowsChanged        int64       `json:"rows_changed"`
-	ManualPauseRemoved bool        `json:"manual_pause_removed,omitempty"`
-	ManualPausePath    string      `json:"manual_pause_path,omitempty"`
+	Repo               string                  `json:"repo"`
+	StateDB            string                  `json:"state_db"`
+	GitDir             string                  `json:"git_dir,omitempty"`
+	CurrentBranchRef   string                  `json:"current_branch_ref,omitempty"`
+	CurrentHead        string                  `json:"current_head,omitempty"`
+	Generation         int64                   `json:"generation,omitempty"`
+	DryRun             bool                    `json:"dry_run"`
+	Force              bool                    `json:"force,omitempty"`
+	ClearPause         bool                    `json:"clear_pause,omitempty"`
+	BackupPath         string                  `json:"backup_path,omitempty"`
+	Actions            []fixAction             `json:"actions"`
+	Unsafe             []string                `json:"unsafe,omitempty"`
+	Suggestions        []string                `json:"suggestions,omitempty"`
+	RowsChanged        int64                   `json:"rows_changed"`
+	ForceRequired      bool                    `json:"force_required,omitempty"`
+	Incomplete         bool                    `json:"incomplete,omitempty"`
+	VerifyErrors       []string                `json:"verify_errors,omitempty"`
+	RemainingBlockers  *fixBlockerVerification `json:"remaining_blockers,omitempty"`
+	ManualPauseRemoved bool                    `json:"manual_pause_removed,omitempty"`
+	ManualPausePath    string                  `json:"manual_pause_path,omitempty"`
 	// Retarget bookkeeping (mirrors recoverPlan fields so JSON callers can
 	// follow ported acd recover semantics without losing data).
 	ManualMarkerRemoved     bool   `json:"manual_marker_removed,omitempty"`
@@ -56,6 +60,13 @@ type fixPlan struct {
 	LiveIndexCandidates     int    `json:"live_index_candidates,omitempty"`
 	LiveIndexApplied        int    `json:"live_index_applied,omitempty"`
 	LiveIndexSkipped        int    `json:"live_index_skipped,omitempty"`
+}
+
+type fixBlockerVerification struct {
+	TotalBlockedConflicts               int `json:"total_blocked_conflicts"`
+	ActiveBlockedBarriersWithSuccessors int `json:"active_blocked_barriers_with_successors"`
+	FailedBarriersWithSuccessors        int `json:"failed_barriers_with_successors"`
+	PendingOnlyIntentDepth              int `json:"pending_only_intent_depth"`
 }
 
 type fixAction struct {
@@ -148,6 +159,21 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	}
 	if len(plan.Actions) > 0 {
 		if err := applyFixPlan(ctx, rec.StateDB, &plan); err != nil {
+			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
+				return rerr
+			}
+			return err
+		}
+	} else if force {
+		conn, err := openStateDBReadOnly(ctx, rec.StateDB)
+		if err != nil {
+			return fmt.Errorf("acd fix: open state.db read-only for post-apply verification: %w", err)
+		}
+		defer conn.Close()
+		if err := verifyFixPostApply(ctx, conn, &plan); err != nil {
+			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
+				return rerr
+			}
 			return err
 		}
 	}
@@ -240,10 +266,10 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		return fixPlan{}, err
 	}
 	if branchRef != "" {
-		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
-			return fixPlan{}, err
-		}
 		if force {
+			// Destructive purges must be applied before retarget_stale_anchor can
+			// reset blocked_conflict rows back to pending. Keep this order in the
+			// action list so --force --yes is order-safe.
 			if err := planPurgeBarrierWithSuccessors(ctx, conn, branchRef, plan.Generation, &plan); err != nil {
 				return fixPlan{}, err
 			}
@@ -255,9 +281,13 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 				return fixPlan{}, err
 			}
 			if n > 0 {
+				plan.ForceRequired = true
 				plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-					"%d blocked barrier row(s) still have pending successors; rerun with --force to plan purge_barrier_with_successors.", n))
+					"%d blocked barrier row(s) still have pending successors; run `acd fix --repo %s --force --yes` to purge them.", n, plan.Repo))
 			}
+		}
+		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
+			return fixPlan{}, err
 		}
 	}
 	return plan, nil
@@ -736,6 +766,9 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 			return err
 		}
 	}
+	if err := verifyFixPostApply(ctx, db.SQL(), plan); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -746,6 +779,39 @@ func planHasAction(plan *fixPlan, kind string) bool {
 		}
 	}
 	return false
+}
+
+func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
+	var errs []string
+	for _, action := range plan.Actions {
+		if action.Kind == fixActionPurgeBarrierWithSuccessors && action.RowsChanged == 0 {
+			errs = append(errs, fmt.Sprintf("planned purge seq=%d changed zero rows", action.Seq))
+		}
+	}
+	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
+	if err != nil {
+		return fmt.Errorf("acd fix: verify post-apply blockers: %w", err)
+	}
+	if counts.ActiveBlockedBarriersWithSuccessors > 0 || counts.FailedBarriersWithSuccessors > 0 {
+		plan.RemainingBlockers = &fixBlockerVerification{
+			TotalBlockedConflicts:               counts.TotalBlockedConflicts,
+			ActiveBlockedBarriersWithSuccessors: counts.ActiveBlockedBarriersWithSuccessors,
+			FailedBarriersWithSuccessors:        counts.FailedBarriersWithSuccessors,
+			PendingOnlyIntentDepth:              counts.PendingOnlyIntentDepth,
+		}
+		if counts.ActiveBlockedBarriersWithSuccessors > 0 {
+			errs = append(errs, fmt.Sprintf("%d active blocked barrier row(s) still have pending successors", counts.ActiveBlockedBarriersWithSuccessors))
+		}
+		if counts.FailedBarriersWithSuccessors > 0 {
+			errs = append(errs, fmt.Sprintf("%d failed barrier row(s) still have pending successors", counts.FailedBarriersWithSuccessors))
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	plan.Incomplete = true
+	plan.VerifyErrors = errs
+	return fmt.Errorf("acd fix: post-apply verification incomplete: %s", strings.Join(errs, "; "))
 }
 
 func preflightFixFS(plan *fixPlan) error {
@@ -1267,6 +1333,19 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintln(out, "Suggested manual steps:")
 		for _, item := range plan.Suggestions {
 			fmt.Fprintf(out, "- %s\n", item)
+		}
+	}
+	if plan.Incomplete || len(plan.VerifyErrors) > 0 {
+		fmt.Fprintln(out, "Fix incomplete:")
+		for _, item := range plan.VerifyErrors {
+			fmt.Fprintf(out, "- %s\n", item)
+		}
+		if plan.RemainingBlockers != nil {
+			fmt.Fprintf(out, "Remaining blockers: total_blocked_conflicts=%d active_blocked_barriers_with_successors=%d failed_barriers_with_successors=%d pending_only_intent_depth=%d\n",
+				plan.RemainingBlockers.TotalBlockedConflicts,
+				plan.RemainingBlockers.ActiveBlockedBarriersWithSuccessors,
+				plan.RemainingBlockers.FailedBarriersWithSuccessors,
+				plan.RemainingBlockers.PendingOnlyIntentDepth)
 		}
 	}
 	if !plan.DryRun {

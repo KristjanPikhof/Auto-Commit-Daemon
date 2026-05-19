@@ -52,9 +52,14 @@ and exits without starting the persistent daemon. See the
 [cold start commit cleanup](user-workflows.md#cold-start-commit-cleanup)
 workflow for usage details and flag reference.
 
-For day-to-day troubleshooting with `acd status`, `acd events`,
-`acd explain`, `acd fix`, `acd diagnose`, and `acd doctor --bundle`, see
-[user-workflows.md](user-workflows.md).
+For day-to-day troubleshooting, use the recovery ladder: diagnose with
+`acd status`, `acd events`, `acd explain`, and `acd diagnose`; preview with
+`acd fix --dry-run`; apply safe cleanup with `acd fix --yes`; use
+`acd fix --force --dry-run` and `acd fix --force --yes` only as an explicit,
+operator-verified purge for barriers with pending successors; then post-check
+with `acd status` or `acd list`. `blocked` means action required, while
+pending-only intent queues may just be waiting for a batch gate or logical
+flush. See [user-workflows.md](user-workflows.md).
 
 For AI provider configuration and the subprocess plugin protocol, see
 [ai-providers.md](ai-providers.md).
