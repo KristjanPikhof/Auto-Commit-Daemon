@@ -159,7 +159,7 @@ acd status                         # post-check: confirm pending/blocked counts 
 
 `acd fix` is the single recovery entrypoint. It backs up `state.db` before mutating, refuses to run while a live daemon owns the database, and won't lift a manual pause unless you pass `--clear-pause`. Safe apply (`acd fix --yes`) handles only self-verifiable cleanup. Force apply is explicit: use `--force` only after the dry-run shows terminal barriers with pending successors and you have verified the captured changes are already represented in `HEAD` or are intentionally being discarded. Use `acd resume --yes` when the only problem is a stale pause marker.
 
-After recovery, `acd list` status `blocked` means operator action is still required; `pending` means queued work remains. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
+After recovery, `acd list` status `blocked` means operator action is still required; `waiting` means queued work remains without an active blocker. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
 
 If a parallel committer (Claude Code's atomic-commit hook, Codex ACD hook, your own script) lands the change before ACD's replay tick, you'll see `handled_external` or `superseded_external` in `acd events`. That's normal. Real content mismatches still surface as `blocked_conflict`.
 

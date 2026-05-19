@@ -416,7 +416,8 @@ pending successors, and is deliberately explicit: run `acd fix --force
 --dry-run` first, then apply only after you verify the captured changes already
 exist in `HEAD` via an external committer or should be discarded. The legacy
 `acd recover` and `acd purge-events` commands remain as hidden, deprecated
-aliases that forward into `acd fix` for one release.
+compatibility commands for one release; new recovery guidance and user-facing
+remediation should point at `acd fix`.
 
 ACD keys lifecycle state by the canonical Git worktree root. `acd start` from
 `repo/sub/dir` registers `repo`, not the subdirectory, and later `acd status` or
@@ -598,7 +599,7 @@ the pause fields:
 | Value | Meaning |
 |---|---|
 | `"OK"` | Daemon running, no pause, no stale heartbeat, and no queued or blocked work. |
-| `"pending"` | Work is queued but not blocked. In intent mode this can be a normal batch wait; wait for more captures or the age trigger, or run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session. |
+| `"waiting"` | Work is queued but not blocked. In intent mode this can be a normal batch wait; wait for more captures or the age trigger, or run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session. |
 | `"blocked"` | A terminal barrier is holding replay. Operator action is required: diagnose, dry-run `acd fix`, then choose safe or explicit force apply. |
 | `"paused"` | Replay paused (operator or rewind grace). Takes priority over `stale`. |
 | `"stale"` | Daemon heartbeat expired or PID dead, at least one live client present. |
