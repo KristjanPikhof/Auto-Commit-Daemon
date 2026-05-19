@@ -54,7 +54,7 @@ func newListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all known daemons across repos",
 		Long: `List repos registered with acd and show daemon liveness, clients, queue
-depth, blocked conflicts, last commit, and pause/stale status.
+depth, blocked conflicts, waiting/draining queues, last commit, and pause/stale status.
 
 Use --watch to refresh the table until interrupted. --interval controls the
 refresh cadence and accepts Go durations such as 500ms, 2s, or 1m. Watch mode

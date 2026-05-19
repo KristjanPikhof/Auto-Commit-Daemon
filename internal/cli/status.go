@@ -73,7 +73,7 @@ func newStatusCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print current daemon + clients for one repo (default: cwd)",
-		Long: `Print daemon, client, queue, pause, branch, and recent decision state for one registered repo.
+		Long: `Print daemon, client, queue, blocked-vs-waiting recovery state, pause, branch, and recent decision state for one registered repo.
 
 The default repo is the current working directory. Use --watch to refresh the
 same repo until interrupted. Use --json for automation. For all registered
