@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2768,6 +2769,136 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentStrategyForcedAgingRewritesWeakSubject(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "parsed.ts", "export const parsed = true\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, pending[0].Seq, 1, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	primary := &qualityRewriteIntentProvider{
+		planSubject: "Update parsed",
+		rewrite:     ai.Result{Subject: "Tighten parser state"},
+	}
+	planner := ai.Compose(primary, ai.DeterministicProvider{}).(ai.IntentPlanner)
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Skipped {
+		t.Fatalf("summary=%+v want forced publish", sum)
+	}
+	if primary.planCalls != 1 || primary.rewriteCalls != 1 {
+		t.Fatalf("planCalls=%d rewriteCalls=%d want 1/1", primary.planCalls, primary.rewriteCalls)
+	}
+	head, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "-1", "--pretty=%s")
+	if err != nil {
+		t.Fatalf("git log subject: %v", err)
+	}
+	if got := strings.TrimSpace(string(head)); got != "Tighten parser state" {
+		t.Fatalf("commit subject=%q want rewritten semantic subject", got)
+	}
+	decisions, err := state.DecisionsForEvent(ctx, f.db, pending[0].Seq, 20)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	hasRewrite := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindMessageQualityRewrite {
+			hasRewrite = true
+			break
+		}
+	}
+	if !hasRewrite {
+		t.Fatalf("message_quality_rewrite decision missing: %+v", decisions)
+	}
+}
+
+func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	body := "export function parseTotal() { return 1 }\n"
+	captureOnePendingFile(t, ctx, f, "total.ts", body)
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending=%d want 1", len(pending))
+	}
+	if err := state.RecordPlannerDefer(ctx, f.db, pending[0].Seq, 1, "waiting for related edit"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	primary := &qualityRewriteIntentProvider{
+		planSubject: "Update total",
+		rewriteErr:  errors.New("rewrite unavailable"),
+	}
+	trace := &memoryTraceLogger{}
+	planner := ai.Compose(primary, ai.DeterministicProvider{}).(ai.IntentPlanner)
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Trace:               trace,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Skipped {
+		t.Fatalf("summary=%+v want deterministic fallback publish", sum)
+	}
+	if primary.planCalls != 1 || primary.rewriteCalls != 1 {
+		t.Fatalf("planCalls=%d rewriteCalls=%d want 1/1", primary.planCalls, primary.rewriteCalls)
+	}
+	validation := traceEventsByClass(trace.Events(), "intent.planner.validation_failed")
+	if len(validation) != 1 || !strings.Contains(validation[0].Error, "rewrite unavailable") {
+		t.Fatalf("validation trace=%+v want rewrite failure", validation)
+	}
+	decisions, err := state.DecisionsForEvent(ctx, f.db, pending[0].Seq, 20)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	hasFallback := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindMessageQualityFallback {
+			hasFallback = true
+			break
+		}
+	}
+	if !hasFallback {
+		t.Fatalf("message_quality_fallback decision missing: %+v", decisions)
+	}
+}
+
 func TestReplay_IntentStrategyBatchWaitSeesOnlyBarrierVisiblePending(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -3902,6 +4033,64 @@ func (p *recordingIntentPlanner) PlanIntent(ctx context.Context, req ai.IntentPl
 		return plan, nil
 	}
 	return p.plan, nil
+}
+
+type qualityRewriteIntentProvider struct {
+	name         string
+	planSubject  string
+	rewrite      ai.Result
+	rewriteErr   error
+	planCalls    int
+	rewriteCalls int
+}
+
+func (p *qualityRewriteIntentProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "openai-compat"
+}
+
+func (p *qualityRewriteIntentProvider) NeedsDiff() bool { return false }
+
+func (p *qualityRewriteIntentProvider) Generate(context.Context, ai.CommitContext) (ai.Result, error) {
+	return ai.Result{}, errors.New("not used")
+}
+
+func (p *qualityRewriteIntentProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return ai.IntentPlan{}, err
+	}
+	p.planCalls++
+	if len(req.OfferedCaptures) != 1 {
+		return ai.IntentPlan{}, fmt.Errorf("offered captures=%d want 1", len(req.OfferedCaptures))
+	}
+	subject := p.planSubject
+	if subject == "" {
+		subject = "Update parsed"
+	}
+	return ai.IntentPlan{
+		SelectedSeqs:   []int64{req.OfferedCaptures[0].Seq},
+		Subject:        subject,
+		GroupingReason: "forced provider plan",
+		Source:         p.Name(),
+	}, nil
+}
+
+func (p *qualityRewriteIntentProvider) RewriteIntentMessage(ctx context.Context, req ai.IntentMessageRewriteRequest) (ai.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return ai.Result{}, err
+	}
+	p.rewriteCalls++
+	if p.rewriteErr != nil {
+		return ai.Result{}, p.rewriteErr
+	}
+	out := p.rewrite
+	if out.Subject == "" {
+		out.Subject = "Tighten parser state"
+	}
+	out.Source = p.Name()
+	return out, nil
 }
 
 type memoryTraceLogger struct {

@@ -69,12 +69,45 @@ func TestEvaluateIntentPlanMessageQuality(t *testing.T) {
 			wantReasons: []MessageQualityReasonCode{MessageQualityReasonTokenOnly},
 		},
 		{
+			name: "camel token subject requests rewrite",
+			req:  baseReq(capture(1, "src/effort.ts", "modify")),
+			plan: IntentPlan{
+				SelectedSeqs:   []int64{1},
+				Subject:        "Update hasPositional",
+				GroupingReason: "single effort change",
+			},
+			wantAction:  MessageQualityRewrite,
+			wantReasons: []MessageQualityReasonCode{MessageQualityReasonTokenOnly},
+		},
+		{
+			name: "generic total subject requests rewrite",
+			req:  baseReq(capture(1, "src/total.ts", "modify")),
+			plan: IntentPlan{
+				SelectedSeqs:   []int64{1},
+				Subject:        "Update total",
+				GroupingReason: "single total change",
+			},
+			wantAction:  MessageQualityRewrite,
+			wantReasons: []MessageQualityReasonCode{MessageQualityReasonTokenOnly},
+		},
+		{
 			name: "filename only subject requests rewrite",
 			req:  baseReq(capture(1, "src/effort.ts", "modify")),
 			plan: IntentPlan{
 				SelectedSeqs:   []int64{1},
 				Subject:        "Update effort.ts",
 				GroupingReason: "single effort change",
+			},
+			wantAction:  MessageQualityRewrite,
+			wantReasons: []MessageQualityReasonCode{MessageQualityReasonFilenameOnly},
+		},
+		{
+			name: "test filename only subject requests rewrite",
+			req:  baseReq(capture(1, "src/effort-flow.test.ts", "modify")),
+			plan: IntentPlan{
+				SelectedSeqs:   []int64{1},
+				Subject:        "Update effort-flow.test.ts",
+				GroupingReason: "single test change",
 			},
 			wantAction:  MessageQualityRewrite,
 			wantReasons: []MessageQualityReasonCode{MessageQualityReasonFilenameOnly},
