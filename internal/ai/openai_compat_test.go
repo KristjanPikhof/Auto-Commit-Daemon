@@ -653,6 +653,64 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 	}
 }
 
+func TestOpenAIIntentMessageRewrite_HappyPath(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+	p, last, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
+		return 200, cannedToolCall("Tighten checkout validation", "")
+	})
+
+	got, err := p.RewriteIntentMessage(context.Background(), rewriteReq)
+	if err != nil {
+		t.Fatalf("RewriteIntentMessage: %v", err)
+	}
+	if got.Subject != "Tighten checkout validation" || got.Body != "" {
+		t.Fatalf("rewrite result=%+v", got)
+	}
+
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		ToolChoice struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(last.rawBody, &sent); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if len(sent.Tools) != 1 || sent.Tools[0].Function.Name != "commit_message" {
+		t.Fatalf("tools=%+v", sent.Tools)
+	}
+	if sent.ToolChoice.Function.Name != "commit_message" {
+		t.Fatalf("tool_choice=%+v", sent.ToolChoice)
+	}
+	if len(sent.Messages) != 2 || !strings.Contains(sent.Messages[1].Content, "Do not change selected_seqs") {
+		t.Fatalf("rewrite prompt missing lock instruction: %+v", sent.Messages)
+	}
+	if strings.Contains(string(last.rawBody), "capture_intent_plan") {
+		t.Fatalf("rewrite request must not expose capture_intent_plan tool: %s", string(last.rawBody))
+	}
+}
+
 func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	p, last, _ := newOpenAIMock(t, func(capturedReq) (int, string) {

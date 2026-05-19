@@ -135,6 +135,52 @@ done
 	}
 }
 
+func TestSubprocess_RewriteIntentMessage(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"intent_message_rewrite"'*'"message_rewrite_request"'*)
+      printf '%s\n' '{"version":1,"subject":"Tighten checkout validation","body":"","error":""}'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing rewrite request"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Update parsed",
+		GroupingReason: "checkout service change is focused",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "docs change is independent",
+		}},
+	}
+	rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+	got, err := p.RewriteIntentMessage(context.Background(), rewriteReq)
+	if err != nil {
+		t.Fatalf("RewriteIntentMessage: %v", err)
+	}
+	if got.Subject != "Tighten checkout validation" || got.Body != "" {
+		t.Fatalf("rewrite result=%+v", got)
+	}
+	if got.Source != "subprocess:test" {
+		t.Fatalf("source=%q", got.Source)
+	}
+}
+
 func TestSubprocess_PlanIntentRejectsSelectedDeferredOverlap(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
