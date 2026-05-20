@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-20
+
 ### Changed
 
 - Recovery views now separate waiting queues from blocked repos, so `acd list`,
