@@ -250,6 +250,16 @@ func TestOpenAI_NoToolCall(t *testing.T) {
 	}
 }
 
+func TestOpenAI_RejectsWrongCommitMessageToolName(t *testing.T) {
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 200, `{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"not_commit_message","arguments":"{\"subject\":\"Update x\"}"}}]}}]}`
+	})
+	_, err := p.Generate(context.Background(), CommitContext{Op: "modify", Path: "x"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected tool") {
+		t.Fatalf("Generate error = %v, want unexpected-tool refusal", err)
+	}
+}
+
 // Compose(openai, deterministic): on openai 5xx the deterministic
 // fallback fires and Source reflects "deterministic".
 func TestOpenAI_ComposeFallback(t *testing.T) {

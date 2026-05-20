@@ -962,8 +962,14 @@ func parseToolCall(raw []byte) (subject string, body string, err error) {
 	var args string
 	switch {
 	case len(msg.ToolCalls) > 0 && msg.ToolCalls[0].Function.Arguments != "":
+		if msg.ToolCalls[0].Function.Name != "commit_message" {
+			return "", "", fmt.Errorf("openai-compat: unexpected tool %q", msg.ToolCalls[0].Function.Name)
+		}
 		args = msg.ToolCalls[0].Function.Arguments
 	case msg.FunctionCall != nil && msg.FunctionCall.Arguments != "":
+		if msg.FunctionCall.Name != "commit_message" {
+			return "", "", fmt.Errorf("openai-compat: unexpected function %q", msg.FunctionCall.Name)
+		}
 		args = msg.FunctionCall.Arguments
 	default:
 		return "", "", errors.New("openai-compat: response carried no tool_call arguments")
