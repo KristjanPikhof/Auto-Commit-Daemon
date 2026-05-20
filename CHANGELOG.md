@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- `acd rewrite-commits` now offers reviewable AI-assisted commit-message
+  rewrites for current-branch linear history, with saved plans, dry runs,
+  backup refs, and recovery guidance.
+
+### Fixed
+
+- OpenAI-compatible responses now reject unexpected tool calls instead of
+  accepting the wrong function output.
+
 ## v2026-05-20
 
 ### Changed
