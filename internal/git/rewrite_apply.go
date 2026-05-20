@@ -212,15 +212,48 @@ func recreateCommitWithMessage(ctx context.Context, repoDir, oldOID, message, pa
 	if err != nil {
 		return "", err
 	}
+	author, err := commitAuthorEnv(ctx, repoDir, oldOID)
+	if err != nil {
+		return "", err
+	}
 	parents := []string{}
 	if parent != "" {
 		parents = append(parents, parent)
 	}
-	newOID, err := CommitTree(ctx, repoDir, tree, strings.TrimRight(message, "\n"), parents...)
+	newOID, err := commitTreeWithEnv(ctx, repoDir, tree, strings.TrimRight(message, "\n"), author, parents...)
 	if err != nil {
 		return "", fmt.Errorf("git rewrite apply: recreate commit %s: %w", shortApplyOID(oldOID), err)
 	}
 	return newOID, nil
+}
+
+func commitTreeWithEnv(ctx context.Context, repoDir, treeOID, message string, env map[string]string, parents ...string) (string, error) {
+	args := []string{"commit-tree", treeOID}
+	for _, p := range parents {
+		args = append(args, "-p", p)
+	}
+	args = append(args, "-F", "-")
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Stdin: strings.NewReader(message), ExtraEnv: env}, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func commitAuthorEnv(ctx context.Context, repoDir, oid string) (map[string]string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "show", "-s", "--format=%an%x00%ae%x00%aI", oid)
+	if err != nil {
+		return nil, fmt.Errorf("git rewrite apply: read author for %s: %w", shortApplyOID(oid), err)
+	}
+	parts := strings.Split(strings.TrimRight(string(out), "\n"), "\x00")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return nil, fmt.Errorf("git rewrite apply: malformed author metadata for %s", shortApplyOID(oid))
+	}
+	return map[string]string{
+		"GIT_AUTHOR_NAME":  parts[0],
+		"GIT_AUTHOR_EMAIL": parts[1],
+		"GIT_AUTHOR_DATE":  parts[2],
+	}, nil
 }
 
 func commitTreeOID(ctx context.Context, repoDir, oid string) (string, error) {
