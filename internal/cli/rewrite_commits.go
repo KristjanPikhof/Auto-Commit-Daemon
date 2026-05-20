@@ -358,7 +358,6 @@ func writeRewritePlanFile(path string, plan state.RewritePlan) error {
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(plan)
-	return nil
 }
 
 func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig) (state.RewritePlan, error) {
