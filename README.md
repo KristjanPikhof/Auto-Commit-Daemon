@@ -291,10 +291,6 @@ commands, so it can be changed per shell invocation.
 - [docs/ai-providers.md](docs/ai-providers.md) — provider configuration and subprocess plugin protocol
 - [docs/overview.md](docs/overview.md) — high-level overview
 
-## Status
-
-Active development. First tag: `v2026-04-28`. Last tag: `v2026-05-10`.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
