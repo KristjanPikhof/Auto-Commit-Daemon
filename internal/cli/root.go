@@ -71,6 +71,7 @@ func newRootCmd() *cobra.Command {
 		newDoctorCmd(),
 		newGCCmd(),
 		newCommitAllCmd(),
+		newRewriteCommitsCmd(),
 		newDaemonCmd(),
 	)
 

@@ -20,6 +20,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
 		{"prompt", []string{"ACD_AI_PROMPT_TRACE", "acd prompt --seq 42 --json", "--last"}},
 		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
+		{"rewrite-commits", []string{"ACD_COMMIT_STRATEGY", "--show-plan", "current branch linear ranges only"}},
 		{"diagnose", []string{"state read-only", "waiting/draining", "acd fix --dry-run"}},
 		{"recover", []string{"DEPRECATED", "acd fix", "--clear-pause"}},
 		{"pause", []string{"acd pause --ttl 1h", "acd resume", "acd status"}},
