@@ -50,6 +50,7 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // rebuilds decision_records without the event_seq foreign key so capture_event
 // pruning cannot erase denormalized ledger identity. v7 adds planner_state for
 // bounded intent-planner deferrals. v8 adds reusable rewrite plan storage.
+// v9 adds rewrite_plans.validation_error for structured proposal failures.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -88,6 +89,39 @@ func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 				return fmt.Errorf("state: reapply schema after v6 decision_records migration: %w", err)
 			}
 		}
+	}
+	if cur < 9 {
+		if err := addColumnIfMissing(ctx, tx, "rewrite_plans", "validation_error", "TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addColumnIfMissing(ctx context.Context, tx *sql.Tx, table, column, typ string) error {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("state: inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("state: scan %s columns: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("state: iterate %s columns: %w", table, err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ)); err != nil {
+		return fmt.Errorf("state: add %s.%s: %w", table, column, err)
 	}
 	return nil
 }

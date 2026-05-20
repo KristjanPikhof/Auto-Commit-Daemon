@@ -133,6 +133,49 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	}
 }
 
+func TestReconcileRewriteCommitOIDs(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, commit_oid)
+VALUES ('refs/heads/main', 1, 'base', 'write', 'a.txt', 'full', 1, 'published', 'old-a'),
+       ('refs/heads/main', 1, 'base', 'write', 'b.txt', 'full', 2, 'published', 'unrelated');
+INSERT INTO decision_records(decision_ts, kind, commit_oid, branch_ref)
+VALUES (1, 'test', 'old-a', 'refs/heads/main'),
+       (2, 'test', 'old-b', 'refs/heads/main');
+INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid, status, updated_ts)
+VALUES (1, 1, 'refs/heads/main', 1, 'old-a', 'old-b', 'published', 1);
+`); err != nil {
+		t.Fatalf("seed oid refs: %v", err)
+	}
+
+	res, err := ReconcileRewriteCommitOIDs(ctx, d, map[string]string{"old-a": "new-a", "old-b": "new-b"})
+	if err != nil {
+		t.Fatalf("ReconcileRewriteCommitOIDs: %v", err)
+	}
+	if res.CaptureEvents != 1 || res.DecisionRecords != 2 || res.PublishSourceHead != 1 || res.PublishTargetCommitOID != 1 {
+		t.Fatalf("unexpected reconcile counts: %+v", res)
+	}
+	for _, tc := range []struct{ table, column, want string }{
+		{"capture_events", "commit_oid", "new-a"},
+		{"decision_records", "commit_oid", "new-a"},
+		{"publish_state", "source_head", "new-a"},
+		{"publish_state", "target_commit_oid", "new-b"},
+	} {
+		var got string
+		q := "SELECT " + tc.column + " FROM " + tc.table + " WHERE " + tc.column + " = ? LIMIT 1"
+		if err := d.SQL().QueryRowContext(ctx, q, tc.want).Scan(&got); err != nil {
+			t.Fatalf("%s.%s not reconciled to %s: %v", tc.table, tc.column, tc.want, err)
+		}
+	}
+	var unrelated int
+	if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE commit_oid = 'unrelated'`).Scan(&unrelated); err != nil || unrelated != 1 {
+		t.Fatalf("unrelated capture event changed: n=%d err=%v", unrelated, err)
+	}
+}
+
 func TestRewritePlanSchemaMigratesFromV7(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -18,8 +18,9 @@ package state
 // append-only product decision records for explainable capture/replay/CLI UX;
 // v6 rebuilds decision_records so event_seq is denormalized ledger data rather
 // than a foreign key cleared by capture_events pruning; v7 adds planner_state
-// for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage.
-const SchemaVersion = 8
+// for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage;
+// v9 adds structured rewrite proposal failure storage.
+const SchemaVersion = 9
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -138,6 +139,7 @@ CREATE TABLE IF NOT EXISTS rewrite_plans(
     provider            TEXT,
     model               TEXT,
     validation_status   TEXT NOT NULL,
+    validation_error    TEXT,
     edited              INTEGER NOT NULL DEFAULT 0,
     apply_status        TEXT NOT NULL DEFAULT 'pending',
     FOREIGN KEY (base_plan_id) REFERENCES rewrite_plans(id)

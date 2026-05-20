@@ -32,6 +32,7 @@ type RewritePlan struct {
 	Provider         sql.NullString
 	Model            sql.NullString
 	ValidationStatus string
+	ValidationError  sql.NullString
 	Edited           bool
 	ApplyStatus      string
 	Commits          []RewritePlanCommit
@@ -100,7 +101,7 @@ func LoadRewritePlan(ctx context.Context, d *DB, id string) (RewritePlan, bool, 
 	}
 	const q = `
 SELECT id, created_ts, updated_ts, base_plan_id, revision, branch_ref,
-       expected_head, provider, model, validation_status, edited, apply_status
+       expected_head, provider, model, validation_status, validation_error, edited, apply_status
 FROM rewrite_plans
 WHERE id = ?`
 	var plan RewritePlan
@@ -108,7 +109,7 @@ WHERE id = ?`
 	err := d.readSQL().QueryRowContext(ctx, q, id).Scan(
 		&plan.ID, &plan.CreatedTS, &plan.UpdatedTS, &plan.BasePlanID, &plan.Revision,
 		&plan.BranchRef, &plan.ExpectedHead, &plan.Provider, &plan.Model,
-		&plan.ValidationStatus, &edited, &plan.ApplyStatus,
+		&plan.ValidationStatus, &plan.ValidationError, &edited, &plan.ApplyStatus,
 	)
 	if err == sql.ErrNoRows {
 		return RewritePlan{}, false, nil
@@ -147,6 +148,7 @@ func CreateEditedRewritePlanRevision(ctx context.Context, d *DB, basePlanID stri
 		Provider:         base.Provider,
 		Model:            base.Model,
 		ValidationStatus: validationStatus,
+		ValidationError:  base.ValidationError,
 		Edited:           true,
 		ApplyStatus:      RewritePlanApplyPending,
 		Commits:          commits,
@@ -176,8 +178,8 @@ func UpdateRewritePlanDraft(ctx context.Context, d *DB, plan RewritePlan) error 
 
 	res, err := tx.ExecContext(ctx, `
 UPDATE rewrite_plans SET
-    updated_ts = ?, validation_status = ?, edited = 1, apply_status = ?
-WHERE id = ?`, nowSeconds(), plan.ValidationStatus, plan.ApplyStatus, plan.ID)
+    updated_ts = ?, validation_status = ?, validation_error = ?, edited = 1, apply_status = ?
+WHERE id = ?`, nowSeconds(), plan.ValidationStatus, plan.ValidationError, plan.ApplyStatus, plan.ID)
 	if err != nil {
 		return fmt.Errorf("state: update rewrite plan draft: %w", err)
 	}
@@ -220,15 +222,78 @@ func MarkRewritePlanApplyStatus(ctx context.Context, d *DB, id, status string) e
 	return nil
 }
 
+// RewriteOIDReconcileResult counts exact old->new OID substitutions made after
+// a successful commit-message rewrite. Only direct references to recreated
+// commit OIDs are changed; rows with unrelated or NULL OIDs are left untouched.
+type RewriteOIDReconcileResult struct {
+	CaptureEvents          int64
+	DecisionRecords        int64
+	PublishTargetCommitOID int64
+	PublishSourceHead      int64
+}
+
+// ReconcileRewriteCommitOIDs updates ACD state references that safely point at
+// commits recreated by a rewrite apply. It performs exact-value substitutions
+// inside one transaction for capture_events.commit_oid,
+// decision_records.commit_oid, and publish_state source/target OID fields.
+func ReconcileRewriteCommitOIDs(ctx context.Context, d *DB, oidMap map[string]string) (RewriteOIDReconcileResult, error) {
+	var out RewriteOIDReconcileResult
+	if len(oidMap) == 0 {
+		return out, nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return out, fmt.Errorf("state: begin rewrite oid reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for oldOID, newOID := range oidMap {
+		if oldOID == "" || newOID == "" || oldOID == newOID {
+			continue
+		}
+		n, err := execCount(ctx, tx, `UPDATE capture_events SET commit_oid = ? WHERE commit_oid = ?`, newOID, oldOID)
+		if err != nil {
+			return out, fmt.Errorf("state: reconcile capture_events commit_oid: %w", err)
+		}
+		out.CaptureEvents += n
+		n, err = execCount(ctx, tx, `UPDATE decision_records SET commit_oid = ? WHERE commit_oid = ?`, newOID, oldOID)
+		if err != nil {
+			return out, fmt.Errorf("state: reconcile decision_records commit_oid: %w", err)
+		}
+		out.DecisionRecords += n
+		n, err = execCount(ctx, tx, `UPDATE publish_state SET target_commit_oid = ? WHERE target_commit_oid = ?`, newOID, oldOID)
+		if err != nil {
+			return out, fmt.Errorf("state: reconcile publish_state target_commit_oid: %w", err)
+		}
+		out.PublishTargetCommitOID += n
+		n, err = execCount(ctx, tx, `UPDATE publish_state SET source_head = ? WHERE source_head = ?`, newOID, oldOID)
+		if err != nil {
+			return out, fmt.Errorf("state: reconcile publish_state source_head: %w", err)
+		}
+		out.PublishSourceHead += n
+	}
+	if err := tx.Commit(); err != nil {
+		return out, fmt.Errorf("state: commit rewrite oid reconciliation: %w", err)
+	}
+	return out, nil
+}
+
+func execCount(ctx context.Context, tx *sql.Tx, q string, args ...any) (int64, error) {
+	res, err := tx.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func insertRewritePlan(ctx context.Context, tx *sql.Tx, plan RewritePlan) error {
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO rewrite_plans(
     id, created_ts, updated_ts, base_plan_id, revision, branch_ref,
-    expected_head, provider, model, validation_status, edited, apply_status
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    expected_head, provider, model, validation_status, validation_error, edited, apply_status
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		plan.ID, plan.CreatedTS, plan.UpdatedTS, plan.BasePlanID, plan.Revision,
 		plan.BranchRef, plan.ExpectedHead, plan.Provider, plan.Model,
-		plan.ValidationStatus, boolToInt(plan.Edited), plan.ApplyStatus,
+		plan.ValidationStatus, plan.ValidationError, boolToInt(plan.Edited), plan.ApplyStatus,
 	)
 	if err != nil {
 		return fmt.Errorf("state: insert rewrite plan: %w", err)
