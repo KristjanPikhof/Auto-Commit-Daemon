@@ -103,9 +103,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		return err
 	}
 	if opts.showPlan != "" {
-		fmt.Fprintf(out, "rewrite-commits saved plan display: %s\n", opts.showPlan)
-		fmt.Fprintln(out, "Saved plan display is command-contract only in this build; no AI provider check required.")
-		return nil
+		return showSavedRewritePlan(ctx, out, repoFlag, opts.showPlan, jsonOut)
 	}
 	if opts.applyPlan != "" {
 		return applySavedRewritePlan(ctx, out, repoFlag, opts)
@@ -243,8 +241,8 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: read apply plan: %w", err)
 	}
-	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
-		return fmt.Errorf("acd rewrite-commits: cannot apply invalid rewrite plan: %s", plan.ValidationError.String)
+	if err := validateRewritePlanReadyForApply(plan); err != nil {
+		return err
 	}
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
@@ -259,6 +257,15 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		return fmt.Errorf("acd rewrite-commits: inspect daemon state: %w", err)
 	} else if daemonState.Mode != "" && daemonState.Mode != "stopped" {
 		return fmt.Errorf("acd rewrite-commits: daemon must be stopped before applying rewrite plan (current mode: %s)", daemonState.Mode)
+	}
+	if !opts.dryRun {
+		pending, err := state.CountAllPendingCaptureEvents(ctx, db)
+		if err != nil {
+			return fmt.Errorf("acd rewrite-commits: inspect pending capture queue: %w", err)
+		}
+		if pending.Count > 0 {
+			return fmt.Errorf("acd rewrite-commits: refusing to rewrite while capture queue has pending event(s); flush or clear the ACD queue first (pending: %d, oldest seq: %d)", pending.Count, pending.OldestSeq)
+		}
 	}
 
 	applyCommits := make([]git.RewriteApplyCommit, 0, len(plan.Commits))
@@ -285,6 +292,12 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		fmt.Fprintf(out, "Dry run: plan can apply to %s at %s; no commits were rewritten.\n", plan.BranchRef, shortenSHA(plan.ExpectedHead))
 		return nil
 	}
+	fmt.Fprintf(out, "Applied rewrite plan to %s: %s -> %s (%d commit(s) recreated).\n", plan.BranchRef, shortenSHA(res.OldHead), shortenSHA(res.NewHead), res.RecreatedCount)
+	fmt.Fprintf(out, "Backup branch: %s\n", res.BackupBranchRef)
+	if res.InternalBackupRef != "" {
+		fmt.Fprintf(out, "Internal backup ref: %s\n", res.InternalBackupRef)
+	}
+	fmt.Fprintf(out, "Recovery: git reset --hard %s\n", res.BackupBranchRef)
 	reconcile, err := state.ReconcileRewriteCommitOIDs(ctx, db, res.CommitMap)
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: reconcile state OIDs after successful git rewrite: %w", err)
@@ -294,13 +307,55 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 			return fmt.Errorf("acd rewrite-commits: mark plan applied: %w", err)
 		}
 	}
-	fmt.Fprintf(out, "Applied rewrite plan to %s: %s -> %s (%d commit(s) recreated).\n", plan.BranchRef, shortenSHA(res.OldHead), shortenSHA(res.NewHead), res.RecreatedCount)
-	fmt.Fprintf(out, "Backup branch: %s\n", res.BackupBranchRef)
-	if res.InternalBackupRef != "" {
-		fmt.Fprintf(out, "Internal backup ref: %s\n", res.InternalBackupRef)
-	}
-	fmt.Fprintf(out, "Recovery: git reset --hard %s\n", res.BackupBranchRef)
 	fmt.Fprintf(out, "State OID reconciliation: capture_events=%d decision_records=%d publish_state_target=%d publish_state_source=%d\n", reconcile.CaptureEvents, reconcile.DecisionRecords, reconcile.PublishTargetCommitOID, reconcile.PublishSourceHead)
+	return nil
+}
+
+func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref string, jsonOut bool) error {
+	repo := repoFlag
+	if _, err := os.Stat(ref); err != nil {
+		var resolveErr error
+		repo, resolveErr = resolveRepo(repoFlag)
+		if resolveErr != nil {
+			return resolveErr
+		}
+	}
+	plan, err := readRewritePlanRef(ctx, repo, ref)
+	if err != nil {
+		return fmt.Errorf("acd rewrite-commits: read show plan: %w", err)
+	}
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(plan)
+	}
+	fmt.Fprintf(out, "rewrite-commits saved plan display: %s\n", ref)
+	fmt.Fprintln(out, "Saved plan display loaded without AI provider check; no AI call was made.")
+	fmt.Fprintf(out, "Plan ID: %s\n", plan.ID)
+	fmt.Fprintf(out, "Branch: %s @ %s\n", plan.BranchRef, shortenSHA(plan.ExpectedHead))
+	fmt.Fprintf(out, "Validation status: %s\n", plan.ValidationStatus)
+	if plan.ValidationError.Valid && strings.TrimSpace(plan.ValidationError.String) != "" {
+		fmt.Fprintf(out, "Validation error: %s\n", plan.ValidationError.String)
+	}
+	fmt.Fprintf(out, "Apply status: %s\n", plan.ApplyStatus)
+	fmt.Fprintf(out, "Commits (%d):\n", len(plan.Commits))
+	for _, c := range plan.Commits {
+		firstLine := strings.SplitN(strings.TrimSpace(c.ProposedMessage), "\n", 2)[0]
+		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OldOID), firstLine)
+	}
+	return nil
+}
+
+func validateRewritePlanReadyForApply(plan state.RewritePlan) error {
+	if plan.ValidationStatus != state.RewritePlanValidationValid {
+		if plan.ValidationStatus == state.RewritePlanValidationInvalid && plan.ValidationError.Valid && strings.TrimSpace(plan.ValidationError.String) != "" {
+			return fmt.Errorf("acd rewrite-commits: cannot apply rewrite plan with validation status %q: %s", plan.ValidationStatus, plan.ValidationError.String)
+		}
+		if strings.TrimSpace(plan.ValidationStatus) == "" {
+			return errors.New("acd rewrite-commits: cannot apply rewrite plan without validation status \"valid\"")
+		}
+		return fmt.Errorf("acd rewrite-commits: cannot apply rewrite plan with validation status %q; expected %q", plan.ValidationStatus, state.RewritePlanValidationValid)
+	}
 	return nil
 }
 

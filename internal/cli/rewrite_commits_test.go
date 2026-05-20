@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -77,14 +78,46 @@ func TestRewriteCommitsPlanGenerationRequiresUsableAIProvider(t *testing.T) {
 func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "")
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		ID:               "plan-show",
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     "abc123456789",
+		ValidationStatus: state.RewritePlanValidationValid,
+		ApplyStatus:      state.RewritePlanApplyPending,
+		Commits:          []state.RewritePlanCommit{{OldOID: "abc123456789", ProposedMessage: "shown subject", OriginalMessage: "old subject"}},
+	})
 
 	var out bytes.Buffer
-	err := runRewriteCommits(context.Background(), &out, "", rewriteCommitsOptions{showPlan: "rewrite.json"}, false)
+	err := runRewriteCommits(context.Background(), &out, "", rewriteCommitsOptions{showPlan: planPath}, false)
 	if err != nil {
 		t.Fatalf("runRewriteCommits show-plan returned error: %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "no AI provider check required") {
-		t.Fatalf("show-plan output missing bypass note: %q", got)
+	got := out.String()
+	if !strings.Contains(got, "without AI provider check") || !strings.Contains(got, "shown subject") || !strings.Contains(got, "Validation status: valid") {
+		t.Fatalf("show-plan output missing loaded plan details/bypass note: %q", got)
+	}
+}
+
+func TestRewriteCommitsApplyPlanRequiresValidValidationStatus(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	head, err := git.RevParse(context.Background(), repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	for _, status := range []string{"", state.RewritePlanValidationDraft, state.RewritePlanValidationInvalid} {
+		planPath := filepath.Join(t.TempDir(), "rewrite-"+status+".json")
+		writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+			BranchRef:        "refs/heads/main",
+			ExpectedHead:     head,
+			ValidationStatus: status,
+			Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+		})
+		var out bytes.Buffer
+		err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{applyPlan: planPath, dryRun: true}, false)
+		if err == nil || !strings.Contains(err.Error(), "validation status") {
+			t.Fatalf("status %q apply err = %v, want validation-status refusal", status, err)
+		}
 	}
 }
 
@@ -156,6 +189,86 @@ func writeRewritePlanTestFile(t *testing.T, path string, plan state.RewritePlan)
 	defer f.Close()
 	if err := json.NewEncoder(f).Encode(plan); err != nil {
 		t.Fatalf("encode plan: %v", err)
+	}
+}
+
+func TestRewriteCommitsApplyRefusesPendingCaptureQueue(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		t.Fatalf("state db path: %v", err)
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open state db: %v", err)
+	}
+	defer db.Close()
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head, Operation: "modify", Path: "queued.txt", Fidelity: "full"}, nil)
+	if err != nil {
+		t.Fatalf("append pending event: %v", err)
+	}
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+
+	var out bytes.Buffer
+	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{applyPlan: planPath, yes: true}, false)
+	if err == nil || !strings.Contains(err.Error(), "pending event") || !strings.Contains(err.Error(), strconv.FormatInt(seq, 10)) {
+		t.Fatalf("apply with pending queue err = %v, want pending refusal with seq %d", err, seq)
+	}
+}
+
+func TestRewriteCommitsApplyRefusesPendingCaptureQueueHiddenBehindBarrier(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		t.Fatalf("state db path: %v", err)
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open state db: %v", err)
+	}
+	defer db.Close()
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head, Operation: "modify", Path: "blocked.txt", Fidelity: "full", State: state.EventStateBlockedConflict}, nil); err != nil {
+		t.Fatalf("append blocked barrier: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head, Operation: "modify", Path: "hidden-pending.txt", Fidelity: "full"}, nil)
+	if err != nil {
+		t.Fatalf("append hidden pending event: %v", err)
+	}
+	visible, err := state.PendingEvents(ctx, db, 1)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("test setup expected barrier-hidden pending event, got visible=%+v", visible)
+	}
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+
+	var out bytes.Buffer
+	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{applyPlan: planPath, yes: true}, false)
+	if err == nil || !strings.Contains(err.Error(), "pending event") || !strings.Contains(err.Error(), strconv.FormatInt(seq, 10)) {
+		t.Fatalf("apply with barrier-hidden pending queue err = %v, want pending refusal with seq %d", err, seq)
 	}
 }
 
@@ -248,6 +361,11 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	}
 	if _, err := parseRewritePlanEdit(empty, rewriteEditFormatJSON, plan); err == nil {
 		t.Fatalf("parse empty message succeeded, want validation error")
+	}
+
+	trailing := append(append([]byte{}, rendered...), []byte("\n{}")...)
+	if _, err := parseRewritePlanEdit(trailing, rewriteEditFormatJSON, plan); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("parse trailing json err = %v, want trailing-data validation", err)
 	}
 }
 

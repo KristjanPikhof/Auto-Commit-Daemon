@@ -134,6 +134,12 @@ func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.Rewr
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: %w", err)
 	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("acd rewrite-commits: invalid JSON plan: trailing JSON value")
+		}
+		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: trailing data: %w", err)
+	}
 	if strings.TrimSpace(doc.PlanID) != "" && doc.PlanID != base.ID {
 		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: plan_id %q, want %q", doc.PlanID, base.ID)
 	}
