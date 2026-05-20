@@ -18,8 +18,9 @@ package state
 // append-only product decision records for explainable capture/replay/CLI UX;
 // v6 rebuilds decision_records so event_seq is denormalized ledger data rather
 // than a foreign key cleared by capture_events pruning; v7 adds planner_state
-// for bounded intent-planner deferrals.
-const SchemaVersion = 7
+// for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage;
+// v9 adds structured rewrite proposal failure storage.
+const SchemaVersion = 9
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -126,6 +127,39 @@ CREATE INDEX IF NOT EXISTS idx_planner_state_defer_count_planned
 
 CREATE INDEX IF NOT EXISTS idx_planner_state_last_planned
     ON planner_state(last_planned_ts, event_seq);
+
+CREATE TABLE IF NOT EXISTS rewrite_plans(
+    id                  TEXT PRIMARY KEY,
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    base_plan_id        TEXT,
+    revision            INTEGER NOT NULL DEFAULT 1,
+    branch_ref          TEXT NOT NULL,
+    expected_head       TEXT NOT NULL,
+    provider            TEXT,
+    model               TEXT,
+    validation_status   TEXT NOT NULL,
+    validation_error    TEXT,
+    edited              INTEGER NOT NULL DEFAULT 0,
+    apply_status        TEXT NOT NULL DEFAULT 'pending',
+    FOREIGN KEY (base_plan_id) REFERENCES rewrite_plans(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rewrite_plans_branch_head_status
+    ON rewrite_plans(branch_ref, expected_head, apply_status);
+
+CREATE INDEX IF NOT EXISTS idx_rewrite_plans_base_revision
+    ON rewrite_plans(base_plan_id, revision);
+
+CREATE TABLE IF NOT EXISTS rewrite_plan_commits(
+    plan_id             TEXT NOT NULL,
+    ord                 INTEGER NOT NULL,
+    old_oid             TEXT NOT NULL,
+    proposed_message    TEXT NOT NULL,
+    original_message    TEXT NOT NULL,
+    PRIMARY KEY (plan_id, ord),
+    FOREIGN KEY (plan_id) REFERENCES rewrite_plans(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS flush_requests(
     id               INTEGER PRIMARY KEY AUTOINCREMENT,

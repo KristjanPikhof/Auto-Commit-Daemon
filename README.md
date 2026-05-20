@@ -128,6 +128,19 @@ acd stop                           # stop the current repo daemon
 acd stop --all                     # stop every registered daemon
 
 acd commit-all                     # one-shot: commit every uncommitted file (daemon must be off)
+
+# Explicit, reviewable intent-mode history cleanup; the daemon never does this automatically.
+acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
+acd rewrite-commits --from 5 --plan-only
+acd rewrite-commits --range 5-12 --review --format text
+acd rewrite-commits --last 4 --no-review --yes
+acd rewrite-commits --show-plan rewrite.json
+acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
+acd rewrite-commits --edit <plan-id-or-file> --dry-run
+acd rewrite-commits --apply-plan rewrite.json --dry-run
+acd rewrite-commits --apply <plan-id-or-file> --yes
+# If apply reports a backup ref/SHA and review fails: git reset --hard <backup-ref-or-sha>
+
 acd pause --reason "rebasing" --yes
 acd resume --yes
 
@@ -247,6 +260,9 @@ The Wave 2 planner-atomicity epic added two operator-facing surfaces:
 
 For the full intent-mode lifecycle, recommended env profiles, message-quality
 rules, and examples, see [docs/intent-commit-flow.md](docs/intent-commit-flow.md).
+For the explicit commit-history rewrite workflow, plan review/apply flow,
+saved-plan reuse, and backup recovery, see
+[docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md).
 
 ## Environment variables
 
@@ -286,6 +302,9 @@ commands, so it can be changed per shell invocation.
 ## Docs
 
 - [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, blocked-conflict states, branch-generation safety, revert workflows, trace event classes
+- [docs/intent-commit-flow.md](docs/intent-commit-flow.md) — intent-mode planning lifecycle, message quality gates, and observability
+- [docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md) — explicit intent commit rewrite workflow with plan generation, review/edit, apply, backup recovery, and saved-plan reuse
+- [docs/rewrite-commits.md](docs/rewrite-commits.md) — `acd rewrite-commits` command contract and flag reference
 - [docs/user-workflows.md](docs/user-workflows.md) — daily user workflows
 - [docs/multi-tool.md](docs/multi-tool.md) — running ACD alongside another auto-committer
 - [docs/ai-providers.md](docs/ai-providers.md) — provider configuration and subprocess plugin protocol

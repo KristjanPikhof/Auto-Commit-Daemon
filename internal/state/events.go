@@ -184,6 +184,28 @@ WHERE seq = ?`
 // covering index idx_capture_events_barrier (schema v3) keeps both the CTE
 // aggregation and the outer pending-row scan off the unindexed full-table
 // path.
+// PendingCaptureQueueSummary reports every pending capture_event row,
+// independent of replay barrier visibility.
+type PendingCaptureQueueSummary struct {
+	Count     int
+	OldestSeq int64
+}
+
+// CountAllPendingCaptureEvents counts all pending capture_events rows without
+// applying PendingEvents' failed/blocked replay barrier filter. Safety gates
+// that must refuse any queued work before history rewrites should use this
+// helper rather than PendingEvents.
+func CountAllPendingCaptureEvents(ctx context.Context, d *DB) (PendingCaptureQueueSummary, error) {
+	var summary PendingCaptureQueueSummary
+	if err := d.readSQL().QueryRowContext(ctx, `
+SELECT COUNT(*), COALESCE(MIN(seq), 0)
+FROM capture_events
+WHERE state = ?`, EventStatePending).Scan(&summary.Count, &summary.OldestSeq); err != nil {
+		return PendingCaptureQueueSummary{}, fmt.Errorf("state: count all pending capture events: %w", err)
+	}
+	return summary, nil
+}
+
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
 	q := `
 WITH barriers AS (
