@@ -186,9 +186,12 @@ Look for:
 | `intent_deferred` | The planner left this pending for a later window. |
 | `intent_forced` | ACD forced an over-deferred capture into a one-item planning window. |
 | `intent_planner_error` | The planner returned an invalid plan or failed; ACD fell back to a safe one-capture plan. |
+| `message_quality_rewrite` | ACD accepted the grouping but rewrote or sanitized the commit message before publish. |
+| `message_quality_fallback` | The message quality gate rejected the planner message or rewrite, so ACD used deterministic fallback. |
 
-`status` and `diagnose --json` show deferred counts, forced-aging readiness, and
-the latest planner error.
+`status` and `diagnose --json` show deferred counts, forced-aging readiness,
+recent message-quality rewrite/fallback counts, the latest message-quality
+reason, and the latest planner error.
 
 The `intent_strategy.strategy` field reflects the *effective* commit strategy:
 ACD reads `commit.strategy` from daemon meta first, then falls back to the
@@ -261,9 +264,9 @@ acd prompt --seq 42
 In event mode, `--seq` selects the commit-message prompt for that captured
 event. In intent mode, `--seq` also matches planner windows where that seq was
 offered, so you can see the offered seqs, selected/deferred seqs, grouping
-reason, validation error, and fallback provider. If no trace is found, restart
-the daemon with `ACD_AI_PROMPT_TRACE=1` and a non-deterministic provider;
-`acd prompt` never creates traces by itself.
+reason, validation error, message-only rewrite request, and fallback provider.
+If no trace is found, restart the daemon with `ACD_AI_PROMPT_TRACE=1` and a
+non-deterministic provider; `acd prompt` never creates traces by itself.
 
 ## Manual revert or superseded queued work
 

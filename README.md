@@ -245,6 +245,9 @@ The Wave 2 planner-atomicity epic added two operator-facing surfaces:
 - **`<gitDir>/acd/planner-rejects.jsonl`** — rotating JSONL of validator-rejected planner responses (5 MiB per file, 2 files retained). **Raw model output is redacted by default**: only the validation code, message, offered seqs, response size, sha256, and parsed-plan summary are kept. Set `ACD_INTENT_REJECTS_RAW=1` to opt into verbatim capture for offline debugging — the daemon emits a one-shot startup warning when verbatim mode is on. Treat the file as sensitive either way; it can leak via repo handoff or backups.
 - **New `acd status` JSON fields** under `intent_strategy`: `planner_error_rate_recent`, `singleton_commit_rate_recent`, `intent_stage_diff_cap`, `path_quiescence_gated_events`. `acd diagnose` warns when `planner_error_rate_recent` exceeds 5% over the last 100 decisions and points at the rejects log.
 
+For the full intent-mode lifecycle, recommended env profiles, message-quality
+rules, and examples, see [docs/intent-commit-flow.md](docs/intent-commit-flow.md).
+
 ## Environment variables
 
 | Variable | Default | What it does |

@@ -370,6 +370,94 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 	return plan, nil
 }
 
+// RewriteIntentMessage POSTs a locked message-only rewrite request and parses
+// the replacement subject/body. Grouping fields never come back from the tool.
+func (p *OpenAIProvider) RewriteIntentMessage(ctx context.Context, rewriteReq IntentMessageRewriteRequest) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	ctx = withPromptTraceStrategy(ctx, "intent_message_rewrite", rewriteReq.LockedPlan.SelectedSeqs, intentDiffIncluded(rewriteReq.PlannerRequest), IntentStageDiffCap)
+	if strings.TrimSpace(p.APIKey) == "" {
+		return Result{}, errors.New("openai-compat: missing API key")
+	}
+
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return Result{}, err
+	}
+	model := p.Model
+	if model == "" {
+		model = DefaultOpenAIModel
+	}
+	httpClient := p.HTTP
+	if httpClient == nil {
+		httpClient = defaultOpenAIClient()
+	}
+
+	body, transform, err := buildOpenAIIntentMessageRewriteRequestWithTrace(model, rewriteReq)
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build intent message rewrite request: %w", err)
+	}
+	p.recordPromptRequest(ctx, body, transform, prompttrace.Metadata{
+		Strategy:     "intent_message_rewrite",
+		OfferedSeqs:  append([]int64(nil), rewriteReq.LockedPlan.SelectedSeqs...),
+		DiffIncluded: intentDiffIncluded(rewriteReq.PlannerRequest),
+		DiffCap:      IntentStageDiffCap,
+	})
+
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
+		return Result{}, fmt.Errorf("openai-compat: http: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
+		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
+		return Result{}, err
+	}
+
+	subject, bodyOut, err := parseToolCall(raw)
+	if err != nil {
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return Result{}, err
+	}
+	cleaned := SanitizeMessage(subject + "\n\n" + bodyOut)
+	parts := strings.SplitN(cleaned, "\n\n", 2)
+	result := Result{Subject: parts[0], Source: p.Name()}
+	if len(parts) == 2 {
+		result.Body = parts[1]
+	}
+	if strings.TrimSpace(result.Subject) == "" {
+		err := errors.New("openai-compat: empty subject after intent message rewrite sanitize")
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return Result{}, err
+	}
+	p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{
+		StatusCode: resp.StatusCode,
+		Subject:    result.Subject,
+		Body:       result.Body,
+	})
+	return result, nil
+}
+
 func (p *OpenAIProvider) recordPromptRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {
 	logger, meta, ok := prompttrace.From(ctx)
 	if !ok {
@@ -658,6 +746,69 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 	}
 	raw, err := json.Marshal(body)
 	return raw, plannerReq.CapturedDiffTransform, err
+}
+
+func buildOpenAIIntentMessageRewriteRequest(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, error) {
+	body, _, err := buildOpenAIIntentMessageRewriteRequestWithTrace(model, rewriteReq)
+	return body, err
+}
+
+func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, prompttrace.TransformMetadata, error) {
+	userPrompt, err := BuildIntentMessageRewriteUserPrompt(rewriteReq)
+	if err != nil {
+		return nil, prompttrace.TransformMetadata{}, err
+	}
+
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type funcDecl struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description,omitempty"`
+		Parameters  map[string]any `json:"parameters"`
+	}
+	type tool struct {
+		Type     string   `json:"type"`
+		Function funcDecl `json:"function"`
+	}
+	type toolChoiceFn struct {
+		Name string `json:"name"`
+	}
+	type toolChoice struct {
+		Type     string       `json:"type"`
+		Function toolChoiceFn `json:"function"`
+	}
+	type req struct {
+		Model       string     `json:"model"`
+		Messages    []message  `json:"messages"`
+		Tools       []tool     `json:"tools"`
+		ToolChoice  toolChoice `json:"tool_choice"`
+		Temperature float64    `json:"temperature"`
+	}
+
+	body := req{
+		Model: model,
+		Messages: []message{
+			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + commitMessageFormatInstructions},
+			{Role: "user", Content: userPrompt},
+		},
+		Tools: []tool{{
+			Type: "function",
+			Function: funcDecl{
+				Name:        "commit_message",
+				Description: "Emit only the replacement commit message subject and body.",
+				Parameters:  openAICommitMessageParameters,
+			},
+		}},
+		ToolChoice: toolChoice{
+			Type:     "function",
+			Function: toolChoiceFn{Name: "commit_message"},
+		},
+		Temperature: 0.2,
+	}
+	raw, err := json.Marshal(body)
+	return raw, rewriteReq.PlannerRequest.CapturedDiffTransform, err
 }
 
 // parseToolCall extracts subject + body from a chat-completion response

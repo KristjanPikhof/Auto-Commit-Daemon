@@ -253,6 +253,11 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 				if plan.Source == "" {
 					plan.Source = c.primary.Name()
 				}
+				plan, err = applyIntentMessageQuality(ctx, c.primary, req, plan)
+				if err != nil {
+					lastErr = err
+					break
+				}
 				return plan, nil
 			}
 		}
@@ -294,6 +299,73 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		currentReq.RetryCorrection = typed.Message
 	}
 	return IntentPlan{}, lastErr
+}
+
+func applyIntentMessageQuality(ctx context.Context, provider Provider, req IntentPlanRequest, plan IntentPlan) (IntentPlan, error) {
+	report := EvaluateIntentPlanMessageQuality(req, plan)
+	switch report.Action {
+	case MessageQualityClean:
+		return plan, nil
+	case MessageQualitySanitizeAccept:
+		plan.Subject = report.SanitizedSubject
+		plan.Body = report.SanitizedBody
+		plan.MessageQuality = MessageQualitySanitizeAccept
+		plan.MessageQualityReason = messageQualitySummary(report)
+		return plan, nil
+	case MessageQualityRewrite:
+		rewriter, ok := provider.(IntentMessageRewriter)
+		if !ok {
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report}
+		}
+		rewriteReq := NewIntentMessageRewriteRequest(req, plan, report)
+		result, err := rewriter.RewriteIntentMessage(ctx, rewriteReq)
+		if err != nil {
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report, Cause: err}
+		}
+		candidate := plan
+		candidate.Subject = result.Subject
+		candidate.Body = result.Body
+		next := EvaluateIntentPlanMessageQuality(req, candidate)
+		switch next.Action {
+		case MessageQualityClean:
+			candidate.MessageQuality = MessageQualityRewrite
+			candidate.MessageQualityReason = messageQualitySummary(report)
+			return candidate, nil
+		case MessageQualitySanitizeAccept:
+			candidate.Subject = next.SanitizedSubject
+			candidate.Body = next.SanitizedBody
+			candidate.MessageQuality = MessageQualityRewrite
+			candidate.MessageQualityReason = messageQualitySummary(report)
+			return candidate, nil
+		default:
+			return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: next}
+		}
+	default:
+		return IntentPlan{}, &MessageQualityError{Provider: provider.Name(), Report: report}
+	}
+}
+
+func messageQualitySummary(report MessageQualityReport) string {
+	if len(report.Reasons) == 0 {
+		return string(report.Action)
+	}
+	codes := make([]string, 0, len(report.Reasons))
+	for _, reason := range report.Reasons {
+		codes = append(codes, string(reason.Code))
+	}
+	return strings.Join(codes, ",")
+}
+
+func withPromptTraceStrategy(ctx context.Context, strategy string, offeredSeqs []int64, diffIncluded bool, diffCap int) context.Context {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return ctx
+	}
+	meta.Strategy = strategy
+	meta.OfferedSeqs = append([]int64(nil), offeredSeqs...)
+	meta.DiffIncluded = diffIncluded
+	meta.DiffCap = diffCap
+	return prompttrace.With(ctx, logger, meta)
 }
 
 // intentRetryOnInvalidEnabled reports whether the composed retry loop

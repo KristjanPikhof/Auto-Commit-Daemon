@@ -2,10 +2,20 @@
 
 ## Unreleased
 
+## v2026-05-20
+
 ### Changed
 
 - Recovery views now separate waiting queues from blocked repos, so `acd list`,
   `acd status`, and `acd diagnose` point to the right next command.
+- Intent mode now rewrites generic planner commit messages while preserving the
+  accepted grouping, and status/diagnose expose message-quality rewrite and
+  fallback reasons.
+- Forced-aging singleton intent windows now run through non-deterministic
+  providers and the message-quality gate, falling back deterministically when
+  rewrite or provider output is unsafe.
+- Intent message-quality checks now catch token-only and filename-only subjects,
+  and prompt tracing includes intent rewrite requests.
 
 ### Fixed
 

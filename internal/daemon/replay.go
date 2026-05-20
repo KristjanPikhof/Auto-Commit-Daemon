@@ -1024,20 +1024,13 @@ func replayIntentBatch(
 		}
 	}
 
-	// Forced-aging singleton fast path: when the planner window has been
-	// narrowed to one capture by forced aging (the only seq the planner
-	// could possibly select), there is nothing for the planner to decide.
-	// Synthesize the plan locally with a diff-aware subject and skip the
-	// planner call entirely. This:
-	//   - guarantees the captured event ships even if the AI provider is
-	//     unreachable, slow, or returning malformed plans,
-	//   - avoids spending an API request on a fully-determined choice,
-	//   - prevents intent_planner_error decisions from accumulating for
-	//     captures where validation could only ever pass.
-	// The forced_aging marker still lands via recordIntentForcedDecision
-	// above; planIntentSingletonFastPath returns an IntentPlan that flows
-	// through the same publish + decision path as a normal plan.
-	if forced && len(items) == 1 {
+	// Forced-aging singleton deterministic fast path: when intent mode is
+	// already using the deterministic planner, synthesize the only possible
+	// plan locally with the bounded diff-aware subject helper. Non-
+	// deterministic planners must still see forced-aging singleton windows so
+	// their message can pass the quality/rewrite policy instead of landing
+	// generic "Update parsed" style subjects.
+	if forced && len(items) == 1 && isDeterministicIntentPlanner(cfg.planner) {
 		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
 		// Defense in depth: even though forced-aging narrows the window to
 		// one self-determined seq, run the safety + plan validators before
@@ -1119,7 +1112,7 @@ func replayIntentBatch(
 			DiffCap: ai.IntentStageDiffCap,
 		})
 	}
-	plan, validationFailure, err := planIntentWithFallback(plannerCtx, db, cfg.planner, req, items, activeCtx, nowSec)
+	plan, validationFailure, err := planIntentWithFallback(plannerCtx, repoRoot, db, cfg.planner, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
@@ -1127,6 +1120,11 @@ func replayIntentBatch(
 		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
 	}
 	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if plan.MessageQuality != "" {
+		if err := recordIntentMessageQualityDecision(ctx, db, items, activeCtx, nowSec, plan); err != nil {
+			return sum, err
+		}
+	}
 	if err := recordIntentDeferrals(ctx, db, plan, items, activeCtx, nowSec); err != nil {
 		return sum, err
 	}
@@ -1681,6 +1679,13 @@ func planIntentSingletonFastPathHook(ctx context.Context, repoRoot string, item 
 	return planIntentSingletonFastPath(ctx, repoRoot, item)
 }
 
+func isDeterministicIntentPlanner(planner ai.IntentPlanner) bool {
+	if planner == nil {
+		return true
+	}
+	return planner.Name() == (ai.DeterministicProvider{}).Name()
+}
+
 func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
 	op := singletonFallbackOp(item)
 	subject := ""
@@ -1786,7 +1791,7 @@ func singletonFallbackOp(item intentReplayItem) ai.OpItem {
 	}
 }
 
-func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
+func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
 	if planner == nil {
 		planner = ai.DeterministicProvider{}
 	}
@@ -1815,6 +1820,28 @@ func planIntentWithFallback(ctx context.Context, db *state.DB, planner ai.Intent
 		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, err.Error(), "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
 		}
+	}
+	var qualityErr *ai.MessageQualityError
+	if errors.As(err, &qualityErr) {
+		for _, item := range items {
+			if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts,
+				state.DecisionKindMessageQualityFallback,
+				string(qualityErr.Report.Action),
+				"message quality fallback",
+				"Message quality validation failed; deterministic fallback will choose a safe one-item plan: "+validationFailure); recErr != nil {
+				return ai.IntentPlan{}, validationFailure, recErr
+			}
+		}
+	}
+	if req.ForcedAging && len(items) == 1 {
+		plan = planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
+		if err := ai.ValidateIntentPlan(req, plan); err != nil {
+			return ai.IntentPlan{}, validationFailure, err
+		}
+		if err := validateIntentSelectionSafety(items, plan); err != nil {
+			return ai.IntentPlan{}, validationFailure, err
+		}
+		return plan, validationFailure, nil
 	}
 	fallback := ai.DeterministicProvider{}
 	plan, err = fallback.PlanIntent(ctx, req)
@@ -1959,6 +1986,35 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 			if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts, state.DecisionKindIntentDeferred, reason, "deferred", "Deferred from this intent planning window: "+msgReason+"."); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func recordIntentMessageQualityDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, plan ai.IntentPlan) error {
+	if plan.MessageQuality == "" {
+		return nil
+	}
+	events := make(map[int64]state.CaptureEvent, len(items))
+	for _, item := range items {
+		events[item.event.Seq] = item.event
+	}
+	reason := strings.TrimSpace(plan.MessageQualityReason)
+	if reason == "" {
+		reason = string(plan.MessageQuality)
+	}
+	action := "message quality " + string(plan.MessageQuality)
+	for _, seq := range plan.SelectedSeqs {
+		ev, ok := events[seq]
+		if !ok {
+			continue
+		}
+		if err := appendIntentPlannerDecision(ctx, db, ev, cctx, ts,
+			state.DecisionKindMessageQualityRewrite,
+			reason,
+			action,
+			"Message quality policy adjusted the selected commit message before publish."); err != nil {
+			return err
 		}
 	}
 	return nil

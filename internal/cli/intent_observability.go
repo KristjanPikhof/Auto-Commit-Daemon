@@ -56,31 +56,37 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 }
 
 type intentStrategyReport struct {
-	Strategy                 string `json:"strategy"`
-	Active                   bool   `json:"active"`
-	Window                   int    `json:"window,omitempty"`
-	RecentCommits            int    `json:"recent_commits,omitempty"`
-	DeferLimit               int    `json:"defer_limit,omitempty"`
-	MinPending               int    `json:"min_pending,omitempty"`
-	MaxPendingAgeSeconds     int64  `json:"max_pending_age_seconds,omitempty"`
-	IntentStageDiffCap       int    `json:"intent_stage_diff_cap,omitempty"`
-	VisiblePendingEvents     int    `json:"visible_pending_events,omitempty"`
-	OldestPendingEventSeq    int64  `json:"oldest_pending_event_seq,omitempty"`
-	OldestPendingPath        string `json:"oldest_pending_path,omitempty"`
-	OldestPendingAgeSeconds  int64  `json:"oldest_pending_age_seconds,omitempty"`
-	AgeTriggerTS             int64  `json:"age_trigger_ts,omitempty"`
-	AgeTriggerInSeconds      int64  `json:"age_trigger_in_seconds,omitempty"`
-	BatchWaitActive          bool   `json:"batch_wait_active,omitempty"`
-	BatchWaitReason          string `json:"batch_wait_reason,omitempty"`
-	DeferredEvents           int    `json:"deferred_events,omitempty"`
-	MaxDeferCount            int    `json:"max_defer_count,omitempty"`
-	ForcedAgingReady         int    `json:"forced_aging_ready,omitempty"`
-	LastDeferredEventSeq     int64  `json:"last_deferred_event_seq,omitempty"`
-	LastDeferredPath         string `json:"last_deferred_path,omitempty"`
-	LastDeferredReason       string `json:"last_deferred_reason,omitempty"`
-	LastPlannerErrorEventSeq int64  `json:"last_planner_error_event_seq,omitempty"`
-	LastPlannerErrorPath     string `json:"last_planner_error_path,omitempty"`
-	LastPlannerError         string `json:"last_planner_error,omitempty"`
+	Strategy                          string `json:"strategy"`
+	Active                            bool   `json:"active"`
+	Window                            int    `json:"window,omitempty"`
+	RecentCommits                     int    `json:"recent_commits,omitempty"`
+	DeferLimit                        int    `json:"defer_limit,omitempty"`
+	MinPending                        int    `json:"min_pending,omitempty"`
+	MaxPendingAgeSeconds              int64  `json:"max_pending_age_seconds,omitempty"`
+	IntentStageDiffCap                int    `json:"intent_stage_diff_cap,omitempty"`
+	VisiblePendingEvents              int    `json:"visible_pending_events,omitempty"`
+	OldestPendingEventSeq             int64  `json:"oldest_pending_event_seq,omitempty"`
+	OldestPendingPath                 string `json:"oldest_pending_path,omitempty"`
+	OldestPendingAgeSeconds           int64  `json:"oldest_pending_age_seconds,omitempty"`
+	AgeTriggerTS                      int64  `json:"age_trigger_ts,omitempty"`
+	AgeTriggerInSeconds               int64  `json:"age_trigger_in_seconds,omitempty"`
+	BatchWaitActive                   bool   `json:"batch_wait_active,omitempty"`
+	BatchWaitReason                   string `json:"batch_wait_reason,omitempty"`
+	DeferredEvents                    int    `json:"deferred_events,omitempty"`
+	MaxDeferCount                     int    `json:"max_defer_count,omitempty"`
+	ForcedAgingReady                  int    `json:"forced_aging_ready,omitempty"`
+	LastDeferredEventSeq              int64  `json:"last_deferred_event_seq,omitempty"`
+	LastDeferredPath                  string `json:"last_deferred_path,omitempty"`
+	LastDeferredReason                string `json:"last_deferred_reason,omitempty"`
+	LastPlannerErrorEventSeq          int64  `json:"last_planner_error_event_seq,omitempty"`
+	LastPlannerErrorPath              string `json:"last_planner_error_path,omitempty"`
+	LastPlannerError                  string `json:"last_planner_error,omitempty"`
+	MessageQualityRewriteCountRecent  int    `json:"message_quality_rewrite_count_recent,omitempty"`
+	MessageQualityFallbackCountRecent int    `json:"message_quality_fallback_count_recent,omitempty"`
+	LastMessageQualityEventSeq        int64  `json:"last_message_quality_event_seq,omitempty"`
+	LastMessageQualityPath            string `json:"last_message_quality_path,omitempty"`
+	LastMessageQualityAction          string `json:"last_message_quality_action,omitempty"`
+	LastMessageQualityReason          string `json:"last_message_quality_reason,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
@@ -176,6 +182,17 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		if r.LastPlannerError != "" {
 			fmt.Fprintf(out, "  Last planner error: seq %d %s (%s)\n",
 				r.LastPlannerErrorEventSeq, valueOrUnset(r.LastPlannerErrorPath), r.LastPlannerError)
+		}
+	}
+	if r.MessageQualityRewriteCountRecent > 0 || r.MessageQualityFallbackCountRecent > 0 || r.LastMessageQualityReason != "" {
+		fmt.Fprintf(out, "Message quality: rewrites=%d fallbacks=%d\n",
+			r.MessageQualityRewriteCountRecent, r.MessageQualityFallbackCountRecent)
+		if r.LastMessageQualityReason != "" {
+			fmt.Fprintf(out, "  Last message quality action: seq %d %s %s (%s)\n",
+				r.LastMessageQualityEventSeq,
+				valueOrUnset(r.LastMessageQualityPath),
+				valueOrUnset(r.LastMessageQualityAction),
+				r.LastMessageQualityReason)
 		}
 	}
 	if r.PlannerErrorRateRecent > 0 || r.SingletonCommitRateRecent > 0 {
@@ -293,6 +310,9 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 		report.MaxPendingAgeSeconds = parseIntentMetaDurationSeconds(v, report.MaxPendingAgeSeconds)
 	}
 	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := loadIntentMessageQualitySummary(ctx, conn, &report); err != nil {
 		return report, err
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
@@ -510,6 +530,58 @@ LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPa
 	}
 	if lastError.Valid {
 		report.LastPlannerError = lastError.String
+	}
+	return nil
+}
+
+func loadIntentMessageQualitySummary(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
+	ok, err := sqliteTableExists(ctx, conn, "decision_records")
+	if err != nil {
+		return fmt.Errorf("message quality decision table check: %w", err)
+	}
+	if !ok {
+		return nil
+	}
+	const recentQ = `
+SELECT
+  COALESCE(SUM(CASE WHEN kind = ? THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN kind = ? THEN 1 ELSE 0 END), 0)
+FROM (
+    SELECT kind
+    FROM decision_records
+    ORDER BY id DESC
+    LIMIT ?
+) recent`
+	if err := conn.QueryRowContext(ctx, recentQ,
+		state.DecisionKindMessageQualityRewrite,
+		state.DecisionKindMessageQualityFallback,
+		IntentRecentDecisionWindow,
+	).Scan(&report.MessageQualityRewriteCountRecent, &report.MessageQualityFallbackCountRecent); err != nil {
+		return fmt.Errorf("message quality recent counts: %w", err)
+	}
+
+	var seq sql.NullInt64
+	var path, action, reason sql.NullString
+	err = conn.QueryRowContext(ctx, `
+SELECT event_seq, path, action_taken, COALESCE(NULLIF(reason, ''), NULLIF(user_message, ''))
+FROM decision_records
+WHERE kind IN (?, ?)
+ORDER BY id DESC
+LIMIT 1`, state.DecisionKindMessageQualityRewrite, state.DecisionKindMessageQualityFallback).Scan(&seq, &path, &action, &reason)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("message quality latest: %w", err)
+	}
+	if seq.Valid {
+		report.LastMessageQualityEventSeq = seq.Int64
+	}
+	if path.Valid {
+		report.LastMessageQualityPath = path.String
+	}
+	if action.Valid {
+		report.LastMessageQualityAction = action.String
+	}
+	if reason.Valid {
+		report.LastMessageQualityReason = reason.String
 	}
 	return nil
 }
