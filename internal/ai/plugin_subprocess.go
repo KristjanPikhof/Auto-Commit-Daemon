@@ -458,6 +458,46 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 	return result, nil
 }
 
+// ProposeCommitRewrite asks the plugin to rewrite one existing commit message.
+func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq CommitRewriteRequest) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	if p.resolveErr != nil {
+		return Result{}, p.resolveErr
+	}
+	req := subprocessRequest{Version: pluginProtocolVersion, RequestType: "commit_rewrite_proposal", CommitRewriteRequest: &rewriteReq}
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return Result{}, err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	var resp subprocessResponse
+	for attempt := 0; attempt < 2; attempt++ {
+		session, err := p.acquire()
+		if err != nil {
+			return Result{}, err
+		}
+		resp, err = session.exchangeBytes(reqCtx, body)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markCrashed(session)
+			return Result{}, err
+		}
+		p.markCrashed(session)
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	if strings.TrimSpace(resp.Error) != "" {
+		return Result{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+	}
+	return ValidateCommitRewriteProposal(rewriteReq, Result{Subject: resp.Subject, Body: resp.Body, Source: p.Name()})
+}
+
 // Close shuts down the plugin process if running. Idempotent and safe to
 // call from any goroutine. After Close, Generate returns an error.
 func (p *SubprocessProvider) Close() error {
@@ -586,6 +626,7 @@ type subprocessRequest struct {
 	Now                   string                       `json:"now,omitempty"`
 	PlannerRequest        *IntentPlanRequest           `json:"planner_request,omitempty"`
 	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
+	CommitRewriteRequest  *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire

@@ -753,6 +753,107 @@ func buildOpenAIIntentMessageRewriteRequest(model string, rewriteReq IntentMessa
 	return body, err
 }
 
+// ProposeCommitRewrite POSTs a historical commit rewrite request and parses a
+// replacement commit_message tool call.
+func (p *OpenAIProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq CommitRewriteRequest) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	if strings.TrimSpace(p.APIKey) == "" {
+		return Result{}, errors.New("openai-compat: missing API key")
+	}
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return Result{}, err
+	}
+	model := p.Model
+	if model == "" {
+		model = DefaultOpenAIModel
+	}
+	httpClient := p.HTTP
+	if httpClient == nil {
+		httpClient = defaultOpenAIClient()
+	}
+	body, err := buildOpenAICommitRewriteRequest(model, rewriteReq)
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build commit rewrite request: %w", err)
+	}
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: http: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Result{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+	}
+	subject, bodyOut, err := parseToolCall(raw)
+	if err != nil {
+		return Result{}, err
+	}
+	result, err := ValidateCommitRewriteProposal(rewriteReq, Result{Subject: subject, Body: bodyOut, Source: p.Name()})
+	if err != nil {
+		return Result{}, err
+	}
+	return result, nil
+}
+
+func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteRequest) ([]byte, error) {
+	userPrompt, err := BuildCommitRewriteUserPrompt(rewriteReq)
+	if err != nil {
+		return nil, err
+	}
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type funcDecl struct {
+		Name        string         `json:"name"`
+		Description string         `json:"description,omitempty"`
+		Parameters  map[string]any `json:"parameters"`
+	}
+	type tool struct {
+		Type     string   `json:"type"`
+		Function funcDecl `json:"function"`
+	}
+	type toolChoiceFn struct {
+		Name string `json:"name"`
+	}
+	type toolChoice struct {
+		Type     string       `json:"type"`
+		Function toolChoiceFn `json:"function"`
+	}
+	type req struct {
+		Model       string     `json:"model"`
+		Messages    []message  `json:"messages"`
+		Tools       []tool     `json:"tools"`
+		ToolChoice  toolChoice `json:"tool_choice"`
+		Temperature float64    `json:"temperature"`
+	}
+	body := req{
+		Model:       model,
+		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + commitMessageFormatInstructions}, {Role: "user", Content: userPrompt}},
+		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters}}},
+		ToolChoice:  toolChoice{Type: "function", Function: toolChoiceFn{Name: "commit_message"}},
+		Temperature: 0.2,
+	}
+	return json.Marshal(body)
+}
+
 func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, prompttrace.TransformMetadata, error) {
 	userPrompt, err := BuildIntentMessageRewriteUserPrompt(rewriteReq)
 	if err != nil {
