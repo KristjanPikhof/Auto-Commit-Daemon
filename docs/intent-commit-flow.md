@@ -41,9 +41,10 @@ acd prompt --last
 acd prompt --seq <capture-seq>
 ~~~
 
-Prompt traces are local diagnostics under `<gitDir>/acd/prompt-trace/`. They
-are redacted and truncated before writing, but can still contain source text and
-private paths.
+Prompt traces are local diagnostics under `<gitDir>/acd/prompt-trace/`. Intent
+message-only rewrite requests are traced alongside planner requests when they
+run. Traces are redacted and truncated before writing, but can still contain
+source text and private paths.
 
 ## Flow
 
