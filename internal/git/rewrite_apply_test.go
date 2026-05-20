@@ -47,6 +47,39 @@ func TestApplyRewritePlanCreatesBackupAndRecreatesDescendants(t *testing.T) {
 	}
 }
 
+func TestApplyRewritePlanPreservesOriginalAuthorMetadata(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	old1 := commitWorktreePathWithEnv(t, ctx, repo, "one.txt", "one\n", "one", map[string]string{
+		"GIT_AUTHOR_NAME":  "Original Author",
+		"GIT_AUTHOR_EMAIL": "author@example.com",
+		"GIT_AUTHOR_DATE":  "2020-01-02T03:04:05+00:00",
+	})
+
+	_, err := ApplyRewritePlan(ctx, repo, RewriteApplyOptions{
+		BranchRef:    "refs/heads/main",
+		ExpectedHead: old1,
+		Commits:      []RewriteApplyCommit{{OldOID: old1, ProposedMessage: "one rewritten"}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRewritePlan: %v", err)
+	}
+	out, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultReadTimeout}, "show", "-s", "--format=%an%x00%ae%x00%aI", "HEAD")
+	if err != nil {
+		t.Fatalf("git show author: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(out)), "\x00")
+	want := []string{"Original Author", "author@example.com", "2020-01-02T03:04:05Z"}
+	if len(got) != len(want) {
+		t.Fatalf("author fields=%q", out)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("author field %d = %q, want %q (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestApplyRewritePlanRefusesMovedHeadWithoutBackup(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
@@ -70,13 +103,18 @@ func TestApplyRewritePlanRefusesMovedHeadWithoutBackup(t *testing.T) {
 
 func commitWorktreePath(t *testing.T, ctx context.Context, repo, path, body, msg string) string {
 	t.Helper()
+	return commitWorktreePathWithEnv(t, ctx, repo, path, body, msg, nil)
+}
+
+func commitWorktreePathWithEnv(t *testing.T, ctx context.Context, repo, path, body, msg string, env map[string]string) string {
+	t.Helper()
 	if err := os.WriteFile(filepath.Join(repo, path), []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 	if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout}, "add", path); err != nil {
 		t.Fatalf("git add %s: %v", path, err)
 	}
-	if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout}, "commit", "-q", "-m", msg); err != nil {
+	if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout, ExtraEnv: env}, "commit", "-q", "-m", msg); err != nil {
 		t.Fatalf("git commit %s: %v", path, err)
 	}
 	oid, err := RevParse(ctx, repo, "HEAD")
