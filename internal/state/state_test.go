@@ -82,8 +82,9 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	// Confirm every §6.1 table exists.
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
-		"capture_events", "capture_ops", "planner_state", "flush_requests",
-		"decision_records", "publish_state", "daemon_meta", "daily_rollups",
+		"capture_events", "capture_ops", "planner_state", "rewrite_plans",
+		"rewrite_plan_commits", "flush_requests", "decision_records", "publish_state",
+		"daemon_meta", "daily_rollups",
 	}
 	for _, table := range tables {
 		var name string
