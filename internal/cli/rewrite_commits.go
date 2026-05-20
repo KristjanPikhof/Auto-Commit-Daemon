@@ -47,16 +47,26 @@ type rewriteCommitsOptions struct {
 func newRewriteCommitsCmd() *cobra.Command {
 	var opts rewriteCommitsOptions
 	cmd := &cobra.Command{
-		Use:   "rewrite-commits (--from <sha|position> | --range <start-end> | --last <n> | --git-range <revset>) [--plan-out FILE] | --edit <plan-id-or-file>",
-		Short: "Generate, review, and optionally apply an AI commit rewrite plan for the current branch",
+		Use:     "rewrite-commits (--from <sha|position> | --range <start-end> | --last <n> | --git-range <revset>) [--plan-out FILE] | --edit <plan-id-or-file>",
+		Aliases: []string{"edit-commits", "edit-commit"},
+		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
 		Long: `Preview an AI-generated rewrite plan for a linear commit range on the
 current branch.
 
 Plan generation is intentionally gated: ACD_COMMIT_STRATEGY must resolve to
 intent and ACD_AI_PROVIDER must name a usable non-deterministic planner provider
 (openai-compat with ACD_AI_API_KEY, or subprocess:<name>). Deterministic fallback
-is not enough for rewrite planning. Showing or applying a previously saved plan
-may bypass the provider gate because no new plan is generated.
+is not enough for rewrite planning. Showing, editing, or applying a previously
+saved plan may bypass the provider gate because no new plan is generated.
+
+Use --edit <plan-id-or-file> to reopen a saved rewrite plan in $EDITOR. The
+editor uses --format text by default, or --format json. Edit only the proposed
+commit message text. When the target is a saved plan id, changed edits are
+validated and saved as a new plan revision, and the new plan id is printed.
+When the target is a standalone JSON plan file, changed edits are written back
+to that file. Unchanged edits are accepted. After editing, ACD asks whether to
+apply the plan unless --plan-only is set; --yes applies after edit, and --dry-run
+validates/previews apply without rewriting commits.
 
 v1 scope: current branch linear ranges only; merge commit rewrites are refused;
 there is no daemon automation.`,
@@ -66,7 +76,8 @@ there is no daemon automation.`,
   acd rewrite-commits --last 4 --no-review --yes
   acd rewrite-commits --git-range main~12..main~4 --format json
   acd rewrite-commits --show-plan rewrite.json
-  acd rewrite-commits --edit <plan-id-or-file> --format text
+  acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
+  acd rewrite-commits --edit <plan-id-or-file> --dry-run
   acd rewrite-commits --edit <plan-id-or-file> --yes
   acd rewrite-commits --apply-plan rewrite.json --dry-run
   acd rewrite-commits --apply <plan-id> --yes
@@ -92,7 +103,7 @@ there is no daemon automation.`,
 	cmd.Flags().BoolVar(&opts.yes, "yes", false, "Answer yes to apply prompts and skip confirmation in noninteractive runs")
 	cmd.Flags().BoolVar(&opts.review, "review", false, "Open EDITOR to review/edit proposed commit messages before apply")
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
-	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate, save, and print the rewrite plan summary without prompting to apply")
+	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
 	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD")
 	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Compatibility selector: select the newest n commits")

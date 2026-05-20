@@ -21,6 +21,9 @@ import (
 func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 	help := commandHelp(t, "rewrite-commits")
 	for _, want := range []string{
+		"Aliases:",
+		"edit-commits",
+		"edit-commit",
 		"ACD_COMMIT_STRATEGY",
 		"ACD_AI_PROVIDER",
 		"--from 8f4c2a1",
@@ -33,6 +36,9 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		"--plan-out",
 		"--show-plan",
 		"--edit",
+		"$EDITOR",
+		"new plan id is printed",
+		"standalone JSON plan file",
 		"--apply-plan",
 		"--apply",
 		"--review",
@@ -47,6 +53,27 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("rewrite-commits help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestRewriteCommitsAliasHelpIncludesEditContract(t *testing.T) {
+	for _, command := range []string{"edit-commits", "edit-commit"} {
+		t.Run(command, func(t *testing.T) {
+			help := commandHelp(t, command)
+			for _, want := range []string{
+				"--edit <plan-id-or-file>",
+				"$EDITOR",
+				"saved plan id",
+				"standalone JSON plan file",
+				"--plan-only",
+				"--dry-run",
+				"no new plan is generated",
+			} {
+				if !strings.Contains(help, want) {
+					t.Fatalf("%s help missing %q:\n%s", command, want, help)
+				}
+			}
+		})
 	}
 }
 
