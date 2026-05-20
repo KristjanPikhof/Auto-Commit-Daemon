@@ -12,7 +12,7 @@ diagrams, see [intent-commit-rewrite-flow.md](intent-commit-rewrite-flow.md).
 - Merge commit rewrites are out of scope and must be refused.
 - No daemon automation: the daemon does not initiate, approve, or apply rewrites.
 - Plan generation requires working AI intent mode.
-- Saved plan display/apply can run without an AI provider because no new plan is
+- Saved plan display/edit/apply can run without an AI provider because no new plan is
   generated.
 
 ## Plan-generation gate
@@ -37,6 +37,7 @@ acd rewrite-commits --last <n> [--plan-out FILE] [--review|--no-review] [--forma
 acd rewrite-commits --git-range <base>..<head> [--plan-out FILE] [--review|--no-review] [--format text|json] [--plan-only|--yes]
 acd rewrite-commits --base <base> [--head <head>] [--plan-out FILE] [--review|--no-review] [--format text|json] [--plan-only|--yes]
 acd rewrite-commits --show-plan FILE
+acd rewrite-commits --edit <plan-id-or-file> [--format text|json] [--plan-only|--yes|--dry-run]
 acd rewrite-commits --apply-plan FILE (--yes | --dry-run)
 acd rewrite-commits --apply <plan-id-or-file> (--yes | --dry-run)
 ~~~
@@ -58,6 +59,12 @@ Flags:
 - `--plan-only`: generate/save/print the plan summary without any interactive prompts or apply.
 - `--format`: editor format, `text` by default or `json` for automation-oriented edits.
 - `--show-plan`: display an existing saved plan; bypasses the provider gate.
+- `--edit`: load an existing saved plan by id or file path, open `$EDITOR` using
+  `--format`, validate the edited content, and save a new edited plan revision
+  when a saved plan id changes or write changed standalone file plans back to the
+  same file. It never calls the AI provider. After editing,
+  ACD prompts to apply the edited plan unless `--plan-only` suppresses apply,
+  `--yes` applies immediately, or `--dry-run` validates/previews apply without rewriting.
 - `--apply-plan`: apply an existing saved plan file; bypasses the plan-generation
   provider gate.
 - `--apply`: apply an existing saved plan by plan id, or by file path when the
@@ -75,6 +82,8 @@ acd rewrite-commits --range 5-12 --review --format text
 acd rewrite-commits --last 4 --no-review --yes
 acd rewrite-commits --git-range main~12..main~4 --format json
 acd rewrite-commits --show-plan rewrite.json
+acd rewrite-commits --edit rewrite-plan-abc123 --format text --plan-only
+acd rewrite-commits --edit rewrite-plan-abc123 --dry-run
 acd rewrite-commits --apply-plan rewrite.json --dry-run
 acd rewrite-commits --apply rewrite-plan-abc123 --yes
 ~~~

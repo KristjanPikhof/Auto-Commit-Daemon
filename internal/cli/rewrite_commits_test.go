@@ -32,6 +32,7 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		"--head",
 		"--plan-out",
 		"--show-plan",
+		"--edit",
 		"--apply-plan",
 		"--apply",
 		"--review",
@@ -96,6 +97,206 @@ func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "without AI provider check") || !strings.Contains(got, "shown subject") || !strings.Contains(got, "Validation status: valid") {
 		t.Fatalf("show-plan output missing loaded plan details/bypass note: %q", got)
+	}
+}
+
+func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	planID := saveRewritePlanForRepo(t, ctx, repo, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     mustRevParse(t, ctx, repo, "HEAD"),
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: mustRevParse(t, ctx, repo, "HEAD"), ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("EDITOR", editor)
+	t.Setenv(ai.EnvCommitStrategy, "event")
+	t.Setenv(ai.EnvProvider, "")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planID, planOnly: true, editFormat: rewriteEditFormatText}, false)
+	if err != nil {
+		t.Fatalf("edit saved plan by id: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "unchanged") || !strings.Contains(got, "no AI call") || !strings.Contains(got, "No commits were rewritten") {
+		t.Fatalf("edit output missing unchanged/no-AI/no-rewrite status: %q", got)
+	}
+}
+
+func TestRewriteCommitsEditStandaloneFilePersistsBackToFile(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		ID:               "file-plan",
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		ApplyStatus:      state.RewritePlanApplyPending,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\npython3 - <<'PY' \"$1\"\nimport pathlib, sys\np = pathlib.Path(sys.argv[1])\np.write_text(p.read_text().replace('seed rewritten', 'file edited subject'))\nPY\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("EDITOR", editor)
+	t.Setenv(ai.EnvCommitStrategy, "event")
+	t.Setenv(ai.EnvProvider, "")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planPath, planOnly: true, editFormat: rewriteEditFormatJSON}, false)
+	if err != nil {
+		t.Fatalf("edit standalone file: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Edited rewrite plan file saved") || !strings.Contains(got, "no AI call") {
+		t.Fatalf("edit file output missing saved/no-AI status: %q", got)
+	}
+	updated, err := readRewritePlanFile(planPath)
+	if err != nil {
+		t.Fatalf("read updated plan file: %v", err)
+	}
+	if updated.Commits[0].ProposedMessage != "file edited subject" || !updated.Edited || updated.ValidationStatus != state.RewritePlanValidationValid {
+		t.Fatalf("standalone file not persisted as edited valid plan: %#v", updated)
+	}
+}
+
+func TestRewriteCommitsGenerationReviewPrintsEditedRevisionID(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    req = json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\npython3 - <<'PY' \"$1\"\nimport pathlib, sys\np = pathlib.Path(sys.argv[1])\np.write_text(p.read_text().replace('plugin subject', 'review edited subject'))\nPY\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+	t.Setenv("EDITOR", editor)
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, review: true, editFormat: rewriteEditFormatText, in: strings.NewReader("n\n")}, false)
+	if err != nil {
+		t.Fatalf("generation review edit: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "Edited rewrite plan saved as ") || !strings.Contains(got, "No commits were rewritten") {
+		t.Fatalf("generation review output missing edited revision id/no-rewrite: %q", got)
+	}
+	editedID := parseRewritePlanIDAfter(t, got, "Edited rewrite plan saved as")
+	db := openRewritePlanTestDB(t, context.Background(), repo)
+	defer db.Close()
+	edited, ok, err := state.LoadRewritePlan(context.Background(), db, editedID)
+	if err != nil || !ok {
+		t.Fatalf("load edited revision: ok=%v err=%v", ok, err)
+	}
+	if !edited.Edited || edited.Commits[0].ProposedMessage != "review edited subject" {
+		t.Fatalf("edited review revision not saved: %#v", edited)
+	}
+}
+
+func TestRewriteCommitsEditSavedPlanPersistsRevisionWithoutAICall(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	planID := saveRewritePlanForRepo(t, ctx, repo, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\npython3 - <<'PY' \"$1\"\nimport pathlib, sys\np = pathlib.Path(sys.argv[1])\np.write_text(p.read_text().replace('seed rewritten', 'edited seed subject'))\nPY\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("EDITOR", editor)
+	t.Setenv(ai.EnvCommitStrategy, "event")
+	t.Setenv(ai.EnvProvider, "")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planID, planOnly: true, editFormat: rewriteEditFormatText}, false)
+	if err != nil {
+		t.Fatalf("edit saved plan persisted revision: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Edited rewrite plan saved as ") || !strings.Contains(got, "no AI call") {
+		t.Fatalf("edit output missing saved revision/no-AI status: %q", got)
+	}
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+	base, ok, err := state.LoadRewritePlan(ctx, db, planID)
+	if err != nil || !ok {
+		t.Fatalf("load base plan: ok=%v err=%v", ok, err)
+	}
+	if base.Commits[0].ProposedMessage != "seed rewritten" {
+		t.Fatalf("base plan mutated: %#v", base.Commits[0])
+	}
+	editedID := parseEditedRewritePlanID(t, got)
+	edited, ok, err := state.LoadRewritePlan(ctx, db, editedID)
+	if err != nil || !ok {
+		t.Fatalf("load edited plan: ok=%v err=%v", ok, err)
+	}
+	if !edited.BasePlanID.Valid || edited.BasePlanID.String != planID || edited.Revision != base.Revision+1 || !edited.Edited || edited.Commits[0].ProposedMessage != "edited seed subject" {
+		t.Fatalf("edited revision not saved as expected: %#v", edited)
+	}
+}
+
+func TestRewriteCommitsEditSavedPlanValidationFailure(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	planID := saveRewritePlanForRepo(t, ctx, repo, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\npython3 - <<'PY' \"$1\"\nimport pathlib, sys\np = pathlib.Path(sys.argv[1])\ns = p.read_text()\nstart = s.index('message <<ACD_COMMIT_MESSAGE') + len('message <<ACD_COMMIT_MESSAGE')\nend = s.index('ACD_COMMIT_MESSAGE', start)\np.write_text(s[:start] + '\\n   \\n' + s[end:])\nPY\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("EDITOR", editor)
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planID, planOnly: true, editFormat: rewriteEditFormatText}, false)
+	if err == nil || !strings.Contains(err.Error(), "empty message") {
+		t.Fatalf("edit validation err = %v, want empty message", err)
+	}
+}
+
+func TestRewriteCommitsEditSavedPlanPromptsBeforeApply(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	planID := saveRewritePlanForRepo(t, ctx, repo, state.RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+	editor := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(editor, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write editor: %v", err)
+	}
+	t.Setenv("EDITOR", editor)
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planID, editFormat: rewriteEditFormatText, in: strings.NewReader("n\n")}, false)
+	if err != nil {
+		t.Fatalf("edit prompt flow: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Apply this edited rewrite plan now?") || !strings.Contains(got, "No commits were rewritten") {
+		t.Fatalf("edit output missing apply prompt/no-rewrite: %q", got)
 	}
 }
 
@@ -178,6 +379,64 @@ func writeRewriteTestFile(t *testing.T, repo, name, body string) {
 	if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
+}
+
+func parseEditedRewritePlanID(t *testing.T, output string) string {
+	t.Helper()
+	return parseRewritePlanIDAfter(t, output, "")
+}
+
+func parseRewritePlanIDAfter(t *testing.T, output, marker string) string {
+	t.Helper()
+	search := output
+	if marker != "" {
+		idx := strings.Index(output, marker)
+		if idx < 0 {
+			t.Fatalf("marker %q not found in output: %q", marker, output)
+		}
+		search = output[idx:]
+	}
+	for _, field := range strings.Fields(search) {
+		field = strings.TrimSuffix(field, ".")
+		if strings.HasPrefix(field, "rp_") || strings.HasPrefix(field, "rewrite-plan-") {
+			return field
+		}
+	}
+	t.Fatalf("no rewrite plan id found in output: %q", search)
+	return ""
+}
+
+func mustRevParse(t *testing.T, ctx context.Context, repo, rev string) string {
+	t.Helper()
+	oid, err := git.RevParse(ctx, repo, rev)
+	if err != nil {
+		t.Fatalf("rev-parse %s: %v", rev, err)
+	}
+	return oid
+}
+
+func openRewritePlanTestDB(t *testing.T, ctx context.Context, repo string) *state.DB {
+	t.Helper()
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		t.Fatalf("state db path: %v", err)
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open state db: %v", err)
+	}
+	return db
+}
+
+func saveRewritePlanForRepo(t *testing.T, ctx context.Context, repo string, plan state.RewritePlan) string {
+	t.Helper()
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+	id, err := state.SaveRewritePlan(ctx, db, plan)
+	if err != nil {
+		t.Fatalf("save rewrite plan: %v", err)
+	}
+	return id
 }
 
 func writeRewritePlanTestFile(t *testing.T, path string, plan state.RewritePlan) {

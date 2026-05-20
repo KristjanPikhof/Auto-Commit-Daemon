@@ -135,6 +135,8 @@ acd rewrite-commits --from 5 --plan-only
 acd rewrite-commits --range 5-12 --review --format text
 acd rewrite-commits --last 4 --no-review --yes
 acd rewrite-commits --show-plan rewrite.json
+acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
+acd rewrite-commits --edit <plan-id-or-file> --dry-run
 acd rewrite-commits --apply-plan rewrite.json --dry-run
 acd rewrite-commits --apply <plan-id-or-file> --yes
 # If apply reports a backup ref/SHA and review fails: git reset --hard <backup-ref-or-sha>

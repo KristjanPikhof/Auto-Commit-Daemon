@@ -78,8 +78,8 @@ provider again.
 
 ~~~bash
 acd rewrite-commits --show-plan rewrite.json
-$EDITOR rewrite.json
-acd rewrite-commits --show-plan rewrite.json
+acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
+acd rewrite-commits --edit <plan-id-or-file> --dry-run
 ~~~
 
 ~~~mermaid
@@ -95,9 +95,11 @@ sequenceDiagram
   CLI->>Plan: persist draft/valid plan
   O->>CLI: --show-plan rewrite.json
   CLI-->>O: display original and proposed messages
-  O->>Plan: optional manual edits
-  O->>CLI: --show-plan rewrite.json
-  CLI-->>O: validate/display edited plan
+  O->>CLI: --edit plan-id-or-file
+  CLI->>Plan: load saved plan without AI call
+  CLI-->>O: open EDITOR with text/json plan
+  CLI->>Plan: validate and save edited revision when changed
+  CLI-->>O: unchanged/edited status and apply prompt
 ~~~
 
 ## Apply a saved plan

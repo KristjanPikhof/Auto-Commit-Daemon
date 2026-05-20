@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -253,6 +252,9 @@ func persistEditedRewritePlan(ctx context.Context, repo string, plan state.Rewri
 	if rewritePlanMessagesEqual(plan.Commits, commits) {
 		return plan, nil
 	}
+	if strings.TrimSpace(plan.ID) == "" {
+		return state.RewritePlan{}, errors.New("acd rewrite-commits: cannot save edited plan revision without a saved plan id")
+	}
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return state.RewritePlan{}, err
@@ -262,12 +264,16 @@ func persistEditedRewritePlan(ctx context.Context, repo string, plan state.Rewri
 		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: open state db: %w", err)
 	}
 	defer db.Close()
-	plan.Commits = commits
-	plan.ValidationStatus = state.RewritePlanValidationValid
-	plan.ValidationError = sql.NullString{}
-	plan.ApplyStatus = state.RewritePlanApplyPending
-	if err := state.UpdateRewritePlanDraft(ctx, db, plan); err != nil {
+	id, err := state.CreateEditedRewritePlanRevision(ctx, db, plan.ID, commits, state.RewritePlanValidationValid)
+	if err != nil {
 		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: save edited plan: %w", err)
 	}
-	return plan, nil
+	updated, ok, err := state.LoadRewritePlan(ctx, db, id)
+	if err != nil {
+		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: load edited plan: %w", err)
+	}
+	if !ok {
+		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: edited plan %q not found after save", id)
+	}
+	return updated, nil
 }
