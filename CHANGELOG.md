@@ -8,6 +8,11 @@
   rewrites for current-branch linear history, with saved plans, dry runs,
   backup refs, and recovery guidance.
 
+### Changed
+
+- Release automation now publishes the Homebrew formula to
+  `KristjanPikhof/homebrew-tap`.
+
 ### Fixed
 
 - OpenAI-compatible responses now reject unexpected tool calls instead of
