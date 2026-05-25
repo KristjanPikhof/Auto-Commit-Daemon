@@ -10,14 +10,13 @@ Two ways to commit:
 ## Install
 
 ~~~bash
-curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh
+brew install KristjanPikhof/tap/acd
 ~~~
 
-Or:
+Alternatives:
 
 ~~~bash
-brew tap KristjanPikhof/tap
-brew install acd
+curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh
 
 # or
 go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest

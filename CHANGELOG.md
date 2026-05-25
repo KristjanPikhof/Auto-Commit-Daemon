@@ -1,17 +1,14 @@
 # Changelog
 
-## Unreleased
+## Unreleased (2026-05-25)
 
 ### Added
 
+- Homebrew tap support now allows installing `acd` with
+  `brew install KristjanPikhof/tap/acd`.
 - `acd rewrite-commits` now offers reviewable AI-assisted commit-message
   rewrites for current-branch linear history, with saved plans, dry runs,
   backup refs, and recovery guidance.
-
-### Changed
-
-- Release automation now publishes the Homebrew formula to
-  `KristjanPikhof/homebrew-tap`.
 
 ### Fixed
 
