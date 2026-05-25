@@ -41,8 +41,9 @@ brews:
       owner: KristjanPikhof
       name: homebrew-tap
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Formula
     homepage: https://github.com/KristjanPikhof/Auto-Commit-Daemon
-    description: "Atomic commit daemon for git worktrees, multi-harness."
+    description: "Atomic commit daemon for git worktrees, multi-harness"
     license: MIT
     install: |
       bin.install "acd"
