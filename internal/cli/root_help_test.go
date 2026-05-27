@@ -33,7 +33,7 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"acd repo init",
 		"acd repo list",
 		"acd repo remove --dry-run",
-		"acd list --watch",
+		"acd list --once",
 		"acd diagnose",
 		"acd doctor",
 		"acd pause",

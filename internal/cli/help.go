@@ -16,8 +16,10 @@ Common workflow:
   acd repo init                     Explicitly initialize ACD state for this repo
   acd repo list                     List all registry rows for lifecycle management
   acd repo remove --dry-run          Preview registry removal and state preservation
-  acd list                          List known repo daemons
-  acd list --watch --interval 5s     Watch known repo daemons live
+  acd list                          Compact dashboard on TTY (Ctrl-C to exit)
+  acd list --once                   One-shot compact table (scripts)
+  acd list --verbose                Wide table with CLIENTS and status notes
+  acd list --json                   All repos as JSON (one-shot on TTY)
   acd logs --lines 200              Tail the current repo daemon log as raw JSONL
   acd logs --follow                 Stream appended raw JSONL daemon log lines
   acd wake                          Refresh heartbeat and nudge replay

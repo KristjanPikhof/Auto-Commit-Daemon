@@ -4,14 +4,14 @@
 
 ### Changed
 
-- **`acd list` (breaking on TTY):** On an interactive terminal, `acd list` now
-  defaults to a live compact dashboard (same as `--watch`) with columns
-  `REPO`/`DAEMON`/`PEND`/`BLK`/`HEAD`/`STATUS`. `REPO` shows the last two path
-  segments (for example `Development/Auto-Commit-Daemon`); basename collisions
-  append a `#` hash suffix. Pipes and non-TTY stdout print a one-shot compact
-  table. Use `--once` for a single snapshot on a TTY, `--verbose` for the wide
-  table (home-short paths, `CLIENTS`, `LAST_COMMIT`, full status notes), and
-  `--watch` as an explicit alias.
+- **`acd list` (breaking on TTY):** Interactive terminals default to a live
+  compact dashboard (`REPO`/`DAEMON`/`PEND`/`BLK`/`HEAD`/`STATUS`). `REPO` is
+  the last two path segments (e.g. `Development/Auto-Commit-Daemon`); duplicate
+  labels get a `#` hash suffix. Compact status tokens include `blk`, `wait`,
+  `miss`, `bad`. Pipes and non-TTY stdout get a one-shot compact table. Use
+  `--once` for one snapshot on a TTY, `--verbose` for the wide table, `--json`
+  for JSON (one-shot on TTY). `--watch` is an explicit alias. `--watch` with
+  `--json` is rejected.
 - **`acd rewrite-commits --plan-only`:** Ends with `Plan saved. Git history
   unchanged.` and a `Next:` block (`--show-plan`, `--apply-plan --dry-run`,
   `--apply-plan --yes`). Declining apply prints `No rewrite performed.`
