@@ -12,12 +12,11 @@
   table. Use `--once` for a single snapshot on a TTY, `--verbose` for the wide
   table (home-short paths, `CLIENTS`, `LAST_COMMIT`, full status notes), and
   `--watch` as an explicit alias.
-
-### Added
-
 - **`acd rewrite-commits --plan-only`:** Ends with `Plan saved. Git history
   unchanged.` and a `Next:` block (`--show-plan`, `--apply-plan --dry-run`,
   `--apply-plan --yes`). Declining apply prints `No rewrite performed.`
+
+### Added
 
 - **Cursor harness:** `acd setup cursor` prints user-global install steps;
   `acd setup cursor --raw > ~/.cursor/hooks.json` writes strict JSON for a
