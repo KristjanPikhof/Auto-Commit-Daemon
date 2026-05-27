@@ -840,7 +840,7 @@ func Run(ctx context.Context, opts Options) error {
 		staleOpMarkerWarnInterval = 5 * time.Minute
 	)
 
-	graceful := func(reason string) {
+	graceful := func(reason string) error {
 		stopped = true
 		st := state.DaemonState{
 			PID:         pid,
@@ -856,12 +856,14 @@ func Run(ctx context.Context, opts Options) error {
 		// run-loop's ctx is already canceled in the most common path
 		// (ctx.Done shutdown). We must still stamp mode=stopped so
 		// controllers can see the daemon left cleanly.
-		shutdownCtx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+		shutdownCtx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer scancel()
 		if err := state.SaveDaemonState(shutdownCtx, opts.DB, st); err != nil {
 			logger.Warn("stamp stopped state", "err", err.Error())
+			return fmt.Errorf("daemon: stamp stopped state: %w", err)
 		}
 		logger.Info("daemon stopping", "reason", reason)
+		return nil
 	}
 
 	logger.Info("daemon running",
@@ -1354,13 +1356,11 @@ func Run(ctx context.Context, opts Options) error {
 
 		// 4a/b. Honor ctx + shutdown signal.
 		if err := ctx.Err(); err != nil {
-			graceful("context canceled")
-			return nil
+			return graceful("context canceled")
 		}
 		select {
 		case <-shutdownCh:
-			graceful("signal shutdown")
-			return nil
+			return graceful("signal shutdown")
 		default:
 		}
 
@@ -1544,8 +1544,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			select {
 			case <-shutdownCh:
-				graceful("signal shutdown")
-				return nil
+				return graceful("signal shutdown")
 			default:
 			}
 			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
@@ -1779,8 +1778,7 @@ func Run(ctx context.Context, opts Options) error {
 				BootGrace:           bootGrace,
 				EmptySweepThreshold: emptyThreshold,
 			}) {
-				graceful(fmt.Sprintf("no live clients for %d sweeps", emptyCount))
-				return nil
+				return graceful(fmt.Sprintf("no live clients for %d sweeps", emptyCount))
 			}
 		}
 
@@ -1850,12 +1848,10 @@ func Run(ctx context.Context, opts Options) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			graceful("context canceled")
-			return nil
+			return graceful("context canceled")
 		case <-shutdownCh:
 			timer.Stop()
-			graceful("signal shutdown")
-			return nil
+			return graceful("signal shutdown")
 		case <-wakeCh:
 			timer.Stop()
 			currentDelay = opts.Scheduler.Reset()

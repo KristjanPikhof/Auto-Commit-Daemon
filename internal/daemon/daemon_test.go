@@ -146,14 +146,40 @@ func daemonMode(t *testing.T, db *state.DB) string {
 func waitForDaemonMode(t *testing.T, db *state.DB, mode string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	var lastMode string
+	var lastOK bool
+	var lastUpdated float64
+	var lastErr error
 	for time.Now().Before(deadline) {
-		st, _, err := state.LoadDaemonState(context.Background(), db)
+		st, ok, err := state.LoadDaemonState(context.Background(), db)
 		if err == nil && st.Mode == mode {
 			return
 		}
+		lastMode = st.Mode
+		lastOK = ok
+		lastUpdated = st.UpdatedTS
+		lastErr = err
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("daemon_state.mode did not become %q within %v", mode, timeout)
+	t.Fatalf("daemon_state.mode did not become %q within %v (last mode=%q ok=%v updated_ts=%.6f err=%v)",
+		mode, timeout, lastMode, lastOK, lastUpdated, lastErr)
+}
+
+func waitForDaemonModeFresh(t *testing.T, dbPath, mode string, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+2*time.Second)
+	defer cancel()
+
+	fresh, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open fresh state db: %v", err)
+	}
+	defer func() {
+		if err := fresh.Close(); err != nil {
+			t.Fatalf("close fresh state db: %v", err)
+		}
+	}()
+	waitForDaemonMode(t, fresh, mode, timeout)
 }
 
 func waitForMetaValue(t *testing.T, db *state.DB, key, want string, timeout time.Duration) {
@@ -261,10 +287,10 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	if runErr != nil {
 		t.Fatalf("Run returned %v", runErr)
 	}
-	// graceful() commits mode=stopped via a fresh background ctx, but the
-	// read pool's WAL snapshot can briefly trail the writer pool's commit
-	// under broad-suite scheduling on macOS. Poll instead of one-shot read.
-	waitForDaemonMode(t, f.db, "stopped", 2*time.Second)
+	// Run returned after graceful() persisted mode=stopped. Use a fresh DB
+	// handle to mirror an external controller and avoid stale read-pool
+	// snapshots from the long-lived fixture handle under macOS broad runs.
+	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
 }
 
 // TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
@@ -931,9 +957,7 @@ func TestRun_GracefulShutdownSignal(t *testing.T) {
 		t.Fatalf("Run did not exit on shutdown signal")
 	}
 
-	if mode := daemonMode(t, f.db); mode != "stopped" {
-		t.Fatalf("daemon_state.mode=%q want stopped", mode)
-	}
+	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
 }
 
 // TestRun_SelfTerminateNoClients: with no daemon_clients rows past the boot
@@ -971,8 +995,48 @@ func TestRun_SelfTerminateNoClients(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("daemon did not self-terminate")
 	}
-	if mode := daemonMode(t, f.db); mode != "stopped" {
-		t.Fatalf("daemon_state.mode=%q want stopped", mode)
+	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
+}
+
+func TestRun_ReturnsErrorWhenStoppedStateCannotPersist(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	wakeCh := make(chan struct{}, 1)
+	shutdownCh := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   fastScheduler(),
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+		})
+	}()
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	if err := f.db.Close(); err != nil {
+		t.Fatalf("close db before shutdown: %v", err)
+	}
+	shutdownCh <- struct{}{}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("Run returned nil after stopped-state persist failure")
+		}
+		if !strings.Contains(err.Error(), "stamp stopped state") {
+			t.Fatalf("Run error %q does not identify stopped-state persist failure", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Run did not exit after shutdown with closed state DB")
 	}
 }
 
