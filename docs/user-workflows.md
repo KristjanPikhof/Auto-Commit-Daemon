@@ -94,11 +94,11 @@ message that points at `acd repo init --repo <path>`.
 
 When commits stop appearing, move from observation to mutation in this order:
 
-1. **Diagnose.** Run `acd status`, then `acd events --watch` and `acd explain --path <file>` for the affected path. If the repo table is easier, `acd list` shows whether a repo is `OK`, `waiting`, `blocked`, `paused`, `stale`, `missing`, or `unreadable`.
+1. **Diagnose.** Run `acd status`, then `acd events --watch` and `acd explain --path <file>` for the affected path. `acd list` shows compact tokens (`OK`, `wait`, `blk`, `pause`, `miss`, `bad`, `stale`); use `--verbose` or `--json` for full status strings.
 2. **Dry-run.** Run `acd diagnose --json`, then `acd fix --dry-run`. Read the plan before changing state.
 3. **Safe apply.** Run `acd fix --yes` only when the dry-run plan matches what happened. Safe apply backs up `state.db`, refuses a live daemon owner, and applies only cleanup ACD can verify.
 4. **Explicit force apply.** If the dry-run says terminal barriers still have pending successors, rerun `acd fix --force --dry-run`. Apply with `acd fix --force --yes` only after you verify the blocked captured changes are already in `HEAD` or should be discarded. Force is never implied by safe apply.
-5. **Post-check.** Run `acd status` or `acd list` again. `blocked` means action is still required. `waiting` means work remains queued without an active blocker; in intent mode, a pending-only queue may be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`, so wait, lower thresholds, or use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session.
+5. **Post-check.** Run `acd status` or `acd list` again. `blk` (or `blocked` with `--verbose`/`--json`) means action is still required. `wait` means queued work without an active blocker; in intent mode, a pending-only queue may be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`, so wait, lower thresholds, or use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session.
 
 ## File was not committed
 

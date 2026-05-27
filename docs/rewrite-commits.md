@@ -2,8 +2,30 @@
 
 `acd rewrite-commits` is the interactive entrypoint for previewing and applying
 an AI-generated commit-message rewrite plan. Use it for local branch cleanup
-before sharing history. For the end-to-end operator workflow and Mermaid
-diagrams, see [intent-commit-rewrite-flow.md](intent-commit-rewrite-flow.md).
+before sharing history.
+
+## Quick start
+
+Generate a plan, preview apply, then apply when ready:
+
+~~~bash
+# 1. Plan only — AI proposes messages; git history stays untouched.
+ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... \
+  acd rewrite-commits --from 5 --plan-out rewrite.json --plan-only
+# Ends with: Plan saved. Git history unchanged.
+# Next: --show-plan, --apply-plan --dry-run, --apply-plan --yes
+
+# 2. Dry-run apply — validate the saved plan without rewriting.
+acd rewrite-commits --apply-plan rewrite.json --dry-run
+
+# 3. Apply — rewrite commits after you accept the plan.
+acd rewrite-commits --apply-plan rewrite.json --yes
+~~~
+
+Declining an interactive apply prompt prints `No rewrite performed.`
+
+For prerequisites, recovery, Mermaid diagrams, and intent-mode detail, see
+[intent-commit-rewrite-flow.md](intent-commit-rewrite-flow.md).
 
 ## Scope
 
@@ -56,7 +78,7 @@ Flags:
 - `--plan-out`: destination for a generated plan.
 - `--review`: open `$EDITOR` to review/edit proposed messages before the apply prompt.
 - `--no-review`: skip the review prompt and leave proposed messages unchanged.
-- `--plan-only`: generate/save/print the plan summary without any interactive prompts or apply.
+- `--plan-only`: generate/save/print the plan summary without any interactive prompts or apply. On success, prints `Plan saved. Git history unchanged.` plus a `Next:` block with `--show-plan`, `--apply-plan --dry-run`, and `--apply-plan --yes` using the saved plan id or `--plan-out` path (quoted when the path contains spaces).
 - `--format`: editor format, `text` by default or `json` for automation-oriented edits.
 - `--show-plan`: display an existing saved plan; bypasses the provider gate.
 - `--edit`: load an existing saved plan by id or file path, open `$EDITOR` using

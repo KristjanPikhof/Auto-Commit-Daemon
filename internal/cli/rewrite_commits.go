@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -196,7 +197,15 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		fmt.Fprintln(out, "No commits were rewritten.")
 		return errors.New("acd rewrite-commits: AI proposal validation failed; invalid plan saved and apply is blocked")
 	}
-	if opts.planOnly || opts.dryRun {
+	if opts.planOnly {
+		planRef := plan.ID
+		if opts.planOut != "" {
+			planRef = opts.planOut
+		}
+		finishRewritePlanOnly(out, planRef)
+		return nil
+	}
+	if opts.dryRun {
 		fmt.Fprintln(out, "No commits were rewritten.")
 		return nil
 	}
@@ -238,13 +247,36 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		}
 	}
 	if !applyNow {
-		fmt.Fprintln(out, "No commits were rewritten.")
+		fmt.Fprintln(out, "No rewrite performed.")
 		return nil
 	}
 	applyOpts := opts
 	applyOpts.applyPlan = plan.ID
 	applyOpts.yes = true
 	return applySavedRewritePlan(ctx, out, repoFlag, applyOpts)
+}
+
+func finishRewritePlanOnly(out io.Writer, planRef string) {
+	fmt.Fprintln(out, "Plan saved. Git history unchanged.")
+	printRewritePlanNextSteps(out, planRef)
+}
+
+func rewritePlanRefArg(ref string) string {
+	if ref == "" {
+		return ref
+	}
+	if strings.ContainsAny(ref, " \t'\"$`\\") {
+		return strconv.Quote(ref)
+	}
+	return ref
+}
+
+func printRewritePlanNextSteps(out io.Writer, planRef string) {
+	arg := rewritePlanRefArg(planRef)
+	fmt.Fprintln(out, "Next:")
+	fmt.Fprintf(out, "  acd rewrite-commits --show-plan %s\n", arg)
+	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --dry-run\n", arg)
+	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", arg)
 }
 
 func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
@@ -286,7 +318,7 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 	}
 	fmt.Fprintln(out, "Saved plan edit loaded without AI provider check; no AI call was made.")
 	if opts.planOnly {
-		fmt.Fprintln(out, "No commits were rewritten.")
+		finishRewritePlanOnly(out, applyRef)
 		return nil
 	}
 	if opts.dryRun {
@@ -302,7 +334,7 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 		}
 	}
 	if !applyNow {
-		fmt.Fprintln(out, "No commits were rewritten.")
+		fmt.Fprintln(out, "No rewrite performed.")
 		return nil
 	}
 	applyOpts := opts

@@ -126,8 +126,11 @@ Open your AI tool, edit files, commits land. The daemon starts on first hook fir
 
 ~~~bash
 acd start                          # start or refresh the current repo daemon
-acd list                           # daemons across all your repos
-acd list --watch                   # refresh until Ctrl-C
+acd list                           # TTY: live compact dashboard (Ctrl-C to exit)
+acd list --once                    # one-shot compact (TTY or scripts)
+acd list --verbose                 # wide table: ~ paths, CLIENTS, status notes
+acd list --json                    # all repos as JSON (one-shot on TTY)
+acd list --watch                   # explicit alias for live refresh
 
 acd status                         # health, queue depth, recent decisions, intent metrics
 acd status --watch                 # live refresh
@@ -146,7 +149,7 @@ acd commit-all                     # one-shot: commit every uncommitted file (da
 
 # Explicit, reviewable intent-mode history cleanup; the daemon never does this automatically.
 acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
-acd rewrite-commits --from 5 --plan-only
+acd rewrite-commits --from 5 --plan-only   # saves plan; prints Next: apply steps
 acd rewrite-commits --range 5-12 --review --format text
 acd rewrite-commits --last 4 --no-review --yes
 acd rewrite-commits --show-plan rewrite.json
@@ -187,7 +190,7 @@ acd status                         # post-check: confirm pending/blocked counts 
 
 `acd fix` is the single recovery entrypoint. It backs up `state.db` before mutating, refuses to run while a live daemon owns the database, and won't lift a manual pause unless you pass `--clear-pause`. Safe apply (`acd fix --yes`) handles only self-verifiable cleanup. Force apply is explicit: use `--force` only after the dry-run shows terminal barriers with pending successors and you have verified the captured changes are already represented in `HEAD` or are intentionally being discarded. Use `acd resume --yes` when the only problem is a stale pause marker.
 
-After recovery, `acd list` status `blocked` means operator action is still required; `waiting` means queued work remains without an active blocker. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
+After recovery, `acd list` shows `blk` / `wait` in the default compact table (`blocked` / `waiting` with `--verbose` or `--json`): blocked means operator action is still required; waiting means queued work remains without an active blocker. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
 
 If a parallel committer (Claude Code's atomic-commit hook, Codex ACD hook, your own script) lands the change before ACD's replay tick, you'll see `handled_external` or `superseded_external` in `acd events`. That's normal. Real content mismatches still surface as `blocked_conflict`.
 

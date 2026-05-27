@@ -703,7 +703,7 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 
 	// list (json)
 	var lOut, lErr bytes.Buffer
-	if err := runList(ctx, &lOut, &lErr, true); err != nil {
+	if err := runList(ctx, &lOut, &lErr, true, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	var listGot struct {

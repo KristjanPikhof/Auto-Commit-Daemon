@@ -127,6 +127,94 @@ func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	}
 }
 
+func TestRewritePlanRefArg(t *testing.T) {
+	tests := []struct {
+		ref  string
+		want string
+	}{
+		{"", ""},
+		{"rp_abc123", "rp_abc123"},
+		{"/tmp/rewrite.json", "/tmp/rewrite.json"},
+		{"has space", strconv.Quote("has space")},
+		{"tab\there", strconv.Quote("tab\there")},
+		{"quote'path", strconv.Quote("quote'path")},
+		{`dollar$path`, strconv.Quote(`dollar$path`)},
+	}
+	for _, tc := range tests {
+		if got := rewritePlanRefArg(tc.ref); got != tc.want {
+			t.Errorf("rewritePlanRefArg(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    req = json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	planDir := filepath.Join(t.TempDir(), "acd plans")
+	if err := os.Mkdir(planDir, 0o755); err != nil {
+		t.Fatalf("mkdir plan dir: %v", err)
+	}
+	planPath := filepath.Join(planDir, "rewrite plan.json")
+	quoted := strconv.Quote(planPath)
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+		selection: git.RewriteSelectionOptions{Last: 1},
+		planOnly:  true,
+		planOut:   planPath,
+	}, false)
+	if err != nil {
+		t.Fatalf("plan-only with spaced plan-out: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	assertRewritePlanNextFooter(t, got)
+	for _, prefix := range []string{
+		"  acd rewrite-commits --show-plan ",
+		"  acd rewrite-commits --apply-plan ",
+	} {
+		var found bool
+		for _, line := range strings.Split(got, "\n") {
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			if !strings.Contains(line, quoted) {
+				t.Fatalf("next step line missing quoted plan path %q:\n%s", quoted, line)
+			}
+			found = true
+		}
+		if !found {
+			t.Fatalf("missing next step line with prefix %q in:\n%s", prefix, got)
+		}
+	}
+}
+
+func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    req = json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, planOnly: true}, false)
+	if err != nil {
+		t.Fatalf("plan-only generate: %v\noutput:\n%s", err, out.String())
+	}
+	assertRewritePlanNextFooter(t, out.String())
+}
+
 func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.T) {
 	repo := rewriteSelectionTestRepo(t)
 	ctx := context.Background()
@@ -150,8 +238,41 @@ func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.
 		t.Fatalf("edit saved plan by id: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "unchanged") || !strings.Contains(got, "no AI call") || !strings.Contains(got, "No commits were rewritten") {
-		t.Fatalf("edit output missing unchanged/no-AI/no-rewrite status: %q", got)
+	if !strings.Contains(got, "unchanged") || !strings.Contains(got, "no AI call") {
+		t.Fatalf("edit output missing unchanged/no-AI status: %q", got)
+	}
+	if strings.Contains(got, "No commits were rewritten.") && !strings.Contains(got, "Plan saved") {
+		t.Fatalf("plan-only edit must not end with only no-rewrite message: %q", got)
+	}
+	assertRewritePlanNextFooter(t, got)
+}
+
+func TestRewriteCommitsDeclinedApplyOmitsNextFooter(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    req = json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+		selection: git.RewriteSelectionOptions{Last: 1},
+		noReview:  true,
+		in:        strings.NewReader("n\n"),
+	}, false)
+	if err != nil {
+		t.Fatalf("declined apply generate: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "No rewrite performed.") {
+		t.Fatalf("declined apply output missing no-rewrite message: %q", got)
+	}
+	if strings.Contains(got, "Next:") {
+		t.Fatalf("declined apply output must not include Next footer: %q", got)
 	}
 }
 
@@ -216,7 +337,7 @@ func TestRewriteCommitsGenerationReviewPrintsEditedRevisionID(t *testing.T) {
 		t.Fatalf("generation review edit: %v\noutput:\n%s", err, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "Edited rewrite plan saved as ") || !strings.Contains(got, "No commits were rewritten") {
+	if !strings.Contains(got, "Edited rewrite plan saved as ") || !strings.Contains(got, "No rewrite performed.") {
 		t.Fatalf("generation review output missing edited revision id/no-rewrite: %q", got)
 	}
 	editedID := parseRewritePlanIDAfter(t, got, "Edited rewrite plan saved as")
@@ -322,7 +443,7 @@ func TestRewriteCommitsEditSavedPlanPromptsBeforeApply(t *testing.T) {
 		t.Fatalf("edit prompt flow: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "Apply this edited rewrite plan now?") || !strings.Contains(got, "No commits were rewritten") {
+	if !strings.Contains(got, "Apply this edited rewrite plan now?") || !strings.Contains(got, "No rewrite performed.") {
 		t.Fatalf("edit output missing apply prompt/no-rewrite: %q", got)
 	}
 }
@@ -378,6 +499,22 @@ func TestRewriteCommitsApplyPlanRequiresConfirmationButBypassesProviderGate(t *t
 	}
 	if got := out.String(); !strings.Contains(got, "no second AI call") {
 		t.Fatalf("apply-plan output missing no-AI-call note: %q", got)
+	}
+}
+
+func assertRewritePlanNextFooter(t *testing.T, got string) {
+	t.Helper()
+	for _, want := range []string{
+		"Plan saved",
+		"Next:",
+		"--show-plan",
+		"--apply-plan",
+		"--dry-run",
+		"--yes",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rewrite plan-only next footer missing %q in:\n%s", want, got)
+		}
 	}
 }
 

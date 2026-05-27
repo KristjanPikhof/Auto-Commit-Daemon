@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed
+
+- **`acd list` (breaking on TTY):** Interactive terminals default to a live
+  compact dashboard (`REPO`/`DAEMON`/`PEND`/`BLK`/`HEAD`/`STATUS`). `REPO` is
+  the last two path segments (e.g. `Development/Auto-Commit-Daemon`); duplicate
+  labels get a `#` hash suffix. Compact status tokens include `blk`, `wait`,
+  `miss`, `bad`. Pipes and non-TTY stdout get a one-shot compact table. Use
+  `--once` for one snapshot on a TTY, `--verbose` for the wide table, `--json`
+  for JSON (one-shot on TTY). `--watch` is an explicit alias. `--watch` with
+  `--json` is rejected.
+- **`acd rewrite-commits --plan-only`:** Ends with `Plan saved. Git history
+  unchanged.` and a `Next:` block (`--show-plan`, `--apply-plan --dry-run`,
+  `--apply-plan --yes`). Declining apply prints `No rewrite performed.`
+
 ### Added
 
 - **Cursor harness:** `acd setup cursor` prints user-global install steps;

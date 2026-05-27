@@ -114,7 +114,8 @@ acd fix --force --dry-run          # explicit force plan for barriers with pendi
 acd fix --force --yes              # apply only after verifying HEAD already has the change or discard is intended
 ~~~
 
-`blocked` in `acd list` means action is still required. If only `pending`
+`blk` in compact `acd list` (`blocked` with `--verbose`/`--json`) means action
+is still required. If only `pending`
 remains under intent strategy, ACD may be waiting for more captures or the age
 trigger; use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an
 active harness session when you want to drain the visible batch now.
