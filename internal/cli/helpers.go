@@ -261,7 +261,7 @@ func buildListRepoLabelsCompact(entries []listEntry) map[string]string {
 }
 
 // listRepoLabelCompact returns the REPO column label for compact list output.
-func listRepoLabelCompact(path, repoHash string, labels map[string]string) string {
+func listRepoLabelCompact(path string, labels map[string]string) string {
 	if label, ok := labels[path]; ok {
 		return label
 	}
@@ -279,8 +279,10 @@ func listStatusCompact(status string) string {
 		return "blk"
 	case "paused":
 		return "pause"
-	case "missing", "unreadable":
+	case "missing":
 		return "miss"
+	case "unreadable":
+		return "bad"
 	case "stale":
 		return "stale"
 	default:

@@ -519,6 +519,57 @@ func TestList_PendingOnlyShowsWaitingNotBlocked(t *testing.T) {
 	}
 }
 
+func TestListStatusCompact(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"OK", "OK"},
+		{"waiting", "wait"},
+		{"blocked", "blk"},
+		{"paused", "pause"},
+		{"missing", "miss"},
+		{"unreadable", "bad"},
+		{"stale", "stale"},
+		{"custom", "custom"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.status, func(t *testing.T) {
+			t.Parallel()
+			if got := listStatusCompact(tc.status); got != tc.want {
+				t.Fatalf("listStatusCompact(%q) = %q, want %q", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestList_UnreadableStateShowsBad(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close state db: %v", err)
+	}
+	if err := os.WriteFile(dbPath, []byte("not-a-sqlite-db"), 0o600); err != nil {
+		t.Fatalf("corrupt state.db: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("runList: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "bad") {
+		t.Fatalf("expected compact unreadable status bad, got:\n%s", stdout.String())
+	}
+	if stderr.Len() == 0 {
+		t.Fatalf("expected skip log on stderr for unreadable state.db, got empty")
+	}
+}
+
 func TestList_MissingStateDB_Reported(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

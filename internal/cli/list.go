@@ -288,7 +288,7 @@ func renderListTableCompact(out io.Writer, entries []listEntry) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "REPO\tDAEMON\tPEND\tBLK\tHEAD\tSTATUS")
 	for _, e := range entries {
-		repo := listRepoLabelCompact(e.Path, e.RepoHash, labels)
+		repo := listRepoLabelCompact(e.Path, labels)
 		statusCol := listStatusCompact(e.Status)
 		if listRowMissing(e.Status) {
 			fmt.Fprintf(tw, "%s\t-\t\t\t\t%s\n", repo, statusCol)
