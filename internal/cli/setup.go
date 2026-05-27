@@ -39,6 +39,9 @@ var harnessSnippets = map[string]harnessSnippet{
 	// with `templates/codex/hooks.json` rather than renaming it to a
 	// `.snippet.json` form, which would imply a partial fragment.
 	"codex":    {"codex/hooks.json", "//"},
+	// cursor ships the full ~/.cursor/hooks.json body (strict JSON), same pattern
+	// as codex: `acd setup cursor --raw > ~/.cursor/hooks.json`.
+	"cursor":   {"cursor/hooks.json", "//"},
 	"opencode": {"opencode/hooks.snippet.yaml", "#"},
 	"pi":       {"pi/hooks.snippet.yaml", "#"},
 	// shell prints both snippet files separated by a divider.
@@ -72,8 +75,9 @@ When no harness is provided, acd tries to detect one installed acd-managed harne
 
 Use --raw to emit only the snippet body (no comment-wrapped header, footer, or README). This is required when the snippet is strict JSON (e.g. acd setup codex --raw > ~/.codex/hooks.json) because JSON has no comment syntax.
 
-Supported harnesses include claude-code, codex, opencode, pi, and shell.`,
+Supported harnesses include claude-code, codex, cursor, opencode, pi, and shell.`,
 		Example: `  acd setup codex --raw > ~/.codex/hooks.json
+  acd setup cursor --raw > ~/.cursor/hooks.json
   acd setup claude-code
   acd setup opencode
   acd setup shell`,
