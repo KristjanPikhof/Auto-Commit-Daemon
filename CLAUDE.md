@@ -70,8 +70,8 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Broad-run-sensitive tests: `TestRun_FsnotifyDrivesWake`, `TestRun_LifecycleHappyPath`, `TestRun_WakeBurstCoalesced`, `TestRun_RealSIGUSR1`, repeated edits, external FF reseed, FF-in-grace self-heal.
 - HEAD-transition tests: `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
 - CLI changes need Cobra help/examples. Template changes need `internal/cli/setup_test.go` plus AdapterE2E coverage.
-- Self-hosting: ACD may auto-commit this repo. Before destructive or prompt-sensitive work: `acd pause --repo . --reason "..." --yes`; after: `acd resume --repo . --yes`.
-- Source edits do not affect the already-running daemon. When testing daemon or prompt behavior, `make build`, install/use the new `bin/acd`, then restart the daemon or run the intended binary directly.
+- Self-hosting: ACD may auto-commit this repo. Pause only for branch/history surgery, recovery/state-db mutation, or tests that intentionally exercise daemon capture/replay against this repo; after: `acd resume --repo . --yes`.
+- Source edits do not affect the already-running daemon. Ordinary implementation work does not require pausing; when testing daemon or prompt behavior, `make build`, install/use the new `bin/acd`, then restart the daemon or run the intended binary directly.
 - Intent-env failures: rerun with `cleanenv`; verify suspected main flakes on `main`.
 
 Commit message format expected from AI and manual fixes:
