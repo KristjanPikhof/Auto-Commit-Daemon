@@ -2,6 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -309,6 +313,133 @@ func TestHookStdinExtract_StdinTruncationIsDistinct(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("unexpected stdout on truncation: %q", out.String())
+	}
+}
+
+func TestHookCursorExtract_SampleCursorStdin(t *testing.T) {
+	requireGitForCLIResolverTest(t)
+	repo := initCLIResolverRepo(t)
+	nested := filepath.Join(repo, "pkg")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"conversation_id": "conv-9f3a2b1c",
+		"workspace_roots": []string{"/not/a/repo", nested},
+		"cwd":             "/ignored/when/roots/git",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runHookCursorExtract(strings.NewReader(string(payload)), &out); err != nil {
+		t.Fatalf("runHookCursorExtract: %v", err)
+	}
+	wantRepo := canonicalCLIResolverTestPath(t, repo)
+	if got := out.String(); got != "conv-9f3a2b1c\n"+wantRepo+"\n" {
+		t.Fatalf("output=%q want conversation_id and git toplevel from first resolvable workspace root", got)
+	}
+}
+
+func TestHookCursorExtract_EmptyWorkspaceRootsUsesCwd(t *testing.T) {
+	const cwd = "/tmp/cursor-hook-cwd"
+	payload := `{"conversation_id":"conv-cwd","workspace_roots":[],"cwd":"` + cwd + `"}`
+
+	var out bytes.Buffer
+	if err := runHookCursorExtract(strings.NewReader(payload), &out); err != nil {
+		t.Fatalf("runHookCursorExtract: %v", err)
+	}
+	if got := out.String(); got != "conv-cwd\n"+cwd+"\n" {
+		t.Fatalf("output=%q want cwd when workspace_roots is empty", got)
+	}
+}
+
+func TestHookCursorExtract_NonGitCwdWhenRootsUnresolved(t *testing.T) {
+	requireGitForCLIResolverTest(t)
+	gitRepo := initCLIResolverRepo(t)
+	nonGit := t.TempDir()
+
+	payload, err := json.Marshal(map[string]any{
+		"conversation_id": "conv-nogit",
+		"workspace_roots": []string{nonGit},
+		"cwd":             nonGit,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runHookCursorExtract(strings.NewReader(string(payload)), &out); err != nil {
+		t.Fatalf("runHookCursorExtract: %v", err)
+	}
+	wantCWD := canonicalCLIResolverTestPath(t, nonGit)
+	if got := out.String(); got != "conv-nogit\n"+wantCWD+"\n" {
+		t.Fatalf("output=%q want non-git cwd when workspace_roots has no git root", got)
+	}
+
+	// Sanity: a resolvable git root in workspace_roots still wins over cwd.
+	payload2, err := json.Marshal(map[string]any{
+		"conversation_id": "conv-git",
+		"workspace_roots": []string{nonGit, gitRepo},
+		"cwd":             nonGit,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload2: %v", err)
+	}
+	out.Reset()
+	if err := runHookCursorExtract(strings.NewReader(string(payload2)), &out); err != nil {
+		t.Fatalf("runHookCursorExtract git root: %v", err)
+	}
+	wantRepo := canonicalCLIResolverTestPath(t, gitRepo)
+	if got := out.String(); got != "conv-git\n"+wantRepo+"\n" {
+		t.Fatalf("output=%q want first resolvable git root in workspace_roots", got)
+	}
+}
+
+func TestHookCursorExtract_FallsBackToProcessCwd(t *testing.T) {
+	requireGitForCLIResolverTest(t)
+	repo := initCLIResolverRepo(t)
+	chdirForTest(t, repo)
+
+	payload := `{"conversation_id":"conv-pwd"}`
+	var out bytes.Buffer
+	if err := runHookCursorExtract(strings.NewReader(payload), &out); err != nil {
+		t.Fatalf("runHookCursorExtract: %v", err)
+	}
+	wantRepo := canonicalCLIResolverTestPath(t, repo)
+	if got := out.String(); got != "conv-pwd\n"+wantRepo+"\n" {
+		t.Fatalf("output=%q want process cwd when roots and cwd are absent", got)
+	}
+}
+
+func TestHookCursorExtract_MissingConversationIDErrors(t *testing.T) {
+	var out bytes.Buffer
+	err := runHookCursorExtract(strings.NewReader(`{"workspace_roots":[]}`), &out)
+	if err == nil {
+		t.Fatal("expected missing conversation_id error")
+	}
+	if !strings.Contains(err.Error(), "conversation_id") {
+		t.Fatalf("error should mention conversation_id: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("unexpected stdout on error: %q", out.String())
+	}
+}
+
+func TestHookCursorExtract_ResolveCursorHookRepoDirect(t *testing.T) {
+	requireGitForCLIResolverTest(t)
+	repo := initCLIResolverRepo(t)
+	got, err := resolveCursorHookRepo(context.Background(), map[string]any{
+		"workspace_roots": []any{repo},
+	})
+	if err != nil {
+		t.Fatalf("resolveCursorHookRepo: %v", err)
+	}
+	want := canonicalCLIResolverTestPath(t, repo)
+	if got != want {
+		t.Fatalf("repo=%q want %q", got, want)
 	}
 }
 

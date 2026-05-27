@@ -2,18 +2,35 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/spf13/cobra"
 )
 
 // hookStdinLimit caps stdin payloads at 1 MiB. Hook payloads from harnesses are
 // expected to be tiny JSON objects; this guards against runaway inputs.
 const hookStdinLimit = 1024 * 1024
+
+func newHookCursorExtractCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "hook-cursor-extract",
+		Short:  "Extract Cursor hook conversation_id and resolved repo from stdin",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(c *cobra.Command, args []string) error {
+			return runHookCursorExtract(c.InOrStdin(), c.OutOrStdout())
+		},
+	}
+	return cmd
+}
 
 func newHookStdinExtractCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -60,23 +77,9 @@ func runHookStdinExtract(in io.Reader, out io.Writer, fields ...string) error {
 		}
 	}
 
-	// Read stdin into a bounded buffer so we can distinguish "JSON was
-	// malformed" from "payload exceeded 1 MiB". We read up to limit+1 bytes;
-	// anything past the limit means truncation.
-	limited := io.LimitReader(in, hookStdinLimit+1)
-	raw, err := io.ReadAll(limited)
+	payload, err := decodeHookStdinPayload(in, "acd hook-stdin-extract")
 	if err != nil {
-		return fmt.Errorf("acd hook-stdin-extract: read stdin: %w", err)
-	}
-	if len(raw) > hookStdinLimit {
-		return fmt.Errorf("acd hook-stdin-extract: stdin exceeded %d byte limit (1 MiB); refusing to decode truncated JSON", hookStdinLimit)
-	}
-
-	var payload map[string]any
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&payload); err != nil {
-		return fmt.Errorf("acd hook-stdin-extract: decode stdin JSON: %w", err)
+		return err
 	}
 
 	var buf bytes.Buffer
@@ -129,4 +132,146 @@ func runHookStdinExtract(in io.Reader, out io.Writer, fields ...string) error {
 		return err
 	}
 	return nil
+}
+
+// runHookCursorExtract decodes Cursor agent-hook stdin and prints two
+// newline-terminated lines: conversation_id (required) and a resolved repo
+// path. Repo resolution follows templates/cursor/README.md: first git
+// worktree root among workspace_roots in array order, else non-empty cwd,
+// else the hook process working directory.
+func runHookCursorExtract(in io.Reader, out io.Writer) error {
+	payload, err := decodeHookStdinPayload(in, "acd hook-cursor-extract")
+	if err != nil {
+		return err
+	}
+
+	sessionID, err := hookJSONRequiredScalar(payload, "conversation_id", "acd hook-cursor-extract")
+	if err != nil {
+		return err
+	}
+	repo, err := resolveCursorHookRepo(context.Background(), payload)
+	if err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(sessionID)
+	buf.WriteByte('\n')
+	buf.WriteString(repo)
+	buf.WriteByte('\n')
+	if _, err := out.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeHookStdinPayload(in io.Reader, prefix string) (map[string]any, error) {
+	limited := io.LimitReader(in, hookStdinLimit+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("%s: read stdin: %w", prefix, err)
+	}
+	if len(raw) > hookStdinLimit {
+		return nil, fmt.Errorf("%s: stdin exceeded %d byte limit (1 MiB); refusing to decode truncated JSON", prefix, hookStdinLimit)
+	}
+
+	var payload map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
+		return nil, fmt.Errorf("%s: decode stdin JSON: %w", prefix, err)
+	}
+	return payload, nil
+}
+
+func hookJSONRequiredScalar(payload map[string]any, key, prefix string) (string, error) {
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return "", fmt.Errorf("%s: field %q not found", prefix, key)
+	}
+	s, err := hookJSONScalarString(v, key, prefix)
+	if err != nil {
+		return "", err
+	}
+	if s == "" {
+		return "", fmt.Errorf("%s: field %q not found", prefix, key)
+	}
+	return validateHookEmitScalar(key, s, prefix)
+}
+
+func hookJSONOptionalScalar(payload map[string]any, key, prefix string) (string, error) {
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return "", nil
+	}
+	s, err := hookJSONScalarString(v, key, prefix)
+	if err != nil {
+		return "", err
+	}
+	if s == "" {
+		return "", nil
+	}
+	return validateHookEmitScalar(key, s, prefix)
+}
+
+func hookJSONScalarString(v any, key, prefix string) (string, error) {
+	switch tv := v.(type) {
+	case string:
+		return tv, nil
+	case json.Number:
+		return tv.String(), nil
+	case bool:
+		return fmt.Sprintf("%t", tv), nil
+	default:
+		return "", fmt.Errorf("%s: field %q is not a scalar", prefix, key)
+	}
+}
+
+func validateHookEmitScalar(key, s, prefix string) (string, error) {
+	if idx := strings.IndexAny(s, "\r\n\x00"); idx >= 0 {
+		return "", fmt.Errorf("%s: field %q contains forbidden byte 0x%02x at offset %d", prefix, key, s[idx], idx)
+	}
+	return s, nil
+}
+
+func resolveCursorHookRepo(ctx context.Context, payload map[string]any) (string, error) {
+	const prefix = "acd hook-cursor-extract"
+
+	if roots, ok := payload["workspace_roots"]; ok && roots != nil {
+		if arr, ok := roots.([]any); ok {
+			for _, item := range arr {
+				root, ok := item.(string)
+				if !ok || strings.TrimSpace(root) == "" {
+					continue
+				}
+				top, err := gitpkg.ShowToplevel(ctx, root)
+				if err != nil {
+					continue
+				}
+				return validateHookEmitScalar("repo", top, prefix)
+			}
+		}
+	}
+
+	if cwd, err := hookJSONOptionalScalar(payload, "cwd", prefix); err != nil {
+		return "", err
+	} else if cwd != "" {
+		return validateHookEmitScalar("repo", canonicalHookPath(cwd), prefix)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("%s: get working directory: %w", prefix, err)
+	}
+	return validateHookEmitScalar("repo", canonicalHookPath(wd), prefix)
+}
+
+// canonicalHookPath normalizes hook-emitted repo paths the same way git
+// rev-parse --show-toplevel does on macOS (/var -> /private/var).
+func canonicalHookPath(path string) string {
+	clean := filepath.Clean(path)
+	if real, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(real)
+	}
+	return clean
 }
