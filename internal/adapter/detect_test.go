@@ -45,7 +45,7 @@ func TestDetectInstalled_IgnoresUnmanagedConfig(t *testing.T) {
 }
 
 func TestNamesIncludesSupportedHarnessesInOrder(t *testing.T) {
-	want := []string{"claude-code", "codex", "opencode", "pi", "shell"}
+	want := []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"}
 	got := Names()
 	if len(got) != len(want) {
 		t.Fatalf("Names len=%d, want %d: %#v", len(got), len(want), got)
@@ -54,6 +54,76 @@ func TestNamesIncludesSupportedHarnessesInOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("Names[%d]=%q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestDetectInstalled_CursorHooksJSONMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".cursor", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir cursor dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "cursor" {
+		t.Fatalf("DetectInstalled=%#v, want cursor only", got)
+	}
+	h, ok := Lookup("cursor")
+	if !ok {
+		t.Fatalf("Lookup(cursor) missing")
+	}
+	if path := h.ConfigPath(); path != hooks {
+		t.Fatalf("ConfigPath=%q, want %q", path, hooks)
+	}
+	matched, ok := h.MatchedPath()
+	if !ok || matched != hooks {
+		t.Fatalf("MatchedPath=%q ok=%v, want %q", matched, ok, hooks)
+	}
+}
+
+func TestDetectInstalled_CursorIgnoresRepoLocalHooksJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	hooks := filepath.Join(repo, ".cursor", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir cursor dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+	chdirForDetectTest(t, repo)
+
+	for _, h := range DetectInstalled() {
+		if h.Name() == "cursor" {
+			t.Fatalf("DetectInstalled includes cursor from repo-local %q", hooks)
+		}
+	}
+}
+
+func TestDetectInstalled_CursorHooksJSONIgnoresYAMLMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".cursor", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir cursor dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte("# acd-managed: true\n"), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none (YAML marker must not match JSON path)", got)
 	}
 }
 
