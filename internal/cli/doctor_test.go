@@ -1484,6 +1484,17 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 	}
 }
 
+func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
+	body := readSnippet(t, "cursor/hooks.json")
+	drifted := strings.Replace(string(body),
+		`"command": "./hooks/acd-lifecycle.sh start"`,
+		`"command": "./hooks/acd-lifecycle.sh wake"`, 1)
+	note := scanHookBodyDrift("cursor", []byte(drifted))
+	if note == "" {
+		t.Fatalf("sessionStart wired to wake should report drift")
+	}
+}
+
 // TestDoctor_DriftWarningCursorActiveHook seeds a cursor hooks.json whose
 // postToolUse body no longer invokes the lifecycle helper and asserts doctor
 // surfaces drift with the cursor remediation hint.
@@ -1576,6 +1587,12 @@ func TestScanCursorLifecycleScript_MissingExecutable(t *testing.T) {
 	}
 	if !strings.Contains(note, "acd-lifecycle.sh") {
 		t.Fatalf("note should mention lifecycle script, got %q", note)
+	}
+	if strings.Contains(note, "templates/cursor") {
+		t.Fatalf("note must not reference checkout-only templates path, got %q", note)
+	}
+	if !strings.Contains(note, "acd setup cursor") {
+		t.Fatalf("note should point at acd setup cursor, got %q", note)
 	}
 }
 

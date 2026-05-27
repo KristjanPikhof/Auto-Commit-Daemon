@@ -985,6 +985,15 @@ func runCursorE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHealsCursor(t, "cursor", ctx, env, home, repo, sessionID, wakeHook, stdin)
 
+	afterEditHook := pickHookByEvent(t, hooks, "afterFileEdit")
+	if !strings.Contains(afterEditHook.Command, "acd-lifecycle.sh wake") {
+		t.Fatalf("cursor afterFileEdit hook must call acd-lifecycle.sh wake, got: %s", afterEditHook.Command)
+	}
+	if afterRes := runCursorHook(t, ctx, env, home, stdin, afterEditHook.Command); afterRes.ExitCode != 0 {
+		t.Fatalf("cursor afterFileEdit exit=%d\nstdout=%s\nstderr=%s",
+			afterRes.ExitCode, afterRes.Stdout, afterRes.Stderr)
+	}
+
 	flushHook := pickHookByEvent(t, hooks, "stop")
 	if !strings.Contains(flushHook.Command, "acd-lifecycle.sh flush") {
 		t.Fatalf("cursor stop hook must call acd-lifecycle.sh flush, got: %s", flushHook.Command)

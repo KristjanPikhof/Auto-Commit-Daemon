@@ -80,7 +80,7 @@ cmd_flush() {
     --repo "$REPO" >/dev/null 2>>"$LOG" || {
     rc=$?
     printf '[%s] flush failed exit=%d cmd=acd-flush-logical\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-    exit 1
+    exit 0
   }
 }
 
