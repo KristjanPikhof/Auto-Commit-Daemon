@@ -203,6 +203,50 @@ func waitForMetaValue(t *testing.T, db *state.DB, key, want string, timeout time
 	t.Fatalf("%s=%q ok=%v want %q", key, got, ok, want)
 }
 
+func waitForCaptureEventCount(t *testing.T, db *state.DB, want int, timeout time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var got int
+		if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&got); err != nil {
+			t.Fatalf("count capture_events: %v", err)
+		}
+		if got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var got int
+	if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&got); err != nil {
+		t.Fatalf("count capture_events: %v", err)
+	}
+	if got == want {
+		return
+	}
+	if want == 0 && got > 0 {
+		rows, err := db.SQL().QueryContext(ctx, `SELECT seq, operation, path, state, base_head FROM capture_events ORDER BY seq`)
+		if err != nil {
+			t.Fatalf("capture_events=%d want 0; query events: %v", got, err)
+		}
+		defer rows.Close()
+		var details []string
+		for rows.Next() {
+			var seq int64
+			var operation, path, stateName, baseHead string
+			if err := rows.Scan(&seq, &operation, &path, &stateName, &baseHead); err != nil {
+				t.Fatalf("scan captured event: %v", err)
+			}
+			details = append(details, fmt.Sprintf("seq=%d op=%s path=%s state=%s base=%s", seq, operation, path, stateName, baseHead))
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate captured events: %v", err)
+		}
+		t.Fatalf("capture_events=%d want 0 after %v: %s", got, timeout, strings.Join(details, "; "))
+	}
+	t.Fatalf("capture_events=%d want %d after %v", got, want, timeout)
+}
+
 func waitForMetaDeleted(t *testing.T, db *state.DB, key string, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
@@ -1884,8 +1928,11 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", upstreamHead, seedHead); err != nil {
 		t.Fatalf("update-ref upstream: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "upstream.txt"), upstreamBody, 0o644); err != nil {
-		t.Fatalf("write upstream worktree: %v", err)
+	// Sync worktree from the fast-forward commit. Writing the file by hand
+	// after UpdateRef races fsnotify on Linux CI and produces a spurious
+	// create capture even though shadow reseed should satisfy HEAD.
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "-q", upstreamHead, "--", "upstream.txt"); err != nil {
+		t.Fatalf("checkout upstream worktree: %v", err)
 	}
 	for i := 0; i < 4; i++ {
 		select {
@@ -1919,31 +1966,7 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 		t.Fatalf("shadow upstream oid=%s want %s", shadowOID, upstreamBlob)
 	}
 
-	time.Sleep(150 * time.Millisecond)
-	var events int
-	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
-		t.Fatalf("count capture_events: %v", err)
-	}
-	if events != 0 {
-		rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq, operation, path, state, base_head FROM capture_events ORDER BY seq`)
-		if err != nil {
-			t.Fatalf("external fast-forward captured %d upstream events, want 0; query events: %v", events, err)
-		}
-		defer rows.Close()
-		var details []string
-		for rows.Next() {
-			var seq int64
-			var operation, path, stateName, baseHead string
-			if err := rows.Scan(&seq, &operation, &path, &stateName, &baseHead); err != nil {
-				t.Fatalf("scan captured event: %v", err)
-			}
-			details = append(details, fmt.Sprintf("seq=%d op=%s path=%s state=%s base=%s", seq, operation, path, stateName, baseHead))
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatalf("iterate captured events: %v", err)
-		}
-		t.Fatalf("external fast-forward captured %d upstream events, want 0: %s", events, strings.Join(details, "; "))
-	}
+	waitForCaptureEventCount(t, f.db, 0, 3*time.Second)
 
 	cancel()
 	wg.Wait()
