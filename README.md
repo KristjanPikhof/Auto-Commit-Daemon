@@ -1,6 +1,6 @@
 # acd — Auto-Commit-Daemon
 
-One static binary that watches your git worktree, captures meaningful changes, and lands them as chronological commits while you keep coding. Pair it with Claude Code, Codex, OpenCode, or Pi and your AI tool's edits ship as real commits without you stopping to type `git commit`.
+One static binary that watches your git worktree, captures meaningful changes, and lands them as chronological commits while you keep coding. Pair it with Claude Code, Codex, Cursor, OpenCode, or Pi and your AI tool's edits ship as real commits without you stopping to type `git commit`.
 
 Two ways to commit:
 
@@ -29,10 +29,27 @@ Pick the one matching your AI tool, run the setup, paste the printed snippet int
 ~~~bash
 acd setup claude-code   # → ~/.claude/settings.json
 acd setup codex         # → ~/.codex/hooks.json
+acd setup cursor        # → ~/.cursor/hooks.json + ~/.cursor/hooks/acd-lifecycle.sh
 acd setup opencode      # → ~/.config/opencode/hook/hooks.yaml
 acd setup pi            # → ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
+
+Fresh Cursor install (no existing hooks): copy the lifecycle helper, then write
+the JSON config. **`acd setup cursor --raw > ~/.cursor/hooks.json` replaces the
+entire file** — back up and merge manually if you already have custom hooks.
+
+~~~bash
+mkdir -p ~/.cursor/hooks
+install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh
+acd setup cursor --raw > ~/.cursor/hooks.json
+~~~
+
+(`templates/...` paths are relative to an acd checkout or release tree; run
+`acd setup cursor` without `--raw` for the full copy-paste instructions.)
+
+Cursor uses **user-global** hooks only (`~/.cursor/hooks.json`, not a repo
+`.cursor/hooks.json`). Approve hooks in **Settings → Hooks** after install.
 
 Codex hooks are enabled by default. If your `~/.codex/config.toml` pins feature
 flags, keep lifecycle hooks enabled with the canonical key:
@@ -51,6 +68,7 @@ After wiring, sanity-check with `acd doctor`. It checks the snippet matches the 
 |---|---|---|
 | `claude-code` | Native | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
 | `codex` | Native (run `/hooks` after each install to re-approve) | [OpenAI Codex](https://developers.openai.com/codex/hooks) |
+| `cursor` | Native (user-global `~/.cursor/hooks.json`; approve in Settings → Hooks) | [Cursor agent hooks](https://cursor.com/docs/agent/hooks) |
 | `opencode` | External: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) | KristjanPikhof |
 | `pi` | External: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) | KristjanPikhof |
 | `shell` | direnv `.envrc` or shell rc | n/a |

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **Cursor harness:** `acd setup cursor` prints user-global install steps;
+  `acd setup cursor --raw > ~/.cursor/hooks.json` writes strict JSON for a
+  fresh install. Copy `templates/cursor/hooks/acd-lifecycle.sh` to
+  `~/.cursor/hooks/acd-lifecycle.sh` first — hook commands are relative to
+  `~/.cursor/`. Redirecting `--raw` output **replaces the entire hooks file**;
+  merge the five lifecycle events manually when you already have custom hooks.
+  Approve hooks in Cursor **Settings → Hooks** after install.
+
 ## v2026-05-25
 
 ### Added
