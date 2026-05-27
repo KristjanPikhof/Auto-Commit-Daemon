@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -260,11 +261,22 @@ func finishRewritePlanOnly(out io.Writer, planRef string) {
 	printRewritePlanNextSteps(out, planRef)
 }
 
+func rewritePlanRefArg(ref string) string {
+	if ref == "" {
+		return ref
+	}
+	if strings.ContainsAny(ref, " \t'\"$`\\") {
+		return strconv.Quote(ref)
+	}
+	return ref
+}
+
 func printRewritePlanNextSteps(out io.Writer, planRef string) {
+	arg := rewritePlanRefArg(planRef)
 	fmt.Fprintln(out, "Next:")
-	fmt.Fprintf(out, "  acd rewrite-commits --show-plan %s\n", planRef)
-	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --dry-run\n", planRef)
-	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", planRef)
+	fmt.Fprintf(out, "  acd rewrite-commits --show-plan %s\n", arg)
+	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --dry-run\n", arg)
+	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", arg)
 }
 
 func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
