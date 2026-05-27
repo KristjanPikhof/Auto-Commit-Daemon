@@ -127,6 +127,75 @@ func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	}
 }
 
+func TestRewritePlanRefArg(t *testing.T) {
+	tests := []struct {
+		ref  string
+		want string
+	}{
+		{"", ""},
+		{"rp_abc123", "rp_abc123"},
+		{"/tmp/rewrite.json", "/tmp/rewrite.json"},
+		{"has space", strconv.Quote("has space")},
+		{"tab\there", strconv.Quote("tab\there")},
+		{"quote'path", strconv.Quote("quote'path")},
+		{`dollar$path`, strconv.Quote(`dollar$path`)},
+	}
+	for _, tc := range tests {
+		if got := rewritePlanRefArg(tc.ref); got != tc.want {
+			t.Errorf("rewritePlanRefArg(%q) = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    req = json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	planDir := filepath.Join(t.TempDir(), "acd plans")
+	if err := os.Mkdir(planDir, 0o755); err != nil {
+		t.Fatalf("mkdir plan dir: %v", err)
+	}
+	planPath := filepath.Join(planDir, "rewrite plan.json")
+	quoted := strconv.Quote(planPath)
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+		selection: git.RewriteSelectionOptions{Last: 1},
+		planOnly:  true,
+		planOut:   planPath,
+	}, false)
+	if err != nil {
+		t.Fatalf("plan-only with spaced plan-out: %v\noutput:\n%s", err, out.String())
+	}
+	got := out.String()
+	assertRewritePlanNextFooter(t, got)
+	for _, prefix := range []string{
+		"  acd rewrite-commits --show-plan ",
+		"  acd rewrite-commits --apply-plan ",
+	} {
+		var found bool
+		for _, line := range strings.Split(got, "\n") {
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			if !strings.Contains(line, quoted) {
+				t.Fatalf("next step line missing quoted plan path %q:\n%s", quoted, line)
+			}
+			found = true
+		}
+		if !found {
+			t.Fatalf("missing next step line with prefix %q in:\n%s", prefix, got)
+		}
+	}
+}
+
 func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
