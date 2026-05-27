@@ -73,11 +73,11 @@ Watch mode prints plain table frames and does not support --json.`,
   acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			stdout, _ := cmd.OutOrStdout().(*os.File)
-			useWatch, err := listRunMode(stdout, once, watch, jsonOut)
-			if err != nil {
-				return err
+			if watch && jsonOut {
+				return fmt.Errorf("acd list: --watch does not support --json")
 			}
+			stdout, _ := cmd.OutOrStdout().(*os.File)
+			useWatch := listUseWatchMode(stdout, once, watch) && !jsonOut
 			if useWatch {
 				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval, verbose)
 			}
@@ -89,15 +89,6 @@ Watch mode prints plain table frames and does not support --json.`,
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Wide table with paths, CLIENTS, LAST_COMMIT, and status notes")
 	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for watch mode (Go duration)")
 	return cmd
-}
-
-// listRunMode decides whether acd list uses the live watch dashboard.
-// --json always selects one-shot output; --watch with --json is rejected.
-func listRunMode(stdout *os.File, once, watchExplicit, jsonOut bool) (useWatch bool, err error) {
-	if watchExplicit && jsonOut {
-		return false, fmt.Errorf("acd list: --watch does not support --json")
-	}
-	return listUseWatchMode(stdout, once, watchExplicit) && !jsonOut, nil
 }
 
 // listUseWatchMode reports whether acd list should run the live dashboard.
