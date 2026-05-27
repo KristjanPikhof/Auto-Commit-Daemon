@@ -38,7 +38,7 @@ func TestListUseWatchMode(t *testing.T) {
 	if listUseWatchMode(nil, true, false) {
 		t.Fatal("--once should disable watch")
 	}
-	if listUseWatchMode(nil, false, true) {
+	if !listUseWatchMode(nil, false, true) {
 		t.Fatal("explicit --watch should enable watch without stdout")
 	}
 	if listUseWatchMode(nil, false, false) {
@@ -72,8 +72,8 @@ func TestList_VerboseOnceShowsWideColumns(t *testing.T) {
 func TestBuildListRepoLabelsCompact_CollisionSuffix(t *testing.T) {
 	t.Parallel()
 	entries := []listEntry{
-		{Path: filepath.Join("/tmp", "work", "acd-repo"), RepoHash: "abc123deadbeef"},
-		{Path: filepath.Join("/tmp", "other", "acd-repo"), RepoHash: "feedbeefabcd12"},
+		{Path: filepath.Join("/tmp", "label", "acd-repo"), RepoHash: "abc123deadbeef"},
+		{Path: filepath.Join("/else", "label", "acd-repo"), RepoHash: "feedbeefabcd12"},
 	}
 	labels := buildListRepoLabelsCompact(entries)
 	a := labels[entries[0].Path]
