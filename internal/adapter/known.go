@@ -73,6 +73,14 @@ var knownHarnesses = []knownHarness{
 		},
 	},
 	{
+		name: "cursor",
+		// User-scoped hooks.json only; Cursor does not use a repo-local
+		// `.cursor/hooks.json` install path for acd (unlike Codex).
+		paths: []pathSpec{
+			{path: "~/.cursor/hooks.json", markers: jsonAcdManagedMarkers},
+		},
+	},
+	{
 		name: "opencode",
 		// Canonical OpenCode default is ~/.config/opencode/hook/hooks.yaml
 		// (note the `hook/` segment). The pre-canonical layout

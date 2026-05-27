@@ -366,6 +366,11 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Notes = append(hr.Notes, note)
 			}
 		}
+		if name == "cursor" && hr.Installed {
+			if note := tailCursorHookLog(); note != "" {
+				hr.Notes = append(hr.Notes, note)
+			}
+		}
 		reports = append(reports, hr)
 	}
 	return reports
@@ -379,6 +384,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 var driftRemediationCommands = map[string]string{
 	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
 	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
+	"cursor":      "acd setup cursor  # merge output into ~/.cursor/hooks.json; to overwrite: cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak && acd setup cursor --raw > ~/.cursor/hooks.json",
 	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
 	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
 }
@@ -387,8 +393,10 @@ var driftRemediationCommands = map[string]string{
 // and returns a non-empty note when one or more active-hook command bodies
 // are missing the canonical `acd start` + `acd wake` pair. Active hooks are:
 //
-//   - claude-code, codex : PreToolUse + PostToolUse entries inside JSON
-//     "hooks" map
+//   - claude-code, codex : PreToolUse + PostToolUse entries inside nested JSON
+//     "hooks" map (PascalCase event keys)
+//   - cursor             : sessionStart/postToolUse/afterFileEdit/stop/sessionEnd
+//     flat JSON entries (camelCase keys, top-level `command` per hook)
 //   - opencode, pi       : YAML hook items whose `event:` is `tool.before.*`
 //     or `tool.after.*`
 //
@@ -406,14 +414,18 @@ func scanHookBodyDrift(name string, body []byte) string {
 // authored canonical file. When matchedPath is empty, behaves identically to
 // the canonical-path remediation.
 func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
-	bodies := extractActiveHookBodies(name, body)
-	if len(bodies) == 0 {
-		return ""
-	}
-	stale := 0
-	for _, b := range bodies {
-		if !(strings.Contains(b, "acd start") && strings.Contains(b, "acd wake")) {
-			stale++
+	var stale int
+	if name == "cursor" {
+		stale = countCursorStaleLifecycleCommands(body)
+	} else {
+		bodies := extractActiveHookBodies(name, body)
+		if len(bodies) == 0 {
+			return ""
+		}
+		for _, b := range bodies {
+			if !activeHookBodyHasStartWake(name, b) {
+				stale++
+			}
 		}
 	}
 	if stale == 0 {
@@ -432,16 +444,98 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
 }
 
+// cursorLifecycleSubcommands maps wired Cursor hook events to the acd command
+// each inline hook string must invoke.
+var cursorLifecycleSubcommands = map[string]string{
+	"sessionStart":  "start",
+	"postToolUse":   "wake",
+	"afterFileEdit": "wake",
+	"stop":          "flush",
+	"sessionEnd":    "stop",
+}
+
+// activeHookBodyHasStartWake reports whether an installed active-hook command
+// body still carries the canonical acd start+wake behavior.
+func activeHookBodyHasStartWake(harness, body string) bool {
+	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
+		return true
+	}
+	if harness == "cursor" {
+		return cursorLifecycleCommandOK("wake", body)
+	}
+	return false
+}
+
+func countCursorStaleLifecycleCommands(body []byte) int {
+	byEvent, ok := extractCursorHookCommandsByEvent(body)
+	if !ok {
+		return 0
+	}
+	stale := 0
+	for event, want := range cursorLifecycleSubcommands {
+		cmds := byEvent[event]
+		if len(cmds) == 0 {
+			stale++
+			continue
+		}
+		for _, cmd := range cmds {
+			if !cursorLifecycleCommandOK(want, cmd) {
+				stale++
+			}
+		}
+	}
+	return stale
+}
+
+func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
+	switch wantSubcmd {
+	case "wake":
+		return strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")
+	case "start":
+		return strings.Contains(command, "acd start")
+	case "flush":
+		return strings.Contains(command, "acd flush --logical")
+	case "stop":
+		return strings.Contains(command, "acd stop")
+	}
+	return false
+}
+
+// extractCursorHookCommandsByEvent parses Cursor hooks.json and returns the
+// command string(s) for each event key present in the file.
+func extractCursorHookCommandsByEvent(body []byte) (map[string][]string, bool) {
+	var top struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil || top.Hooks == nil {
+		return nil, false
+	}
+	out := make(map[string][]string)
+	for ev, entries := range top.Hooks {
+		for _, e := range entries {
+			if c := strings.TrimSpace(e.Command); c != "" {
+				out[ev] = append(out[ev], c)
+			}
+		}
+	}
+	return out, true
+}
+
 // extractActiveHookBodies returns the command-string bodies of the active
 // hooks for harness `name`. JSON harnesses (claude-code, codex) parse the
-// "hooks" map and return the "command" string of every entry under
-// PreToolUse + PostToolUse. YAML harnesses (opencode, pi) text-scan for hook
-// items whose event matches tool.before.* / tool.after.* and concatenate the
-// `bash: |` block bodies.
+// nested "hooks" map and return the "command" string of every entry under
+// PreToolUse + PostToolUse. Cursor uses the flat version-1 schema (camelCase
+// event keys with a top-level `command` per hook). YAML harnesses (opencode,
+// pi) text-scan for hook items whose event matches tool.before.* /
+// tool.after.* and concatenate the `bash: |` block bodies.
 func extractActiveHookBodies(name string, body []byte) []string {
 	switch name {
 	case "claude-code", "codex":
 		return extractJSONHookBodies(body, []string{"PreToolUse", "PostToolUse"})
+	case "cursor":
+		return extractCursorFlatHookBodies(body, []string{"postToolUse", "afterFileEdit"})
 	case "opencode", "pi":
 		return extractYAMLHookBodies(body, []string{"tool.before.", "tool.after."})
 	default:
@@ -489,6 +583,46 @@ func extractJSONHookBodies(body []byte, events []string) []string {
 				if strings.TrimSpace(h.Command) != "" {
 					out = append(out, h.Command)
 				}
+			}
+		}
+	}
+	return out
+}
+
+// extractCursorFlatHookBodies parses Cursor hooks.json (version 1 flat schema)
+// and returns the `command` string of every hook entry under the requested
+// camelCase event keys (e.g. postToolUse, afterFileEdit).
+//
+// Schema (per templates/cursor/hooks.json):
+//
+//	{
+//	  "version": 1,
+//	  "hooks": {
+//	    "postToolUse": [ { "command": "...", "timeout": 15 }, ... ],
+//	    ...
+//	  }
+//	}
+func extractCursorFlatHookBodies(body []byte, events []string) []string {
+	var top struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil
+	}
+	if len(top.Hooks) == 0 {
+		return nil
+	}
+	var out []string
+	for _, ev := range events {
+		entries, ok := top.Hooks[ev]
+		if !ok {
+			continue
+		}
+		for _, e := range entries {
+			if strings.TrimSpace(e.Command) != "" {
+				out = append(out, e.Command)
 			}
 		}
 	}
@@ -619,18 +753,27 @@ func extractYAMLHookBodies(body []byte, eventPrefixes []string) []string {
 	return out
 }
 
-// codexHookLogPath returns the canonical location of codex-hook.log under
-// XDG_STATE_HOME (defaulting to $HOME/.local/state). Mirrors the path used
-// by templates/codex/hooks.json.
-func codexHookLogPath() string {
+// harnessHookLogPath returns <XDG_STATE_HOME>/acd/<harness>-hook.log.
+func harnessHookLogPath(harness string) string {
 	if v := os.Getenv("XDG_STATE_HOME"); v != "" && filepath.IsAbs(v) {
-		return filepath.Join(v, "acd", "codex-hook.log")
+		return filepath.Join(v, "acd", harness+"-hook.log")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".local", "state", "acd", "codex-hook.log")
+	return filepath.Join(home, ".local", "state", "acd", harness+"-hook.log")
+}
+
+// codexHookLogPath returns the canonical location of codex-hook.log under
+// XDG_STATE_HOME (defaulting to $HOME/.local/state). Mirrors the path used
+// by templates/codex/hooks.json.
+func codexHookLogPath() string {
+	return harnessHookLogPath("codex")
+}
+
+func cursorHookLogPath() string {
+	return harnessHookLogPath("cursor")
 }
 
 // codexHookLogRecentWindow controls how far back tailCodexHookLog looks for
@@ -640,10 +783,19 @@ var codexHookLogRecentWindow = 5 * time.Minute
 
 // tailCodexHookLog returns a Note describing recent codex-hook.log entries
 // that look like errors (stderr-style), or "" when the file does not exist
-// or contains no error-like lines. We read the trailing 8 KiB of the file
-// and inspect up to the last 50 non-empty lines.
+// or contains no error-like lines.
 func tailCodexHookLog() string {
-	path := codexHookLogPath()
+	return tailHarnessHookLog(codexHookLogPath(), "codex-hook.log")
+}
+
+// tailCursorHookLog mirrors tailCodexHookLog for cursor-hook.log.
+func tailCursorHookLog() string {
+	return tailHarnessHookLog(cursorHookLogPath(), "cursor-hook.log")
+}
+
+// tailHarnessHookLog reads the trailing 8 KiB of path and inspects up to the
+// last 50 non-empty lines for hook-wrapper failures.
+func tailHarnessHookLog(path, displayName string) string {
 	if path == "" {
 		return ""
 	}
@@ -722,11 +874,11 @@ func tailCodexHookLog() string {
 		first = first[:240] + "…"
 	}
 	if recentCount > 0 {
-		return fmt.Sprintf("codex-hook.log shows %d recent error(s) within the last %s (first: %s); see %s",
-			recentCount, formatDurationCompact(codexHookLogRecentWindow), first, homeShort(path))
+		return fmt.Sprintf("%s shows %d recent error(s) within the last %s (first: %s); see %s",
+			displayName, recentCount, formatDurationCompact(codexHookLogRecentWindow), first, homeShort(path))
 	}
-	return fmt.Sprintf("codex-hook.log shows %d error(s) in the last %d line(s) (first: %s); see %s",
-		totalErr, len(tail), first, homeShort(path))
+	return fmt.Sprintf("%s shows %d error(s) in the last %d line(s) (first: %s); see %s",
+		displayName, totalErr, len(tail), first, homeShort(path))
 }
 
 // looksLikeHookError returns true when ln looks like a real failure

@@ -54,7 +54,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `internal/ai` | deterministic/openai-compat/subprocess providers, commit message prompts, intent planner |
 | `internal/adapter` | harness detection and markers; do not restore TODO stubs |
 | `internal/{central,identity,logger,paths,pause,trace}` | registry/stats, fingerprints, logs, XDG, pause markers, trace |
-| `templates/{claude-code,codex,opencode,pi,shell}` | setup snippets; Codex uses `hooks.json`; legacy TOML removed |
+| `templates/{claude-code,codex,cursor,opencode,pi,shell}` | setup snippets; Codex and Cursor use `hooks.json`; legacy TOML removed |
 | `test/integration` | build-tagged lifecycle, adapter, recovery, AI, explainable, self-heal, intent, latency-budget tests |
 | `.github/workflows/{ci,codeql,release}.yml` | CI, CodeQL, tag release |
 | `README.md`, `docs/*`, `CHANGELOG.md` | user contract; nested fences use `~~~` |
@@ -191,6 +191,7 @@ acd status --repo .
 |---|---|---|---|---|
 | Claude Code | `SessionStart -> acd start` fail-soft | `Pre/PostToolUse`: start+wake and-chain + log fallback | `Stop -> acd flush --logical`; `SessionEnd -> acd stop --session-id` | `CLAUDE_PROJECT_DIR:-$PWD`; nested JSON |
 | Codex | `SessionStart -> acd start` | `UserPromptSubmit`/`PreToolUse`/`PostToolUse`; matcher `apply_patch\|Edit\|Write\|Bash` | `Stop -> acd touch` | `templates/codex/hooks.json`; active timeout 15s |
+| Cursor | `sessionStart -> acd start` | `postToolUse`/`afterFileEdit` -> start+wake inline | `stop -> flush`; `sessionEnd -> stop` | User-global `~/.cursor/hooks.json`; `conversation_id`; `--watch-pid 0`; approve in Settings → Hooks |
 | OpenCode | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: start+wake and-chain + log fallback | `session.idle -> acd flush --logical`; `session.deleted -> acd stop --session-id` | `OPENCODE_SESSION_ID`/`OPENCODE_PROJECT_DIR`; `~/.config/opencode/hook/hooks.yaml` |
 | Pi | `session.created -> acd start` | `tool.before.*`/`tool.after.*`: start+wake and-chain + log fallback | `session.idle -> acd flush --logical`; `session.deleted -> acd stop --session-id` | `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`; no `uuidgen`; `~/.pi/agent/hook/hooks.yaml` |
 
@@ -209,6 +210,7 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 - Codex Stop deliberately stays on `acd touch`: Codex Stop fires on every assistant turn and overlaps tool runs, so `flush --logical` there would chain commits per tool turn. If Codex later adds a true session-idle event, mirror the Claude/OpenCode/Pi flush behavior.
 - Codex `/hooks` re-approval is required after every `~/.codex/hooks.json` change; until approved, `SessionStart` never fires.
 - `acd setup codex --raw > ~/.codex/hooks.json` destroys non-ACD entries; custom-hook users must merge manually.
+- Cursor: user-global `~/.cursor/hooks.json` only (not repo `.cursor/hooks.json`); hook commands are inline in `templates/cursor/hooks.json`. `acd setup cursor --raw > ~/.cursor/hooks.json` replaces the entire file; merge the five lifecycle events manually when non-acd hooks exist. Approve in Settings → Hooks after install.
 - Codex hooks are enabled by default. If `~/.codex/config.toml` pins feature flags, keep `[features].hooks = true`; `features.codex_hooks` is only a deprecated alias. `hooks.json` carries hook bodies, not feature flags.
 - Codex `cwd` comes from stdin via `acd hook-stdin-extract session_id cwd? <&0`; missing `cwd` falls back to `$PWD`. `CODEX_PROJECT_DIR`/`printf "{}\n"` are gone. Bash bodies use `|| exit 0` after helper so missing `acd` does not block hook.
 - `acd flush --logical` refreshes heartbeat, enqueues `flush_logical`, and SIGUSR1s the daemon. Only drained `flush_logical` sets `IntentBypassBatchWait`; plain `acd wake` only nudges capture/replay. Logical flush requires a registered active session id and reports refusals in JSON without blocking the harness hook.

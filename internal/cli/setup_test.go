@@ -255,6 +255,146 @@ func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
 	}
 }
 
+// --- cursor -----------------------------------------------------------------
+
+func TestSetup_Cursor_ExitsZero(t *testing.T) {
+	out, _, err := runSetupCmd(t, "cursor")
+	if err != nil {
+		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
+	}
+}
+
+func TestSetup_Cursor_ContainsSnippet(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "cursor")
+	want := snippetBody(t, "cursor/hooks.json")
+	if !strings.Contains(out, strings.TrimSpace(want)) {
+		t.Errorf("cursor snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
+	}
+}
+
+func TestSetup_Cursor_AcdManagedMarker(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "cursor")
+	if !strings.Contains(out, `"_acd_managed": true`) {
+		t.Errorf("acd-managed marker not found in cursor output:\n%s", out)
+	}
+}
+
+func TestSetup_Cursor_FooterInstructions(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "cursor")
+	if !strings.Contains(out, "hooks.json") {
+		t.Errorf("footer missing 'hooks.json' in output:\n%s", out)
+	}
+}
+
+func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
+	out, _, err := runSetupCmd(t, "cursor", "--raw")
+	if err != nil {
+		t.Fatalf("acd setup cursor --raw exit=%v\nstdout=%s", err, out)
+	}
+	var v interface{}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
+	}
+	if strings.HasPrefix(strings.TrimSpace(out), "//") {
+		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
+	}
+}
+
+func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
+	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})
+
+	out, stderr, err := runSetupCmd(t, "cursor", "--raw")
+	if err == nil {
+		t.Fatalf("acd setup cursor --raw with invalid template must return non-zero, got nil\nstdout:%s\nstderr:%s", out, stderr)
+	}
+	if out != "" {
+		t.Errorf("invalid JSON template must not emit body to stdout, got:\n%s", out)
+	}
+	for _, want := range []string{"cursor/hooks.json", "not valid JSON", "byte offset"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing %q in:\n%s", want, stderr)
+		}
+	}
+}
+
+func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
+	out, _, _ := runSetupCmd(t, "cursor")
+	start := strings.Index(out, "{")
+	if start == -1 {
+		t.Fatalf("no JSON block found in cursor output:\n%s", out)
+	}
+	tail := out[start:]
+	if footer := strings.Index(tail, "\n// ── install instructions"); footer >= 0 {
+		tail = tail[:footer]
+	}
+	end := strings.LastIndex(tail, "}")
+	if end == -1 {
+		t.Fatalf("no JSON block found in cursor output:\n%s", out)
+	}
+	block := tail[:end+1]
+	var settings struct {
+		Version    int  `json:"version"`
+		ACDManaged bool `json:"_acd_managed"`
+		Hooks      map[string][]struct {
+			Command string `json:"command"`
+			Timeout int    `json:"timeout"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(block), &settings); err != nil {
+		t.Fatalf("parse cursor JSON: %v\nblock:\n%s", err, block)
+	}
+	if settings.Version != 1 {
+		t.Errorf("version=%d want 1", settings.Version)
+	}
+	if !settings.ACDManaged {
+		t.Errorf("_acd_managed not true at top level")
+	}
+	required := []string{"sessionStart", "postToolUse", "afterFileEdit", "stop", "sessionEnd"}
+	for _, ev := range required {
+		entries, ok := settings.Hooks[ev]
+		if !ok || len(entries) == 0 {
+			t.Errorf("event %q missing or has no entries", ev)
+			continue
+		}
+		for i, h := range entries {
+			if h.Command == "" {
+				t.Errorf("event %q entry %d: command empty", ev, i)
+			}
+			if h.Timeout <= 0 {
+				t.Errorf("event %q entry %d: timeout must be positive, got %d", ev, i, h.Timeout)
+			}
+			if !strings.Contains(h.Command, "hook-cursor-extract") {
+				t.Errorf("event %q entry %d: command must extract Cursor stdin: %s", ev, i, h.Command)
+			}
+		}
+	}
+	if start := settings.Hooks["sessionStart"]; len(start) > 0 {
+		if !strings.Contains(start[0].Command, "acd start --harness cursor") {
+			t.Errorf("sessionStart hook must call acd start: %s", start[0].Command)
+		}
+	}
+	for _, ev := range []string{"postToolUse", "afterFileEdit"} {
+		entries := settings.Hooks[ev]
+		if len(entries) == 0 {
+			continue
+		}
+		if !strings.Contains(entries[0].Command, "acd start --harness cursor") || !strings.Contains(entries[0].Command, "acd wake") {
+			t.Errorf("%s hook must call acd start+wake: %s", ev, entries[0].Command)
+		}
+	}
+	if stop := settings.Hooks["stop"]; len(stop) > 0 {
+		if !strings.Contains(stop[0].Command, "acd flush --logical") {
+			t.Errorf("stop hook must call acd flush --logical: %s", stop[0].Command)
+		}
+	}
+	if sessionEnd := settings.Hooks["sessionEnd"]; len(sessionEnd) > 0 {
+		if !strings.Contains(sessionEnd[0].Command, "acd stop") {
+			t.Errorf("sessionEnd hook must call acd stop: %s", sessionEnd[0].Command)
+		}
+	}
+}
+
 // --- codex ------------------------------------------------------------------
 
 func TestSetup_Codex_ExitsZero(t *testing.T) {

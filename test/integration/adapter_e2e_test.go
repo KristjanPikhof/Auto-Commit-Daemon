@@ -46,7 +46,7 @@ func TestAdapterE2E(t *testing.T) {
 	// Ensure init renders for every harness up-front so a missing snippet
 	// surfaces as one obvious failure rather than five copies.
 	bin := buildAcdBinary(t)
-	for _, h := range []string{"claude-code", "codex", "opencode", "pi", "shell"} {
+	for _, h := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		out := runAcd(t, ctx, os.Environ(), "setup", h)
 		cancel()
@@ -66,6 +66,9 @@ func TestAdapterE2E(t *testing.T) {
 		runCodexE2E(t, bin)
 		runCodexMissingAcdWritesHookLog(t)
 		runCodexLegacyTOMLAutoDetect(t, bin)
+	})
+	t.Run("cursor", func(t *testing.T) {
+		runCursorE2E(t, bin)
 	})
 	t.Run("opencode", func(t *testing.T) {
 		runOpencodeE2E(t, bin)
@@ -411,6 +414,68 @@ func parseCodexHooksJSON(t *testing.T, body string) []hookSpec {
 		t.Fatalf("codex hooks.json snippet contained no handlers:\n%s", body)
 	}
 	return hooks
+}
+
+// parseCursorHooksJSON walks templates/cursor/hooks.json. Cursor uses a flat
+// schema: hooks.<eventName>[] entries each carry command and timeout directly
+// (no nested type/hooks arrays like codex).
+func parseCursorHooksJSON(t *testing.T, body string) []hookSpec {
+	t.Helper()
+	var doc struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+			Timeout int    `json:"timeout"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("parse cursor hooks.json: %v\nbody:\n%s", err, body)
+	}
+	var hooks []hookSpec
+	for ev, entries := range doc.Hooks {
+		for _, e := range entries {
+			if e.Command == "" {
+				continue
+			}
+			hooks = append(hooks, hookSpec{
+				Event:   ev,
+				Command: e.Command,
+			})
+		}
+	}
+	if len(hooks) == 0 {
+		t.Fatalf("cursor hooks.json snippet contained no commands:\n%s", body)
+	}
+	return hooks
+}
+
+// installCursorHooks copies the embedded hooks.json into isolated $HOME/.cursor.
+func installCursorHooks(t *testing.T, home string) {
+	t.Helper()
+	cursorDir := filepath.Join(home, ".cursor")
+	if err := os.MkdirAll(cursorDir, 0o700); err != nil {
+		t.Fatalf("install cursor hooks: mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cursorDir, "hooks.json"),
+		[]byte(readSnippet(t, "cursor/hooks.json")), 0o600); err != nil {
+		t.Fatalf("install cursor hooks: write hooks.json: %v", err)
+	}
+}
+
+func homeFromEnv(env []string) string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			return strings.TrimPrefix(kv, "HOME=")
+		}
+	}
+	return ""
+}
+
+// runCursorHook executes a hooks.json command with cwd=$HOME/.cursor, matching
+// Cursor's user-global hook working directory.
+func runCursorHook(t *testing.T, ctx context.Context, env []string, home, stdin, command string) ExecResult {
+	t.Helper()
+	cursorDir := filepath.Join(home, ".cursor")
+	return runBash(t, ctx, env, stdin, "cd "+shellQuote(cursorDir)+" && "+command)
 }
 
 // parseYAMLBashBlocks extracts every `bash: |` heredoc block from an
@@ -874,6 +939,94 @@ func runCodexE2E(t *testing.T, bin string) {
 			tearDown.ExitCode, tearDown.Stdout, tearDown.Stderr)
 	}
 	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
+}
+
+func runCursorE2E(t *testing.T, bin string) {
+	body := readSnippet(t, "cursor/hooks.json")
+	hooks := parseCursorHooksJSON(t, body)
+
+	repo := tempRepo(t)
+	binDir := filepath.Dir(bin)
+	sessionID := "e2e-cursor"
+	stdin := fmt.Sprintf(`{"conversation_id":%q,"workspace_roots":[%q]}`,
+		sessionID, repo)
+
+	env := adapterEnv(t, binDir)
+	home := homeFromEnv(env)
+	if home == "" {
+		t.Fatal("cursor e2e: HOME missing from env")
+	}
+	installCursorHooks(t, home)
+
+	startHook := pickHookByEvent(t, hooks, "sessionStart")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res := runCursorHook(t, ctx, env, home, stdin, startHook.Command)
+	if res.ExitCode != 0 {
+		t.Fatalf("cursor sessionStart exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	waitFor(t, "cursor daemon mode==running", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "cursor", 5*time.Second)
+
+	wakeHook := pickHookByEvent(t, hooks, "postToolUse")
+	if wakeRes := runCursorHook(t, ctx, env, home, stdin, wakeHook.Command); wakeRes.ExitCode != 0 {
+		t.Fatalf("cursor postToolUse exit=%d\nstdout=%s\nstderr=%s",
+			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
+	}
+	assertActiveHookSelfHealsCursor(t, "cursor", ctx, env, home, repo, sessionID, wakeHook, stdin)
+
+	afterEditHook := pickHookByEvent(t, hooks, "afterFileEdit")
+	if !strings.Contains(afterEditHook.Command, "acd wake") {
+		t.Fatalf("cursor afterFileEdit hook must call acd wake, got: %s", afterEditHook.Command)
+	}
+	if afterRes := runCursorHook(t, ctx, env, home, stdin, afterEditHook.Command); afterRes.ExitCode != 0 {
+		t.Fatalf("cursor afterFileEdit exit=%d\nstdout=%s\nstderr=%s",
+			afterRes.ExitCode, afterRes.Stdout, afterRes.Stderr)
+	}
+
+	flushHook := pickHookByEvent(t, hooks, "stop")
+	if !strings.Contains(flushHook.Command, "acd flush --logical") {
+		t.Fatalf("cursor stop hook must call acd flush --logical, got: %s", flushHook.Command)
+	}
+	if flushRes := runCursorHook(t, ctx, env, home, stdin, flushHook.Command); flushRes.ExitCode != 0 {
+		t.Fatalf("cursor stop (flush) exit=%d\nstdout=%s\nstderr=%s",
+			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
+	}
+	if mode := readDaemonStateMode(repo); mode != "running" {
+		t.Fatalf("cursor daemon mode after stop=%q; want running (stop must flush, not stop daemon)", mode)
+	}
+
+	endHook := pickHookByEvent(t, hooks, "sessionEnd")
+	if endRes := runCursorHook(t, ctx, env, home, stdin, endHook.Command); endRes.ExitCode != 0 {
+		t.Fatalf("cursor sessionEnd exit=%d\nstdout=%s\nstderr=%s",
+			endRes.ExitCode, endRes.Stdout, endRes.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, "cursor daemon stopped", repo)
+}
+
+// assertActiveHookSelfHealsCursor mirrors assertActiveHookSelfHeals but runs
+// hook bodies from $HOME/.cursor like Cursor does in production.
+func assertActiveHookSelfHealsCursor(t *testing.T, label string, ctx context.Context, env []string, home, repo, sessionID string, hook hookSpec, stdin string) {
+	t.Helper()
+	selfHealStop := runBash(t, ctx, env, "",
+		"acd stop --session-id "+shellQuote(sessionID)+
+			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
+	if selfHealStop.ExitCode != 0 {
+		t.Fatalf("%s self-heal pre-stop exit=%d\nstdout=%s\nstderr=%s",
+			label, selfHealStop.ExitCode, selfHealStop.Stdout, selfHealStop.Stderr)
+	}
+	waitDaemonStoppedOrKill(t, label+" daemon stopped before self-heal", repo)
+	if healRes := runCursorHook(t, ctx, env, home, stdin, hook.Command); healRes.ExitCode != 0 {
+		t.Fatalf("%s active-hook self-heal exit=%d\nstdout=%s\nstderr=%s",
+			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
+	}
+	waitFor(t, label+" daemon mode==running after self-heal", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertClientRow(t, repo, sessionID, "cursor", 5*time.Second)
 }
 
 // runCodexLegacyTOMLAutoDetect ensures `acd setup` with no harness arg still
