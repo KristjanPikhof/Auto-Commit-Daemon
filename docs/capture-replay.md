@@ -390,9 +390,10 @@ acd events              # durable product decision ledger
 acd events --watch      # stream decisions appended after watch starts
 acd explain --path FILE # explain why a path was captured, skipped, or blocked
 acd explain --commit HEAD # explain decisions linked to a commit
-acd list                # PENDING + BLOCKED columns across all repos
-acd list --watch        # refresh the repo table until Ctrl-C
-acd list --watch --interval 5s
+acd list                # compact table; TTY refreshes until Ctrl-C
+acd list --once         # one-shot (scripts / pseudo-TTY)
+acd list --verbose      # wide: CLIENTS, PENDING, BLOCKED, notes
+acd list --json         # machine-readable; one-shot on TTY
 acd logs                # tail the current repo daemon log as raw JSONL
 acd logs --lines 200    # choose the initial tail length
 acd logs --follow       # stream appended raw JSONL lines until Ctrl-C
@@ -429,8 +430,8 @@ repo (`start`, `status`, `diagnose`, and related current-repo operations) refuse
 directories outside a Git worktree instead of creating central-registry entries
 for arbitrary paths.
 
-`acd list --watch` redraws plain table frames on the requested interval; it is
-for watching daemon liveness and queue counts, not an interactive TUI. `acd
+`acd list` on a TTY redraws compact table frames every few seconds (same as
+`--watch`). It is for daemon liveness and queue counts, not an interactive TUI. `acd
 logs` prints the daemon log exactly as stored: raw JSONL from the per-repo log
 file. It does not include full AI prompt traces; those are written only when
 `ACD_AI_PROMPT_TRACE=1` is enabled and a non-deterministic provider sends a
@@ -710,7 +711,7 @@ version lives in [user-workflows.md](user-workflows.md).
 
    ~~~bash
    acd status              # Daemon field: running / stale / stopped
-   acd list --watch        # all registered repos, refreshed until Ctrl-C
+   acd list                # all registered repos; TTY refreshes until Ctrl-C
    acd doctor              # daemon_alive boolean per repo
    ~~~
 

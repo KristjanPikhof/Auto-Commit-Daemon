@@ -127,8 +127,9 @@ Open your AI tool, edit files, commits land. The daemon starts on first hook fir
 ~~~bash
 acd start                          # start or refresh the current repo daemon
 acd list                           # TTY: live compact dashboard (Ctrl-C to exit)
-acd list --once                    # one-shot compact table (TTY or scripts)
+acd list --once                    # one-shot compact (TTY or scripts)
 acd list --verbose                 # wide table: ~ paths, CLIENTS, status notes
+acd list --json                    # all repos as JSON (one-shot on TTY)
 acd list --watch                   # explicit alias for live refresh
 
 acd status                         # health, queue depth, recent decisions, intent metrics
