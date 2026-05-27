@@ -444,8 +444,8 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
 }
 
-// cursorLifecycleSubcommands maps wired Cursor hook events to the lifecycle
-// helper subcommand each command string must invoke.
+// cursorLifecycleSubcommands maps wired Cursor hook events to the acd command
+// each inline hook string must invoke.
 var cursorLifecycleSubcommands = map[string]string{
 	"sessionStart":  "start",
 	"postToolUse":   "wake",
@@ -455,10 +455,7 @@ var cursorLifecycleSubcommands = map[string]string{
 }
 
 // activeHookBodyHasStartWake reports whether an installed active-hook command
-// body still carries the canonical acd start+wake behavior. Inline snippets
-// (Claude/Codex/OpenCode/Pi) must mention both subcommands; Cursor's shipped
-// template delegates to acd-lifecycle.sh wake, which runs start+wake inside
-// the helper — that lifecycle form is accepted for cursor only.
+// body still carries the canonical acd start+wake behavior.
 func activeHookBodyHasStartWake(harness, body string) bool {
 	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
 		return true

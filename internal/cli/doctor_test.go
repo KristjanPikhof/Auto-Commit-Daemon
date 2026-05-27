@@ -1473,8 +1473,8 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 		}
 	}
 	drifted := strings.Replace(string(body),
-		`"command": "./hooks/acd-lifecycle.sh wake"`,
-		`"command": "echo drifted"`, 1)
+		`acd wake --session-id`,
+		`acd woke --session-id`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("cursor drift snippet should report drift, got empty note")
@@ -1488,7 +1488,7 @@ func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
 	drifted := strings.Replace(string(body),
 		`acd start --harness cursor`,
-		`acd wake --session-id "$SID"`, 1)
+		`acd wake --session-id SID`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("sessionStart wired to wake should report drift")
@@ -1517,8 +1517,8 @@ func TestJSONDrift_CursorRejectsMissingWakeCommand(t *testing.T) {
 }
 
 // TestDoctor_DriftWarningCursorActiveHook seeds a cursor hooks.json whose
-// postToolUse body no longer invokes the lifecycle helper and asserts doctor
-// surfaces drift with the cursor remediation hint.
+// postToolUse body no longer invokes start+wake and asserts doctor surfaces
+// drift with the cursor remediation hint.
 func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
@@ -1537,7 +1537,7 @@ func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
 				{ "command": "echo no-op", "timeout": 15 }
 			],
 			"afterFileEdit": [
-				{ "command": "./hooks/acd-lifecycle.sh wake", "timeout": 15 }
+				{ "command": "acd start --harness cursor && acd wake", "timeout": 15 }
 			]
 		}
 	}`
