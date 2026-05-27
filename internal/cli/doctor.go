@@ -379,6 +379,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 var driftRemediationCommands = map[string]string{
 	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
 	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
+	"cursor":      "acd setup cursor  # merge output into ~/.cursor/hooks.json; to overwrite: cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak && acd setup cursor --raw > ~/.cursor/hooks.json",
 	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
 	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
 }
@@ -387,8 +388,10 @@ var driftRemediationCommands = map[string]string{
 // and returns a non-empty note when one or more active-hook command bodies
 // are missing the canonical `acd start` + `acd wake` pair. Active hooks are:
 //
-//   - claude-code, codex : PreToolUse + PostToolUse entries inside JSON
-//     "hooks" map
+//   - claude-code, codex : PreToolUse + PostToolUse entries inside nested JSON
+//     "hooks" map (PascalCase event keys)
+//   - cursor             : postToolUse + afterFileEdit flat JSON entries
+//     (camelCase keys, top-level `command` per hook)
 //   - opencode, pi       : YAML hook items whose `event:` is `tool.before.*`
 //     or `tool.after.*`
 //
@@ -412,7 +415,7 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	}
 	stale := 0
 	for _, b := range bodies {
-		if !(strings.Contains(b, "acd start") && strings.Contains(b, "acd wake")) {
+		if !activeHookBodyHasStartWake(name, b) {
 			stale++
 		}
 	}
@@ -432,16 +435,35 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
 }
 
+// activeHookBodyHasStartWake reports whether an installed active-hook command
+// body still carries the canonical acd start+wake behavior. Inline snippets
+// (Claude/Codex/OpenCode/Pi) must mention both subcommands; Cursor's shipped
+// template delegates to acd-lifecycle.sh wake, which runs start+wake inside
+// the helper — that lifecycle form is accepted for cursor only.
+func activeHookBodyHasStartWake(harness, body string) bool {
+	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
+		return true
+	}
+	if harness == "cursor" {
+		return strings.Contains(body, "acd-lifecycle.sh") &&
+			(strings.Contains(body, " wake") || strings.HasSuffix(strings.TrimSpace(body), "wake"))
+	}
+	return false
+}
+
 // extractActiveHookBodies returns the command-string bodies of the active
 // hooks for harness `name`. JSON harnesses (claude-code, codex) parse the
-// "hooks" map and return the "command" string of every entry under
-// PreToolUse + PostToolUse. YAML harnesses (opencode, pi) text-scan for hook
-// items whose event matches tool.before.* / tool.after.* and concatenate the
-// `bash: |` block bodies.
+// nested "hooks" map and return the "command" string of every entry under
+// PreToolUse + PostToolUse. Cursor uses the flat version-1 schema (camelCase
+// event keys with a top-level `command` per hook). YAML harnesses (opencode,
+// pi) text-scan for hook items whose event matches tool.before.* /
+// tool.after.* and concatenate the `bash: |` block bodies.
 func extractActiveHookBodies(name string, body []byte) []string {
 	switch name {
 	case "claude-code", "codex":
 		return extractJSONHookBodies(body, []string{"PreToolUse", "PostToolUse"})
+	case "cursor":
+		return extractCursorFlatHookBodies(body, []string{"postToolUse", "afterFileEdit"})
 	case "opencode", "pi":
 		return extractYAMLHookBodies(body, []string{"tool.before.", "tool.after."})
 	default:
@@ -489,6 +511,46 @@ func extractJSONHookBodies(body []byte, events []string) []string {
 				if strings.TrimSpace(h.Command) != "" {
 					out = append(out, h.Command)
 				}
+			}
+		}
+	}
+	return out
+}
+
+// extractCursorFlatHookBodies parses Cursor hooks.json (version 1 flat schema)
+// and returns the `command` string of every hook entry under the requested
+// camelCase event keys (e.g. postToolUse, afterFileEdit).
+//
+// Schema (per templates/cursor/hooks.json):
+//
+//	{
+//	  "version": 1,
+//	  "hooks": {
+//	    "postToolUse": [ { "command": "...", "timeout": 15 }, ... ],
+//	    ...
+//	  }
+//	}
+func extractCursorFlatHookBodies(body []byte, events []string) []string {
+	var top struct {
+		Hooks map[string][]struct {
+			Command string `json:"command"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil
+	}
+	if len(top.Hooks) == 0 {
+		return nil
+	}
+	var out []string
+	for _, ev := range events {
+		entries, ok := top.Hooks[ev]
+		if !ok {
+			continue
+		}
+		for _, e := range entries {
+			if strings.TrimSpace(e.Command) != "" {
+				out = append(out, e.Command)
 			}
 		}
 	}
