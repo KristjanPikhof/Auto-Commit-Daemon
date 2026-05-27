@@ -63,11 +63,102 @@ func TestList_WatchAndJSONRejected(t *testing.T) {
 	}
 }
 
-func TestList_JSONOnTTYDoesNotSelectWatch(t *testing.T) {
-	withIsolatedHome(t)
-	if !isatty.IsTerminal(os.Stdout.Fd()) && !isatty.IsCygwinTerminal(os.Stdout.Fd()) {
-		t.Skip("requires interactive stdout to exercise TTY default")
+func TestListRunMode(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		once          bool
+		watchExplicit bool
+		jsonOut       bool
+		wantWatch     bool
+		wantErr       string
+	}{
+		{
+			name:          "watch and json rejected",
+			watchExplicit: true,
+			jsonOut:       true,
+			wantErr:       "acd list: --watch does not support --json",
+		},
+		{
+			name:      "json disables watch without tty",
+			jsonOut:   true,
+			wantWatch: false,
+		},
+		{
+			name:      "once disables watch",
+			once:      true,
+			wantWatch: false,
+		},
+		{
+			name:          "explicit watch without json",
+			watchExplicit: true,
+			wantWatch:     true,
+		},
+		{
+			name:      "non-tty default is one-shot",
+			wantWatch: false,
+		},
 	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotWatch, err := listRunMode(nil, tc.once, tc.watchExplicit, tc.jsonOut)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("listRunMode() err=%v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("listRunMode() unexpected err: %v", err)
+			}
+			if gotWatch != tc.wantWatch {
+				t.Fatalf("listRunMode() watch=%v, want %v", gotWatch, tc.wantWatch)
+			}
+		})
+	}
+}
+
+func TestList_WatchAndJSONRejected(t *testing.T) {
+	withIsolatedHome(t)
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--watch", "--json"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("acd list --watch --json: got nil, want error")
+	}
+	if !strings.Contains(err.Error(), "--watch does not support --json") {
+		t.Fatalf("error=%v, want watch/json rejection", err)
+	}
+}
+
+func TestList_OnceProducesSingleSnapshot(t *testing.T) {
+	withIsolatedHome(t)
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--once"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("acd list --once: %v", err)
+	}
+	got := stdout.String()
+	if strings.Contains(got, "Updated:") {
+		t.Fatalf("--once should not use watch frames:\n%s", got)
+	}
+	if !strings.Contains(got, "REPO") || !strings.Contains(got, "DAEMON") {
+		t.Fatalf("expected compact table header:\n%s", got)
+	}
+}
+
+func TestList_JSONOnTTYUsesOneShot(t *testing.T) {
+	withIsolatedHome(t)
 
 	cmd := newRootCmd()
 	var stdout, stderr bytes.Buffer
@@ -75,10 +166,10 @@ func TestList_JSONOnTTYDoesNotSelectWatch(t *testing.T) {
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"list", "--json"})
 	if err := cmd.Execute(); err != nil {
-		t.Fatalf("acd list --json on TTY: %v", err)
+		t.Fatalf("acd list --json: %v", err)
 	}
-	if strings.Contains(stderr.String(), "--watch does not support --json") {
-		t.Fatalf("json on TTY incorrectly selected watch mode: stderr=%q", stderr.String())
+	if strings.Contains(stdout.String(), "Updated:") {
+		t.Fatalf("json must not select watch mode:\n%s", stdout.String())
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
