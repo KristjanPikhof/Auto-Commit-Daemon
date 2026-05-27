@@ -13,8 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattn/go-isatty"
-
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )

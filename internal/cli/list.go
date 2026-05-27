@@ -91,6 +91,15 @@ Watch mode prints plain table frames and does not support --json.`,
 	return cmd
 }
 
+// listRunMode decides whether acd list uses the live watch dashboard.
+// --json always selects one-shot output; --watch with --json is rejected.
+func listRunMode(stdout *os.File, once, watchExplicit, jsonOut bool) (useWatch bool, err error) {
+	if watchExplicit && jsonOut {
+		return false, fmt.Errorf("acd list: --watch does not support --json")
+	}
+	return listUseWatchMode(stdout, once, watchExplicit) && !jsonOut, nil
+}
+
 // listUseWatchMode reports whether acd list should run the live dashboard.
 // Explicit --once disables watch; explicit --watch enables it; otherwise TTY
 // stdout defaults to watch.
