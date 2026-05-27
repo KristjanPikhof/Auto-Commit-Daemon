@@ -16,14 +16,30 @@ cursor_extract() {
   out=$(acd hook-cursor-extract <&0 2>>"$LOG") || {
     rc=$?
     printf '[%s] hook-cursor-extract failed exit=%d\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-    return "$rc"
+    return 1
   }
   SESSION_ID=$(printf '%s\n' "$out" | sed -n '1p')
   REPO=$(printf '%s\n' "$out" | sed -n '2p')
 }
 
+repo_is_git() {
+  git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+skip_non_git_repo() {
+  if repo_is_git "$REPO"; then
+    return 1
+  fi
+  printf '[%s] skip %s: resolved repo is not a git worktree: %s\n' \
+    "$(date +%FT%T%z)" "$1" "$REPO" >>"$LOG"
+  return 0
+}
+
 cmd_start() {
-  cursor_extract || exit 1
+  cursor_extract || exit 0
+  if skip_non_git_repo start; then
+    exit 0
+  fi
   acd start \
     --harness cursor \
     --session-id "$SESSION_ID" \
@@ -36,7 +52,10 @@ cmd_start() {
 }
 
 cmd_wake() {
-  cursor_extract || exit 1
+  cursor_extract || exit 0
+  if skip_non_git_repo wake; then
+    exit 0
+  fi
   { acd start \
       --harness cursor \
       --session-id "$SESSION_ID" \
@@ -52,7 +71,10 @@ cmd_wake() {
 }
 
 cmd_flush() {
-  cursor_extract || exit 1
+  cursor_extract || exit 0
+  if skip_non_git_repo flush; then
+    exit 0
+  fi
   acd flush --logical \
     --session-id "$SESSION_ID" \
     --repo "$REPO" >/dev/null 2>>"$LOG" || {

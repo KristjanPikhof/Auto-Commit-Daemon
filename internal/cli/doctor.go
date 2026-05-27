@@ -366,6 +366,19 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Notes = append(hr.Notes, note)
 			}
 		}
+		if name == "cursor" && hr.Installed {
+			driftBody, _ := os.ReadFile(path)
+			if hr.MatchedPath != "" {
+				if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+					driftBody = mb
+				}
+			}
+			if len(driftBody) > 0 {
+				if note := scanCursorLifecycleScript(driftBody); note != "" {
+					hr.Notes = append(hr.Notes, note)
+				}
+			}
+		}
 		reports = append(reports, hr)
 	}
 	return reports
@@ -445,10 +458,37 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 		return true
 	}
 	if harness == "cursor" {
-		return strings.Contains(body, "acd-lifecycle.sh") &&
-			(strings.Contains(body, " wake") || strings.HasSuffix(strings.TrimSpace(body), "wake"))
+		return strings.Contains(body, "./hooks/acd-lifecycle.sh wake")
 	}
 	return false
+}
+
+// scanCursorLifecycleScript returns a doctor note when hooks.json references
+// the lifecycle helper but ~/.cursor/hooks/acd-lifecycle.sh is missing or not
+// executable.
+func scanCursorLifecycleScript(body []byte) string {
+	if !strings.Contains(string(body), "acd-lifecycle.sh") {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	script := filepath.Join(home, ".cursor", "hooks", "acd-lifecycle.sh")
+	info, err := os.Stat(script)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "hooks.json references ~/.cursor/hooks/acd-lifecycle.sh but the script is missing; install with: mkdir -p ~/.cursor/hooks && install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh"
+		}
+		return fmt.Sprintf("hooks.json references acd-lifecycle.sh but %s is not accessible: %v", script, err)
+	}
+	if info.IsDir() {
+		return "~/.cursor/hooks/acd-lifecycle.sh exists but is a directory; replace with the executable script from templates/cursor/hooks/acd-lifecycle.sh"
+	}
+	if info.Mode()&0111 == 0 {
+		return "~/.cursor/hooks/acd-lifecycle.sh is not executable; run: chmod +x ~/.cursor/hooks/acd-lifecycle.sh"
+	}
+	return ""
 }
 
 // extractActiveHookBodies returns the command-string bodies of the active

@@ -2,7 +2,7 @@
 
 User-global Cursor agent hooks only. This document is the harness contract for
 implementers (`acd setup cursor`, `acd-lifecycle.sh`, adapter detection, and
-E2E). It does not ship runnable snippets by itself.
+E2E).
 
 ## Scope
 
@@ -19,7 +19,7 @@ the open workspace root.
 
 ## Layout
 
-After install (future `acd setup cursor` or manual copy):
+After install:
 
 ~~~text
 ~/.cursor/hooks.json          # version 1, _acd_managed, event -> command entries
@@ -41,8 +41,7 @@ Hook log (convention, same as other harnesses):
 ## Stdin precedence
 
 Cursor delivers one JSON object on stdin per hook invocation. The lifecycle
-script (or `acd hook-stdin-extract` extensions used by it) resolves fields in
-this order.
+script uses `acd hook-cursor-extract` to resolve fields in this order.
 
 ### Session id
 
@@ -50,10 +49,10 @@ this order.
 |----------|--------|------|
 | 1 | `conversation_id` | Required top-level string. This is the acd `--session-id` for the Cursor conversation. |
 
-There is no `session_id` alias on Cursor stdin. Empty or missing
-`conversation_id` is a hard failure for lifecycle commands (log and exit
-nonzero for `start`/`wake`/`flush`; `stop` may fail-soft like other harnesses
-when the session is already gone).
+There is no `session_id` alias on Cursor stdin. When `conversation_id` is
+missing or `hook-cursor-extract` fails for any reason, the lifecycle script logs
+and exits **0** (fail-soft, same as Codex `hook-stdin-extract` failures) so
+Cursor is not blocked.
 
 ### Repository path
 
@@ -67,11 +66,13 @@ Notes:
 
 - `workspace_roots` may list multiple folders (monorepo roots, worktrees). Only
   the **first** resolvable git root wins; do not merge or union paths.
+- All resolved repo paths are canonicalized (`EvalSymlinks`) so macOS `/var` and
+  `/private/var` aliases match across hooks in one session.
 - When `workspace_roots` is missing, empty, or has no git root, fall through to
   `cwd` then `$PWD`.
-- Non-git `cwd` with no git root in `workspace_roots` should skip start/wake
-  under repo autodiscovery rules (same as other harnesses), not invent
-  `.git/acd`.
+- When the resolved path is not inside a git worktree, `start`/`wake`/`flush`
+  log and exit **0** without calling acd (repo autodiscovery skip). `stop`
+  still attempts deregistration when extract succeeds.
 
 ### watch-pid
 
@@ -100,10 +101,12 @@ Behavioral alignment with Claude Code / OpenCode / Pi:
 - **`stop`** maps to `acd flush --logical`, not `acd touch` (Codex uses touch
   because `Stop` fires every assistant turn).
 - **`sessionEnd`** deregisters the session; do not rely on `watch-pid` cleanup.
+- **`postToolUse` + `afterFileEdit`** both wire `wake`; a single edit may fire
+  both events and run start+wake twice. This is intentional for v1; narrow with
+  matchers only if Cursor documents overlapping events as noisy.
 
 Do **not** wire `preToolUse`, `subagentStart`, `beforeShellExecution`, or Tab
-events in v1. Matchers are unnecessary for the initial five events unless a
-later revision needs to narrow `postToolUse` noise.
+events in v1.
 
 Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 `stop` / `sessionEnd` 5s.
@@ -134,32 +137,34 @@ Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 }
 ~~~
 
-## Install (manual until `acd setup cursor`)
+## Install
 
 1. Install acd:
    `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Copy the lifecycle helper into `~/.cursor/hooks/` (executable). From an acd
-   checkout or release tree:
+2. Install the lifecycle helper (executable):
 
    ~~~bash
    mkdir -p ~/.cursor/hooks
    install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh
    ~~~
 
+   From a release tree without the checkout, copy the script from the acd source
+   bundle or re-run `acd setup cursor` and follow the printed README block.
+
 3. Install `~/.cursor/hooks.json`:
 
    - **Merge (recommended):** if you already have custom hooks, copy the five
-     event entries from `templates/cursor/hooks.json` (or the fragment above)
+     event entries from `acd setup cursor --raw` (or `templates/cursor/hooks.json`)
      into your file. Ensure top-level `"version": 1` and `"_acd_managed": true`.
    - **Replace:** only when the file has no non-acd hooks:
 
      ~~~bash
-     cp templates/cursor/hooks.json ~/.cursor/hooks.json
+     acd setup cursor --raw > ~/.cursor/hooks.json
      ~~~
 
-   **Overwrite warning:** once `acd setup cursor` ships, redirecting
-   `acd setup cursor --raw > ~/.cursor/hooks.json` replaces the **entire**
-   file. Back up first and merge manually if you have non-acd hooks.
+   **Overwrite warning:** redirecting `acd setup cursor --raw > ~/.cursor/hooks.json`
+   replaces the **entire** file. Back up first and merge manually if you have
+   non-acd hooks.
 
 4. Restart Cursor (or rely on hooks hot-reload; restart if hooks do not load).
 5. Approve hooks in Cursor **Settings → Hooks** when prompted.
@@ -186,7 +191,7 @@ the session.
 - Expect one client with `harness=cursor` and `session-id` matching
   `conversation_id`.
 - On hook failure, inspect `~/.local/state/acd/cursor-hook.log`.
-- Run `acd doctor` (once cursor detection ships) for template drift and missing
+- Run `acd doctor` for template drift, missing lifecycle script, and missing
   `start`/`wake` wiring.
 
 ## Uninstall

@@ -248,7 +248,7 @@ func resolveCursorHookRepo(ctx context.Context, payload map[string]any) (string,
 				if err != nil {
 					continue
 				}
-				return validateHookEmitScalar("repo", top, prefix)
+				return validateHookEmitScalar("repo", canonicalHookPath(top), prefix)
 			}
 		}
 	}
