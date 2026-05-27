@@ -27,9 +27,59 @@ func TestList_HumanOneShotOutputStaysTableOnly(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr=%q, want empty", stderr.String())
 	}
-	want := "REPO  DAEMON  CLIENTS  PENDING  BLOCKED  LAST_COMMIT  STATUS\n"
+	want := "REPO  DAEMON  PEND  BLK  HEAD  STATUS\n"
 	if stdout.String() != want {
 		t.Fatalf("one-shot output drifted:\ngot  %q\nwant %q", stdout.String(), want)
+	}
+}
+
+func TestListUseWatchMode(t *testing.T) {
+	t.Parallel()
+	if listUseWatchMode(nil, true, false) {
+		t.Fatal("--once should disable watch")
+	}
+	if listUseWatchMode(nil, false, true) {
+		t.Fatal("explicit --watch should enable watch without stdout")
+	}
+	if listUseWatchMode(nil, false, false) {
+		t.Fatal("nil stdout without flags should not watch")
+	}
+}
+
+func TestList_VerboseOnceShowsWideColumns(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
+		t.Fatalf("runList verbose: %v", err)
+	}
+	got := stdout.String()
+	for _, col := range []string{"CLIENTS", "PENDING", "BLOCKED", "LAST_COMMIT"} {
+		if !strings.Contains(got, col) {
+			t.Fatalf("verbose table missing %s:\n%s", col, got)
+		}
+	}
+}
+
+func TestBuildListRepoLabelsCompact_CollisionSuffix(t *testing.T) {
+	t.Parallel()
+	entries := []listEntry{
+		{Path: filepath.Join("/tmp", "work", "acd-repo"), RepoHash: "abc123deadbeef"},
+		{Path: filepath.Join("/tmp", "other", "acd-repo"), RepoHash: "feedbeefabcd12"},
+	}
+	labels := buildListRepoLabelsCompact(entries)
+	a := labels[entries[0].Path]
+	b := labels[entries[1].Path]
+	if a == b || !strings.Contains(a, "acd-repo#") || !strings.Contains(b, "acd-repo#") {
+		t.Fatalf("labels=%q %q, want distinct acd-repo#<hash-tail> suffixes", a, b)
 	}
 }
 
@@ -132,7 +182,7 @@ func TestList_StatusColumnShowsManualPause(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "paused (manual)") {
@@ -155,7 +205,7 @@ func TestList_StatusColumnShowsRewindGrace(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	got := stdout.String()
@@ -347,14 +397,14 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 
-	// Human output exposes both columns and counts.
+	// Compact human output exposes queue depth and blocked status token.
 	var humanOut, humanErr bytes.Buffer
 	if err := runList(ctx, &humanOut, &humanErr, false, false); err != nil {
 		t.Fatalf("runList human: %v", err)
 	}
 	human := humanOut.String()
-	if !strings.Contains(human, "PENDING") || !strings.Contains(human, "BLOCKED") {
-		t.Fatalf("human output missing PENDING/BLOCKED columns:\n%s", human)
+	if !strings.Contains(human, "PEND") || !strings.Contains(human, "BLK") || !strings.Contains(human, "blk") {
+		t.Fatalf("human output missing compact queue/blocked markers:\n%s", human)
 	}
 
 	// JSON shape exposes counts as integers and matches the state we wrote.
@@ -438,8 +488,8 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "missing") {
-		t.Fatalf("expected 'missing' marker, got:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "miss") {
+		t.Fatalf("expected compact missing status, got:\n%s", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "state.db missing") {
 		t.Fatalf("expected slog/log warn for missing state.db, got stderr:\n%s", stderr.String())
@@ -472,7 +522,7 @@ func TestList_PausedAndStale_RendersBoth(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	got := stdout.String()
@@ -603,6 +653,9 @@ func TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel(t *testing.T) {
 	}
 	if strings.Count(got, "REPO") < 2 {
 		t.Fatalf("watch output missing repeated table renders:\n%s", got)
+	}
+	if !strings.Contains(got, "PEND") || strings.Contains(got, "PENDING\t") {
+		t.Fatalf("watch frames should use compact headers:\n%s", got)
 	}
 }
 
