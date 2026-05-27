@@ -1568,6 +1568,7 @@ func TestDriftRemediation_CursorCanonicalPath(t *testing.T) {
 }
 
 func TestScanCursorLifecycleScript_MissingExecutable(t *testing.T) {
+	_ = withIsolatedHome(t)
 	body := readSnippet(t, "cursor/hooks.json")
 	note := scanCursorLifecycleScript(body)
 	if note == "" {
