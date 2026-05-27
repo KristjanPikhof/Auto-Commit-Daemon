@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -43,6 +45,31 @@ func TestListUseWatchMode(t *testing.T) {
 	}
 	if listUseWatchMode(nil, false, false) {
 		t.Fatal("nil stdout without flags should not watch")
+	}
+}
+
+func TestList_JSONOnTTYDoesNotSelectWatch(t *testing.T) {
+	withIsolatedHome(t)
+	if !isatty.IsTerminal(os.Stdout.Fd()) && !isatty.IsCygwinTerminal(os.Stdout.Fd()) {
+		t.Skip("requires interactive stdout to exercise TTY default")
+	}
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("acd list --json on TTY: %v", err)
+	}
+	if strings.Contains(stderr.String(), "--watch does not support --json") {
+		t.Fatalf("json on TTY incorrectly selected watch mode: stderr=%q", stderr.String())
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("expected JSON output, got: %q err=%v", stdout.String(), err)
 	}
 }
 
