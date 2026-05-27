@@ -29,25 +29,22 @@ Pick the one matching your AI tool, run the setup, paste the printed snippet int
 ~~~bash
 acd setup claude-code   # → ~/.claude/settings.json
 acd setup codex         # → ~/.codex/hooks.json
-acd setup cursor        # → ~/.cursor/hooks.json + ~/.cursor/hooks/acd-lifecycle.sh
+acd setup cursor        # → ~/.cursor/hooks.json
 acd setup opencode      # → ~/.config/opencode/hook/hooks.yaml
 acd setup pi            # → ~/.pi/agent/hook/hooks.yaml
 acd setup shell         # universal direnv / zshrc fallback
 ~~~
 
-Fresh Cursor install (no existing hooks): copy the lifecycle helper, then write
-the JSON config. **`acd setup cursor --raw > ~/.cursor/hooks.json` replaces the
-entire file** — back up and merge manually if you already have custom hooks.
+Fresh Cursor install (no existing hooks): write the JSON config. **`acd setup
+cursor --raw > ~/.cursor/hooks.json` replaces the entire file** — back up and
+merge manually if you already have custom hooks.
 
 ~~~bash
-mkdir -p ~/.cursor/hooks
-acd setup cursor --helper > ~/.cursor/hooks/acd-lifecycle.sh
-chmod +x ~/.cursor/hooks/acd-lifecycle.sh
+mkdir -p ~/.cursor
 acd setup cursor --raw > ~/.cursor/hooks.json
 ~~~
 
-`acd setup cursor --helper` works from the installed binary; run
-`acd setup cursor` without `--raw` for the full copy-paste instructions.
+Run `acd setup cursor` without `--raw` for the full copy-paste instructions.
 
 Cursor uses **user-global** hooks only (`~/.cursor/hooks.json`, not a repo
 `.cursor/hooks.json`). Approve hooks in **Settings → Hooks** after install.

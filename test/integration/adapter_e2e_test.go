@@ -448,23 +448,16 @@ func parseCursorHooksJSON(t *testing.T, body string) []hookSpec {
 	return hooks
 }
 
-// installCursorHooks copies the embedded hooks.json and acd-lifecycle.sh into
-// isolated $HOME/.cursor so hook commands resolve relative to ~/.cursor.
+// installCursorHooks copies the embedded hooks.json into isolated $HOME/.cursor.
 func installCursorHooks(t *testing.T, home string) {
 	t.Helper()
 	cursorDir := filepath.Join(home, ".cursor")
-	hooksDir := filepath.Join(cursorDir, "hooks")
-	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+	if err := os.MkdirAll(cursorDir, 0o700); err != nil {
 		t.Fatalf("install cursor hooks: mkdir: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(cursorDir, "hooks.json"),
 		[]byte(readSnippet(t, "cursor/hooks.json")), 0o600); err != nil {
 		t.Fatalf("install cursor hooks: write hooks.json: %v", err)
-	}
-	scriptPath := filepath.Join(hooksDir, "acd-lifecycle.sh")
-	writeFile(t, scriptPath, readSnippet(t, "cursor/hooks/acd-lifecycle.sh"))
-	if err := os.Chmod(scriptPath, 0o755); err != nil {
-		t.Fatalf("install cursor hooks: chmod lifecycle script: %v", err)
 	}
 }
 
@@ -478,7 +471,7 @@ func homeFromEnv(env []string) string {
 }
 
 // runCursorHook executes a hooks.json command with cwd=$HOME/.cursor, matching
-// how Cursor resolves ./hooks/acd-lifecycle.sh paths.
+// Cursor's user-global hook working directory.
 func runCursorHook(t *testing.T, ctx context.Context, env []string, home, stdin, command string) ExecResult {
 	t.Helper()
 	cursorDir := filepath.Join(home, ".cursor")
@@ -986,8 +979,8 @@ func runCursorE2E(t *testing.T, bin string) {
 	assertActiveHookSelfHealsCursor(t, "cursor", ctx, env, home, repo, sessionID, wakeHook, stdin)
 
 	afterEditHook := pickHookByEvent(t, hooks, "afterFileEdit")
-	if !strings.Contains(afterEditHook.Command, "acd-lifecycle.sh wake") {
-		t.Fatalf("cursor afterFileEdit hook must call acd-lifecycle.sh wake, got: %s", afterEditHook.Command)
+	if !strings.Contains(afterEditHook.Command, "acd wake") {
+		t.Fatalf("cursor afterFileEdit hook must call acd wake, got: %s", afterEditHook.Command)
 	}
 	if afterRes := runCursorHook(t, ctx, env, home, stdin, afterEditHook.Command); afterRes.ExitCode != 0 {
 		t.Fatalf("cursor afterFileEdit exit=%d\nstdout=%s\nstderr=%s",
@@ -995,8 +988,8 @@ func runCursorE2E(t *testing.T, bin string) {
 	}
 
 	flushHook := pickHookByEvent(t, hooks, "stop")
-	if !strings.Contains(flushHook.Command, "acd-lifecycle.sh flush") {
-		t.Fatalf("cursor stop hook must call acd-lifecycle.sh flush, got: %s", flushHook.Command)
+	if !strings.Contains(flushHook.Command, "acd flush --logical") {
+		t.Fatalf("cursor stop hook must call acd flush --logical, got: %s", flushHook.Command)
 	}
 	if flushRes := runCursorHook(t, ctx, env, home, stdin, flushHook.Command); flushRes.ExitCode != 0 {
 		t.Fatalf("cursor stop (flush) exit=%d\nstdout=%s\nstderr=%s",

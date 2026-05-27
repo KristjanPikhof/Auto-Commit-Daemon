@@ -63,7 +63,6 @@ func readmeFile(harness string) string {
 
 func newSetupCmd() *cobra.Command {
 	var applyFlag bool
-	var helperFlag bool
 	var rawFlag bool
 
 	cmd := &cobra.Command{
@@ -76,12 +75,9 @@ When no harness is provided, acd tries to detect one installed acd-managed harne
 
 Use --raw to emit only the snippet body (no comment-wrapped header, footer, or README). This is required when the snippet is strict JSON (e.g. acd setup codex --raw > ~/.codex/hooks.json) because JSON has no comment syntax.
 
-Use --helper with cursor to emit the embedded lifecycle helper script.
-
 Supported harnesses include claude-code, codex, cursor, opencode, pi, and shell.`,
 		Example: `  acd setup codex --raw > ~/.codex/hooks.json
   acd setup cursor --raw > ~/.cursor/hooks.json
-  acd setup cursor --helper > ~/.cursor/hooks/acd-lifecycle.sh
   acd setup claude-code
   acd setup opencode
   acd setup shell`,
@@ -100,17 +96,16 @@ Supported harnesses include claude-code, codex, cursor, opencode, pi, and shell.
 			if len(args) == 1 {
 				harness = args[0]
 			}
-			return runSetup(cmd, harness, rawFlag, helperFlag)
+			return runSetup(cmd, harness, rawFlag)
 		},
 	}
 	cmd.Flags().BoolVar(&applyFlag, "apply", false, "Automatically apply snippet (deferred to v0.2)")
-	cmd.Flags().BoolVar(&helperFlag, "helper", false, "Emit the Cursor lifecycle helper script")
 	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Emit only the snippet body (no comment-wrapped instructions); required for strict-JSON targets like ~/.codex/hooks.json")
 	_ = cmd.Flags().MarkHidden("apply")
 	return cmd
 }
 
-func runSetup(cmd *cobra.Command, harness string, raw bool, helper bool) error {
+func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 	if harness == "" {
 		detected := adapter.DetectInstalled()
 		switch len(detected) {
@@ -145,13 +140,6 @@ func runSetup(cmd *cobra.Command, harness string, raw bool, helper bool) error {
 	embeddedFS := templatesFS
 
 	out := cmd.OutOrStdout()
-
-	if helper {
-		if harness != "cursor" {
-			return fmt.Errorf("acd setup: --helper is only supported for cursor")
-		}
-		return printSnippet(out, embeddedFS, "cursor/hooks/acd-lifecycle.sh")
-	}
 
 	if raw {
 		// Raw mode: emit just the snippet body so the output can be redirected

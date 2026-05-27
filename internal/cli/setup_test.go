@@ -300,30 +300,6 @@ func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
 	}
 }
 
-func TestSetup_Cursor_HelperEmitsLifecycleScript(t *testing.T) {
-	out, _, err := runSetupCmd(t, "cursor", "--helper")
-	if err != nil {
-		t.Fatalf("acd setup cursor --helper exit=%v\nstdout=%s", err, out)
-	}
-	want := snippetBody(t, "cursor/hooks/acd-lifecycle.sh")
-	if out != want {
-		t.Fatalf("--helper output mismatch\nwant:\n%s\ngot:\n%s", want, out)
-	}
-	if !strings.Contains(out, "hook-cursor-extract") {
-		t.Fatalf("helper output does not look like cursor lifecycle script:\n%s", out)
-	}
-}
-
-func TestSetup_HelperRejectsNonCursorHarness(t *testing.T) {
-	out, stderr, err := runSetupCmd(t, "codex", "--helper")
-	if err == nil {
-		t.Fatalf("expected --helper to reject non-cursor harness\nstdout=%s\nstderr=%s", out, stderr)
-	}
-	if !strings.Contains(err.Error(), "only supported for cursor") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
 	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})
@@ -388,19 +364,33 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 			if h.Timeout <= 0 {
 				t.Errorf("event %q entry %d: timeout must be positive, got %d", ev, i, h.Timeout)
 			}
-			if !strings.Contains(h.Command, "acd-lifecycle.sh") {
-				t.Errorf("event %q entry %d: command must call acd-lifecycle.sh: %s", ev, i, h.Command)
+			if !strings.Contains(h.Command, "hook-cursor-extract") {
+				t.Errorf("event %q entry %d: command must extract Cursor stdin: %s", ev, i, h.Command)
 			}
 		}
 	}
+	if start := settings.Hooks["sessionStart"]; len(start) > 0 {
+		if !strings.Contains(start[0].Command, "acd start --harness cursor") {
+			t.Errorf("sessionStart hook must call acd start: %s", start[0].Command)
+		}
+	}
+	for _, ev := range []string{"postToolUse", "afterFileEdit"} {
+		entries := settings.Hooks[ev]
+		if len(entries) == 0 {
+			continue
+		}
+		if !strings.Contains(entries[0].Command, "acd start --harness cursor") || !strings.Contains(entries[0].Command, "acd wake") {
+			t.Errorf("%s hook must call acd start+wake: %s", ev, entries[0].Command)
+		}
+	}
 	if stop := settings.Hooks["stop"]; len(stop) > 0 {
-		if !strings.Contains(stop[0].Command, "flush") {
-			t.Errorf("stop hook must call flush subcommand: %s", stop[0].Command)
+		if !strings.Contains(stop[0].Command, "acd flush --logical") {
+			t.Errorf("stop hook must call acd flush --logical: %s", stop[0].Command)
 		}
 	}
 	if sessionEnd := settings.Hooks["sessionEnd"]; len(sessionEnd) > 0 {
-		if !strings.Contains(sessionEnd[0].Command, "stop") {
-			t.Errorf("sessionEnd hook must call stop subcommand: %s", sessionEnd[0].Command)
+		if !strings.Contains(sessionEnd[0].Command, "acd stop") {
+			t.Errorf("sessionEnd hook must call acd stop: %s", sessionEnd[0].Command)
 		}
 	}
 }

@@ -367,17 +367,6 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 		}
 		if name == "cursor" && hr.Installed {
-			driftBody, _ := os.ReadFile(path)
-			if hr.MatchedPath != "" {
-				if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
-					driftBody = mb
-				}
-			}
-			if len(driftBody) > 0 {
-				if note := scanCursorLifecycleScript(driftBody); note != "" {
-					hr.Notes = append(hr.Notes, note)
-				}
-			}
 			if note := tailCursorHookLog(); note != "" {
 				hr.Notes = append(hr.Notes, note)
 			}
@@ -502,30 +491,17 @@ func countCursorStaleLifecycleCommands(body []byte) int {
 }
 
 func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
-	if strings.Contains(command, "acd start") && strings.Contains(command, "acd wake") {
-		return wantSubcmd == "wake"
+	switch wantSubcmd {
+	case "wake":
+		return strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")
+	case "start":
+		return strings.Contains(command, "acd start")
+	case "flush":
+		return strings.Contains(command, "acd flush --logical")
+	case "stop":
+		return strings.Contains(command, "acd stop")
 	}
-	const helper = "acd-lifecycle.sh"
-	for offset := 0; ; {
-		idx := strings.Index(command[offset:], helper)
-		if idx < 0 {
-			return false
-		}
-		start := offset + idx
-		rest := command[start+len(helper):]
-		if len(rest) > 0 && rest[0] != ' ' && rest[0] != '\t' {
-			offset = start + len(helper)
-			continue
-		}
-		rest = strings.TrimLeft(rest, " \t")
-		if strings.HasPrefix(rest, wantSubcmd) {
-			next := rest[len(wantSubcmd):]
-			if next == "" || isShellTokenBoundary(next[0]) {
-				return true
-			}
-		}
-		offset = start + len(helper)
-	}
+	return false
 }
 
 // extractCursorHookCommandsByEvent parses Cursor hooks.json and returns the
@@ -548,43 +524,6 @@ func extractCursorHookCommandsByEvent(body []byte) (map[string][]string, bool) {
 		}
 	}
 	return out, true
-}
-
-func isShellTokenBoundary(ch byte) bool {
-	switch ch {
-	case ' ', '\t', '\r', '\n', ';', '&', '|', ')', '(', '<', '>', '\'', '"':
-		return true
-	default:
-		return false
-	}
-}
-
-// scanCursorLifecycleScript returns a doctor note when hooks.json references
-// the lifecycle helper but ~/.cursor/hooks/acd-lifecycle.sh is missing or not
-// executable.
-func scanCursorLifecycleScript(body []byte) string {
-	if !strings.Contains(string(body), "acd-lifecycle.sh") {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	script := filepath.Join(home, ".cursor", "hooks", "acd-lifecycle.sh")
-	info, err := os.Stat(script)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "hooks.json references ~/.cursor/hooks/acd-lifecycle.sh but the script is missing; run acd setup cursor and install the lifecycle helper into ~/.cursor/hooks/ per the printed README"
-		}
-		return fmt.Sprintf("hooks.json references acd-lifecycle.sh but %s is not accessible: %v", script, err)
-	}
-	if info.IsDir() {
-		return "~/.cursor/hooks/acd-lifecycle.sh exists but is a directory; replace with the executable lifecycle helper from acd setup cursor install instructions"
-	}
-	if info.Mode()&0111 == 0 {
-		return "~/.cursor/hooks/acd-lifecycle.sh is not executable; run: chmod +x ~/.cursor/hooks/acd-lifecycle.sh"
-	}
-	return ""
 }
 
 // extractActiveHookBodies returns the command-string bodies of the active
