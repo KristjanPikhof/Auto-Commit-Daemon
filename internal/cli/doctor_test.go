@@ -1495,6 +1495,27 @@ func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	}
 }
 
+func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
+	note := scanHookBodyDrift("cursor", []byte(`{"_acd_managed":true,"hooks":{}}`))
+	if note == "" {
+		t.Fatalf("empty managed cursor hooks should report drift")
+	}
+	if !strings.Contains(note, "5 active hook(s)") {
+		t.Fatalf("empty managed cursor hooks should count five missing lifecycle hooks, got %q", note)
+	}
+}
+
+func TestJSONDrift_CursorRejectsSubcommandPrefix(t *testing.T) {
+	body := readSnippet(t, "cursor/hooks.json")
+	drifted := strings.Replace(string(body),
+		`"command": "./hooks/acd-lifecycle.sh wake"`,
+		`"command": "./hooks/acd-lifecycle.sh wake-bad"`, 1)
+	note := scanHookBodyDrift("cursor", []byte(drifted))
+	if note == "" {
+		t.Fatalf("helper subcommand prefix should report drift")
+	}
+}
+
 // TestDoctor_DriftWarningCursorActiveHook seeds a cursor hooks.json whose
 // postToolUse body no longer invokes the lifecycle helper and asserts doctor
 // surfaces drift with the cursor remediation hint.

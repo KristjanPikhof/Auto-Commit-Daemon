@@ -481,13 +481,18 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 }
 
 func countCursorStaleLifecycleCommands(body []byte) int {
-	byEvent := extractCursorHookCommandsByEvent(body)
-	if len(byEvent) == 0 {
+	byEvent, ok := extractCursorHookCommandsByEvent(body)
+	if !ok {
 		return 0
 	}
 	stale := 0
 	for event, want := range cursorLifecycleSubcommands {
-		for _, cmd := range byEvent[event] {
+		cmds := byEvent[event]
+		if len(cmds) == 0 {
+			stale++
+			continue
+		}
+		for _, cmd := range cmds {
 			if !cursorLifecycleCommandOK(want, cmd) {
 				stale++
 			}
@@ -500,23 +505,39 @@ func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
 	if strings.Contains(command, "acd start") && strings.Contains(command, "acd wake") {
 		return wantSubcmd == "wake"
 	}
-	if !strings.Contains(command, "acd-lifecycle.sh") {
-		return false
+	const helper = "acd-lifecycle.sh"
+	for offset := 0; ; {
+		idx := strings.Index(command[offset:], helper)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		rest := command[start+len(helper):]
+		if len(rest) > 0 && rest[0] != ' ' && rest[0] != '\t' {
+			offset = start + len(helper)
+			continue
+		}
+		rest = strings.TrimLeft(rest, " \t")
+		if strings.HasPrefix(rest, wantSubcmd) {
+			next := rest[len(wantSubcmd):]
+			if next == "" || isShellTokenBoundary(next[0]) {
+				return true
+			}
+		}
+		offset = start + len(helper)
 	}
-	needle := "acd-lifecycle.sh " + wantSubcmd
-	return strings.Contains(command, needle) || strings.Contains(command, "acd-lifecycle.sh\t"+wantSubcmd)
 }
 
 // extractCursorHookCommandsByEvent parses Cursor hooks.json and returns the
 // command string(s) for each event key present in the file.
-func extractCursorHookCommandsByEvent(body []byte) map[string][]string {
+func extractCursorHookCommandsByEvent(body []byte) (map[string][]string, bool) {
 	var top struct {
 		Hooks map[string][]struct {
 			Command string `json:"command"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal(body, &top); err != nil || len(top.Hooks) == 0 {
-		return nil
+	if err := json.Unmarshal(body, &top); err != nil || top.Hooks == nil {
+		return nil, false
 	}
 	out := make(map[string][]string)
 	for ev, entries := range top.Hooks {
@@ -526,7 +547,16 @@ func extractCursorHookCommandsByEvent(body []byte) map[string][]string {
 			}
 		}
 	}
-	return out
+	return out, true
+}
+
+func isShellTokenBoundary(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\r', '\n', ';', '&', '|', ')', '(', '<', '>', '\'', '"':
+		return true
+	default:
+		return false
+	}
 }
 
 // scanCursorLifecycleScript returns a doctor note when hooks.json references

@@ -41,12 +41,13 @@ entire file** — back up and merge manually if you already have custom hooks.
 
 ~~~bash
 mkdir -p ~/.cursor/hooks
-install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh
+acd setup cursor --helper > ~/.cursor/hooks/acd-lifecycle.sh
+chmod +x ~/.cursor/hooks/acd-lifecycle.sh
 acd setup cursor --raw > ~/.cursor/hooks.json
 ~~~
 
-(`templates/...` paths are relative to an acd checkout or release tree; run
-`acd setup cursor` without `--raw` for the full copy-paste instructions.)
+`acd setup cursor --helper` works from the installed binary; run
+`acd setup cursor` without `--raw` for the full copy-paste instructions.
 
 Cursor uses **user-global** hooks only (`~/.cursor/hooks.json`, not a repo
 `.cursor/hooks.json`). Approve hooks in **Settings → Hooks** after install.

@@ -300,6 +300,30 @@ func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
 	}
 }
 
+func TestSetup_Cursor_HelperEmitsLifecycleScript(t *testing.T) {
+	out, _, err := runSetupCmd(t, "cursor", "--helper")
+	if err != nil {
+		t.Fatalf("acd setup cursor --helper exit=%v\nstdout=%s", err, out)
+	}
+	want := snippetBody(t, "cursor/hooks/acd-lifecycle.sh")
+	if out != want {
+		t.Fatalf("--helper output mismatch\nwant:\n%s\ngot:\n%s", want, out)
+	}
+	if !strings.Contains(out, "hook-cursor-extract") {
+		t.Fatalf("helper output does not look like cursor lifecycle script:\n%s", out)
+	}
+}
+
+func TestSetup_HelperRejectsNonCursorHarness(t *testing.T) {
+	out, stderr, err := runSetupCmd(t, "codex", "--helper")
+	if err == nil {
+		t.Fatalf("expected --helper to reject non-cursor harness\nstdout=%s\nstderr=%s", out, stderr)
+	}
+	if !strings.Contains(err.Error(), "only supported for cursor") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
 	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})

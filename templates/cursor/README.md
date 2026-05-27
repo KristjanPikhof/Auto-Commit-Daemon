@@ -145,11 +145,12 @@ Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 
    ~~~bash
    mkdir -p ~/.cursor/hooks
-   install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh
+   acd setup cursor --helper > ~/.cursor/hooks/acd-lifecycle.sh
+   chmod +x ~/.cursor/hooks/acd-lifecycle.sh
    ~~~
 
-   From a release tree without the checkout, copy the script from the acd source
-   bundle or re-run `acd setup cursor` and follow the printed README block.
+   `acd setup cursor --helper` emits the embedded helper from the installed
+   binary, so it works even when acd was installed from a release archive.
 
 3. Install `~/.cursor/hooks.json`:
 
