@@ -78,7 +78,7 @@ Flags:
 - `--plan-out`: destination for a generated plan.
 - `--review`: open `$EDITOR` to review/edit proposed messages before the apply prompt.
 - `--no-review`: skip the review prompt and leave proposed messages unchanged.
-- `--plan-only`: generate/save/print the plan summary without any interactive prompts or apply. On success, prints `Plan saved. Git history unchanged.` plus a `Next:` block with `--show-plan`, `--apply-plan --dry-run`, and `--apply-plan --yes` using the saved plan id or `--plan-out` path.
+- `--plan-only`: generate/save/print the plan summary without any interactive prompts or apply. On success, prints `Plan saved. Git history unchanged.` plus a `Next:` block with `--show-plan`, `--apply-plan --dry-run`, and `--apply-plan --yes` using the saved plan id or `--plan-out` path (quoted when the path contains spaces).
 - `--format`: editor format, `text` by default or `json` for automation-oriented edits.
 - `--show-plan`: display an existing saved plan; bypasses the provider gate.
 - `--edit`: load an existing saved plan by id or file path, open `$EDITOR` using
