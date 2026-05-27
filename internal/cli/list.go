@@ -73,12 +73,12 @@ Watch mode prints plain table frames and does not support --json.`,
   acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if watch && jsonOut {
+				return fmt.Errorf("acd list: --watch does not support --json")
+			}
 			stdout, _ := cmd.OutOrStdout().(*os.File)
 			useWatch := listUseWatchMode(stdout, once, watch) && !jsonOut
 			if useWatch {
-				if jsonOut {
-					return fmt.Errorf("acd list: --watch does not support --json")
-				}
 				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval, verbose)
 			}
 			return runList(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonOut, verbose)

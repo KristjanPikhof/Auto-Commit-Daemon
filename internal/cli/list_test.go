@@ -48,6 +48,23 @@ func TestListUseWatchMode(t *testing.T) {
 	}
 }
 
+func TestList_WatchAndJSONRejected(t *testing.T) {
+	withIsolatedHome(t)
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"list", "--watch", "--json"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --watch --json")
+	}
+	if !strings.Contains(err.Error(), "--watch does not support --json") {
+		t.Fatalf("error=%q, want substring --watch does not support --json", err.Error())
+	}
+}
+
 func TestList_JSONOnTTYDoesNotSelectWatch(t *testing.T) {
 	withIsolatedHome(t)
 	if !isatty.IsTerminal(os.Stdout.Fd()) && !isatty.IsCygwinTerminal(os.Stdout.Fd()) {
