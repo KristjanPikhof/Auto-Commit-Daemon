@@ -126,8 +126,10 @@ Open your AI tool, edit files, commits land. The daemon starts on first hook fir
 
 ~~~bash
 acd start                          # start or refresh the current repo daemon
-acd list                           # daemons across all your repos
-acd list --watch                   # refresh until Ctrl-C
+acd list                           # TTY: live compact dashboard (Ctrl-C to exit)
+acd list --once                    # one-shot compact table (TTY or scripts)
+acd list --verbose                 # wide table: ~ paths, CLIENTS, status notes
+acd list --watch                   # explicit alias for live refresh
 
 acd status                         # health, queue depth, recent decisions, intent metrics
 acd status --watch                 # live refresh
@@ -146,7 +148,7 @@ acd commit-all                     # one-shot: commit every uncommitted file (da
 
 # Explicit, reviewable intent-mode history cleanup; the daemon never does this automatically.
 acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
-acd rewrite-commits --from 5 --plan-only
+acd rewrite-commits --from 5 --plan-only   # saves plan; prints Next: apply steps
 acd rewrite-commits --range 5-12 --review --format text
 acd rewrite-commits --last 4 --no-review --yes
 acd rewrite-commits --show-plan rewrite.json

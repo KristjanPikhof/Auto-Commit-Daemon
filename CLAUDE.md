@@ -143,7 +143,7 @@ Line 3+: bullet list for why/context
 - Startup sweeps `acknowledged` flush requests older than `OrphanFlushAckThreshold = 5m` to `failed`.
 - fsnotify dispatch must not block: runtime creates use `rewalkCh`/`rewalkWorker`; diagnostics `diagCh`; tail clamps `MaxDebounceTail = 500ms`; ENOSPC -> `errBudgetExceeded`.
 - Daemon log: `paths.Roots.RepoLogPath(repoHash)` (`~/.local/state/acd/<repo-hash>/daemon.log`) with rotation/compression. Hook log: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log`.
-- `acd logs --follow` streams from EOF reached by initial tail read; do not re-`Stat`. `acd list --watch` rejects `--json`. `acd events --watch` without `--since` starts at current ledger tail; with `--since` resumes after cursor.
+- `acd logs --follow` streams from EOF reached by initial tail read; do not re-`Stat`. `acd list` on a TTY defaults to compact watch (`REPO`/`DAEMON`/`PEND`/`BLK`/`HEAD`/`STATUS`; two-segment `REPO`, `#hash` on collision); non-TTY and `--once` one-shot compact; `--verbose` wide table; watch modes reject `--json`. `acd rewrite-commits --plan-only` ends with plan-saved + `Next:` apply commands; declined apply prints `No rewrite performed.`. `acd events --watch` without `--since` starts at current ledger tail; with `--since` resumes after cursor.
 - Probes: `acd status --repo .`; `acd events --watch`; `acd logs --repo . --lines 50 --follow`; `acd diagnose --repo . --json`; `acd doctor --repo . --json`; `git status --short --ignored`.
 
 ## CLI, Git, AI

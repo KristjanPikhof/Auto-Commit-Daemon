@@ -2,7 +2,22 @@
 
 ## Unreleased
 
+### Changed
+
+- **`acd list` (breaking on TTY):** On an interactive terminal, `acd list` now
+  defaults to a live compact dashboard (same as `--watch`) with columns
+  `REPO`/`DAEMON`/`PEND`/`BLK`/`HEAD`/`STATUS`. `REPO` shows the last two path
+  segments (for example `Development/Auto-Commit-Daemon`); basename collisions
+  append a `#` hash suffix. Pipes and non-TTY stdout print a one-shot compact
+  table. Use `--once` for a single snapshot on a TTY, `--verbose` for the wide
+  table (home-short paths, `CLIENTS`, `LAST_COMMIT`, full status notes), and
+  `--watch` as an explicit alias.
+
 ### Added
+
+- **`acd rewrite-commits --plan-only`:** Ends with `Plan saved. Git history
+  unchanged.` and a `Next:` block (`--show-plan`, `--apply-plan --dry-run`,
+  `--apply-plan --yes`). Declining apply prints `No rewrite performed.`
 
 - **Cursor harness:** `acd setup cursor` prints user-global install steps;
   `acd setup cursor --raw > ~/.cursor/hooks.json` writes strict JSON for a
