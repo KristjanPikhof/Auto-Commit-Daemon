@@ -11,6 +11,11 @@
   merge the five lifecycle events manually when you already have custom hooks.
   Approve hooks in Cursor **Settings → Hooks** after install.
 
+### Fixed
+
+- Daemon shutdown now reports stopped-state persistence failures and lifecycle
+  tests read stopped state through a fresh DB handle, reducing macOS CI flakes.
+
 ## v2026-05-25
 
 ### Added
