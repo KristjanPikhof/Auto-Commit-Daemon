@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
@@ -48,6 +49,8 @@ type listEntry struct {
 
 func newListCmd() *cobra.Command {
 	var watch bool
+	var once bool
+	var verbose bool
 	var interval time.Duration
 
 	cmd := &cobra.Command{
@@ -56,27 +59,52 @@ func newListCmd() *cobra.Command {
 		Long: `List repos registered with acd and show daemon liveness, clients, queue
 depth, blocked conflicts, waiting/draining queues, last commit, and pause/stale status.
 
-Use --watch to refresh the table until interrupted. --interval controls the
-refresh cadence and accepts Go durations such as 500ms, 2s, or 1m. Watch mode
-prints plain table frames and does not support --json.`,
+On an interactive terminal, acd list defaults to a live compact dashboard (same as
+--watch) until interrupted. Pipes and non-TTY stdout print a one-shot compact table;
+use --once to force a single snapshot on a TTY. --verbose restores the wide table
+(home-short paths, CLIENTS, LAST_COMMIT, and status notes).
+
+--interval controls watch refresh cadence (Go durations such as 500ms, 2s, or 1m).
+Watch mode prints plain table frames and does not support --json.`,
 		Example: `  acd list
-  acd list --watch
+  acd list --once
+  acd list --once --verbose
   acd list --watch --interval 5s
   acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			if watch {
+			stdout, _ := cmd.OutOrStdout().(*os.File)
+			useWatch := listUseWatchMode(stdout, once, watch)
+			if useWatch {
 				if jsonOut {
 					return fmt.Errorf("acd list: --watch does not support --json")
 				}
-				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval)
+				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval, verbose)
 			}
-			return runList(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonOut)
+			return runList(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonOut, verbose)
 		},
 	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh list output until interrupted")
-	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh list output until interrupted (default on TTY)")
+	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit (even on a TTY)")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Wide table with paths, CLIENTS, LAST_COMMIT, and status notes")
+	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for watch mode (Go duration)")
 	return cmd
+}
+
+// listUseWatchMode reports whether acd list should run the live dashboard.
+// Explicit --once disables watch; explicit --watch enables it; otherwise TTY
+// stdout defaults to watch.
+func listUseWatchMode(stdout *os.File, once, watchExplicit bool) bool {
+	if once {
+		return false
+	}
+	if watchExplicit {
+		return true
+	}
+	if stdout == nil {
+		return false
+	}
+	return isatty.IsTerminal(stdout.Fd()) || isatty.IsCygwinTerminal(stdout.Fd())
 }
 
 type listSnapshot struct {
@@ -84,7 +112,7 @@ type listSnapshot struct {
 	Entries   []listEntry
 }
 
-func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
+func runList(ctx context.Context, out, errOut io.Writer, jsonOut, verbose bool) error {
 	snapshot, err := collectListSnapshot(ctx, errOut)
 	if err != nil {
 		return err
@@ -92,10 +120,10 @@ func runList(ctx context.Context, out, errOut io.Writer, jsonOut bool) error {
 	if jsonOut {
 		return renderListJSON(out, snapshot.Entries)
 	}
-	return renderListTable(out, snapshot.Entries)
+	return renderListTable(out, snapshot.Entries, verbose)
 }
 
-func runListWatch(ctx context.Context, out, errOut io.Writer, interval time.Duration) error {
+func runListWatch(ctx context.Context, out, errOut io.Writer, interval time.Duration, verbose bool) error {
 	if interval <= 0 {
 		return fmt.Errorf("acd list: --interval must be positive")
 	}
@@ -122,7 +150,7 @@ func runListWatch(ctx context.Context, out, errOut io.Writer, interval time.Dura
 			}
 			return err
 		}
-		if err := renderListWatchFrame(out, snapshot); err != nil {
+		if err := renderListWatchFrame(out, snapshot, verbose); err != nil {
 			return err
 		}
 
@@ -302,10 +330,10 @@ func renderListTableVerbose(out io.Writer, entries []listEntry) error {
 	return nil
 }
 
-func renderListWatchFrame(out io.Writer, snapshot listSnapshot) error {
+func renderListWatchFrame(out io.Writer, snapshot listSnapshot, verbose bool) error {
 	fmt.Fprint(out, "\033[2J\033[H")
 	fmt.Fprintf(out, "Updated: %s\n\n", snapshot.UpdatedAt.Format(time.RFC3339))
-	return renderListTable(out, snapshot.Entries)
+	return renderListTable(out, snapshot.Entries, verbose)
 }
 
 // dashIfMissing returns "-" when the row represents a missing/unreadable
