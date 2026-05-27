@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -209,4 +210,96 @@ func homeShort(p string) string {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// pathTwoSegmentLabel returns the last two path segments joined with "/"
+// (e.g. Development/Auto-Commit-Daemon). A single-segment path uses that name.
+func pathTwoSegmentLabel(path string) string {
+	clean := filepath.Clean(path)
+	parts := strings.Split(clean, string(filepath.Separator))
+	var segs []string
+	for _, p := range parts {
+		if p != "" {
+			segs = append(segs, p)
+		}
+	}
+	switch len(segs) {
+	case 0:
+		return "?"
+	case 1:
+		return segs[0]
+	default:
+		return segs[len(segs)-2] + "/" + segs[len(segs)-1]
+	}
+}
+
+// buildListRepoLabelsCompact assigns a compact REPO column label per path. When
+// two entries share the same two-segment label, each colliding row gets a "#"
+// suffix with the last four characters of repo_hash.
+func buildListRepoLabelsCompact(entries []listEntry) map[string]string {
+	baseCounts := make(map[string]int)
+	bases := make(map[string]string, len(entries))
+	for _, e := range entries {
+		base := pathTwoSegmentLabel(e.Path)
+		bases[e.Path] = base
+		baseCounts[base]++
+	}
+	labels := make(map[string]string, len(entries))
+	for _, e := range entries {
+		base := bases[e.Path]
+		if baseCounts[base] > 1 {
+			tail := e.RepoHash
+			if len(tail) > 4 {
+				tail = tail[len(tail)-4:]
+			}
+			labels[e.Path] = base + "#" + tail
+			continue
+		}
+		labels[e.Path] = base
+	}
+	return labels
+}
+
+// listRepoLabelCompact returns the REPO column label for compact list output.
+func listRepoLabelCompact(path, repoHash string, labels map[string]string) string {
+	if label, ok := labels[path]; ok {
+		return label
+	}
+	return pathTwoSegmentLabel(path)
+}
+
+// listStatusCompact maps list status strings to short dashboard tokens.
+func listStatusCompact(status string) string {
+	switch status {
+	case "OK":
+		return "OK"
+	case "waiting":
+		return "wait"
+	case "blocked":
+		return "blk"
+	case "paused":
+		return "pause"
+	case "missing", "unreadable":
+		return "miss"
+	case "stale":
+		return "stale"
+	default:
+		return status
+	}
+}
+
+// listLastCommitShort renders the HEAD/LAST_COMMIT column (7-char oid prefix).
+func listLastCommitShort(oid string) string {
+	if oid == "" {
+		return "-"
+	}
+	if len(oid) > 7 {
+		return oid[:7]
+	}
+	return oid
+}
+
+// listRowMissing reports rows without readable state.db summary data.
+func listRowMissing(status string) bool {
+	return status == "missing" || status == "unreadable"
 }

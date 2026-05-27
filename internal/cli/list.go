@@ -248,27 +248,53 @@ func renderListJSON(out io.Writer, entries []listEntry) error {
 	}{Repos: entries})
 }
 
-func renderListTable(out io.Writer, entries []listEntry) error {
+func renderListTable(out io.Writer, entries []listEntry, verbose bool) error {
+	if verbose {
+		return renderListTableVerbose(out, entries)
+	}
+	return renderListTableCompact(out, entries)
+}
+
+func renderListTableCompact(out io.Writer, entries []listEntry) error {
+	labels := buildListRepoLabelsCompact(entries)
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "REPO\tDAEMON\tPEND\tBLK\tHEAD\tSTATUS")
+	for _, e := range entries {
+		repo := listRepoLabelCompact(e.Path, e.RepoHash, labels)
+		statusCol := listStatusCompact(e.Status)
+		if listRowMissing(e.Status) {
+			fmt.Fprintf(tw, "%s\t-\t\t\t\t%s\n", repo, statusCol)
+			continue
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\t%s\n",
+			repo,
+			e.Daemon,
+			e.PendingEvents,
+			e.BlockedConflicts,
+			listLastCommitShort(e.LastCommitOID),
+			statusCol,
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		return fmt.Errorf("acd list: flush: %w", err)
+	}
+	return nil
+}
+
+func renderListTableVerbose(out io.Writer, entries []listEntry) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tLAST_COMMIT\tSTATUS")
 	for _, e := range entries {
 		clients := dashIfMissing(e.Status, fmt.Sprintf("%d", e.Clients))
 		pending := dashIfMissing(e.Status, fmt.Sprintf("%d", e.PendingEvents))
 		blocked := dashIfMissing(e.Status, fmt.Sprintf("%d", e.BlockedConflicts))
-		lastOID := "-"
-		if e.LastCommitOID != "" {
-			if len(e.LastCommitOID) > 7 {
-				lastOID = e.LastCommitOID[:7]
-			} else {
-				lastOID = e.LastCommitOID
-			}
-		}
 		statusCol := e.Status
 		if e.StatusNote != "" {
 			statusCol = e.Status + " (" + e.StatusNote + ")"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			homeShort(e.Path), e.Daemon, clients, pending, blocked, lastOID, statusCol)
+			homeShort(e.Path), e.Daemon, clients, pending, blocked,
+			listLastCommitShort(e.LastCommitOID), statusCol)
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("acd list: flush: %w", err)
@@ -293,9 +319,9 @@ func dashIfMissing(status, val string) string {
 
 func blockedListStatusNote(blockedConflicts, activeBarriers int) string {
 	if activeBarriers > 0 {
-		return fmt.Sprintf("blocked conflicts=%d; active barriers=%d; run acd diagnose; preview safe fix with acd fix --dry-run or force purge plan with acd fix --force --dry-run", blockedConflicts, activeBarriers)
+		return fmt.Sprintf("blocked conflicts=%d, barriers=%d; run acd diagnose; preview with acd fix --dry-run", blockedConflicts, activeBarriers)
 	}
-	return fmt.Sprintf("blocked conflicts=%d; run acd diagnose; preview safe fix with acd fix --dry-run", blockedConflicts)
+	return fmt.Sprintf("blocked conflicts=%d; run acd diagnose; preview with acd fix --dry-run", blockedConflicts)
 }
 
 // repoSummary is the subset of state.db fields the CLI needs.
