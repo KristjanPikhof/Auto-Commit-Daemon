@@ -21,7 +21,7 @@ func TestList_HumanOneShotOutputStaysTableOnly(t *testing.T) {
 	withIsolatedHome(t)
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(context.Background(), &stdout, &stderr, false); err != nil {
+	if err := runList(context.Background(), &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	if stderr.Len() != 0 {
@@ -55,7 +55,7 @@ func TestList_Human_TwoRepos(t *testing.T) {
 	registerRepo(t, roots, repoB, dbB, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	out := stdout.String()
@@ -96,7 +96,7 @@ func TestList_JSON_TwoRepos(t *testing.T) {
 	registerRepo(t, roots, repoB, dbB, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -132,7 +132,7 @@ func TestList_StatusColumnShowsManualPause(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "paused (manual)") {
@@ -155,7 +155,7 @@ func TestList_StatusColumnShowsRewindGrace(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	got := stdout.String()
@@ -176,7 +176,7 @@ func TestList_NoPauseShowsOK(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	var got struct {
@@ -212,7 +212,7 @@ func TestList_StaleHeartbeatMarked(t *testing.T) {
 	registerRepo(t, roots, repo, db, "claude-code")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "stale") {
@@ -242,7 +242,7 @@ func TestList_HidesStaleDaemonWithoutLiveClients(t *testing.T) {
 	registerRepo(t, roots, repo, db, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -286,7 +286,7 @@ func TestList_CountsOnlyLiveClients(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -349,7 +349,7 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 
 	// Human output exposes both columns and counts.
 	var humanOut, humanErr bytes.Buffer
-	if err := runList(ctx, &humanOut, &humanErr, false); err != nil {
+	if err := runList(ctx, &humanOut, &humanErr, false, false); err != nil {
 		t.Fatalf("runList human: %v", err)
 	}
 	human := humanOut.String()
@@ -359,7 +359,7 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 
 	// JSON shape exposes counts as integers and matches the state we wrote.
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true); err != nil {
+	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -405,7 +405,7 @@ func TestList_PendingOnlyShowsWaitingNotBlocked(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true); err != nil {
+	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -435,7 +435,7 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 	registerRepo(t, roots, repo, db+".doesnotexist", "claude-code")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "missing") {
@@ -472,7 +472,7 @@ func TestList_PausedAndStale_RendersBoth(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false); err != nil {
+	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
 		t.Fatalf("runList: %v", err)
 	}
 	got := stdout.String()
@@ -502,7 +502,7 @@ func TestList_JSON_PausedAndStale(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -548,7 +548,7 @@ func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true); err != nil {
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
 		t.Fatalf("runList json: %v", err)
 	}
 	var got struct {
@@ -571,7 +571,7 @@ func TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel(t *testing.T) {
 	stdout := newCancelAfterFramesWriter(cancel, 2)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runListWatch(ctx, stdout, io.Discard, time.Millisecond)
+		errCh <- runListWatch(ctx, stdout, io.Discard, time.Millisecond, false)
 	}()
 
 	select {
@@ -613,7 +613,7 @@ func TestListWatch_AlreadyCanceledContextReturnsNil(t *testing.T) {
 	cancel()
 
 	var stdout bytes.Buffer
-	if err := runListWatch(ctx, &stdout, io.Discard, time.Millisecond); err != nil {
+	if err := runListWatch(ctx, &stdout, io.Discard, time.Millisecond, false); err != nil {
 		t.Fatalf("runListWatch: %v", err)
 	}
 	if stdout.Len() != 0 {
