@@ -443,6 +443,33 @@ func TestHookCursorExtract_ResolveCursorHookRepoDirect(t *testing.T) {
 	}
 }
 
+func TestHookCursorExtract_WorkspaceRootCanonicalizesGitToplevel(t *testing.T) {
+	requireGitForCLIResolverTest(t)
+	repo := initCLIResolverRepo(t)
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "repo-link")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"conversation_id": "conv-symlink",
+		"workspace_roots": []string{link},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runHookCursorExtract(strings.NewReader(string(payload)), &out); err != nil {
+		t.Fatalf("runHookCursorExtract: %v", err)
+	}
+	wantRepo := canonicalCLIResolverTestPath(t, repo)
+	if got := out.String(); got != "conv-symlink\n"+wantRepo+"\n" {
+		t.Fatalf("output=%q want symlinked workspace root to match canonical git toplevel %q", got, wantRepo)
+	}
+}
+
 func TestHookStdinExtract_DecodeErrorWordingUnchangedForSmallPayload(t *testing.T) {
 	// Sanity: small malformed payload still surfaces as a decode error,
 	// not as a truncation error, so the two paths stay distinguishable.

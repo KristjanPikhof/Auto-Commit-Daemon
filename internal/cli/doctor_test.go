@@ -1567,6 +1567,62 @@ func TestDriftRemediation_CursorCanonicalPath(t *testing.T) {
 	}
 }
 
+func TestScanCursorLifecycleScript_MissingExecutable(t *testing.T) {
+	body := readSnippet(t, "cursor/hooks.json")
+	note := scanCursorLifecycleScript(body)
+	if note == "" {
+		t.Fatalf("expected missing lifecycle script note when ~/.cursor/hooks/acd-lifecycle.sh is absent")
+	}
+	if !strings.Contains(note, "acd-lifecycle.sh") {
+		t.Fatalf("note should mention lifecycle script, got %q", note)
+	}
+}
+
+func TestScanCursorLifecycleScript_PresentExecutable(t *testing.T) {
+	_ = withIsolatedHome(t)
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".cursor", "hooks"), 0o700); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+	script := filepath.Join(home, ".cursor", "hooks", "acd-lifecycle.sh")
+	if err := os.WriteFile(script, []byte("#!/usr/bin/env bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	body := readSnippet(t, "cursor/hooks.json")
+	if note := scanCursorLifecycleScript(body); note != "" {
+		t.Fatalf("expected no note when lifecycle script is present and executable, got %q", note)
+	}
+}
+
+func TestDoctor_CursorMissingLifecycleScript(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
+		t.Fatalf("mkdir cursor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), readSnippet(t, "cursor/hooks.json"), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	cur := findDoctorHarness(t, rep, "cursor")
+	notes := strings.Join(cur.Notes, "\n")
+	if !strings.Contains(notes, "acd-lifecycle.sh") {
+		t.Fatalf("expected missing lifecycle script note, got notes=%v", cur.Notes)
+	}
+}
+
 // TestDriftRemediation_OpenCodePiCanonicalPaths locks in that the
 // remediation hints surfaced by `acd doctor` for OpenCode and Pi point at
 // the canonical default hook paths (`~/.config/opencode/hook/hooks.yaml`
