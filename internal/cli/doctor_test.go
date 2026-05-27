@@ -649,6 +649,12 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
+		t.Fatalf("mkdir cursor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write cursor hooks.json: %v", err)
+	}
 
 	var jsonOut bytes.Buffer
 	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
@@ -672,13 +678,20 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "legacy") {
 		t.Fatalf("codex should not show legacy warning when only hooks.json exists: %+v", codex)
 	}
+	cursor := findDoctorHarness(t, rep, "cursor")
+	if !cursor.Installed || !cursor.MarkerFound {
+		t.Fatalf("cursor hooks.json install report wrong: %+v", cursor)
+	}
+	if !strings.HasSuffix(cursor.ConfigPath, "/.cursor/hooks.json") {
+		t.Fatalf("cursor ConfigPath=%q, want ~/.cursor/hooks.json", cursor.ConfigPath)
+	}
 
 	var humanOut bytes.Buffer
 	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
 		t.Fatalf("runDoctor human: %v", err)
 	}
 	body := humanOut.String()
-	for _, want := range []string{"Install", "claude-code : yes", "codex       : yes"} {
+	for _, want := range []string{"Install", "claude-code : yes", "codex       : yes", "cursor      : yes"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("human doctor missing %q:\n%s", want, body)
 		}
@@ -1440,6 +1453,117 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 				t.Fatalf("%s drift note missing prefix, got %q", tc.harness, note)
 			}
 		})
+	}
+}
+
+// TestJSONDrift_FromVerbatimCursorSnippet feeds the shipped cursor/hooks.json
+// flat schema into extractCursorFlatHookBodies and scanHookBodyDrift.
+func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
+	body := readSnippet(t, "cursor/hooks.json")
+	if note := scanHookBodyDrift("cursor", body); note != "" {
+		t.Fatalf("verbatim cursor snippet should not report drift, got %q", note)
+	}
+	bodies := extractCursorFlatHookBodies(body, []string{"postToolUse", "afterFileEdit"})
+	if len(bodies) < 2 {
+		t.Fatalf("expected at least 2 active hook bodies for cursor, got %d", len(bodies))
+	}
+	for i, b := range bodies {
+		if !activeHookBodyHasStartWake("cursor", b) {
+			t.Fatalf("cursor active hook[%d] missing canonical start+wake behavior in %q", i, b)
+		}
+	}
+	drifted := strings.Replace(string(body),
+		`"command": "./hooks/acd-lifecycle.sh wake"`,
+		`"command": "echo drifted"`, 1)
+	note := scanHookBodyDrift("cursor", []byte(drifted))
+	if note == "" {
+		t.Fatalf("cursor drift snippet should report drift, got empty note")
+	}
+	if !strings.Contains(note, "installed snippet drift") {
+		t.Fatalf("cursor drift note missing prefix, got %q", note)
+	}
+}
+
+// TestDoctor_DriftWarningCursorActiveHook seeds a cursor hooks.json whose
+// postToolUse body no longer invokes the lifecycle helper and asserts doctor
+// surfaces drift with the cursor remediation hint.
+func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
+		t.Fatalf("mkdir cursor: %v", err)
+	}
+	body := `{
+		"version": 1,
+		"_acd_managed": true,
+		"hooks": {
+			"postToolUse": [
+				{ "command": "echo no-op", "timeout": 15 }
+			],
+			"afterFileEdit": [
+				{ "command": "./hooks/acd-lifecycle.sh wake", "timeout": 15 }
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write cursor hooks.json: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	cur := findDoctorHarness(t, rep, "cursor")
+	if !cur.Installed {
+		t.Fatalf("cursor should be installed: %+v", cur)
+	}
+	notes := strings.Join(cur.Notes, "\n")
+	if !strings.Contains(notes, "installed snippet drift") {
+		t.Fatalf("expected drift warning, got notes=%v", cur.Notes)
+	}
+	if !strings.Contains(notes, "acd setup cursor") {
+		t.Fatalf("drift note missing remediation command, got notes=%v", cur.Notes)
+	}
+}
+
+// TestDriftRemediation_CursorCanonicalPath locks in that cursor drift hints
+// reference ~/.cursor/hooks.json for merge and overwrite recipes.
+func TestDriftRemediation_CursorCanonicalPath(t *testing.T) {
+	cmd, ok := driftRemediationCommands["cursor"]
+	if !ok {
+		t.Fatal("driftRemediationCommands missing entry for cursor")
+	}
+	for _, want := range []string{
+		"acd setup cursor",
+		"merge output into ~/.cursor/hooks.json",
+		"cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak",
+		"acd setup cursor --raw > ~/.cursor/hooks.json",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("cursor remediation missing %q\nfull: %s", want, cmd)
+		}
+	}
+	tokens := extractPathTokensAfter(t, cmd, []string{
+		"merge output into ",
+		"cp ",
+		"--raw > ",
+	})
+	if len(tokens) == 0 {
+		t.Fatalf("cursor remediation: extracted 0 path tokens\nfull: %s", cmd)
+	}
+	for _, tok := range tokens {
+		normalized := strings.TrimSuffix(tok, ".bak")
+		if !strings.HasSuffix(normalized, "/.cursor/hooks.json") {
+			t.Fatalf("cursor remediation path token %q does not end with /.cursor/hooks.json\nfull: %s", tok, cmd)
+		}
 	}
 }
 
