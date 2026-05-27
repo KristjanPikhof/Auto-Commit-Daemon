@@ -1,7 +1,7 @@
 # acd adapter: cursor
 
 User-global Cursor agent hooks only. This document is the harness contract for
-implementers (`acd setup cursor`, `acd-lifecycle.sh`, adapter detection, and
+implementers (`acd setup cursor`, inline hook commands, adapter detection, and
 E2E).
 
 ## Scope
@@ -9,13 +9,12 @@ E2E).
 | In scope | Out of scope |
 |----------|--------------|
 | `~/.cursor/hooks.json` (canonical install path) | Repo-local `.cursor/hooks.json` |
-| `~/.cursor/hooks/acd-lifecycle.sh` helper | `acd setup cursor --apply` merge installer |
+| Inline lifecycle command bodies | `acd setup cursor --apply` merge installer |
 | Agent lifecycle events below | Tab hooks (`beforeTabFileRead`, `afterTabFileEdit`) |
 | `watch-pid 0` (no harness refcount) | Project hooks checked into repositories |
 
-Cursor runs user hooks from `~/.cursor/`, so hook commands use paths relative to
-that directory (for example `./hooks/acd-lifecycle.sh`), not paths relative to
-the open workspace root.
+Cursor runs user hooks from `~/.cursor/`. The shipped commands are inline shell
+commands, so no auxiliary script path is required.
 
 ## Layout
 
@@ -23,16 +22,6 @@ After install:
 
 ~~~text
 ~/.cursor/hooks.json          # version 1, _acd_managed, event -> command entries
-~/.cursor/hooks/acd-lifecycle.sh   # subcommands: start | wake | flush | stop
-~~~
-
-`hooks.json` must not embed long shell; each wired event calls the helper:
-
-~~~text
-./hooks/acd-lifecycle.sh start
-./hooks/acd-lifecycle.sh wake
-./hooks/acd-lifecycle.sh flush
-./hooks/acd-lifecycle.sh stop
 ~~~
 
 Hook log (convention, same as other harnesses):
@@ -40,8 +29,8 @@ Hook log (convention, same as other harnesses):
 
 ## Stdin precedence
 
-Cursor delivers one JSON object on stdin per hook invocation. The lifecycle
-script uses `acd hook-cursor-extract` to resolve fields in this order.
+Cursor delivers one JSON object on stdin per hook invocation. Inline hook
+commands use `acd hook-cursor-extract` to resolve fields in this order.
 
 ### Session id
 
@@ -50,9 +39,9 @@ script uses `acd hook-cursor-extract` to resolve fields in this order.
 | 1 | `conversation_id` | Required top-level string. This is the acd `--session-id` for the Cursor conversation. |
 
 There is no `session_id` alias on Cursor stdin. When `conversation_id` is
-missing or `hook-cursor-extract` fails for any reason, the lifecycle script logs
-and exits **0** (fail-soft, same as Codex `hook-stdin-extract` failures) so
-Cursor is not blocked.
+missing or `hook-cursor-extract` fails for any reason, the hook command logs and
+exits **0** (fail-soft, same as Codex `hook-stdin-extract` failures) so Cursor
+is not blocked.
 
 ### Repository path
 
@@ -85,13 +74,13 @@ parent PID for refcount sweep; session end is driven by `sessionEnd` ->
 Register exactly these Cursor agent hook events in `~/.cursor/hooks.json`
 (schema `version: 1`, camelCase event names):
 
-| Cursor event | Helper | acd action |
-|--------------|--------|------------|
-| `sessionStart` | `./hooks/acd-lifecycle.sh start` | `acd start --harness cursor --session-id <conversation_id> --watch-pid 0 --repo <resolved>` |
-| `postToolUse` | `./hooks/acd-lifecycle.sh wake` | Idempotent `acd start` then `acd wake` (same session/repo) |
-| `afterFileEdit` | `./hooks/acd-lifecycle.sh wake` | Same as `postToolUse` |
-| `stop` | `./hooks/acd-lifecycle.sh flush` | `acd flush --logical` (prompt-end commit boundary; bypasses intent batch wait when drained) |
-| `sessionEnd` | `./hooks/acd-lifecycle.sh stop` | `acd stop --session-id <conversation_id> --repo <resolved>` |
+| Cursor event | acd action |
+|--------------|------------|
+| `sessionStart` | `acd start --harness cursor --session-id <conversation_id> --watch-pid 0 --repo <resolved>` |
+| `postToolUse` | Idempotent `acd start` then `acd wake` (same session/repo) |
+| `afterFileEdit` | Same as `postToolUse` |
+| `stop` | `acd flush --logical` (prompt-end commit boundary; bypasses intent batch wait when drained) |
+| `sessionEnd` | `acd stop --session-id <conversation_id> --repo <resolved>` |
 
 Behavioral alignment with Claude Code / OpenCode / Pi:
 
@@ -111,48 +100,11 @@ events in v1.
 Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 `stop` / `sessionEnd` 5s.
 
-### Example `hooks.json` contract (fragment)
-
-~~~json
-{
-  "version": 1,
-  "_acd_managed": true,
-  "hooks": {
-    "sessionStart": [
-      { "command": "./hooks/acd-lifecycle.sh start", "timeout": 15 }
-    ],
-    "postToolUse": [
-      { "command": "./hooks/acd-lifecycle.sh wake", "timeout": 15 }
-    ],
-    "afterFileEdit": [
-      { "command": "./hooks/acd-lifecycle.sh wake", "timeout": 15 }
-    ],
-    "stop": [
-      { "command": "./hooks/acd-lifecycle.sh flush", "timeout": 5 }
-    ],
-    "sessionEnd": [
-      { "command": "./hooks/acd-lifecycle.sh stop", "timeout": 5 }
-    ]
-  }
-}
-~~~
-
 ## Install
 
 1. Install acd:
    `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Install the lifecycle helper (executable):
-
-   ~~~bash
-   mkdir -p ~/.cursor/hooks
-   acd setup cursor --helper > ~/.cursor/hooks/acd-lifecycle.sh
-   chmod +x ~/.cursor/hooks/acd-lifecycle.sh
-   ~~~
-
-   `acd setup cursor --helper` emits the embedded helper from the installed
-   binary, so it works even when acd was installed from a release archive.
-
-3. Install `~/.cursor/hooks.json`:
+2. Install `~/.cursor/hooks.json`:
 
    - **Merge (recommended):** if you already have custom hooks, copy the five
      event entries from `acd setup cursor --raw` (or `templates/cursor/hooks.json`)
@@ -167,8 +119,8 @@ Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
    replaces the **entire** file. Back up first and merge manually if you have
    non-acd hooks.
 
-4. Restart Cursor (or rely on hooks hot-reload; restart if hooks do not load).
-5. Approve hooks in Cursor **Settings → Hooks** when prompted.
+3. Restart Cursor (or rely on hooks hot-reload; restart if hooks do not load).
+4. Approve hooks in Cursor **Settings → Hooks** when prompted.
 
 Do **not** commit repo-local `.cursor/hooks.json` for acd; the canonical path
 is user-global only (same policy as Claude Code, OpenCode, and Pi).

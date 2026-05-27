@@ -8,24 +8,18 @@
    (non-acd) hooks, remove those five event entries and `_acd_managed` (and
    `version` if nothing else needs it) instead of deleting the file, so your
    other hooks are preserved.
-2. Remove the helper script:
-   ~~~bash
-   rm -f ~/.cursor/hooks/acd-lifecycle.sh
-   ~~~
-   Remove `~/.cursor/hooks/` only if no other tools use scripts in that
-   directory.
-3. Stop any running daemons (Cursor does not use `watch-pid` refcount; sessions
+2. Stop any running daemons (Cursor does not use `watch-pid` refcount; sessions
    may linger until explicitly stopped):
    ~~~bash
    acd stop --all
    ~~~
-4. (Optional) Remove the acd binary:
+3. (Optional) Remove the acd binary:
    ~~~bash
    rm ~/.local/bin/acd
    # or
    brew uninstall acd
    ~~~
-5. (Optional) Remove all acd state and logs:
+4. (Optional) Remove all acd state and logs:
    ~~~bash
    rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
    ~~~
