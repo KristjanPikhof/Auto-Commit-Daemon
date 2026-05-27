@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-28
+
 ### Changed
 
 - **`acd list` (breaking on TTY):** Interactive terminals default to a live
