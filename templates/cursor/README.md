@@ -138,13 +138,28 @@ Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 
 1. Install acd:
    `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Create `~/.cursor/hooks/` and install `acd-lifecycle.sh` (executable).
-3. Merge the fragment above into `~/.cursor/hooks.json`, or replace the file
-   only if it contains no custom hooks.
+2. Copy the lifecycle helper into `~/.cursor/hooks/` (executable). From an acd
+   checkout or release tree:
 
-   **Overwrite warning:** redirecting `acd setup cursor --raw > ~/.cursor/hooks.json`
-   (once implemented) replaces the entire file. Back up first and merge the
-   acd block manually if you have non-acd hooks.
+   ~~~bash
+   mkdir -p ~/.cursor/hooks
+   install -m 0755 templates/cursor/hooks/acd-lifecycle.sh ~/.cursor/hooks/acd-lifecycle.sh
+   ~~~
+
+3. Install `~/.cursor/hooks.json`:
+
+   - **Merge (recommended):** if you already have custom hooks, copy the five
+     event entries from `templates/cursor/hooks.json` (or the fragment above)
+     into your file. Ensure top-level `"version": 1` and `"_acd_managed": true`.
+   - **Replace:** only when the file has no non-acd hooks:
+
+     ~~~bash
+     cp templates/cursor/hooks.json ~/.cursor/hooks.json
+     ~~~
+
+   **Overwrite warning:** once `acd setup cursor` ships, redirecting
+   `acd setup cursor --raw > ~/.cursor/hooks.json` replaces the **entire**
+   file. Back up first and merge manually if you have non-acd hooks.
 
 4. Restart Cursor (or rely on hooks hot-reload; restart if hooks do not load).
 5. Approve hooks in Cursor **Settings → Hooks** when prompted.

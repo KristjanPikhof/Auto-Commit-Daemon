@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "_acd_managed": true,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./hooks/acd-lifecycle.sh start",
+        "timeout": 15
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "./hooks/acd-lifecycle.sh wake",
+        "timeout": 15
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "./hooks/acd-lifecycle.sh wake",
+        "timeout": 15
+      }
+    ],
+    "stop": [
+      {
+        "command": "./hooks/acd-lifecycle.sh flush",
+        "timeout": 5
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "./hooks/acd-lifecycle.sh stop",
+        "timeout": 5
+      }
+    ]
+  }
+}

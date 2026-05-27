@@ -1,11 +1,13 @@
 # Uninstall acd from Cursor
 
-1. Remove the acd-managed entries from `~/.cursor/hooks.json`. If the file
-   contains only the acd block you can delete it outright. If you have merged
-   custom (non-acd) hooks, remove the five acd event entries
-   (`sessionStart`, `postToolUse`, `afterFileEdit`, `stop`, `sessionEnd`) and
-   the top-level `_acd_managed` key instead of deleting the file, so your other
-   hooks are preserved.
+1. Remove the acd-managed entries from `~/.cursor/hooks.json`. The shipped
+   template (`templates/cursor/hooks.json`) wires exactly five events:
+   `sessionStart`, `postToolUse`, `afterFileEdit`, `stop`, and `sessionEnd`,
+   plus top-level `"version": 1` and `"_acd_managed": true`. If the file
+   contains only the acd block you can delete it outright. If you merged custom
+   (non-acd) hooks, remove those five event entries and `_acd_managed` (and
+   `version` if nothing else needs it) instead of deleting the file, so your
+   other hooks are preserved.
 2. Remove the helper script:
    ~~~bash
    rm -f ~/.cursor/hooks/acd-lifecycle.sh
