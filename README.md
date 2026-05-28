@@ -183,7 +183,7 @@ acd explain --path path/to/file    # inspect: why is this file stuck?
 acd diagnose --json                # inspect: branch anchor + barrier report
 acd fix --dry-run                  # plan safe remediation; read it before applying
 acd fix --yes                      # apply only the safe plan
-acd fix --force --dry-run          # explicit force plan for blocked barriers with pending successors
+acd fix --force --dry-run          # explicit force plan for replay barriers with pending successors
 acd fix --force --yes              # explicit force apply after you verify the plan
 acd status                         # post-check: confirm pending/blocked counts and status terms
 ~~~

@@ -145,7 +145,7 @@ Intent planner reliability, explicit flush boundaries, and safer recovery.
 ### Recovery
 
 - `acd fix` is the recovery entrypoint. `--yes` applies safe repairs, and
-  `--force` can purge blocked barriers with pending successors. The command
+  `--force` can purge replay barriers with pending successors. The command
   backs up `state.db` and refuses to run while a live daemon owns it.
 - `acd diagnose --json` reports `auto_resolvable_blocked_count` and
   `barrier_with_successors_count`.
