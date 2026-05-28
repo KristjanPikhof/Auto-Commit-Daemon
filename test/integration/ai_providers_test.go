@@ -185,7 +185,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 	const cannedResp = `{
   "id": "chatcmpl-test",
   "object": "chat.completion",
-  "model": "gpt-4o-mini",
+  "model": "gpt-5.4-mini",
   "choices": [{
     "index": 0,
     "message": {
@@ -223,7 +223,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-mock", "shell", extra...)
@@ -268,7 +268,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
 	p := startSessionJSON(t, ctx, env, repo, "ai-5xx", "shell", extra...)
@@ -322,7 +322,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 	const cannedResp = `{
   "id": "chatcmpl-diff",
   "object": "chat.completion",
-  "model": "gpt-4o-mini",
+  "model": "gpt-5.4-mini",
   "choices": [{
     "index": 0,
     "message": {
@@ -365,7 +365,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		"ACD_AI_DIFF_EGRESS=1",
 		trustEnv,
 	}

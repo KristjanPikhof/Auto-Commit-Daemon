@@ -100,7 +100,7 @@ AI grouping:
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=$YOUR_API_KEY
 export ACD_AI_BASE_URL=https://your-endpoint/v1
-export ACD_AI_MODEL=gpt-4o-mini
+export ACD_AI_MODEL=gpt-5.4-mini
 export ACD_AI_DIFF_EGRESS=1
 
 export ACD_COMMIT_STRATEGY=intent
@@ -236,7 +236,7 @@ git reset --hard <backup-ref-or-sha>
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
 | `ACD_AI_API_KEY` | unset | Required by `openai-compat`. |
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
-| `ACD_AI_MODEL` | `gpt-4o-mini` | Model passed to the provider. |
+| `ACD_AI_MODEL` | `gpt-5.4-mini` | Model passed to the provider. |
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs to providers that ask for diffs. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred count before planning. Lower it for sparse repos. |

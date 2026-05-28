@@ -29,7 +29,7 @@ OpenAI-compatible endpoint:
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=sk-...
 export ACD_AI_BASE_URL=https://api.openai.com/v1
-export ACD_AI_MODEL=gpt-4o-mini
+export ACD_AI_MODEL=gpt-5.4-mini
 export ACD_AI_TIMEOUT=30s
 ~~~
 
@@ -86,7 +86,7 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | Must be an absolute HTTPS URL. |
 | `ACD_AI_API_KEY` | unset | Required for `openai-compat`; missing key falls back to deterministic. |
-| `ACD_AI_MODEL` | `gpt-4o-mini` | Sent to the OpenAI-compatible endpoint. |
+| `ACD_AI_MODEL` | `gpt-5.4-mini` | Sent to the OpenAI-compatible endpoint. |
 | `ACD_AI_TIMEOUT` | `30s` | Applies to HTTP and subprocess providers. Plain seconds also work. |
 | `ACD_AI_CA_FILE` | unset | PEM CA bundle for private HTTPS gateways. |
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |

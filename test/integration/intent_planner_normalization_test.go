@@ -69,7 +69,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 		resp := map[string]any{
 			"id":     "chatcmpl-bad-deferred-reason",
 			"object": "chat.completion",
-			"model":  "gpt-4o-mini",
+			"model":  "gpt-5.4-mini",
 			"choices": []map[string]any{{
 				"index": 0,
 				"message": map[string]any{
@@ -108,7 +108,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "intent-normalize", "shell", extra...)
@@ -201,7 +201,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 		resp := map[string]any{
 			"id":     "chatcmpl-rejects-log",
 			"object": "chat.completion",
-			"model":  "gpt-4o-mini",
+			"model":  "gpt-5.4-mini",
 			"choices": []map[string]any{{
 				"index": 0,
 				"message": map[string]any{
@@ -240,7 +240,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "intent-rejects-log", "shell", extra...)
@@ -331,7 +331,7 @@ func TestIntentStrategy_SingletonShortCircuitUsesMessageProvider(t *testing.T) {
 		resp := map[string]any{
 			"id":     "chatcmpl-singleton-message",
 			"object": "chat.completion",
-			"model":  "gpt-4o-mini",
+			"model":  "gpt-5.4-mini",
 			"choices": []map[string]any{{
 				"index": 0,
 				"message": map[string]any{
@@ -369,7 +369,7 @@ func TestIntentStrategy_SingletonShortCircuitUsesMessageProvider(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-4o-mini",
+		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "intent-singleton-shortcircuit", "shell", extra...)
