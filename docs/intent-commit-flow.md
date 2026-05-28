@@ -1,13 +1,15 @@
 # Intent commit flow
 
-Intent mode lets ACD group related captured edits into semantic commits while
-preserving replay safety. The default `event` strategy still commits one capture
-at a time; use intent mode only when you want the AI planner to decide which
-pending captures belong together.
+Intent mode groups related captures before replay writes a commit. Capture
+durability stays the same: every edit is still stored first, then planning
+decides which pending seqs can publish together.
 
-## Quick setup
+Use `event` mode when you want one capture per commit. Use `intent` when local
+history should read like review-ready changes.
 
-Sparse repos should keep the batch small and the age trigger short:
+## Setup
+
+Sparse repo:
 
 ~~~bash
 export ACD_COMMIT_STRATEGY=intent
@@ -20,7 +22,7 @@ export ACD_INTENT_MAX_PENDING_AGE=60s
 export ACD_INTENT_DEFER_LIMIT=1
 ~~~
 
-Busy repos can wait for larger groups:
+Busy repo:
 
 ~~~bash
 export ACD_COMMIT_STRATEGY=intent
@@ -33,124 +35,109 @@ export ACD_INTENT_MAX_PENDING_AGE=5m
 export ACD_INTENT_DEFER_LIMIT=1
 ~~~
 
-Enable prompt tracing only while debugging:
+Prompt-end flush from a registered harness session:
 
 ~~~bash
-export ACD_AI_PROMPT_TRACE=1
-acd prompt --last
-acd prompt --seq <capture-seq>
+acd flush --repo . --session-id "$ACD_SESSION_ID" --logical
 ~~~
 
-Prompt traces are local diagnostics under `<gitDir>/acd/prompt-trace/`. Intent
-message-only rewrite requests are traced alongside planner requests when they
-run. Traces are redacted and truncated before writing, but can still contain
-source text and private paths.
+Logical flush bypasses only the batch wait. It does not bypass validation,
+terminal barriers, or replay safety checks.
 
 ## Flow
 
 ~~~mermaid
 flowchart TB
-  A[Capture event] --> B[(state.db pending)]
-  B --> C{Batch gate met?}
-  C -- no --> D[Wait for min count<br/>or max age]
-  D --> C
-  C -- yes --> E[Build planner request]
-  E --> F[AI intent planner]
-  F --> G{Valid grouping?}
-  G -- no --> H[Deterministic fallback]
-  G -- yes --> I{Message quality OK?}
-  I -- rewrite --> J[Message-only rewrite]
-  J --> K{Rewrite OK?}
-  K -- no --> H
-  I -- yes --> L[Publish selected seqs]
-  K -- yes --> L
-  H --> L
-  L --> M[(decision_records)]
-  M --> N[status / diagnose / events]
+  A["Capture rows<br/>state=pending"] --> B{"Batch ready?"}
+  B -->|no| C["Wait for count,<br/>age, or logical flush"]
+  C --> B
+  B -->|yes| D["Build planner window"]
+  D --> E["AI planner"]
+  E --> F{"Plan valid?"}
+  F -->|no| G["Deterministic<br/>one-capture fallback"]
+  F -->|yes| H{"Message OK?"}
+  H -->|needs rewrite| I["Locked message rewrite"]
+  I --> J{"Rewrite valid?"}
+  J -->|no| G
+  H -->|yes| K["Replay selected seqs"]
+  J -->|yes| K
+  G --> K
+  K --> L[("decision ledger")]
 
   classDef queue fill:#243447,stroke:#7aa2f7,color:#e6edf3
   classDef decision fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
   classDef provider fill:#203a31,stroke:#9ece6a,color:#eaffdf
   classDef fallback fill:#402b2b,stroke:#f7768e,color:#ffe8ee
-  class B,M queue
-  class C,G,I,K decision
-  class F,J provider
-  class H fallback
+  class A,L queue
+  class B,F,H,J decision
+  class E,I provider
+  class G fallback
 ~~~
 
-## What the planner receives
+## Planner input
 
-ACD offers a bounded pending window to the provider as structured
-`capture_intent_plan` input. The request includes:
-
-| Field | Purpose |
+| Field | Meaning |
 |---|---|
-| `offered_captures` | Candidate seqs with path, op, timestamp, fidelity, defer count, and optional captured diff. |
-| `latest_commit` | Recent HEAD context for the branch. |
+| `offered_captures` | Candidate seqs with path, op, timestamp, defer count, fidelity, and optional captured diff. |
+| `recent_commits` | Compact branch context. |
 | `path_commit_context` | Recent commits for paths touched by the offered captures. |
 | `forced_aging` | True when a repeatedly deferred capture is forced into a one-capture window. |
-| `path_recent_commits` | Hint that an offered path recently changed at HEAD. It does not amend commits. |
+| `path_recent_commits` | Optional hint that an offered path recently changed at HEAD. It is not an amend feature. |
 
-The planner must classify every offered seq as selected or deferred. It may
-select exactly one capture or a larger related subset. Deferred seqs require one
-reason each.
+The planner must put every offered seq in either `selected_seqs` or
+`deferred_seqs`. It may select one seq or a larger related subset. Deferred
+seqs need reasons.
 
-## Message quality gate
+## Message rules
 
-Grouping validation and message quality are separate. A valid grouping can still
-be rejected for a weak commit message.
-
-Small single-file commits can use a semantic subject without a body:
+Small single-file commits can use only a subject:
 
 ~~~text
 Refine prompt validation
 ~~~
 
-Body bullets are required for multi-file changes, larger diffs, mixed
-code/test/docs/config changes, and high-impact paths such as CLI, config,
-migrations, recovery, public API, templates, workflows, and installer scripts:
+Multi-file, larger, mixed code/test/docs/config, CLI, migration, recovery,
+template, workflow, installer, and public contract changes need body bullets:
 
 ~~~text
 Surface rewrite diagnostics
 
-- Show recent message-quality rewrite counts in status output
+- Show recent rewrite counts in status output
 - Preserve fallback reasons for diagnose and events inspection
 ~~~
 
-ACD rejects generic, token-only, and filename-only subjects such as:
+Rejected examples:
 
-| Rejected subject | Reason |
+| Subject | Why it is rejected |
 |---|---|
-| `Update file` | Generic subject. |
-| `Update parsed` | Token-only subject. |
-| `Update effort.ts` | Filename-only subject. |
+| `Update file` | Generic. |
+| `Update parsed` | Token-only. |
+| `Update effort.ts` | Filename-only. |
 
-When only the message is weak, ACD sends a locked message-only rewrite request.
-The provider can replace `subject` and `body`, but cannot change
-`selected_seqs`, `deferred_seqs`, `grouping_reason`, or `deferred_reasons`.
+When only the message is weak, ACD sends a locked rewrite request. The provider
+may change `subject` and `body`, but not selected seqs, deferred seqs, or
+grouping rationale.
 
-## Forced aging
+## Deferrals
 
-Repeated deferrals eventually force the overdue capture into a one-capture
-window. Non-deterministic providers still receive that locked request so the
-message quality gate and rewrite path can run. If the provider is unavailable,
-times out, or returns an unsafe rewrite, ACD falls back to the bounded
-deterministic forced-aging path and still publishes the capture safely.
+Deferral is normal. It means the planner decided a capture did not belong in the
+current commit.
+
+When a capture reaches `ACD_INTENT_DEFER_LIMIT`, ACD forces it through a
+one-capture planning window unless an earlier related-path capture must land
+first. If the provider fails there, deterministic fallback publishes the
+capture safely.
 
 ## Observability
 
-Use these commands to inspect intent behavior:
+| Question | Command |
+|---|---|
+| What strategy and batch gate are active? | `acd status --json` |
+| Why is intent waiting? | `acd diagnose --json` or `acd doctor` |
+| Which seqs were grouped or deferred? | `acd events --json` |
+| What did the provider see? | `ACD_AI_PROMPT_TRACE=1` then `acd prompt --seq <seq>` |
+| Where are rejected planner responses? | `<gitDir>/acd/planner-rejects.jsonl` |
 
-~~~bash
-acd status --json
-acd diagnose --json
-acd events --json
-acd prompt --seq <capture-seq>
-~~~
-
-`intent_strategy` reports active window settings, batch wait state, deferred
-counts, forced-aging readiness, planner error rate, singleton commit rate, and
-message-quality rewrite/fallback fields. `decision_records` include
-`intent_deferred`, `intent_forced`, `intent_planner_error`,
-`message_quality_rewrite`, and `message_quality_fallback` rows when those paths
-run.
+`intent_strategy` reports window settings, batch wait state, deferred counts,
+forced-aging readiness, planner error rate, singleton commit rate, and
+message-quality rewrite or fallback counts.
