@@ -242,6 +242,7 @@ git reset --hard <backup-ref-or-sha>
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred count before planning. Lower it for sparse repos. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age escape hatch for sparse queues. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before ACD forces a one-capture window. |
+| `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after invalid planner output. |
 | `ACD_SAFE_IGNORE` | enabled | Set false-like value to stop pruning generated trees. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Extra generated trees, such as `dist/,build/`. |
 | `ACD_SENSITIVE_GLOBS` | built in | Extra sensitive path globs. Empty keeps defaults. |

@@ -39,18 +39,19 @@ import (
 // Env var names — kept exported so the CLI / docs can reference them
 // without re-typing the literal strings.
 const (
-	EnvProvider            = "ACD_AI_PROVIDER"
-	EnvBaseURL             = "ACD_AI_BASE_URL"
-	EnvAPIKey              = "ACD_AI_API_KEY"
-	EnvModel               = "ACD_AI_MODEL"
-	EnvTimeout             = "ACD_AI_TIMEOUT"
-	EnvCAFile              = "ACD_AI_CA_FILE"
-	EnvCommitStrategy      = "ACD_COMMIT_STRATEGY"
-	EnvIntentWindow        = "ACD_INTENT_WINDOW"
-	EnvIntentMinPending    = "ACD_INTENT_MIN_PENDING"
-	EnvIntentMaxPendingAge = "ACD_INTENT_MAX_PENDING_AGE"
-	EnvIntentRecentCommits = "ACD_INTENT_RECENT_COMMITS"
-	EnvIntentDeferLimit    = "ACD_INTENT_DEFER_LIMIT"
+	EnvProvider             = "ACD_AI_PROVIDER"
+	EnvBaseURL              = "ACD_AI_BASE_URL"
+	EnvAPIKey               = "ACD_AI_API_KEY"
+	EnvModel                = "ACD_AI_MODEL"
+	EnvTimeout              = "ACD_AI_TIMEOUT"
+	EnvCAFile               = "ACD_AI_CA_FILE"
+	EnvCommitStrategy       = "ACD_COMMIT_STRATEGY"
+	EnvIntentWindow         = "ACD_INTENT_WINDOW"
+	EnvIntentMinPending     = "ACD_INTENT_MIN_PENDING"
+	EnvIntentMaxPendingAge  = "ACD_INTENT_MAX_PENDING_AGE"
+	EnvIntentRecentCommits  = "ACD_INTENT_RECENT_COMMITS"
+	EnvIntentDeferLimit     = "ACD_INTENT_DEFER_LIMIT"
+	EnvIntentRetryOnInvalid = "ACD_INTENT_RETRY_ON_INVALID"
 )
 
 // DefaultProviderTimeout is the per-request timeout applied to the
@@ -62,9 +63,14 @@ const (
 	DefaultIntentMinPending    = 10
 	DefaultIntentMaxPendingAge = 5 * time.Minute
 	DefaultIntentRecentCommits = 5
+	// DefaultIntentRetryOnInvalid caps correction retries after typed
+	// planner validation errors. The first planner call is not counted as
+	// a retry, so the default allows up to three total planner attempts:
+	// initial attempt plus two correction attempts with RetryCorrection.
+	DefaultIntentRetryOnInvalid = 2
 	// DefaultIntentDeferLimit was 2 prior to the Wave 2 planner-atomicity
-	// epic. The retry loop in composed.PlanIntent (typed validation error
-	// triggers one re-prompt) plus the rejects-log forensic surface mean
+	// epic. The retry loop in composed.PlanIntent (typed validation errors
+	// can trigger correction re-prompts) plus the rejects-log forensic surface mean
 	// an event that has already been deferred once is overwhelmingly
 	// likely to be planner churn rather than a legitimate "wait for
 	// related work" decision. Lowering the default to 1 forces the

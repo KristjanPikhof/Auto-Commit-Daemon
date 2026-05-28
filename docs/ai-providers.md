@@ -98,7 +98,7 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent commits sent as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before forced one-capture planning. |
 | `ACD_INTENT_PATH_COALESCE` | `1` | Folds consecutive same-path captures into one planner offer. |
-| `ACD_INTENT_RETRY_ON_INVALID` | `1` | Retries once after typed planner validation errors. |
+| `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after typed planner validation errors. `0` or false-like values disable retries. |
 | `ACD_INTENT_REJECTS_RAW` | off | Truthy stores raw rejected planner responses. Sensitive. |
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |

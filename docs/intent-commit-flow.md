@@ -33,6 +33,7 @@ export ACD_INTENT_WINDOW=10
 export ACD_INTENT_MIN_PENDING=8
 export ACD_INTENT_MAX_PENDING_AGE=5m
 export ACD_INTENT_DEFER_LIMIT=1
+export ACD_INTENT_RETRY_ON_INVALID=1
 ~~~
 
 Prompt-end flush from a registered harness session:
