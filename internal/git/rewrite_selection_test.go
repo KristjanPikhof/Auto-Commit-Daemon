@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,6 +42,44 @@ func TestResolveRewriteSelectionPositions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveFromPositionOrCommit_AllDigitShortSHA(t *testing.T) {
+	dir := initRepoWithMain(t)
+	ctx := context.Background()
+
+	for i := 0; i < 128; i++ {
+		oid := commitWorktreeFile(t, ctx, dir, "numeric.txt", strconv.Itoa(i)+"\n", "numeric")
+		short := oid[:4]
+		n, err := strconv.Atoi(short)
+		if err != nil {
+			continue
+		}
+		chain, err := firstParentChain(ctx, dir)
+		if err != nil {
+			t.Fatalf("firstParentChain: %v", err)
+		}
+		if n <= len(chain) {
+			continue
+		}
+		if resolved, err := RevParse(ctx, dir, short+"^{commit}"); err != nil || resolved != oid {
+			continue
+		}
+		got, err := resolveFromPositionOrCommit(ctx, dir, short, chain)
+		if err != nil {
+			t.Fatalf("resolveFromPositionOrCommit(%q): %v", short, err)
+		}
+		for want, candidate := range chain {
+			if candidate == oid {
+				if got != want {
+					t.Fatalf("position=%d want %d for %s", got, want, short)
+				}
+				return
+			}
+		}
+		t.Fatalf("commit %s missing from chain", oid)
+	}
+	t.Fatal("did not generate an unambiguous all-digit short SHA")
 }
 
 func TestResolveRewriteSelectionRejectsUnsupportedShapes(t *testing.T) {
