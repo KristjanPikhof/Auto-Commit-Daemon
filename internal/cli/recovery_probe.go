@@ -361,41 +361,33 @@ WHERE e.state = ?
 	return n, err
 }
 
-// countBarrierBlockedWithSuccessors counts blocked_conflict rows on the
-// active (branch_ref, generation) that still have pending successors at a
-// higher seq. These are the rows the operator must purge with
-// `acd fix --force` when self-heal cannot land them.
-func countBarrierBlockedWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64) (int, error) {
-	counts, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, generation)
-	if err != nil {
-		return 0, fmt.Errorf("count barrier rows with successors: %w", err)
-	}
-	return counts.ActiveBlockedBarriersWithSuccessors, nil
-}
-
-// barrierBlockedRowWithSuccessors describes a blocked_conflict row whose seq
-// still blocks pending rows on the same (branch_ref, generation). Used by the
-// fix planner to enumerate purge_barrier_with_successors candidates.
-type barrierBlockedRowWithSuccessors struct {
+// terminalBarrierRowWithSuccessors describes a terminal replay barrier whose
+// seq still blocks pending rows on the same (branch_ref, generation). Used by
+// the fix planner to enumerate purge_barrier_with_successors candidates.
+type terminalBarrierRowWithSuccessors struct {
 	Seq        int64
 	Path       string
+	State      string
 	BranchRef  string
 	Generation int64
 }
 
-// scanBarrierBlockedRowsWithSuccessors returns all blocked_conflict rows on
-// the active (branch_ref, generation) that have pending successors. Used by
-// the planner for purge_barrier_with_successors when --force is set.
-func scanBarrierBlockedRowsWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64) ([]barrierBlockedRowWithSuccessors, error) {
+// scanTerminalBarrierRowsWithSuccessors returns terminal replay barriers that
+// have pending successors. blocked_conflict rows are limited to the active
+// anchor because they can represent conflict state on other live branches;
+// failed rows are global because failed barrier counts are global and a failed
+// replay barrier does not carry a self-heal path.
+func scanTerminalBarrierRowsWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64) ([]terminalBarrierRowWithSuccessors, error) {
 	if branchRef == "" {
 		return nil, nil
 	}
 	rows, err := conn.QueryContext(ctx, `
-SELECT e.seq, e.path, e.branch_ref, e.branch_generation
+SELECT e.seq, e.path, e.state, e.branch_ref, e.branch_generation
 FROM capture_events e
-WHERE e.state = ?
-  AND e.branch_ref = ?
-  AND e.branch_generation = ?
+WHERE (
+      (e.state = ? AND e.branch_ref = ? AND e.branch_generation = ?)
+   OR e.state = ?
+)
   AND EXISTS (
       SELECT 1
       FROM capture_events p
@@ -404,15 +396,18 @@ WHERE e.state = ?
         AND p.seq > e.seq
         AND p.state = ?
   )
-ORDER BY e.seq ASC`, state.EventStateBlockedConflict, branchRef, generation, state.EventStatePending)
+ORDER BY e.seq ASC`,
+		state.EventStateBlockedConflict, branchRef, generation,
+		state.EventStateFailed,
+		state.EventStatePending)
 	if err != nil {
 		return nil, fmt.Errorf("scan barrier rows with successors: %w", err)
 	}
 	defer rows.Close()
-	var out []barrierBlockedRowWithSuccessors
+	var out []terminalBarrierRowWithSuccessors
 	for rows.Next() {
-		var r barrierBlockedRowWithSuccessors
-		if err := rows.Scan(&r.Seq, &r.Path, &r.BranchRef, &r.Generation); err != nil {
+		var r terminalBarrierRowWithSuccessors
+		if err := rows.Scan(&r.Seq, &r.Path, &r.State, &r.BranchRef, &r.Generation); err != nil {
 			return nil, fmt.Errorf("scan barrier row: %w", err)
 		}
 		out = append(out, r)

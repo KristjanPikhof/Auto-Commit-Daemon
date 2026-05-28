@@ -658,7 +658,7 @@ func TestFix_ForceYesPurgesBeforeRetargetResetsBlockedRows(t *testing.T) {
 	}
 }
 
-func TestFix_ForceYesReportsIncompleteWhenBlockersRemain(t *testing.T) {
+func TestFix_ForceYesPurgesFailedBarrierWithSuccessors(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	head, err := git.RevParse(ctx, repo, "HEAD")
@@ -690,19 +690,32 @@ func TestFix_ForceYesReportsIncompleteWhenBlockersRemain(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = runFix(ctx, &out, repo, false, true, true, false, true)
-	if err == nil {
-		t.Fatalf("runFix --force --yes succeeded despite remaining failed barrier:\n%s", out.String())
+	if err := runFix(ctx, &out, repo, false, true, true, false, true); err != nil {
+		t.Fatalf("runFix --force --yes: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
 	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
-	if !plan.Incomplete || len(plan.VerifyErrors) == 0 || plan.RemainingBlockers == nil {
-		t.Fatalf("plan did not report incomplete remaining blockers: %+v", plan)
+	var purge *fixAction
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind == fixActionPurgeBarrierWithSuccessors {
+			purge = &plan.Actions[i]
+			break
+		}
 	}
-	if plan.RemainingBlockers.FailedBarriersWithSuccessors != 1 {
-		t.Fatalf("failed blocker count=%+v want 1", plan.RemainingBlockers)
+	if purge == nil {
+		t.Fatalf("plan did not purge failed barrier: %+v", plan.Actions)
+	}
+	if purge.State != state.EventStateFailed || purge.RowsChanged != 1 {
+		t.Fatalf("purge action = %+v, want failed rows=1", *purge)
+	}
+	got := countCaptureRowsByState(t, db)
+	if got[state.EventStateFailed] != 0 {
+		t.Fatalf("failed rows remain after --force --yes: %v", got)
+	}
+	if got[state.EventStatePending] == 0 {
+		t.Fatalf("pending successors should remain: %v", got)
 	}
 }
 
