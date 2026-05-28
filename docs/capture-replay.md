@@ -415,8 +415,9 @@ acd resume --repo . --yes
 
 `acd fix` is the single recovery entrypoint. Review the dry-run plan before
 applying with `--yes`; safe apply backs up `state.db` and performs only cleanup
-ACD can verify. `--force` opts into purging blocked barriers that still have
-pending successors, and is deliberately explicit: run `acd fix --force
+ACD can verify. `--force` opts into purging replay barriers, including failed
+barriers, that still have pending successors, and is deliberately explicit:
+run `acd fix --force
 --dry-run` first, then apply only after you verify the captured changes already
 exist in `HEAD` via an external committer or should be discarded. The legacy
 `acd recover` and `acd purge-events` commands remain as hidden, deprecated

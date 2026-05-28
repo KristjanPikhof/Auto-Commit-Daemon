@@ -87,6 +87,7 @@ type fixAction struct {
 	Applied          bool   `json:"applied,omitempty"`
 	SetAt            string `json:"set_at,omitempty"`
 	RequiresForce    bool   `json:"requires_force,omitempty"`
+	State            string `json:"state,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
@@ -100,7 +101,7 @@ without --force it prints a dry-run plan only. --yes applies the safe,
 auto-resolvable actions (resolve already-landed barriers, retarget stale
 anchors, clear obsolete barriers, mark externally-published rows, clear
 expired manual pauses, clear drained backpressure). --force opts into the
-destructive purge of blocked barriers that still have pending successors;
+destructive purge of replay barriers that still have pending successors;
 --force without --yes is still dry-run. All actions refuse while a live
 daemon owns the state DB, and state.db is backed up before any mutation.`,
 		Example: `  acd fix --dry-run
@@ -121,7 +122,7 @@ daemon owns the state DB, and state.db is backed up before any mutation.`,
 	}
 	cmd.Flags().Bool("dry-run", false, "Show the guided remediation plan without mutating state")
 	cmd.Flags().Bool("yes", false, "Apply safe remediation actions (auto/safe set)")
-	cmd.Flags().Bool("force", false, "Include destructive purge of blocked barriers with pending successors in the plan; combine with --yes to apply")
+	cmd.Flags().Bool("force", false, "Include destructive purge of replay barriers with pending successors in the plan; combine with --yes to apply")
 	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker when retargeting a stale anchor")
 	return cmd
 }
@@ -276,14 +277,15 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		} else {
 			// Without --force we never plan the purge, but we still nudge the
 			// operator when a stuck barrier exists so they can opt in.
-			n, err := countBarrierBlockedWithSuccessors(ctx, conn, branchRef, plan.Generation)
+			counts, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, plan.Generation)
 			if err != nil {
 				return fixPlan{}, err
 			}
+			n := counts.ActiveBlockedBarriersWithSuccessors + counts.FailedBarriersWithSuccessors
 			if n > 0 {
 				plan.ForceRequired = true
 				plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-					"%d blocked barrier row(s) still have pending successors; run `acd fix --repo %s --force --yes` to purge them.", n, plan.Repo))
+					"%d replay barrier row(s) still have pending successors; run `acd fix --repo %s --force --yes` to purge them.", n, plan.Repo))
 			}
 		}
 		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
@@ -985,15 +987,15 @@ INSERT INTO decision_records(
 	case fixActionRetargetStaleAnchor:
 		return applyRetargetStaleAnchorTx(ctx, tx, plan, nowSec)
 	case fixActionPurgeBarrierWithSuccessors:
-		// Delete one specific blocked_conflict row by seq (planner enumerates
-		// rows with pending successors). Tightly scoped to seq + state so
-		// concurrent transitions cannot accidentally clobber an unrelated row.
+		// Delete one specific terminal replay barrier by seq (planner enumerates
+		// rows with pending successors). Tightly scoped to seq + terminal states
+		// so concurrent transitions cannot accidentally clobber an unrelated row.
 		res, err := tx.ExecContext(ctx, `
 DELETE FROM capture_events
-WHERE seq = ? AND state = ?`,
-			action.Seq, state.EventStateBlockedConflict)
+WHERE seq = ? AND state IN (?, ?)`,
+			action.Seq, state.EventStateBlockedConflict, state.EventStateFailed)
 		if err != nil {
-			return 0, fmt.Errorf("acd fix: purge blocked seq %d: %w", action.Seq, err)
+			return 0, fmt.Errorf("acd fix: purge terminal barrier seq %d: %w", action.Seq, err)
 		}
 		n, _ := res.RowsAffected()
 		if n > 0 {
@@ -1139,11 +1141,13 @@ WHERE state IN (?, ?)
 	return nil
 }
 
-// planPurgeBarrierWithSuccessors enumerates blocked_conflict rows whose
-// (branch_ref, generation) still has pending successors. Only invoked when
+// planPurgeBarrierWithSuccessors enumerates terminal replay barriers whose
+// (branch_ref, generation) still has pending successors. blocked_conflict
+// rows are scoped to the active anchor; failed rows are global because
+// status/list/diagnose count failed barriers globally. Only invoked when
 // --force is set on the planner inputs.
 func planPurgeBarrierWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64, plan *fixPlan) error {
-	rows, err := scanBarrierBlockedRowsWithSuccessors(ctx, conn, branchRef, generation)
+	rows, err := scanTerminalBarrierRowsWithSuccessors(ctx, conn, branchRef, generation)
 	if err != nil {
 		return fmt.Errorf("acd fix: scan barrier-with-successors rows: %w", err)
 	}
@@ -1151,13 +1155,14 @@ func planPurgeBarrierWithSuccessors(ctx context.Context, conn *sql.DB, branchRef
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:               fmt.Sprintf("%s:%d", fixActionPurgeBarrierWithSuccessors, r.Seq),
 			Kind:             fixActionPurgeBarrierWithSuccessors,
-			Description:      "purge blocked barrier with pending successors (destructive)",
-			Reason:           "blocked_conflict row still has pending successors on same (branch_ref, generation)",
+			Description:      "purge replay barrier with pending successors (destructive)",
+			Reason:           fmt.Sprintf("%s row still has pending successors on same (branch_ref, generation)", r.State),
 			Seq:              r.Seq,
 			Path:             r.Path,
 			BranchRef:        r.BranchRef,
 			BranchGeneration: r.Generation,
 			RequiresForce:    true,
+			State:            r.State,
 		})
 	}
 	return nil

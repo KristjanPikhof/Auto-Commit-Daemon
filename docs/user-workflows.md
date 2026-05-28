@@ -423,6 +423,15 @@ acd fix --yes
 acd status
 ~~~
 
+When the plan reports replay barriers with pending successors, preview and
+apply the explicit force path:
+
+~~~bash
+acd fix --force --dry-run
+acd fix --force --yes
+acd status
+~~~
+
 If you are inside a harness shell with `ACD_SESSION_ID` set, run
 `acd wake --repo . --session-id "$ACD_SESSION_ID"` before checking status.
 
