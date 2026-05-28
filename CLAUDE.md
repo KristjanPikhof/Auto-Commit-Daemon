@@ -179,7 +179,7 @@ acd status --repo .
 
 - `acd fix` is the recovery entrypoint. Dry-run is default without `--yes`.
 - `--yes` applies safe actions: resolve already-landed barriers, retarget stale anchors, delete obsolete barriers, mark externally-published rows, clear expired manual pauses, clear drained backpressure.
-- `--force` also purges blocked barriers with pending successors; combine with `--yes` to apply.
+- `--force` also purges terminal replay barriers with pending successors, including failed rows; combine with `--yes` to apply.
 - Fixes refuse while a live daemon owns the state DB; state.db is backed up before mutation.
 - `acd resume --yes` lifts only manual pause.
 - `acd recover` and `acd purge-events` are deprecated and hidden; use `acd fix`.
