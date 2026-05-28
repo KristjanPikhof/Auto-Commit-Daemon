@@ -607,7 +607,7 @@ the pause fields:
 | Value | Meaning |
 |---|---|
 | `"OK"` | Daemon running, no pause, no stale heartbeat, and no queued or blocked work. |
-| `"waiting"` | Work is queued but not blocked. In intent mode this can be a normal batch wait; wait for more captures or the age trigger, or run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session. |
+| `"waiting"` | Work is queued but not blocked. In intent mode this can be a normal batch wait; `acd list` shows the remaining age-trigger countdown when that wait is active. Wait for more captures or the age trigger, or run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session. |
 | `"blocked"` | A terminal barrier is holding replay. Operator action is required: diagnose, dry-run `acd fix`, then choose safe or explicit force apply. |
 | `"paused"` | Replay paused (operator or rewind grace). Takes priority over `stale`. |
 | `"stale"` | Daemon heartbeat expired or PID dead, at least one live client present. |

@@ -29,22 +29,25 @@ const defaultListWatchInterval = 2 * time.Second
 // listEntry is one row in the `acd list` output. JSON marshal tags match
 // the §7.7 example shape.
 type listEntry struct {
-	Path             string     `json:"path"`
-	RepoHash         string     `json:"repo_hash"`
-	Daemon           string     `json:"daemon"`
-	PID              int        `json:"pid,omitempty"`
-	Clients          int        `json:"clients"`
-	LastSeq          int64      `json:"last_seq"`
-	LastCommitOID    string     `json:"last_commit_oid,omitempty"`
-	HeartbeatAgeSecs float64    `json:"heartbeat_age_seconds,omitempty"`
-	PendingEvents    int        `json:"pending_events"`
-	BlockedConflicts int        `json:"blocked_conflicts"`
-	ActiveBarriers   int        `json:"active_barriers,omitempty"`
-	Status           string     `json:"status"`
-	StatusNote       string     `json:"status_note,omitempty"`
-	Paused           bool       `json:"paused,omitempty"`
-	StaleHeartbeat   bool       `json:"stale_heartbeat,omitempty"`
-	Pause            *pauseInfo `json:"pause,omitempty"`
+	Path                 string     `json:"path"`
+	RepoHash             string     `json:"repo_hash"`
+	Daemon               string     `json:"daemon"`
+	PID                  int        `json:"pid,omitempty"`
+	Clients              int        `json:"clients"`
+	LastSeq              int64      `json:"last_seq"`
+	LastCommitOID        string     `json:"last_commit_oid,omitempty"`
+	HeartbeatAgeSecs     float64    `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents        int        `json:"pending_events"`
+	BlockedConflicts     int        `json:"blocked_conflicts"`
+	ActiveBarriers       int        `json:"active_barriers,omitempty"`
+	IntentWaitSeconds    int64      `json:"intent_wait_seconds,omitempty"`
+	IntentVisiblePending int        `json:"intent_visible_pending,omitempty"`
+	IntentMinPending     int        `json:"intent_min_pending,omitempty"`
+	Status               string     `json:"status"`
+	StatusNote           string     `json:"status_note,omitempty"`
+	Paused               bool       `json:"paused,omitempty"`
+	StaleHeartbeat       bool       `json:"stale_heartbeat,omitempty"`
+	Pause                *pauseInfo `json:"pause,omitempty"`
 }
 
 func newListCmd() *cobra.Command {
@@ -229,6 +232,15 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 		} else if summary.pendingEvents > 0 {
 			e.Status = "waiting"
 			e.StatusNote = "pending captures queued; no recovery blockers"
+			if summary.intentWait != nil {
+				e.IntentWaitSeconds = summary.intentWait.waitSeconds
+				e.IntentVisiblePending = summary.intentWait.visiblePending
+				e.IntentMinPending = summary.intentWait.minPending
+				e.StatusNote = fmt.Sprintf("intent batch wait: pending=%d/%d, trigger in %s",
+					summary.intentWait.visiblePending,
+					summary.intentWait.minPending,
+					formatDurationCompact(time.Duration(summary.intentWait.waitSeconds)*time.Second))
+			}
 		}
 		if summary.pause != nil {
 			e.Status = "paused"
@@ -290,6 +302,9 @@ func renderListTableCompact(out io.Writer, entries []listEntry) error {
 	for _, e := range entries {
 		repo := listRepoLabelCompact(e.Path, labels)
 		statusCol := listStatusCompact(e.Status)
+		if e.Status == "waiting" && e.IntentWaitSeconds > 0 {
+			statusCol = statusCol + " " + formatDurationCompact(time.Duration(e.IntentWaitSeconds)*time.Second)
+		}
 		if listRowMissing(e.Status) {
 			fmt.Fprintf(tw, "%s\t-\t\t\t\t%s\n", repo, statusCol)
 			continue
@@ -366,6 +381,13 @@ type repoSummary struct {
 	blockedConflicts int
 	activeBarriers   int
 	pause            *pauseInfo
+	intentWait       *listIntentWaitSummary
+}
+
+type listIntentWaitSummary struct {
+	waitSeconds    int64
+	visiblePending int
+	minPending     int
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
@@ -470,6 +492,13 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 	s.blockedConflicts = blockers.TotalBlockedConflicts
 	s.activeBarriers = blockers.ActiveBlockedBarriersWithSuccessors
+	if s.pendingEvents > 0 && s.blockedConflicts == 0 && s.activeBarriers == 0 {
+		if intentWait, err := loadListIntentWaitSummary(ctx, conn); err != nil {
+			return repoSummary{}, fmt.Errorf("intent wait summary: %w", err)
+		} else {
+			s.intentWait = intentWait
+		}
+	}
 	if info, err := pauseInfoForRepo(ctx, conn, dbPath, now); err != nil {
 		return repoSummary{}, fmt.Errorf("pause state: %w", err)
 	} else {
@@ -477,6 +506,64 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 
 	return s, nil
+}
+
+func loadListIntentWaitSummary(ctx context.Context, conn *sql.DB) (*listIntentWaitSummary, error) {
+	report := intentStrategyFromEnv()
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	report.Strategy = string(strategy)
+	report.Active = strategy == "intent"
+	if !report.Active {
+		return nil, nil
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.min_pending"); err != nil {
+		return nil, fmt.Errorf("intent.min_pending: %w", err)
+	} else if ok {
+		report.MinPending = parseIntentMetaInt(v, report.MinPending)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.max_pending_age"); err != nil {
+		return nil, fmt.Errorf("intent.max_pending_age: %w", err)
+	} else if ok {
+		report.MaxPendingAgeSeconds = parseIntentMetaDurationSeconds(v, report.MaxPendingAgeSeconds)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.defer_limit"); err != nil {
+		return nil, fmt.Errorf("intent.defer_limit: %w", err)
+	} else if ok {
+		report.DeferLimit = parseIntentMetaInt(v, report.DeferLimit)
+	}
+	if ok, err := sqliteTableExists(ctx, conn, "planner_state"); err != nil {
+		return nil, fmt.Errorf("planner_state table check: %w", err)
+	} else if ok {
+		if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM planner_state ps
+JOIN capture_events e ON e.seq = ps.event_seq
+WHERE e.state = ? AND ps.defer_count >= ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events barrier
+      WHERE barrier.branch_ref = e.branch_ref
+        AND barrier.branch_generation = e.branch_generation
+        AND barrier.seq < e.seq
+        AND barrier.state IN (?, ?)
+  )`, state.EventStatePending, report.DeferLimit, state.EventStateFailed, state.EventStateBlockedConflict).Scan(&report.ForcedAgingReady); err != nil {
+			return nil, fmt.Errorf("planner forced-aging summary: %w", err)
+		}
+	}
+	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
+		return nil, err
+	}
+	if !report.BatchWaitActive || report.AgeTriggerInSeconds <= 0 {
+		return nil, nil
+	}
+	return &listIntentWaitSummary{
+		waitSeconds:    report.AgeTriggerInSeconds,
+		visiblePending: report.VisiblePendingEvents,
+		minPending:     report.MinPending,
+	}, nil
 }
 
 func countLiveClients(ctx context.Context, conn *sql.DB, now time.Time, ttl time.Duration) (int, error) {

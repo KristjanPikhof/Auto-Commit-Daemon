@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- `acd list` now shows the intent batch-wait countdown in `wait` rows, so
+  sparse queues show when the age trigger will commit without extra commands.
+
 ### Fixed
 
 - `acd fix --force` now purges failed replay barriers with pending successors,
