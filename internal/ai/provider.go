@@ -17,6 +17,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
@@ -162,13 +163,14 @@ func recordPromptFallback(ctx context.Context, strategy, primary, fallback, reas
 // deterministic fallback path.
 //
 // On a typed *IntentPlanValidationError from the primary planner, PlanIntent
-// retries the primary exactly once with the validator message quoted verbatim
-// in the planner request's RetryCorrection field. Transport errors (timeouts,
-// HTTP errors, context cancellation, network failures) and untyped validation
-// errors do not trigger a retry — they fall back as before. The retry path
-// fires whether the typed error originates from the primary's own internal
-// ValidateIntentPlan call (returned through PlanIntent) or from the
-// composed-layer re-validation that runs after normalization.
+// retries the primary with the validator message quoted verbatim in the planner
+// request's RetryCorrection field. The retry cap defaults to
+// DefaultIntentRetryOnInvalid and can be overridden with
+// ACD_INTENT_RETRY_ON_INVALID. Transport errors (timeouts, HTTP errors, context
+// cancellation, network failures) and untyped validation errors do not trigger
+// a retry. The retry path fires whether the typed error originates from the
+// primary's own internal ValidateIntentPlan call (returned through PlanIntent)
+// or from the composed-layer re-validation that runs after normalization.
 func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (IntentPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return IntentPlan{}, err
@@ -221,15 +223,14 @@ func logIntentPlanNormalization(provider string, dropped, synthesized, overlapRe
 	slog.Warn("intent planner: normalized deferred_reasons", attrs...)
 }
 
-// runPrimaryWithRetry runs the primary planner up to twice. On a typed
-// validation error from the first attempt it appends the validator message
-// to the request via RetryCorrection and calls the planner once more. The
-// second attempt is final: any error there is returned to the composed
-// caller, which records the intent_planner_error decision and falls back
-// to deterministic.
+// runPrimaryWithRetry runs the primary planner once, then up to the configured
+// retry limit. On a typed validation error it appends the validator message to
+// the request via RetryCorrection and calls the planner again. Once retries are
+// exhausted, any error is returned to the composed caller, which records the
+// intent_planner_error decision and falls back to deterministic.
 func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanner, req IntentPlanRequest) (IntentPlan, error) {
-	const maxAttempts = 2
-	retryEnabled := intentRetryOnInvalidEnabled()
+	maxRetries := intentRetryOnInvalidLimit()
+	maxAttempts := 1 + maxRetries
 	currentReq := req
 	var (
 		lastErr        error
@@ -262,17 +263,10 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 			}
 		}
 		lastErr = err
-		// Decide whether to retry. Only typed validation errors qualify
-		// and only on the first attempt (cap retries at 1).
+		// Decide whether to retry. Only typed validation errors qualify,
+		// and the configured limit counts retries after the initial call.
 		var typed *IntentPlanValidationError
 		if attempt >= maxAttempts || !errors.As(err, &typed) {
-			break
-		}
-		// Operator opt-out: ACD_INTENT_RETRY_ON_INVALID=0|false|no|off
-		// disables the retry loop so the daemon falls straight through to
-		// deterministic. Useful when an upstream gateway bills per call
-		// and the operator prefers to skip the second round-trip.
-		if !retryEnabled {
 			break
 		}
 		// Skip retry for codes the provider-side normalizer is supposed to
@@ -291,6 +285,8 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		}
 		slog.Info("intent planner: retry attempted",
 			slog.String("provider", c.primary.Name()),
+			slog.Int("retry", attempt),
+			slog.Int("max_retries", maxRetries),
 			slog.Int("code", int(typed.Code)),
 			slog.Int64("seq", typed.Seq),
 			slog.String("error", typed.Message),
@@ -368,16 +364,23 @@ func withPromptTraceStrategy(ctx context.Context, strategy string, offeredSeqs [
 	return prompttrace.With(ctx, logger, meta)
 }
 
-// intentRetryOnInvalidEnabled reports whether the composed retry loop
-// should re-prompt the primary planner after a typed validation error.
-// Default is enabled. The operator can opt out with
-// ACD_INTENT_RETRY_ON_INVALID set to "0", "false", "no", or "off"
-// (case-insensitive). Other values keep the default.
-func intentRetryOnInvalidEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ACD_INTENT_RETRY_ON_INVALID"))) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
+// intentRetryOnInvalidLimit reports how many correction retries the composed
+// planner may make after typed validation errors. The initial planner call is
+// not counted. Empty or invalid values use DefaultIntentRetryOnInvalid.
+// False-like values disable retries for cost-sensitive environments.
+func intentRetryOnInvalidLimit() int {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(EnvIntentRetryOnInvalid)))
+	switch raw {
+	case "":
+		return DefaultIntentRetryOnInvalid
+	case "false", "no", "off":
+		return 0
+	case "true", "yes", "on":
+		return DefaultIntentRetryOnInvalid
 	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return DefaultIntentRetryOnInvalid
+	}
+	return n
 }

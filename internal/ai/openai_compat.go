@@ -65,7 +65,7 @@ import (
 const DefaultOpenAIBaseURL = "https://api.openai.com/v1"
 
 // DefaultOpenAIModel matches the spec §10.4 default.
-const DefaultOpenAIModel = "gpt-4o-mini"
+const DefaultOpenAIModel = "gpt-5.4-mini"
 
 // DefaultOpenAITimeout is the per-request HTTP timeout. The caller's ctx
 // can shorten this; the field exists so a client without a deadline still

@@ -1,11 +1,24 @@
-# acd — Auto-Commit-Daemon
+# acd: Auto-Commit-Daemon
 
-One static binary that watches your git worktree, captures meaningful changes, and lands them as chronological commits while you keep coding. Pair it with Claude Code, Codex, Cursor, OpenCode, or Pi and your AI tool's edits ship as real commits without you stopping to type `git commit`.
+`acd` watches a Git worktree and turns file edits into local commits while you
+keep working. It is built for AI coding tools such as Claude Code, Codex,
+Cursor, OpenCode, and Pi, but the daemon itself is just a static Go binary.
 
-Two ways to commit:
+~~~mermaid
+flowchart LR
+  Tool["AI tool hook"] --> CLI["acd start / wake / flush"]
+  CLI --> Daemon["acd daemon"]
+  Daemon --> Store[("state.db<br/>and git blobs")]
+  Store --> Replay["scratch index replay"]
+  Replay --> Commit["git commit<br/>update-ref"]
 
-- **`event`** (default): one captured edit becomes one commit. Fast, predictable, no LLM grouping.
-- **`intent`**: an AI planner groups related captures into one reviewable commit per logical change.
+  classDef hook fill:#243447,stroke:#7aa2f7,color:#e6edf3
+  classDef daemon fill:#203a31,stroke:#9ece6a,color:#eaffdf
+  classDef store fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
+  class Tool,CLI hook
+  class Daemon,Replay daemon
+  class Store,Commit store
+~~~
 
 ## Install
 
@@ -13,214 +26,174 @@ Two ways to commit:
 brew install KristjanPikhof/tap/acd
 ~~~
 
-Alternatives:
+Other options:
 
 ~~~bash
 curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh
 
-# or
 go install github.com/KristjanPikhof/Auto-Commit-Daemon/cmd/acd@latest
 ~~~
 
-## Wire your harness
+## Set up your AI tool
 
-Pick the one matching your AI tool, run the setup, paste the printed snippet into the target file. Don't redirect with `>` if you already have custom hooks — it overwrites the file.
+Run the setup command for the tool you use, then paste the printed snippet into
+the target config file. Do not redirect with `>` when you already have custom
+hooks, because that replaces the whole file.
 
 ~~~bash
-acd setup claude-code   # → ~/.claude/settings.json
-acd setup codex         # → ~/.codex/hooks.json
-acd setup cursor        # → ~/.cursor/hooks.json
-acd setup opencode      # → ~/.config/opencode/hook/hooks.yaml
-acd setup pi            # → ~/.pi/agent/hook/hooks.yaml
-acd setup shell         # universal direnv / zshrc fallback
+acd setup claude-code
+acd setup codex
+acd setup cursor
+acd setup opencode
+acd setup pi
+acd setup shell
 ~~~
 
-Fresh Cursor install (no existing hooks): write the JSON config. **`acd setup
-cursor --raw > ~/.cursor/hooks.json` replaces the entire file** — back up and
-merge manually if you already have custom hooks.
+| Tool | Config file | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/settings.json` | Native hook support. |
+| Codex | `~/.codex/hooks.json` | Run `/hooks` after changing the file so Codex re-approves it. |
+| Cursor | `~/.cursor/hooks.json` | User-global hooks only. Approve in Settings -> Hooks. |
+| OpenCode | `~/.config/opencode/hook/hooks.yaml` | Uses the OpenCode-Hooks adapter. |
+| Pi | `~/.pi/agent/hook/hooks.yaml` | Uses the Pi-YAML-Hooks adapter. |
+| Shell | `.envrc` or shell rc | Fallback when no native harness exists. |
+
+Fresh Cursor install with no existing hooks:
 
 ~~~bash
 mkdir -p ~/.cursor
 acd setup cursor --raw > ~/.cursor/hooks.json
 ~~~
 
-Run `acd setup cursor` without `--raw` for the full copy-paste instructions.
-
-Cursor uses **user-global** hooks only (`~/.cursor/hooks.json`, not a repo
-`.cursor/hooks.json`). Approve hooks in **Settings → Hooks** after install.
-
-Codex hooks are enabled by default. If your `~/.codex/config.toml` pins feature
-flags, keep lifecycle hooks enabled with the canonical key:
+If `~/.codex/config.toml` pins feature flags, keep hooks enabled:
 
 ~~~toml
 [features]
 hooks = true
 ~~~
 
-Do not set `hooks = false`; that disables Codex lifecycle hooks. The older
-`codex_hooks` key still works as a deprecated alias.
+After setup:
 
-After wiring, sanity-check with `acd doctor`. It checks the snippet matches the current template and tells you what to fix.
+~~~bash
+acd doctor
+~~~
 
-| Harness | Hook engine | Source |
+`doctor` checks that the installed snippet still matches the current template.
+
+## Choose commit behavior
+
+| Strategy | What happens | Best for |
 |---|---|---|
-| `claude-code` | Native | [Anthropic Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) |
-| `codex` | Native (run `/hooks` after each install to re-approve) | [OpenAI Codex](https://developers.openai.com/codex/hooks) |
-| `cursor` | Native (user-global `~/.cursor/hooks.json`; approve in Settings → Hooks) | [Cursor agent hooks](https://cursor.com/docs/agent/hooks) |
-| `opencode` | External: [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) | KristjanPikhof |
-| `pi` | External: [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) | KristjanPikhof |
-| `shell` | direnv `.envrc` or shell rc | n/a |
+| `event` | One captured edit becomes one commit. This is the default. | Offline use, CI, shared branches, strict traceability. |
+| `intent` | An AI planner groups related captures before replay writes a commit. | Local work where reviewable commits matter more than one-edit history. |
 
-## Pick a strategy
-
-Both strategies use AI for commit messages. Only `intent` calls the planner to group captures.
-
-### Recommended: deterministic event strategy (offline, no provider)
-
-Best when you want one-edit-equals-one-commit, no network calls, no API key. CI smoke runs, shared branches with strict review, and most users start here.
+Offline default:
 
 ~~~bash
 export ACD_AI_PROVIDER=deterministic
 export ACD_COMMIT_STRATEGY=event
 ~~~
 
-That's the whole config. Subjects come from a built-in symbol extractor (Go func name, TS class, Python def, Markdown heading, basename fallback).
-
-### Recommended: AI intent strategy (gpt-5.4-mini openai-compat)
-
-Best for local development where you want reviewer-friendly commits. The planner sees a window of pending captures and picks one or more related ones to ship as a single commit; the rest stay pending until the next pass.
+AI grouping:
 
 ~~~bash
-# Provider
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=$YOUR_API_KEY
 export ACD_AI_BASE_URL=https://your-endpoint/v1
 export ACD_AI_MODEL=gpt-5.4-mini
-export ACD_AI_TIMEOUT=30s
-export ACD_AI_DIFF_EGRESS=1            # required: planner groups poorly without diff context
+export ACD_AI_DIFF_EGRESS=1
 
-# Strategy
 export ACD_COMMIT_STRATEGY=intent
 export ACD_INTENT_WINDOW=10
-export ACD_INTENT_MIN_PENDING=4        # 4 for sparse repos, 10 for heavy edit bursts
+export ACD_INTENT_MIN_PENDING=4
 export ACD_INTENT_MAX_PENDING_AGE=5m
-export ACD_INTENT_RECENT_COMMITS=5
-export ACD_INTENT_DEFER_LIMIT=2
+export ACD_INTENT_DEFER_LIMIT=1
 ~~~
 
-Why these defaults? `MIN_PENDING=4` keeps sparse repos from waiting on a 10-edit batch that never arrives. `DEFER_LIMIT=1` matches the Wave 2 retry+normalize stack: a single deferral is more often planner churn than a real "wait for related work" signal. Raise to `2` if you see legit grouping decisions getting forced into singletons.
+`ACD_AI_DIFF_EGRESS=1` lets the planner see redacted captured diffs. Leave it
+unset when the endpoint should receive metadata only.
 
-Claude Code, OpenCode, and Pi snippets now use `acd flush --logical` at the natural turn boundary, so this profile still commits promptly with `MAX_PENDING_AGE=5m`. If you keep an older wake-only snippet or want faster background commits between turn boundaries, lower `ACD_INTENT_MAX_PENDING_AGE` to `60s`.
+## Daily commands
 
-`ACD_AI_DIFF_EGRESS=1` is the one knob that materially improves grouping. Without it the planner sees metadata only and groups poorly. Only leave it off if your endpoint is untrusted.
+| Need | Command |
+|---|---|
+| Start or refresh the current repo daemon | `acd start` |
+| Watch all registered repos | `acd list` |
+| Show this repo state | `acd status` |
+| Follow capture, group, publish, and block decisions | `acd events --watch` |
+| Ask why a path behaved a certain way | `acd explain --path FILE` |
+| Ask what ACD did for a commit | `acd explain --commit HEAD` |
+| Flush the current visible intent batch from an active harness session | `acd flush --session-id "$ACD_SESSION_ID" --logical` |
+| Nudge capture and replay without bypassing intent batch gates | `acd wake --session-id "$ACD_SESSION_ID"` |
+| Stop this repo daemon | `acd stop` |
+| Stop every registered daemon | `acd stop --all` |
+| Tail the daemon log | `acd logs --follow` |
+| Create a support bundle | `acd doctor --bundle` |
 
-### When to skip intent
+`acd start` resolves your current directory to the canonical Git worktree root,
+so calling it from a subdirectory refreshes the same daemon.
 
-- You don't trust the network endpoint with diff bytes (use `event` + `deterministic`).
-- Your repo is huge and replay latency matters more than message quality.
-- You want strict one-to-one traceability between an edit and a commit.
+## When commits stop
 
-## Use it
-
-Open your AI tool, edit files, commits land. The daemon starts on first hook fire and refreshes itself per session.
+Use the same ladder every time:
 
 ~~~bash
-acd start                          # start or refresh the current repo daemon
-acd list                           # TTY: live compact dashboard (Ctrl-C to exit)
-acd list --once                    # one-shot compact (TTY or scripts)
-acd list --verbose                 # wide table: ~ paths, CLIENTS, status notes
-acd list --json                    # all repos as JSON (one-shot on TTY)
-acd list --watch                   # explicit alias for live refresh
+acd status
+acd events --watch
+acd explain --path path/to/file
+acd diagnose --json
+acd fix --dry-run
+acd fix --yes
+acd status
+~~~
 
-acd status                         # health, queue depth, recent decisions, intent metrics
-acd status --watch                 # live refresh
-acd events                         # decision ledger (capture, group, defer, publish, block)
-acd events --watch                 # stream new decisions
-acd explain --path FILE            # why was this captured / skipped / blocked?
-acd explain --commit HEAD          # why did these captures land in this commit?
+Only use the force path after the dry-run shows terminal barriers with pending
+successors and you have checked that the blocked changes are already in `HEAD`
+or should be discarded:
 
-acd flush --session-id X --logical # drain pending captures NOW (bypasses MIN_PENDING / age)
-acd wake --session-id X            # heartbeat refresh + capture/replay nudge; does not bypass intent gates
-acd stop --session-id X            # refcount-aware stop (stays alive while peers are connected)
-acd stop                           # stop the current repo daemon
-acd stop --all                     # stop every registered daemon
+~~~bash
+acd fix --force --dry-run
+acd fix --force --yes
+~~~
 
-acd commit-all                     # one-shot: commit every uncommitted file (daemon must be off)
+`acd fix` backs up `state.db` before it mutates state and refuses to run while a
+live daemon owns the database. If the problem is only a manual pause marker,
+run:
 
-# Explicit, reviewable intent-mode history cleanup; the daemon never does this automatically.
-acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
-acd rewrite-commits --from 5 --plan-only   # saves plan; prints Next: apply steps
-acd rewrite-commits --range 5-12 --review --format text
-acd rewrite-commits --last 4 --no-review --yes
-acd rewrite-commits --show-plan rewrite.json
-acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
-acd rewrite-commits --edit <plan-id-or-file> --dry-run
-acd rewrite-commits --apply-plan rewrite.json --dry-run
-acd rewrite-commits --apply <plan-id-or-file> --yes
-# If apply reports a backup ref/SHA and review fails: git reset --hard <backup-ref-or-sha>
-
-acd pause --reason "rebasing" --yes
+~~~bash
 acd resume --yes
-
-acd logs --follow                  # tail the daemon JSONL log
-acd doctor                         # health diagnostics + harness-snippet drift
-acd doctor --bundle                # zip diagnostics for issue reports
-acd diagnose --json                # branch-anchor + blocked-conflict report
 ~~~
 
-`acd start` resolves your `$PWD` to its canonical Git worktree root, so calling it from a subdirectory refreshes the same daemon instead of spawning a duplicate.
+## Dirty worktree after the daemon was off
 
-ACD refuses lifecycle commands outside a Git worktree. `start`, `status`, `diagnose` all fail with a clear non-Git error rather than registering an arbitrary directory.
-
-## When commits stop appearing
-
-Use the recovery ladder in order:
+Use `commit-all` when files changed while no daemon was running:
 
 ~~~bash
-acd status                         # diagnose: pause, failed barriers, blocked conflicts, intent wait
-acd events --watch                 # inspect: what is the daemon deciding right now?
-acd explain --path path/to/file    # inspect: why is this file stuck?
-acd diagnose --json                # inspect: branch anchor + barrier report
-acd fix --dry-run                  # plan safe remediation; read it before applying
-acd fix --yes                      # apply only the safe plan
-acd fix --force --dry-run          # explicit force plan for replay barriers with pending successors
-acd fix --force --yes              # explicit force apply after you verify the plan
-acd status                         # post-check: confirm pending/blocked counts and status terms
+acd commit-all --dry-run
+acd commit-all --yes
+acd commit-all --yes --json
 ~~~
 
-`acd fix` is the single recovery entrypoint. It backs up `state.db` before mutating, refuses to run while a live daemon owns the database, and won't lift a manual pause unless you pass `--clear-pause`. Safe apply (`acd fix --yes`) handles only self-verifiable cleanup. Force apply is explicit: use `--force` only after the dry-run shows terminal barriers with pending successors and you have verified the captured changes are already represented in `HEAD` or are intentionally being discarded. Use `acd resume --yes` when the only problem is a stale pause marker.
+It refuses on detached HEAD, in-progress Git operations, manual pause markers,
+or while the per-repo daemon is alive.
 
-After recovery, `acd list` shows `blk` / `wait` in the default compact table (`blocked` / `waiting` with `--verbose` or `--json`): blocked means operator action is still required; waiting means queued work remains without an active blocker. With intent strategy, pending-only queues may simply be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`; compact `wait` rows include the remaining age-trigger countdown when that batch wait is active. Run `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session to drain the visible batch now, or wait for the age trigger.
+## Repo registration
 
-If a parallel committer (Claude Code's atomic-commit hook, Codex ACD hook, your own script) lands the change before ACD's replay tick, you'll see `handled_external` or `superseded_external` in `acd events`. That's normal. Real content mismatches still surface as `blocked_conflict`.
+Most repos need no manual setup. Harness hooks call `acd start`, which creates
+`<gitDir>/acd/state.db` and registers the repo.
 
-## Repo lifecycle and autodiscovery
-
-The default path is still automatic: open a Git repo, let a harness hook run
-`acd start`, and ACD creates `<gitDir>/acd/state.db` plus the central registry
-row for that repo. This keeps existing installs working without a separate
-setup step per repo.
-
-Use the explicit lifecycle path when you want to manage registered repos
-yourself:
+Use explicit lifecycle commands when autodiscovery is disabled or when old rows
+need cleanup:
 
 ~~~bash
-acd repo init                      # create .git/acd/state.db and register this repo
-acd repo list                      # show registered repos, daemon state, queue counts, and status
-acd repo remove --dry-run          # preview registry removal; preserve state by default
-acd repo remove                    # interactive registry manager
-acd repo remove --yes              # scriptable removal; preserve .git/acd
-acd repo remove --yes --purge-state # also delete this repo's .git/acd state
+acd repo init
+acd repo list
+acd repo remove --dry-run
+acd repo remove --yes
+acd repo remove --yes --purge-state
 ~~~
 
-`acd repo remove` always removes the central registry row and clears matching
-start caches. It preserves `<gitDir>/acd` unless you explicitly choose
-`--purge-state`. Bare `acd repo remove` is interactive: select one or more
-repos, review the preview, type `remove`, and type `purge` only when deleting
-the repo-local `.git/acd` state is intended.
-
-To require explicit registration for new repos, disable autodiscovery in
-`~/.config/acd/config.json`:
+Disable autodiscovery in `~/.config/acd/config.json`:
 
 ~~~json
 {
@@ -230,103 +203,66 @@ To require explicit registration for new repos, disable autodiscovery in
 }
 ~~~
 
-The environment override wins over the config file for one shell:
+Override it for one process:
 
 ~~~bash
 ACD_REPO_AUTODISCOVERY=disabled acd start
 ACD_REPO_AUTODISCOVERY=enabled acd start
 ~~~
 
-Accepted enabled values are `1`, `true`, `yes`, `on`, `enable`, and
-`enabled`. Accepted disabled values are `0`, `false`, `no`, `off`, `disable`,
-and `disabled`.
+## Rewrite commit messages
 
-When autodiscovery is disabled, unregistered hook-driven paths no-op without
-creating `.git/acd` or registry rows. Manual `acd start` is intentionally
-louder and tells you to run `acd repo init --repo <path>` or re-enable
-`repo_lifecycle.autodiscovery`. Top-level `acd init` remains a compatibility
-alias for `acd setup`; use `acd repo init` for repo lifecycle registration.
-
-## Cold start: dirty worktree, daemon was off
-
-When files accumulated without ACD running:
+The daemon never rewrites history on its own. Use `rewrite-commits` only for an
+explicit local cleanup before sharing a branch:
 
 ~~~bash
-acd commit-all --dry-run           # preview, no writes
-acd commit-all --yes               # apply
-acd commit-all --yes --json        # machine-readable
+acd rewrite-commits --from 5 --plan-out rewrite.json --plan-only
+acd rewrite-commits --show-plan rewrite.json
+acd rewrite-commits --apply-plan rewrite.json --dry-run
+acd rewrite-commits --apply-plan rewrite.json --yes
 ~~~
 
-Refuses on detached HEAD, in-progress git operations (rebase, merge, cherry-pick, bisect), manual pause markers, or while the per-repo daemon is alive. Start the daemon normally with `acd start` afterward.
+If apply prints a backup ref or SHA and review fails:
 
-## Migrating from prior releases
+~~~bash
+git reset --hard <backup-ref-or-sha>
+~~~
 
-Re-run `acd setup <harness>` after upgrading. The Stop / `session.idle` hook for Claude Code, OpenCode, and Pi changed from `acd touch` to `acd flush --logical` so partial work commits when the AI session ends instead of waiting up to 5 minutes for the age trigger. Existing snippets keep working but lose the new prompt-end commit boundary; plain `acd wake` only nudges capture/replay and does not bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. `acd doctor` flags the drift. If you intentionally keep wake-only hooks and want faster commits, set `ACD_INTENT_MAX_PENDING_AGE=60s`.
+## Environment you will actually touch
 
-`acd flush --logical` is the new explicit drain entrypoint:
-
-- Refreshes the session heartbeat (same as `acd touch`).
-- Enqueues a labeled flush request and signals the daemon.
-- Bypasses `ACD_INTENT_MIN_PENDING` and `ACD_INTENT_MAX_PENDING_AGE` for the next pass.
-- Refuses on detached HEAD, in-progress git operations, or active pause markers (heartbeat still runs).
-- Requires an existing registered session when `--logical` is set. Without `--logical` the command lazy-registers like `acd touch`.
-
-The Wave 2 planner-atomicity epic added two operator-facing surfaces:
-
-- **`<gitDir>/acd/planner-rejects.jsonl`** — rotating JSONL of validator-rejected planner responses (5 MiB per file, 2 files retained). **Raw model output is redacted by default**: only the validation code, message, offered seqs, response size, sha256, and parsed-plan summary are kept. Set `ACD_INTENT_REJECTS_RAW=1` to opt into verbatim capture for offline debugging — the daemon emits a one-shot startup warning when verbatim mode is on. Treat the file as sensitive either way; it can leak via repo handoff or backups.
-- **New `acd status` JSON fields** under `intent_strategy`: `planner_error_rate_recent`, `singleton_commit_rate_recent`, `intent_stage_diff_cap`, `path_quiescence_gated_events`. `acd diagnose` warns when `planner_error_rate_recent` exceeds 5% over the last 100 decisions and points at the rejects log.
-
-For the full intent-mode lifecycle, recommended env profiles, message-quality
-rules, and examples, see [docs/intent-commit-flow.md](docs/intent-commit-flow.md).
-For the explicit commit-history rewrite workflow, plan review/apply flow,
-saved-plan reuse, and backup recovery, see
-[docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md).
-
-## Environment variables
-
-| Variable | Default | What it does |
+| Variable | Default | Use |
 |---|---:|---|
-| `ACD_COMMIT_STRATEGY` | `event` | `event` = one captured edit per commit. `intent` = AI planner groups related captures. |
-| `ACD_AI_PROVIDER` | `deterministic` | `deterministic` (offline), `openai-compat` (network), `subprocess:<name>` (plugin). |
-| `ACD_AI_API_KEY` | unset | Required for network providers. |
-| `ACD_AI_BASE_URL` | unset | Required for network providers. |
-| `ACD_AI_MODEL` | provider default | Model id passed to the provider (e.g. `gpt-5.4-mini`). |
-| `ACD_AI_TIMEOUT` | `30s` | Per-request budget; replay backs off on timeout. |
-| `ACD_AI_DIFF_EGRESS` | unset (off) | Truthy opts in to sending redacted diffs to network providers. Off = metadata-only. Strongly recommended on for `intent`. |
-| `ACD_INTENT_WINDOW` | `10` | Max pending captures offered to one planner pass. |
-| `ACD_INTENT_MIN_PENDING` | `10` | Preferred batch gate before a normal planner pass starts. Lower for sparse repos. |
-| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age escape hatch for sparse queues that never reach `MIN_PENDING`. |
-| `ACD_INTENT_RECENT_COMMITS` | `5` | Recent commits sent to the planner as context. |
-| `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals allowed before ACD forces the overdue capture into a one-item commit. Lowered from `2` in Wave 2. Raise to `2` to restore prior tolerance. |
-| `ACD_INTENT_PATH_COALESCE` | `1` (on) | Folds consecutive same-path captures into one planner offer. Stops at branch transitions, multi-path interleave, and barriers. Set `0`/`false`/`no`/`off` to disable. Restart daemon to apply. |
-| `ACD_INTENT_RETRY_ON_INVALID` | `1` (on) | Composed planner retries the primary provider once on typed validation error, quoting the validator message. Skips retry on transport errors and on already-healed validator codes. Set `0`/`false`/`no`/`off` to disable. |
-| `ACD_INTENT_REJECTS_RAW` | unset (off) | Off = redact raw model output before persisting to `planner-rejects.jsonl` (recommended). Truthy = persist verbatim (debugging only; sensitive). |
-| `ACD_PATH_QUIESCENCE_SECONDS` | `0` (off) | When `>0`, defers planner-offer for path P until P has been quiet that long. Capture rows still persist immediately. FIFO-preserving and multi-op aware. Restart daemon to apply. |
-| `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` (off, was `120`) | When `>0` and the most recent HEAD commit touched an offered path within that window, the planner gets a "extend or wait" hint. Hint-only; no amend implemented. Default flipped to `0` because the lookup costs N `git log` per pass. |
-| `ACD_TRACE` | unset | Truthy enables JSONL decision-trace logging under `<gitDir>/acd/trace/`. |
-| `ACD_TRACE_DIR` | `<gitDir>/acd/trace` | Override trace output location. |
-| `ACD_AI_PROMPT_TRACE` | unset | Truthy persists AI request/response diagnostics under `<gitDir>/acd/prompt-trace/`. Sensitive even after redaction; delete when done. |
-| `ACD_SAFE_IGNORE` | enabled | Set `0`/`false`/`no`/`off` to disable ACD's built-in generated-tree pruning (`node_modules/`, `target/`, `.venv/`, etc.). |
-| `ACD_SAFE_IGNORE_EXTRA` | unset | Comma-separated extra patterns: `dist/,build/`. |
-| `ACD_SENSITIVE_GLOBS` | built-in defaults | Empty string keeps defaults; never disables them. |
-| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after Diverged reseed. |
-| `ACD_REWIND_GRACE_SECONDS` | `60` | Pause replay this long after a same-branch rewind. `0` disables. |
-| `ACD_REPO_AUTODISCOVERY` | unset | Overrides `repo_lifecycle.autodiscovery` for implicit repo registration. Enabled: `1`, `true`, `yes`, `on`, `enable`, `enabled`. Disabled: `0`, `false`, `no`, `off`, `disable`, `disabled`. |
+| `ACD_COMMIT_STRATEGY` | `event` | `event` for one capture per commit, `intent` for AI grouping. |
+| `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
+| `ACD_AI_API_KEY` | unset | Required by `openai-compat`. |
+| `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
+| `ACD_AI_MODEL` | `gpt-5.4-mini` | Model passed to the provider. |
+| `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs to providers that ask for diffs. |
+| `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
+| `ACD_INTENT_MIN_PENDING` | `10` | Preferred count before planning. Lower it for sparse repos. |
+| `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age escape hatch for sparse queues. |
+| `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before ACD forces a one-capture window. |
+| `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after invalid planner output. |
+| `ACD_SAFE_IGNORE` | enabled | Set false-like value to stop pruning generated trees. |
+| `ACD_SAFE_IGNORE_EXTRA` | unset | Extra generated trees, such as `dist/,build/`. |
+| `ACD_SENSITIVE_GLOBS` | built in | Extra sensitive path globs. Empty keeps defaults. |
+| `ACD_TRACE` | off | Writes daemon decision summaries under `<gitDir>/acd/trace/`. |
+| `ACD_AI_PROMPT_TRACE` | off | Writes local AI request diagnostics. Treat as sensitive. |
 
-Daemon runtime env changes are read at daemon start. Restart an existing daemon
-to pick them up. `ACD_REPO_AUTODISCOVERY` is read by CLI lifecycle and hook
-commands, so it can be changed per shell invocation.
+Restart a running daemon after changing daemon runtime environment.
 
 ## Docs
 
-- [docs/capture-replay.md](docs/capture-replay.md) — storage model, replay index, blocked-conflict states, branch-generation safety, revert workflows, trace event classes
-- [docs/intent-commit-flow.md](docs/intent-commit-flow.md) — intent-mode planning lifecycle, message quality gates, and observability
-- [docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md) — explicit intent commit rewrite workflow with plan generation, review/edit, apply, backup recovery, and saved-plan reuse
-- [docs/rewrite-commits.md](docs/rewrite-commits.md) — `acd rewrite-commits` command contract and flag reference
-- [docs/user-workflows.md](docs/user-workflows.md) — daily user workflows
-- [docs/multi-tool.md](docs/multi-tool.md) — running ACD alongside another auto-committer
-- [docs/ai-providers.md](docs/ai-providers.md) — provider configuration and subprocess plugin protocol
-- [docs/overview.md](docs/overview.md) — high-level overview
+| Doc | Use it for |
+|---|---|
+| [docs/overview.md](docs/overview.md) | A short system map. |
+| [docs/user-workflows.md](docs/user-workflows.md) | Daily status, recovery, support bundles, and `commit-all`. |
+| [docs/capture-replay.md](docs/capture-replay.md) | Storage, replay, branch safety, blockers, and trace classes. |
+| [docs/intent-commit-flow.md](docs/intent-commit-flow.md) | Intent grouping behavior and planner observability. |
+| [docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md) | Safe history rewrite workflow. |
+| [docs/rewrite-commits.md](docs/rewrite-commits.md) | `rewrite-commits` command grammar. |
+| [docs/ai-providers.md](docs/ai-providers.md) | Provider setup, diff privacy, prompt tracing, and plugin protocol. |
+| [docs/multi-tool.md](docs/multi-tool.md) | Running ACD next to another auto-committer. |
 
 ## License
 

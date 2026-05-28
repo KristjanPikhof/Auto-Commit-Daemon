@@ -221,17 +221,21 @@ func parsePositionRange(s string) (int, int, error) {
 }
 
 func resolveFromPositionOrCommit(ctx context.Context, repoDir, from string, chain []string) (int, error) {
+	var positionErr error
 	if n, err := strconv.Atoi(from); err == nil {
 		if n <= 0 {
 			return 0, fmt.Errorf("git rewrite selection: --from position must be positive")
 		}
-		if n > len(chain) {
-			return 0, fmt.Errorf("git rewrite selection: --from position %d exceeds branch history length %d", n, len(chain))
+		if n <= len(chain) {
+			return n - 1, nil
 		}
-		return n - 1, nil
+		positionErr = fmt.Errorf("git rewrite selection: --from position %d exceeds branch history length %d", n, len(chain))
 	}
 	oid, err := RevParse(ctx, repoDir, from+"^{commit}")
 	if err != nil {
+		if positionErr != nil {
+			return 0, positionErr
+		}
 		return 0, fmt.Errorf("git rewrite selection: resolve --from %q: %w", from, err)
 	}
 	for i, c := range chain {

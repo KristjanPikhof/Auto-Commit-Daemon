@@ -1,78 +1,43 @@
-# User Workflows: Status, Events, Explain, Fix, and Support
+# User workflows
 
-Use this guide when commits do not look the way you expected. It starts with
-the daily commands and only escalates to diagnostics when the repo is actually
-stuck.
+Use this page when you want to know what ACD is doing, why a commit did not
+appear, or how to recover a stuck queue.
 
 ## Daily command loop
 
-~~~bash
-acd status
-acd status --watch
-acd events
-acd events --watch
-acd explain --path path/to/file
-acd explain --commit HEAD
-acd prompt --last
-~~~
+| Need | Command | Reads or writes |
+|---|---|---|
+| Current repo state | `acd status` | Read |
+| Live state refresh | `acd status --watch` | Read |
+| Product decision ledger | `acd events` | Read |
+| Stream new decisions | `acd events --watch` | Read |
+| Explain one path | `acd explain --path path/to/file` | Read |
+| Explain one commit | `acd explain --commit HEAD` | Read |
+| Inspect latest AI prompt trace | `acd prompt --last` | Read |
+| Tail raw daemon log | `acd logs --follow` | Read |
+| Create support bundle | `acd doctor --bundle` | Read |
 
-`acd status` is the current snapshot: daemon liveness, queue counts, pause
-state, branch generation, active commit strategy, and recent decision counts.
-`acd events` is the durable decision ledger. It tells you what ACD captured,
-skipped, committed, deferred, grouped, blocked, or treated as already handled by
-another committer. `acd explain` turns those decisions into a path or commit
-answer.
-
-Use `acd prompt` only when you enabled prompt tracing with
-`ACD_AI_PROMPT_TRACE=1`. It reads local prompt-trace JSONL files and does not
-open or migrate `state.db`.
-
-`acd events --watch` follows new ledger rows. Without `--since`, it starts at
-the current ledger tail and prints only decisions appended after watch starts.
-Use `acd events --since <cursor>` when you want to resume from an older
-decision cursor.
-
-Reach for the raw log only when you need daemon internals:
-
-~~~bash
-acd logs --lines 200
-acd logs --follow
-~~~
-
-For support reports, prefer `acd doctor --bundle`; it sanitizes and bundles the
-useful diagnostics instead of asking someone to read raw JSONL. `acd logs`
-does not contain full AI prompts; prompt traces live separately under
-`<gitDir>/acd/prompt-trace/` and are visible only after you opt in with
+`acd prompt` only works after a non-deterministic provider ran with
 `ACD_AI_PROMPT_TRACE=1`.
 
-## Managing repo registration
+`acd events --watch` starts at the current ledger tail unless you pass
+`--since <cursor>`.
 
-Most repos need no manual registration. By default, `acd start` and harness
-hooks auto-create the repo-local state database at `<gitDir>/acd/state.db` and
-add the repo to the central registry.
+## Repo registration
 
-Use explicit repo lifecycle commands when autodiscovery is disabled or when you
-want to clean up old registry rows:
+Most repos are automatic. A harness hook calls `acd start`, which creates
+`<gitDir>/acd/state.db` and registers the canonical worktree root.
 
-~~~bash
-acd repo init
-acd repo list
-acd repo remove --dry-run
-acd repo remove
-acd repo remove --yes
-acd repo remove --yes --purge-state
-~~~
-
-| Command | Use it for |
+| Task | Command |
 |---|---|
-| `acd repo init` | Create `.git/acd/state.db` and register the current Git repo without starting the daemon. |
-| `acd repo list` | Inspect all registered repos, including stopped, missing, or state-missing rows. |
-| `acd repo remove --dry-run` | Preview registry removal while preserving registry and state. |
-| `acd repo remove` | Open an interactive registry manager with selection, preview, and confirmation. |
-| `acd repo remove --yes` | Scriptable registry removal; repo-local `.git/acd` state is preserved. |
-| `acd repo remove --yes --purge-state` | Remove the registry row and delete that repo's `.git/acd` state. |
+| Register without starting the daemon | `acd repo init` |
+| List registered repos | `acd repo list` |
+| Preview registry removal | `acd repo remove --dry-run` |
+| Interactive removal | `acd repo remove` |
+| Scriptable removal, keep repo state | `acd repo remove --yes` |
+| Remove registry row and `.git/acd` state | `acd repo remove --yes --purge-state` |
 
-Configure explicit-only mode in `~/.config/acd/config.json`:
+Disable autodiscovery:
 
 ~~~json
 {
@@ -82,27 +47,54 @@ Configure explicit-only mode in `~/.config/acd/config.json`:
 }
 ~~~
 
-`ACD_REPO_AUTODISCOVERY` overrides the file for the current process. Enabled
-forms are `1`, `true`, `yes`, `on`, `enable`, and `enabled`; disabled forms
-are `0`, `false`, `no`, `off`, `disable`, and `disabled`.
+Override it for one command:
 
-When autodiscovery is disabled, harness hooks in unregistered repos skip
-without creating `.git/acd`. A manual `acd start` prints a repo-init-required
-message that points at `acd repo init --repo <path>`.
+~~~bash
+ACD_REPO_AUTODISCOVERY=disabled acd start
+ACD_REPO_AUTODISCOVERY=enabled acd start
+~~~
 
-## Recovery decision ladder
+When autodiscovery is disabled, unregistered harness hooks skip without creating
+state. Manual `acd start` tells you to run `acd repo init --repo <path>`.
 
-When commits stop appearing, move from observation to mutation in this order:
+## Recovery ladder
 
-1. **Diagnose.** Run `acd status`, then `acd events --watch` and `acd explain --path <file>` for the affected path. `acd list` shows compact tokens (`OK`, `wait`, `blk`, `pause`, `miss`, `bad`, `stale`); use `--verbose` or `--json` for full status strings.
-2. **Dry-run.** Run `acd diagnose --json`, then `acd fix --dry-run`. Read the plan before changing state.
-3. **Safe apply.** Run `acd fix --yes` only when the dry-run plan matches what happened. Safe apply backs up `state.db`, refuses a live daemon owner, and applies only cleanup ACD can verify.
-4. **Explicit force apply.** If the dry-run says terminal barriers still have pending successors, rerun `acd fix --force --dry-run`. Apply with `acd fix --force --yes` only after you verify the blocked captured changes are already in `HEAD` or should be discarded. Force is never implied by safe apply.
-5. **Post-check.** Run `acd status` or `acd list` again. `blk` (or `blocked` with `--verbose`/`--json`) means action is still required. `wait` means queued work without an active blocker; in intent mode, a pending-only queue may be waiting for `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`, so wait, lower thresholds, or use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an active harness session.
+Run these in order. Stop when the queue is healthy again.
+
+| Step | Command | What to decide |
+|---|---|---|
+| Observe | `acd status` | Is the daemon running, paused, waiting, or blocked? |
+| Inspect decisions | `acd events --watch` | What is ACD doing now? |
+| Inspect one path | `acd explain --path FILE` | Is the file captured, skipped, protected, or blocked? |
+| Inspect blockers | `acd diagnose --json` | Which branch anchor or terminal row is holding replay? |
+| Preview cleanup | `acd fix --dry-run` | Does the plan match what happened? |
+| Safe apply | `acd fix --yes` | Apply only verifiable cleanup. |
+| Force preview | `acd fix --force --dry-run` | Use only when terminal barriers still hold pending successors. |
+| Force apply | `acd fix --force --yes` | Apply only after checking the blocked changes. |
+| Post-check | `acd status` | Confirm `blk`/`blocked` cleared. |
+
+`acd fix` backs up `state.db` before mutation and refuses a live daemon owner.
+If the only problem is a manual pause marker, use:
+
+~~~bash
+acd resume --yes
+~~~
+
+## Common symptoms
+
+| Symptom | First check | Likely answer |
+|---|---|---|
+| File was not committed | `acd explain --path FILE` | It may be pending, skipped, protected, or unseen. |
+| Queue says `wait` | `acd status` | Intent mode may be waiting for count or age. |
+| Queue says `blk` | `acd diagnose --json` | A terminal barrier needs operator action. |
+| Commit message is generic | `acd status --json` | Provider may be deterministic fallback. |
+| Path under generated tree is ignored | `acd doctor` | Safe-ignore pruned it. |
+| Prompt trace is missing | `acd prompt --last` | Tracing was not enabled before the provider call. |
+| External tool already committed the file | `acd explain --commit HEAD` | Expect `handled_external` or `superseded_external`. |
 
 ## File was not committed
 
-Start with the path, not SQLite:
+Start with the path:
 
 ~~~bash
 acd status
@@ -110,136 +102,73 @@ acd explain --path path/to/file
 acd events --path path/to/file
 ~~~
 
-Common answers:
-
 | What you see | Meaning | Next step |
 |---|---|---|
-| `captured` with action `queued` | ACD noticed the file and replay has not published it yet. | Wait one tick, or run `acd wake --session-id "$ACD_SESSION_ID"` from a harness shell. If pending grows, check `acd status`. |
-| `committed` | ACD already made the commit. | Use `acd explain --commit HEAD` or `git log -- path/to/file`. |
-| `protected` or `skipped` | ACD intentionally left the path uncommitted. | Check safe-ignore, sensitive globs, `.gitignore`, or whether the file is outside the repo. |
-| No decision and no pending event | ACD has not seen the path. | Confirm the daemon is running for this repo and the path is not ignored or generated. |
-| `blocked` | Replay stopped before it could safely publish. | Run `acd diagnose`, then `acd fix --dry-run`. |
+| `captured` | ACD queued it. | Wait, or run `acd wake --session-id "$ACD_SESSION_ID"` from a harness shell. |
+| `committed` | ACD already published it. | Check `git log -- path/to/file`. |
+| `protected` or `skipped` | ACD intentionally left it alone. | Check safe-ignore, sensitive globs, `.gitignore`, or path location. |
+| No decision | ACD has not seen it. | Check daemon liveness and ignore settings. |
+| `blocked` | Replay stopped first. | Run `acd diagnose --json`, then `acd fix --dry-run`. |
 
-If the daemon is alive but the file still has no decision, run:
+If the daemon is alive and the path still has no decision:
 
 ~~~bash
 acd doctor
 ~~~
 
-Look for fsnotify fallback, missing harness install, safe-ignore, and sensitive
-glob information. `doctor` is a health check; `explain` is the daily "why did
-this path do that?" command.
+## External commits handled the change
 
-## AI or manual commit handled the change externally
-
-If another tool, AI hook, or manual `git commit` lands the same content before
-ACD publishes its queued event, ACD should settle the event without creating a
-duplicate commit.
+When another tool or a manual `git commit` lands the same captured final state,
+ACD settles its queued event instead of creating a duplicate commit.
 
 ~~~bash
 acd events --path path/to/file
 acd explain --commit HEAD
 ~~~
 
-Expected decisions:
-
 | Decision | Meaning |
 |---|---|
-| `handled_external` | The current `HEAD` already contains the captured after-state, so ACD marked the event published against that commit. |
-| `handled_external_after_block` | A previously `blocked_conflict` row was self-healed: the daemon detected that an external committer landed the captured after-state and promoted the row to `published` without a new commit. |
-| `superseded_external` | External history made the queued event obsolete, usually because `HEAD` now matches the captured before-state or otherwise proves replay would be redundant. |
+| `handled_external` | Current `HEAD` already has the captured after-state. |
+| `handled_external_after_block` | A blocked row self-healed after an external commit landed the captured state. |
+| `superseded_external` | External history made the queued event obsolete. |
 
-No action is needed when `acd explain` says the external commit already
-contains the change. If the queue remains blocked after an external commit, use the ladder:
+No action is needed when `explain` says `HEAD` contains the change. If the queue
+stays blocked, go through the recovery ladder.
 
-~~~bash
-acd fix --dry-run
-acd fix --yes
-acd fix --force --dry-run
-acd fix --force --yes
-~~~
+## Intent grouping waits
 
-`fix --yes` refuses unsafe mutations and backs up `state.db` first. Stop the
-daemon before applying a plan if the command tells you a live daemon owns the
-state database. If the plan reports barriers with pending successors, `--force`
-adds that purge only when you request it explicitly; inspect the forced dry-run
-and verify the blocked changes are already represented in `HEAD` or are safe to
-discard before applying.
+Intent mode may wait before asking the planner.
 
-## Intent grouping deferred or forced a change
-
-When `ACD_COMMIT_STRATEGY=intent` is enabled, ACD may publish several related
-captures as one commit, choose exactly one capture, or defer unrelated captures
-for a later planning window. Deferrals are normal. They mean the planner did not
-have enough evidence to group that capture with the current selected set.
-
-~~~bash
-acd status
-acd events --watch
-acd explain --path path/to/file
-~~~
-
-Look for:
-
-| Decision | Meaning |
+| Gate | Meaning |
 |---|---|
-| `intent_deferred` | The planner left this pending for a later window. |
-| `intent_forced` | ACD forced an over-deferred capture into a one-item planning window. |
-| `intent_planner_error` | The planner returned an invalid plan or failed; ACD fell back to a safe one-capture plan. |
-| `message_quality_rewrite` | ACD accepted the grouping but rewrote or sanitized the commit message before publish. |
-| `message_quality_fallback` | The message quality gate rejected the planner message or rewrite, so ACD used deterministic fallback. |
+| `ACD_INTENT_MIN_PENDING` | Wait for this many visible pending captures. |
+| `ACD_INTENT_MAX_PENDING_AGE` | Publish when the oldest visible capture reaches this age. |
+| `ACD_INTENT_WINDOW` | Offer at most this many captures to the planner. |
+| `ACD_INTENT_DEFER_LIMIT` | Force a capture after this many deferrals. |
 
-`status` and `diagnose --json` show deferred counts, forced-aging readiness,
-recent message-quality rewrite/fallback counts, the latest message-quality
-reason, and the latest planner error.
-
-The `intent_strategy.strategy` field reflects the *effective* commit strategy:
-ACD reads `commit.strategy` from daemon meta first, then falls back to the
-`ACD_COMMIT_STRATEGY` env, then the canonical default. Unrecognized meta
-values do not leak into the report — they emit a slog warning and the
-env-derived strategy is shown instead. `commit-all` uses the same resolution
-so a one-shot run matches what the live daemon would do.
-
-If commits are waiting before any planner request appears, check the batch wait
-state:
+Inspect:
 
 ~~~bash
 acd status
 acd diagnose
 acd doctor
+acd events --watch
 ~~~
 
-`ACD_INTENT_WINDOW` is the maximum offered to a normal planner pass,
-`ACD_INTENT_MIN_PENDING` is the preferred count trigger, and
-`ACD_INTENT_MAX_PENDING_AGE` is the age escape hatch for sparse queues. When the
-visible pending count is below `min_pending` and the oldest pending capture is
-younger than `max_pending_age`, ACD waits instead of asking the planner. The
-status, diagnose, and doctor reports show how many more captures are needed or
-how long remains until the age trigger. To publish the current visible batch
-now, run `acd flush --logical --repo . --session-id "$ACD_SESSION_ID"` from a
-harness shell. Plain `acd wake` nudges capture/replay but still honors the
-intent batch gate. Logical flush bypasses only the batch wait, not validation or
-replay safety checks.
+Drain the visible batch from a registered harness session:
 
-If deferrals keep growing after planning starts, reduce the batching thresholds,
-check provider health, or temporarily return to `ACD_COMMIT_STRATEGY=event`.
-When a capture reaches `ACD_INTENT_DEFER_LIMIT`, ACD forces it through a
-one-item planning window unless an earlier related-path capture must land first.
+~~~bash
+acd flush --repo . --session-id "$ACD_SESSION_ID" --logical
+~~~
+
+Plain `acd wake` does not bypass intent batch gates.
 
 ## Inspect an AI prompt
 
-Prompt tracing is opt-in because it records the actual payload sent to an AI
-provider or subprocess plugin. The trace is stored locally under
-`<gitDir>/acd/prompt-trace/`. Records are written after ACD redacts and
-truncates outbound payloads, but they may still contain source code, private
-paths, request envelopes, tool schemas, provider responses, and fallback
-metadata. The default deterministic provider sends no AI request, so it creates
-no prompt trace. Trace files are daily JSONL logs with no automatic pruning;
-ACD buffers 256 pending prompt-trace records in memory and drops the oldest
-buffered record if the writer falls behind. Treat prompt traces as sensitive
-local diagnostics.
+Prompt tracing is opt-in because traces may contain source text and provider
+responses.
 
-Event-mode inspection:
+Event mode:
 
 ~~~bash
 export ACD_AI_PROVIDER=openai-compat
@@ -250,114 +179,51 @@ acd prompt --last
 acd prompt --seq 42 --json
 ~~~
 
-Intent-mode inspection:
+Intent mode:
 
 ~~~bash
 export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=...
 ACD_AI_PROMPT_TRACE=1 ACD_COMMIT_STRATEGY=intent acd start
-# make enough changes for a batch, or use acd flush --logical --session-id <active-session> to drain now
+# make enough changes for a batch, or run logical flush
 acd prompt --last
 acd prompt --seq 42
 ~~~
 
-In event mode, `--seq` selects the commit-message prompt for that captured
-event. In intent mode, `--seq` also matches planner windows where that seq was
-offered, so you can see the offered seqs, selected/deferred seqs, grouping
-reason, validation error, message-only rewrite request, and fallback provider.
-If no trace is found, restart the daemon with `ACD_AI_PROMPT_TRACE=1` and a
-non-deterministic provider; `acd prompt` never creates traces by itself.
+In intent mode, `--seq` can match any planner window where that seq was
+offered. Remove `<gitDir>/acd/prompt-trace/` after debugging.
 
-## Manual revert or superseded queued work
+## Branch surgery
 
-For planned revert, reset, or rebase work, pause first:
-
-~~~bash
-acd pause --repo . --reason "manual revert" --yes
-# run git revert, git reset, or git rebase
-acd resume --repo . --yes
-~~~
-
-If you are inside a harness shell with `ACD_SESSION_ID` set, run
-`acd wake --repo . --session-id "$ACD_SESSION_ID"` after `resume` to nudge the
-daemon immediately. Terminal users can usually run `acd status --watch` and wait
-for the next tick.
-
-After the operation:
-
-~~~bash
-acd status
-acd events --watch
-acd explain --path path/to/file
-~~~
-
-If the queued work was made obsolete by the revert or by a newer manual commit,
-you should see `handled_external` or `superseded_external`. If the queue is
-blocked by old terminal rows, including failed terminal barriers surfaced by
-`status`, `diagnose`, or `doctor`, preview the conservative cleanup:
-
-~~~bash
-acd fix --dry-run
-~~~
-
-Apply only after reading the plan:
-
-~~~bash
-acd fix --yes
-~~~
-
-If `fix --dry-run` reports barriers with pending successors, rerun with
-`--force` to include the purge in the plan before applying.
-
-## Branch reset, rebase, or other branch surgery
-
-ACD detects same-branch rewinds and git operation markers. During a rewind
-grace window, both capture and replay pause so transient files do not get
-recaptured while you are still arranging the branch.
-
-~~~bash
-acd status
-acd status --watch
-~~~
-
-Look for a pause source such as `rewind grace` or `manual`. When branch surgery
-is deliberate, the safest workflow is:
+Pause before planned revert, reset, rebase, or branch inspection:
 
 ~~~bash
 acd pause --repo . --reason "branch surgery" --yes
-# reset, rebase, switch, or inspect
+# git revert, reset, rebase, switch, or inspect
 acd resume --repo . --yes
 acd status
-acd events --watch
 ~~~
 
-If the branch was changed while the daemon was stopped or if old-generation
-events remain blocked:
+If you are inside a harness shell:
 
 ~~~bash
-acd diagnose
-acd fix --dry-run
+acd wake --repo . --session-id "$ACD_SESSION_ID"
 ~~~
 
-`diagnose` focuses on replay blockers and branch anchors. `fix` plans safe
-state cleanup. After reading `fix --dry-run`, apply with `acd fix --yes`. `fix` preserves a
-manual pause marker unless you add `--clear-pause`; use `acd resume --yes`
-when the marker itself is the only problem.
+| Operation | ACD behavior |
+|---|---|
+| `git revert` | Normal fast-forward. Matching pending work can settle at `HEAD`. |
+| `git reset --soft` or `--mixed` | Same-branch rewind. Capture and replay pause for rewind grace. |
+| `git reset --hard` | Same rewind behavior, with worktree overwritten by Git. |
+| `git rebase -i` | Git operation marker pauses capture and replay. Generation bumps after rebase. |
+| Deleted merged branch | Startup cleanup can remove stale unpublished rows for that dead ref. |
 
-When a feature branch has been merged and deleted, ACD cleans up stale
-`pending`, `blocked_conflict`, and `failed` rows for that dead branch ref during
-the next runtime branch transition or daemon startup. `acd diagnose --json`
-shows the most recent cleanup in `dead_branch_prune_last_run_ts`,
-`dead_branch_prune_last_count`, and `dead_branch_prune_last_refs`. If you need
-to inspect those rows before cleanup, start the daemon with
-`ACD_KEEP_DEAD_BRANCH_BARRIERS=1`.
+Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` before daemon start if you need to inspect
+deleted-branch rows before cleanup.
 
 ## Skipped generated or sensitive files
 
-ACD intentionally avoids committing generated dependency/cache trees and
-sensitive paths. The default generated-tree safe-ignore list includes
-`node_modules/`, `target/`, `.venv/`, `venv/`, `__pycache__/`,
-`.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and `.gradle/`.
+ACD prunes generated dependency/cache trees and protects sensitive paths.
 
 ~~~bash
 acd explain --path .env
@@ -365,45 +231,18 @@ acd events --path node_modules/pkg/index.js
 acd doctor
 ~~~
 
-Expected decisions include:
+| Setting | Use |
+|---|---|
+| `ACD_SAFE_IGNORE=0` | Disable generated-tree pruning. |
+| `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated-tree patterns. |
+| `ACD_SENSITIVE_GLOBS=...` | Configure sensitive globs. Empty keeps defaults. |
 
-| Decision | Typical reason | Meaning |
-|---|---|---|
-| `protected` | `sensitive`, `safe_ignore`, or `gitignore` | ACD preserved an existing tracked/protected path without synthesizing a delete. |
-| `skipped` | oversize, unreadable, invalid, unstable, or non-regular path | ACD left the path uncommitted by design. |
-
-A new untracked file under a pruned generated tree or sensitive path can have no
-decision row because ACD skipped walking that subtree. In that case, `doctor`
-shows the active safe-ignore and sensitive-glob configuration.
-
-To adjust generated-tree handling:
-
-~~~bash
-acd stop
-ACD_SAFE_IGNORE=0 acd start
-
-acd stop
-ACD_SAFE_IGNORE_EXTRA=dist/,build/ acd start
-~~~
-
-An already-running daemon keeps the safe-ignore settings it started with. Stop
-and restart it before expecting `ACD_SAFE_IGNORE` or `ACD_SAFE_IGNORE_EXTRA`
-changes to affect capture or watcher pruning.
-
-For sensitive paths, set `ACD_SENSITIVE_GLOBS` carefully. Empty or whitespace
-values keep the default sensitive deny-list so a typo does not disable the
-defaults.
+Restart the daemon after changing these settings.
 
 ## Blocked conflicts and failed barriers
 
-`blocked_conflict` means ACD could not prove that replaying the captured event
-would be safe. Later pending events on the same branch generation wait behind
-that barrier.
-
-`failed` rows are also terminal. When `acd status`, `acd diagnose`, or
-`acd doctor` reports failed terminal events or `failed_blocking_pending`, treat
-that as the same kind of replay barrier: inspect first, then preview cleanup
-with `acd fix --dry-run`.
+`blocked_conflict` and `failed` are terminal. Later pending rows for the same
+branch generation wait behind them.
 
 ~~~bash
 acd status
@@ -413,18 +252,15 @@ acd diagnose
 acd fix --dry-run
 ~~~
 
-Read the dry-run plan. It may propose safe actions such as deleting obsolete
-barriers, marking externally handled events as published, clearing expired
-manual pauses, or clearing drained backpressure. Apply the plan only when it
-matches what happened:
+Apply only after reading the plan:
 
 ~~~bash
 acd fix --yes
 acd status
 ~~~
 
-When the plan reports replay barriers with pending successors, preview and
-apply the explicit force path:
+Use the force path only when the plan says barriers still have pending
+successors:
 
 ~~~bash
 acd fix --force --dry-run
@@ -432,15 +268,42 @@ acd fix --force --yes
 acd status
 ~~~
 
-If you are inside a harness shell with `ACD_SESSION_ID` set, run
-`acd wake --repo . --session-id "$ACD_SESSION_ID"` before checking status.
+## Cold start commit cleanup
 
-If `fix --dry-run` reports unsafe conditions, keep the output and create a
-support bundle.
+Use `commit-all` when the daemon was off and the worktree is dirty:
 
-## Support bundle creation
+~~~bash
+acd commit-all --dry-run
+acd commit-all --yes
+acd commit-all --yes --json
+acd commit-all --repo /path/to/repo --yes
+~~~
 
-When asking for help, include the daily command output plus a doctor bundle:
+What it does:
+
+| Step | Behavior |
+|---|---|
+| Reseed | Rebuilds shadow state from `HEAD`. |
+| Drop stale pending | Removes old pending rows for the active branch generation. |
+| Capture | Captures live worktree vs `HEAD`. |
+| Sort | Orders paths lexicographically. |
+| Replay | Uses the configured commit strategy. |
+
+`--json` requires `--yes` because there is no interactive prompt.
+
+Refusals:
+
+| Refusal | Fix |
+|---|---|
+| Detached HEAD | Check out a branch. |
+| Git operation in progress | Finish the operation. |
+| Manual pause marker | `acd resume --yes` |
+| Per-repo daemon is running | `acd stop` first. |
+| No initial commit | Create an initial commit. |
+
+## Support bundle
+
+When asking for help, include:
 
 ~~~bash
 acd status
@@ -449,144 +312,39 @@ acd diagnose --json
 acd doctor --bundle
 ~~~
 
-`acd doctor --bundle` writes a zip to `~/Downloads` unless `--output` is set:
+`acd doctor --bundle` writes a zip to `~/Downloads` unless you set `--output`:
 
 ~~~bash
 acd doctor --bundle --output /tmp
 ~~~
 
-The bundle includes sanitized paths, safe-ignore patterns, sensitive-glob
-configuration, fsnotify stats, state/meta JSON, and daemon log tails. Raw logs
-are still available with `acd logs`, but `doctor --bundle` is the preferred
-artifact for issue reports.
+The bundle includes sanitized paths, safe-ignore and sensitive-glob settings,
+fsnotify information, state/meta JSON, and daemon log tails.
 
 ## Decision terms
 
-| Decision | User meaning |
+| Decision | Meaning |
 |---|---|
-| `captured` | ACD noticed a change and queued it for replay. |
-| `committed` | ACD published the queued change as a commit. |
-| `intent_deferred` | Intent planning left the capture pending for a later commit. Pending-only intent queues may need more captures, the age trigger, or an explicit logical flush. |
-| `intent_forced` | ACD forced an over-deferred capture through a one-item planning window. |
-| `intent_planner_error` | The planner failed validation; ACD used a safe fallback plan. |
-| `skipped` | ACD intentionally left a path uncommitted, usually due to ignore or policy. |
-| `protected` | ACD protected a sensitive or generated path and did not synthesize a delete. |
+| `captured` | ACD queued a change. |
+| `committed` | ACD published a queued change. |
+| `intent_deferred` | Planner left a capture pending. |
+| `intent_forced` | A deferred capture was forced into a one-item window. |
+| `intent_planner_error` | Planner output failed validation or the provider failed. |
+| `message_quality_rewrite` | ACD rewrote a weak planner message. |
+| `message_quality_fallback` | ACD used deterministic fallback for the message. |
+| `skipped` | ACD intentionally left a path uncommitted. |
+| `protected` | A sensitive or generated path was protected. |
 | `handled_external` | Another commit already contains the captured after-state. |
-| `handled_external_after_block` | A `blocked_conflict` row was self-healed: an external committer landed the captured after-state, so the daemon promoted the row to `published` without a new commit. |
-| `superseded_external` | External history made the queued work obsolete. |
-| `blocked` | Replay stopped because applying the event was not provably safe; operator action is required. |
-| `paused` / `resumed` | Capture or replay pause state changed because of a manual marker, rewind grace, or git operation marker. |
-
-## Cold start commit cleanup
-
-Use `acd commit-all` when the daemon was off for a while and your worktree
-contains many uncommitted files. It performs a one-shot capture and replay cycle
-without starting the persistent daemon, then exits.
-
-Typical situations where `commit-all` helps:
-
-- You opened a repo, made edits, and forgot to start ACD first.
-- You paused ACD during a large merge and now have a dirty worktree.
-- You want to bring a brand-new clone into a committed baseline before enabling
-  the live daemon.
-
-`commit-all` reads the active commit strategy from existing config — daemon meta
-first, then the `ACD_COMMIT_STRATEGY` env, then the canonical default. There is
-no `--strategy` override flag; the one-shot run matches exactly what the daemon
-would do on its own.
-
-**Reseed before capture.** `commit-all` always force-reseeds `shadow_paths`
-from `HEAD`'s tree before it captures, and drops any stale `pending`
-capture events for the active `(branch_ref, branch_generation)` pair. This
-guarantees the diff that drives commit decisions is "live worktree vs
-HEAD", not "live worktree vs whatever shadow happens to remain from an
-earlier daemon session". Without the reseed, a daemon that captured edits
-into shadow but failed to replay them would leave a poisoned shadow
-mirroring live state — the next `commit-all` would see zero diff and
-report `Commits: 0` while the worktree was still dirty. The JSON output
-includes a `dropped_stale_pending` count and a `shadow reseeded from
-HEAD` note for visibility.
-
-**Ordering.** Because ACD has no historical modification times, files are sorted
-lexicographically by path. Sibling files in the same directory cluster together
-in the commit history, so directories like `pkg/a/*.go` land adjacent.
-With `ACD_COMMIT_STRATEGY=intent`, the planner receives coherent windows of
-path-sorted siblings, which improves grouping quality even without mtime
-ordering.
-
-**Confirmation flow.** Without `--yes`, `commit-all` prints a summary and asks
-before writing any commit:
-
-~~~
-Repo: /path/to/repo (refs/heads/main @ abc123456789)
-Pending events: 42
-Strategy: event (provider deterministic)
-Estimated passes: 42
-Proceed? [y/N]:
-~~~
-
-With `intent` strategy the summary also shows intent window and defer limit:
-
-~~~
-Repo: /path/to/repo (refs/heads/main @ abc123456789)
-Pending events: 12
-Strategy: intent (provider openai-compat)
-Intent window: 10, defer limit: 2
-Estimated passes: 2
-Proceed? [y/N]:
-~~~
-
-**Flags.**
-
-~~~bash
-acd commit-all --dry-run          # plan and show summary; no commits written
-acd commit-all --yes              # skip the interactive confirmation prompt
-acd commit-all --yes --json       # machine-readable JSON output (requires --yes)
-acd commit-all --repo /path/to/repo --yes
-~~~
-
-`--dry-run` shows the pending count and estimated passes without writing
-anything. With `ACD_COMMIT_STRATEGY=intent`, it also calls the planner and
-prints how many captures would be selected or deferred in the first window.
-
-**Refusal cases.** `commit-all` refuses to run when:
-
-- `HEAD` is detached — check out a branch first.
-- A git operation is in progress: rebase, merge, cherry-pick, or bisect.
-- A manual pause marker is present — run `acd resume --yes` first.
-- The per-repo daemon is already running — stop it first with `acd stop`.
-
-**Intent strategy and deferred files.** When `ACD_COMMIT_STRATEGY=intent`, the
-planner sees at most `ACD_INTENT_WINDOW` files per pass. Files that are deferred
-`ACD_INTENT_DEFER_LIMIT` times are forced into a one-item commit so they cannot
-starve. For a large dirty worktree, estimated passes equals
-`ceil(pending / ACD_INTENT_WINDOW)`, and each pass makes real calls to the
-configured AI provider.
-
-**Non-interactive use.**
-
-~~~bash
-acd commit-all --yes --json | jq '.commits'
-~~~
-
-`--json` requires `--yes` because no interactive prompt is available. The JSON
-payload includes `ok`, `repo`, `branch_ref`, `head_before`, `head_after`,
-`strategy`, `provider`, `intent_window`, `intent_defer_limit`,
-`pending_before`, `pending_after`, `estimated_passes`, `commits`, `drained`,
-`confirmed`, `duration_ms`, and `notes`. When the pre-capture reseed drops
-stale pending rows, the payload also carries `dropped_stale_pending` and a
-`shadow reseeded from HEAD; N stale pending events dropped` entry in
-`notes`.
-
-After `commit-all` finishes, start the live daemon normally:
-
-~~~bash
-acd start
-acd status
-~~~
+| `handled_external_after_block` | A blocked row was promoted after `HEAD` matched its after-state. |
+| `superseded_external` | External history made queued work obsolete. |
+| `blocked` | Replay stopped because applying the event was not safe. |
+| `paused` / `resumed` | Manual pause, rewind grace, or Git operation state changed. |
 
 ## See also
 
-- [Capture and replay internals](capture-replay.md)
-- [Running alongside another auto-committer](multi-tool.md)
-- [AI provider configuration](ai-providers.md)
+| Doc | Use |
+|---|---|
+| [capture-replay.md](capture-replay.md) | Replay internals and blocker model. |
+| [intent-commit-flow.md](intent-commit-flow.md) | Intent grouping and planner behavior. |
+| [ai-providers.md](ai-providers.md) | Provider setup and diff privacy. |
+| [multi-tool.md](multi-tool.md) | Running next to another auto-committer. |

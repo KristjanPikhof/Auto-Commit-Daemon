@@ -778,16 +778,56 @@ func TestComposedPlanIntentRetriesOnSelectedDeferredOverlap(t *testing.T) {
 	}
 }
 
-// TestComposedPlanIntentRetryGivesUpAfterSecondInvalid pins the retry cap at
-// one. If the second attempt is also invalid, the composed planner returns
-// the validation error so replay records intent_planner_error and runs its
-// deterministic fallback.
-func TestComposedPlanIntentRetryGivesUpAfterSecondInvalid(t *testing.T) {
+// TestComposedPlanIntentDefaultRetryAllowsSecondCorrection pins the default
+// retry cap at two correction attempts. If the first correction is still
+// invalid but the second correction is valid, the composed planner succeeds.
+func TestComposedPlanIntentDefaultRetryAllowsSecondCorrection(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	invalidPlan := IntentPlan{
 		// Selected seq 999 is not in the offered window; the planner
-		// repeats the same hallucination on both attempts so retry
-		// caps at 1 and returns the typed validation error.
+		// repeats the same hallucination before finally correcting it.
+		SelectedSeqs:   []int64{999},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	validPlan := IntentPlan{
+		SelectedSeqs:   []int64{101},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, invalidPlan, validPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	plan, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PlanIntent: %v", err)
+	}
+	if primary.calls != 3 {
+		t.Fatalf("primary calls=%d want 3 (default cap retries at 2)", primary.calls)
+	}
+	if len(plan.SelectedSeqs) != 1 || plan.SelectedSeqs[0] != 101 {
+		t.Fatalf("selected=%v want [101]", plan.SelectedSeqs)
+	}
+	if primary.corrections[0] != "" || primary.corrections[1] == "" || primary.corrections[2] == "" {
+		t.Fatalf("corrections=%q want empty, validator, validator", primary.corrections)
+	}
+}
+
+func TestComposedPlanIntentGivesUpAfterDefaultRetries(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	invalidPlan := IntentPlan{
 		SelectedSeqs:   []int64{999},
 		DeferredSeqs:   []int64{102},
 		Subject:        "Tighten checkout flow",
@@ -799,15 +839,15 @@ func TestComposedPlanIntentRetryGivesUpAfterSecondInvalid(t *testing.T) {
 	}
 	primary := &scriptedIntentPlanner{
 		name:  "scripted-primary",
-		plans: []IntentPlan{invalidPlan, invalidPlan},
+		plans: []IntentPlan{invalidPlan, invalidPlan, invalidPlan},
 	}
 	planner := Compose(primary, DeterministicProvider{})
 	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
 	if err == nil {
-		t.Fatalf("expected validation error after second attempt")
+		t.Fatalf("expected validation error after default retry cap")
 	}
-	if primary.calls != 2 {
-		t.Fatalf("primary calls=%d want exactly 2 (cap retries at 1)", primary.calls)
+	if primary.calls != 3 {
+		t.Fatalf("primary calls=%d want 3 (initial + 2 retries)", primary.calls)
 	}
 	var typed *IntentPlanValidationError
 	if !errors.As(err, &typed) {
@@ -883,7 +923,7 @@ func TestComposedRetry_SkipsForHealedCodes(t *testing.T) {
 }
 
 // TestComposedRetry_DisabledByEnv verifies ACD_INTENT_RETRY_ON_INVALID=0
-// disables the retry loop entirely; even a typically-retryable code
+// disables the retry loop entirely; even a typically retryable code
 // (OfferedWindow hallucination) collapses to a single primary call.
 func TestComposedRetry_DisabledByEnv(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
@@ -909,6 +949,33 @@ func TestComposedRetry_DisabledByEnv(t *testing.T) {
 	}
 	if primary.calls != 1 {
 		t.Fatalf("primary calls=%d want 1 (env opt-out must skip retry)", primary.calls)
+	}
+}
+
+func TestComposedRetry_CountFromEnv(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	t.Setenv("ACD_INTENT_RETRY_ON_INVALID", "1")
+	invalidPlan := IntentPlan{
+		SelectedSeqs:   []int64{999},
+		DeferredSeqs:   []int64{102},
+		Subject:        "Tighten checkout flow",
+		GroupingReason: "single focused checkout change",
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation change is separate",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name:  "scripted-primary",
+		plans: []IntentPlan{invalidPlan, invalidPlan, invalidPlan},
+	}
+	planner := Compose(primary, DeterministicProvider{})
+	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
+	if err == nil {
+		t.Fatalf("expected validation error after configured retry cap")
+	}
+	if primary.calls != 2 {
+		t.Fatalf("primary calls=%d want 2 (initial + one configured retry)", primary.calls)
 	}
 }
 

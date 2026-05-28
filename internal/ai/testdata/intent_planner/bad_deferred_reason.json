@@ -30,7 +30,7 @@
     "id": "chatcmpl-bad-deferred-reason",
     "object": "chat.completion",
     "created": 1778795200,
-    "model": "gpt-4o-mini",
+    "model": "gpt-5.4-mini",
     "choices": [
       {
         "index": 0,
