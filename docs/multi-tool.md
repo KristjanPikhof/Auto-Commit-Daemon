@@ -1,189 +1,108 @@
-# Running ACD Alongside Another Auto-Committer
+# Running ACD next to another auto-committer
 
-This document covers what happens when `acd` shares a repository with another
-process that also creates commits automatically — for example, the Claude Code
-Automatic Atomic Commits hook or the Codex ACD hook.
+ACD can share a repo with another tool that also creates commits. If the other
+tool lands the same captured state first, ACD settles its queued event at
+`HEAD` instead of making a duplicate commit.
 
-See [docs/capture-replay.md](capture-replay.md) for the underlying replay and
-conflict-resolution mechanics this document references.
+## What happens
 
----
+~~~mermaid
+flowchart TB
+  A["File changes"] --> B["ACD captures<br/>pending event"]
+  A --> C["Other committer<br/>creates commit"]
+  C --> D["HEAD advances"]
+  B --> E["ACD replay tick"]
+  D --> E
+  E --> F{"HEAD already has<br/>captured after-state?"}
+  F -->|yes| G["Mark event published<br/>at external HEAD"]
+  F -->|no| H["Continue replay<br/>or block on mismatch"]
 
-## How parallel committers interact with ACD
-
-`acd` captures file operations at the moment they happen and queues them as
-`pending` events in SQLite. The replay loop drains the queue on each poll tick.
-With `ACD_COMMIT_STRATEGY=event`, it considers one event at a time. With
-`ACD_COMMIT_STRATEGY=intent`, it may wait for `ACD_INTENT_MIN_PENDING`, the
-`ACD_INTENT_MAX_PENDING_AGE` escape hatch, or an explicit logical flush before
-offering at most `ACD_INTENT_WINDOW` visible captures to the planner. Plain
-`acd wake` nudges capture/replay but still honors the intent batch gate. It may
-then publish a selected group as one commit, but the same safety checks and
-idempotent settle rules still apply to each selected capture.
-When another tool (Claude Code hook, Codex hook, or any `git commit` call) lands
-a commit *before* `acd`'s replay tick, the branch ref has already advanced. On
-the next replay pass `acd` detects this via its idempotent publish probe
-(`alreadyPublishedAtHEAD`, `internal/daemon/replay.go`):
-
-1. `acd` reads the current `HEAD` tree.
-2. For every op in the queued event, it checks whether the desired final state
-   is already present — file blob matches, or path is already absent for
-   deletes.
-3. An ancestry guard confirms `HEAD` descends from the replay parent that the
-   event was chained off. This prevents a coincidental tree match from masking
-   a real divergence.
-4. If every op passes, the event is marked `published` with `commit_oid = HEAD`.
-   No new commit is created.
-
-Trace decision strings emitted by this path:
-
-| Decision string | Trigger |
-|---|---|
-| `already_published_by_external_committer` | Before-state probe would have blocked; HEAD tree already matches — external tool landed the change. |
-| `already_published_no_op_tree` | Op set produces an empty tree diff (no content change); settled at HEAD without a commit. |
-| `already_published_after_cas_exhaustion` | CAS retries exhausted; HEAD already reflects the captured change — treated as a parallel publish. |
-| `handled_external_after_block` | Emitted (event class `replay.self_heal`) when the daemon promotes a `blocked_conflict` row to `published` because an external committer already landed the captured after-state. The row was previously blocked but HEAD now matches the captured intent, so no new commit is needed. |
-
----
-
-## Claude Code Automatic Atomic Commits hook
-
-The Claude Code Automatic Atomic Commits (AAC) plugin commits each file
-immediately after every `Edit` or `Write` tool use. These commits land on the
-branch *before* `acd`'s next replay tick. Typical sequence:
-
-```text
-[Claude Code hook] Edit tool use fires
-[Claude Code hook] git commit -m "modify auth.go"   ← branch advances
-[acd replay tick ] pending event for auth.go
-                   → alreadyPublishedAtHEAD = true
-                   → event marked published (no new commit)
-```
-
-The net result is the same file state without a duplicate ACD commit. `acd`
-marks the event published against the external commit, so author, message, and
-timing come from the tool that committed first. `acd status` will show
-`pending_events: 0` within one tick after the hook runs.
-
----
-
-## Codex ACD hook
-
-Harness active hooks (`UserPromptSubmit` / `PreToolUse` / `PostToolUse` /
-tool-before / tool-after, depending on the harness) run idempotent `acd start`
-before `acd wake`, so later activity can recover if the daemon was manually
-stopped inside an already-open session. End-session behavior remains
-harness-specific: Claude Code, OpenCode, and Pi deregister with
-`acd stop --session-id`; Codex `Stop` calls `acd touch` so the daemon survives
-end-of-turn until the refcount sweep cleans up after Codex exits. If Codex
-itself also has an auto-commit plugin active, the same idempotent publish logic
-applies: `acd` detects the already-landed commit and settles without creating a
-duplicate.
-
-If repo autodiscovery is disabled, hook-driven `acd start` calls only manage
-repos that were registered with `acd repo init`. In an unregistered repo the
-hook path skips without creating `.git/acd` or a central registry row. Run
-`acd repo init` in that repo, or temporarily set
-`ACD_REPO_AUTODISCOVERY=enabled`, before expecting harness hooks to manage it.
-
----
-
-## Edge cases that still produce `blocked_conflict`
-
-The idempotent publish probe only passes when the live `HEAD` tree exactly
-matches the captured intent. The following scenarios bypass it and become
-`blocked_conflict`:
-
-| Scenario | Why it blocks |
-|---|---|
-| **Mode-only change** where the external committer used a different file mode | Blob OIDs match but the recorded `after_mode` diverges from what `HEAD` shows; the probe fails the per-op check. |
-| **Rename source unreachable** | External tool deleted the rename source before `acd` could move it; the path is absent but `after_oid` does not match an absent entry. |
-| **Symlink target mismatch** | Symlink (mode `120000`) blob encodes the target string; an external tool that wrote a different target produces a different OID, failing the probe. |
-| **Ancestry divergence** | `HEAD` does not descend from the replay parent (force-push, hard reset to an unrelated commit); the ancestry guard returns `false` before the tree is even checked. |
-
-Resolve `blocked_conflict` rows with the standard recovery ladder:
-
-~~~bash
-acd status                         # diagnose counts and status terms
-acd events --watch                 # inspect current decisions
-acd explain --path path/to/file    # inspect the affected path
-acd diagnose --repo .              # inspect blockers and branch anchors
-acd fix --dry-run                  # plan safe cleanup
-acd fix --yes                      # apply safe cleanup only if the plan matches
-acd fix --force --dry-run          # explicit force plan for barriers with pending successors
-acd fix --force --yes              # apply only after verifying HEAD already has the change or discard is intended
+  classDef event fill:#243447,stroke:#7aa2f7,color:#e6edf3
+  classDef decision fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
+  classDef ok fill:#203a31,stroke:#9ece6a,color:#eaffdf
+  classDef block fill:#402b2b,stroke:#f7768e,color:#ffe8ee
+  class A,B,C,D,E event
+  class F decision
+  class G ok
+  class H block
 ~~~
 
-`blk` in compact `acd list` (`blocked` with `--verbose`/`--json`) means action
-is still required. If only `pending`
-remains under intent strategy, ACD may be waiting for more captures or the age
-trigger; use `acd flush --logical --session-id "$ACD_SESSION_ID"` from an
-active harness session when you want to drain the visible batch now.
+ACD checks the current `HEAD` tree against the captured after-state for every
+op. For deletes, the path must already be absent. It also checks ancestry so a
+coincidental tree match does not hide a real branch divergence.
 
-After applying, nudge the daemon if you are inside a harness shell:
+## Expected decisions
+
+| Decision | Meaning |
+|---|---|
+| `already_published_by_external_committer` | Replay would have blocked, but `HEAD` already matches the captured final state. |
+| `already_published_no_op_tree` | The op set produced no tree change. |
+| `already_published_after_cas_exhaustion` | `update-ref` retries failed, then `HEAD` was found to contain the captured state. |
+| `handled_external_after_block` | A previously blocked row self-healed after an external commit landed the captured state. |
+
+User-facing commands show these as `handled_external`,
+`handled_external_after_block`, or `superseded_external`.
+
+## Common setups
+
+| Setup | Result |
+|---|---|
+| ACD is the only committer | Simplest. Replay writes the commits. |
+| Another hook commits first | ACD usually settles its matching event at the external commit. |
+| Both tools race on different content | ACD may produce `blocked_conflict`. |
+| Codex ACD hook plus another auto-commit plugin | Same settle behavior; watch `acd events`. |
+
+Codex `Stop` calls `acd touch`, not logical flush. Claude Code, OpenCode, and Pi
+snippets use `acd flush --logical` at their natural idle or stop boundary.
+
+If repo autodiscovery is disabled, hook-driven starts manage only repos that
+were registered with `acd repo init`.
+
+## Edge cases that still block
+
+| Case | Why it blocks |
+|---|---|
+| Mode-only mismatch | Blob matches, but the captured file mode does not. |
+| Rename source mismatch | The source path state no longer matches the captured rename op. |
+| Symlink target mismatch | Symlink blobs encode target strings, so a different target is different content. |
+| Ancestry divergence | Current `HEAD` does not descend from the replay parent. |
+| Partial external commit | Some, but not all, captured ops are present at `HEAD`. |
+
+Recovery:
 
 ~~~bash
-acd wake --session-id "$ACD_SESSION_ID"
+acd status
+acd events --watch
+acd explain --path path/to/file
+acd diagnose --repo .
+acd fix --dry-run
+acd fix --yes
+acd fix --force --dry-run
+acd fix --force --yes
 ~~~
 
-`wake` requires a non-empty session id. Without one, wait for the next daemon tick.
-
-`acd recover` and `acd purge-events` are deprecated; use `acd fix` instead.
-
----
+Use force only after checking the blocked changes are already represented in
+`HEAD` or should be discarded.
 
 ## Recommended configurations
 
-### Option A — let `acd` be the sole committer (simplest)
+| Option | When to use | Commands |
+|---|---|---|
+| Let ACD be sole committer | You want fewer moving parts. | Disable other auto-commit hooks, then run `acd setup <harness>`. |
+| Accept external settle | You need another hook too. | Watch `acd events --watch` and keep `blocked_conflicts` at `0`. |
+| Debug settle decisions | You need internal proof. | Start with `ACD_TRACE=1`, then inspect `.git/acd/trace/*.jsonl`. |
 
-Disable any per-file auto-commit hooks in your harness and let `acd` be the
-only tool writing commits. No idempotent probe is needed; replay always has
-a clean before-state.
-
-~~~bash
-# Claude Code: remove or disable the Automatic Atomic Commits plugin
-# Codex: do not install a separate auto-commit hook alongside acd setup codex
-acd setup codex   # wake hook only — no separate commit hook
-~~~
-
-### Option B — accept idempotent settle as the steady state
-
-Run both hooks simultaneously. The idempotent publish probe absorbs the
-parallel committer's commits silently. Watch `acd status` to confirm
-`blocked_conflicts` stays at `0` and no failed terminal barrier is blocking
-pending replay, or stream the decision ledger:
-
-~~~bash
-acd events --watch
-acd explain --commit HEAD
-~~~
-
-`acd events --watch` starts at the current ledger tail when `--since` is
-omitted, so it prints only decisions appended after watch starts.
-
-Enable trace logging only when you need internal replay decisions:
-
-~~~bash
-ACD_TRACE=1 acd start --repo . --session-id debug --harness claude-code
-# decisions appear in .git/acd/trace/YYYY-MM-DD.jsonl
-~~~
-
-Filter for the settle path:
+Trace filter:
 
 ~~~bash
 grep already_published .git/acd/trace/*.jsonl | python3 -c \
-  "import sys,json; [print(json.loads(l)['decision'], json.loads(l)['input']) for l in sys.stdin]"
+  'import sys,json; [print(json.loads(line).get("decision"), json.loads(line).get("input")) for line in sys.stdin]'
 ~~~
-
----
 
 ## See also
 
-- [User workflows](user-workflows.md) — daily status, events, explain, fix, and
-  support diagnostics workflows.
-- [Revert workflows](capture-replay.md#revert-workflows) — git revert, reset,
-  and rebase with ACD running.
-- [Replay mechanics](capture-replay.md#replay-how-a-pending-event-becomes-a-commit)
-  — scratch-index, conflict probe, and CAS ref update.
-- [Trace event classes](capture-replay.md#trace-event-classes) — full
-  enumeration of `event_class` and `decision` strings.
+| Doc | Use |
+|---|---|
+| [user-workflows.md](user-workflows.md) | Daily status, explain, fix, and support flows. |
+| [capture-replay.md](capture-replay.md) | Scratch-index replay and conflict probes. |
+| [intent-commit-flow.md](intent-commit-flow.md) | Intent batch waits and logical flush. |
