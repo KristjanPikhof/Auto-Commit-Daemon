@@ -4,6 +4,11 @@
 
 ### Changed
 
+- README and the docs folder were rewritten into shorter, task-focused guides
+  with diagrams and clearer recovery paths.
+- OpenAI-compatible provider defaults now use `gpt-5.4-mini`.
+- `ACD_INTENT_RETRY_ON_INVALID` now accepts a retry count and defaults to `2`,
+  giving invalid intent plans one more correction attempt before fallback.
 - `acd list` now shows the intent batch-wait countdown in `wait` rows, so
   sparse queues show when the age trigger will commit without extra commands.
 
