@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- `acd fix --force` now purges failed replay barriers with pending successors,
+  so stuck queues can recover through the supported `acd fix` flow instead of
+  the hidden `purge-events --failed` compatibility command.
+
 ## v2026-05-28
 
 ### Changed
