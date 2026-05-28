@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-05-29
+
 ### Changed
 
 - README and the docs folder were rewritten into shorter, task-focused guides
