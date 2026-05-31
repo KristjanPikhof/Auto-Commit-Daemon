@@ -58,7 +58,7 @@ func newRewriteCommitsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
-	Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
+		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
 		Long: `Generate, review, edit, and apply an AI-generated commit-message
 rewrite plan for a linear range on the current branch.
 
