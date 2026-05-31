@@ -25,8 +25,10 @@ func TestResolveRewriteSelectionPositions(t *testing.T) {
 		positions [2]int
 	}{
 		{name: "last", opts: RewriteSelectionOptions{Last: 2}, selected: []string{commits[2], commits[3]}, positions: [2]int{1, 2}},
+		{name: "from_position_explicit", opts: RewriteSelectionOptions{FromPosition: 3}, selected: []string{commits[1], commits[2], commits[3]}, positions: [2]int{1, 3}},
 		{name: "from_position", opts: RewriteSelectionOptions{From: "3"}, selected: []string{commits[1], commits[2], commits[3]}, positions: [2]int{1, 3}},
 		{name: "range", opts: RewriteSelectionOptions{Range: "2-3"}, selected: []string{commits[1], commits[2]}, recreated: []string{commits[3]}, positions: [2]int{2, 3}},
+		{name: "from_sha_explicit", opts: RewriteSelectionOptions{FromSHA: commits[1][:12]}, selected: []string{commits[1], commits[2], commits[3]}, positions: [2]int{1, 3}},
 		{name: "from_sha", opts: RewriteSelectionOptions{From: commits[1][:12]}, selected: []string{commits[1], commits[2], commits[3]}, positions: [2]int{1, 3}},
 		{name: "git_range", opts: RewriteSelectionOptions{GitRange: commits[0] + ".." + commits[2]}, selected: []string{commits[1], commits[2]}, recreated: []string{commits[3]}, positions: [2]int{2, 3}},
 	} {
@@ -65,14 +67,14 @@ func TestResolveFromPositionOrCommit_AllDigitShortSHA(t *testing.T) {
 		if resolved, err := RevParse(ctx, dir, short+"^{commit}"); err != nil || resolved != oid {
 			continue
 		}
-		got, err := resolveFromPositionOrCommit(ctx, dir, short, chain)
+		got, err := ResolveRewriteSelection(ctx, dir, RewriteSelectionOptions{FromSHA: short})
 		if err != nil {
-			t.Fatalf("resolveFromPositionOrCommit(%q): %v", short, err)
+			t.Fatalf("ResolveRewriteSelection(FromSHA %q): %v", short, err)
 		}
 		for want, candidate := range chain {
 			if candidate == oid {
-				if got != want {
-					t.Fatalf("position=%d want %d for %s", got, want, short)
+				if got.SelectedOldestIndex != want+1 {
+					t.Fatalf("oldest position=%d want %d for %s", got.SelectedOldestIndex, want+1, short)
 				}
 				return
 			}

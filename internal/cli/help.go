@@ -24,8 +24,8 @@ Common workflow:
   acd logs --follow                 Stream appended raw JSONL daemon log lines
   acd wake                          Refresh heartbeat and nudge replay
   acd commit-all                    One-shot: commit every uncommitted file (daemon must be off)
-  acd rewrite-commits --from 5 --plan-only  Generate an AI-gated linear rewrite plan without prompts
-  acd rewrite-commits --range 5-12 --review  Review/edit proposed messages before applying
+  acd rewrite-commits --from-nr 5 --plan-only  Generate an AI-gated linear rewrite plan without prompts
+  acd rewrite-commits --range-nr 5-12 --review  Review/edit proposed messages before applying
   acd rewrite-commits --edit <plan-id> --plan-only  Edit a saved plan revision without AI calls
   acd rewrite-commits --apply <plan-id> --dry-run  Validate a saved plan before apply
   acd stop                          Stop the repo daemon or deregister a session

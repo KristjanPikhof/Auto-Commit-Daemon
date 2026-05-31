@@ -23,6 +23,18 @@ type RewriteApplyOptions struct {
 	Commits      []RewriteApplyCommit
 	DryRun       bool
 	Now          time.Time
+	Progress     func(RewriteApplyProgress) error
+}
+
+// RewriteApplyProgress reports durable milestones during rewrite apply.
+type RewriteApplyProgress struct {
+	Phase     string
+	Message   string
+	Current   int
+	Total     int
+	OldOID    string
+	NewOID    string
+	BackupRef string
 }
 
 // RewriteApplyResult reports refs and old->new commit mapping produced by an
@@ -49,6 +61,9 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 	if opts.BranchRef == "" || opts.ExpectedHead == "" || len(opts.Commits) == 0 {
 		return RewriteApplyResult{}, fmt.Errorf("git rewrite apply: missing required plan fields")
 	}
+	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "validate", Message: "checking repository"}); err != nil {
+		return RewriteApplyResult{}, err
+	}
 	if err := ensureRewriteSafeRepo(ctx, repoDir); err != nil {
 		return RewriteApplyResult{}, err
 	}
@@ -72,6 +87,9 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 	if err := validateRewriteApplyChain(ctx, repoDir, opts); err != nil {
 		return RewriteApplyResult{}, err
 	}
+	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "validate", Message: "validated plan"}); err != nil {
+		return RewriteApplyResult{}, err
+	}
 
 	res := RewriteApplyResult{OldHead: head, CommitMap: make(map[string]string)}
 	if opts.DryRun {
@@ -83,6 +101,9 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		return RewriteApplyResult{}, err
 	}
 	res.BackupBranchRef = backupBranch
+	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "backup", Message: "created backup refs", BackupRef: backupBranch}); err != nil {
+		return RewriteApplyResult{}, err
+	}
 	if opts.PlanID != "" {
 		res.InternalBackupRef = "refs/acd/rewrite-backups/" + sanitizeRewriteRefPart(opts.PlanID)
 	}
@@ -92,7 +113,7 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		return RewriteApplyResult{}, err
 	}
 	newParent := parent
-	for _, c := range opts.Commits {
+	for i, c := range opts.Commits {
 		newOID, err := recreateCommitWithMessage(ctx, repoDir, c.OldOID, c.ProposedMessage, newParent)
 		if err != nil {
 			return res, err
@@ -100,13 +121,23 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		res.CommitMap[c.OldOID] = newOID
 		newParent = newOID
 		res.RecreatedCount++
+		if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{
+			Phase:   "recreate_selected",
+			Message: "recreated selected commit",
+			Current: i + 1,
+			Total:   len(opts.Commits),
+			OldOID:  c.OldOID,
+			NewOID:  newOID,
+		}); err != nil {
+			return res, err
+		}
 	}
 
 	newer, err := firstParentDescendantsReverse(ctx, repoDir, opts.Commits[len(opts.Commits)-1].OldOID, head)
 	if err != nil {
 		return res, err
 	}
-	for _, oldOID := range newer {
+	for i, oldOID := range newer {
 		msg, err := commitMessage(ctx, repoDir, oldOID)
 		if err != nil {
 			return res, err
@@ -118,12 +149,32 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		res.CommitMap[oldOID] = newOID
 		newParent = newOID
 		res.RecreatedCount++
+		if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{
+			Phase:   "recreate_unchanged",
+			Message: "recreated unchanged descendant",
+			Current: i + 1,
+			Total:   len(newer),
+			OldOID:  oldOID,
+			NewOID:  newOID,
+		}); err != nil {
+			return res, err
+		}
 	}
 	res.NewHead = newParent
+	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "update_ref", Message: "updating branch ref", OldOID: head, NewOID: res.NewHead}); err != nil {
+		return res, err
+	}
 	if err := UpdateRef(ctx, repoDir, opts.BranchRef, res.NewHead, head); err != nil {
 		return res, fmt.Errorf("git rewrite apply: CAS update %s: %w", opts.BranchRef, err)
 	}
 	return res, nil
+}
+
+func emitRewriteApplyProgress(opts RewriteApplyOptions, event RewriteApplyProgress) error {
+	if opts.Progress == nil {
+		return nil
+	}
+	return opts.Progress(event)
 }
 
 func validateRewriteApplyChain(ctx context.Context, repoDir string, opts RewriteApplyOptions) error {

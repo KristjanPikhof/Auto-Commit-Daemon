@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- `acd rewrite-commits` now has explicit `--from-sha`, `--from-nr`,
+  `--range-nr`, and `--range-sha` selectors, plus stderr-only progress modes
+  for plan generation and apply.
+
 ## v2026-05-29
 
 ### Changed

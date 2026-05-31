@@ -29,7 +29,12 @@ type rewriteSelectionReport struct {
 }
 
 type rewriteCommitsOptions struct {
-	selection  git.RewriteSelectionOptions
+	selection git.RewriteSelectionOptions
+	fromSHA   string
+	fromNR    int
+	rangeNR   string
+	rangeSHA  string
+
 	base       string
 	head       string
 	planOut    string
@@ -42,17 +47,31 @@ type rewriteCommitsOptions struct {
 	noReview   bool
 	planOnly   bool
 	editFormat string
+	progress   string
+	progressTo io.Writer
+	quiet      bool
 	in         io.Reader
 }
 
 func newRewriteCommitsCmd() *cobra.Command {
 	var opts rewriteCommitsOptions
 	cmd := &cobra.Command{
-		Use:     "rewrite-commits (--from <sha|position> | --range <start-end> | --last <n> | --git-range <revset>) [--plan-out FILE] | --edit <plan-id-or-file>",
+		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
 		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
-		Long: `Preview an AI-generated rewrite plan for a linear commit range on the
-current branch.
+		Long: `Generate, review, edit, and apply an AI-generated commit-message
+rewrite plan for a linear range on the current branch.
+
+Safe workflow:
+  1. Choose commits with --from-nr, --from-sha, --range-nr, --range-sha, or --last.
+  2. Generate a plan with --plan-only or --plan-out.
+  3. Review with --show-plan or --edit.
+  4. Dry-run apply, then apply with --yes.
+
+Progress goes to stderr. Command results stay on stdout, so --json output remains
+parseable. Use --progress json for JSONL progress events, --progress plain for
+stable text progress, --progress off to disable progress, or --quiet to suppress
+non-essential output.
 
 Plan generation is intentionally gated: ACD_COMMIT_STRATEGY must resolve to
 intent and ACD_AI_PROVIDER must name a usable non-deterministic planner provider
@@ -71,10 +90,12 @@ validates/previews apply without rewriting commits.
 
 v1 scope: current branch linear ranges only; merge commit rewrites are refused;
 there is no daemon automation.`,
-		Example: `  ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
-  acd rewrite-commits --from 5 --plan-only
-  acd rewrite-commits --range 5-12 --review --format text
+		Example: `  ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
+  acd rewrite-commits --from-nr 5 --plan-only
+  acd rewrite-commits --range-nr 5-12 --review --format text
+  acd rewrite-commits --range-sha main~12..main~4 --format json
   acd rewrite-commits --last 4 --no-review --yes
+  acd rewrite-commits --from 5 --plan-only        # compatibility alias
   acd rewrite-commits --git-range main~12..main~4 --format json
   acd rewrite-commits --show-plan rewrite.json
   acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
@@ -87,12 +108,19 @@ there is no daemon automation.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			quiet, _ := cmd.Flags().GetBool("quiet")
 			opts.in = cmd.InOrStdin()
+			opts.progressTo = cmd.ErrOrStderr()
+			opts.quiet = quiet
 			return runRewriteCommits(cmd.Context(), cmd.OutOrStdout(), repo, opts, jsonOut)
 		},
 	}
-	cmd.Flags().StringVar(&opts.selection.Range, "range", "", "1-based position range to rewrite (start-end, where 1 is HEAD)")
-	cmd.Flags().StringVar(&opts.selection.GitRange, "git-range", "", "Advanced git rev-list revset; selected commits must be contiguous on the current branch")
+	cmd.Flags().StringVar(&opts.fromSHA, "from-sha", "", "Rewrite from commit-ish through HEAD; numeric-looking values are treated as commits, not positions")
+	cmd.Flags().IntVar(&opts.fromNR, "from-nr", 0, "Rewrite from 1-based position n through HEAD, where 1 is HEAD")
+	cmd.Flags().StringVar(&opts.rangeNR, "range-nr", "", "Rewrite a 1-based position range (start-end, where 1 is HEAD)")
+	cmd.Flags().StringVar(&opts.rangeSHA, "range-sha", "", "Rewrite commits selected by a simple git range <base>..<head>")
+	cmd.Flags().StringVar(&opts.selection.Range, "range", "", "Compatibility selector: 1-based position range to rewrite (start-end, where 1 is HEAD)")
+	cmd.Flags().StringVar(&opts.selection.GitRange, "git-range", "", "Advanced compatibility selector: git rev-list revset; selected commits must be contiguous on the current branch")
 	cmd.Flags().StringVar(&opts.base, "base", "", "Deprecated alias for --git-range <base>..<head>: exclusive base revision")
 	cmd.Flags().StringVar(&opts.head, "head", "", "Deprecated alias for --git-range <base>..<head>: inclusive head revision (default HEAD when --base is set)")
 	cmd.Flags().StringVar(&opts.planOut, "plan-out", "", "Write the generated rewrite plan to FILE")
@@ -105,8 +133,9 @@ there is no daemon automation.`,
 	cmd.Flags().BoolVar(&opts.review, "review", false, "Open EDITOR to review/edit proposed commit messages before apply")
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
+	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
-	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD")
+	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD; prefer --from-sha or --from-nr")
 	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Compatibility selector: select the newest n commits")
 	return cmd
 }
@@ -116,6 +145,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		ctx = context.Background()
 	}
 	if err := normalizeAndValidateRewriteOptions(&opts); err != nil {
+		return err
+	}
+	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
+	if err != nil {
 		return err
 	}
 	if opts.showPlan != "" {
@@ -144,11 +177,21 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		RecreateUnchanged: selection.RecreateUnchanged,
 		SelectedPositions: fmt.Sprintf("%d-%d", selection.SelectedNewestIndex, selection.SelectedOldestIndex),
 	}
+	if err := progress.Emit(rewriteProgressEvent{
+		Phase:   "selection",
+		Message: fmt.Sprintf("selected %d commit(s)", len(report.Selected)),
+		Current: len(report.Selected),
+		Total:   len(report.Selected),
+	}); err != nil {
+		return err
+	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(report)
 	}
+	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
+	printRewriteSelectionSummary(out, report)
 
 	cfg := ai.LoadProviderConfigFromEnv()
 	provider, closer, err := ai.BuildProvider(cfg)
@@ -161,8 +204,11 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	if err := ai.CheckRewritePlanGenerationGate(cfg, provider); err != nil {
 		return fmt.Errorf("acd rewrite-commits: %w", err)
 	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "provider", Message: fmt.Sprintf("using %s", ai.PrimaryProviderName(provider))}); err != nil {
+		return err
+	}
 
-	plan, err := generateRewritePlan(ctx, repo, selection, provider, cfg)
+	plan, err := generateRewritePlan(ctx, repo, selection, provider, cfg, progress)
 	if err != nil {
 		return err
 	}
@@ -170,25 +216,18 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		if err := writeRewritePlanFile(opts.planOut, plan); err != nil {
 			return err
 		}
-	}
-
-	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
-	fmt.Fprintf(out, "rewrite-commits selection for %s (%s @ %s)\n", report.Repo, report.BranchRef, shortenSHA(report.Head))
-	fmt.Fprintf(out, "Selected positions: %s\n", report.SelectedPositions)
-	fmt.Fprintf(out, "Selected commits (%d):\n", len(report.Selected))
-	for _, c := range report.Selected {
-		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
-	}
-	if len(report.RecreateUnchanged) > 0 {
-		fmt.Fprintf(out, "Recreate unchanged newer commits (%d):\n", len(report.RecreateUnchanged))
-		for _, c := range report.RecreateUnchanged {
-			fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+		if err := progress.Emit(rewriteProgressEvent{Phase: "save", Message: fmt.Sprintf("wrote %s", opts.planOut), PlanID: plan.ID}); err != nil {
+			return err
 		}
 	}
+
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
 		fmt.Fprintf(out, "Plan stored as invalid: %s\n", plan.ValidationError.String)
 	} else {
 		fmt.Fprintf(out, "Generated valid rewrite plan %s with %d proposal(s).\n", plan.ID, len(plan.Commits))
+	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "validation", Message: fmt.Sprintf("status %s", plan.ValidationStatus), PlanID: plan.ID}); err != nil {
+		return err
 	}
 	if opts.planOut != "" {
 		fmt.Fprintf(out, "Plan written to %s\n", opts.planOut)
@@ -201,6 +240,9 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		planRef := plan.ID
 		if opts.planOut != "" {
 			planRef = opts.planOut
+		}
+		if err := progress.Emit(rewriteProgressEvent{Phase: "next", Message: "plan saved; git history unchanged", PlanID: plan.ID}); err != nil {
+			return err
 		}
 		finishRewritePlanOnly(out, planRef)
 		return nil
@@ -279,6 +321,21 @@ func printRewritePlanNextSteps(out io.Writer, planRef string) {
 	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", arg)
 }
 
+func printRewriteSelectionSummary(out io.Writer, report rewriteSelectionReport) {
+	fmt.Fprintf(out, "rewrite-commits selection for %s (%s @ %s)\n", report.Repo, report.BranchRef, shortenSHA(report.Head))
+	fmt.Fprintf(out, "Selected positions: %s\n", report.SelectedPositions)
+	fmt.Fprintf(out, "Selected commits (%d):\n", len(report.Selected))
+	for _, c := range report.Selected {
+		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+	}
+	if len(report.RecreateUnchanged) > 0 {
+		fmt.Fprintf(out, "Recreate unchanged newer commits (%d):\n", len(report.RecreateUnchanged))
+		for _, c := range report.RecreateUnchanged {
+			fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+		}
+	}
+}
+
 func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
@@ -355,6 +412,10 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	if !opts.yes && !opts.dryRun {
 		return errors.New("acd rewrite-commits: --apply-plan requires --yes or --dry-run")
 	}
+	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
+	if err != nil {
+		return err
+	}
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
 		return err
@@ -400,6 +461,17 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		PlanID:       plan.ID,
 		Commits:      applyCommits,
 		DryRun:       opts.dryRun,
+		Progress: func(event git.RewriteApplyProgress) error {
+			return progress.Emit(rewriteProgressEvent{
+				Phase:        "apply_" + event.Phase,
+				Message:      event.Message,
+				Current:      event.Current,
+				Total:        event.Total,
+				CommitOID:    event.OldOID,
+				NewCommitOID: event.NewOID,
+				BackupRef:    event.BackupRef,
+			})
+		},
 	})
 	if err != nil {
 		if plan.ID != "" && !opts.dryRun {
@@ -423,6 +495,10 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	reconcile, err := state.ReconcileRewriteCommitOIDs(ctx, db, res.CommitMap)
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: reconcile state OIDs after successful git rewrite: %w", err)
+	}
+	reconciledRows := reconcile.CaptureEvents + reconcile.DecisionRecords + reconcile.PublishTargetCommitOID + reconcile.PublishSourceHead
+	if err := progress.Emit(rewriteProgressEvent{Phase: "apply_reconcile", Message: "reconciled state OIDs", Current: int(reconciledRows)}); err != nil {
+		return err
 	}
 	if plan.ID != "" {
 		if err := markRewritePlanStatusIfPresent(ctx, db, plan.ID, state.RewritePlanApplyApplied); err != nil {
@@ -537,7 +613,7 @@ func writeRewritePlanFile(path string, plan state.RewritePlan) error {
 	return enc.Encode(plan)
 }
 
-func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig) (state.RewritePlan, error) {
+func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink) (state.RewritePlan, error) {
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return state.RewritePlan{}, err
@@ -561,6 +637,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		ApplyStatus:      state.RewritePlanApplyPending,
 	}
 	for i, c := range selection.Selected {
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "requesting proposal",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			return state.RewritePlan{}, err
+		}
 		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider))
 		if err != nil {
 			return state.RewritePlan{}, err
@@ -570,6 +656,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 			plan.ValidationStatus = state.RewritePlanValidationInvalid
 			plan.ValidationError = sql.NullString{String: rewriteFailureJSON(c.OID, err), Valid: true}
 			plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: c.Message})
+			if emitErr := progress.Emit(rewriteProgressEvent{
+				Phase:         "proposal",
+				Message:       "proposal failed",
+				Current:       i + 1,
+				Total:         len(selection.Selected),
+				CommitOID:     c.OID,
+				CommitSubject: c.Subject,
+			}); emitErr != nil {
+				return state.RewritePlan{}, emitErr
+			}
 			break
 		}
 		message := result.Subject
@@ -577,6 +673,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 			message += "\n\n" + result.Body
 		}
 		plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: message})
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "proposal accepted",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			return state.RewritePlan{}, err
+		}
 	}
 	if len(plan.Commits) == 0 && len(selection.Selected) > 0 {
 		c := selection.Selected[0]
@@ -589,6 +695,9 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: save rewrite plan: %w", err)
 	}
 	plan.ID = id
+	if err := progress.Emit(rewriteProgressEvent{Phase: "save", Message: "saved plan", PlanID: plan.ID}); err != nil {
+		return state.RewritePlan{}, err
+	}
 	return plan, nil
 }
 
@@ -699,12 +808,31 @@ func rewriteFailureJSON(oid string, err error) string {
 }
 
 func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
+	opts.fromSHA = strings.TrimSpace(opts.fromSHA)
+	opts.rangeNR = strings.TrimSpace(opts.rangeNR)
+	opts.rangeSHA = strings.TrimSpace(opts.rangeSHA)
+	opts.selection.From = strings.TrimSpace(opts.selection.From)
+	opts.selection.Range = strings.TrimSpace(opts.selection.Range)
+	opts.selection.GitRange = strings.TrimSpace(opts.selection.GitRange)
+	opts.base = strings.TrimSpace(opts.base)
+	opts.head = strings.TrimSpace(opts.head)
+	opts.showPlan = strings.TrimSpace(opts.showPlan)
+	opts.applyPlan = strings.TrimSpace(opts.applyPlan)
+	opts.editPlan = strings.TrimSpace(opts.editPlan)
+
 	opts.editFormat = strings.ToLower(strings.TrimSpace(opts.editFormat))
 	if opts.editFormat == "" {
 		opts.editFormat = rewriteEditFormatText
 	}
+	opts.progress = strings.ToLower(strings.TrimSpace(opts.progress))
+	if opts.progress == "" {
+		opts.progress = string(rewriteProgressModeAuto)
+	}
 	if opts.editFormat != rewriteEditFormatText && opts.editFormat != rewriteEditFormatJSON {
 		return fmt.Errorf("acd rewrite-commits: --format must be text or json")
+	}
+	if !validRewriteProgressMode(opts.progress) {
+		return fmt.Errorf("acd rewrite-commits: --progress must be auto, plain, json, or off")
 	}
 	if opts.review && opts.noReview {
 		return errors.New("acd rewrite-commits: choose only one of --review or --no-review")
@@ -715,31 +843,87 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	if opts.editPlan != "" && (opts.review || opts.noReview) {
 		return errors.New("acd rewrite-commits: --edit cannot be combined with --review or --no-review")
 	}
+	if opts.fromNR < 0 {
+		return errors.New("acd rewrite-commits: --from-nr must be positive")
+	}
+	newSelectorCount := 0
+	if opts.fromSHA != "" {
+		newSelectorCount++
+	}
+	if opts.fromNR > 0 {
+		newSelectorCount++
+	}
+	if opts.rangeNR != "" {
+		newSelectorCount++
+	}
+	if opts.rangeSHA != "" {
+		newSelectorCount++
+	}
+	compatSelectorCount := 0
+	if opts.selection.From != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.Range != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.GitRange != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.Last > 0 {
+		compatSelectorCount++
+	}
+	if opts.selection.Last < 0 {
+		return errors.New("acd rewrite-commits: --last must be positive")
+	}
+	if newSelectorCount > 0 && compatSelectorCount > 0 {
+		return errors.New("acd rewrite-commits: use one selector family; prefer --from-sha, --from-nr, --range-nr, or --range-sha instead of mixing compatibility flags")
+	}
+	if newSelectorCount > 1 {
+		return errors.New("acd rewrite-commits: choose only one of --from-sha, --from-nr, --range-nr, or --range-sha")
+	}
+	if newSelectorCount > 0 && (opts.base != "" || opts.head != "") {
+		return errors.New("acd rewrite-commits: use either --from-sha/--from-nr/--range-nr/--range-sha or --base/--head, not both")
+	}
+	if opts.rangeSHA != "" {
+		if strings.ContainsAny(opts.rangeSHA, " \t\n\r") || !strings.Contains(opts.rangeSHA, "..") {
+			return errors.New("acd rewrite-commits: --range-sha must be a simple git range like base..head")
+		}
+		opts.selection.GitRange = opts.rangeSHA
+	}
+	if opts.rangeNR != "" {
+		opts.selection.Range = opts.rangeNR
+	}
+	if opts.fromNR > 0 {
+		opts.selection.FromPosition = opts.fromNR
+	}
+	if opts.fromSHA != "" {
+		opts.selection.FromSHA = opts.fromSHA
+	}
 	modes := 0
-	if strings.TrimSpace(opts.showPlan) != "" {
+	if opts.showPlan != "" {
 		modes++
 	}
-	if strings.TrimSpace(opts.applyPlan) != "" {
+	if opts.applyPlan != "" {
 		modes++
 	}
-	if strings.TrimSpace(opts.editPlan) != "" {
+	if opts.editPlan != "" {
 		modes++
 	}
-	generate := opts.selection.Range != "" || opts.selection.GitRange != "" || opts.base != "" || opts.head != "" || opts.selection.From != "" || opts.selection.Last > 0
+	generate := opts.selection.Range != "" || opts.selection.GitRange != "" || opts.base != "" || opts.head != "" || opts.selection.From != "" || opts.selection.FromSHA != "" || opts.selection.FromPosition > 0 || opts.selection.Last > 0
 	if generate {
 		modes++
 	}
 	if modes == 0 {
-		return errors.New("acd rewrite-commits: choose --from, --range, --last, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
+		return errors.New("acd rewrite-commits: choose --from-sha, --from-nr, --range-nr, --range-sha, --last, --from, --range, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
 	}
 	if modes > 1 {
 		return errors.New("acd rewrite-commits: choose only one mode: generate, --show-plan, --edit, or --apply/--apply-plan")
 	}
 	if opts.selection.Range != "" && strings.Contains(opts.selection.Range, "..") {
-		return errors.New("acd rewrite-commits: --range uses 1-based positions like 2-5; use --git-range for git revsets")
+		return errors.New("acd rewrite-commits: --range-nr/--range uses 1-based positions like 2-5; use --range-sha or --git-range for git revsets")
 	}
 	if (opts.selection.Range != "" || opts.selection.GitRange != "") && (opts.base != "" || opts.head != "") {
-		return errors.New("acd rewrite-commits: use either --range/--git-range or --base/--head, not both")
+		return errors.New("acd rewrite-commits: use either --range-nr/--range-sha/--git-range or --base/--head, not both")
 	}
 	if opts.head != "" && opts.base == "" {
 		return errors.New("acd rewrite-commits: --head requires --base")
@@ -755,6 +939,12 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 }
 
 func rewriteSelectionLabel(opts rewriteCommitsOptions) string {
+	if opts.selection.FromSHA != "" {
+		return opts.selection.FromSHA + "..HEAD"
+	}
+	if opts.selection.FromPosition > 0 {
+		return fmt.Sprintf("from position %d", opts.selection.FromPosition)
+	}
 	if opts.selection.Range != "" {
 		return opts.selection.Range
 	}

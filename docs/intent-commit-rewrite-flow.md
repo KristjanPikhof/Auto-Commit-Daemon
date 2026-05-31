@@ -20,20 +20,29 @@ The daemon never rewrites commits automatically.
 
 ~~~bash
 # Commit-ish through HEAD.
-acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
+acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
 
 # 1-based position through HEAD. Position 1 is HEAD.
-acd rewrite-commits --from 5 --plan-out rewrite.json
+acd rewrite-commits --from-nr 5 --plan-out rewrite.json
 
 # Positions 5 through 12.
-acd rewrite-commits --range 5-12 --plan-out rewrite.json
+acd rewrite-commits --range-nr 5-12 --plan-out rewrite.json
 
 # Newest four commits.
 acd rewrite-commits --last 4 --plan-out rewrite.json
 
-# Advanced explicit range. Base is exclusive, head is inclusive.
+# Simple SHA/range syntax. Base is exclusive, head is inclusive.
+acd rewrite-commits --range-sha main~12..main~4 --plan-out rewrite.json
+
+# Advanced compatibility revset.
 acd rewrite-commits --git-range main~12..main~4 --plan-out rewrite.json
 ~~~
+
+Progress is visible before slow provider work starts. The command prints the
+selected commits first, then reports provider, proposal, validation, save, and
+next-step progress to stderr. Use `--progress json` for JSONL events or
+`--progress off` to disable progress. Stdout remains reserved for command
+results and `--json`.
 
 ~~~mermaid
 flowchart TB
@@ -97,6 +106,12 @@ Apply verifies that the original commit IDs still match the branch, creates a
 backup, recreates selected commits with planned messages, recreates newer
 commits unchanged when needed, moves the current branch ref, and marks the plan
 applied.
+
+Apply progress goes to stderr. Dry-run emits validation phases only. Real apply
+also reports backup creation, selected commit recreation, unchanged descendant
+recreation, branch ref update, and state OID reconciliation. If apply succeeds,
+the output includes a backup branch and an internal backup ref when the plan has
+an id.
 
 ~~~mermaid
 flowchart TB

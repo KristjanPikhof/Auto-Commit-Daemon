@@ -216,11 +216,16 @@ The daemon never rewrites history on its own. Use `rewrite-commits` only for an
 explicit local cleanup before sharing a branch:
 
 ~~~bash
-acd rewrite-commits --from 5 --plan-out rewrite.json --plan-only
+acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
 acd rewrite-commits --show-plan rewrite.json
 acd rewrite-commits --apply-plan rewrite.json --dry-run
 acd rewrite-commits --apply-plan rewrite.json --yes
 ~~~
+
+Use `--from-sha <sha>` when you want a commit-ish selector, `--range-nr 5-12`
+for positions, or `--range-sha base..head` for a simple git range. Progress goes
+to stderr; stdout remains safe for command output and `--json`. Use
+`--progress json` for JSONL progress events or `--progress off` to disable them.
 
 If apply prints a backup ref or SHA and review fails:
 
