@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-06-01
+
 ### Changed
 
 - `acd rewrite-commits` now has explicit `--from-sha`, `--from-nr`,
