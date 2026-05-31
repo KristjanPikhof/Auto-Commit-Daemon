@@ -275,6 +275,14 @@ func parseRewriteProgressEvents(t *testing.T, body string) []rewriteProgressEven
 	return events
 }
 
+func progressEventPhases(events []rewriteProgressEvent) []string {
+	out := make([]string, 0, len(events))
+	for _, event := range events {
+		out = append(out, event.Phase)
+	}
+	return out
+}
+
 func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.T) {
 	repo := rewriteSelectionTestRepo(t)
 	ctx := context.Background()
@@ -559,6 +567,38 @@ func TestRewriteCommitsApplyPlanRequiresConfirmationButBypassesProviderGate(t *t
 	}
 	if got := out.String(); !strings.Contains(got, "no second AI call") {
 		t.Fatalf("apply-plan output missing no-AI-call note: %q", got)
+	}
+}
+
+func TestRewriteCommitsApplyProgressJSON(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		ID:               "file-plan",
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits:          []state.RewritePlanCommit{{OldOID: head, ProposedMessage: "seed rewritten", OriginalMessage: "seed"}},
+	})
+
+	var stdout, stderr bytes.Buffer
+	err := runRewriteCommits(ctx, &stdout, repo, rewriteCommitsOptions{
+		applyPlan:  planPath,
+		dryRun:     true,
+		progress:   "json",
+		progressTo: &stderr,
+	}, false)
+	if err != nil {
+		t.Fatalf("apply dry-run: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	events := parseRewriteProgressEvents(t, stderr.String())
+	if got := progressEventPhases(events); strings.Join(got, ",") != "apply_validate,apply_validate" {
+		t.Fatalf("apply phases=%v want validation only; events=%+v", got, events)
+	}
+	if !strings.Contains(stdout.String(), "Dry run: plan can apply") {
+		t.Fatalf("stdout missing dry-run result:\n%s", stdout.String())
 	}
 }
 

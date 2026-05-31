@@ -452,13 +452,13 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		DryRun:       opts.dryRun,
 		Progress: func(event git.RewriteApplyProgress) error {
 			return progress.Emit(rewriteProgressEvent{
-				Phase:     "apply_" + event.Phase,
-				Message:   event.Message,
-				Current:   event.Current,
-				Total:     event.Total,
-				CommitOID: event.OldOID,
+				Phase:        "apply_" + event.Phase,
+				Message:      event.Message,
+				Current:      event.Current,
+				Total:        event.Total,
+				CommitOID:    event.OldOID,
 				NewCommitOID: event.NewOID,
-				BackupRef: event.BackupRef,
+				BackupRef:    event.BackupRef,
 			})
 		},
 	})

@@ -47,6 +47,79 @@ func TestApplyRewritePlanCreatesBackupAndRecreatesDescendants(t *testing.T) {
 	}
 }
 
+func TestApplyRewritePlanProgressCallbackOrder(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	old1 := commitWorktreePath(t, ctx, repo, "one.txt", "one\n", "one")
+	old2 := commitWorktreePath(t, ctx, repo, "two.txt", "two\n", "two")
+	old3 := commitWorktreePath(t, ctx, repo, "three.txt", "three\n", "three")
+
+	var events []RewriteApplyProgress
+	res, err := ApplyRewritePlan(ctx, repo, RewriteApplyOptions{
+		BranchRef:    "refs/heads/main",
+		ExpectedHead: old3,
+		PlanID:       "plan-1",
+		Commits:      []RewriteApplyCommit{{OldOID: old1, ProposedMessage: "one rewritten"}, {OldOID: old2, ProposedMessage: "two rewritten"}},
+		Now:          time.Date(2026, 5, 20, 1, 2, 3, 0, time.UTC),
+		Progress: func(event RewriteApplyProgress) error {
+			events = append(events, event)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRewritePlan: %v", err)
+	}
+	wantPhases := []string{"validate", "validate", "backup", "recreate_selected", "recreate_selected", "recreate_unchanged", "update_ref"}
+	if len(events) != len(wantPhases) {
+		t.Fatalf("events=%+v want phases %v", events, wantPhases)
+	}
+	for i, want := range wantPhases {
+		if events[i].Phase != want {
+			t.Fatalf("event %d phase=%q want %q; events=%+v", i, events[i].Phase, want, events)
+		}
+	}
+	if events[2].BackupRef != res.BackupBranchRef {
+		t.Fatalf("backup event=%+v result=%+v", events[2], res)
+	}
+	if events[3].OldOID != old1 || events[3].NewOID == "" || events[3].Current != 1 || events[3].Total != 2 {
+		t.Fatalf("selected recreate event missing fields: %+v", events[3])
+	}
+	if events[5].OldOID != old3 || events[5].NewOID != res.NewHead {
+		t.Fatalf("unchanged recreate event=%+v result=%+v", events[5], res)
+	}
+}
+
+func TestApplyRewritePlanDryRunProgressIsValidationOnly(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	old1 := commitWorktreePath(t, ctx, repo, "one.txt", "one\n", "one")
+
+	var events []RewriteApplyProgress
+	res, err := ApplyRewritePlan(ctx, repo, RewriteApplyOptions{
+		BranchRef:    "refs/heads/main",
+		ExpectedHead: old1,
+		Commits:      []RewriteApplyCommit{{OldOID: old1, ProposedMessage: "one rewritten"}},
+		DryRun:       true,
+		Progress: func(event RewriteApplyProgress) error {
+			events = append(events, event)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRewritePlan dry-run: %v", err)
+	}
+	if res.NewHead != "" || res.RecreatedCount != 0 {
+		t.Fatalf("dry-run result mutated rewrite state: %+v", res)
+	}
+	if got := progressPhases(events); strings.Join(got, ",") != "validate,validate" {
+		t.Fatalf("dry-run phases=%v want validation only; events=%+v", got, events)
+	}
+	head, err := RevParse(ctx, repo, "HEAD")
+	if err != nil || head != old1 {
+		t.Fatalf("dry-run changed HEAD=%s err=%v want %s", head, err, old1)
+	}
+}
+
 func TestApplyRewritePlanPreservesOriginalAuthorMetadata(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
@@ -99,6 +172,14 @@ func TestApplyRewritePlanRefusesMovedHeadWithoutBackup(t *testing.T) {
 	if err != nil || exists {
 		t.Fatalf("backup exists after refusal=%v err=%v", exists, err)
 	}
+}
+
+func progressPhases(events []RewriteApplyProgress) []string {
+	out := make([]string, 0, len(events))
+	for _, event := range events {
+		out = append(out, event.Phase)
+	}
+	return out
 }
 
 func commitWorktreePath(t *testing.T, ctx context.Context, repo, path, body, msg string) string {
