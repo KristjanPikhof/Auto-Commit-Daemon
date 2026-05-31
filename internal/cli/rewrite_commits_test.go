@@ -26,10 +26,12 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		"edit-commit",
 		"ACD_COMMIT_STRATEGY",
 		"ACD_AI_PROVIDER",
-		"--from 8f4c2a1",
-		"--from 5",
-		"--range 5-12",
+		"--from-sha 8f4c2a1",
+		"--from-nr 5",
+		"--range-nr 5-12",
+		"--range-sha",
 		"--last 4",
+		"--from 5",
 		"--git-range",
 		"--base",
 		"--head",
@@ -711,6 +713,20 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 	}
 	_ = opts
 
+	for _, args := range [][]string{
+		{"--from-sha", "8f4c2a1", "--plan-only"},
+		{"--from-nr", "5", "--plan-only"},
+		{"--range-nr", "5-12", "--plan-only"},
+		{"--range-sha", "main~12..main~4", "--plan-only"},
+	} {
+		cmd = newRewriteCommitsCmd()
+		cmd.SetArgs(args)
+		cmd.RunE = func(cmd *cobra.Command, args []string) error { return nil }
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute parser flags %v: %v", args, err)
+		}
+	}
+
 	err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, review: true, noReview: true, editFormat: "text"})
 	if err == nil || !strings.Contains(err.Error(), "--review") {
 		t.Fatalf("review/no-review validation err = %v", err)
@@ -722,6 +738,58 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{applyPlan: "plan-id", planOnly: true, editFormat: "text"})
 	if err == nil || !strings.Contains(err.Error(), "--plan-only") {
 		t.Fatalf("plan-only/apply validation err = %v", err)
+	}
+}
+
+func TestRewriteCommitsSelectorAliasesNormalize(t *testing.T) {
+	tests := []struct {
+		name string
+		opts rewriteCommitsOptions
+		want git.RewriteSelectionOptions
+	}{
+		{
+			name: "from-sha",
+			opts: rewriteCommitsOptions{fromSHA: "1234abcd", editFormat: "text"},
+			want: git.RewriteSelectionOptions{FromSHA: "1234abcd"},
+		},
+		{
+			name: "from-nr",
+			opts: rewriteCommitsOptions{fromNR: 5, editFormat: "text"},
+			want: git.RewriteSelectionOptions{FromPosition: 5},
+		},
+		{
+			name: "range-nr",
+			opts: rewriteCommitsOptions{rangeNR: "5-12", editFormat: "text"},
+			want: git.RewriteSelectionOptions{Range: "5-12"},
+		},
+		{
+			name: "range-sha",
+			opts: rewriteCommitsOptions{rangeSHA: "main~12..main~4", editFormat: "text"},
+			want: git.RewriteSelectionOptions{GitRange: "main~12..main~4"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := normalizeAndValidateRewriteOptions(&tc.opts); err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if tc.opts.selection != tc.want {
+				t.Fatalf("selection=%+v want %+v", tc.opts.selection, tc.want)
+			}
+		})
+	}
+
+	err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{fromSHA: "abc123", fromNR: 2, editFormat: "text"})
+	if err == nil || !strings.Contains(err.Error(), "choose only one") {
+		t.Fatalf("mixed new selectors err = %v", err)
+	}
+	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{fromSHA: "abc123", selection: git.RewriteSelectionOptions{From: "2"}, editFormat: "text"})
+	if err == nil || !strings.Contains(err.Error(), "one selector family") {
+		t.Fatalf("mixed selector families err = %v", err)
+	}
+	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{rangeSHA: "--no-walk abc", editFormat: "text"})
+	if err == nil || !strings.Contains(err.Error(), "--range-sha") {
+		t.Fatalf("range-sha validation err = %v", err)
 	}
 }
 

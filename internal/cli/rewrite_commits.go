@@ -831,6 +831,12 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 }
 
 func rewriteSelectionLabel(opts rewriteCommitsOptions) string {
+	if opts.selection.FromSHA != "" {
+		return opts.selection.FromSHA + "..HEAD"
+	}
+	if opts.selection.FromPosition > 0 {
+		return fmt.Sprintf("from position %d", opts.selection.FromPosition)
+	}
 	if opts.selection.Range != "" {
 		return opts.selection.Range
 	}
