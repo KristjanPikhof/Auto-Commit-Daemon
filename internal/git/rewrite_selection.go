@@ -16,6 +16,12 @@ type RewriteSelectionOptions struct {
 	// From accepts either a commit-ish (full/short SHA, ref) or a 1-based
 	// first-parent position where 1 is HEAD. It selects that commit through HEAD.
 	From string
+	// FromSHA accepts only a commit-ish and selects that commit through HEAD.
+	// It exists so all-digit short SHAs are never interpreted as positions.
+	FromSHA string
+	// FromPosition selects the commit at a 1-based first-parent position through
+	// HEAD, where 1 is HEAD.
+	FromPosition int
 	// Range is a 1-based first-parent position range "start-end" where 1 is
 	// HEAD. The start position must be newer than or equal to the end position;
 	// selecting 5-12 records positions 5..12 for rewrite and 1..4 for unchanged
@@ -117,6 +123,12 @@ func validateRewriteSelector(opts RewriteSelectionOptions) error {
 	if strings.TrimSpace(opts.From) != "" {
 		count++
 	}
+	if strings.TrimSpace(opts.FromSHA) != "" {
+		count++
+	}
+	if opts.FromPosition > 0 {
+		count++
+	}
 	if strings.TrimSpace(opts.Range) != "" {
 		count++
 	}
@@ -129,8 +141,11 @@ func validateRewriteSelector(opts RewriteSelectionOptions) error {
 	if opts.Last < 0 {
 		return errors.New("git rewrite selection: --last must be positive")
 	}
+	if opts.FromPosition < 0 {
+		return errors.New("git rewrite selection: --from-nr must be positive")
+	}
 	if count != 1 {
-		return errors.New("git rewrite selection: specify exactly one of --from, --range, --last, or --git-range")
+		return errors.New("git rewrite selection: specify exactly one of --from-sha, --from-nr, --range-nr, --range-sha, --last, --from, --range, or --git-range")
 	}
 	return nil
 }
@@ -181,6 +196,12 @@ func resolveRewriteBounds(ctx context.Context, repoDir string, opts RewriteSelec
 		}
 		return 0, opts.Last - 1, nil
 	}
+	if opts.FromPosition > 0 {
+		if opts.FromPosition > len(chain) {
+			return 0, 0, fmt.Errorf("git rewrite selection: --from-nr %d exceeds branch history length %d", opts.FromPosition, len(chain))
+		}
+		return 0, opts.FromPosition - 1, nil
+	}
 	if r := strings.TrimSpace(opts.Range); r != "" {
 		start, end, err := parsePositionRange(r)
 		if err != nil {
@@ -190,6 +211,13 @@ func resolveRewriteBounds(ctx context.Context, repoDir string, opts RewriteSelec
 			return 0, 0, fmt.Errorf("git rewrite selection: range %d-%d exceeds branch history length %d", start, end, len(chain))
 		}
 		return start - 1, end - 1, nil
+	}
+	if from := strings.TrimSpace(opts.FromSHA); from != "" {
+		pos, err := resolveFromCommit(ctx, repoDir, from, chain)
+		if err != nil {
+			return 0, 0, err
+		}
+		return 0, pos, nil
 	}
 	if from := strings.TrimSpace(opts.From); from != "" {
 		pos, err := resolveFromPositionOrCommit(ctx, repoDir, from, chain)
@@ -231,11 +259,16 @@ func resolveFromPositionOrCommit(ctx context.Context, repoDir, from string, chai
 		}
 		positionErr = fmt.Errorf("git rewrite selection: --from position %d exceeds branch history length %d", n, len(chain))
 	}
+	pos, err := resolveFromCommit(ctx, repoDir, from, chain)
+	if err != nil && positionErr != nil {
+		return 0, positionErr
+	}
+	return pos, err
+}
+
+func resolveFromCommit(ctx context.Context, repoDir, from string, chain []string) (int, error) {
 	oid, err := RevParse(ctx, repoDir, from+"^{commit}")
 	if err != nil {
-		if positionErr != nil {
-			return 0, positionErr
-		}
 		return 0, fmt.Errorf("git rewrite selection: resolve --from %q: %w", from, err)
 	}
 	for i, c := range chain {

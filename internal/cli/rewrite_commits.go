@@ -29,7 +29,12 @@ type rewriteSelectionReport struct {
 }
 
 type rewriteCommitsOptions struct {
-	selection  git.RewriteSelectionOptions
+	selection git.RewriteSelectionOptions
+	fromSHA   string
+	fromNR    int
+	rangeNR   string
+	rangeSHA  string
+
 	base       string
 	head       string
 	planOut    string
@@ -48,7 +53,7 @@ type rewriteCommitsOptions struct {
 func newRewriteCommitsCmd() *cobra.Command {
 	var opts rewriteCommitsOptions
 	cmd := &cobra.Command{
-		Use:     "rewrite-commits (--from <sha|position> | --range <start-end> | --last <n> | --git-range <revset>) [--plan-out FILE] | --edit <plan-id-or-file>",
+		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
 		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
 		Long: `Preview an AI-generated rewrite plan for a linear commit range on the
@@ -71,10 +76,12 @@ validates/previews apply without rewriting commits.
 
 v1 scope: current branch linear ranges only; merge commit rewrites are refused;
 there is no daemon automation.`,
-		Example: `  ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... acd rewrite-commits --from 8f4c2a1 --plan-out rewrite.json
-  acd rewrite-commits --from 5 --plan-only
-  acd rewrite-commits --range 5-12 --review --format text
+		Example: `  ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
+  acd rewrite-commits --from-nr 5 --plan-only
+  acd rewrite-commits --range-nr 5-12 --review --format text
+  acd rewrite-commits --range-sha main~12..main~4 --format json
   acd rewrite-commits --last 4 --no-review --yes
+  acd rewrite-commits --from 5 --plan-only        # compatibility alias
   acd rewrite-commits --git-range main~12..main~4 --format json
   acd rewrite-commits --show-plan rewrite.json
   acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
@@ -91,7 +98,11 @@ there is no daemon automation.`,
 			return runRewriteCommits(cmd.Context(), cmd.OutOrStdout(), repo, opts, jsonOut)
 		},
 	}
-	cmd.Flags().StringVar(&opts.selection.Range, "range", "", "1-based position range to rewrite (start-end, where 1 is HEAD)")
+	cmd.Flags().StringVar(&opts.fromSHA, "from-sha", "", "Rewrite from commit-ish through HEAD; numeric-looking values are treated as commits, not positions")
+	cmd.Flags().IntVar(&opts.fromNR, "from-nr", 0, "Rewrite from 1-based position n through HEAD, where 1 is HEAD")
+	cmd.Flags().StringVar(&opts.rangeNR, "range-nr", "", "Rewrite a 1-based position range (start-end, where 1 is HEAD)")
+	cmd.Flags().StringVar(&opts.rangeSHA, "range-sha", "", "Rewrite commits selected by a simple git range <base>..<head>")
+	cmd.Flags().StringVar(&opts.selection.Range, "range", "", "Compatibility selector: 1-based position range to rewrite (start-end, where 1 is HEAD)")
 	cmd.Flags().StringVar(&opts.selection.GitRange, "git-range", "", "Advanced git rev-list revset; selected commits must be contiguous on the current branch")
 	cmd.Flags().StringVar(&opts.base, "base", "", "Deprecated alias for --git-range <base>..<head>: exclusive base revision")
 	cmd.Flags().StringVar(&opts.head, "head", "", "Deprecated alias for --git-range <base>..<head>: inclusive head revision (default HEAD when --base is set)")
@@ -699,6 +710,18 @@ func rewriteFailureJSON(oid string, err error) string {
 }
 
 func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
+	opts.fromSHA = strings.TrimSpace(opts.fromSHA)
+	opts.rangeNR = strings.TrimSpace(opts.rangeNR)
+	opts.rangeSHA = strings.TrimSpace(opts.rangeSHA)
+	opts.selection.From = strings.TrimSpace(opts.selection.From)
+	opts.selection.Range = strings.TrimSpace(opts.selection.Range)
+	opts.selection.GitRange = strings.TrimSpace(opts.selection.GitRange)
+	opts.base = strings.TrimSpace(opts.base)
+	opts.head = strings.TrimSpace(opts.head)
+	opts.showPlan = strings.TrimSpace(opts.showPlan)
+	opts.applyPlan = strings.TrimSpace(opts.applyPlan)
+	opts.editPlan = strings.TrimSpace(opts.editPlan)
+
 	opts.editFormat = strings.ToLower(strings.TrimSpace(opts.editFormat))
 	if opts.editFormat == "" {
 		opts.editFormat = rewriteEditFormatText
@@ -715,31 +738,84 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	if opts.editPlan != "" && (opts.review || opts.noReview) {
 		return errors.New("acd rewrite-commits: --edit cannot be combined with --review or --no-review")
 	}
+	if opts.fromNR < 0 {
+		return errors.New("acd rewrite-commits: --from-nr must be positive")
+	}
+	newSelectorCount := 0
+	if opts.fromSHA != "" {
+		newSelectorCount++
+	}
+	if opts.fromNR > 0 {
+		newSelectorCount++
+	}
+	if opts.rangeNR != "" {
+		newSelectorCount++
+	}
+	if opts.rangeSHA != "" {
+		newSelectorCount++
+	}
+	compatSelectorCount := 0
+	if opts.selection.From != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.Range != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.GitRange != "" {
+		compatSelectorCount++
+	}
+	if opts.selection.Last > 0 {
+		compatSelectorCount++
+	}
+	if opts.selection.Last < 0 {
+		return errors.New("acd rewrite-commits: --last must be positive")
+	}
+	if newSelectorCount > 0 && compatSelectorCount > 0 {
+		return errors.New("acd rewrite-commits: use one selector family; prefer --from-sha, --from-nr, --range-nr, or --range-sha instead of mixing compatibility flags")
+	}
+	if newSelectorCount > 1 {
+		return errors.New("acd rewrite-commits: choose only one of --from-sha, --from-nr, --range-nr, or --range-sha")
+	}
+	if opts.rangeSHA != "" {
+		if strings.ContainsAny(opts.rangeSHA, " \t\n\r") || !strings.Contains(opts.rangeSHA, "..") {
+			return errors.New("acd rewrite-commits: --range-sha must be a simple git range like base..head")
+		}
+		opts.selection.GitRange = opts.rangeSHA
+	}
+	if opts.rangeNR != "" {
+		opts.selection.Range = opts.rangeNR
+	}
+	if opts.fromNR > 0 {
+		opts.selection.FromPosition = opts.fromNR
+	}
+	if opts.fromSHA != "" {
+		opts.selection.FromSHA = opts.fromSHA
+	}
 	modes := 0
-	if strings.TrimSpace(opts.showPlan) != "" {
+	if opts.showPlan != "" {
 		modes++
 	}
-	if strings.TrimSpace(opts.applyPlan) != "" {
+	if opts.applyPlan != "" {
 		modes++
 	}
-	if strings.TrimSpace(opts.editPlan) != "" {
+	if opts.editPlan != "" {
 		modes++
 	}
-	generate := opts.selection.Range != "" || opts.selection.GitRange != "" || opts.base != "" || opts.head != "" || opts.selection.From != "" || opts.selection.Last > 0
+	generate := opts.selection.Range != "" || opts.selection.GitRange != "" || opts.base != "" || opts.head != "" || opts.selection.From != "" || opts.selection.FromSHA != "" || opts.selection.FromPosition > 0 || opts.selection.Last > 0
 	if generate {
 		modes++
 	}
 	if modes == 0 {
-		return errors.New("acd rewrite-commits: choose --from, --range, --last, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
+		return errors.New("acd rewrite-commits: choose --from-sha, --from-nr, --range-nr, --range-sha, --last, --from, --range, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
 	}
 	if modes > 1 {
 		return errors.New("acd rewrite-commits: choose only one mode: generate, --show-plan, --edit, or --apply/--apply-plan")
 	}
 	if opts.selection.Range != "" && strings.Contains(opts.selection.Range, "..") {
-		return errors.New("acd rewrite-commits: --range uses 1-based positions like 2-5; use --git-range for git revsets")
+		return errors.New("acd rewrite-commits: --range-nr/--range uses 1-based positions like 2-5; use --range-sha or --git-range for git revsets")
 	}
 	if (opts.selection.Range != "" || opts.selection.GitRange != "") && (opts.base != "" || opts.head != "") {
-		return errors.New("acd rewrite-commits: use either --range/--git-range or --base/--head, not both")
+		return errors.New("acd rewrite-commits: use either --range-nr/--range-sha/--git-range or --base/--head, not both")
 	}
 	if opts.head != "" && opts.base == "" {
 		return errors.New("acd rewrite-commits: --head requires --base")
