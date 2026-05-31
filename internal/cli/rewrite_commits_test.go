@@ -47,6 +47,8 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		"--no-review",
 		"--plan-only",
 		"--format",
+		"--progress",
+		"Progress goes to stderr",
 		"backup recovery",
 		"current branch linear ranges only",
 		"merge commit rewrites are refused",
