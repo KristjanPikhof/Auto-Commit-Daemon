@@ -26,6 +26,7 @@ type rewriteProgressEvent struct {
 	Current       int    `json:"current,omitempty"`
 	Total         int    `json:"total,omitempty"`
 	CommitOID     string `json:"commit_oid,omitempty"`
+	NewCommitOID  string `json:"new_commit_oid,omitempty"`
 	CommitSubject string `json:"commit_subject,omitempty"`
 	PlanID        string `json:"plan_id,omitempty"`
 	BackupRef     string `json:"backup_ref,omitempty"`

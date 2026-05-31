@@ -401,6 +401,10 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	if !opts.yes && !opts.dryRun {
 		return errors.New("acd rewrite-commits: --apply-plan requires --yes or --dry-run")
 	}
+	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
+	if err != nil {
+		return err
+	}
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
 		return err
@@ -446,6 +450,17 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		PlanID:       plan.ID,
 		Commits:      applyCommits,
 		DryRun:       opts.dryRun,
+		Progress: func(event git.RewriteApplyProgress) error {
+			return progress.Emit(rewriteProgressEvent{
+				Phase:     "apply_" + event.Phase,
+				Message:   event.Message,
+				Current:   event.Current,
+				Total:     event.Total,
+				CommitOID: event.OldOID,
+				NewCommitOID: event.NewOID,
+				BackupRef: event.BackupRef,
+			})
+		},
 	})
 	if err != nil {
 		if plan.ID != "" && !opts.dryRun {
@@ -469,6 +484,9 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	reconcile, err := state.ReconcileRewriteCommitOIDs(ctx, db, res.CommitMap)
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: reconcile state OIDs after successful git rewrite: %w", err)
+	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "apply_reconcile", Message: "reconciled state OIDs", Current: reconcile.CaptureEvents + reconcile.DecisionRecords + reconcile.PublishTargetCommitOID + reconcile.PublishSourceHead}); err != nil {
+		return err
 	}
 	if plan.ID != "" {
 		if err := markRewritePlanStatusIfPresent(ctx, db, plan.ID, state.RewritePlanApplyApplied); err != nil {
