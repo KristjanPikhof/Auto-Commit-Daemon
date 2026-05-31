@@ -78,7 +78,7 @@ acd rewrite-commits --git-range main~12..main~4 --format json
 | `--progress plain` | Writes stable line progress to stderr. |
 | `--progress json` | Writes JSONL progress events to stderr. |
 | `--progress off` | Disables progress. |
-| `--quiet` | Suppresses progress and other non-essential output. |
+| `--quiet` | Suppresses progress output. |
 
 Progress never goes to stdout. Selection and command results remain parseable
 when `--json` is set. Generation progress reports selection, provider, proposal,
@@ -104,6 +104,9 @@ Noninteractive apply requires either `--dry-run` or `--yes`. Declining an
 interactive apply prompt prints `No rewrite performed.`
 
 ## Command grammar
+
+`--progress auto|plain|json|off` is accepted by generate, edit, and apply modes
+that run through the rewrite command.
 
 ~~~text
 acd rewrite-commits --from-sha <sha> [--plan-out FILE] [--review|--no-review] [--format text|json] [--progress auto|plain|json|off] [--plan-only|--yes]
