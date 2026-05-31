@@ -58,9 +58,20 @@ func newRewriteCommitsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
-		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
-		Long: `Preview an AI-generated rewrite plan for a linear commit range on the
-current branch.
+	Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
+		Long: `Generate, review, edit, and apply an AI-generated commit-message
+rewrite plan for a linear range on the current branch.
+
+Safe workflow:
+  1. Choose commits with --from-nr, --from-sha, --range-nr, --range-sha, or --last.
+  2. Generate a plan with --plan-only or --plan-out.
+  3. Review with --show-plan or --edit.
+  4. Dry-run apply, then apply with --yes.
+
+Progress goes to stderr. Command results stay on stdout, so --json output remains
+parseable. Use --progress json for JSONL progress events, --progress plain for
+stable text progress, --progress off to disable progress, or --quiet to suppress
+non-essential output.
 
 Plan generation is intentionally gated: ACD_COMMIT_STRATEGY must resolve to
 intent and ACD_AI_PROVIDER must name a usable non-deterministic planner provider
@@ -109,7 +120,7 @@ there is no daemon automation.`,
 	cmd.Flags().StringVar(&opts.rangeNR, "range-nr", "", "Rewrite a 1-based position range (start-end, where 1 is HEAD)")
 	cmd.Flags().StringVar(&opts.rangeSHA, "range-sha", "", "Rewrite commits selected by a simple git range <base>..<head>")
 	cmd.Flags().StringVar(&opts.selection.Range, "range", "", "Compatibility selector: 1-based position range to rewrite (start-end, where 1 is HEAD)")
-	cmd.Flags().StringVar(&opts.selection.GitRange, "git-range", "", "Advanced git rev-list revset; selected commits must be contiguous on the current branch")
+	cmd.Flags().StringVar(&opts.selection.GitRange, "git-range", "", "Advanced compatibility selector: git rev-list revset; selected commits must be contiguous on the current branch")
 	cmd.Flags().StringVar(&opts.base, "base", "", "Deprecated alias for --git-range <base>..<head>: exclusive base revision")
 	cmd.Flags().StringVar(&opts.head, "head", "", "Deprecated alias for --git-range <base>..<head>: inclusive head revision (default HEAD when --base is set)")
 	cmd.Flags().StringVar(&opts.planOut, "plan-out", "", "Write the generated rewrite plan to FILE")
@@ -124,7 +135,7 @@ there is no daemon automation.`,
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
 	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
-	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD")
+	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD; prefer --from-sha or --from-nr")
 	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Compatibility selector: select the newest n commits")
 	return cmd
 }
@@ -485,7 +496,8 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: reconcile state OIDs after successful git rewrite: %w", err)
 	}
-	if err := progress.Emit(rewriteProgressEvent{Phase: "apply_reconcile", Message: "reconciled state OIDs", Current: reconcile.CaptureEvents + reconcile.DecisionRecords + reconcile.PublishTargetCommitOID + reconcile.PublishSourceHead}); err != nil {
+	reconciledRows := reconcile.CaptureEvents + reconcile.DecisionRecords + reconcile.PublishTargetCommitOID + reconcile.PublishSourceHead
+	if err := progress.Emit(rewriteProgressEvent{Phase: "apply_reconcile", Message: "reconciled state OIDs", Current: int(reconciledRows)}); err != nil {
 		return err
 	}
 	if plan.ID != "" {
