@@ -217,6 +217,64 @@ func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
 	assertRewritePlanNextFooter(t, out.String())
 }
 
+func TestRewriteCommitsGenerationProgressEvents(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'plugin subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	var stdout, stderr bytes.Buffer
+	err := runRewriteCommits(context.Background(), &stdout, repo, rewriteCommitsOptions{
+		selection:  git.RewriteSelectionOptions{Last: 1},
+		planOnly:   true,
+		progress:   "json",
+		progressTo: &stderr,
+	}, false)
+	if err != nil {
+		t.Fatalf("plan-only generate: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	got := stdout.String()
+	selectionIdx := strings.Index(got, "Selected commits")
+	generatedIdx := strings.Index(got, "Generated valid rewrite plan")
+	if selectionIdx < 0 || generatedIdx < 0 || selectionIdx > generatedIdx {
+		t.Fatalf("selection summary must appear before generated status:\n%s", got)
+	}
+	events := parseRewriteProgressEvents(t, stderr.String())
+	wantPhases := []string{"selection", "provider", "proposal", "proposal", "save", "validation", "next"}
+	if len(events) != len(wantPhases) {
+		t.Fatalf("events=%+v want phases %v", events, wantPhases)
+	}
+	for i, want := range wantPhases {
+		if events[i].Phase != want {
+			t.Fatalf("event %d phase=%q want %q; events=%+v", i, events[i].Phase, want, events)
+		}
+	}
+	if events[2].CommitOID == "" || events[2].CommitSubject == "" || events[2].Current != 1 || events[2].Total != 1 {
+		t.Fatalf("proposal event missing commit progress fields: %+v", events[2])
+	}
+}
+
+func parseRewriteProgressEvents(t *testing.T, body string) []rewriteProgressEvent {
+	t.Helper()
+	var events []rewriteProgressEvent
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		if line == "" {
+			continue
+		}
+		var event rewriteProgressEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("parse progress line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
 func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.T) {
 	repo := rewriteSelectionTestRepo(t)
 	ctx := context.Background()
@@ -790,6 +848,72 @@ func TestRewriteCommitsSelectorAliasesNormalize(t *testing.T) {
 	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{rangeSHA: "--no-walk abc", editFormat: "text"})
 	if err == nil || !strings.Contains(err.Error(), "--range-sha") {
 		t.Fatalf("range-sha validation err = %v", err)
+	}
+}
+
+func TestRewriteCommitsProgressModesKeepJSONStdoutClean(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+
+	t.Run("json progress writes jsonl stderr", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := runRewriteCommits(context.Background(), &stdout, repo, rewriteCommitsOptions{
+			selection:  git.RewriteSelectionOptions{Last: 1},
+			progress:   "json",
+			progressTo: &stderr,
+		}, true)
+		if err != nil {
+			t.Fatalf("runRewriteCommits: %v", err)
+		}
+		var report rewriteSelectionReport
+		if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+			t.Fatalf("stdout is not clean JSON: %v\n%s", err, stdout.String())
+		}
+		var event rewriteProgressEvent
+		if err := json.Unmarshal(bytes.TrimSpace(stderr.Bytes()), &event); err != nil {
+			t.Fatalf("stderr is not progress JSONL: %v\n%s", err, stderr.String())
+		}
+		if event.Event != "rewrite_progress" || event.Phase != "selection" {
+			t.Fatalf("event=%+v, want rewrite_progress selection", event)
+		}
+	})
+
+	t.Run("plain progress writes stderr", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := runRewriteCommits(context.Background(), &stdout, repo, rewriteCommitsOptions{
+			selection:  git.RewriteSelectionOptions{Last: 1},
+			progress:   "plain",
+			progressTo: &stderr,
+		}, true)
+		if err != nil {
+			t.Fatalf("runRewriteCommits: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "rewrite-commits: selection: selected 1 commit") {
+			t.Fatalf("stderr missing plain progress:\n%s", stderr.String())
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &rewriteSelectionReport{}); err != nil {
+			t.Fatalf("stdout is not clean JSON: %v\n%s", err, stdout.String())
+		}
+	})
+
+	t.Run("auto non-tty and quiet are silent", func(t *testing.T) {
+		for _, opts := range []rewriteCommitsOptions{
+			{selection: git.RewriteSelectionOptions{Last: 1}, progress: "auto"},
+			{selection: git.RewriteSelectionOptions{Last: 1}, progress: "json", quiet: true},
+		} {
+			var stdout, stderr bytes.Buffer
+			opts.progressTo = &stderr
+			if err := runRewriteCommits(context.Background(), &stdout, repo, opts, true); err != nil {
+				t.Fatalf("runRewriteCommits: %v", err)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr=%q, want silent", stderr.String())
+			}
+		}
+	})
+
+	err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, progress: "loud"})
+	if err == nil || !strings.Contains(err.Error(), "--progress") {
+		t.Fatalf("progress validation err = %v", err)
 	}
 }
 

@@ -179,6 +179,8 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		enc.SetIndent("", "  ")
 		return enc.Encode(report)
 	}
+	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
+	printRewriteSelectionSummary(out, report)
 
 	cfg := ai.LoadProviderConfigFromEnv()
 	provider, closer, err := ai.BuildProvider(cfg)
@@ -191,8 +193,11 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	if err := ai.CheckRewritePlanGenerationGate(cfg, provider); err != nil {
 		return fmt.Errorf("acd rewrite-commits: %w", err)
 	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "provider", Message: fmt.Sprintf("using %s", ai.PrimaryProviderName(provider))}); err != nil {
+		return err
+	}
 
-	plan, err := generateRewritePlan(ctx, repo, selection, provider, cfg)
+	plan, err := generateRewritePlan(ctx, repo, selection, provider, cfg, progress)
 	if err != nil {
 		return err
 	}
@@ -200,25 +205,18 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		if err := writeRewritePlanFile(opts.planOut, plan); err != nil {
 			return err
 		}
-	}
-
-	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
-	fmt.Fprintf(out, "rewrite-commits selection for %s (%s @ %s)\n", report.Repo, report.BranchRef, shortenSHA(report.Head))
-	fmt.Fprintf(out, "Selected positions: %s\n", report.SelectedPositions)
-	fmt.Fprintf(out, "Selected commits (%d):\n", len(report.Selected))
-	for _, c := range report.Selected {
-		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
-	}
-	if len(report.RecreateUnchanged) > 0 {
-		fmt.Fprintf(out, "Recreate unchanged newer commits (%d):\n", len(report.RecreateUnchanged))
-		for _, c := range report.RecreateUnchanged {
-			fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+		if err := progress.Emit(rewriteProgressEvent{Phase: "save", Message: fmt.Sprintf("wrote %s", opts.planOut), PlanID: plan.ID}); err != nil {
+			return err
 		}
 	}
+
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
 		fmt.Fprintf(out, "Plan stored as invalid: %s\n", plan.ValidationError.String)
 	} else {
 		fmt.Fprintf(out, "Generated valid rewrite plan %s with %d proposal(s).\n", plan.ID, len(plan.Commits))
+	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "validation", Message: fmt.Sprintf("status %s", plan.ValidationStatus), PlanID: plan.ID}); err != nil {
+		return err
 	}
 	if opts.planOut != "" {
 		fmt.Fprintf(out, "Plan written to %s\n", opts.planOut)
@@ -231,6 +229,9 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		planRef := plan.ID
 		if opts.planOut != "" {
 			planRef = opts.planOut
+		}
+		if err := progress.Emit(rewriteProgressEvent{Phase: "next", Message: "plan saved; git history unchanged", PlanID: plan.ID}); err != nil {
+			return err
 		}
 		finishRewritePlanOnly(out, planRef)
 		return nil
@@ -307,6 +308,21 @@ func printRewritePlanNextSteps(out io.Writer, planRef string) {
 	fmt.Fprintf(out, "  acd rewrite-commits --show-plan %s\n", arg)
 	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --dry-run\n", arg)
 	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", arg)
+}
+
+func printRewriteSelectionSummary(out io.Writer, report rewriteSelectionReport) {
+	fmt.Fprintf(out, "rewrite-commits selection for %s (%s @ %s)\n", report.Repo, report.BranchRef, shortenSHA(report.Head))
+	fmt.Fprintf(out, "Selected positions: %s\n", report.SelectedPositions)
+	fmt.Fprintf(out, "Selected commits (%d):\n", len(report.Selected))
+	for _, c := range report.Selected {
+		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+	}
+	if len(report.RecreateUnchanged) > 0 {
+		fmt.Fprintf(out, "Recreate unchanged newer commits (%d):\n", len(report.RecreateUnchanged))
+		for _, c := range report.RecreateUnchanged {
+			fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OID), c.Subject)
+		}
+	}
 }
 
 func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
@@ -567,7 +583,7 @@ func writeRewritePlanFile(path string, plan state.RewritePlan) error {
 	return enc.Encode(plan)
 }
 
-func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig) (state.RewritePlan, error) {
+func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink) (state.RewritePlan, error) {
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return state.RewritePlan{}, err
@@ -591,6 +607,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		ApplyStatus:      state.RewritePlanApplyPending,
 	}
 	for i, c := range selection.Selected {
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "requesting proposal",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			return state.RewritePlan{}, err
+		}
 		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider))
 		if err != nil {
 			return state.RewritePlan{}, err
@@ -600,6 +626,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 			plan.ValidationStatus = state.RewritePlanValidationInvalid
 			plan.ValidationError = sql.NullString{String: rewriteFailureJSON(c.OID, err), Valid: true}
 			plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: c.Message})
+			if emitErr := progress.Emit(rewriteProgressEvent{
+				Phase:         "proposal",
+				Message:       "proposal failed",
+				Current:       i + 1,
+				Total:         len(selection.Selected),
+				CommitOID:     c.OID,
+				CommitSubject: c.Subject,
+			}); emitErr != nil {
+				return state.RewritePlan{}, emitErr
+			}
 			break
 		}
 		message := result.Subject
@@ -607,6 +643,16 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 			message += "\n\n" + result.Body
 		}
 		plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: message})
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "proposal accepted",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			return state.RewritePlan{}, err
+		}
 	}
 	if len(plan.Commits) == 0 && len(selection.Selected) > 0 {
 		c := selection.Selected[0]
@@ -619,6 +665,9 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: save rewrite plan: %w", err)
 	}
 	plan.ID = id
+	if err := progress.Emit(rewriteProgressEvent{Phase: "save", Message: "saved plan", PlanID: plan.ID}); err != nil {
+		return state.RewritePlan{}, err
+	}
 	return plan, nil
 }
 
