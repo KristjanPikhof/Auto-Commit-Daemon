@@ -4,20 +4,42 @@
 keep working. It is built for AI coding tools such as Claude Code, Codex,
 Cursor, OpenCode, and Pi, but the daemon itself is just a static Go binary.
 
-~~~mermaid
-flowchart LR
-  Tool["AI tool hook"] --> CLI["acd start / wake / flush"]
-  CLI --> Daemon["acd daemon"]
-  Daemon --> Store[("state.db<br/>and git blobs")]
-  Store --> Replay["scratch index replay"]
-  Replay --> Commit["git commit<br/>update-ref"]
+The flow is: your AI tool tells `acd` that work happened, the daemon records a
+durable capture, then replay turns that capture into a normal Git commit.
 
-  classDef hook fill:#243447,stroke:#7aa2f7,color:#e6edf3
-  classDef daemon fill:#203a31,stroke:#9ece6a,color:#eaffdf
-  classDef store fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
-  class Tool,CLI hook
-  class Daemon,Replay daemon
-  class Store,Commit store
+~~~mermaid
+flowchart TB
+  Hook["AI tool hook<br/>Claude Code, Codex, Cursor, OpenCode, Pi"]
+
+  subgraph Capture["1. Notice and capture edits"]
+    CLI["acd start / wake / flush<br/>refreshes the repo session"]
+    Daemon["acd daemon<br/>watches files and records events"]
+  end
+
+  subgraph State["2. Keep the work durable"]
+    DB[("state.db<br/>event ledger")]
+    Blobs[("git blobs<br/>captured file content")]
+  end
+
+  subgraph Replay["3. Publish a safe commit"]
+    Scratch["scratch index replay<br/>rebuilds the intended tree"]
+    Commit["git commit + update-ref<br/>moves the branch only after checks pass"]
+  end
+
+  Hook --> CLI --> Daemon --> DB
+  Daemon --> Blobs
+  DB --> Scratch
+  Blobs --> Scratch
+  Scratch --> Commit
+
+  classDef external fill:#233142,stroke:#7aa2f7,color:#e6edf3
+  classDef capture fill:#203a31,stroke:#9ece6a,color:#eaffdf
+  classDef durable fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
+  classDef publish fill:#332b46,stroke:#bb9af7,color:#f4edff
+  class Hook external
+  class CLI,Daemon capture
+  class DB,Blobs durable
+  class Scratch,Commit publish
 ~~~
 
 ## Install
