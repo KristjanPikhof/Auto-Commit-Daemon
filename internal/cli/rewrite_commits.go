@@ -47,6 +47,9 @@ type rewriteCommitsOptions struct {
 	noReview   bool
 	planOnly   bool
 	editFormat string
+	progress   string
+	progressTo io.Writer
+	quiet      bool
 	in         io.Reader
 }
 
@@ -94,7 +97,10 @@ there is no daemon automation.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			quiet, _ := cmd.Flags().GetBool("quiet")
 			opts.in = cmd.InOrStdin()
+			opts.progressTo = cmd.ErrOrStderr()
+			opts.quiet = quiet
 			return runRewriteCommits(cmd.Context(), cmd.OutOrStdout(), repo, opts, jsonOut)
 		},
 	}
@@ -116,6 +122,7 @@ there is no daemon automation.`,
 	cmd.Flags().BoolVar(&opts.review, "review", false, "Open EDITOR to review/edit proposed commit messages before apply")
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
+	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
 	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD")
 	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Compatibility selector: select the newest n commits")
@@ -127,6 +134,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		ctx = context.Background()
 	}
 	if err := normalizeAndValidateRewriteOptions(&opts); err != nil {
+		return err
+	}
+	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
+	if err != nil {
 		return err
 	}
 	if opts.showPlan != "" {
@@ -154,6 +165,14 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		Selected:          selection.Selected,
 		RecreateUnchanged: selection.RecreateUnchanged,
 		SelectedPositions: fmt.Sprintf("%d-%d", selection.SelectedNewestIndex, selection.SelectedOldestIndex),
+	}
+	if err := progress.Emit(rewriteProgressEvent{
+		Phase:   "selection",
+		Message: fmt.Sprintf("selected %d commit(s)", len(report.Selected)),
+		Current: len(report.Selected),
+		Total:   len(report.Selected),
+	}); err != nil {
+		return err
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -726,8 +745,15 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	if opts.editFormat == "" {
 		opts.editFormat = rewriteEditFormatText
 	}
+	opts.progress = strings.ToLower(strings.TrimSpace(opts.progress))
+	if opts.progress == "" {
+		opts.progress = string(rewriteProgressModeAuto)
+	}
 	if opts.editFormat != rewriteEditFormatText && opts.editFormat != rewriteEditFormatJSON {
 		return fmt.Errorf("acd rewrite-commits: --format must be text or json")
+	}
+	if !validRewriteProgressMode(opts.progress) {
+		return fmt.Errorf("acd rewrite-commits: --progress must be auto, plain, json, or off")
 	}
 	if opts.review && opts.noReview {
 		return errors.New("acd rewrite-commits: choose only one of --review or --no-review")
@@ -775,6 +801,9 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	}
 	if newSelectorCount > 1 {
 		return errors.New("acd rewrite-commits: choose only one of --from-sha, --from-nr, --range-nr, or --range-sha")
+	}
+	if newSelectorCount > 0 && (opts.base != "" || opts.head != "") {
+		return errors.New("acd rewrite-commits: use either --from-sha/--from-nr/--range-nr/--range-sha or --base/--head, not both")
 	}
 	if opts.rangeSHA != "" {
 		if strings.ContainsAny(opts.rangeSHA, " \t\n\r") || !strings.Contains(opts.rangeSHA, "..") {
