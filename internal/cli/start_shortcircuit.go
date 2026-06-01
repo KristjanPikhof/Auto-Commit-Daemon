@@ -259,6 +259,9 @@ func evaluateShortCircuit(
 	if registryRecord == nil {
 		return shortCircuitDecision{Reason: "registry_missing_repo"}
 	}
+	if registryRecord.LifecycleDisabled() {
+		return shortCircuitDecision{Reason: repoAutodiscoverySkipRepoDisabled}
+	}
 	// Defensive: reject cache that claims to belong to a different repo
 	// hash than the one currently registered. Should only fire if the
 	// .git dir was relocated.
