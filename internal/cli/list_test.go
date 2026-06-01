@@ -701,7 +701,7 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 	}
 }
 
-func TestList_DisabledLifecycleRendersWithoutStateCounts(t *testing.T) {
+func TestList_DisabledLifecycleHiddenFromList(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 
@@ -725,25 +725,16 @@ func TestList_DisabledLifecycleRendersWithoutStateCounts(t *testing.T) {
 	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
 		t.Fatalf("runList compact: %v", err)
 	}
-	compactLines := strings.Split(strings.TrimSpace(compactOut.String()), "\n")
-	if len(compactLines) != 2 {
-		t.Fatalf("compact output should contain one disabled row:\n%s", compactOut.String())
-	}
-	fields := strings.Fields(compactLines[1])
-	if len(fields) != 3 || fields[1] != "-" || fields[2] != "disabled" {
-		t.Fatalf("compact disabled row should omit daemon/queue counts, got fields=%q output:\n%s", fields, compactOut.String())
+	if strings.Contains(compactOut.String(), repo) || strings.Contains(compactOut.String(), "disabled") {
+		t.Fatalf("compact output should hide disabled rows:\n%s", compactOut.String())
 	}
 
 	var verboseOut, verboseErr bytes.Buffer
 	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
 		t.Fatalf("runList verbose: %v", err)
 	}
-	verbose := verboseOut.String()
-	if !strings.Contains(verbose, "disabled (repo lifecycle disabled)") {
-		t.Fatalf("verbose output missing disabled note:\n%s", verbose)
-	}
-	if strings.Contains(verbose, " 0 ") {
-		t.Fatalf("verbose disabled row should not render queue/client zeroes:\n%s", verbose)
+	if strings.Contains(verboseOut.String(), repo) || strings.Contains(verboseOut.String(), "disabled") {
+		t.Fatalf("verbose output should hide disabled rows:\n%s", verboseOut.String())
 	}
 
 	var jsonOut, jsonErr bytes.Buffer
@@ -756,12 +747,8 @@ func TestList_DisabledLifecycleRendersWithoutStateCounts(t *testing.T) {
 	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	entry := got.Repos[0]
-	if entry.LifecycleState != central.RepoLifecycleDisabled || entry.Status != "disabled" {
-		t.Fatalf("json disabled lifecycle fields missing: %+v", entry)
+	if len(got.Repos) != 0 {
+		t.Fatalf("disabled repos should be hidden from JSON lifecycle output: %+v", got.Repos)
 	}
 	if compactErr.Len() != 0 || verboseErr.Len() != 0 || jsonErr.Len() != 0 {
 		t.Fatalf("disabled lifecycle list should not warn, compact=%q verbose=%q json=%q", compactErr.String(), verboseErr.String(), jsonErr.String())
@@ -798,8 +785,8 @@ func TestList_DisabledLifecycleDoesNotOpenMissingStateDB(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
 	}
-	if len(got.Repos) != 1 || got.Repos[0].LifecycleState != central.RepoLifecycleDisabled {
-		t.Fatalf("disabled repo missing from JSON lifecycle output: %+v", got.Repos)
+	if len(got.Repos) != 0 {
+		t.Fatalf("disabled repo should be hidden from JSON lifecycle output: %+v", got.Repos)
 	}
 }
 

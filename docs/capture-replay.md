@@ -239,10 +239,10 @@ with pending successors after you check the blocked changes.
 | `miss` | Repo or state DB is missing. |
 | `bad` | State DB exists but cannot be read. |
 
-Disabled repos appear with `disabled` status and do not show daemon or queue
-counts. A disabled registry row makes hook-driven `start`, `wake`, `touch`, and
-`flush` skip with `repo_disabled` before capture or replay state is opened.
-Re-enable with `acd repo enable --repo <path>`, or use `acd repo manage` /
+Disabled repos are hidden from normal `acd list` snapshots. A disabled registry
+row makes hook-driven `start`, `wake`, `touch`, and `flush` skip with
+`repo_disabled` before capture or replay state is opened. Re-enable with
+`acd repo enable --repo <path>`, or use `acd repo manage` /
 `acd list --interactive` to toggle from the manager.
 
 ## Safe-ignore and sensitive paths

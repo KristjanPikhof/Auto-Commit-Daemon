@@ -195,26 +195,22 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 	ttl := clientTTL()
 	entries := make([]listEntry, 0, len(reg.Repos))
 
-	for _, rec := range reg.Repos {
-		e := listEntry{
-			Path:           rec.Path,
-			RepoHash:       rec.RepoHash,
-			LifecycleState: rec.LifecycleStateName(),
-			Daemon:         "-",
-			Status:         "OK",
-		}
+		for _, rec := range reg.Repos {
+			if rec.LifecycleDisabled() {
+				continue
+			}
+			e := listEntry{
+				Path:           rec.Path,
+				RepoHash:       rec.RepoHash,
+				LifecycleState: rec.LifecycleStateName(),
+				Daemon:         "-",
+				Status:         "OK",
+			}
 
-		if rec.LifecycleDisabled() {
-			e.Status = "disabled"
-			e.StatusNote = "repo lifecycle disabled"
-			entries = append(entries, e)
-			continue
-		}
-
-		// Repo dir missing — we still emit a row so the user sees what gc
-		// would prune.
-		if !fileExists(rec.Path) {
-			e.Status = "missing"
+			// Repo dir missing — we still emit a row so the user sees what gc
+			// would prune.
+			if !fileExists(rec.Path) {
+				e.Status = "missing"
 			e.StatusNote = "repo missing"
 			entries = append(entries, e)
 			continue
@@ -323,13 +319,10 @@ func renderListTableCompact(out io.Writer, entries []listEntry) error {
 	for _, e := range entries {
 		repo := listRepoLabelCompact(e.Path, labels)
 		statusCol := listStatusCompact(e.Status)
-		if e.Status == "disabled" {
-			statusCol = "disabled"
-		}
 		if e.Status == "waiting" && e.IntentWaitSeconds > 0 {
 			statusCol = statusCol + " " + formatDurationCompact(time.Duration(e.IntentWaitSeconds)*time.Second)
 		}
-		if listRowMissing(e.Status) || e.Status == "disabled" {
+		if listRowMissing(e.Status) {
 			fmt.Fprintf(tw, "%s\t-\t\t\t\t%s\n", repo, statusCol)
 			continue
 		}
@@ -378,7 +371,7 @@ func renderListWatchFrame(out io.Writer, snapshot listSnapshot, verbose bool) er
 // dashIfMissing returns "-" when the row represents a missing/unreadable
 // repo so the table reads "no data yet" without lying about zero rows.
 func dashIfMissing(status, val string) string {
-	if status == "missing" || status == "unreadable" || status == "disabled" {
+	if status == "missing" || status == "unreadable" {
 		return "-"
 	}
 	return val
