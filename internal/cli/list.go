@@ -317,7 +317,7 @@ func renderListTableCompact(out io.Writer, entries []listEntry) error {
 		if e.Status == "waiting" && e.IntentWaitSeconds > 0 {
 			statusCol = statusCol + " " + formatDurationCompact(time.Duration(e.IntentWaitSeconds)*time.Second)
 		}
-		if listRowMissing(e.Status) {
+		if listRowMissing(e.Status) || e.Status == "disabled" {
 			fmt.Fprintf(tw, "%s\t-\t\t\t\t%s\n", repo, statusCol)
 			continue
 		}

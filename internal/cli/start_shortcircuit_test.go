@@ -618,6 +618,62 @@ func TestRunStart_RepeatedActiveHooks_ShortCircuit(t *testing.T) {
 	}
 }
 
+func TestRunStart_DisabledRepoRejectsStartCacheHotPath(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	installFakeDaemonFingerprint(t, identity.Fingerprint{
+		StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "test-argv",
+	})
+
+	var first bytes.Buffer
+	if err := runStart(ctx, &first, repoDir, "sess-disabled-hot", "claude-code", 0, true); err != nil {
+		t.Fatalf("first runStart: %v", err)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("first call spawn count=%d want 1", count.Load())
+	}
+
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		res := reg.DisableRepo(central.RepoRemovalTarget{Path: repoDir}, time.Now().Unix())
+		if res.NotFound {
+			return errors.New("registered repo not found")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("disable repo: %v", err)
+	}
+
+	var hotTouches atomic.Int32
+	prevTouch := touchClientHotPath
+	touchClientHotPath = func(ctx context.Context, gitDir, sessionID string) error {
+		hotTouches.Add(1)
+		return prevTouch(ctx, gitDir, sessionID)
+	}
+	t.Cleanup(func() { touchClientHotPath = prevTouch })
+
+	var second bytes.Buffer
+	if err := runStart(ctx, &second, repoDir, "sess-disabled-hot", "claude-code", 0, true); err != nil {
+		t.Fatalf("second runStart: %v", err)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("disabled hot-path call spawned daemon: count=%d want 1", count.Load())
+	}
+	if hotTouches.Load() != 0 {
+		t.Fatalf("disabled repo touched hot-path client cache %d times", hotTouches.Load())
+	}
+	var got startResult
+	if err := json.Unmarshal(second.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal second: %v\n%s", err, second.String())
+	}
+	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipRepoDisabled {
+		t.Fatalf("second result=%+v, want repo_disabled skip", got)
+	}
+}
+
 // A different session_id MUST escalate to the cold path; the short-circuit
 // is keyed on session_id and harness.
 func TestRunStart_DifferentSession_NoShortCircuit(t *testing.T) {
