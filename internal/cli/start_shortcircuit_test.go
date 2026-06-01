@@ -135,7 +135,7 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 			wantBlame: "registry_missing_repo",
 		},
 		{
-			name: "disabled_registry_entry_escalates",
+			name:  "disabled_registry_entry_escalates",
 			cache: stampedCache(),
 			registry: &central.RepoRecord{
 				Path:           "/tmp/x",
