@@ -678,6 +678,15 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	_ = stoppedDB.Close()
 	registerRepo(t, roots, stoppedRepo, stoppedStateDB, "")
 
+	disabledRepo, disabledStateDB, disabledDB := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, disabledDB, state.DaemonState{
+		PID: 0, Mode: "stopped", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save disabled daemon state: %v", err)
+	}
+	_ = disabledDB.Close()
+	registerRepo(t, roots, disabledRepo, disabledStateDB, "")
+
 	missingRepo := filepath.Join(t.TempDir(), "missing-repo")
 	stateMissingRepo := initRepoForRepoLifecycle(t)
 	wt, err := git.ResolveWorktree(ctx, stateMissingRepo)
@@ -687,7 +696,7 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	stateMissingDB := state.DBPathFromGitDir(wt.GitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.UpsertRepo(missingRepo, "missinghash", filepath.Join(missingRepo, ".git", "acd", "state.db"), "", 42)
-		reg.DisableRepo(central.RepoRemovalTarget{Path: stoppedRepo}, 43)
+		reg.DisableRepo(central.RepoRemovalTarget{Path: disabledRepo}, 43)
 		reg.UpsertRepo(stateMissingRepo, "statemissinghash", stateMissingDB, "", 42)
 		return nil
 	}); err != nil {
@@ -704,7 +713,7 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("decode repo list: %v\n%s", err, out.String())
 	}
-	if len(got.Repos) != 4 {
+	if len(got.Repos) != 5 {
 		t.Fatalf("repo list should include all registry rows, got %d: %+v", len(got.Repos), got.Repos)
 	}
 	byPath := map[string]repoListEntry{}
@@ -716,10 +725,10 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 		t.Fatalf("active summary mismatch: %+v", active)
 	}
 	if byPath[stoppedRepo].Status != "stopped" {
-		t.Fatalf("stopped status mismatch before disabled assertion: %+v", byPath[stoppedRepo])
+		t.Fatalf("stopped status mismatch: %+v", byPath[stoppedRepo])
 	}
-	if byPath[stoppedRepo].Status != "disabled" {
-		t.Fatalf("disabled status mismatch: %+v", byPath[stoppedRepo])
+	if byPath[disabledRepo].Status != "disabled" {
+		t.Fatalf("disabled status mismatch: %+v", byPath[disabledRepo])
 	}
 	if byPath[missingRepo].Status != "repo-missing" {
 		t.Fatalf("missing repo status mismatch: %+v", byPath[missingRepo])
