@@ -553,16 +553,6 @@ func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.R
 		StatePreserved: true,
 		Record:         rec,
 	}
-	if disable && safety.DaemonAlive {
-		stopRes, err := repoDisableStopOneRepo(ctx, rec.Path, "", true)
-		res.Stopped = &stopRes
-		if err != nil {
-			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: stop daemon: %w", err)
-		}
-		if !stopRes.Stopped {
-			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
-		}
-	}
 	var changed central.RepoLifecycleResult
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		if disable {
@@ -581,6 +571,16 @@ func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.R
 	res.Record = changed.Record
 	res.Repo = changed.Record.Path
 	res.StateDB = changed.Record.StateDB
+	if disable && safety.DaemonAlive {
+		stopRes, err := repoDisableStopOneRepo(ctx, rec.Path, "", true)
+		res.Stopped = &stopRes
+		if err != nil {
+			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: stop daemon: %w", err)
+		}
+		if !stopRes.Stopped {
+			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
+		}
+	}
 	if disable && safety.GitDir != "" {
 		removeAllStartCaches(safety.GitDir)
 		res.StartCachesCleared = true

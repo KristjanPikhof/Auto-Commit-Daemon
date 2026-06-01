@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -113,6 +115,56 @@ func TestStart_DisabledRepoManualReportsEnableGuidance(t *testing.T) {
 		t.Fatalf("error %q does not point to repo enable", msg)
 	}
 	assertNoRepoState(t, repoDir)
+}
+
+func TestStart_RechecksDisabledAfterControlLockWait(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	stateDB := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
+	registerRepo(t, roots, repoDir, stateDB, "codex")
+
+	held, err := daemon.AcquireControlLock(filepath.Join(repoDir, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire control.lock: %v", err)
+	}
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+
+	var out bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runStart(ctx, &out, repoDir, "session-race", "codex", 0, true)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		res := reg.DisableRepo(central.RepoRemovalTarget{Path: repoDir, StateDB: stateDB}, time.Now().Unix())
+		if res.NotFound {
+			t.Fatalf("disable target not found")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("disable repo: %v", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("release control.lock: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("runStart: %v\n%s", err, out.String())
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count=%d, want 0", count.Load())
+	}
+	var got startResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipRepoDisabled {
+		t.Fatalf("start result=%+v, want repo_disabled skip", got)
+	}
+	if fileExists(stateDB) {
+		t.Fatalf("start created state.db after repo was disabled")
+	}
 }
 
 func TestStart_AutodiscoveryDisabledManualUnregisteredRequiresRepoInit(t *testing.T) {
