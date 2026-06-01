@@ -70,6 +70,13 @@ type repoLifecycleCommandResult struct {
 	Record             central.RepoRecord        `json:"record,omitempty"`
 }
 
+type repoManageMode int
+
+const (
+	repoManageCompact repoManageMode = iota
+	repoManageVerbose
+)
+
 var repoRemoveStopOneRepo = stopOneRepo
 var repoDisableStopOneRepo = stopOneRepo
 
@@ -95,6 +102,7 @@ Disable implicit repo registration with repo_lifecycle.autodiscovery in ~/.confi
 		newRepoInitCmd(),
 		newRepoDisableCmd(),
 		newRepoEnableCmd(),
+		newRepoManageCmd(),
 		newRepoListCmd(),
 		newRepoRemoveCmd(),
 	)
@@ -153,6 +161,27 @@ The command clears the disabled lifecycle state and preserves .git/acd/state.db.
 	}
 }
 
+func newRepoManageCmd() *cobra.Command {
+	var verbose bool
+	cmd := &cobra.Command{
+		Use:   "manage",
+		Short: "Open the interactive repo lifecycle manager",
+		Long: `Open a line-oriented repo lifecycle manager for registered repos.
+
+The manager starts in compact mode by default. Use t N to toggle a repo,
+e N to enable, d N to disable, r to refresh, v to switch compact and
+verbose views, and q to exit.`,
+		Example: `  acd repo manage
+  acd repo manage --verbose
+  acd list --interactive`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRepoManageWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), verbose)
+		},
+	}
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Start in verbose audit mode")
+	return cmd
+}
+
 func newRepoListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -165,6 +194,122 @@ func newRepoListCmd() *cobra.Command {
 			return runRepoList(cmd.Context(), cmd.OutOrStdout(), jsonOut)
 		},
 	}
+}
+
+func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, verbose bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		return fmt.Errorf("acd repo manage: resolve paths: %w", err)
+	}
+	mode := repoManageCompact
+	if verbose {
+		mode = repoManageVerbose
+	}
+	reader := bufio.NewReader(in)
+	for {
+		entries, err := loadRepoManagementEntries(ctx, roots)
+		if err != nil {
+			return err
+		}
+		if err := renderRepoManage(out, entries, mode); err != nil {
+			return err
+		}
+		fmt.Fprint(out, "repo manage> ")
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("acd repo manage: read command: %w", readErr)
+		}
+		cmd := strings.TrimSpace(line)
+		if cmd == "" {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			continue
+		}
+		quit, err := handleRepoManageCommand(ctx, roots, out, cmd, entries, &mode)
+		if err != nil {
+			fmt.Fprintf(out, "Invalid command: %v\n", err)
+		}
+		if quit || errors.Is(readErr, io.EOF) {
+			return nil
+		}
+	}
+}
+
+func loadRepoManagementEntries(ctx context.Context, roots paths.Roots) ([]repoListEntry, error) {
+	reg, err := central.Load(roots)
+	if err != nil {
+		return nil, fmt.Errorf("acd repo manage: load registry: %w", err)
+	}
+	return collectRepoManagementEntries(ctx, reg.Repos), nil
+}
+
+func handleRepoManageCommand(ctx context.Context, roots paths.Roots, out io.Writer, command string, entries []repoListEntry, mode *repoManageMode) (bool, error) {
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false, nil
+	}
+	switch strings.ToLower(fields[0]) {
+	case "q", "quit":
+		fmt.Fprintln(out, "acd repo manage: done")
+		return true, nil
+	case "r", "refresh":
+		fmt.Fprintln(out, "acd repo manage: refreshed")
+		return false, nil
+	case "v", "verbose":
+		if *mode == repoManageCompact {
+			*mode = repoManageVerbose
+			fmt.Fprintln(out, "acd repo manage: verbose")
+		} else {
+			*mode = repoManageCompact
+			fmt.Fprintln(out, "acd repo manage: compact")
+		}
+		return false, nil
+	case "t", "toggle", "e", "enable", "d", "disable":
+		if len(fields) != 2 {
+			return false, fmt.Errorf("usage: %s N", fields[0])
+		}
+		idx, err := parseRepoManageIndex(fields[1], len(entries))
+		if err != nil {
+			return false, err
+		}
+		entry := entries[idx]
+		disable := fields[0] == "d" || fields[0] == "disable" ||
+			(fields[0] == "t" || fields[0] == "toggle") && !entry.LifecycleDisabled()
+		if err := applyRepoManageLifecycle(ctx, roots, out, entry, disable); err != nil {
+			return false, err
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("commands: t N, e N, d N, r, v, q")
+	}
+}
+
+func parseRepoManageIndex(input string, count int) (int, error) {
+	n, err := strconv.Atoi(input)
+	if err != nil || n < 1 || n > count {
+		return 0, fmt.Errorf("choose a number from 1 to %d", count)
+	}
+	return n - 1, nil
+}
+
+func applyRepoManageLifecycle(ctx context.Context, roots paths.Roots, out io.Writer, entry repoListEntry, disable bool) error {
+	target := central.RepoRemovalTarget{Path: entry.Path, StateDB: entry.StateDB}
+	if disable {
+		res, err := applyRepoDisable(ctx, roots, target)
+		if err != nil {
+			return err
+		}
+		return renderRepoLifecycleCommand(out, res, false)
+	}
+	res, err := applyRepoEnable(ctx, roots, target)
+	if err != nil {
+		return err
+	}
+	return renderRepoLifecycleCommand(out, res, false)
 }
 
 func newRepoRemoveCmd() *cobra.Command {
@@ -565,6 +710,17 @@ func runRepoRemoveInteractive(ctx context.Context, roots paths.Roots, out io.Wri
 		}
 	}
 	return nil
+}
+
+func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, verbose bool) error {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return fmt.Errorf("acd repo manage: resolve paths: %w", err)
+	}
+	if verbose {
+		fmt.Fprintln(out, "acd repo manage: interactive removal preserves state by default")
+	}
+	return runRepoRemoveInteractive(ctx, roots, out, in, false)
 }
 
 func renderRepoRemoveChoices(out io.Writer, entries []repoListEntry) error {
