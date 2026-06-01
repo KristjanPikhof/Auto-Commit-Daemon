@@ -98,6 +98,23 @@ func runTouch(ctx context.Context, out io.Writer, repoFlag, sessionID string, js
 		return fmt.Errorf("acd touch: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()
+	if repoDisabledAfterControlLock(policy) {
+		res := touchResult{
+			OK:            true,
+			Skipped:       true,
+			SkippedReason: repoAutodiscoverySkipRepoDisabled,
+			Repo:          repo,
+			SessionID:     sessionID,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd touch: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+			repo, repoAutodiscoverySkipRepoDisabled, repo)
+		return nil
+	}
 
 	dbPath := state.DBPathFromGitDir(gitDir)
 	db, err := state.Open(ctx, dbPath)

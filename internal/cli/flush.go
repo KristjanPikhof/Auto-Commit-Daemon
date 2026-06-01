@@ -167,6 +167,21 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 		return fmt.Errorf("acd flush: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()
+	if repoDisabledAfterControlLock(policy) {
+		res := flushResult{
+			OK:            true,
+			Logical:       logical,
+			Skipped:       true,
+			SkippedReason: repoAutodiscoverySkipRepoDisabled,
+			Repo:          repo,
+			SessionID:     sessionID,
+		}
+		if logical {
+			res.RefusedReason = repoAutodiscoverySkipRepoDisabled
+		}
+		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)",
+			repo, repoAutodiscoverySkipRepoDisabled, repo))
+	}
 
 	dbPath := state.DBPathFromGitDir(gitDir)
 	db, err := state.Open(ctx, dbPath)
