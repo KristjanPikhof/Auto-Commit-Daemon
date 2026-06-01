@@ -251,13 +251,13 @@ func TestRegistry_NormalizeDisabledWinsWhenMergingDuplicates(t *testing.T) {
 func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
 	reg := NewRegistry()
 	reg.Repos = []RepoRecord{{
-		Path:              "/tmp/repo/subdir",
-		RepoHash:          "old",
-		StateDB:           "/tmp/repo/.git/acd/state.db",
-		FirstRegisteredTS: 10,
-		LastSeenTS:        20,
-		Harnesses:         []string{"codex"},
-		LifecycleState:    RepoLifecycleDisabled,
+		Path:               "/tmp/repo/subdir",
+		RepoHash:           "old",
+		StateDB:            "/tmp/repo/.git/acd/state.db",
+		FirstRegisteredTS:  10,
+		LastSeenTS:         20,
+		Harnesses:          []string{"codex"},
+		LifecycleState:     RepoLifecycleDisabled,
 		LifecycleUpdatedTS: 25,
 	}}
 
