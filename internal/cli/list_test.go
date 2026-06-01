@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -665,6 +666,125 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "state.db missing") {
 		t.Fatalf("expected slog/log warn for missing state.db, got stderr:\n%s", stderr.String())
+	}
+}
+
+func TestList_DisabledLifecycleRendersWithoutStateCounts(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "queued.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, []state.CaptureOp{{Op: "modify", Path: "queued.go", Fidelity: "exact"}}); err != nil {
+		t.Fatalf("append pending: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+	disableRepoLifecycleForListTest(t, roots, repo)
+
+	var compactOut, compactErr bytes.Buffer
+	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
+		t.Fatalf("runList compact: %v", err)
+	}
+	compactLines := strings.Split(strings.TrimSpace(compactOut.String()), "\n")
+	if len(compactLines) != 2 {
+		t.Fatalf("compact output should contain one disabled row:\n%s", compactOut.String())
+	}
+	fields := strings.Fields(compactLines[1])
+	if len(fields) != 3 || fields[1] != "-" || fields[2] != "disabled" {
+		t.Fatalf("compact disabled row should omit daemon/queue counts, got fields=%q output:\n%s", fields, compactOut.String())
+	}
+
+	var verboseOut, verboseErr bytes.Buffer
+	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
+		t.Fatalf("runList verbose: %v", err)
+	}
+	verbose := verboseOut.String()
+	if !strings.Contains(verbose, "disabled (repo lifecycle disabled)") {
+		t.Fatalf("verbose output missing disabled note:\n%s", verbose)
+	}
+	if strings.Contains(verbose, " 0 ") {
+		t.Fatalf("verbose disabled row should not render queue/client zeroes:\n%s", verbose)
+	}
+
+	var jsonOut, jsonErr bytes.Buffer
+	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(got.Repos))
+	}
+	entry := got.Repos[0]
+	if entry.LifecycleState != central.RepoLifecycleDisabled || entry.Status != "disabled" {
+		t.Fatalf("json disabled lifecycle fields missing: %+v", entry)
+	}
+	if compactErr.Len() != 0 || verboseErr.Len() != 0 || jsonErr.Len() != 0 {
+		t.Fatalf("disabled lifecycle list should not warn, compact=%q verbose=%q json=%q", compactErr.String(), verboseErr.String(), jsonErr.String())
+	}
+}
+
+func TestList_DisabledLifecycleDoesNotOpenMissingStateDB(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close state db: %v", err)
+	}
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("remove state db: %v", err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+	disableRepoLifecycleForListTest(t, roots, repo)
+
+	var stdout, stderr bytes.Buffer
+	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	if fileExists(dbPath) {
+		t.Fatalf("disabled lifecycle list recreated missing state.db at %s", dbPath)
+	}
+	if strings.Contains(stderr.String(), "state.db missing") {
+		t.Fatalf("disabled lifecycle list should not inspect missing state.db, stderr:\n%s", stderr.String())
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if len(got.Repos) != 1 || got.Repos[0].LifecycleState != central.RepoLifecycleDisabled {
+		t.Fatalf("disabled repo missing from JSON lifecycle output: %+v", got.Repos)
+	}
+}
+
+func disableRepoLifecycleForListTest(t *testing.T, roots paths.Roots, repo string) {
+	t.Helper()
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		for i := range reg.Repos {
+			if central.SameRepoPath(reg.Repos[i].Path, repo) {
+				reg.Repos[i].LifecycleState = central.RepoLifecycleDisabled
+				reg.Repos[i].LifecycleUpdatedTS = time.Now().Unix()
+				return nil
+			}
+		}
+		t.Fatalf("repo %s not registered", repo)
+		return nil
+	}); err != nil {
+		t.Fatalf("disable lifecycle: %v", err)
 	}
 }
 

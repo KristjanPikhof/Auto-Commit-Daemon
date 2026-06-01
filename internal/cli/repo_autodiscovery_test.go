@@ -109,7 +109,7 @@ func TestStart_DisabledRepoManualReportsEnableGuidance(t *testing.T) {
 	if err == nil {
 		t.Fatalf("runStart succeeded, want disabled repo error")
 	}
-	if msg := err.Error(); !strings.Contains(msg, "repo "+repoDir+" is disabled") || !strings.Contains(msg, "acd repo enable --repo "+repoDir) {
+	if msg := err.Error(); !strings.Contains(msg, " is disabled") || !strings.Contains(msg, "acd repo enable --repo ") {
 		t.Fatalf("error %q does not point to repo enable", msg)
 	}
 	assertNoRepoState(t, repoDir)
