@@ -307,7 +307,7 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 
 	repoA, dbA, dA := makeRepoStateDB(t)
 	if err := state.SaveDaemonState(ctx, dA, state.DaemonState{
-		PID: 99000, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: 0, Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save A: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 
 	repoB, dbB, dB := makeRepoStateDB(t)
 	if err := state.SaveDaemonState(ctx, dB, state.DaemonState{
-		PID: 99001, Mode: "running", HeartbeatTS: nowFloat(),
+		PID: 0, Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("save B: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 
 	var out bytes.Buffer
 	// `force=true` so the per-repo stopper enters the force path. The
-	// fixture's PIDs (99000/99001) are not alive, so stopOneRepo
+	// fixture PIDs are zero, so stopOneRepo
 	// short-circuits to res.Stopped=true / Reason="daemon not running"
 	// without invoking signalProcess. Result: both repos land in the
 	// Stopped bucket and runStopAll returns nil. The point of this

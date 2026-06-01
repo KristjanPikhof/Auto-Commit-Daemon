@@ -31,6 +31,10 @@ Most repos are automatic. A harness hook calls `acd start`, which creates
 | Task | Command |
 |---|---|
 | Register without starting the daemon | `acd repo init` |
+| Disable one registered repo, preserve state | `acd repo disable --repo <path>` |
+| Enable a disabled repo, do not start daemon | `acd repo enable --repo <path>` |
+| Interactive lifecycle manager | `acd repo manage` |
+| Same manager from the daemon list command | `acd list --interactive` |
 | List registered repos | `acd repo list` |
 | Preview registry removal | `acd repo remove --dry-run` |
 | Interactive removal | `acd repo remove` |
@@ -56,6 +60,28 @@ ACD_REPO_AUTODISCOVERY=enabled acd start
 
 When autodiscovery is disabled, unregistered harness hooks skip without creating
 state. Manual `acd start` tells you to run `acd repo init --repo <path>`.
+
+Per-repo disable is stronger than global autodiscovery. A disabled registry row
+stays disabled even when hooks rediscover the repo, and hook-driven `start`,
+`wake`, `touch`, and `flush` return a clean `repo_disabled` skip. Manual
+`acd start` points to `acd repo enable --repo <path>`.
+
+Use `disable` when you may want the repo back: it stops the live daemon, clears
+start caches, and keeps `.git/acd/state.db`. Use `remove` when you want to
+unregister the row; `--purge-state` is the separate destructive state cleanup.
+
+The manager supports compact and verbose views. Compact shows number, lifecycle
+state, repo, daemon, pending, blocked, and status. Verbose adds state DB, last
+seen, harnesses, and status details.
+
+| Manager command | Action |
+|---|---|
+| `t N` | Toggle repo N between enabled and disabled. |
+| `e N` | Enable repo N. |
+| `d N` | Disable repo N. |
+| `r` | Refresh from the registry. |
+| `v` | Switch compact and verbose views. |
+| `q` | Exit. |
 
 ## Recovery ladder
 

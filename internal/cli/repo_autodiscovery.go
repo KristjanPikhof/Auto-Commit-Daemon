@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	repoAutodiscoverySkipDisabled = "autodiscovery_disabled"
-	repoAutodiscoverySkipRegistry = "autodiscovery_registry_error"
+	repoAutodiscoverySkipDisabled     = "autodiscovery_disabled"
+	repoAutodiscoverySkipRegistry     = "autodiscovery_registry_error"
+	repoAutodiscoverySkipRepoDisabled = "repo_disabled"
 )
 
 type repoAutodiscoveryPolicy struct {
@@ -23,6 +24,7 @@ type repoAutodiscoveryPolicy struct {
 	Decision   config.AutodiscoveryDecision
 	Requested  string
 	Registered bool
+	Disabled   bool
 	Record     central.RepoRecord
 }
 
@@ -66,9 +68,6 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 	if policy.Requested == "" {
 		policy.Requested = wt.Root
 	}
-	if decision.Allowed {
-		return policy, nil
-	}
 	reg, err := central.Load(roots)
 	if err != nil {
 		if caller == config.PolicyCallerHook {
@@ -81,19 +80,40 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 	if ok {
 		policy.Registered = true
 		policy.Record = rec
+		policy.Disabled = rec.LifecycleDisabled()
 	}
 	return policy, nil
 }
 
 func (p repoAutodiscoveryPolicy) allowsImplicitState() bool {
+	if p.Disabled {
+		return false
+	}
 	return p.Decision.Allowed || p.Registered
 }
 
 func (p repoAutodiscoveryPolicy) skipReason() string {
+	if p.Disabled {
+		return repoAutodiscoverySkipRepoDisabled
+	}
 	if p.Decision.SkippedReason != "" {
 		return p.Decision.SkippedReason
 	}
 	return repoAutodiscoverySkipDisabled
+}
+
+func repoDisabledError(command string, p repoAutodiscoveryPolicy) error {
+	return fmt.Errorf("acd %s: repo %s is disabled; run `acd repo enable --repo %s` to allow ACD to manage it again",
+		command, p.Worktree.Root, p.Requested)
+}
+
+func repoDisabledAfterControlLock(p repoAutodiscoveryPolicy) bool {
+	reg, err := central.Load(p.Roots)
+	if err != nil {
+		return false
+	}
+	rec, ok := reg.FindRepo(p.Worktree.Root, state.DBPathFromGitDir(p.Worktree.GitDir))
+	return ok && rec.LifecycleDisabled()
 }
 
 func repoInitRequiredError(command string, p repoAutodiscoveryPolicy) error {

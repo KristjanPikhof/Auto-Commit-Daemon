@@ -221,6 +221,7 @@ with pending successors after you check the blocked changes.
 | All registered repos | `acd list` |
 | Wide repo table | `acd list --verbose` |
 | Machine-readable repo table | `acd list --json` |
+| Interactive repo lifecycle manager | `acd list --interactive` |
 | Raw daemon log | `acd logs --follow` |
 | Recovery report | `acd diagnose --json` |
 | Safe recovery plan | `acd fix --dry-run` |
@@ -237,6 +238,12 @@ with pending successors after you check the blocked changes.
 | `pause` | Manual pause or rewind grace is active. |
 | `miss` | Repo or state DB is missing. |
 | `bad` | State DB exists but cannot be read. |
+
+Disabled repos are hidden from normal `acd list` snapshots. A disabled registry
+row makes hook-driven `start`, `wake`, `touch`, and `flush` skip with
+`repo_disabled` before capture or replay state is opened. Re-enable with
+`acd repo enable --repo <path>`, or use `acd repo manage` /
+`acd list --interactive` to toggle from the manager.
 
 ## Safe-ignore and sensitive paths
 

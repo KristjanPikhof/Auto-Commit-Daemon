@@ -19,6 +19,8 @@ func TestRepoHelpIncludesLifecycleCommands(t *testing.T) {
 	help := commandHelp(t, "repo")
 	for _, want := range []string{
 		"acd repo init",
+		"acd repo disable --repo /path/to/repo",
+		"acd repo enable --repo /path/to/repo --json",
 		"acd repo list --json",
 		"acd repo remove --yes --purge-state",
 		"Manage explicit acd repository registration",
@@ -28,6 +30,180 @@ func TestRepoHelpIncludesLifecycleCommands(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Fatalf("repo help missing %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestRepoDisable_StopsClearsCachesPreservesState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+	gitDir := filepath.Dir(filepath.Dir(stateDB))
+	cachePath := startCachePath(gitDir, "repo-disable-test")
+	if err := os.WriteFile(cachePath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	stops := 0
+	prev := repoDisableStopOneRepo
+	repoDisableStopOneRepo = func(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
+		stops++
+		if !force {
+			t.Fatalf("repo disable should force stop live daemon")
+		}
+		return stopRepoResult{Repo: repo, Stopped: true, Force: true, DaemonPID: os.Getpid()}, nil
+	}
+	t.Cleanup(func() { repoDisableStopOneRepo = prev })
+
+	var out bytes.Buffer
+	if err := runRepoDisable(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runRepoDisable: %v\n%s", err, out.String())
+	}
+	if stops != 1 {
+		t.Fatalf("stop calls=%d want 1", stops)
+	}
+	var got repoLifecycleCommandResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode disable json: %v\n%s", err, out.String())
+	}
+	if got.Action != "disable" || !got.Updated || !got.StatePreserved || !got.StartCachesCleared {
+		t.Fatalf("unexpected disable result: %+v", got)
+	}
+	if got.Stopped == nil || !got.Stopped.Stopped {
+		t.Fatalf("missing stopped result: %+v", got)
+	}
+	if fileExists(cachePath) {
+		t.Fatalf("start cache was not cleared: %s", cachePath)
+	}
+	if !fileExists(stateDB) {
+		t.Fatalf("state db should be preserved")
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, stateDB)
+	if !ok || !rec.LifecycleDisabled() {
+		t.Fatalf("registry row not disabled: ok=%v rec=%+v", ok, rec)
+	}
+}
+
+func TestRepoDisable_IdempotentAlreadyDisabled(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		res := reg.DisableRepo(central.RepoRemovalTarget{Path: repo}, 42)
+		if res.NotFound {
+			t.Fatalf("seed disable not found")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed disable: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRepoDisable(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runRepoDisable: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "already disabled "+repo) || !strings.Contains(out.String(), "state: preserved "+stateDB) {
+		t.Fatalf("unexpected human output:\n%s", out.String())
+	}
+}
+
+func TestRepoEnable_ClearsDisabledWithoutStartingDaemon(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.DisableRepo(central.RepoRemovalTarget{Path: repo}, 42)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed disable: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runRepoEnable(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runRepoEnable: %v\n%s", err, out.String())
+	}
+	var got repoLifecycleCommandResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode enable json: %v\n%s", err, out.String())
+	}
+	if got.Action != "enable" || !got.Updated || got.Stopped != nil || got.StartCachesCleared {
+		t.Fatalf("unexpected enable result: %+v", got)
+	}
+	if !fileExists(stateDB) {
+		t.Fatalf("state db should be preserved")
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, stateDB)
+	if !ok || rec.LifecycleDisabled() {
+		t.Fatalf("registry row not enabled: ok=%v rec=%+v", ok, rec)
+	}
+}
+
+func TestRepoEnable_IdempotentAlreadyEnabled(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoEnable(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runRepoEnable: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "already enabled "+repo) || !strings.Contains(out.String(), "state: preserved "+stateDB) {
+		t.Fatalf("unexpected human output:\n%s", out.String())
+	}
+}
+
+func TestRepoLifecycle_UnknownRepoDoesNotCreateState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo := initRepoForRepoLifecycle(t)
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	stateDB := state.DBPathFromGitDir(wt.GitDir)
+	if fileExists(stateDB) {
+		t.Fatalf("test setup unexpectedly created state db: %s", stateDB)
+	}
+
+	var out bytes.Buffer
+	err = runRepoDisable(ctx, &out, repo, true)
+	if err == nil {
+		t.Fatalf("runRepoDisable unknown succeeded")
+	}
+	for _, want := range []string{"not registered", "acd repo init --repo " + repo, "acd repo list"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("unknown repo error missing %q: %v", want, err)
+		}
+	}
+	if fileExists(stateDB) {
+		t.Fatalf("unknown disable created state db: %s", stateDB)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Repos) != 0 {
+		t.Fatalf("unknown disable created registry row: %+v", reg.Repos)
 	}
 }
 
@@ -367,6 +543,73 @@ func TestRepoRemoveInteractive_PurgeStateConfirmed(t *testing.T) {
 	}
 }
 
+func TestRepoManage_QuitRefreshInvalidAndVerboseToggle(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("x\nr\nv\nq\n"), false); err != nil {
+		t.Fatalf("repo manage: %v\n%s", err, out.String())
+	}
+	text := out.String()
+	for _, want := range []string{
+		"N", "STATE", "REPO", "repo manage>", "Invalid command", "refreshed", "verbose", "STATE_DB", "done",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("repo manage output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRepoManage_ToggleEnableDisableRefreshesState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("t 1\ne 1\nd 1\nd 1\nq\n"), false); err != nil {
+		t.Fatalf("repo manage toggle: %v\n%s", err, out.String())
+	}
+	text := out.String()
+	for _, want := range []string{"acd repo disable: disabled", "acd repo enable: enabled", "already disabled"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("repo manage toggle output missing %q:\n%s", want, text)
+		}
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, stateDB)
+	if !ok {
+		t.Fatalf("repo missing after manage toggle")
+	}
+	if !rec.LifecycleDisabled() {
+		t.Fatalf("repo should be disabled after final d command: %+v", rec)
+	}
+}
+
+func TestRepoManage_EOFExits(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader(""), false); err != nil {
+		t.Fatalf("repo manage eof: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "repo manage>") {
+		t.Fatalf("repo manage did not render prompt before EOF:\n%s", out.String())
+	}
+}
+
 func TestRepoRemove_JSONDryRunSkipsInteractiveInput(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -502,6 +745,15 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	_ = stoppedDB.Close()
 	registerRepo(t, roots, stoppedRepo, stoppedStateDB, "")
 
+	disabledRepo, disabledStateDB, disabledDB := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, disabledDB, state.DaemonState{
+		PID: 0, Mode: "stopped", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save disabled daemon state: %v", err)
+	}
+	_ = disabledDB.Close()
+	registerRepo(t, roots, disabledRepo, disabledStateDB, "")
+
 	missingRepo := filepath.Join(t.TempDir(), "missing-repo")
 	stateMissingRepo := initRepoForRepoLifecycle(t)
 	wt, err := git.ResolveWorktree(ctx, stateMissingRepo)
@@ -511,6 +763,7 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	stateMissingDB := state.DBPathFromGitDir(wt.GitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.UpsertRepo(missingRepo, "missinghash", filepath.Join(missingRepo, ".git", "acd", "state.db"), "", 42)
+		reg.DisableRepo(central.RepoRemovalTarget{Path: disabledRepo}, 43)
 		reg.UpsertRepo(stateMissingRepo, "statemissinghash", stateMissingDB, "", 42)
 		return nil
 	}); err != nil {
@@ -527,7 +780,7 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("decode repo list: %v\n%s", err, out.String())
 	}
-	if len(got.Repos) != 4 {
+	if len(got.Repos) != 5 {
 		t.Fatalf("repo list should include all registry rows, got %d: %+v", len(got.Repos), got.Repos)
 	}
 	byPath := map[string]repoListEntry{}
@@ -540,6 +793,9 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	}
 	if byPath[stoppedRepo].Status != "stopped" {
 		t.Fatalf("stopped status mismatch: %+v", byPath[stoppedRepo])
+	}
+	if byPath[disabledRepo].Status != "disabled" {
+		t.Fatalf("disabled status mismatch: %+v", byPath[disabledRepo])
 	}
 	if byPath[missingRepo].Status != "repo-missing" {
 		t.Fatalf("missing repo status mismatch: %+v", byPath[missingRepo])

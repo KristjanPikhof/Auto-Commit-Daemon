@@ -14,6 +14,9 @@ Common workflow:
   acd explain --path FILE           Explain why ACD did or did not commit a path
   acd fix --dry-run                 Preview safe remediation for a stuck repo (use --force dry-run for barrier purge plans)
   acd repo init                     Explicitly initialize ACD state for this repo
+  acd repo disable                  Stop and disable a registered repo while preserving state
+  acd repo enable                   Re-enable a registered repo without starting its daemon
+  acd repo manage                   Interactive lifecycle manager for enabling and disabling repos
   acd repo list                     List all registry rows for lifecycle management
   acd repo remove --dry-run          Preview registry removal and state preservation
   acd list                          Compact dashboard on TTY (Ctrl-C to exit)

@@ -138,6 +138,62 @@ func TestRegistry_FlockSerializesUpdatesWithSamePath(t *testing.T) {
 	}
 }
 
+func TestRegistry_FlockPreservesDisabledStateAcrossUpserts(t *testing.T) {
+	roots := rootsForTest(t)
+	const N = 50
+	const repoPath = "/tmp/disabled-repo-many-refreshes"
+
+	if err := WithLock(roots, func(reg *Registry) error {
+		reg.UpsertRepo(repoPath, "h-stable", repoPath+"/.git/acd/state.db", "codex", 100)
+		res := reg.DisableRepo(RepoRemovalTarget{Path: repoPath}, 200)
+		if res.NotFound || !res.Updated {
+			return fmt.Errorf("disable result=%+v, want update", res)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed disabled repo: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			harness := fmt.Sprintf("refresh-%02d", i)
+			err := WithLock(roots, func(reg *Registry) error {
+				reg.UpsertRepo(repoPath, "h-stable", repoPath+"/.git/acd/state.db",
+					harness, int64(300+i))
+				return nil
+			})
+			if err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("WithLock writer: %v", err)
+	}
+
+	got, err := Load(roots)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d want 1", len(got.Repos))
+	}
+	rec := got.Repos[0]
+	if !rec.LifecycleDisabled() || rec.LifecycleUpdatedTS != 200 {
+		t.Fatalf("lifecycle=%+v, want disabled preserved", rec)
+	}
+	if len(rec.Harnesses) != N+1 {
+		t.Fatalf("harnesses=%d want %d (got %v)", len(rec.Harnesses), N+1, rec.Harnesses)
+	}
+}
+
 // runRegistryTearSampler polls roots.RegistryPath() (and the .tmp sibling)
 // asserting any non-empty body parses cleanly. Stops on stop close; reports
 // the first failure (or nil) on out.

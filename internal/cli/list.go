@@ -31,6 +31,7 @@ const defaultListWatchInterval = 2 * time.Second
 type listEntry struct {
 	Path                 string     `json:"path"`
 	RepoHash             string     `json:"repo_hash"`
+	LifecycleState       string     `json:"lifecycle_state"`
 	Daemon               string     `json:"daemon"`
 	PID                  int        `json:"pid,omitempty"`
 	Clients              int        `json:"clients"`
@@ -54,6 +55,7 @@ func newListCmd() *cobra.Command {
 	var watch bool
 	var once bool
 	var verbose bool
+	var interactive bool
 	var interval time.Duration
 
 	cmd := &cobra.Command{
@@ -73,9 +75,19 @@ Watch mode prints plain table frames and does not support --json.`,
   acd list --once
   acd list --once --verbose
   acd list --watch --interval 5s
+  acd list --interactive
   acd list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if interactive {
+				if jsonOut {
+					return fmt.Errorf("acd list: --interactive does not support --json")
+				}
+				if watch {
+					return fmt.Errorf("acd list: --interactive does not support --watch")
+				}
+				return runRepoManageWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), verbose)
+			}
 			if watch && jsonOut {
 				return fmt.Errorf("acd list: --watch does not support --json")
 			}
@@ -90,6 +102,7 @@ Watch mode prints plain table frames and does not support --json.`,
 	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh list output until interrupted (default on TTY)")
 	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit (even on a TTY)")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Wide table with paths, CLIENTS, LAST_COMMIT, and status notes")
+	cmd.Flags().BoolVar(&interactive, "interactive", false, "Open the interactive repo lifecycle manager")
 	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for watch mode (Go duration)")
 	return cmd
 }
@@ -183,11 +196,15 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 	entries := make([]listEntry, 0, len(reg.Repos))
 
 	for _, rec := range reg.Repos {
+		if rec.LifecycleDisabled() {
+			continue
+		}
 		e := listEntry{
-			Path:     rec.Path,
-			RepoHash: rec.RepoHash,
-			Daemon:   "-",
-			Status:   "OK",
+			Path:           rec.Path,
+			RepoHash:       rec.RepoHash,
+			LifecycleState: rec.LifecycleStateName(),
+			Daemon:         "-",
+			Status:         "OK",
 		}
 
 		// Repo dir missing — we still emit a row so the user sees what gc

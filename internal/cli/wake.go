@@ -97,8 +97,13 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 			enc.SetIndent("", "  ")
 			return enc.Encode(res)
 		}
-		fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
-			repo, policy.skipReason(), repo)
+		if policy.Disabled {
+			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+				repo, policy.skipReason(), repo)
+		} else {
+			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
+				repo, policy.skipReason(), repo)
+		}
 		return nil
 	}
 
@@ -128,6 +133,23 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 		return fmt.Errorf("acd wake: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()
+	if repoDisabledAfterControlLock(policy) {
+		res := wakeResult{
+			OK:            true,
+			Skipped:       true,
+			SkippedReason: repoAutodiscoverySkipRepoDisabled,
+			Repo:          repo,
+			SessionID:     sessionID,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+			repo, repoAutodiscoverySkipRepoDisabled, repo)
+		return nil
+	}
 
 	dbPath := state.DBPathFromGitDir(gitDir)
 	db, err := state.Open(ctx, dbPath)

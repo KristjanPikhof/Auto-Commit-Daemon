@@ -205,15 +205,36 @@ Most repos need no manual setup. Harness hooks call `acd start`, which creates
 `<gitDir>/acd/state.db` and registers the repo.
 
 Use explicit lifecycle commands when autodiscovery is disabled or when old rows
-need cleanup:
+need cleanup, or when you want to keep global autodiscovery on but exclude one
+repo:
 
 ~~~bash
 acd repo init
+acd repo disable --repo /path/to/repo
+acd repo enable --repo /path/to/repo
+acd repo manage
+acd list --interactive
 acd repo list
 acd repo remove --dry-run
 acd repo remove --yes
 acd repo remove --yes --purge-state
 ~~~
+
+`acd repo disable` stops a live repo daemon, clears start caches, preserves
+`.git/acd/state.db`, and records disabled lifecycle state in the central
+registry. Hook-driven `start`, `wake`, `touch`, and `flush` calls then skip
+cleanly with `repo_disabled`; manual `acd start` tells you to run
+`acd repo enable --repo <path>`. Normal `acd list` snapshots hide disabled
+repos; use `acd repo list`, `acd repo manage`, or `acd list --interactive` to
+inspect and re-enable them. `acd repo enable` only clears that disabled state;
+it does not start the daemon. Use `repo remove` when you want to unregister a
+row instead of temporarily disabling it.
+
+`acd repo manage` and `acd list --interactive` open the same line-oriented
+manager. Compact mode is the default; `--verbose` starts with state DB, last
+seen, harness, and status details. Inside the manager: `t N` toggles a repo,
+`e N` enables, `d N` disables, `r` refreshes, `v` switches compact/verbose,
+and `q` exits.
 
 Disable autodiscovery in `~/.config/acd/config.json`:
 

@@ -154,6 +154,9 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	if !policy.allowsImplicitState() {
 		if isManualAutodiscoveryCaller(caller) {
+			if policy.Disabled {
+				return repoDisabledError("start", policy)
+			}
 			return repoInitRequiredError("start", policy)
 		}
 		res := startResult{
@@ -171,8 +174,13 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			enc.SetIndent("", "  ")
 			return enc.Encode(res)
 		}
-		fmt.Fprintf(out, "acd start: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
-			repo, policy.skipReason(), repo)
+		if policy.Disabled {
+			fmt.Fprintf(out, "acd start: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+				repo, policy.skipReason(), repo)
+		} else {
+			fmt.Fprintf(out, "acd start: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
+				repo, policy.skipReason(), repo)
+		}
 		return nil
 	}
 	if err := ensureAttachedHEAD(ctx, repo); err != nil {
@@ -241,6 +249,26 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		return fmt.Errorf("acd start: acquire control.lock: %w", err)
 	}
 	defer func() { _ = clock.Release() }()
+	if repoDisabledAfterControlLock(policy) {
+		res := startResult{
+			Started:    false,
+			Duplicate:  false,
+			Skipped:    true,
+			SkipReason: repoAutodiscoverySkipRepoDisabled,
+			Repo:       repo,
+			RepoHash:   repoHash,
+			SessionID:  sessionID,
+			Harness:    harness,
+		}
+		if jsonOut {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(res)
+		}
+		fmt.Fprintf(out, "acd start: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+			repo, repoAutodiscoverySkipRepoDisabled, repo)
+		return nil
+	}
 
 	dbPath := state.DBPathFromGitDir(gitDir)
 	db, err := state.Open(ctx, dbPath)
