@@ -93,6 +93,7 @@ Disable implicit repo registration with repo_lifecycle.autodiscovery in ~/.confi
   acd repo init --json
   acd repo disable --repo /path/to/repo
   acd repo enable --repo /path/to/repo --json
+  acd repo manage
   acd repo list --json
   acd repo remove --dry-run
   acd repo remove --yes
