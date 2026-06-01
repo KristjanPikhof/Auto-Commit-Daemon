@@ -543,6 +543,73 @@ func TestRepoRemoveInteractive_PurgeStateConfirmed(t *testing.T) {
 	}
 }
 
+func TestRepoManage_QuitRefreshInvalidAndVerboseToggle(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("x\nr\nv\nq\n"), false); err != nil {
+		t.Fatalf("repo manage: %v\n%s", err, out.String())
+	}
+	text := out.String()
+	for _, want := range []string{
+		"N", "STATE", "REPO", "repo manage>", "Invalid command", "refreshed", "verbose", "STATE_DB", "done",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("repo manage output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRepoManage_ToggleEnableDisableRefreshesState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("t 1\ne 1\nd 1\nq\n"), false); err != nil {
+		t.Fatalf("repo manage toggle: %v\n%s", err, out.String())
+	}
+	text := out.String()
+	for _, want := range []string{"acd repo disable: disabled", "acd repo enable: enabled", "already disabled"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("repo manage toggle output missing %q:\n%s", want, text)
+		}
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, stateDB)
+	if !ok {
+		t.Fatalf("repo missing after manage toggle")
+	}
+	if !rec.LifecycleDisabled() {
+		t.Fatalf("repo should be disabled after final d command: %+v", rec)
+	}
+}
+
+func TestRepoManage_EOFExits(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	var out bytes.Buffer
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader(""), false); err != nil {
+		t.Fatalf("repo manage eof: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "repo manage>") {
+		t.Fatalf("repo manage did not render prompt before EOF:\n%s", out.String())
+	}
+}
+
 func TestRepoRemove_JSONDryRunSkipsInteractiveInput(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

@@ -434,6 +434,49 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 	return nil
 }
 
+func renderRepoManage(out io.Writer, entries []repoListEntry, mode repoManageMode) error {
+	if mode == repoManageVerbose {
+		return renderRepoManageVerbose(out, entries)
+	}
+	return renderRepoManageCompact(out, entries)
+}
+
+func renderRepoManageCompact(out io.Writer, entries []repoListEntry) error {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "N\tSTATE\tREPO\tDAEMON\tPEND\tBLK\tSTATUS")
+	for i, entry := range entries {
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%d\t%d\t%s\n",
+			i+1,
+			entry.LifecycleStateName(),
+			homeShort(entry.Path),
+			repoEntryDaemon(entry),
+			entry.PendingEvents,
+			entry.BlockedConflicts,
+			entry.Status)
+	}
+	return tw.Flush()
+}
+
+func renderRepoManageVerbose(out io.Writer, entries []repoListEntry) error {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "N\tSTATE\tREPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tSTATE_DB\tLAST_SEEN\tHARNESSES\tSTATUS")
+	for i, entry := range entries {
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%s\t%s\n",
+			i+1,
+			entry.LifecycleStateName(),
+			homeShort(entry.Path),
+			repoEntryDaemon(entry),
+			entry.Clients,
+			entry.PendingEvents,
+			entry.BlockedConflicts,
+			entry.StateDB,
+			entry.LastSeenTS,
+			strings.Join(entry.Harnesses, ","),
+			entry.Status)
+	}
+	return tw.Flush()
+}
+
 func runRepoDisable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
 	return runRepoLifecycleCommand(ctx, out, repoFlag, true, jsonOut)
 }
@@ -466,6 +509,40 @@ func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string
 	if !ok {
 		return repoLifecycleUnknownTargetError(action, target)
 	}
+	_ = rec
+	var res repoLifecycleCommandResult
+	if disable {
+		res, err = applyRepoDisable(ctx, roots, target)
+	} else {
+		res, err = applyRepoEnable(ctx, roots, target)
+	}
+	if err != nil {
+		return err
+	}
+	return renderRepoLifecycleCommand(out, res, jsonOut)
+}
+
+func applyRepoDisable(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget) (repoLifecycleCommandResult, error) {
+	return applyRepoLifecycle(ctx, roots, target, true)
+}
+
+func applyRepoEnable(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget) (repoLifecycleCommandResult, error) {
+	return applyRepoLifecycle(ctx, roots, target, false)
+}
+
+func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget, disable bool) (repoLifecycleCommandResult, error) {
+	action := "enable"
+	if disable {
+		action = "disable"
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: load registry: %w", action, err)
+	}
+	rec, ok := reg.FindRepo(target.Path, target.StateDB)
+	if !ok {
+		return repoLifecycleCommandResult{}, repoLifecycleUnknownTargetError(action, target)
+	}
 	safety := central.ProbeRepoRemovalSafety(ctx, rec)
 	res := repoLifecycleCommandResult{
 		Target:         target,
@@ -479,10 +556,10 @@ func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string
 		stopRes, err := repoDisableStopOneRepo(ctx, rec.Path, "", true)
 		res.Stopped = &stopRes
 		if err != nil {
-			return fmt.Errorf("acd repo disable: stop daemon: %w", err)
+			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: stop daemon: %w", err)
 		}
 		if !stopRes.Stopped {
-			return fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
+			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
 		}
 	}
 	var changed central.RepoLifecycleResult
@@ -494,10 +571,10 @@ func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("acd repo %s: update registry: %w", action, err)
+		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: update registry: %w", action, err)
 	}
 	if changed.NotFound {
-		return repoLifecycleUnknownTargetError(action, target)
+		return repoLifecycleCommandResult{}, repoLifecycleUnknownTargetError(action, target)
 	}
 	res.Updated = changed.Updated
 	res.Record = changed.Record
@@ -507,7 +584,7 @@ func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string
 		removeAllStartCaches(safety.GitDir)
 		res.StartCachesCleared = true
 	}
-	return renderRepoLifecycleCommand(out, res, jsonOut)
+	return res, nil
 }
 
 func repoLifecycleUnknownTargetError(action string, target central.RepoRemovalTarget) error {
@@ -710,17 +787,6 @@ func runRepoRemoveInteractive(ctx context.Context, roots paths.Roots, out io.Wri
 		}
 	}
 	return nil
-}
-
-func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, verbose bool) error {
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd repo manage: resolve paths: %w", err)
-	}
-	if verbose {
-		fmt.Fprintln(out, "acd repo manage: interactive removal preserves state by default")
-	}
-	return runRepoRemoveInteractive(ctx, roots, out, in, false)
 }
 
 func renderRepoRemoveChoices(out io.Writer, entries []repoListEntry) error {
