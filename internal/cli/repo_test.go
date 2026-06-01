@@ -572,7 +572,7 @@ func TestRepoManage_ToggleEnableDisableRefreshesState(t *testing.T) {
 	registerRepo(t, roots, repo, stateDB, "")
 
 	var out bytes.Buffer
-	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("t 1\ne 1\nd 1\nq\n"), false); err != nil {
+	if err := runRepoManageWithInput(ctx, &out, strings.NewReader("t 1\ne 1\nd 1\nd 1\nq\n"), false); err != nil {
 		t.Fatalf("repo manage toggle: %v\n%s", err, out.String())
 	}
 	text := out.String()

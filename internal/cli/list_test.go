@@ -65,6 +65,37 @@ func TestList_WatchAndJSONRejected(t *testing.T) {
 	}
 }
 
+func TestListInteractiveRoutesToRepoManager(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeRepoStateDB(t)
+	_ = db.Close()
+	registerRepo(t, roots, repo, stateDB, "")
+
+	cmd := newRootCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetIn(strings.NewReader("q\n"))
+	cmd.SetArgs([]string{"list", "--interactive"})
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		t.Fatalf("list interactive: %v\nstderr:%s\nstdout:%s", err, stderr.String(), stdout.String())
+	}
+	for _, want := range []string{"STATE", "repo manage>", "done"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("interactive list output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, stateDB)
+	if !ok || rec.LifecycleDisabled() {
+		t.Fatalf("list --interactive q mutated repo: ok=%v rec=%+v", ok, rec)
+	}
+}
+
 func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	withIsolatedHome(t)
 

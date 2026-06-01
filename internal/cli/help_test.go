@@ -16,7 +16,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"stop", []string{"acd stop --session-id", "acd stop --all --json", "active sessions"}},
 		{"status", []string{"current working directory", "blocked-vs-waiting recovery state", "acd explain"}},
 		{"fix", []string{"acd fix --dry-run", "single recovery entrypoint", "--force"}},
-		{"list", []string{"acd list --watch --interval 5s", "waiting/draining queues", "--interval"}},
+		{"list", []string{"acd list --watch --interval 5s", "acd list --interactive", "--interval"}},
 		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
 		{"prompt", []string{"ACD_AI_PROMPT_TRACE", "acd prompt --seq 42 --json", "--last"}},
 		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
@@ -29,7 +29,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"wake", []string{"acd wake --session-id", "acd touch", "current working directory"}},
 		{"stats", []string{"acd stats --since 30d", "all registered repos", "--json"}},
 		{"gc", []string{"acd gc --json", "30 days", "acd list"}},
-		{"repo", []string{"acd repo disable --repo /path/to/repo", "acd repo enable --repo /path/to/repo --json", "repo remove to preview or remove"}},
+		{"repo", []string{"acd repo disable --repo /path/to/repo", "acd repo manage", "repo remove to preview or remove"}},
 	}
 
 	for _, tt := range tests {
