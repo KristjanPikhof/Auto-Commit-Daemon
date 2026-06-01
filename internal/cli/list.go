@@ -195,22 +195,22 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 	ttl := clientTTL()
 	entries := make([]listEntry, 0, len(reg.Repos))
 
-		for _, rec := range reg.Repos {
-			if rec.LifecycleDisabled() {
-				continue
-			}
-			e := listEntry{
-				Path:           rec.Path,
-				RepoHash:       rec.RepoHash,
-				LifecycleState: rec.LifecycleStateName(),
-				Daemon:         "-",
-				Status:         "OK",
-			}
+	for _, rec := range reg.Repos {
+		if rec.LifecycleDisabled() {
+			continue
+		}
+		e := listEntry{
+			Path:           rec.Path,
+			RepoHash:       rec.RepoHash,
+			LifecycleState: rec.LifecycleStateName(),
+			Daemon:         "-",
+			Status:         "OK",
+		}
 
-			// Repo dir missing — we still emit a row so the user sees what gc
-			// would prune.
-			if !fileExists(rec.Path) {
-				e.Status = "missing"
+		// Repo dir missing — we still emit a row so the user sees what gc
+		// would prune.
+		if !fileExists(rec.Path) {
+			e.Status = "missing"
 			e.StatusNote = "repo missing"
 			entries = append(entries, e)
 			continue

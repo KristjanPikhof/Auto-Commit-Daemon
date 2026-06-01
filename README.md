@@ -224,9 +224,11 @@ acd repo remove --yes --purge-state
 `.git/acd/state.db`, and records disabled lifecycle state in the central
 registry. Hook-driven `start`, `wake`, `touch`, and `flush` calls then skip
 cleanly with `repo_disabled`; manual `acd start` tells you to run
-`acd repo enable --repo <path>`. `acd repo enable` only clears that disabled
-state; it does not start the daemon. Use `repo remove` when you want to
-unregister a row instead of temporarily disabling it.
+`acd repo enable --repo <path>`. Normal `acd list` snapshots hide disabled
+repos; use `acd repo list`, `acd repo manage`, or `acd list --interactive` to
+inspect and re-enable them. `acd repo enable` only clears that disabled state;
+it does not start the daemon. Use `repo remove` when you want to unregister a
+row instead of temporarily disabling it.
 
 `acd repo manage` and `acd list --interactive` open the same line-oriented
 manager. Compact mode is the default; `--verbose` starts with state DB, last
