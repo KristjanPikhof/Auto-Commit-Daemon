@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Per-repo lifecycle controls: `acd repo disable`, `acd repo enable`,
+  `acd repo manage`, and `acd list --interactive`. Disabled repos preserve
+  `.git/acd` state while hook calls skip cleanly with `repo_disabled`.
+
 ## v2026-06-01
 
 ### Changed

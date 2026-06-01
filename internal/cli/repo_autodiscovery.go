@@ -107,6 +107,15 @@ func repoDisabledError(command string, p repoAutodiscoveryPolicy) error {
 		command, p.Worktree.Root, p.Requested)
 }
 
+func repoDisabledAfterControlLock(p repoAutodiscoveryPolicy) bool {
+	reg, err := central.Load(p.Roots)
+	if err != nil {
+		return false
+	}
+	rec, ok := reg.FindRepo(p.Worktree.Root, state.DBPathFromGitDir(p.Worktree.GitDir))
+	return ok && rec.LifecycleDisabled()
+}
+
 func repoInitRequiredError(command string, p repoAutodiscoveryPolicy) error {
 	source := p.Decision.Source
 	if source == "" {
