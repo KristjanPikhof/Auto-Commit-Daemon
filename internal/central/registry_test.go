@@ -102,6 +102,91 @@ func TestRegistry_UpsertIdempotent(t *testing.T) {
 	}
 }
 
+func TestRegistry_LoadOldRowsDefaultToEnabled(t *testing.T) {
+	roots := rootsForTest(t)
+
+	if err := os.MkdirAll(roots.Share, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := []byte(`{"version":1,"repos":[{"path":"/tmp/repo","repo_hash":"h1","state_db":"/tmp/repo/.git/acd/state.db","first_registered_ts":10,"last_seen_ts":20,"harnesses":["codex"]}]}`)
+	if err := os.WriteFile(roots.RegistryPath(), body, 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	reg, err := Load(roots)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := reg.Repos[0]
+	if rec.LifecycleStateName() != RepoLifecycleEnabled || rec.LifecycleUpdatedTS != 0 {
+		t.Fatalf("lifecycle=%+v, want enabled old row", rec)
+	}
+	if reg.Version != RegistryVersion {
+		t.Fatalf("version=%d, want %d", reg.Version, RegistryVersion)
+	}
+}
+
+func TestRegistry_DisableEnableRepoLifecycle(t *testing.T) {
+	reg := NewRegistry()
+	reg.UpsertRepo("/tmp/repo", "h1", "/tmp/repo/.git/acd/state.db", "codex", 10)
+
+	disabled := reg.DisableRepo(RepoRemovalTarget{Path: "/tmp/repo"}, 30)
+	if disabled.NotFound || !disabled.Updated {
+		t.Fatalf("disable result=%+v, want updated", disabled)
+	}
+	if !disabled.Record.LifecycleDisabled() || disabled.Record.LifecycleUpdatedTS != 30 {
+		t.Fatalf("disabled record=%+v, want disabled at 30", disabled.Record)
+	}
+	rec := reg.Repos[0]
+	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 10 || rec.RepoHash != "h1" || rec.StateDB != "/tmp/repo/.git/acd/state.db" {
+		t.Fatalf("non-lifecycle metadata changed: %+v", rec)
+	}
+
+	again := reg.DisableRepo(RepoRemovalTarget{StateDB: "/tmp/repo/.git/acd/state.db"}, 30)
+	if again.NotFound || again.Updated {
+		t.Fatalf("idempotent disable=%+v, want no update", again)
+	}
+
+	enabled := reg.EnableRepo(RepoRemovalTarget{Path: "/tmp/repo"}, 40)
+	if enabled.NotFound || !enabled.Updated {
+		t.Fatalf("enable result=%+v, want updated", enabled)
+	}
+	if enabled.Record.LifecycleStateName() != RepoLifecycleEnabled || enabled.Record.LifecycleUpdatedTS != 40 {
+		t.Fatalf("enabled record=%+v, want lifecycle cleared", enabled.Record)
+	}
+
+	missing := reg.DisableRepo(RepoRemovalTarget{Path: "/tmp/missing"}, 50)
+	if !missing.NotFound || missing.Updated {
+		t.Fatalf("missing result=%+v, want not-found no-op", missing)
+	}
+}
+
+func TestRegistry_UpsertPreservesDisabledState(t *testing.T) {
+	reg := NewRegistry()
+	reg.UpsertRepo("/tmp/repo", "old", "/tmp/repo/.git/acd/state.db", "codex", 10)
+	reg.DisableRepo(RepoRemovalTarget{Path: "/tmp/repo"}, 25)
+
+	reg.UpsertRepo("/tmp/repo", "new", "/tmp/repo/.git/acd/state.db", "pi", 40)
+
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := reg.Repos[0]
+	if !rec.LifecycleDisabled() || rec.LifecycleUpdatedTS != 25 {
+		t.Fatalf("lifecycle=%+v, want disabled preserved", rec)
+	}
+	if rec.RepoHash != "new" || rec.LastSeenTS != 40 {
+		t.Fatalf("refresh metadata=%+v, want updated hash/last_seen", rec)
+	}
+	wantHarnesses := []string{"codex", "pi"}
+	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
+		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
 func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
 	reg := NewRegistry()
 	reg.Repos = []RepoRecord{{
@@ -111,6 +196,8 @@ func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
 		FirstRegisteredTS: 10,
 		LastSeenTS:        20,
 		Harnesses:         []string{"codex"},
+		LifecycleState:    RepoLifecycleDisabled,
+		LifecycleUpdatedTS: 25,
 	}}
 
 	reg.UpsertRepo("/tmp/repo", "new", "/tmp/repo/.git/acd/state.db", "pi", 30)
@@ -124,6 +211,9 @@ func TestRegistry_UpsertMergesLegacySubdirRowByStateDB(t *testing.T) {
 	}
 	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 30 {
 		t.Fatalf("timestamps=%d/%d want 10/30", rec.FirstRegisteredTS, rec.LastSeenTS)
+	}
+	if !rec.LifecycleDisabled() || rec.LifecycleUpdatedTS != 25 {
+		t.Fatalf("lifecycle=%+v, want disabled preserved", rec)
 	}
 	wantHarnesses := []string{"codex", "pi"}
 	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
@@ -344,7 +434,7 @@ func TestRegistry_CleanupLegacyDuplicatesMergesSubdirRowsByGitToplevel(t *testin
 
 	reg := NewRegistry()
 	reg.Repos = []RepoRecord{
-		{Path: wt.Root, RepoHash: "old", StateDB: filepath.Join(wt.GitDir, "acd", "state.db"), FirstRegisteredTS: 20, LastSeenTS: 30, Harnesses: []string{"codex"}},
+		{Path: wt.Root, RepoHash: "old", StateDB: filepath.Join(wt.GitDir, "acd", "state.db"), FirstRegisteredTS: 20, LastSeenTS: 30, Harnesses: []string{"codex"}, LifecycleState: RepoLifecycleDisabled, LifecycleUpdatedTS: 35},
 		{Path: subdir, RepoHash: "new", StateDB: filepath.Join(wt.GitDir, "acd", "state.db"), FirstRegisteredTS: 10, LastSeenTS: 40, Harnesses: []string{"claude-code"}},
 	}
 
@@ -364,6 +454,9 @@ func TestRegistry_CleanupLegacyDuplicatesMergesSubdirRowsByGitToplevel(t *testin
 	}
 	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 40 {
 		t.Fatalf("timestamps not merged: %+v", rec)
+	}
+	if !rec.LifecycleDisabled() || rec.LifecycleUpdatedTS != 35 {
+		t.Fatalf("lifecycle not merged conservatively: %+v", rec)
 	}
 	wantHarnesses := []string{"claude-code", "codex"}
 	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {

@@ -72,7 +72,14 @@ type RepoRecord struct {
 	FirstRegisteredTS int64    `json:"first_registered_ts"`
 	LastSeenTS        int64    `json:"last_seen_ts"`
 	Harnesses         []string `json:"harnesses"`
+	LifecycleState    string   `json:"lifecycle_state,omitempty"`
+	LifecycleUpdatedTS int64    `json:"lifecycle_updated_ts,omitempty"`
 }
+
+const (
+	RepoLifecycleEnabled  = "enabled"
+	RepoLifecycleDisabled = "disabled"
+)
 
 // RepoRegistrationResult describes an explicit registry insert or refresh.
 type RepoRegistrationResult struct {
@@ -114,6 +121,15 @@ type RepoRemovalSafety struct {
 	DaemonPID        int    `json:"daemon_pid,omitempty"`
 	DaemonAlive      bool   `json:"daemon_alive"`
 	DaemonStateError string `json:"daemon_state_error,omitempty"`
+}
+
+// RepoLifecycleResult describes a per-repo lifecycle mutation. NotFound is
+// true when the target does not match any registry row; Updated is true only
+// when the disabled lifecycle fields changed.
+type RepoLifecycleResult struct {
+	Record   RepoRecord `json:"record,omitempty"`
+	Updated  bool       `json:"updated"`
+	NotFound bool       `json:"not_found"`
 }
 
 // LegacyDuplicateChange describes one registry row removed by
@@ -358,6 +374,56 @@ func (r *Registry) RemoveRepo(ctx context.Context, target RepoRemovalTarget) Rep
 	}
 }
 
+// DisableRepo marks a registered repo disabled without touching registration,
+// daemon, harness, or timestamp metadata. Call this from inside WithLock when
+// persisting the mutation.
+func (r *Registry) DisableRepo(target RepoRemovalTarget, now int64) RepoLifecycleResult {
+	return r.setRepoDisabled(target, true, now)
+}
+
+// EnableRepo clears a registered repo's disabled lifecycle state without
+// touching registration, daemon, harness, or timestamp metadata. Call this
+// from inside WithLock when persisting the mutation.
+func (r *Registry) EnableRepo(target RepoRemovalTarget, now int64) RepoLifecycleResult {
+	return r.setRepoDisabled(target, false, now)
+}
+
+func (r *Registry) setRepoDisabled(target RepoRemovalTarget, disabled bool, now int64) RepoLifecycleResult {
+	if r == nil {
+		return RepoLifecycleResult{NotFound: true}
+	}
+	idx, ok := r.findRepoIndex(target.Path, target.StateDB)
+	if !ok {
+		return RepoLifecycleResult{NotFound: true}
+	}
+	row := &r.Repos[idx]
+	beforeState := row.LifecycleState
+	beforeUpdatedTS := row.LifecycleUpdatedTS
+	if disabled {
+		row.LifecycleState = RepoLifecycleDisabled
+		row.LifecycleUpdatedTS = now
+	} else {
+		row.LifecycleState = ""
+		row.LifecycleUpdatedTS = now
+	}
+	return RepoLifecycleResult{
+		Record:   *row,
+		Updated:  beforeState != row.LifecycleState || beforeUpdatedTS != row.LifecycleUpdatedTS,
+		NotFound: false,
+	}
+}
+
+func (rec RepoRecord) LifecycleStateName() string {
+	if rec.LifecycleState == "" {
+		return RepoLifecycleEnabled
+	}
+	return rec.LifecycleState
+}
+
+func (rec RepoRecord) LifecycleDisabled() bool {
+	return rec.LifecycleState == RepoLifecycleDisabled
+}
+
 func (r *Registry) findRepoIndex(path string, stateDBs ...string) (int, bool) {
 	if r == nil {
 		return -1, false
@@ -473,6 +539,20 @@ func mergeRepoRecord(dst *RepoRecord, src RepoRecord) {
 	}
 	for _, h := range src.Harnesses {
 		dst.Harnesses = addHarness(dst.Harnesses, h)
+	}
+	mergeRepoLifecycle(dst, src)
+}
+
+func mergeRepoLifecycle(dst *RepoRecord, src RepoRecord) {
+	if dst == nil {
+		return
+	}
+	if src.LifecycleState != RepoLifecycleDisabled {
+		return
+	}
+	dst.LifecycleState = RepoLifecycleDisabled
+	if src.LifecycleUpdatedTS > dst.LifecycleUpdatedTS {
+		dst.LifecycleUpdatedTS = src.LifecycleUpdatedTS
 	}
 }
 
