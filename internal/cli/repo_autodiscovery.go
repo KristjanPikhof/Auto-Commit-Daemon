@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	repoAutodiscoverySkipDisabled = "autodiscovery_disabled"
-	repoAutodiscoverySkipRegistry = "autodiscovery_registry_error"
+	repoAutodiscoverySkipDisabled     = "autodiscovery_disabled"
+	repoAutodiscoverySkipRegistry     = "autodiscovery_registry_error"
 	repoAutodiscoverySkipRepoDisabled = "repo_disabled"
 )
 
