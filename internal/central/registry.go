@@ -66,13 +66,13 @@ type Registry struct {
 
 // RepoRecord is one entry in Registry.Repos.
 type RepoRecord struct {
-	Path              string   `json:"path"`
-	RepoHash          string   `json:"repo_hash"`
-	StateDB           string   `json:"state_db"`
-	FirstRegisteredTS int64    `json:"first_registered_ts"`
-	LastSeenTS        int64    `json:"last_seen_ts"`
-	Harnesses         []string `json:"harnesses"`
-	LifecycleState    string   `json:"lifecycle_state,omitempty"`
+	Path               string   `json:"path"`
+	RepoHash           string   `json:"repo_hash"`
+	StateDB            string   `json:"state_db"`
+	FirstRegisteredTS  int64    `json:"first_registered_ts"`
+	LastSeenTS         int64    `json:"last_seen_ts"`
+	Harnesses          []string `json:"harnesses"`
+	LifecycleState     string   `json:"lifecycle_state,omitempty"`
 	LifecycleUpdatedTS int64    `json:"lifecycle_updated_ts,omitempty"`
 }
 
