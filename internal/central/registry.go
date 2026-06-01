@@ -400,9 +400,15 @@ func (r *Registry) setRepoDisabled(target RepoRemovalTarget, disabled bool, now 
 	beforeState := row.LifecycleState
 	beforeUpdatedTS := row.LifecycleUpdatedTS
 	if disabled {
+		if row.LifecycleDisabled() {
+			return RepoLifecycleResult{Record: *row}
+		}
 		row.LifecycleState = RepoLifecycleDisabled
 		row.LifecycleUpdatedTS = now
 	} else {
+		if !row.LifecycleDisabled() && row.LifecycleState == "" {
+			return RepoLifecycleResult{Record: *row}
+		}
 		row.LifecycleState = ""
 		row.LifecycleUpdatedTS = now
 	}

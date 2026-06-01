@@ -39,6 +39,7 @@ func TestRegistry_RoundTrip(t *testing.T) {
 	want := NewRegistry()
 	want.UpsertRepo("/tmp/repo-A", "aaaa1111", "/tmp/repo-A/.git/acd/state.db", "claude-code", 100)
 	want.UpsertRepo("/tmp/repo-B", "bbbb2222", "/tmp/repo-B/.git/acd/state.db", "codex", 200)
+	want.DisableRepo(RepoRemovalTarget{Path: "/tmp/repo-B"}, 250)
 
 	if err := Save(roots, want); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -157,6 +158,10 @@ func TestRegistry_DisableEnableRepoLifecycle(t *testing.T) {
 	if enabled.Record.LifecycleStateName() != RepoLifecycleEnabled || enabled.Record.LifecycleUpdatedTS != 40 {
 		t.Fatalf("enabled record=%+v, want lifecycle cleared", enabled.Record)
 	}
+	enabledAgain := reg.EnableRepo(RepoRemovalTarget{Path: "/tmp/repo"}, 50)
+	if enabledAgain.NotFound || enabledAgain.Updated {
+		t.Fatalf("idempotent enable=%+v, want no update", enabledAgain)
+	}
 
 	missing := reg.DisableRepo(RepoRemovalTarget{Path: "/tmp/missing"}, 50)
 	if !missing.NotFound || missing.Updated {
@@ -184,6 +189,62 @@ func TestRegistry_UpsertPreservesDisabledState(t *testing.T) {
 	wantHarnesses := []string{"codex", "pi"}
 	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
 		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
+func TestRegistry_RegisterResolvedRepoPreservesDisabledState(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+
+	reg := NewRegistry()
+	if _, err := reg.RegisterResolvedRepo(wt, "codex", 10); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	reg.DisableRepo(RepoRemovalTarget{Path: wt.Root}, 25)
+
+	refreshed, err := reg.RegisterResolvedRepo(wt, "pi", 40)
+	if err != nil {
+		t.Fatalf("refresh register: %v", err)
+	}
+	if refreshed.Inserted || !refreshed.Refreshed {
+		t.Fatalf("refresh result=%+v, want refreshed", refreshed)
+	}
+	if !refreshed.Record.LifecycleDisabled() || refreshed.Record.LifecycleUpdatedTS != 25 {
+		t.Fatalf("lifecycle=%+v, want disabled preserved", refreshed.Record)
+	}
+	if refreshed.Record.LastSeenTS != 40 {
+		t.Fatalf("last_seen=%d, want 40", refreshed.Record.LastSeenTS)
+	}
+}
+
+func TestRegistry_NormalizeDisabledWinsWhenMergingDuplicates(t *testing.T) {
+	reg := NewRegistry()
+	reg.Repos = []RepoRecord{
+		{Path: "/tmp/repo", RepoHash: "old", StateDB: "/tmp/repo/.git/acd/state-old.db", FirstRegisteredTS: 10, LastSeenTS: 20, Harnesses: []string{"codex"}, LifecycleState: RepoLifecycleDisabled, LifecycleUpdatedTS: 30},
+		{Path: "/tmp/repo", RepoHash: "new", StateDB: "/tmp/repo/.git/acd/state.db", FirstRegisteredTS: 15, LastSeenTS: 40, Harnesses: []string{"pi"}},
+	}
+
+	reg.Normalize()
+
+	if len(reg.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(reg.Repos))
+	}
+	rec := reg.Repos[0]
+	if !rec.LifecycleDisabled() || rec.LifecycleUpdatedTS != 30 {
+		t.Fatalf("lifecycle=%+v, want disabled winner", rec)
+	}
+	if rec.RepoHash != "new" || rec.LastSeenTS != 40 {
+		t.Fatalf("metadata=%+v, want newest non-lifecycle fields", rec)
 	}
 }
 
