@@ -31,6 +31,7 @@ const defaultListWatchInterval = 2 * time.Second
 type listEntry struct {
 	Path                 string     `json:"path"`
 	RepoHash             string     `json:"repo_hash"`
+	LifecycleState       string     `json:"lifecycle_state"`
 	Daemon               string     `json:"daemon"`
 	PID                  int        `json:"pid,omitempty"`
 	Clients              int        `json:"clients"`
@@ -184,10 +185,18 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 
 	for _, rec := range reg.Repos {
 		e := listEntry{
-			Path:     rec.Path,
-			RepoHash: rec.RepoHash,
-			Daemon:   "-",
-			Status:   "OK",
+			Path:           rec.Path,
+			RepoHash:       rec.RepoHash,
+			LifecycleState: rec.LifecycleStateName(),
+			Daemon:         "-",
+			Status:         "OK",
+		}
+
+		if rec.LifecycleDisabled() {
+			e.Status = "disabled"
+			e.StatusNote = "repo lifecycle disabled"
+			entries = append(entries, e)
+			continue
 		}
 
 		// Repo dir missing — we still emit a row so the user sees what gc
@@ -302,6 +311,9 @@ func renderListTableCompact(out io.Writer, entries []listEntry) error {
 	for _, e := range entries {
 		repo := listRepoLabelCompact(e.Path, labels)
 		statusCol := listStatusCompact(e.Status)
+		if e.Status == "disabled" {
+			statusCol = "disabled"
+		}
 		if e.Status == "waiting" && e.IntentWaitSeconds > 0 {
 			statusCol = statusCol + " " + formatDurationCompact(time.Duration(e.IntentWaitSeconds)*time.Second)
 		}
@@ -354,7 +366,7 @@ func renderListWatchFrame(out io.Writer, snapshot listSnapshot, verbose bool) er
 // dashIfMissing returns "-" when the row represents a missing/unreadable
 // repo so the table reads "no data yet" without lying about zero rows.
 func dashIfMissing(status, val string) string {
-	if status == "missing" || status == "unreadable" {
+	if status == "missing" || status == "unreadable" || status == "disabled" {
 		return "-"
 	}
 	return val

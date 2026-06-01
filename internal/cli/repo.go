@@ -57,7 +57,21 @@ type repoRemoveResult struct {
 	Stopped            *stopRepoResult           `json:"stopped,omitempty"`
 }
 
+type repoLifecycleCommandResult struct {
+	Target             central.RepoRemovalTarget `json:"target"`
+	Repo               string                    `json:"repo,omitempty"`
+	StateDB            string                    `json:"state_db,omitempty"`
+	Action             string                    `json:"action"`
+	Updated            bool                      `json:"updated"`
+	NotFound           bool                      `json:"not_found"`
+	StatePreserved     bool                      `json:"state_preserved"`
+	StartCachesCleared bool                      `json:"start_caches_cleared,omitempty"`
+	Stopped            *stopRepoResult           `json:"stopped,omitempty"`
+	Record             central.RepoRecord        `json:"record,omitempty"`
+}
+
 var repoRemoveStopOneRepo = stopOneRepo
+var repoDisableStopOneRepo = stopOneRepo
 
 func newRepoCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -65,11 +79,13 @@ func newRepoCmd() *cobra.Command {
 		Short: "Manage explicit repo registration lifecycle",
 		Long: `Manage explicit acd repository registration without starting normal capture and replay workflows.
 
-Autodiscovery is enabled by default, so normal harness hooks still create repo state automatically. Use repo init to prepare the current Git worktree when autodiscovery is disabled, repo list to inspect every registry row, and repo remove to preview or remove a repo registration.
+Autodiscovery is enabled by default, so normal harness hooks still create repo state automatically. Use repo init to prepare the current Git worktree when autodiscovery is disabled, repo disable to stop and disable a registered repo without deleting state, repo enable to re-enable a disabled repo, repo list to inspect every registry row, and repo remove to preview or remove a repo registration.
 
 Disable implicit repo registration with repo_lifecycle.autodiscovery in ~/.config/acd/config.json or override one shell with ACD_REPO_AUTODISCOVERY=disabled.`,
 		Example: `  acd repo init
   acd repo init --json
+  acd repo disable --repo /path/to/repo
+  acd repo enable --repo /path/to/repo --json
   acd repo list --json
   acd repo remove --dry-run
   acd repo remove --yes
@@ -77,6 +93,8 @@ Disable implicit repo registration with repo_lifecycle.autodiscovery in ~/.confi
 	}
 	cmd.AddCommand(
 		newRepoInitCmd(),
+		newRepoDisableCmd(),
+		newRepoEnableCmd(),
 		newRepoListCmd(),
 		newRepoRemoveCmd(),
 	)
@@ -97,6 +115,40 @@ This command refuses detached HEAD, opens or creates .git/acd/state.db, and reco
 			repoFlag, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			return runRepoInit(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
+		},
+	}
+}
+
+func newRepoDisableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "disable",
+		Short: "Disable a registered repo without deleting state",
+		Long: `Disable a registered repo in the central registry without deleting .git/acd/state.db.
+
+The command stops a live repo daemon, clears start caches, and preserves state so the repo can be enabled again later. It does not create a registry row for unknown repos.`,
+		Example: `  acd repo disable --repo /path/to/repo
+  acd repo disable --repo /path/to/repo --json`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repoFlag, _ := cmd.Flags().GetString("repo")
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			return runRepoDisable(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
+		},
+	}
+}
+
+func newRepoEnableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "enable",
+		Short: "Enable a registered repo without starting its daemon",
+		Long: `Enable a registered repo in the central registry without starting its daemon.
+
+The command clears the disabled lifecycle state and preserves .git/acd/state.db. It does not create a registry row for unknown repos.`,
+		Example: `  acd repo enable --repo /path/to/repo
+  acd repo enable --repo /path/to/repo --json`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repoFlag, _ := cmd.Flags().GetString("repo")
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			return runRepoEnable(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
 		},
 	}
 }
@@ -237,6 +289,93 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 	return nil
 }
 
+func runRepoDisable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
+	return runRepoLifecycleCommand(ctx, out, repoFlag, true, jsonOut)
+}
+
+func runRepoEnable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
+	return runRepoLifecycleCommand(ctx, out, repoFlag, false, jsonOut)
+}
+
+func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string, disable bool, jsonOut bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	action := "enable"
+	if disable {
+		action = "disable"
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		return fmt.Errorf("acd repo %s: resolve paths: %w", action, err)
+	}
+	target, err := repoRemovalTargetForCommand(ctx, repoFlag, "repo "+action)
+	if err != nil {
+		return err
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		return fmt.Errorf("acd repo %s: load registry: %w", action, err)
+	}
+	rec, ok := reg.FindRepo(target.Path, target.StateDB)
+	if !ok {
+		return repoLifecycleUnknownTargetError(action, target)
+	}
+	safety := central.ProbeRepoRemovalSafety(ctx, rec)
+	res := repoLifecycleCommandResult{
+		Target:         target,
+		Repo:           rec.Path,
+		StateDB:        rec.StateDB,
+		Action:         action,
+		StatePreserved: true,
+		Record:         rec,
+	}
+	if disable && safety.DaemonAlive {
+		stopRes, err := repoDisableStopOneRepo(ctx, rec.Path, "", true)
+		res.Stopped = &stopRes
+		if err != nil {
+			return fmt.Errorf("acd repo disable: stop daemon: %w", err)
+		}
+		if !stopRes.Stopped {
+			return fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
+		}
+	}
+	var changed central.RepoLifecycleResult
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		if disable {
+			changed = reg.DisableRepo(target, time.Now().Unix())
+		} else {
+			changed = reg.EnableRepo(target, time.Now().Unix())
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("acd repo %s: update registry: %w", action, err)
+	}
+	if changed.NotFound {
+		return repoLifecycleUnknownTargetError(action, target)
+	}
+	res.Updated = changed.Updated
+	res.Record = changed.Record
+	res.Repo = changed.Record.Path
+	res.StateDB = changed.Record.StateDB
+	if disable && safety.GitDir != "" {
+		removeAllStartCaches(safety.GitDir)
+		res.StartCachesCleared = true
+	}
+	return renderRepoLifecycleCommand(out, res, jsonOut)
+}
+
+func repoLifecycleUnknownTargetError(action string, target central.RepoRemovalTarget) error {
+	name := target.Path
+	if name == "" {
+		name = target.StateDB
+	}
+	if name == "" {
+		name = "."
+	}
+	return fmt.Errorf("acd repo %s: repo %s is not registered; run `acd repo init --repo %s` to register it or `acd repo list` to inspect registered repos", action, name, name)
+}
+
 func runRepoRemove(ctx context.Context, out io.Writer, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {
 	return runRepoRemoveWithInput(ctx, out, os.Stdin, repoFlag, dryRun, yes, purgeState, jsonOut)
 }
@@ -255,7 +394,7 @@ func runRepoRemoveWithInput(ctx context.Context, out io.Writer, in io.Reader, re
 	if !yes && !dryRun && !jsonOut && repoFlag == "" {
 		return runRepoRemoveInteractive(ctx, roots, out, in, purgeState)
 	}
-	target, err := repoRemovalTarget(ctx, repoFlag)
+	target, err := repoRemovalTargetForCommand(ctx, repoFlag, "repo remove")
 	if err != nil {
 		return err
 	}
@@ -555,6 +694,10 @@ func repoBranchRef(ctx context.Context, repo, command string) (string, error) {
 }
 
 func repoRemovalTarget(ctx context.Context, repoFlag string) (central.RepoRemovalTarget, error) {
+	return repoRemovalTargetForCommand(ctx, repoFlag, "repo remove")
+}
+
+func repoRemovalTargetForCommand(ctx context.Context, repoFlag, command string) (central.RepoRemovalTarget, error) {
 	if wt, err := git.ResolveWorktree(ctx, repoFlag); err == nil {
 		return central.RepoRemovalTarget{
 			Path:    wt.Root,
@@ -567,13 +710,13 @@ func repoRemovalTarget(ctx context.Context, repoFlag string) (central.RepoRemova
 	if path == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return central.RepoRemovalTarget{}, fmt.Errorf("acd repo remove: get cwd: %w", err)
+			return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: get cwd: %w", command, err)
 		}
 		path = cwd
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return central.RepoRemovalTarget{}, fmt.Errorf("acd repo remove: abs %q: %w", path, err)
+		return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: abs %q: %w", command, path, err)
 	}
 	return central.RepoRemovalTarget{Path: filepath.Clean(abs)}, nil
 }
@@ -608,6 +751,8 @@ func previewRepoRemoval(ctx context.Context, roots paths.Roots, target central.R
 
 func repoLifecycleStatus(rec central.RepoRecord, safety central.RepoRemovalSafety) string {
 	switch {
+	case rec.LifecycleDisabled():
+		return "disabled"
 	case rec.Path != "" && !fileExists(rec.Path):
 		return "repo-missing"
 	case !safety.StateDBExists:
@@ -631,6 +776,33 @@ func repoEntryDaemon(entry repoListEntry) string {
 		return fmt.Sprintf("%s pid=%d", entry.Daemon, entry.PID)
 	}
 	return entry.Daemon
+}
+
+func renderRepoLifecycleCommand(out io.Writer, res repoLifecycleCommandResult, jsonOut bool) error {
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	}
+	past := "enabled"
+	if res.Action == "disable" {
+		past = "disabled"
+	}
+	if res.Updated {
+		fmt.Fprintf(out, "acd repo %s: %s %s\n", res.Action, past, res.Repo)
+	} else {
+		fmt.Fprintf(out, "acd repo %s: already %s %s\n", res.Action, past, res.Repo)
+	}
+	if res.Action == "disable" {
+		if res.Stopped != nil && res.Stopped.Stopped {
+			fmt.Fprintf(out, "daemon: stopped pid=%d\n", res.Stopped.DaemonPID)
+		}
+		if res.StartCachesCleared {
+			fmt.Fprintln(out, "start cache: cleared")
+		}
+	}
+	fmt.Fprintf(out, "state: preserved %s\n", res.StateDB)
+	return nil
 }
 
 func renderRepoRemove(out io.Writer, res repoRemoveResult, jsonOut bool) error {

@@ -135,6 +135,19 @@ func TestEvaluateShortCircuit_Matrix(t *testing.T) {
 			wantBlame: "registry_missing_repo",
 		},
 		{
+			name: "disabled_registry_entry_escalates",
+			cache: stampedCache(),
+			registry: &central.RepoRecord{
+				Path:           "/tmp/x",
+				RepoHash:       repoHash,
+				LastSeenTS:     freshTS,
+				LifecycleState: central.RepoLifecycleDisabled,
+			},
+			fp:        matchingFP,
+			wantOK:    false,
+			wantBlame: repoAutodiscoverySkipRepoDisabled,
+		},
+		{
 			name: "harness_mismatch_escalates",
 			cache: func() *startCache {
 				c := stampedCache()
