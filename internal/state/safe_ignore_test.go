@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"database/sql"
 	"reflect"
 	"testing"
 )
