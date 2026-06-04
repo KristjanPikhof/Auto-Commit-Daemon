@@ -181,6 +181,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseCapacity(ctx, conn, &report); err != nil {
 		return report, err
 	}
+	if err := diagnoseGeneratedPending(ctx, conn, rec.Path, &report); err != nil {
+		return report, err
+	}
 	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
 		return report, err
 	} else {
@@ -335,6 +338,40 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
 			report.EventsDroppedTotal = total
 		}
+	}
+	return nil
+}
+
+func diagnoseGeneratedPending(ctx context.Context, conn *sql.DB, repo string, report *diagnoseReport) error {
+	groups, err := state.ScanGeneratedPendingDeletes(ctx, conn, state.NewSafeIgnoreMatcher(), 0)
+	if err != nil {
+		return fmt.Errorf("generated pending deletes: %w", err)
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	roots := make([]string, 0, len(groups))
+	for _, group := range groups {
+		roots = append(roots, group.Root)
+	}
+	tracked, err := git.CountTrackedPathsUnder(ctx, repo, roots...)
+	if err != nil {
+		return fmt.Errorf("tracked generated roots: %w", err)
+	}
+	report.GeneratedPending = make([]diagnoseGeneratedPendingGroup, 0, len(groups))
+	for _, group := range groups {
+		report.GeneratedPending = append(report.GeneratedPending, diagnoseGeneratedPendingGroup{
+			Root:             group.Root,
+			Pattern:          group.Pattern,
+			BranchRef:        group.BranchRef,
+			BranchGeneration: group.BranchGeneration,
+			BaseHead:         group.BaseHead,
+			PendingCount:     group.PendingCount,
+			TrackedCount:     tracked[group.Root],
+			OldestSeq:        group.OldestSeq,
+			NewestSeq:        group.NewestSeq,
+			EventSeqs:        append([]int64(nil), group.EventSeqs...),
+		})
 	}
 	return nil
 }
@@ -598,6 +635,16 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			fmt.Sprintf("%d failed terminal barrier(s) block later pending replay; inspect the recent barriers and run `acd fix --dry-run` before purging.", report.FailedBlockingPending))
 	}
+	for _, group := range report.GeneratedPending {
+		remediation = append(remediation,
+			fmt.Sprintf("Generated root %s has %d queued delete(s); stop the daemon if it is running, run `acd fix --repo %s --dry-run`, then `acd fix --repo %s --yes` to clean ACD state only.",
+				group.Root, group.PendingCount, report.Repo, report.Repo))
+		if group.TrackedCount > 0 {
+			remediation = append(remediation,
+				fmt.Sprintf("Generated root %s still has %d tracked file(s) in Git; review `git status -- %s`, then run `git add -u -- %s` and commit the cleanup yourself.",
+					group.Root, group.TrackedCount, group.Root, group.Root))
+		}
+	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
 			"capture pending depth is non-zero; queue is waiting/draining. If depth keeps climbing toward ACD_MAX_PENDING_EVENTS, wait for replay, run acd flush --logical for intentional batch waits, or run acd resume if capture/replay is paused.")
@@ -709,6 +756,14 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 		fmt.Fprintf(out, "Git operation: %s present for %s%s\n",
 			r.OperationInProgress, r.OperationMarkerDuration, stale)
+	}
+
+	if len(r.GeneratedPending) > 0 {
+		fmt.Fprintln(out, "Generated pending deletes:")
+		for _, group := range r.GeneratedPending {
+			fmt.Fprintf(out, "  - root=%s pending=%d tracked=%d seq=%d..%d pattern=%s\n",
+				group.Root, group.PendingCount, group.TrackedCount, group.OldestSeq, group.NewestSeq, group.Pattern)
+		}
 	}
 
 	fmt.Fprintln(out, "Terminal replay barrier histogram:")
