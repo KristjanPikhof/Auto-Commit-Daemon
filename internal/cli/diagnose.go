@@ -66,26 +66,26 @@ type diagnoseGeneratedPendingGroup struct {
 }
 
 type diagnoseReport struct {
-	Repo                       string                 `json:"repo"`
-	RepoHash                   string                 `json:"repo_hash"`
-	StateDB                    string                 `json:"state_db"`
-	Anchor                     diagnoseAnchorReport   `json:"anchor"`
-	PendingDepth               int                    `json:"pending_depth"`
-	FailedEvents               int                    `json:"failed_events"`
-	FailedBlockingPending      int                    `json:"failed_blocking_pending"`
-	PendingHighWater           int64                  `json:"pending_high_water"`
-	BackpressurePaused         bool                   `json:"backpressure_paused"`
-	BackpressurePausedAt       string                 `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal         int64                  `json:"events_dropped_total"`
-	IntentStrategy             intentStrategyReport   `json:"intent_strategy"`
-	BlockedHistogram           []diagnoseBlockedClass `json:"blocked_histogram"`
-	RecentBlocked              []diagnoseBlockedEntry `json:"recent_blocked"`
+	Repo                       string                          `json:"repo"`
+	RepoHash                   string                          `json:"repo_hash"`
+	StateDB                    string                          `json:"state_db"`
+	Anchor                     diagnoseAnchorReport            `json:"anchor"`
+	PendingDepth               int                             `json:"pending_depth"`
+	FailedEvents               int                             `json:"failed_events"`
+	FailedBlockingPending      int                             `json:"failed_blocking_pending"`
+	PendingHighWater           int64                           `json:"pending_high_water"`
+	BackpressurePaused         bool                            `json:"backpressure_paused"`
+	BackpressurePausedAt       string                          `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
+	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
+	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
+	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
-	AutoResolvableBlockedCount int                    `json:"auto_resolvable_blocked_count"`
-	BarrierWithSuccessorsCount int                    `json:"barrier_with_successors_count"`
-	OperationInProgress        string                 `json:"operation_in_progress,omitempty"`
-	StaleOperationMarker       bool                   `json:"stale_operation_marker"`
-	OperationMarkerDuration    string                 `json:"operation_marker_duration,omitempty"`
+	AutoResolvableBlockedCount int                             `json:"auto_resolvable_blocked_count"`
+	BarrierWithSuccessorsCount int                             `json:"barrier_with_successors_count"`
+	OperationInProgress        string                          `json:"operation_in_progress,omitempty"`
+	StaleOperationMarker       bool                            `json:"stale_operation_marker"`
+	OperationMarkerDuration    string                          `json:"operation_marker_duration,omitempty"`
 	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
 	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
 	// terminal prune action so operators can confirm stale-branch hygiene

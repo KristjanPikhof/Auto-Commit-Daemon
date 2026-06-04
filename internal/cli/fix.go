@@ -618,7 +618,7 @@ func planGeneratedPendingCleanup(ctx context.Context, conn *sql.DB, repo string,
 			EventSeqs:         append([]int64(nil), group.EventSeqs...),
 		})
 		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-			"Generated root %s has %d queued delete(s) and %d tracked file(s); `acd fix --repo %s --yes` cleans ACD state only. To record the Git cleanup, review `git status -- %s`, then run `git add -u -- %s` and commit it yourself.",
+			"Generated root %s has %d queued delete(s) and %d tracked file(s); `acd fix --repo %s --yes` cleans ACD state only. To record the Git cleanup, review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
 			group.Root, group.PendingCount, trackedCount, plan.Repo, group.Root, group.Root))
 	}
 	return nil

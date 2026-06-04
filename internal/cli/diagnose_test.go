@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -563,6 +564,56 @@ func TestDiagnose_CapacityRemediation_FiresOnDepthAlone(t *testing.T) {
 	if !sawHint {
 		t.Fatalf("remediation lacks capacity hint even with PendingDepth=1 and PendingHighWater=0: %v",
 			rep.Remediation)
+	}
+}
+
+func TestDiagnose_GeneratedPendingGuidance(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+	seedDiagnoseCommit(t, repo)
+	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, d)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose json: %v\n%s", err, out.String())
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if len(rep.GeneratedPending) != 1 {
+		t.Fatalf("generated_pending=%+v, want one group", rep.GeneratedPending)
+	}
+	group := rep.GeneratedPending[0]
+	if group.Root != ".derivedData-provider-core" ||
+		group.PendingCount != 2 ||
+		group.TrackedCount != 2 ||
+		group.Pattern != ".derivedData*/" ||
+		!reflect.DeepEqual(group.EventSeqs, generatedSeqs) {
+		t.Fatalf("generated group=%+v seqs=%v", group, generatedSeqs)
+	}
+	for _, want := range []string{"acd fix --repo " + repo + " --dry-run", "acd fix --repo " + repo + " --yes", "git add -u -- .derivedData-provider-core"} {
+		if !containsStringWith(rep.Remediation, want) {
+			t.Fatalf("remediation missing %q: %v", want, rep.Remediation)
+		}
+	}
+
+	out.Reset()
+	if err := runDiagnose(ctx, &out, repo, false); err != nil {
+		t.Fatalf("runDiagnose human: %v", err)
+	}
+	for _, want := range []string{
+		"Generated pending deletes:",
+		"root=.derivedData-provider-core pending=2 tracked=2",
+		"pattern=.derivedData*/",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("human diagnose missing %q in:\n%s", want, out.String())
+		}
 	}
 }
 
