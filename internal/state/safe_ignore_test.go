@@ -1,6 +1,8 @@
 package state
 
 import (
+	"context"
+	"database/sql"
 	"reflect"
 	"testing"
 )
@@ -74,6 +76,89 @@ func TestSafeIgnoreDirectoryPatternsDoNotMatchSameNamedFiles(t *testing.T) {
 		if !m.MatchFile(rel) {
 			t.Fatalf("MatchFile(%q) = false, want true for descendant", rel)
 		}
+	}
+}
+
+func TestSafeIgnoreMatchRootReturnsConcreteGeneratedRoot(t *testing.T) {
+	t.Setenv(EnvSafeIgnore, "")
+	t.Setenv(EnvSafeIgnoreExtra, "web/build/")
+	m := NewSafeIgnoreMatcher()
+
+	cases := []struct {
+		path        string
+		wantRoot    string
+		wantPattern string
+	}{
+		{"frontend/node_modules/react/index.js", "frontend/node_modules", "node_modules/"},
+		{".derivedData-provider-core/Index.noindex/cache.db", ".derivedData-provider-core", ".derivedData*/"},
+		{"nested/.derivedData-tests/Build/cache.db", "nested/.derivedData-tests", ".derivedData*/"},
+		{"web/build/app.js", "web/build", "web/build/"},
+	}
+	for _, tc := range cases {
+		got, ok := m.MatchRoot(tc.path)
+		if !ok {
+			t.Fatalf("MatchRoot(%q) did not match", tc.path)
+		}
+		if got.Root != tc.wantRoot || got.Pattern != tc.wantPattern {
+			t.Fatalf("MatchRoot(%q) = %+v, want root=%q pattern=%q", tc.path, got, tc.wantRoot, tc.wantPattern)
+		}
+	}
+}
+
+func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
+	t.Setenv(EnvSafeIgnore, "")
+	t.Setenv(EnvSafeIgnoreExtra, "")
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	head := "0123456789012345678901234567890123456789"
+
+	appendEvent := func(op, path, st string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         head,
+			Operation:        op,
+			Path:             path,
+			Fidelity:         "full",
+			State:            st,
+		}, nil)
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent(%s,%s,%s): %v", op, path, st, err)
+		}
+		return seq
+	}
+
+	seqOne := appendEvent("delete", "frontend/node_modules/react/index.js", EventStatePending)
+	seqTwo := appendEvent("delete", "frontend/node_modules/react/package.json", EventStatePending)
+	seqThree := appendEvent("delete", ".derivedData-provider-core/Index.noindex/cache.db", EventStatePending)
+	appendEvent("delete", "build/output.js", EventStatePending)
+	appendEvent("delete", "docs/node_modules.md", EventStatePending)
+	appendEvent("create", "node_modules/new-file.js", EventStatePending)
+	appendEvent("delete", "node_modules/published.js", EventStatePublished)
+
+	groups, err := ScanGeneratedPendingDeletes(ctx, db.ReadSQL(), NewSafeIgnoreMatcher(), 0)
+	if err != nil {
+		t.Fatalf("ScanGeneratedPendingDeletes: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("groups=%+v, want 2 generated groups", groups)
+	}
+	if g := groups[0]; g.Root != "frontend/node_modules" || g.Pattern != "node_modules/" ||
+		g.PendingCount != 2 || g.OldestSeq != seqOne || g.NewestSeq != seqTwo ||
+		!reflect.DeepEqual(g.EventSeqs, []int64{seqOne, seqTwo}) {
+		t.Fatalf("node_modules group=%+v", g)
+	}
+	if g := groups[1]; g.Root != ".derivedData-provider-core" || g.Pattern != ".derivedData*/" ||
+		g.PendingCount != 1 || g.OldestSeq != seqThree || g.NewestSeq != seqThree ||
+		!reflect.DeepEqual(g.EventSeqs, []int64{seqThree}) {
+		t.Fatalf("derived data group=%+v", g)
+	}
+}
+
+func TestScanGeneratedPendingDeletesRequiresQueryer(t *testing.T) {
+	if _, err := ScanGeneratedPendingDeletes(context.Background(), nil, NewSafeIgnoreMatcher(), 0); err == nil {
+		t.Fatalf("ScanGeneratedPendingDeletes nil queryer error = nil")
 	}
 }
 
