@@ -265,6 +265,20 @@ acd doctor
 
 Restart the daemon after changing these values.
 
+Tracked generated files are different from new generated files. If a cache tree
+such as `.derivedData-provider-core/` was already committed to Git, deleting it
+can leave pending delete rows from an older ACD version or a stale queue. New
+capture passes protect those safe-ignore deletes instead of queuing them, and
+`acd diagnose --json` reports grouped `generated_pending` roots. Use
+`acd fix --dry-run` and `acd fix --yes` to clean ACD state, then review and
+commit the Git cleanup separately:
+
+~~~bash
+git status -- .derivedData-provider-core
+git add -u -- .derivedData-provider-core
+git commit -m "Remove tracked generated cache files"
+~~~
+
 ## Revert and rebase workflows
 
 Pause before planned branch surgery:

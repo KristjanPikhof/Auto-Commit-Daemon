@@ -265,6 +265,26 @@ acd doctor
 
 Restart the daemon after changing these settings.
 
+## Generated cache flood recovery
+
+Use this when a generated cache directory was tracked in Git and then deleted,
+for example `.derivedData-provider-core/`.
+
+| Step | Command | Result |
+|---|---|---|
+| Inspect | `acd diagnose --json` | Shows `generated_pending` roots, queued delete count, and tracked count. |
+| Preview ACD cleanup | `acd fix --dry-run` | Shows `drop_generated_pending` actions. |
+| Stop if needed | `acd stop` | Required when a live daemon owns the state DB. |
+| Clean ACD queue | `acd fix --yes` | Removes only protected generated pending rows from ACD state. |
+| Review Git cleanup | `git status -- .derivedData-provider-core` | Confirms which tracked generated files are deleted. |
+| Stage Git cleanup | `git add -u -- .derivedData-provider-core` | Stages the tracked generated file removals. |
+| Commit Git cleanup | `git commit -m "Remove tracked generated cache files"` | Records the repository cleanup. |
+
+Why this happens: `.gitignore` and ACD safe-ignore prevent new generated files
+from being captured, but they do not untrack files already committed to Git.
+ACD keeps Git mutation separate from state recovery, so `acd fix --yes` never
+stages or commits those removals for you.
+
 ## Blocked conflicts and failed barriers
 
 `blocked_conflict` and `failed` are terminal. Later pending rows for the same
