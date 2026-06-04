@@ -964,3 +964,82 @@ ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error`, hea
 		t.Fatalf("seed publish_state: %v", err)
 	}
 }
+
+func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo string, db *state.DB) []int64 {
+	t.Helper()
+	write := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write(".derivedData-provider-core/Index.noindex/a.db", "a")
+	write(".derivedData-provider-core/Index.noindex/b.db", "b")
+	write("build/output.js", "ignored but not safe-ignore")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "-f",
+		".derivedData-provider-core/Index.noindex/a.db",
+		".derivedData-provider-core/Index.noindex/b.db"); err != nil {
+		t.Fatalf("git add forced generated files: %v", err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	seed := func(path, op string) int64 {
+		t.Helper()
+		seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         head,
+			Operation:        op,
+			Path:             path,
+			Fidelity:         "full",
+			State:            state.EventStatePending,
+		}, []state.CaptureOp{{
+			Op:         op,
+			Path:       path,
+			Fidelity:   "full",
+			BeforeOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: op == "delete"},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: op == "delete"},
+			AfterOID:   sql.NullString{String: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Valid: op != "delete"},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: op != "delete"},
+		}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent(%s,%s): %v", op, path, err)
+		}
+		if err := state.RecordPlannerOffer(ctx, db, seq, 123); err != nil {
+			t.Fatalf("RecordPlannerOffer(%d): %v", seq, err)
+		}
+		return seq
+	}
+	seqs := []int64{
+		seed(".derivedData-provider-core/Index.noindex/a.db", "delete"),
+		seed(".derivedData-provider-core/Index.noindex/b.db", "delete"),
+	}
+	seed("build/output.js", "delete")
+	seed("src/ordinary.txt", "modify")
+	return seqs
+}
+
+func countRowsWhere(t *testing.T, db *state.DB, table, where string, args ...any) int {
+	t.Helper()
+	var n int
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table, where)
+	if err := db.SQL().QueryRowContext(context.Background(), q, args...).Scan(&n); err != nil {
+		t.Fatalf("count %s where %s: %v", table, where, err)
+	}
+	return n
+}
+
+func gitCachedNameStatus(t *testing.T, ctx context.Context, repo string) string {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--name-status")
+	if err != nil {
+		t.Fatalf("git diff --cached --name-status: %v", err)
+	}
+	return string(out)
+}
