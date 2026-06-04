@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +303,112 @@ func hasFixAction(plan fixPlan, kind string) bool {
 		}
 	}
 	return false
+}
+
+func TestFix_DryRunPlansGeneratedPendingCleanup(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, true, false, false, false, true); err != nil {
+		t.Fatalf("runFix generated dry-run: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	var generated *fixAction
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
+			generated = &plan.Actions[i]
+			break
+		}
+	}
+	if generated == nil {
+		t.Fatalf("plan missing generated cleanup action: %+v", plan.Actions)
+	}
+	if generated.GeneratedRoot != ".derivedData-provider-core" ||
+		generated.SafeIgnorePattern != ".derivedData*/" ||
+		generated.PendingCount != 2 ||
+		generated.TrackedCount != 2 ||
+		!reflect.DeepEqual(generated.EventSeqs, generatedSeqs) {
+		t.Fatalf("generated action=%+v, seqs=%v", *generated, generatedSeqs)
+	}
+	after, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("dry-run mutated state.db: before=%s after=%s", before, after)
+	}
+
+	out.Reset()
+	if err := runFix(ctx, &out, repo, true, false, false, false, false); err != nil {
+		t.Fatalf("runFix generated human dry-run: %v\n%s", err, out.String())
+	}
+	human := out.String()
+	for _, want := range []string{
+		"drop protected generated pending deletes",
+		"root=.derivedData-provider-core pending=2 tracked=2",
+		"git add -u -- .derivedData-provider-core",
+	} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("human output missing %q:\n%s", want, human)
+		}
+	}
+}
+
+func TestFix_ApplyDropsGeneratedPendingOnly(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
+	beforeIndex := gitCachedNameStatus(t, ctx, repo)
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
+		t.Fatalf("runFix generated apply: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	var generated *fixAction
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
+			generated = &plan.Actions[i]
+			break
+		}
+	}
+	if generated == nil || !generated.Applied || generated.RowsChanged != 2 {
+		t.Fatalf("generated action not applied as expected: %+v actions=%+v", generated, plan.Actions)
+	}
+	if plan.BackupPath == "" {
+		t.Fatalf("apply did not create backup: %+v", plan)
+	}
+	for _, seq := range generatedSeqs {
+		if got := countRowsWhere(t, db, "capture_events", "seq = ?", seq); got != 0 {
+			t.Fatalf("generated capture_event seq=%d remains: %d", seq, got)
+		}
+		if got := countRowsWhere(t, db, "capture_ops", "event_seq = ?", seq); got != 0 {
+			t.Fatalf("generated capture_ops seq=%d remains: %d", seq, got)
+		}
+		if got := countRowsWhere(t, db, "planner_state", "event_seq = ?", seq); got != 0 {
+			t.Fatalf("generated planner_state seq=%d remains: %d", seq, got)
+		}
+	}
+	for _, path := range []string{"build/output.js", "src/ordinary.txt"} {
+		if got := countRowsWhere(t, db, "capture_events", "path = ? AND state = ?", path, state.EventStatePending); got != 1 {
+			t.Fatalf("unrelated pending path %s count=%d want 1", path, got)
+		}
+	}
+	if afterIndex := gitCachedNameStatus(t, ctx, repo); afterIndex != beforeIndex {
+		t.Fatalf("fix mutated git index:\nbefore:\n%s\nafter:\n%s", beforeIndex, afterIndex)
+	}
 }
 
 // TestFix_DryRunListsResolveAlreadyLandedBarrier exercises the Wave 3a

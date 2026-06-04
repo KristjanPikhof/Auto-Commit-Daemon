@@ -1428,10 +1428,13 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintln(out, "Actions:")
 		for _, action := range plan.Actions {
 			target := ""
-			if action.Seq > 0 {
+			if action.Kind == fixActionDropGeneratedPending {
+				target = fmt.Sprintf(" root=%s pending=%d tracked=%d seq=%d..%d",
+					action.GeneratedRoot, action.PendingCount, action.TrackedCount, action.OldestSeq, action.NewestSeq)
+			} else if action.Seq > 0 {
 				target = fmt.Sprintf(" seq=%d", action.Seq)
 			}
-			if action.Path != "" {
+			if action.Path != "" && action.Kind != fixActionDropGeneratedPending {
 				target += " path=" + action.Path
 			}
 			fmt.Fprintf(out, "- %s%s", action.Description, target)
