@@ -25,7 +25,7 @@ func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
 		Path:        sqlNullStr("secret.env"),
 		Reason:      sqlNullStr("sensitive"),
 		ActionTaken: sqlNullStr("no_delete_generated"),
-		UserMessage: sqlNullStr("Skipped present protected path secret.env without generating a delete."),
+		UserMessage: sqlNullStr("Skipped protected path secret.env without generating a delete."),
 	}); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"Path: secret.env",
-		"Skipped present protected path secret.env",
+		"Skipped protected path secret.env",
 		"Replay is still pending for this path",
 		"protected",
 	} {
