@@ -288,7 +288,7 @@ ORDER BY seq ASC`
 
 	type key struct {
 		root, pattern, branchRef, baseHead string
-		generation                        int64
+		generation                         int64
 	}
 	groups := map[key]*GeneratedPendingGroup{}
 	for rows.Next() {
