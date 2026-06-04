@@ -641,7 +641,7 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				group.Root, group.PendingCount, report.Repo, report.Repo))
 		if group.TrackedCount > 0 {
 			remediation = append(remediation,
-				fmt.Sprintf("Generated root %s still has %d tracked file(s) in Git; review `git status -- %s`, then run `git add -u -- %s` and commit the cleanup yourself.",
+				fmt.Sprintf("Generated root %s still has %d tracked file(s) in Git; review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
 					group.Root, group.TrackedCount, group.Root, group.Root))
 		}
 	}

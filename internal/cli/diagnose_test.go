@@ -596,7 +596,12 @@ func TestDiagnose_GeneratedPendingGuidance(t *testing.T) {
 		!reflect.DeepEqual(group.EventSeqs, generatedSeqs) {
 		t.Fatalf("generated group=%+v seqs=%v", group, generatedSeqs)
 	}
-	for _, want := range []string{"acd fix --repo " + repo + " --dry-run", "acd fix --repo " + repo + " --yes", "git add -u -- .derivedData-provider-core"} {
+	for _, want := range []string{
+		"acd fix --repo " + repo + " --dry-run",
+		"acd fix --repo " + repo + " --yes",
+		"git add -u -- .derivedData-provider-core",
+		"git commit -m \"Remove tracked generated cache files\"",
+	} {
 		if !containsStringWith(rep.Remediation, want) {
 			t.Fatalf("remediation missing %q: %v", want, rep.Remediation)
 		}

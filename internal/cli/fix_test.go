@@ -357,6 +357,7 @@ func TestFix_DryRunPlansGeneratedPendingCleanup(t *testing.T) {
 		"drop protected generated pending deletes",
 		"root=.derivedData-provider-core pending=2 tracked=2",
 		"git add -u -- .derivedData-provider-core",
+		"git commit -m \"Remove tracked generated cache files\"",
 	} {
 		if !strings.Contains(human, want) {
 			t.Fatalf("human output missing %q:\n%s", want, human)
