@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-06-05
+
 ### Added
 
 - Per-repo lifecycle controls: `acd repo disable`, `acd repo enable`,
