@@ -52,6 +52,19 @@ type diagnoseBlockedEntry struct {
 	BranchGeneration int64  `json:"branch_generation,omitempty"`
 }
 
+type diagnoseGeneratedPendingGroup struct {
+	Root             string  `json:"root"`
+	Pattern          string  `json:"pattern"`
+	BranchRef        string  `json:"branch_ref"`
+	BranchGeneration int64   `json:"branch_generation"`
+	BaseHead         string  `json:"base_head,omitempty"`
+	PendingCount     int     `json:"pending_count"`
+	TrackedCount     int     `json:"tracked_count"`
+	OldestSeq        int64   `json:"oldest_seq"`
+	NewestSeq        int64   `json:"newest_seq"`
+	EventSeqs        []int64 `json:"event_seqs,omitempty"`
+}
+
 type diagnoseReport struct {
 	Repo                       string                 `json:"repo"`
 	RepoHash                   string                 `json:"repo_hash"`
@@ -67,6 +80,7 @@ type diagnoseReport struct {
 	IntentStrategy             intentStrategyReport   `json:"intent_strategy"`
 	BlockedHistogram           []diagnoseBlockedClass `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry `json:"recent_blocked"`
+	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
 	AutoResolvableBlockedCount int                    `json:"auto_resolvable_blocked_count"`
 	BarrierWithSuccessorsCount int                    `json:"barrier_with_successors_count"`
 	OperationInProgress        string                 `json:"operation_in_progress,omitempty"`
