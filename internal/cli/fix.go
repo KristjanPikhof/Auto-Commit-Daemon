@@ -26,6 +26,7 @@ const (
 	fixActionClearDrainedBackpressure    = "clear_drained_backpressure"
 	fixActionDeleteObsoleteBarrier       = "delete_obsolete_barrier"
 	fixActionMarkExternalPublished       = "mark_external_published"
+	fixActionDropGeneratedPending        = "drop_generated_pending"
 	fixActionResolveAlreadyLandedBarrier = "resolve_already_landed_barrier"
 	fixActionRetargetStaleAnchor         = "retarget_stale_anchor"
 	fixActionPurgeBarrierWithSuccessors  = "purge_barrier_with_successors"
@@ -70,24 +71,31 @@ type fixBlockerVerification struct {
 }
 
 type fixAction struct {
-	ID               string `json:"id"`
-	Kind             string `json:"kind"`
-	Description      string `json:"description"`
-	Reason           string `json:"reason,omitempty"`
-	Seq              int64  `json:"seq,omitempty"`
-	Path             string `json:"path,omitempty"`
-	DecisionID       int64  `json:"decision_id,omitempty"`
-	CommitOID        string `json:"commit_oid,omitempty"`
-	BlobOID          string `json:"blob_oid,omitempty"`
-	CapturedAfterOID string `json:"captured_after_oid,omitempty"`
-	BranchRef        string `json:"branch_ref,omitempty"`
-	BranchGeneration int64  `json:"branch_generation,omitempty"`
-	BaseHead         string `json:"base_head,omitempty"`
-	RowsChanged      int64  `json:"rows_changed,omitempty"`
-	Applied          bool   `json:"applied,omitempty"`
-	SetAt            string `json:"set_at,omitempty"`
-	RequiresForce    bool   `json:"requires_force,omitempty"`
-	State            string `json:"state,omitempty"`
+	ID                string  `json:"id"`
+	Kind              string  `json:"kind"`
+	Description       string  `json:"description"`
+	Reason            string  `json:"reason,omitempty"`
+	Seq               int64   `json:"seq,omitempty"`
+	Path              string  `json:"path,omitempty"`
+	DecisionID        int64   `json:"decision_id,omitempty"`
+	CommitOID         string  `json:"commit_oid,omitempty"`
+	BlobOID           string  `json:"blob_oid,omitempty"`
+	CapturedAfterOID  string  `json:"captured_after_oid,omitempty"`
+	BranchRef         string  `json:"branch_ref,omitempty"`
+	BranchGeneration  int64   `json:"branch_generation,omitempty"`
+	BaseHead          string  `json:"base_head,omitempty"`
+	GeneratedRoot     string  `json:"generated_root,omitempty"`
+	SafeIgnorePattern string  `json:"safe_ignore_pattern,omitempty"`
+	PendingCount      int     `json:"pending_count,omitempty"`
+	TrackedCount      int     `json:"tracked_count,omitempty"`
+	OldestSeq         int64   `json:"oldest_seq,omitempty"`
+	NewestSeq         int64   `json:"newest_seq,omitempty"`
+	EventSeqs         []int64 `json:"event_seqs,omitempty"`
+	RowsChanged       int64   `json:"rows_changed,omitempty"`
+	Applied           bool    `json:"applied,omitempty"`
+	SetAt             string  `json:"set_at,omitempty"`
+	RequiresForce     bool    `json:"requires_force,omitempty"`
+	State             string  `json:"state,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
@@ -245,6 +253,9 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
 			return fixPlan{}, err
 		}
+	}
+	if err := planGeneratedPendingCleanup(ctx, conn, repo, &plan); err != nil {
+		return fixPlan{}, err
 	}
 	// resolve_already_landed_barrier must precede delete_obsolete_barrier:
 	// a blocked row whose captured after-state matches HEAD is BOTH "obsolete"
@@ -567,6 +578,48 @@ ORDER BY e.seq ASC, d.id DESC`,
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("acd fix: iterate external decisions: %w", err)
+	}
+	return nil
+}
+
+func planGeneratedPendingCleanup(ctx context.Context, conn *sql.DB, repo string, plan *fixPlan) error {
+	groups, err := state.ScanGeneratedPendingDeletes(ctx, conn, state.NewSafeIgnoreMatcher(), 0)
+	if err != nil {
+		return fmt.Errorf("acd fix: scan generated pending deletes: %w", err)
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	roots := make([]string, 0, len(groups))
+	for _, group := range groups {
+		roots = append(roots, group.Root)
+	}
+	tracked, err := git.CountTrackedPathsUnder(ctx, repo, roots...)
+	if err != nil {
+		return fmt.Errorf("acd fix: count tracked generated roots: %w", err)
+	}
+	for _, group := range groups {
+		trackedCount := tracked[group.Root]
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:                fmt.Sprintf("%s:%s:%d:%d", fixActionDropGeneratedPending, group.Root, group.BranchGeneration, group.OldestSeq),
+			Kind:              fixActionDropGeneratedPending,
+			Description:       "drop protected generated pending deletes from ACD queue",
+			Reason:            "pending delete paths match active safe-ignore generated-tree guard",
+			Path:              group.Root,
+			GeneratedRoot:     group.Root,
+			SafeIgnorePattern: group.Pattern,
+			BranchRef:         group.BranchRef,
+			BranchGeneration:  group.BranchGeneration,
+			BaseHead:          group.BaseHead,
+			PendingCount:      group.PendingCount,
+			TrackedCount:      trackedCount,
+			OldestSeq:         group.OldestSeq,
+			NewestSeq:         group.NewestSeq,
+			EventSeqs:         append([]int64(nil), group.EventSeqs...),
+		})
+		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
+			"Generated root %s has %d queued delete(s) and %d tracked file(s); `acd fix --repo %s --yes` cleans ACD state only. To record the Git cleanup, review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
+			group.Root, group.PendingCount, trackedCount, plan.Repo, group.Root, group.Root))
 	}
 	return nil
 }
@@ -984,6 +1037,8 @@ INSERT INTO decision_records(
 			return 0, fmt.Errorf("acd fix: append decision for self-heal seq %d: %w", action.Seq, err)
 		}
 		return n, nil
+	case fixActionDropGeneratedPending:
+		return applyDropGeneratedPending(ctx, tx, action)
 	case fixActionRetargetStaleAnchor:
 		return applyRetargetStaleAnchorTx(ctx, tx, plan, nowSec)
 	case fixActionPurgeBarrierWithSuccessors:
@@ -1013,6 +1068,64 @@ WHERE id = 1
 	default:
 		return 0, fmt.Errorf("acd fix: unknown action kind %q", action.Kind)
 	}
+}
+
+func applyDropGeneratedPending(ctx context.Context, tx *sql.Tx, action fixAction) (int64, error) {
+	if len(action.EventSeqs) == 0 {
+		return 0, nil
+	}
+	var changed int64
+	for _, chunk := range chunkInt64s(action.EventSeqs, 500) {
+		placeholders := placeholders(len(chunk))
+		args := int64Args(chunk)
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM planner_state WHERE event_seq IN (`+placeholders+`)`, args...); err != nil {
+			return 0, fmt.Errorf("acd fix: delete generated planner state for %s: %w", action.GeneratedRoot, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM capture_ops WHERE event_seq IN (`+placeholders+`)`, args...); err != nil {
+			return 0, fmt.Errorf("acd fix: delete generated capture ops for %s: %w", action.GeneratedRoot, err)
+		}
+		eventArgs := append(int64Args(chunk), state.EventStatePending, "delete")
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM capture_events WHERE seq IN (`+placeholders+`) AND state = ? AND operation = ?`, eventArgs...)
+		if err != nil {
+			return 0, fmt.Errorf("acd fix: delete generated pending events for %s: %w", action.GeneratedRoot, err)
+		}
+		n, _ := res.RowsAffected()
+		changed += n
+	}
+	return changed, nil
+}
+
+func chunkInt64s(values []int64, size int) [][]int64 {
+	if size <= 0 {
+		size = len(values)
+	}
+	var out [][]int64
+	for start := 0; start < len(values); start += size {
+		end := start + size
+		if end > len(values) {
+			end = len(values)
+		}
+		out = append(out, values[start:end])
+	}
+	return out
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+func int64Args(values []int64) []any {
+	args := make([]any, len(values))
+	for i, v := range values {
+		args[i] = v
+	}
+	return args
 }
 
 func nullableString(s string) sql.NullString {
@@ -1315,10 +1428,13 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintln(out, "Actions:")
 		for _, action := range plan.Actions {
 			target := ""
-			if action.Seq > 0 {
+			if action.Kind == fixActionDropGeneratedPending {
+				target = fmt.Sprintf(" root=%s pending=%d tracked=%d seq=%d..%d",
+					action.GeneratedRoot, action.PendingCount, action.TrackedCount, action.OldestSeq, action.NewestSeq)
+			} else if action.Seq > 0 {
 				target = fmt.Sprintf(" seq=%d", action.Seq)
 			}
-			if action.Path != "" {
+			if action.Path != "" && action.Kind != fixActionDropGeneratedPending {
 				target += " path=" + action.Path
 			}
 			fmt.Fprintf(out, "- %s%s", action.Description, target)

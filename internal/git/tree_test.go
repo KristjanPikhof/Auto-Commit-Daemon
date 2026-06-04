@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -498,5 +499,50 @@ func TestLsFilesStagedReturnsIndexedEntries(t *testing.T) {
 	got := entries[0]
 	if got.Path != "file.txt" || got.OID != blob || got.Mode != "100644" || got.Stage != 0 {
 		t.Fatalf("unexpected entry: %+v", got)
+	}
+}
+
+func TestCountTrackedPathsUnderScopesToRoots(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	write := func(rel, body string) {
+		t.Helper()
+		path := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	write(".gitignore", ".derivedData*/\nbuild/\n")
+	write(".derivedData-provider-core/a.txt", "a")
+	write(".derivedData-provider-core/nested/b.txt", "b")
+	write("build/output.js", "ignored but untracked")
+	write("src/main.go", "package main\n")
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "add", ".gitignore", "src/main.go"); err != nil {
+		t.Fatalf("git add tracked files: %v", err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: dir}, "add", "-f", ".derivedData-provider-core/a.txt", ".derivedData-provider-core/nested/b.txt"); err != nil {
+		t.Fatalf("git add forced generated files: %v", err)
+	}
+
+	got, err := CountTrackedPathsUnder(ctx, dir,
+		".derivedData-provider-core",
+		"build",
+		"missing",
+		".derivedData-provider-core",
+	)
+	if err != nil {
+		t.Fatalf("CountTrackedPathsUnder: %v", err)
+	}
+	want := map[string]int{
+		".derivedData-provider-core": 2,
+		"build":                      0,
+		"missing":                    0,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CountTrackedPathsUnder = %#v, want %#v", got, want)
 	}
 }

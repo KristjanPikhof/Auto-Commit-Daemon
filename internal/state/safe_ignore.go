@@ -1,9 +1,12 @@
 package state
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -24,6 +27,8 @@ const (
 var DefaultSafeIgnorePatterns = []string{
 	"node_modules/",
 	"target/",
+	"DerivedData/",
+	".derivedData*/",
 	".venv/",
 	"venv/",
 	"__pycache__/",
@@ -112,6 +117,27 @@ type SafeIgnoreMatcher struct {
 	patterns []string
 }
 
+// SafeIgnoreMatch describes the generated-tree root responsible for a
+// safe-ignore match.
+type SafeIgnoreMatch struct {
+	Root    string
+	Pattern string
+}
+
+// GeneratedPendingGroup summarizes pending delete capture rows under one
+// active safe-ignore root for a branch generation.
+type GeneratedPendingGroup struct {
+	Root             string  `json:"root"`
+	Pattern          string  `json:"pattern"`
+	BranchRef        string  `json:"branch_ref"`
+	BranchGeneration int64   `json:"branch_generation"`
+	BaseHead         string  `json:"base_head,omitempty"`
+	PendingCount     int     `json:"pending_count"`
+	OldestSeq        int64   `json:"oldest_seq"`
+	NewestSeq        int64   `json:"newest_seq"`
+	EventSeqs        []int64 `json:"event_seqs,omitempty"`
+}
+
 // NewSafeIgnoreMatcher snapshots SafeIgnorePatterns once.
 func NewSafeIgnoreMatcher() *SafeIgnoreMatcher {
 	return &SafeIgnoreMatcher{patterns: SafeIgnorePatterns()}
@@ -120,6 +146,31 @@ func NewSafeIgnoreMatcher() *SafeIgnoreMatcher {
 // Match reports whether rel matches any safe-ignore pattern.
 func (m *SafeIgnoreMatcher) Match(rel string) bool {
 	return m.match(rel, true)
+}
+
+// MatchRoot returns the concrete generated root that matched rel. For a
+// nested directory pattern such as node_modules/, a descendant like
+// frontend/node_modules/react/index.js maps to frontend/node_modules.
+func (m *SafeIgnoreMatcher) MatchRoot(rel string) (SafeIgnoreMatch, bool) {
+	if m == nil || len(m.patterns) == 0 {
+		return SafeIgnoreMatch{}, false
+	}
+	rel = cleanSafeIgnoreRel(rel)
+	if rel == "" {
+		return SafeIgnoreMatch{}, false
+	}
+	for _, pattern := range m.patterns {
+		if strings.HasSuffix(pattern, "/") {
+			if root, ok := matchSafeIgnoreDirRoot(strings.TrimSuffix(pattern, "/"), rel); ok {
+				return SafeIgnoreMatch{Root: root, Pattern: pattern}, true
+			}
+			continue
+		}
+		if matchGlob(pattern, rel) {
+			return SafeIgnoreMatch{Root: rel, Pattern: pattern}, true
+		}
+	}
+	return SafeIgnoreMatch{}, false
 }
 
 // MatchFile reports whether rel is a file-like path that should be skipped.
@@ -174,14 +225,26 @@ func cleanSafeIgnoreRel(rel string) string {
 }
 
 func matchSafeIgnoreDirPattern(pattern, rel string, includeSelf bool) bool {
+	_, ok := matchSafeIgnoreDirRootWithSelf(pattern, rel, includeSelf)
+	return ok
+}
+
+func matchSafeIgnoreDirRoot(pattern, rel string) (string, bool) {
+	return matchSafeIgnoreDirRootWithSelf(pattern, rel, true)
+}
+
+func matchSafeIgnoreDirRootWithSelf(pattern, rel string, includeSelf bool) (string, bool) {
 	if pattern == "" || rel == "" {
-		return false
+		return "", false
 	}
 	if strings.Contains(pattern, "/") {
 		if includeSelf && rel == pattern {
-			return true
+			return pattern, true
 		}
-		return strings.HasPrefix(rel, pattern+"/")
+		if strings.HasPrefix(rel, pattern+"/") {
+			return pattern, true
+		}
+		return "", false
 	}
 	segments := strings.Split(rel, "/")
 	limit := len(segments)
@@ -191,8 +254,99 @@ func matchSafeIgnoreDirPattern(pattern, rel string, includeSelf bool) bool {
 	for i := 0; i < limit; i++ {
 		segment := segments[i]
 		if ok, _ := path.Match(pattern, segment); ok {
-			return true
+			return strings.Join(segments[:i+1], "/"), true
 		}
 	}
-	return false
+	return "", false
+}
+
+// ScanGeneratedPendingDeletes groups pending delete events whose path matches
+// the active safe-ignore generated-tree guard. It is read-only and accepts any
+// query-capable SQLite handle so recovery CLIs can use read-only connections.
+func ScanGeneratedPendingDeletes(ctx context.Context, q queryer, matcher *SafeIgnoreMatcher, limit int) ([]GeneratedPendingGroup, error) {
+	if q == nil {
+		return nil, fmt.Errorf("state: ScanGeneratedPendingDeletes: nil queryer")
+	}
+	if matcher == nil {
+		matcher = NewSafeIgnoreMatcher()
+	}
+	sql := `
+SELECT seq, branch_ref, branch_generation, base_head, path
+FROM capture_events
+WHERE state = ? AND operation = ?
+ORDER BY seq ASC`
+	args := []any{EventStatePending, "delete"}
+	if limit > 0 {
+		sql += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := q.QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("state: query generated pending deletes: %w", err)
+	}
+	defer rows.Close()
+
+	type key struct {
+		root, pattern, branchRef, baseHead string
+		generation                         int64
+	}
+	groups := map[key]*GeneratedPendingGroup{}
+	for rows.Next() {
+		var seq int64
+		var branchRef, baseHead, rel string
+		var generation int64
+		if err := rows.Scan(&seq, &branchRef, &generation, &baseHead, &rel); err != nil {
+			return nil, fmt.Errorf("state: scan generated pending delete: %w", err)
+		}
+		if !matcher.MatchFile(rel) {
+			continue
+		}
+		match, ok := matcher.MatchRoot(rel)
+		if !ok {
+			continue
+		}
+		k := key{
+			root:       match.Root,
+			pattern:    match.Pattern,
+			branchRef:  branchRef,
+			generation: generation,
+			baseHead:   baseHead,
+		}
+		g := groups[k]
+		if g == nil {
+			g = &GeneratedPendingGroup{
+				Root:             match.Root,
+				Pattern:          match.Pattern,
+				BranchRef:        branchRef,
+				BranchGeneration: generation,
+				BaseHead:         baseHead,
+				OldestSeq:        seq,
+			}
+			groups[k] = g
+		}
+		g.PendingCount++
+		g.NewestSeq = seq
+		g.EventSeqs = append(g.EventSeqs, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate generated pending deletes: %w", err)
+	}
+
+	out := make([]GeneratedPendingGroup, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, *g)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OldestSeq != out[j].OldestSeq {
+			return out[i].OldestSeq < out[j].OldestSeq
+		}
+		if out[i].Root != out[j].Root {
+			return out[i].Root < out[j].Root
+		}
+		if out[i].BranchRef != out[j].BranchRef {
+			return out[i].BranchRef < out[j].BranchRef
+		}
+		return out[i].BranchGeneration < out[j].BranchGeneration
+	})
+	return out, nil
 }

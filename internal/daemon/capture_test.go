@@ -370,7 +370,7 @@ func TestCapture_TrackedSafeIgnorePresentIsProtectedFromDelete(t *testing.T) {
 	assertProtectedDecision(t, f.db, "node_modules/pkg/index.js", "safe_ignore")
 }
 
-func TestCapture_TrackedSafeIgnoreDeletedChildEmitsDelete(t *testing.T) {
+func TestCapture_TrackedSafeIgnoreDeletedChildIsProtectedFromDelete(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -408,10 +408,30 @@ func TestCapture_TrackedSafeIgnoreDeletedChildEmitsDelete(t *testing.T) {
 	}
 
 	ops := pendingOps(t, f.db)
-	if len(ops) != 1 || ops[0].Op != "delete" || ops[0].Path != trackedRel {
-		t.Fatalf("deleted child under safe-ignore dir ops=%+v, want one delete", ops)
+	if len(ops) != 0 {
+		t.Fatalf("deleted child under safe-ignore dir should be protected, got ops=%+v", ops)
 	}
-	assertNoProtectedDecision(t, f.db, trackedRel, "safe_ignore")
+	assertProtectedDecision(t, f.db, trackedRel, "safe_ignore")
+
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("second capture: %v", err)
+	}
+	if ops := pendingOps(t, f.db); len(ops) != 0 {
+		t.Fatalf("safe-ignore delete recaptured on second pass: %+v", ops)
+	}
+	var shadowRows int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ? AND path = ?`,
+		f.cctx.BranchRef, f.cctx.BranchGeneration, trackedRel,
+	).Scan(&shadowRows); err != nil {
+		t.Fatalf("count shadow row: %v", err)
+	}
+	if shadowRows != 0 {
+		t.Fatalf("shadow row for protected deleted safe-ignore path remains: %d", shadowRows)
+	}
 }
 
 func TestCapture_TrackedGitignoredDeletedChildEmitsDelete(t *testing.T) {
@@ -512,7 +532,7 @@ func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(f.dir, "fine.txt"), []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write fine: %v", err)
 	}
-	for _, root := range []string{"node_modules", "target"} {
+	for _, root := range []string{"node_modules", "target", "DerivedData", ".derivedData-provider-core"} {
 		for i := 0; i < 16; i++ {
 			dir := filepath.Join(f.dir, root, fmt.Sprintf("pkg-%02d", i))
 			if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -541,7 +561,10 @@ func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
 
 	var sawFine bool
 	for _, op := range pendingOps(t, f.db) {
-		if strings.HasPrefix(op.Path, "node_modules/") || strings.HasPrefix(op.Path, "target/") {
+		if strings.HasPrefix(op.Path, "node_modules/") ||
+			strings.HasPrefix(op.Path, "target/") ||
+			strings.HasPrefix(op.Path, "DerivedData/") ||
+			strings.HasPrefix(op.Path, ".derivedData-provider-core/") {
 			t.Fatalf("safe-ignore generated path captured: %+v", op)
 		}
 		if op.Path == "fine.txt" {

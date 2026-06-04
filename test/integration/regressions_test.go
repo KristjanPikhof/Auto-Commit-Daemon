@@ -929,17 +929,27 @@ func regTrackedChildDeleteUnderSafeIgnoredDir(t *testing.T) {
 	wakeSession(t, ctx, env, repo, "safe-delete-1")
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "node_modules/pkg/generated.txt", "published", 8*time.Second)
+	waitFor(t, "safe-ignore delete protected decision", 8*time.Second, func() bool {
+		return sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM decision_records WHERE path = 'node_modules/pkg/generated.txt' AND kind = 'protected' AND action_taken = 'no_delete_generated'") != "0"
+	})
 	if got := sqliteScalar(t, dbPath,
-		"SELECT operation FROM capture_events WHERE path = 'node_modules/pkg/generated.txt' ORDER BY seq DESC LIMIT 1"); got != "delete" {
-		t.Fatalf("operation=%q want delete for tracked child under safe-ignored dir", got)
-	}
-	if out, err := runGit(repo, "cat-file", "-e", "HEAD:node_modules/pkg/generated.txt"); err == nil {
-		t.Fatalf("tracked child still exists at HEAD after delete replay\n%s", out)
+		"SELECT COUNT(*) FROM capture_events WHERE path = 'node_modules/pkg/generated.txt'"); got != "0" {
+		t.Fatalf("safe-ignore deleted child should not be queued, capture_events=%s", got)
 	}
 	if got := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM decision_records WHERE path = 'node_modules/pkg/generated.txt' AND kind = 'protected'"); got != "0" {
-		t.Fatalf("delete was incorrectly protected under safe-ignored parent; protected decisions=%s", got)
+		"SELECT COUNT(*) FROM shadow_paths WHERE path = 'node_modules/pkg/generated.txt'"); got != "0" {
+		t.Fatalf("safe-ignore deleted child shadow row should be reconciled away, shadow_paths=%s", got)
+	}
+	if out, err := runGit(repo, "cat-file", "-e", "HEAD:node_modules/pkg/generated.txt"); err != nil {
+		t.Fatalf("acd must not mutate Git for protected safe-ignore delete; HEAD missing tracked child\n%s", out)
+	}
+
+	wakeSession(t, ctx, env, repo, "safe-delete-1")
+	time.Sleep(500 * time.Millisecond)
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM capture_events WHERE path = 'node_modules/pkg/generated.txt'"); got != "0" {
+		t.Fatalf("safe-ignore deleted child recaptured on second wake, capture_events=%s", got)
 	}
 }
 

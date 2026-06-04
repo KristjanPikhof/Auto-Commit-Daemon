@@ -195,6 +195,42 @@ func LsFilesStaged(ctx context.Context, repoDir string, paths ...string) ([]Inde
 	return LsFilesIndex(ctx, repoDir, "", paths...)
 }
 
+// CountTrackedPathsUnder returns the number of tracked index entries under
+// each supplied root. It is pathspec-scoped through git ls-files, so callers
+// can inspect ignored generated directories without walking the worktree.
+func CountTrackedPathsUnder(ctx context.Context, repoDir string, roots ...string) (map[string]int, error) {
+	out := make(map[string]int, len(roots))
+	cleaned := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		root = strings.Trim(strings.ReplaceAll(root, "\\", "/"), "/")
+		if root == "" {
+			continue
+		}
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		out[root] = 0
+		cleaned = append(cleaned, root)
+	}
+	if len(cleaned) == 0 {
+		return out, nil
+	}
+	entries, err := LsFilesStaged(ctx, repoDir, cleaned...)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		for _, root := range cleaned {
+			if entry.Path == root || strings.HasPrefix(entry.Path, root+"/") {
+				out[root]++
+			}
+		}
+	}
+	return out, nil
+}
+
 // LsFilesIndex returns the staged index entries for the given repo,
 // optionally redirected to indexFile via GIT_INDEX_FILE. When indexFile is
 // empty the call falls through to the repo's default index (the legacy

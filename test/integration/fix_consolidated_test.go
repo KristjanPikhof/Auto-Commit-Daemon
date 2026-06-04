@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +253,104 @@ VALUES (last_insert_rowid(), 0, 'modify', 'purge-me.txt', '111111111111111111111
 	if cnt := sqliteScalar(t, dbPath,
 		fmt.Sprintf("SELECT COUNT(*) FROM capture_events WHERE seq = %s", purgeSeq)); cnt != "0" {
 		t.Fatalf("purge-events left blocked seq %s in DB (count=%s)", purgeSeq, cnt)
+	}
+}
+
+func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
+	requireSQLite(t)
+
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	for _, rel := range []string{
+		".derivedData-provider-core/Index.noindex/a.db",
+		".derivedData-provider-core/Index.noindex/b.db",
+	} {
+		writeFile(t, filepath.Join(repo, filepath.FromSlash(rel)), "generated\n")
+	}
+	runGitOK(t, repo, "add", "-f",
+		".derivedData-provider-core/Index.noindex/a.db",
+		".derivedData-provider-core/Index.noindex/b.db")
+	runGitOK(t, repo, "commit", "-q", "-m", "track generated cache files")
+	if err := os.RemoveAll(filepath.Join(repo, ".derivedData-provider-core")); err != nil {
+		t.Fatalf("remove generated root: %v", err)
+	}
+	beforeStatus := runGitOK(t, repo, "status", "--short", "--", ".derivedData-provider-core")
+
+	dbPath := initStateDBSchema(t, ctx, env, repo, "fix-generated-init")
+	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
+	if gen == "" {
+		gen = "1"
+	}
+	now := nowFloatSeconds()
+	seedSQL := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'delete', '.derivedData-provider-core/Index.noindex/a.db', 'rescan', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/a.db', '1111111111111111111111111111111111111111', '100644', 'rescan');
+INSERT INTO planner_state(event_seq, defer_count, last_planned_ts)
+VALUES ((SELECT seq FROM capture_events WHERE path = '.derivedData-provider-core/Index.noindex/a.db' ORDER BY seq DESC LIMIT 1), 0, %f);
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'delete', '.derivedData-provider-core/Index.noindex/b.db', 'rescan', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/b.db', '2222222222222222222222222222222222222222', '100644', 'rescan');
+INSERT INTO planner_state(event_seq, defer_count, last_planned_ts)
+VALUES ((SELECT seq FROM capture_events WHERE path = '.derivedData-provider-core/Index.noindex/b.db' ORDER BY seq DESC LIMIT 1), 0, %f);
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('refs/heads/main', %s, '%s', 'delete', 'build/output.js', 'rescan', %f, 'pending');
+`, gen, head, now, now,
+		gen, head, now+0.001, now+0.001,
+		gen, head, now+0.002)
+	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
+		t.Fatalf("seed generated pending rows: %v\n%s", err, out)
+	}
+
+	diagnose := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
+	if diagnose.ExitCode != 0 {
+		t.Fatalf("diagnose exit=%d\nstdout=%s\nstderr=%s", diagnose.ExitCode, diagnose.Stdout, diagnose.Stderr)
+	}
+	if !strings.Contains(diagnose.Stdout, `"generated_pending"`) ||
+		!strings.Contains(diagnose.Stdout, `"tracked_count": 2`) {
+		t.Fatalf("diagnose did not surface generated pending tracked count:\n%s", diagnose.Stdout)
+	}
+
+	dryRun := runAcd(t, ctx, env, "fix", "--repo", repo, "--dry-run", "--json")
+	if dryRun.ExitCode != 0 {
+		t.Fatalf("fix dry-run exit=%d\nstdout=%s\nstderr=%s", dryRun.ExitCode, dryRun.Stdout, dryRun.Stderr)
+	}
+	plan := decodeFixPlan(t, dryRun.Stdout)
+	if !hasFixActionKind(plan.Actions, "drop_generated_pending") {
+		t.Fatalf("fix dry-run missing drop_generated_pending:\n%s", dryRun.Stdout)
+	}
+
+	apply := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	if apply.ExitCode != 0 {
+		t.Fatalf("fix --yes exit=%d\nstdout=%s\nstderr=%s", apply.ExitCode, apply.Stdout, apply.Stderr)
+	}
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM capture_events WHERE path LIKE '.derivedData-provider-core/%'"); got != "0" {
+		t.Fatalf("generated pending rows remain after fix --yes: %s\n%s", got, apply.Stdout)
+	}
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM capture_ops WHERE path LIKE '.derivedData-provider-core/%'"); got != "0" {
+		t.Fatalf("generated capture_ops remain after fix --yes: %s", got)
+	}
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM planner_state"); got != "0" {
+		t.Fatalf("generated planner_state rows remain after fix --yes: %s", got)
+	}
+	if got := sqliteScalar(t, dbPath,
+		"SELECT COUNT(*) FROM capture_events WHERE path = 'build/output.js' AND state = 'pending'"); got != "1" {
+		t.Fatalf("unrelated pending row count=%s want 1", got)
+	}
+	afterStatus := runGitOK(t, repo, "status", "--short", "--", ".derivedData-provider-core")
+	if afterStatus != beforeStatus {
+		t.Fatalf("fix mutated Git status:\nbefore:\n%s\nafter:\n%s", beforeStatus, afterStatus)
 	}
 }
 

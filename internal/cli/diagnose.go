@@ -52,26 +52,40 @@ type diagnoseBlockedEntry struct {
 	BranchGeneration int64  `json:"branch_generation,omitempty"`
 }
 
+type diagnoseGeneratedPendingGroup struct {
+	Root             string  `json:"root"`
+	Pattern          string  `json:"pattern"`
+	BranchRef        string  `json:"branch_ref"`
+	BranchGeneration int64   `json:"branch_generation"`
+	BaseHead         string  `json:"base_head,omitempty"`
+	PendingCount     int     `json:"pending_count"`
+	TrackedCount     int     `json:"tracked_count"`
+	OldestSeq        int64   `json:"oldest_seq"`
+	NewestSeq        int64   `json:"newest_seq"`
+	EventSeqs        []int64 `json:"event_seqs,omitempty"`
+}
+
 type diagnoseReport struct {
-	Repo                       string                 `json:"repo"`
-	RepoHash                   string                 `json:"repo_hash"`
-	StateDB                    string                 `json:"state_db"`
-	Anchor                     diagnoseAnchorReport   `json:"anchor"`
-	PendingDepth               int                    `json:"pending_depth"`
-	FailedEvents               int                    `json:"failed_events"`
-	FailedBlockingPending      int                    `json:"failed_blocking_pending"`
-	PendingHighWater           int64                  `json:"pending_high_water"`
-	BackpressurePaused         bool                   `json:"backpressure_paused"`
-	BackpressurePausedAt       string                 `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal         int64                  `json:"events_dropped_total"`
-	IntentStrategy             intentStrategyReport   `json:"intent_strategy"`
-	BlockedHistogram           []diagnoseBlockedClass `json:"blocked_histogram"`
-	RecentBlocked              []diagnoseBlockedEntry `json:"recent_blocked"`
-	AutoResolvableBlockedCount int                    `json:"auto_resolvable_blocked_count"`
-	BarrierWithSuccessorsCount int                    `json:"barrier_with_successors_count"`
-	OperationInProgress        string                 `json:"operation_in_progress,omitempty"`
-	StaleOperationMarker       bool                   `json:"stale_operation_marker"`
-	OperationMarkerDuration    string                 `json:"operation_marker_duration,omitempty"`
+	Repo                       string                          `json:"repo"`
+	RepoHash                   string                          `json:"repo_hash"`
+	StateDB                    string                          `json:"state_db"`
+	Anchor                     diagnoseAnchorReport            `json:"anchor"`
+	PendingDepth               int                             `json:"pending_depth"`
+	FailedEvents               int                             `json:"failed_events"`
+	FailedBlockingPending      int                             `json:"failed_blocking_pending"`
+	PendingHighWater           int64                           `json:"pending_high_water"`
+	BackpressurePaused         bool                            `json:"backpressure_paused"`
+	BackpressurePausedAt       string                          `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
+	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
+	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
+	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
+	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
+	AutoResolvableBlockedCount int                             `json:"auto_resolvable_blocked_count"`
+	BarrierWithSuccessorsCount int                             `json:"barrier_with_successors_count"`
+	OperationInProgress        string                          `json:"operation_in_progress,omitempty"`
+	StaleOperationMarker       bool                            `json:"stale_operation_marker"`
+	OperationMarkerDuration    string                          `json:"operation_marker_duration,omitempty"`
 	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
 	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
 	// terminal prune action so operators can confirm stale-branch hygiene
@@ -165,6 +179,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	}
 	if err := diagnoseCapacity(ctx, conn, &report); err != nil {
+		return report, err
+	}
+	if err := diagnoseGeneratedPending(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
 	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
@@ -321,6 +338,40 @@ func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport)
 		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
 			report.EventsDroppedTotal = total
 		}
+	}
+	return nil
+}
+
+func diagnoseGeneratedPending(ctx context.Context, conn *sql.DB, repo string, report *diagnoseReport) error {
+	groups, err := state.ScanGeneratedPendingDeletes(ctx, conn, state.NewSafeIgnoreMatcher(), 0)
+	if err != nil {
+		return fmt.Errorf("generated pending deletes: %w", err)
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	roots := make([]string, 0, len(groups))
+	for _, group := range groups {
+		roots = append(roots, group.Root)
+	}
+	tracked, err := git.CountTrackedPathsUnder(ctx, repo, roots...)
+	if err != nil {
+		return fmt.Errorf("tracked generated roots: %w", err)
+	}
+	report.GeneratedPending = make([]diagnoseGeneratedPendingGroup, 0, len(groups))
+	for _, group := range groups {
+		report.GeneratedPending = append(report.GeneratedPending, diagnoseGeneratedPendingGroup{
+			Root:             group.Root,
+			Pattern:          group.Pattern,
+			BranchRef:        group.BranchRef,
+			BranchGeneration: group.BranchGeneration,
+			BaseHead:         group.BaseHead,
+			PendingCount:     group.PendingCount,
+			TrackedCount:     tracked[group.Root],
+			OldestSeq:        group.OldestSeq,
+			NewestSeq:        group.NewestSeq,
+			EventSeqs:        append([]int64(nil), group.EventSeqs...),
+		})
 	}
 	return nil
 }
@@ -584,6 +635,16 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation,
 			fmt.Sprintf("%d failed terminal barrier(s) block later pending replay; inspect the recent barriers and run `acd fix --dry-run` before purging.", report.FailedBlockingPending))
 	}
+	for _, group := range report.GeneratedPending {
+		remediation = append(remediation,
+			fmt.Sprintf("Generated root %s has %d queued delete(s); stop the daemon if it is running, run `acd fix --repo %s --dry-run`, then `acd fix --repo %s --yes` to clean ACD state only.",
+				group.Root, group.PendingCount, report.Repo, report.Repo))
+		if group.TrackedCount > 0 {
+			remediation = append(remediation,
+				fmt.Sprintf("Generated root %s still has %d tracked file(s) in Git; review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
+					group.Root, group.TrackedCount, group.Root, group.Root))
+		}
+	}
 	if report.PendingDepth > 0 {
 		remediation = append(remediation,
 			"capture pending depth is non-zero; queue is waiting/draining. If depth keeps climbing toward ACD_MAX_PENDING_EVENTS, wait for replay, run acd flush --logical for intentional batch waits, or run acd resume if capture/replay is paused.")
@@ -695,6 +756,14 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 		fmt.Fprintf(out, "Git operation: %s present for %s%s\n",
 			r.OperationInProgress, r.OperationMarkerDuration, stale)
+	}
+
+	if len(r.GeneratedPending) > 0 {
+		fmt.Fprintln(out, "Generated pending deletes:")
+		for _, group := range r.GeneratedPending {
+			fmt.Fprintf(out, "  - root=%s pending=%d tracked=%d seq=%d..%d pattern=%s\n",
+				group.Root, group.PendingCount, group.TrackedCount, group.OldestSeq, group.NewestSeq, group.Pattern)
+		}
 	}
 
 	fmt.Fprintln(out, "Terminal replay barrier histogram:")

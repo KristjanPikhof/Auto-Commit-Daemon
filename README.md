@@ -186,6 +186,16 @@ run:
 acd resume --yes
 ~~~
 
+If `acd diagnose --json` reports generated pending deletes under a tracked
+cache directory such as `.derivedData-provider-core`, `acd fix --yes` cleans
+only ACD's queue. Record the Git cleanup separately after review:
+
+~~~bash
+git status -- .derivedData-provider-core
+git add -u -- .derivedData-provider-core
+git commit -m "Remove tracked generated cache files"
+~~~
+
 ## Dirty worktree after the daemon was off
 
 Use `commit-all` when files changed while no daemon was running:

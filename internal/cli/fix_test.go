@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +304,113 @@ func hasFixAction(plan fixPlan, kind string) bool {
 		}
 	}
 	return false
+}
+
+func TestFix_DryRunPlansGeneratedPendingCleanup(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, true, false, false, false, true); err != nil {
+		t.Fatalf("runFix generated dry-run: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	var generated *fixAction
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
+			generated = &plan.Actions[i]
+			break
+		}
+	}
+	if generated == nil {
+		t.Fatalf("plan missing generated cleanup action: %+v", plan.Actions)
+	}
+	if generated.GeneratedRoot != ".derivedData-provider-core" ||
+		generated.SafeIgnorePattern != ".derivedData*/" ||
+		generated.PendingCount != 2 ||
+		generated.TrackedCount != 2 ||
+		!reflect.DeepEqual(generated.EventSeqs, generatedSeqs) {
+		t.Fatalf("generated action=%+v, seqs=%v", *generated, generatedSeqs)
+	}
+	after, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("dry-run mutated state.db: before=%s after=%s", before, after)
+	}
+
+	out.Reset()
+	if err := runFix(ctx, &out, repo, true, false, false, false, false); err != nil {
+		t.Fatalf("runFix generated human dry-run: %v\n%s", err, out.String())
+	}
+	human := out.String()
+	for _, want := range []string{
+		"drop protected generated pending deletes",
+		"root=.derivedData-provider-core pending=2 tracked=2",
+		"git add -u -- .derivedData-provider-core",
+		"git commit -m \"Remove tracked generated cache files\"",
+	} {
+		if !strings.Contains(human, want) {
+			t.Fatalf("human output missing %q:\n%s", want, human)
+		}
+	}
+}
+
+func TestFix_ApplyDropsGeneratedPendingOnly(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
+	beforeIndex := gitCachedNameStatus(t, ctx, repo)
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
+		t.Fatalf("runFix generated apply: %v\n%s", err, out.String())
+	}
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	var generated *fixAction
+	for i := range plan.Actions {
+		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
+			generated = &plan.Actions[i]
+			break
+		}
+	}
+	if generated == nil || !generated.Applied || generated.RowsChanged != 2 {
+		t.Fatalf("generated action not applied as expected: %+v actions=%+v", generated, plan.Actions)
+	}
+	if plan.BackupPath == "" {
+		t.Fatalf("apply did not create backup: %+v", plan)
+	}
+	for _, seq := range generatedSeqs {
+		if got := countRowsWhere(t, db, "capture_events", "seq = ?", seq); got != 0 {
+			t.Fatalf("generated capture_event seq=%d remains: %d", seq, got)
+		}
+		if got := countRowsWhere(t, db, "capture_ops", "event_seq = ?", seq); got != 0 {
+			t.Fatalf("generated capture_ops seq=%d remains: %d", seq, got)
+		}
+		if got := countRowsWhere(t, db, "planner_state", "event_seq = ?", seq); got != 0 {
+			t.Fatalf("generated planner_state seq=%d remains: %d", seq, got)
+		}
+	}
+	for _, path := range []string{"build/output.js", "src/ordinary.txt"} {
+		if got := countRowsWhere(t, db, "capture_events", "path = ? AND state = ?", path, state.EventStatePending); got != 1 {
+			t.Fatalf("unrelated pending path %s count=%d want 1", path, got)
+		}
+	}
+	if afterIndex := gitCachedNameStatus(t, ctx, repo); afterIndex != beforeIndex {
+		t.Fatalf("fix mutated git index:\nbefore:\n%s\nafter:\n%s", beforeIndex, afterIndex)
+	}
 }
 
 // TestFix_DryRunListsResolveAlreadyLandedBarrier exercises the Wave 3a
@@ -856,4 +965,83 @@ VALUES (1, 1, 'refs/heads/main', 1, ?, 'blocked_conflict', 'modify before-state 
 ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error`, head); err != nil {
 		t.Fatalf("seed publish_state: %v", err)
 	}
+}
+
+func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo string, db *state.DB) []int64 {
+	t.Helper()
+	write := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write(".derivedData-provider-core/Index.noindex/a.db", "a")
+	write(".derivedData-provider-core/Index.noindex/b.db", "b")
+	write("build/output.js", "ignored but not safe-ignore")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "-f",
+		".derivedData-provider-core/Index.noindex/a.db",
+		".derivedData-provider-core/Index.noindex/b.db"); err != nil {
+		t.Fatalf("git add forced generated files: %v", err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	seed := func(path, op string) int64 {
+		t.Helper()
+		seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 1,
+			BaseHead:         head,
+			Operation:        op,
+			Path:             path,
+			Fidelity:         "full",
+			State:            state.EventStatePending,
+		}, []state.CaptureOp{{
+			Op:         op,
+			Path:       path,
+			Fidelity:   "full",
+			BeforeOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: op == "delete"},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: op == "delete"},
+			AfterOID:   sql.NullString{String: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Valid: op != "delete"},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: op != "delete"},
+		}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent(%s,%s): %v", op, path, err)
+		}
+		if err := state.RecordPlannerOffer(ctx, db, seq, 123); err != nil {
+			t.Fatalf("RecordPlannerOffer(%d): %v", seq, err)
+		}
+		return seq
+	}
+	seqs := []int64{
+		seed(".derivedData-provider-core/Index.noindex/a.db", "delete"),
+		seed(".derivedData-provider-core/Index.noindex/b.db", "delete"),
+	}
+	seed("build/output.js", "delete")
+	seed("src/ordinary.txt", "modify")
+	return seqs
+}
+
+func countRowsWhere(t *testing.T, db *state.DB, table, where string, args ...any) int {
+	t.Helper()
+	var n int
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table, where)
+	if err := db.SQL().QueryRowContext(context.Background(), q, args...).Scan(&n); err != nil {
+		t.Fatalf("count %s where %s: %v", table, where, err)
+	}
+	return n
+}
+
+func gitCachedNameStatus(t *testing.T, ctx context.Context, repo string) string {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--name-status")
+	if err != nil {
+		t.Fatalf("git diff --cached --name-status: %v", err)
+	}
+	return string(out)
 }

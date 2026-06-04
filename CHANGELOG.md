@@ -8,6 +8,15 @@
   `acd repo manage`, and `acd list --interactive`. Disabled repos preserve
   `.git/acd` state, are hidden from normal `acd list` snapshots, and make hook
   calls skip cleanly with `repo_disabled`.
+- `acd diagnose` and `acd fix` now surface tracked generated-cache delete
+  floods, clean the ACD queue without mutating Git, and print explicit
+  `git add -u` plus `git commit` follow-up commands for the repository cleanup.
+
+### Fixed
+
+- Capture now protects deleted tracked files under safe-ignore generated trees
+  instead of queuing delete floods, and reconciles shadow state so the same
+  generated deletes do not reappear on the next scan.
 
 ## v2026-06-01
 
