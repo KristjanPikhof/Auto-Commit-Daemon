@@ -298,6 +298,9 @@ ORDER BY seq ASC`
 		if err := rows.Scan(&seq, &branchRef, &generation, &baseHead, &rel); err != nil {
 			return nil, fmt.Errorf("state: scan generated pending delete: %w", err)
 		}
+		if !matcher.MatchFile(rel) {
+			continue
+		}
 		match, ok := matcher.MatchRoot(rel)
 		if !ok {
 			continue

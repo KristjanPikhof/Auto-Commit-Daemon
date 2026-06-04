@@ -131,6 +131,7 @@ func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
 	seqOne := appendEvent("delete", "frontend/node_modules/react/index.js", EventStatePending)
 	seqTwo := appendEvent("delete", "frontend/node_modules/react/package.json", EventStatePending)
 	seqThree := appendEvent("delete", ".derivedData-provider-core/Index.noindex/cache.db", EventStatePending)
+	appendEvent("delete", "target", EventStatePending)
 	appendEvent("delete", "build/output.js", EventStatePending)
 	appendEvent("delete", "docs/node_modules.md", EventStatePending)
 	appendEvent("create", "node_modules/new-file.js", EventStatePending)
@@ -152,6 +153,33 @@ func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
 		g.PendingCount != 1 || g.OldestSeq != seqThree || g.NewestSeq != seqThree ||
 		!reflect.DeepEqual(g.EventSeqs, []int64{seqThree}) {
 		t.Fatalf("derived data group=%+v", g)
+	}
+}
+
+func TestScanGeneratedPendingDeletesIgnoresSameNamedFile(t *testing.T) {
+	t.Setenv(EnvSafeIgnore, "")
+	t.Setenv(EnvSafeIgnoreExtra, "")
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+
+	if _, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         "0123456789012345678901234567890123456789",
+		Operation:        "delete",
+		Path:             "target",
+		Fidelity:         "full",
+		State:            EventStatePending,
+	}, nil); err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
+
+	groups, err := ScanGeneratedPendingDeletes(ctx, db.ReadSQL(), NewSafeIgnoreMatcher(), 0)
+	if err != nil {
+		t.Fatalf("ScanGeneratedPendingDeletes: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("same-named file was grouped as generated pending delete: %+v", groups)
 	}
 }
 
