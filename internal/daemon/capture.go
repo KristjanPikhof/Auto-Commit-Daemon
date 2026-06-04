@@ -694,6 +694,10 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	protectedSkipCount := protectShadowFromSkippedPresent(ctx, repoRoot, db, cctx, shadow, protectedSkips)
 
 	ops := Classify(shadow, live)
+	ops, protectedDeleteCount, err := protectSafeIgnoreDeleteOps(ctx, db, cctx, safeIgnore, ops)
+	if err != nil {
+		return summary, err
+	}
 	if opts.SortByPath {
 		// Reorder ops in lexicographic ascending Path order BEFORE the
 		// per-op AppendCaptureEvent loop runs and BEFORE the
@@ -716,7 +720,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			"walked_files": summary.WalkedFiles,
 			"oversize":     summary.Oversize,
 			"errors":       summary.Errors,
-			"protected":    protectedSkipCount,
+			"protected":    protectedSkipCount + protectedDeleteCount,
 		},
 		Generation: cctx.BranchGeneration,
 	})
@@ -875,6 +879,26 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	return summary, nil
 }
 
+func protectSafeIgnoreDeleteOps(ctx context.Context, db *state.DB, cctx CaptureContext, safeIgnore *state.SafeIgnoreMatcher, ops []ClassifiedOp) ([]ClassifiedOp, int, error) {
+	if safeIgnore == nil || len(ops) == 0 {
+		return ops, 0, nil
+	}
+	out := make([]ClassifiedOp, 0, len(ops))
+	protected := 0
+	for _, op := range ops {
+		if op.Op != "delete" || !safeIgnore.MatchFile(op.Path) {
+			out = append(out, op)
+			continue
+		}
+		if err := updateShadow(ctx, db, cctx, op); err != nil {
+			return nil, protected, fmt.Errorf("daemon: protect safe-ignore delete shadow %s: %w", op.Path, err)
+		}
+		recordProtectedSkipDecision(ctx, db, cctx, op.Path, "safe_ignore")
+		protected++
+	}
+	return out, protected, nil
+}
+
 func toStateOp(op ClassifiedOp) state.CaptureOp {
 	return state.CaptureOp{
 		Ord:        0,
@@ -997,7 +1021,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 		BranchRef:        sql.NullString{String: cctx.BranchRef, Valid: cctx.BranchRef != ""},
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		ActionTaken:      sql.NullString{String: "no_delete_generated", Valid: true},
-		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped present protected path %s without generating a delete.", path), Valid: true},
+		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped protected path %s without generating a delete.", path), Valid: true},
 	}); err != nil {
 		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
 	}
