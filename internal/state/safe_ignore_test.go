@@ -18,6 +18,9 @@ func TestSafeIgnoreDefaultsMatchGeneratedTrees(t *testing.T) {
 		{"frontend/node_modules/react/index.js", true},
 		{"target/debug/app", true},
 		{"pkg/target/debug/app", true},
+		{"DerivedData/Build/Intermediates.noindex/cache.db", true},
+		{".derivedData-provider-core/Index.noindex/DataStore/record", true},
+		{"nested/.derivedData-tests/Build/cache.db", true},
 		{".venv/bin/python", true},
 		{"service/venv/bin/python", true},
 		{"pkg/__pycache__/mod.pyc", true},
@@ -28,6 +31,7 @@ func TestSafeIgnoreDefaultsMatchGeneratedTrees(t *testing.T) {
 		{"src/main.go", false},
 		{"docs/node_modules.md", false},
 		{"targeted/file.txt", false},
+		{"DerivedDataNotes/file.txt", false},
 		{"vendor/pkg/file.go", false},
 		{"build/output.js", false},
 		{"dist/app.js", false},
@@ -61,7 +65,7 @@ func TestSafeIgnoreDirectoryPatternsDoNotMatchSameNamedFiles(t *testing.T) {
 	t.Setenv(EnvSafeIgnoreExtra, "dist/, web/build/")
 	m := NewSafeIgnoreMatcher()
 
-	for _, rel := range []string{"node_modules", "target", "pkg/target", "dist", "web/build"} {
+	for _, rel := range []string{"node_modules", "target", "pkg/target", ".derivedData-provider-core.md", "dist", "web/build"} {
 		if m.MatchFile(rel) {
 			t.Fatalf("MatchFile(%q) = true, want false for same-named file", rel)
 		}

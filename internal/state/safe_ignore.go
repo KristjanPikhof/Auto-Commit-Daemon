@@ -24,6 +24,8 @@ const (
 var DefaultSafeIgnorePatterns = []string{
 	"node_modules/",
 	"target/",
+	"DerivedData/",
+	".derivedData*/",
 	".venv/",
 	"venv/",
 	"__pycache__/",

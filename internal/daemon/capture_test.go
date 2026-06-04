@@ -512,7 +512,7 @@ func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(f.dir, "fine.txt"), []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write fine: %v", err)
 	}
-	for _, root := range []string{"node_modules", "target"} {
+	for _, root := range []string{"node_modules", "target", "DerivedData", ".derivedData-provider-core"} {
 		for i := 0; i < 16; i++ {
 			dir := filepath.Join(f.dir, root, fmt.Sprintf("pkg-%02d", i))
 			if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -541,7 +541,10 @@ func TestCapture_SafeIgnoreDefaultPrunesGeneratedTrees(t *testing.T) {
 
 	var sawFine bool
 	for _, op := range pendingOps(t, f.db) {
-		if strings.HasPrefix(op.Path, "node_modules/") || strings.HasPrefix(op.Path, "target/") {
+		if strings.HasPrefix(op.Path, "node_modules/") ||
+			strings.HasPrefix(op.Path, "target/") ||
+			strings.HasPrefix(op.Path, "DerivedData/") ||
+			strings.HasPrefix(op.Path, ".derivedData-provider-core/") {
 			t.Fatalf("safe-ignore generated path captured: %+v", op)
 		}
 		if op.Path == "fine.txt" {
