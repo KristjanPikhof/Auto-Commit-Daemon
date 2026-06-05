@@ -209,6 +209,49 @@ func TestEvaluateIntentPlanMessageQuality(t *testing.T) {
 	}
 }
 
+func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
+		CommitFormat: CommitFormatConventional,
+		OfferedCaptures: []OfferedCapture{{
+			Seq:       1,
+			Path:      "internal/ai/message_quality.go",
+			Op:        "modify",
+			Timestamp: now,
+			Fidelity:  "full",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequest: %v", err)
+	}
+	tests := []struct {
+		name       string
+		subject    string
+		wantAction MessageQualityAction
+		wantReason MessageQualityReasonCode
+	}{
+		{name: "valid", subject: "fix: enforce conventional messages", wantAction: MessageQualityClean},
+		{name: "scoped rejected", subject: "fix(ai): enforce conventional messages", wantAction: MessageQualityRewrite, wantReason: MessageQualityReasonMalformedSubject},
+		{name: "unknown type", subject: "feature: enforce conventional messages", wantAction: MessageQualityRewrite, wantReason: MessageQualityReasonUnknownCommitType},
+		{name: "missing description", subject: "fix: ", wantAction: MessageQualityRewrite, wantReason: MessageQualityReasonMalformedSubject},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report := EvaluateIntentPlanMessageQuality(req, IntentPlan{
+				SelectedSeqs:   []int64{1},
+				Subject:        tc.subject,
+				GroupingReason: "single AI validation change",
+			})
+			if report.Action != tc.wantAction {
+				t.Fatalf("Action=%s want %s reasons=%+v", report.Action, tc.wantAction, report.Reasons)
+			}
+			if tc.wantReason != "" && !report.HasReason(tc.wantReason) {
+				t.Fatalf("missing reason %s in %+v", tc.wantReason, report.Reasons)
+			}
+		})
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_DiffSizeRequiresBody(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{

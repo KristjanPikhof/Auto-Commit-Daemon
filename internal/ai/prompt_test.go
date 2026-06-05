@@ -28,7 +28,7 @@ func TestCommitMessageFormatInstructionsConventional(t *testing.T) {
 		"scope-less Conventional Commit type",
 		"Allowed types are feat, fix, docs, refactor, test, build, ci, chore, perf, style, and revert",
 		"Do not include scopes",
-		"Example subject: feat: add commit format selection",
+		"`feat: add commit format selection`",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("conventional instructions missing %q in %q", want, got)

@@ -84,3 +84,21 @@ func TestValidateCommitRewriteProposalRejectsGenericAndMalformedResponses(t *tes
 		t.Fatalf("subject=%q", got.Subject)
 	}
 }
+
+func TestValidateCommitRewriteProposalConventional(t *testing.T) {
+	req := CommitRewriteRequest{
+		OldOID:       "abc123",
+		ChangedPaths: []string{"internal/ai/rewrite_proposals.go"},
+		CommitFormat: CommitFormatConventional,
+	}
+	if _, err := ValidateCommitRewriteProposal(req, Result{Subject: "Fix rewrite proposal validation"}); err == nil {
+		t.Fatalf("expected imperative proposal rejection in conventional mode")
+	}
+	got, err := ValidateCommitRewriteProposal(req, Result{Subject: "fix: validate rewrite proposals"})
+	if err != nil {
+		t.Fatalf("valid conventional proposal rejected: %v", err)
+	}
+	if got.Subject != "fix: validate rewrite proposals" {
+		t.Fatalf("subject=%q", got.Subject)
+	}
+}
