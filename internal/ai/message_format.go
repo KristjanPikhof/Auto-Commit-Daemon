@@ -36,8 +36,7 @@ const conventionalCommitMessageFormatInstructions = "Commit message format: " +
 	"Do not include scopes such as feat(api): or fix(cli):. " +
 	"Prefer a concise subject and practical body focused on what changed and why. " +
 	"The body should explain why, intent, impact, or context, not restate the diff. " +
-	"Example subject: feat: add commit format selection. " +
-	"Example subject: fix: reject scoped conventional subjects."
+	"Example subjects include `feat: add commit format selection` and `fix: reject scoped conventional subjects`."
 
 // CommitMessageFormatInstructions returns the provider-facing message
 // contract for the selected format. Unknown values intentionally use the
@@ -65,4 +64,77 @@ func isConventionalCommitType(raw string) bool {
 		}
 	}
 	return false
+}
+
+func effectiveCommitFormat(format CommitFormat) CommitFormat {
+	switch format {
+	case CommitFormatConventional:
+		return CommitFormatConventional
+	default:
+		return CommitFormatImperative
+	}
+}
+
+func validateCommitMessageFormat(format CommitFormat, subject, body string) []MessageQualityReason {
+	var reasons []MessageQualityReason
+	if strings.TrimSpace(body) != "" && !wellFormedBulletBody(strings.TrimSpace(body)) {
+		reasons = append(reasons, MessageQualityReason{
+			Code:    MessageQualityReasonMalformedBody,
+			Message: "body must contain only '- ' bullets with indented continuations",
+		})
+	}
+	if effectiveCommitFormat(format) != CommitFormatConventional {
+		return reasons
+	}
+	subject = strings.TrimSpace(subject)
+	switch {
+	case subject == "":
+		reasons = append(reasons, MessageQualityReason{
+			Code:    MessageQualityReasonEmptySubject,
+			Message: "subject is empty",
+		})
+	case len([]rune(subject)) > SubjectCap:
+		reasons = append(reasons, MessageQualityReason{
+			Code:    MessageQualityReasonMalformedSubject,
+			Message: "conventional subject exceeds 50 characters",
+		})
+	case strings.HasSuffix(subject, "."):
+		reasons = append(reasons, MessageQualityReason{
+			Code:    MessageQualityReasonMalformedSubject,
+			Message: "conventional subject must not end with a period",
+		})
+	default:
+		reasons = append(reasons, validateConventionalSubject(subject)...)
+	}
+	return reasons
+}
+
+func validateConventionalSubject(subject string) []MessageQualityReason {
+	idx := strings.Index(subject, ": ")
+	if idx <= 0 {
+		return []MessageQualityReason{{
+			Code:    MessageQualityReasonMalformedSubject,
+			Message: "conventional subject must use '<type>: <description>'",
+		}}
+	}
+	typ := subject[:idx]
+	desc := strings.TrimSpace(subject[idx+2:])
+	switch {
+	case strings.ContainsAny(typ, "()!"):
+		return []MessageQualityReason{{
+			Code:    MessageQualityReasonMalformedSubject,
+			Message: "conventional subject must not include a scope or breaking marker",
+		}}
+	case !isConventionalCommitType(typ):
+		return []MessageQualityReason{{
+			Code:    MessageQualityReasonUnknownCommitType,
+			Message: "conventional subject uses an unknown type",
+		}}
+	case desc == "":
+		return []MessageQualityReason{{
+			Code:    MessageQualityReasonMalformedSubject,
+			Message: "conventional subject description must be non-empty",
+		}}
+	}
+	return nil
 }

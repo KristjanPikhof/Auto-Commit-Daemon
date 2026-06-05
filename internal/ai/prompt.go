@@ -40,6 +40,9 @@ type CommitContext struct {
 	Commits  []string  // recent parent commit subjects for additional context
 	MultiOp  []OpItem  // present when one event carries > 1 ops
 	Now      time.Time // injected clock for deterministic tests
+	// CommitFormat selects the message subject format. Empty keeps the
+	// historical imperative default.
+	CommitFormat CommitFormat
 }
 
 // OpItem is one entry of CommitContext.MultiOp. Mirrors the per-op subset
@@ -124,8 +127,15 @@ var (
 
 // IntentPlannerSystemPrompt returns the stable system instructions used by
 // network and plugin planner providers.
-func IntentPlannerSystemPrompt() string {
-	return intentPlannerSystemPrompt
+func IntentPlannerSystemPrompt(format ...CommitFormat) string {
+	selected := CommitFormatImperative
+	if len(format) > 0 {
+		selected = format[0]
+	}
+	if effectiveCommitFormat(selected) == CommitFormatImperative {
+		return intentPlannerSystemPrompt
+	}
+	return strings.Replace(intentPlannerSystemPrompt, commitMessageFormatInstructions, CommitMessageFormatInstructions(selected), 1)
 }
 
 // BuildIntentPlanUserPrompt serializes req into the planner user message. When
@@ -158,6 +168,7 @@ func BuildIntentMessageRewriteUserPrompt(req IntentMessageRewriteRequest) (strin
 	return "Rewrite only the git commit subject and body for this accepted intent plan.\n" +
 		"Do not change selected_seqs, deferred_seqs, grouping_reason, deferred_reasons, or any offered capture data.\n" +
 		"Return only the commit_message tool output with a replacement subject and body that fixes the listed quality_failures.\n" +
+		CommitMessageFormatInstructions(req.PlannerRequest.CommitFormat) + "\n" +
 		"If body_required is true, include body bullets. Keep grouping rationale out of the body.\n" +
 		string(body), nil
 }

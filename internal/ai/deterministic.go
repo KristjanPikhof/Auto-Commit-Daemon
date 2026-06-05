@@ -36,7 +36,9 @@ import (
 // DeterministicProvider is the always-available rule-based provider.
 // The struct is empty so callers may construct it as a value literal
 // without needing a constructor — it has no dependencies and no state.
-type DeterministicProvider struct{}
+type DeterministicProvider struct {
+	CommitFormat CommitFormat
+}
 
 // Name returns the canonical provider identifier used in Result.Source.
 func (DeterministicProvider) Name() string { return "deterministic" }
@@ -54,7 +56,7 @@ func (p DeterministicProvider) Generate(ctx context.Context, cc CommitContext) (
 	ops := normalizeOps(cc)
 	if len(ops) == 0 {
 		return Result{
-			Subject: "Update files",
+			Subject: p.formatSubject("Update files", ops),
 			Source:  p.Name(),
 		}, nil
 	}
@@ -65,12 +67,12 @@ func (p DeterministicProvider) Generate(ctx context.Context, cc CommitContext) (
 		// pure pass-through to singleOpSubject so byte-identical legacy
 		// output is preserved.
 		return Result{
-			Subject: DiffAwareSubject(ops[0], cc.DiffText),
+			Subject: p.formatSubject(DiffAwareSubject(ops[0], cc.DiffText), ops),
 			Source:  p.Name(),
 		}, nil
 	}
 
-	subject := multiOpSubject(ops)
+	subject := p.formatSubject(multiOpSubject(ops), ops)
 	var b strings.Builder
 	for i, op := range ops {
 		if i > 0 {
@@ -83,6 +85,61 @@ func (p DeterministicProvider) Generate(ctx context.Context, cc CommitContext) (
 		Body:    b.String(),
 		Source:  p.Name(),
 	}, nil
+}
+
+func (p DeterministicProvider) formatSubject(imperative string, ops []OpItem) string {
+	if effectiveCommitFormat(p.CommitFormat) != CommitFormatConventional {
+		return imperative
+	}
+	return conventionalTypeForOps(ops) + ": " + lowerFirst(imperative)
+}
+
+func conventionalTypeForOps(ops []OpItem) string {
+	if len(ops) == 0 {
+		return "chore"
+	}
+	typ := ""
+	for _, op := range ops {
+		next := conventionalTypeForPathOp(op)
+		if typ == "" {
+			typ = next
+			continue
+		}
+		if typ != next {
+			return "chore"
+		}
+	}
+	if typ == "" {
+		return "chore"
+	}
+	return typ
+}
+
+func conventionalTypeForPathOp(op OpItem) string {
+	switch {
+	case strings.HasPrefix(op.Path, ".github/workflows/"):
+		return "ci"
+	case strings.HasPrefix(op.Path, "docs/") || strings.HasSuffix(strings.ToLower(op.Path), ".md"):
+		return "docs"
+	case strings.Contains(strings.ToLower(op.Path), "test"):
+		return "test"
+	case strings.HasSuffix(op.Path, "go.mod") || strings.HasSuffix(op.Path, "go.sum") ||
+		strings.Contains(strings.ToLower(op.Path), "makefile"):
+		return "build"
+	default:
+		return "chore"
+	}
+}
+
+func lowerFirst(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if c := s[0]; c >= 'A' && c <= 'Z' {
+		return string(c-'A'+'a') + s[1:]
+	}
+	return s
 }
 
 // normalizeOps collapses the CommitContext input shape (which carries

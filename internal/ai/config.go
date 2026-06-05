@@ -291,7 +291,7 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	det := DeterministicProvider{}
+	det := DeterministicProvider{CommitFormat: cfg.CommitFormat}
 
 	mode := cfg.Mode
 	switch {
@@ -317,6 +317,7 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 			APIKey:  cfg.APIKey,
 			Model:   cfg.Model,
 			HTTP:    httpClient,
+			Format:  cfg.CommitFormat,
 		}
 		return Compose(primary, det), nil, nil
 
@@ -328,8 +329,9 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 			return det, nil, nil
 		}
 		sp := NewSubprocessProvider(name, SubprocessOptions{
-			Timeout: cfg.Timeout,
-			Logger:  logger,
+			Timeout:      cfg.Timeout,
+			Logger:       logger,
+			CommitFormat: cfg.CommitFormat,
 		})
 		return Compose(sp, det), sp, nil
 
