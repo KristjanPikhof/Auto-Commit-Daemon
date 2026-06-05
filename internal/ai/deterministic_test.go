@@ -123,6 +123,23 @@ func TestDeterministic_ConventionalSubjects(t *testing.T) {
 	}
 }
 
+func TestDeterministic_ConventionalSubjectRespectsCap(t *testing.T) {
+	p := DeterministicProvider{CommitFormat: CommitFormatConventional}
+	got, err := p.Generate(context.Background(), CommitContext{
+		Op:   "create",
+		Path: "internal/ai/this-is-a-very-long-generated-provider-fixture-name.go",
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(got.Subject) > SubjectCap {
+		t.Fatalf("subject length=%d want <= %d: %q", len(got.Subject), SubjectCap, got.Subject)
+	}
+	if reasons := validateCommitMessageFormat(CommitFormatConventional, got.Subject, ""); len(reasons) != 0 {
+		t.Fatalf("subject failed conventional validation: %v", reasons)
+	}
+}
+
 // TestDeterministic_CommonDir checks the full-prefix-equals-path edge case
 // (paths fully nest -> drop trailing dir segment so we don't claim a file
 // as a directory). Mirrors the legacy _common_dir tail behaviour.
