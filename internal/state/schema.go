@@ -19,8 +19,9 @@ package state
 // v6 rebuilds decision_records so event_seq is denormalized ledger data rather
 // than a foreign key cleared by capture_events pruning; v7 adds planner_state
 // for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage;
-// v9 adds structured rewrite proposal failure storage.
-const SchemaVersion = 9
+// v9 adds structured rewrite proposal failure storage; v10 preserves the
+// commit-message format used to validate rewrite plans.
+const SchemaVersion = 10
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -138,6 +139,7 @@ CREATE TABLE IF NOT EXISTS rewrite_plans(
     expected_head       TEXT NOT NULL,
     provider            TEXT,
     model               TEXT,
+    commit_format       TEXT NOT NULL DEFAULT 'imperative',
     validation_status   TEXT NOT NULL,
     validation_error    TEXT,
     edited              INTEGER NOT NULL DEFAULT 0,
