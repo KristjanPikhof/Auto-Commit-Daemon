@@ -1,6 +1,9 @@
 package ai
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 const imperativeCommitMessageFormatInstructions = "Commit message format: " +
 	"Line 1: <imperative verb> <what changed>, max 50 characters, no trailing period. " +
@@ -73,6 +76,26 @@ func effectiveCommitFormat(format CommitFormat) CommitFormat {
 	default:
 		return CommitFormatImperative
 	}
+}
+
+func firstCommitFormat(formats ...CommitFormat) CommitFormat {
+	for _, format := range formats {
+		if format != "" {
+			return effectiveCommitFormat(format)
+		}
+	}
+	return CommitFormatImperative
+}
+
+func commitFormatValidationError(prefix string, reasons []MessageQualityReason) error {
+	if len(reasons) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, string(reason.Code))
+	}
+	return fmt.Errorf("%s: message format validation failed: %s", prefix, strings.Join(parts, ","))
 }
 
 func validateCommitMessageFormat(format CommitFormat, subject, body string) []MessageQualityReason {
