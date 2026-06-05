@@ -175,9 +175,6 @@ func UpdateRewritePlanDraft(ctx context.Context, d *DB, plan RewritePlan) error 
 	if plan.ApplyStatus == "" {
 		plan.ApplyStatus = RewritePlanApplyPending
 	}
-	if plan.CommitFormat == "" {
-		plan.CommitFormat = "imperative"
-	}
 	if err := validateRewritePlanCommits(plan.Commits); err != nil {
 		return err
 	}
@@ -189,7 +186,7 @@ func UpdateRewritePlanDraft(ctx context.Context, d *DB, plan RewritePlan) error 
 
 	res, err := tx.ExecContext(ctx, `
 UPDATE rewrite_plans SET
-    updated_ts = ?, commit_format = ?, validation_status = ?, validation_error = ?, edited = 1, apply_status = ?
+    updated_ts = ?, commit_format = COALESCE(NULLIF(?, ''), commit_format), validation_status = ?, validation_error = ?, edited = 1, apply_status = ?
 WHERE id = ?`, nowSeconds(), plan.CommitFormat, plan.ValidationStatus, plan.ValidationError, plan.ApplyStatus, plan.ID)
 	if err != nil {
 		return fmt.Errorf("state: update rewrite plan draft: %w", err)
