@@ -92,6 +92,7 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local prompt diagnostics under `<gitDir>/acd/prompt-trace/`. |
 | `ACD_COMMIT_STRATEGY` | `event` | Set `intent` to ask the planner to group captures. |
+| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending count before planning. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age trigger for sparse queues. |
@@ -103,7 +104,14 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |
 
-Restart the daemon after changing provider or intent environment.
+Restart the daemon after changing provider, format, or intent environment.
+
+`ACD_COMMIT_FORMAT=conventional` accepts only `feat`, `fix`, `docs`,
+`refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`
+subjects in the form `type: summary`. Scopes such as `feat(ui): ...` and
+breaking markers such as `feat!: ...` are rejected. Format selection changes
+provider prompts and validation only; it does not change whether diffs leave the
+machine. Diff egress is still controlled only by `ACD_AI_DIFF_EGRESS`.
 
 ## Prompt traces
 
@@ -141,6 +149,7 @@ Commit-message request:
   "diff": "",
   "repo_root": "/abs/path/to/repo",
   "branch": "refs/heads/main",
+  "commit_format": "imperative",
   "multi_op": [],
   "now": "2026-04-28T12:00:00Z"
 }
@@ -157,9 +166,9 @@ Commit-message response:
 }
 ~~~
 
-Intent planner requests set `request_type` to `intent_plan` and include
-`planner_request.offered_captures`. The response must classify every offered
-seq:
+Intent planner requests set `request_type` to `intent_plan`, include
+`commit_format`, and include `planner_request.offered_captures`. The response
+must classify every offered seq:
 
 ~~~json
 {
@@ -183,6 +192,7 @@ Rules:
 | `selected_seqs` must be non-empty | Replay must make progress. |
 | Every offered seq must be selected or deferred | The planner cannot ignore work. |
 | `deferred_reasons` may mention only deferred seqs | Reasons stay aligned with the plan. |
+| `subject` must match `commit_format` | Wrong-format output gets rejected, corrected, or falls back deterministically. |
 | Non-empty `error` is a soft error | ACD keeps the plugin alive and falls back for that request. |
 | Timeout, EOF, crash, or I/O error is a hard error | ACD kills the plugin and respawns it on the next request. |
 
@@ -211,6 +221,7 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 |---|---|
 | Provider unset | Deterministic provider. |
 | `openai-compat` succeeds | Provider result is used. |
+| Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
 | `openai-compat` fails, times out, or has no key | Deterministic fallback. |
 | Subprocess response has `error` | Deterministic fallback, plugin stays alive. |
 | Subprocess crashes or times out | Deterministic fallback, plugin restarts next time. |

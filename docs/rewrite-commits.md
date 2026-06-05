@@ -45,6 +45,14 @@ export ACD_AI_API_KEY=...
 `deterministic` fallback is not enough to generate a new rewrite plan. It is
 fine for showing or applying an existing saved plan.
 
+Rewrite plans use the active `ACD_COMMIT_FORMAT` when they are generated. The
+default is `imperative`, so existing rewrite behavior stays unchanged. Set
+`ACD_COMMIT_FORMAT=conventional` to request scope-less Conventional Commit
+subjects such as `fix: preserve rewrite plan format`. Accepted conventional
+types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`,
+`perf`, `style`, and `revert`; scopes and breaking markers are rejected. Body
+bullets keep the same `- ` prefix and wrapping rules in both modes.
+
 ## Select commits
 
 | Selector | Meaning |
@@ -102,6 +110,12 @@ state reconciliation.
 
 Noninteractive apply requires either `--dry-run` or `--yes`. Declining an
 interactive apply prompt prints `No rewrite performed.`
+
+Saved plans store their commit format. `--show-plan` prints it, `--edit`
+preserves it, and edited text or JSON must still match the stored format. When a
+provider proposes a wrong-format conventional rewrite, ACD saves the plan as
+invalid with the original messages retained so you can inspect or regenerate it
+without accidentally applying malformed subjects.
 
 ## Command grammar
 

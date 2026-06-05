@@ -135,6 +135,22 @@ export ACD_INTENT_DEFER_LIMIT=1
 `ACD_AI_DIFF_EGRESS=1` lets the planner see redacted captured diffs. Leave it
 unset when the endpoint should receive metadata only.
 
+Message format:
+
+| Format | Example subject | Notes |
+|---|---|---|
+| `imperative` | `Add commit format selection` | Default and recommended. Existing behavior is unchanged. |
+| `conventional` | `feat: add commit format selection` | Optional scope-less Conventional Commit style. |
+
+~~~bash
+export ACD_COMMIT_FORMAT=conventional
+~~~
+
+Conventional mode accepts only `feat`, `fix`, `docs`, `refactor`, `test`,
+`build`, `ci`, `chore`, `perf`, `style`, and `revert`. Scopes and breaking
+markers are not supported. Body bullets keep the same `- ` prefix and wrapping
+rules as the default format.
+
 ## Daily commands
 
 | Need | Command |
@@ -291,6 +307,7 @@ git reset --hard <backup-ref-or-sha>
 | Variable | Default | Use |
 |---|---:|---|
 | `ACD_COMMIT_STRATEGY` | `event` | `event` for one capture per commit, `intent` for AI grouping. |
+| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
 | `ACD_AI_API_KEY` | unset | Required by `openai-compat`. |
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |

@@ -74,7 +74,9 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - Source edits do not affect the already-running daemon. Ordinary implementation work does not require pausing; when testing daemon or prompt behavior, `make build`, install/use the new `bin/acd`, then restart the daemon or run the intended binary directly.
 - Intent-env failures: rerun with `cleanenv`; verify suspected main flakes on `main`.
 
-Commit message format expected from AI and manual fixes:
+Commit message format expected from AI and manual fixes defaults to the
+imperative format. This is the release contract and existing behavior; do not
+change it unless the user opts in with `ACD_COMMIT_FORMAT=conventional`.
 
 ```text
 Line 1: <imperative verb> <what changed>
@@ -94,13 +96,15 @@ Line 3+: bullet list for why/context
 - Body explains why, intent, impact, or context; do not restate the diff.
 - Intent planner grouping rationale belongs in `grouping_reason`, never in commit body.
 - Avoid generic messages: `Update file`, `WIP`, `changes`.
+- Optional conventional mode uses scope-less subjects like `feat: add intent format reporting`.
+- Conventional types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`; scopes and breaking markers are rejected.
 - Code facts: `ai.SubjectCap = 50`, `ai.BodyWrap = 72`, per-event `ai.DiffCap = 4000`, planner `ai.IntentStageDiffCap = 16000`.
 
 ## State, Branch, Capture
 
 - Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG state/share.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2. `acd stop` removes matching/all caches. Atomic tmp+rename prevents corruption.
-- `SchemaVersion = 7`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`.
+- `SchemaVersion = 10`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`; v8-v9 rewrite-plan state; v10 `rewrite_plans.commit_format`.
 - `shadow_paths` key `(branch_ref, branch_generation, path)`; read-heavy paths use `state.DB.ReadSQL()`.
 - Shadow bootstrap: 5000-row chunks; marker `shadow.bootstrapped:<branch_ref>:<generation>` only after all chunks commit; clean partial rows on failure. Empty active shadow with marker means delete marker and re-bootstrap.
 - Reseed prunes old generations via `ACD_SHADOW_RETENTION_GENERATIONS` default `1`.
@@ -222,6 +226,6 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 | Trace | `ACD_TRACE`; `ACD_TRACE_DIR` default `<gitDir>/acd/trace` |
 | Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables); `ACD_KEEP_DEAD_BRANCH_BARRIERS` disables auto-prune |
 | Capture | `ACD_SENSITIVE_GLOBS`; `ACD_SAFE_IGNORE`; `ACD_SAFE_IGNORE_EXTRA`; `ACD_MAX_PENDING_EVENTS`; `ACD_PATH_QUIESCENCE_SECONDS=0` (off; restart to apply; capture remains durable, planner offer waits for quiet path) |
-| AI | `ACD_AI_PROVIDER=deterministic|openai-compat|subprocess:<name>`; `ACD_AI_BASE_URL`; `ACD_AI_API_KEY`; `ACD_AI_MODEL`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS`; `ACD_INTENT_REJECTS_RAW` |
+| AI | `ACD_AI_PROVIDER=deterministic|openai-compat|subprocess:<name>`; `ACD_AI_BASE_URL`; `ACD_AI_API_KEY`; `ACD_AI_MODEL`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS`; `ACD_COMMIT_FORMAT=imperative|conventional`; `ACD_INTENT_REJECTS_RAW` |
 | Strategy | `ACD_COMMIT_STRATEGY=event|intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=1`; `ACD_INTENT_PATH_COALESCE=1`; `ACD_RECENT_COMMIT_AFFINITY_SECONDS=0`; planner cap `ai.IntentStageDiffCap=16000` |
 | Watcher/client | `ACD_FSNOTIFY_ENABLED`; `ACD_DISABLE_FSNOTIFY`; `ACD_MAX_INOTIFY_WATCHES`; `ACD_CLIENT_TTL_SECONDS` |
