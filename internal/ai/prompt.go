@@ -88,16 +88,7 @@ const DiffCap = 4000
 // limit even at the upper window value.
 const IntentStageDiffCap = 16000
 
-const commitMessageFormatInstructions = "Commit message format: " +
-	"Line 1: <imperative verb> <what changed>, max 50 characters, no trailing period. " +
-	"Line 2: blank. " +
-	"Line 3+: bullet list for why/context; each bullet starts with '- '; max 72 characters per line; wrapped continuation lines must not start with '- '. " +
-	"Line 1 must start with an imperative verb such as Add, Fix, Refactor, Remove, Rename, Simplify, Update, or Document. " +
-	"Describe the semantic change, not just the filename. " +
-	"Prefer a concise subject and practical body focused on what changed and why. " +
-	"The body should explain why, intent, impact, or context, not restate the diff. " +
-	"Avoid generic messages such as Update file, WIP, or changes. " +
-	"Do not mention filenames in line 1 unless the change is specifically about that file itself."
+const commitMessageFormatInstructions = imperativeCommitMessageFormatInstructions
 
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
