@@ -811,6 +811,7 @@ type intentReplayConfig struct {
 	// the matching HEAD commit for any offered path whose most recent
 	// HEAD commit landed within the window.
 	recentCommitAffinity time.Duration
+	commitFormat         ai.CommitFormat
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -838,6 +839,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		bypassBatchWait:      opts.IntentBypassBatchWait,
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
+		commitFormat:         cfg.CommitFormat,
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
@@ -878,13 +880,13 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	provider, closer, err := ai.BuildProvider(providerCfg)
 	if err != nil {
 		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
-		out.planner = ai.DeterministicProvider{}
+		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		return out, nil, nil
 	}
 	planner, ok := provider.(ai.IntentPlanner)
 	if !ok {
 		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
-		out.planner = ai.DeterministicProvider{}
+		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		if closer != nil {
 			return out, func() {
 				if err := closer.Close(); err != nil {
@@ -1482,6 +1484,7 @@ func buildIntentPlanRequest(
 		ForcedAging:          forced,
 		IncludeCapturedDiffs: cfg.includeDiffs,
 		PathRecentCommits:    pathRecent,
+		CommitFormat:         cfg.commitFormat,
 	})
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err

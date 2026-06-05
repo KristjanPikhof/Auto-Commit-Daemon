@@ -360,6 +360,7 @@ func Run(ctx context.Context, opts Options) error {
 	_ = resolvePathQuiescenceSeconds()
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
 		"commit.strategy":        string(providerCfg.CommitStrategy),
+		"commit.format":          string(providerCfg.CommitFormat),
 		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
 		"intent.min_pending":     strconv.Itoa(providerCfg.IntentMinPending),
 		"intent.max_pending_age": providerCfg.IntentMaxPendingAge.String(),
@@ -378,7 +379,7 @@ func Run(ctx context.Context, opts Options) error {
 			if err != nil {
 				logger.Warn("build ai provider; falling back to deterministic",
 					"err", err.Error())
-				provider = ai.DeterministicProvider{}
+				provider = ai.DeterministicProvider{CommitFormat: providerCfg.CommitFormat}
 			} else {
 				provider = built
 				providerCloser = closer
