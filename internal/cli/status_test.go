@@ -429,6 +429,7 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 	}
 	for k, v := range map[string]string{
 		"commit.strategy":       "intent",
+		"commit.format":         "conventional",
 		"intent.window":         "7",
 		"intent.recent_commits": "3",
 		"intent.defer_limit":    "1",
@@ -448,6 +449,7 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
 	if !rep.IntentStrategy.Active || rep.IntentStrategy.Strategy != "intent" ||
+		rep.IntentStrategy.CommitFormat != "conventional" ||
 		rep.IntentStrategy.Window != 7 || rep.IntentStrategy.RecentCommits != 3 ||
 		rep.IntentStrategy.DeferLimit != 1 {
 		t.Fatalf("intent strategy = %+v, want daemon metadata", rep.IntentStrategy)
