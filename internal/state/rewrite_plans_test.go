@@ -44,6 +44,9 @@ func TestRewritePlanSaveLoadAndApplyStatus(t *testing.T) {
 	if got.ValidationStatus != RewritePlanValidationValid || got.Edited || got.ApplyStatus != RewritePlanApplyPending {
 		t.Fatalf("loaded status mismatch: %+v", got)
 	}
+	if got.CommitFormat != "imperative" {
+		t.Fatalf("CommitFormat=%q want imperative", got.CommitFormat)
+	}
 	if len(got.Commits) != 2 || got.Commits[0].Ord != 0 || got.Commits[1].OldOID != "old2" || got.Commits[1].ProposedMessage != "new message 2" {
 		t.Fatalf("loaded commits mismatch: %+v", got.Commits)
 	}
@@ -70,6 +73,7 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 		ExpectedHead: "head456",
 		Provider:     sql.NullString{String: "anthropic", Valid: true},
 		Model:        sql.NullString{String: "claude-test", Valid: true},
+		CommitFormat: "conventional",
 		Commits: []RewritePlanCommit{
 			{OldOID: "old-a", ProposedMessage: "draft proposal", OriginalMessage: "original"},
 		},
@@ -96,6 +100,9 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	if !base.Edited || base.ValidationStatus != RewritePlanValidationValid || len(base.Commits) != 2 || base.Commits[0].ProposedMessage != "edited in place" {
 		t.Fatalf("draft update mismatch: %+v commits=%+v", base, base.Commits)
 	}
+	if base.CommitFormat != "conventional" {
+		t.Fatalf("draft CommitFormat=%q want conventional", base.CommitFormat)
+	}
 
 	revID, err := CreateEditedRewritePlanRevision(ctx, d, baseID, []RewritePlanCommit{
 		{OldOID: "old-a", ProposedMessage: "revision proposal", OriginalMessage: "original"},
@@ -112,6 +119,9 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	}
 	if rev.BranchRef != base.BranchRef || rev.ExpectedHead != base.ExpectedHead || rev.Provider.String != base.Provider.String || rev.Model.String != base.Model.String {
 		t.Fatalf("revision metadata mismatch: base=%+v rev=%+v", base, rev)
+	}
+	if rev.CommitFormat != "conventional" {
+		t.Fatalf("revision CommitFormat=%q want conventional", rev.CommitFormat)
 	}
 	if !rev.Edited || rev.ValidationStatus != RewritePlanValidationValid || rev.ApplyStatus != RewritePlanApplyPending {
 		t.Fatalf("revision status mismatch: %+v", rev)
@@ -235,7 +245,11 @@ PRAGMA user_version = 7;`); err != nil {
 	if err != nil {
 		t.Fatalf("SaveRewritePlan after migration: %v", err)
 	}
-	if _, ok, err := LoadRewritePlan(ctx, d, id); err != nil || !ok {
+	loaded, ok, err := LoadRewritePlan(ctx, d, id)
+	if err != nil || !ok {
 		t.Fatalf("LoadRewritePlan after migration: ok=%v err=%v", ok, err)
+	}
+	if loaded.CommitFormat != "imperative" {
+		t.Fatalf("migrated CommitFormat=%q want imperative", loaded.CommitFormat)
 	}
 }
