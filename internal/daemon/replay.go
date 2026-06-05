@@ -1783,6 +1783,28 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 	return plan, nil
 }
 
+func stringFromNull(s sql.NullString) string {
+	if !s.Valid {
+		return ""
+	}
+	return s.String
+}
+
+func opItemsFromCaptureOps(item intentReplayItem) []ai.OpItem {
+	if len(item.ops) == 0 {
+		return nil
+	}
+	out := make([]ai.OpItem, 0, len(item.ops))
+	for _, op := range item.ops {
+		out = append(out, ai.OpItem{
+			Path:    op.Path,
+			Op:      op.Op,
+			OldPath: stringFromNull(op.OldPath),
+		})
+	}
+	return out
+}
+
 // singletonFallbackOp picks the OpItem fed to DiffAwareSubject. For a
 // single captured op (the common case) we use it directly. For events
 // that came in with multiple ops we fall back to the event-level shape
