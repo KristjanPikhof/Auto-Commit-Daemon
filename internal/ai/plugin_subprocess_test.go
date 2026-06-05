@@ -92,6 +92,67 @@ done
 	}
 }
 
+func TestSubprocess_CommitFormatEnvelope(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"commit_format":"conventional"'*)
+      printf '{"version":1,"subject":"fix: validate subprocess envelope","body":"","error":""}\n'
+      ;;
+    *)
+      printf '{"version":1,"subject":"","body":"","error":"missing commit_format"}\n'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath:     fixedLookPath("acd-provider-test", bin),
+		Timeout:      5 * time.Second,
+		Stderr:       io.Discard,
+		CommitFormat: CommitFormatConventional,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	got, err := p.Generate(context.Background(), CommitContext{Path: "internal/ai/plugin_subprocess.go", Op: "modify"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if got.Subject != "fix: validate subprocess envelope" {
+		t.Fatalf("Subject=%q", got.Subject)
+	}
+}
+
+func TestSubprocess_WrongConventionalFormatFallsBack(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  printf '{"version":1,"subject":"Update plugin_subprocess.go","body":"","error":""}\n'
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath:     fixedLookPath("acd-provider-test", bin),
+		Timeout:      5 * time.Second,
+		Stderr:       io.Discard,
+		CommitFormat: CommitFormatConventional,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	prov := Compose(p, DeterministicProvider{CommitFormat: CommitFormatConventional})
+	got, err := prov.Generate(context.Background(), CommitContext{Path: "internal/ai/plugin_subprocess.go", Op: "modify"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if got.Source != "deterministic" {
+		t.Fatalf("Source=%q want deterministic", got.Source)
+	}
+	if got.Subject != "chore: update plugin_subprocess.go" {
+		t.Fatalf("Subject=%q", got.Subject)
+	}
+}
+
 func TestSubprocess_PlanIntent(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
