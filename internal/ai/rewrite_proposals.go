@@ -40,7 +40,7 @@ type CommitRewriteRequest struct {
 	NeighborCommits []CommitSummary          `json:"neighbor_commits,omitempty"`
 	DecisionContext []RewriteDecisionContext `json:"acd_decision_context,omitempty"`
 	Now             time.Time                `json:"now,omitempty"`
-	CommitFormat    CommitFormat            `json:"commit_format,omitempty"`
+	CommitFormat    CommitFormat             `json:"commit_format,omitempty"`
 }
 
 // BuildCommitRewriteUserPrompt serializes a stable rewrite prompt. The output

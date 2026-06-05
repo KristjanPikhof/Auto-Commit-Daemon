@@ -87,20 +87,20 @@ func openAICommitMessageParameters(format CommitFormat) map[string]any {
 		subjectDescription = "Line 1 only: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
 	}
 	return map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"subject": map[string]any{
-			"type":        "string",
-			"description": subjectDescription,
+		"type": "object",
+		"properties": map[string]any{
+			"subject": map[string]any{
+				"type":        "string",
+				"description": subjectDescription,
+			},
+			"body": map[string]any{
+				"type":        "string",
+				"description": "Optional commit body bullets for why/context/impact. Each bullet starts with '- ', max 72 chars per line, continuation lines are indented and do not start with '- '. Do not restate the diff.",
+			},
 		},
-		"body": map[string]any{
-			"type":        "string",
-			"description": "Optional commit body bullets for why/context/impact. Each bullet starts with '- ', max 72 chars per line, continuation lines are indented and do not start with '- '. Do not restate the diff.",
-		},
-	},
-	"required":             []string{"subject"},
-	"additionalProperties": false,
-}
+		"required":             []string{"subject"},
+		"additionalProperties": false,
+	}
 }
 
 func openAIIntentPlanParameters(format CommitFormat) map[string]any {
@@ -109,47 +109,47 @@ func openAIIntentPlanParameters(format CommitFormat) map[string]any {
 		subjectDescription = "Final commit subject for selected captures: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
 	}
 	return map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"selected_seqs": map[string]any{
-			"type":        "array",
-			"description": "Non-empty seqs selected for the next commit.",
-			"items":       map[string]any{"type": "integer"},
-		},
-		"deferred_seqs": map[string]any{
-			"type":        "array",
-			"description": "Every offered seq not selected for this commit.",
-			"items":       map[string]any{"type": "integer"},
-		},
-		"subject": map[string]any{
-			"type":        "string",
-			"description": subjectDescription,
-		},
-		"body": map[string]any{
-			"type":        "string",
-			"description": "Optional final commit body bullets for why/context/impact. Do not explain why selected captures fit together; put that rationale only in grouping_reason.",
-		},
-		"grouping_reason": map[string]any{
-			"type":        "string",
-			"description": "Evidence-grounded rationale for why the selected captures belong together. This is not part of the git commit message.",
-		},
-		"deferred_reasons": map[string]any{
-			"type":        "array",
-			"description": "One reason for every deferred seq.",
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"seq":    map[string]any{"type": "integer"},
-					"reason": map[string]any{"type": "string"},
+		"type": "object",
+		"properties": map[string]any{
+			"selected_seqs": map[string]any{
+				"type":        "array",
+				"description": "Non-empty seqs selected for the next commit.",
+				"items":       map[string]any{"type": "integer"},
+			},
+			"deferred_seqs": map[string]any{
+				"type":        "array",
+				"description": "Every offered seq not selected for this commit.",
+				"items":       map[string]any{"type": "integer"},
+			},
+			"subject": map[string]any{
+				"type":        "string",
+				"description": subjectDescription,
+			},
+			"body": map[string]any{
+				"type":        "string",
+				"description": "Optional final commit body bullets for why/context/impact. Do not explain why selected captures fit together; put that rationale only in grouping_reason.",
+			},
+			"grouping_reason": map[string]any{
+				"type":        "string",
+				"description": "Evidence-grounded rationale for why the selected captures belong together. This is not part of the git commit message.",
+			},
+			"deferred_reasons": map[string]any{
+				"type":        "array",
+				"description": "One reason for every deferred seq.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"seq":    map[string]any{"type": "integer"},
+						"reason": map[string]any{"type": "string"},
+					},
+					"required":             []string{"seq", "reason"},
+					"additionalProperties": false,
 				},
-				"required":             []string{"seq", "reason"},
-				"additionalProperties": false,
 			},
 		},
-	},
-	"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
-	"additionalProperties": false,
-}
+		"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
+		"additionalProperties": false,
+	}
 }
 
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
