@@ -91,7 +91,15 @@ func (p DeterministicProvider) formatSubject(imperative string, ops []OpItem) st
 	if effectiveCommitFormat(p.CommitFormat) != CommitFormatConventional {
 		return imperative
 	}
-	return conventionalTypeForOps(ops) + ": " + lowerFirst(imperative)
+	subject := conventionalTypeForOps(ops) + ": " + lowerFirst(imperative)
+	return trimSubjectToCap(subject)
+}
+
+// FormatSubjectForOps applies the provider's selected message format to an
+// already-rendered imperative subject. It is used by daemon fallback paths that
+// need a diff-aware subject but should keep the same format rules.
+func (p DeterministicProvider) FormatSubjectForOps(imperative string, ops []OpItem) string {
+	return p.formatSubject(imperative, ops)
 }
 
 func conventionalTypeForOps(ops []OpItem) string {
@@ -140,6 +148,14 @@ func lowerFirst(s string) string {
 		return string(c-'A'+'a') + s[1:]
 	}
 	return s
+}
+
+func trimSubjectToCap(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if len(subject) <= SubjectCap {
+		return subject
+	}
+	return strings.TrimSpace(subject[:SubjectCap])
 }
 
 // normalizeOps collapses the CommitContext input shape (which carries
