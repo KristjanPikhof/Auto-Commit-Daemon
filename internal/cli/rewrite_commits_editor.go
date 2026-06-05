@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 )
 
 const (
@@ -110,6 +111,9 @@ func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.Rewr
 		if strings.TrimSpace(blocks[i].message) == "" {
 			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan: commit %s has empty message", blocks[i].oid)
 		}
+		if err := validateEditedRewriteMessage(base, baseCommit, blocks[i].message); err != nil {
+			return nil, err
+		}
 		out[i] = baseCommit
 		out[i].ProposedMessage = blocks[i].message
 	}
@@ -154,10 +158,33 @@ func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.Rewr
 		if strings.TrimSpace(got.Message) == "" {
 			return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: commit %s has empty message", got.OldOID)
 		}
+		if err := validateEditedRewriteMessage(base, baseCommit, got.Message); err != nil {
+			return nil, err
+		}
 		out[i] = baseCommit
 		out[i].ProposedMessage = got.Message
 	}
 	return out, nil
+}
+
+func validateEditedRewriteMessage(plan state.RewritePlan, commit state.RewritePlanCommit, message string) error {
+	if normalizeRewritePlanCommitFormat(plan.CommitFormat) != string(ai.CommitFormatConventional) {
+		return nil
+	}
+	parts := strings.SplitN(strings.TrimSpace(message), "\n\n", 2)
+	result := ai.Result{Subject: parts[0]}
+	if len(parts) == 2 {
+		result.Body = parts[1]
+	}
+	_, err := ai.ValidateCommitRewriteProposal(ai.CommitRewriteRequest{
+		OldOID:          commit.OldOID,
+		OriginalMessage: commit.OriginalMessage,
+		CommitFormat:    ai.CommitFormatConventional,
+	}, result)
+	if err != nil {
+		return fmt.Errorf("acd rewrite-commits: invalid conventional message for %s: %w", commit.OldOID, err)
+	}
+	return nil
 }
 
 func rewritePlanMessagesEqual(a, b []state.RewritePlanCommit) bool {
