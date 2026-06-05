@@ -75,16 +75,23 @@ const DefaultOpenAITimeout = 15 * time.Second
 // openAISystemPrompt is the steering text we prepend to every request.
 // Kept short on purpose — verbose system prompts tend to make smaller
 // models hallucinate boilerplate the sanitizer then has to strip.
-const openAISystemPrompt = "You are a git commit message generator. " +
-	"Always call the commit_message function. " +
-	commitMessageFormatInstructions
+func openAISystemPrompt(format CommitFormat) string {
+	return "You are a git commit message generator. " +
+		"Always call the commit_message function. " +
+		CommitMessageFormatInstructions(format)
+}
 
-var openAICommitMessageParameters = map[string]any{
+func openAICommitMessageParameters(format CommitFormat) map[string]any {
+	subjectDescription := "Line 1 only: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed."
+	if effectiveCommitFormat(format) == CommitFormatConventional {
+		subjectDescription = "Line 1 only: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
+	}
+	return map[string]any{
 	"type": "object",
 	"properties": map[string]any{
 		"subject": map[string]any{
 			"type":        "string",
-			"description": "Line 1 only: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
+			"description": subjectDescription,
 		},
 		"body": map[string]any{
 			"type":        "string",
@@ -94,8 +101,14 @@ var openAICommitMessageParameters = map[string]any{
 	"required":             []string{"subject"},
 	"additionalProperties": false,
 }
+}
 
-var openAIIntentPlanParameters = map[string]any{
+func openAIIntentPlanParameters(format CommitFormat) map[string]any {
+	subjectDescription := "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed."
+	if effectiveCommitFormat(format) == CommitFormatConventional {
+		subjectDescription = "Final commit subject for selected captures: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
+	}
+	return map[string]any{
 	"type": "object",
 	"properties": map[string]any{
 		"selected_seqs": map[string]any{
@@ -110,7 +123,7 @@ var openAIIntentPlanParameters = map[string]any{
 		},
 		"subject": map[string]any{
 			"type":        "string",
-			"description": "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
+			"description": subjectDescription,
 		},
 		"body": map[string]any{
 			"type":        "string",
@@ -137,6 +150,7 @@ var openAIIntentPlanParameters = map[string]any{
 	"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
 	"additionalProperties": false,
 }
+}
 
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
 // usable: Generate fills in the BaseURL/Model/HTTP/Now defaults on first
@@ -152,6 +166,10 @@ type OpenAIProvider struct {
 
 	// DiffCap caps the unified-diff payload before send (default DiffCap).
 	DiffCap int
+
+	// Format selects the commit-message subject contract. Empty preserves
+	// the historical imperative default.
+	Format CommitFormat
 }
 
 // Name reports the canonical identifier; sources stamped on Result are
@@ -184,6 +202,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		httpClient = defaultOpenAIClient()
 	}
 
+	if cc.CommitFormat == "" {
+		cc.CommitFormat = p.Format
+	}
 	body, transform, err := buildOpenAIRequestWithTrace(model, cc, diffCap)
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
@@ -664,7 +685,7 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: openAISystemPrompt},
+			{Role: "system", Content: openAISystemPrompt(cc.CommitFormat)},
 			{Role: "user", Content: "Generate a commit message for this change:\n" + string(userJSON)},
 		},
 		Tools: []tool{{
@@ -672,7 +693,7 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit a single commit message for the change described.",
-				Parameters:  openAICommitMessageParameters,
+				Parameters:  openAICommitMessageParameters(cc.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{
@@ -727,7 +748,7 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: IntentPlannerSystemPrompt()},
+			{Role: "system", Content: IntentPlannerSystemPrompt(plannerReq.CommitFormat)},
 			{Role: "user", Content: userPrompt},
 		},
 		Tools: []tool{{
@@ -735,7 +756,7 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 			Function: funcDecl{
 				Name:        "capture_intent_plan",
 				Description: "Select or defer every offered capture for the next commit.",
-				Parameters:  openAIIntentPlanParameters,
+				Parameters:  openAIIntentPlanParameters(plannerReq.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{
@@ -846,8 +867,8 @@ func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteReque
 	}
 	body := req{
 		Model:       model,
-		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + commitMessageFormatInstructions}, {Role: "user", Content: userPrompt}},
-		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters}}},
+		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)}, {Role: "user", Content: userPrompt}},
+		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters(rewriteReq.CommitFormat)}}},
 		ToolChoice:  toolChoice{Type: "function", Function: toolChoiceFn{Name: "commit_message"}},
 		Temperature: 0.2,
 	}
@@ -891,7 +912,7 @@ func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq In
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + commitMessageFormatInstructions},
+			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)},
 			{Role: "user", Content: userPrompt},
 		},
 		Tools: []tool{{
@@ -899,7 +920,7 @@ func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq In
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit only the replacement commit message subject and body.",
-				Parameters:  openAICommitMessageParameters,
+				Parameters:  openAICommitMessageParameters(rewriteReq.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{
