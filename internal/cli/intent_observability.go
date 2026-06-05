@@ -57,6 +57,7 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 
 type intentStrategyReport struct {
 	Strategy                          string `json:"strategy"`
+	CommitFormat                      string `json:"commit_format"`
 	Active                            bool   `json:"active"`
 	Window                            int    `json:"window,omitempty"`
 	RecentCommits                     int    `json:"recent_commits,omitempty"`
@@ -159,10 +160,10 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		status = r.Strategy
 	}
 	if r.Active {
-		fmt.Fprintf(out, "Commit strategy: %s (window %d, min pending %d, max age %s, recent commits %d, defer limit %d)\n",
-			status, r.Window, r.MinPending, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
+		fmt.Fprintf(out, "Commit strategy: %s format=%s (window %d, min pending %d, max age %s, recent commits %d, defer limit %d)\n",
+			status, valueOrUnset(r.CommitFormat), r.Window, r.MinPending, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
 	} else {
-		fmt.Fprintf(out, "Commit strategy: %s\n", status)
+		fmt.Fprintf(out, "Commit strategy: %s format=%s\n", status, valueOrUnset(r.CommitFormat))
 	}
 	if r.BatchWaitActive {
 		fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
@@ -261,6 +262,7 @@ func intentStrategyFromEnv() intentStrategyReport {
 	cfg := ai.LoadProviderConfigFromEnv()
 	return intentStrategyReport{
 		Strategy:      string(cfg.CommitStrategy),
+		CommitFormat:  string(cfg.CommitFormat),
 		Active:        cfg.CommitStrategy == ai.CommitStrategyIntent,
 		Window:        cfg.IntentWindow,
 		RecentCommits: cfg.IntentRecentCommits,
@@ -284,6 +286,11 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	}
 	report.Strategy = string(strategy)
 	report.Active = strategy == ai.CommitStrategyIntent
+	if v, ok, err := metaLookup(ctx, conn, "commit.format"); err != nil {
+		return report, fmt.Errorf("commit.format: %w", err)
+	} else if ok {
+		report.CommitFormat = normalizeCommitFormatForReport(v, report.CommitFormat)
+	}
 	if v, ok, err := metaLookup(ctx, conn, "intent.window"); err != nil {
 		return report, fmt.Errorf("intent.window: %w", err)
 	} else if ok {
@@ -392,6 +399,17 @@ LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlock
 	}
 
 	return report, nil
+}
+
+func normalizeCommitFormatForReport(raw, fallback string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(ai.CommitFormatConventional):
+		return string(ai.CommitFormatConventional)
+	case "", string(ai.CommitFormatImperative):
+		return string(ai.CommitFormatImperative)
+	default:
+		return fallback
+	}
 }
 
 // loadIntentRecentRates populates PlannerErrorRateRecent and
