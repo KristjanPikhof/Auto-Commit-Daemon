@@ -265,6 +265,10 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return Result{}, err
 	}
+	if err := commitFormatValidationError("openai-compat", validateCommitMessageFormat(cc.CommitFormat, subj, bodyOut)); err != nil {
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return Result{}, err
+	}
 	p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
@@ -712,6 +716,7 @@ func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([
 }
 
 func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRequest) ([]byte, prompttrace.TransformMetadata, error) {
+	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 	userPrompt, err := BuildIntentPlanUserPrompt(plannerReq)
 	if err != nil {
 		return nil, prompttrace.TransformMetadata{}, err
@@ -834,6 +839,7 @@ func (p *OpenAIProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq Co
 }
 
 func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteRequest) ([]byte, error) {
+	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
 	userPrompt, err := BuildCommitRewriteUserPrompt(rewriteReq)
 	if err != nil {
 		return nil, err
@@ -876,6 +882,7 @@ func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteReque
 }
 
 func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, prompttrace.TransformMetadata, error) {
+	rewriteReq.CommitFormat = firstCommitFormat(rewriteReq.CommitFormat, rewriteReq.PlannerRequest.CommitFormat)
 	userPrompt, err := BuildIntentMessageRewriteUserPrompt(rewriteReq)
 	if err != nil {
 		return nil, prompttrace.TransformMetadata{}, err

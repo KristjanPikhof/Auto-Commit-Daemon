@@ -254,6 +254,10 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
 		return Result{}, err
 	}
+	if err := commitFormatValidationError("subprocess:"+p.name, validateCommitMessageFormat(req.CommitFormat, subj, bodyOut)); err != nil {
+		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
+		return Result{}, err
+	}
 	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
@@ -272,6 +276,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	if p.resolveErr != nil {
 		return IntentPlan{}, p.resolveErr
 	}
+	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 
 	req := subprocessRequest{
 		Version:        pluginProtocolVersion,
@@ -399,6 +404,7 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 	if p.resolveErr != nil {
 		return Result{}, p.resolveErr
 	}
+	rewriteReq.CommitFormat = firstCommitFormat(rewriteReq.CommitFormat, rewriteReq.PlannerRequest.CommitFormat)
 
 	req := subprocessRequest{
 		Version:               pluginProtocolVersion,
@@ -472,6 +478,7 @@ func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteRe
 	if p.resolveErr != nil {
 		return Result{}, p.resolveErr
 	}
+	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
 	req := subprocessRequest{Version: pluginProtocolVersion, RequestType: "commit_rewrite_proposal", CommitFormat: rewriteReq.CommitFormat, CommitRewriteRequest: &rewriteReq}
 	body, err := marshalSubprocessRequest(req)
 	if err != nil {
