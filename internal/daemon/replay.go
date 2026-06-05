@@ -1033,7 +1033,7 @@ func replayIntentBatch(
 	// their message can pass the quality/rewrite policy instead of landing
 	// generic "Update parsed" style subjects.
 	if forced && len(items) == 1 && isDeterministicIntentPlanner(cfg.planner) {
-			plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0], cfg.commitFormat)
+		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0], cfg.commitFormat)
 		// Defense in depth: even though forced-aging narrows the window to
 		// one self-determined seq, run the safety + plan validators before
 		// publishing. A future regression in planIntentSingletonFastPath or
@@ -1065,11 +1065,11 @@ func replayIntentBatch(
 		// Validation failure: fall through to the standard deterministic
 		// path. We replace the planner with the deterministic provider so
 		// PlanIntent below cannot produce another bad plan.
-			cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
+		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
 	}
 
 	if !forced && isSingletonProviderFastPath(items) {
-			plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0], cfg.commitFormat)
+		plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0], cfg.commitFormat)
 		if err != nil {
 			return sum, err
 		}
@@ -1093,7 +1093,7 @@ func replayIntentBatch(
 			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
 		}
-			cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
+		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
 	}
 
 	if !forced {
@@ -1709,19 +1709,19 @@ func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item inte
 		diffCh <- diffResult{diff: rendered, err: err}
 	}()
 	select {
-		case res := <-diffCh:
-			if res.err != nil || subjectCtx.Err() != nil {
-				subject = ai.DiffAwareSubject(op, "")
-			} else {
-				subject = ai.DiffAwareSubject(op, res.diff)
-			}
+	case res := <-diffCh:
+		if res.err != nil || subjectCtx.Err() != nil {
+			subject = ai.DiffAwareSubject(op, "")
+		} else {
+			subject = ai.DiffAwareSubject(op, res.diff)
+		}
 	case <-subjectCtx.Done():
 		// Timed out: do NOT block waiting for the goroutine to finish; the
 		// renderer will observe the cancelled context on its next git
 		// invocation and exit on its own. Use the cheap subject so the
 		// commit still ships within the forced-aging budget.
-			subject = ai.DiffAwareSubject(op, "")
-		}
+		subject = ai.DiffAwareSubject(op, "")
+	}
 	subject = ai.DeterministicProvider{CommitFormat: format}.FormatSubjectForOps(subject, []ai.OpItem{op})
 	return ai.IntentPlan{
 		SelectedSeqs:   []int64{item.event.Seq},

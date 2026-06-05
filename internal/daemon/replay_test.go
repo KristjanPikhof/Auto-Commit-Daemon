@@ -6203,7 +6203,7 @@ func TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout(t *testing.T) {
 		ops:   []state.CaptureOp{{EventSeq: 1, Path: "slow.go", Op: "modify"}},
 	}
 	start := time.Now()
-		plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item, ai.CommitFormatImperative)
+	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item, ai.CommitFormatImperative)
 	elapsed := time.Since(start)
 	if elapsed > time.Second {
 		t.Fatalf("subject budget exceeded; elapsed=%s want <= ~50ms+overhead", elapsed)
