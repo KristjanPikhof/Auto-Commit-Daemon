@@ -75,67 +75,81 @@ const DefaultOpenAITimeout = 15 * time.Second
 // openAISystemPrompt is the steering text we prepend to every request.
 // Kept short on purpose — verbose system prompts tend to make smaller
 // models hallucinate boilerplate the sanitizer then has to strip.
-const openAISystemPrompt = "You are a git commit message generator. " +
-	"Always call the commit_message function. " +
-	commitMessageFormatInstructions
-
-var openAICommitMessageParameters = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"subject": map[string]any{
-			"type":        "string",
-			"description": "Line 1 only: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
-		},
-		"body": map[string]any{
-			"type":        "string",
-			"description": "Optional commit body bullets for why/context/impact. Each bullet starts with '- ', max 72 chars per line, continuation lines are indented and do not start with '- '. Do not restate the diff.",
-		},
-	},
-	"required":             []string{"subject"},
-	"additionalProperties": false,
+func openAISystemPrompt(format CommitFormat) string {
+	return "You are a git commit message generator. " +
+		"Always call the commit_message function. " +
+		CommitMessageFormatInstructions(format)
 }
 
-var openAIIntentPlanParameters = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"selected_seqs": map[string]any{
-			"type":        "array",
-			"description": "Non-empty seqs selected for the next commit.",
-			"items":       map[string]any{"type": "integer"},
-		},
-		"deferred_seqs": map[string]any{
-			"type":        "array",
-			"description": "Every offered seq not selected for this commit.",
-			"items":       map[string]any{"type": "integer"},
-		},
-		"subject": map[string]any{
-			"type":        "string",
-			"description": "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed.",
-		},
-		"body": map[string]any{
-			"type":        "string",
-			"description": "Optional final commit body bullets for why/context/impact. Do not explain why selected captures fit together; put that rationale only in grouping_reason.",
-		},
-		"grouping_reason": map[string]any{
-			"type":        "string",
-			"description": "Evidence-grounded rationale for why the selected captures belong together. This is not part of the git commit message.",
-		},
-		"deferred_reasons": map[string]any{
-			"type":        "array",
-			"description": "One reason for every deferred seq.",
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"seq":    map[string]any{"type": "integer"},
-					"reason": map[string]any{"type": "string"},
-				},
-				"required":             []string{"seq", "reason"},
-				"additionalProperties": false,
+func openAICommitMessageParameters(format CommitFormat) map[string]any {
+	subjectDescription := "Line 1 only: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed."
+	if effectiveCommitFormat(format) == CommitFormatConventional {
+		subjectDescription = "Line 1 only: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"subject": map[string]any{
+				"type":        "string",
+				"description": subjectDescription,
+			},
+			"body": map[string]any{
+				"type":        "string",
+				"description": "Optional commit body bullets for why/context/impact. Each bullet starts with '- ', max 72 chars per line, continuation lines are indented and do not start with '- '. Do not restate the diff.",
 			},
 		},
-	},
-	"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
-	"additionalProperties": false,
+		"required":             []string{"subject"},
+		"additionalProperties": false,
+	}
+}
+
+func openAIIntentPlanParameters(format CommitFormat) map[string]any {
+	subjectDescription := "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed."
+	if effectiveCommitFormat(format) == CommitFormatConventional {
+		subjectDescription = "Final commit subject for selected captures: scope-less Conventional Commit '<type>: <description>', allowed type, <= 50 chars, no trailing period."
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"selected_seqs": map[string]any{
+				"type":        "array",
+				"description": "Non-empty seqs selected for the next commit.",
+				"items":       map[string]any{"type": "integer"},
+			},
+			"deferred_seqs": map[string]any{
+				"type":        "array",
+				"description": "Every offered seq not selected for this commit.",
+				"items":       map[string]any{"type": "integer"},
+			},
+			"subject": map[string]any{
+				"type":        "string",
+				"description": subjectDescription,
+			},
+			"body": map[string]any{
+				"type":        "string",
+				"description": "Optional final commit body bullets for why/context/impact. Do not explain why selected captures fit together; put that rationale only in grouping_reason.",
+			},
+			"grouping_reason": map[string]any{
+				"type":        "string",
+				"description": "Evidence-grounded rationale for why the selected captures belong together. This is not part of the git commit message.",
+			},
+			"deferred_reasons": map[string]any{
+				"type":        "array",
+				"description": "One reason for every deferred seq.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"seq":    map[string]any{"type": "integer"},
+						"reason": map[string]any{"type": "string"},
+					},
+					"required":             []string{"seq", "reason"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
+		"additionalProperties": false,
+	}
 }
 
 // OpenAIProvider is the OpenAI-compatible HTTP provider. Zero value is
@@ -152,6 +166,10 @@ type OpenAIProvider struct {
 
 	// DiffCap caps the unified-diff payload before send (default DiffCap).
 	DiffCap int
+
+	// Format selects the commit-message subject contract. Empty preserves
+	// the historical imperative default.
+	Format CommitFormat
 }
 
 // Name reports the canonical identifier; sources stamped on Result are
@@ -184,6 +202,9 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		httpClient = defaultOpenAIClient()
 	}
 
+	if cc.CommitFormat == "" {
+		cc.CommitFormat = p.Format
+	}
 	body, transform, err := buildOpenAIRequestWithTrace(model, cc, diffCap)
 	if err != nil {
 		return Result{}, fmt.Errorf("openai-compat: build request: %w", err)
@@ -241,6 +262,10 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 	}
 	if strings.TrimSpace(subj) == "" {
 		err := errors.New("openai-compat: empty subject after sanitize")
+		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
+		return Result{}, err
+	}
+	if err := commitFormatValidationError("openai-compat", validateCommitMessageFormat(cc.CommitFormat, subj, bodyOut)); err != nil {
 		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return Result{}, err
 	}
@@ -664,7 +689,7 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: openAISystemPrompt},
+			{Role: "system", Content: openAISystemPrompt(cc.CommitFormat)},
 			{Role: "user", Content: "Generate a commit message for this change:\n" + string(userJSON)},
 		},
 		Tools: []tool{{
@@ -672,7 +697,7 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit a single commit message for the change described.",
-				Parameters:  openAICommitMessageParameters,
+				Parameters:  openAICommitMessageParameters(cc.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{
@@ -691,6 +716,7 @@ func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([
 }
 
 func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRequest) ([]byte, prompttrace.TransformMetadata, error) {
+	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 	userPrompt, err := BuildIntentPlanUserPrompt(plannerReq)
 	if err != nil {
 		return nil, prompttrace.TransformMetadata{}, err
@@ -727,7 +753,7 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: IntentPlannerSystemPrompt()},
+			{Role: "system", Content: IntentPlannerSystemPrompt(plannerReq.CommitFormat)},
 			{Role: "user", Content: userPrompt},
 		},
 		Tools: []tool{{
@@ -735,7 +761,7 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 			Function: funcDecl{
 				Name:        "capture_intent_plan",
 				Description: "Select or defer every offered capture for the next commit.",
-				Parameters:  openAIIntentPlanParameters,
+				Parameters:  openAIIntentPlanParameters(plannerReq.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{
@@ -813,6 +839,7 @@ func (p *OpenAIProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq Co
 }
 
 func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteRequest) ([]byte, error) {
+	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
 	userPrompt, err := BuildCommitRewriteUserPrompt(rewriteReq)
 	if err != nil {
 		return nil, err
@@ -846,8 +873,8 @@ func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteReque
 	}
 	body := req{
 		Model:       model,
-		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + commitMessageFormatInstructions}, {Role: "user", Content: userPrompt}},
-		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters}}},
+		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)}, {Role: "user", Content: userPrompt}},
+		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters(rewriteReq.CommitFormat)}}},
 		ToolChoice:  toolChoice{Type: "function", Function: toolChoiceFn{Name: "commit_message"}},
 		Temperature: 0.2,
 	}
@@ -855,6 +882,7 @@ func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteReque
 }
 
 func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, prompttrace.TransformMetadata, error) {
+	rewriteReq.CommitFormat = firstCommitFormat(rewriteReq.CommitFormat, rewriteReq.PlannerRequest.CommitFormat)
 	userPrompt, err := BuildIntentMessageRewriteUserPrompt(rewriteReq)
 	if err != nil {
 		return nil, prompttrace.TransformMetadata{}, err
@@ -891,7 +919,7 @@ func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq In
 	body := req{
 		Model: model,
 		Messages: []message{
-			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + commitMessageFormatInstructions},
+			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)},
 			{Role: "user", Content: userPrompt},
 		},
 		Tools: []tool{{
@@ -899,7 +927,7 @@ func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq In
 			Function: funcDecl{
 				Name:        "commit_message",
 				Description: "Emit only the replacement commit message subject and body.",
-				Parameters:  openAICommitMessageParameters,
+				Parameters:  openAICommitMessageParameters(rewriteReq.CommitFormat),
 			},
 		}},
 		ToolChoice: toolChoice{

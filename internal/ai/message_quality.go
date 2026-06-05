@@ -29,6 +29,8 @@ const (
 	MessageQualityReasonTokenOnly          MessageQualityReasonCode = "token_only_subject"
 	MessageQualityReasonBodyRequired       MessageQualityReasonCode = "body_required"
 	MessageQualityReasonMalformedBody      MessageQualityReasonCode = "malformed_body"
+	MessageQualityReasonMalformedSubject   MessageQualityReasonCode = "malformed_subject"
+	MessageQualityReasonUnknownCommitType  MessageQualityReasonCode = "unknown_commit_type"
 	MessageQualityReasonSanitizedSubject   MessageQualityReasonCode = "sanitized_subject"
 	MessageQualityReasonSanitizedBody      MessageQualityReasonCode = "sanitized_body"
 	MessageQualityReasonMissingSelection   MessageQualityReasonCode = "missing_selected_capture"
@@ -103,6 +105,9 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if strings.TrimSpace(plan.Body) != "" && !wellFormedBulletBody(strings.TrimSpace(plan.Body)) {
 		report.add(MessageQualityReasonMalformedBody, "body must contain only '- ' bullets with indented continuations")
 	}
+	for _, reason := range validateCommitMessageFormat(req.CommitFormat, subject, body) {
+		report.add(reason.Code, reason.Message)
+	}
 	if isGenericSubject(subject) {
 		report.add(MessageQualityReasonGenericSubject, "subject is generic and does not describe the semantic change")
 	}
@@ -140,6 +145,8 @@ func (r MessageQualityReport) decide(plan IntentPlan) MessageQualityAction {
 		r.HasReason(MessageQualityReasonFilenameOnly) ||
 		r.HasReason(MessageQualityReasonTokenOnly) ||
 		r.HasReason(MessageQualityReasonBodyRequired) ||
+		r.HasReason(MessageQualityReasonMalformedSubject) ||
+		r.HasReason(MessageQualityReasonUnknownCommitType) ||
 		r.HasReason(MessageQualityReasonMalformedBody) {
 		return MessageQualityRewrite
 	}

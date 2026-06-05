@@ -31,6 +31,7 @@ type RewritePlan struct {
 	ExpectedHead     string
 	Provider         sql.NullString
 	Model            sql.NullString
+	CommitFormat     string
 	ValidationStatus string
 	ValidationError  sql.NullString
 	Edited           bool
@@ -62,6 +63,9 @@ func SaveRewritePlan(ctx context.Context, d *DB, plan RewritePlan) (string, erro
 	}
 	if plan.ValidationStatus == "" {
 		plan.ValidationStatus = RewritePlanValidationDraft
+	}
+	if plan.CommitFormat == "" {
+		plan.CommitFormat = "imperative"
 	}
 	if plan.ApplyStatus == "" {
 		plan.ApplyStatus = RewritePlanApplyPending
@@ -101,7 +105,7 @@ func LoadRewritePlan(ctx context.Context, d *DB, id string) (RewritePlan, bool, 
 	}
 	const q = `
 SELECT id, created_ts, updated_ts, base_plan_id, revision, branch_ref,
-       expected_head, provider, model, validation_status, validation_error, edited, apply_status
+       expected_head, provider, model, commit_format, validation_status, validation_error, edited, apply_status
 FROM rewrite_plans
 WHERE id = ?`
 	var plan RewritePlan
@@ -109,7 +113,7 @@ WHERE id = ?`
 	err := d.readSQL().QueryRowContext(ctx, q, id).Scan(
 		&plan.ID, &plan.CreatedTS, &plan.UpdatedTS, &plan.BasePlanID, &plan.Revision,
 		&plan.BranchRef, &plan.ExpectedHead, &plan.Provider, &plan.Model,
-		&plan.ValidationStatus, &plan.ValidationError, &edited, &plan.ApplyStatus,
+		&plan.CommitFormat, &plan.ValidationStatus, &plan.ValidationError, &edited, &plan.ApplyStatus,
 	)
 	if err == sql.ErrNoRows {
 		return RewritePlan{}, false, nil
@@ -118,6 +122,9 @@ WHERE id = ?`
 		return RewritePlan{}, false, fmt.Errorf("state: load rewrite plan: %w", err)
 	}
 	plan.Edited = edited != 0
+	if plan.CommitFormat == "" {
+		plan.CommitFormat = "imperative"
+	}
 
 	commits, err := loadRewritePlanCommits(ctx, d.readSQL(), id)
 	if err != nil {
@@ -147,6 +154,7 @@ func CreateEditedRewritePlanRevision(ctx context.Context, d *DB, basePlanID stri
 		ExpectedHead:     base.ExpectedHead,
 		Provider:         base.Provider,
 		Model:            base.Model,
+		CommitFormat:     base.CommitFormat,
 		ValidationStatus: validationStatus,
 		ValidationError:  base.ValidationError,
 		Edited:           true,
@@ -178,8 +186,8 @@ func UpdateRewritePlanDraft(ctx context.Context, d *DB, plan RewritePlan) error 
 
 	res, err := tx.ExecContext(ctx, `
 UPDATE rewrite_plans SET
-    updated_ts = ?, validation_status = ?, validation_error = ?, edited = 1, apply_status = ?
-WHERE id = ?`, nowSeconds(), plan.ValidationStatus, plan.ValidationError, plan.ApplyStatus, plan.ID)
+    updated_ts = ?, commit_format = COALESCE(NULLIF(?, ''), commit_format), validation_status = ?, validation_error = ?, edited = 1, apply_status = ?
+WHERE id = ?`, nowSeconds(), plan.CommitFormat, plan.ValidationStatus, plan.ValidationError, plan.ApplyStatus, plan.ID)
 	if err != nil {
 		return fmt.Errorf("state: update rewrite plan draft: %w", err)
 	}
@@ -289,11 +297,11 @@ func insertRewritePlan(ctx context.Context, tx *sql.Tx, plan RewritePlan) error 
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO rewrite_plans(
     id, created_ts, updated_ts, base_plan_id, revision, branch_ref,
-    expected_head, provider, model, validation_status, validation_error, edited, apply_status
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    expected_head, provider, model, commit_format, validation_status, validation_error, edited, apply_status
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		plan.ID, plan.CreatedTS, plan.UpdatedTS, plan.BasePlanID, plan.Revision,
 		plan.BranchRef, plan.ExpectedHead, plan.Provider, plan.Model,
-		plan.ValidationStatus, plan.ValidationError, boolToInt(plan.Edited), plan.ApplyStatus,
+		plan.CommitFormat, plan.ValidationStatus, plan.ValidationError, boolToInt(plan.Edited), plan.ApplyStatus,
 	)
 	if err != nil {
 		return fmt.Errorf("state: insert rewrite plan: %w", err)
@@ -352,6 +360,9 @@ type queryer interface {
 func validateRewritePlan(plan RewritePlan) error {
 	if plan.ID == "" || plan.BranchRef == "" || plan.ExpectedHead == "" || plan.ValidationStatus == "" || plan.ApplyStatus == "" {
 		return fmt.Errorf("state: rewrite plan required field missing")
+	}
+	if plan.CommitFormat == "" {
+		return fmt.Errorf("state: rewrite plan commit format missing")
 	}
 	return validateRewritePlanCommits(plan.Commits)
 }

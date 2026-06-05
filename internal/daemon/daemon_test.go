@@ -1300,7 +1300,8 @@ func TestPruneCaptureEvents_DropsOldTerminalRowsWhenNotBarriers(t *testing.T) {
 	oldFailed := appendEvent("old-failed.txt", "refs/heads/failed", state.EventStateFailed, 1)
 	barrier := appendEvent("barrier.txt", "refs/heads/barrier", state.EventStateBlockedConflict, 1)
 	pendingBehindBarrier := appendEvent("pending.txt", "refs/heads/barrier", state.EventStatePending, 1)
-	freshFailed := appendEvent("fresh-failed.txt", "refs/heads/fresh", state.EventStateFailed, float64(time.Now().Unix()))
+	freshTS := float64(time.Now().Add(time.Hour).UnixNano()) / 1e9
+	freshFailed := appendEvent("fresh-failed.txt", "refs/heads/fresh", state.EventStateFailed, freshTS)
 
 	n, err := PruneCaptureEvents(ctx, f.db, time.Now(), 1*time.Second)
 	if err != nil {

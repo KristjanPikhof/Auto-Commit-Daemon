@@ -11,9 +11,10 @@
 //  1. Deterministic default (ACD_AI_PROVIDER unset)         — TestAI_DeterministicDefault
 //  2. openai-compat against a mock HTTP server (success)    — TestAI_OpenAICompatMockSuccess
 //  3. openai-compat 5xx -> deterministic fallback           — TestAI_OpenAICompat5xxFallback
-//  4. Subprocess plugin happy path                          — TestAI_SubprocessPluginHappyPath
-//  5. Subprocess plugin timeout (ACD_AI_TIMEOUT=300ms)      — TestAI_SubprocessPluginTimeoutFallback
-//  6. Subprocess plugin crash + respawn between events      — TestAI_SubprocessPluginCrashRespawn
+//  4. conventional mode wrong-format response -> fallback    — TestAI_OpenAICompatConventionalWrongFormatFallback
+//  5. Subprocess plugin happy path                          — TestAI_SubprocessPluginHappyPath
+//  6. Subprocess plugin timeout (ACD_AI_TIMEOUT=300ms)      — TestAI_SubprocessPluginTimeoutFallback
+//  7. Subprocess plugin crash + respawn between events      — TestAI_SubprocessPluginCrashRespawn
 //
 // Plugin tests are skipped on Windows (the bash shebang trick is not
 // portable; v1 ships no Windows support anyway per D1).
@@ -290,6 +291,75 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	tail := readDaemonLogTail(t, env, p.RepoHash)
 	if tail != "" && !strings.Contains(tail, "500") {
 		t.Logf("daemon log tail did not include 500 marker (best-effort check). tail:\n%s", tail)
+	}
+}
+
+// TestAI_OpenAICompatConventionalWrongFormatFallback proves that conventional
+// mode validates provider output end-to-end. A 200 OK response with the old
+// imperative subject format must not publish as-is; replay falls back to the
+// deterministic conventional message instead.
+func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	const cannedResp = `{
+  "id": "chatcmpl-format",
+  "object": "chat.completion",
+  "model": "gpt-5.4-mini",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "commit_message",
+          "arguments": "{\"subject\":\"Add wrong format\",\"body\":\"\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}`
+
+	var hits atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(cannedResp))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	extra := []string{
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_COMMIT_FORMAT=conventional",
+		trustEnv,
+	}
+	startSession(t, ctx, env, repo, "ai-conventional-format", "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repo, "format-bad.txt"), "wrong format fallback\n")
+	wakeSession(t, ctx, envWith(env, extra...), repo, "ai-conventional-format")
+	waitHeadAdvances(t, repo, startHead, 8*time.Second)
+
+	if hits.Load() == 0 {
+		t.Fatalf("mock never received a request; daemon never tried openai-compat")
+	}
+	if subj := headSubject(t, repo); subj != "chore: add format-bad.txt" {
+		t.Fatalf("subject=%q want conventional deterministic fallback", subj)
 	}
 }
 

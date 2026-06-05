@@ -1026,6 +1026,31 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestRewritePlanEditRejectsWrongConventionalFormat(t *testing.T) {
+	plan := rewritePlanEditTestPlan()
+	plan.CommitFormat = string(ai.CommitFormatConventional)
+	plan.Commits = []state.RewritePlanCommit{{
+		OldOID:          "abc123",
+		OriginalMessage: "old subject",
+		ProposedMessage: "fix: improve rewrite edit validation",
+	}}
+	rendered, err := renderRewritePlanEdit(plan, rewriteEditFormatText)
+	if err != nil {
+		t.Fatalf("renderRewritePlanEdit: %v", err)
+	}
+	invalid := strings.Replace(string(rendered), "fix: improve rewrite edit validation", "Improve rewrite edit validation", 1)
+	if _, err := parseRewritePlanEdit([]byte(invalid), rewriteEditFormatText, plan); err == nil {
+		t.Fatalf("expected conventional format validation error")
+	}
+	valid, err := parseRewritePlanEdit(rendered, rewriteEditFormatText, plan)
+	if err != nil {
+		t.Fatalf("valid conventional edit rejected: %v", err)
+	}
+	if valid[0].ProposedMessage != "fix: improve rewrite edit validation" {
+		t.Fatalf("ProposedMessage=%q", valid[0].ProposedMessage)
+	}
+}
+
 func TestRewritePlanFakeEditorAcceptsUnchangedContent(t *testing.T) {
 	plan := rewritePlanEditTestPlan()
 	editor := filepath.Join(t.TempDir(), "editor.sh")

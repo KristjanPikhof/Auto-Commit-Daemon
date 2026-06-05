@@ -91,6 +91,7 @@ seqs need reasons.
 
 ## Message rules
 
+`ACD_COMMIT_FORMAT=imperative` is the default and keeps the existing rules.
 Small single-file commits can use only a subject:
 
 ~~~text
@@ -119,6 +120,20 @@ When only the message is weak, ACD sends a locked rewrite request. The provider
 may change `subject` and `body`, but not selected seqs, deferred seqs, or
 grouping rationale.
 
+`ACD_COMMIT_FORMAT=conventional` opts into scope-less Conventional Commit
+subjects:
+
+~~~text
+feat: add intent format reporting
+~~~
+
+Accepted types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`,
+`chore`, `perf`, `style`, and `revert`. Scopes and breaking markers are not
+accepted. Body bullets keep the same format as imperative commits. If a planner
+or locked rewrite returns the wrong format, ACD records the validation issue,
+uses configured correction retries when available, and then falls back to a
+deterministic one-capture message in the selected format.
+
 ## Deferrals
 
 Deferral is normal. It means the planner decided a capture did not belong in the
@@ -139,6 +154,6 @@ capture safely.
 | What did the provider see? | `ACD_AI_PROMPT_TRACE=1` then `acd prompt --seq <seq>` |
 | Where are rejected planner responses? | `<gitDir>/acd/planner-rejects.jsonl` |
 
-`intent_strategy` reports window settings, batch wait state, deferred counts,
-forced-aging readiness, planner error rate, singleton commit rate, and
-message-quality rewrite or fallback counts.
+`intent_strategy` reports `commit_format`, window settings, batch wait state,
+deferred counts, forced-aging readiness, planner error rate, singleton commit
+rate, and message-quality rewrite or fallback counts.

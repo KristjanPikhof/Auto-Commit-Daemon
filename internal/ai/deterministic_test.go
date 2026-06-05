@@ -97,6 +97,49 @@ func TestDeterministic_MultiOp(t *testing.T) {
 	}
 }
 
+func TestDeterministic_ConventionalSubjects(t *testing.T) {
+	p := DeterministicProvider{CommitFormat: CommitFormatConventional}
+	tests := []struct {
+		name string
+		cc   CommitContext
+		want string
+	}{
+		{name: "docs", cc: CommitContext{Op: "modify", Path: "docs/rewrite-commits.md"}, want: "docs: update rewrite-commits.md"},
+		{name: "test", cc: CommitContext{Op: "modify", Path: "internal/ai/prompt_test.go"}, want: "test: update prompt_test.go"},
+		{name: "ci", cc: CommitContext{Op: "modify", Path: ".github/workflows/ci.yml"}, want: "ci: update ci.yml"},
+		{name: "build", cc: CommitContext{Op: "modify", Path: "go.mod"}, want: "build: update go.mod"},
+		{name: "unknown", cc: CommitContext{Op: "modify", Path: "internal/ai/provider.go"}, want: "chore: update provider.go"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := p.Generate(context.Background(), tc.cc)
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			if got.Subject != tc.want {
+				t.Fatalf("subject=%q want %q", got.Subject, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeterministic_ConventionalSubjectRespectsCap(t *testing.T) {
+	p := DeterministicProvider{CommitFormat: CommitFormatConventional}
+	got, err := p.Generate(context.Background(), CommitContext{
+		Op:   "create",
+		Path: "internal/ai/this-is-a-very-long-generated-provider-fixture-name.go",
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(got.Subject) > SubjectCap {
+		t.Fatalf("subject length=%d want <= %d: %q", len(got.Subject), SubjectCap, got.Subject)
+	}
+	if reasons := validateCommitMessageFormat(CommitFormatConventional, got.Subject, ""); len(reasons) != 0 {
+		t.Fatalf("subject failed conventional validation: %v", reasons)
+	}
+}
+
 // TestDeterministic_CommonDir checks the full-prefix-equals-path edge case
 // (paths fully nest -> drop trailing dir segment so we don't claim a file
 // as a directory). Mirrors the legacy _common_dir tail behaviour.

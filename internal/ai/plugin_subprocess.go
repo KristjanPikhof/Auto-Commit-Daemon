@@ -76,11 +76,12 @@ type LookPathFunc func(string) (string, error)
 // back to safe defaults (Timeout=30s, LookPath=exec.LookPath, Logger=
 // slog.Default, Stderr=~/.local/state/acd/plugin-<name>.log).
 type SubprocessOptions struct {
-	Timeout  time.Duration // per-request hard timeout; 0 -> DefaultSubprocessTimeout
-	Logger   *slog.Logger  // optional; nil -> slog.Default
-	Env      []string      // additional env entries appended to os.Environ
-	LookPath LookPathFunc  // resolves binary path; nil -> exec.LookPath
-	Stderr   io.Writer     // plugin stderr sink; nil -> per-plugin log file
+	Timeout      time.Duration // per-request hard timeout; 0 -> DefaultSubprocessTimeout
+	Logger       *slog.Logger  // optional; nil -> slog.Default
+	Env          []string      // additional env entries appended to os.Environ
+	LookPath     LookPathFunc  // resolves binary path; nil -> exec.LookPath
+	Stderr       io.Writer     // plugin stderr sink; nil -> per-plugin log file
+	CommitFormat CommitFormat  // empty -> imperative
 }
 
 // SubprocessProvider implements Provider by talking JSONL to a long-lived
@@ -95,6 +96,7 @@ type SubprocessProvider struct {
 	env     []string
 	stderr  io.Writer
 	logger  *slog.Logger
+	format  CommitFormat
 
 	mu     sync.Mutex // guards plugin/closed
 	plugin *pluginSession
@@ -127,6 +129,7 @@ func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvi
 		env:     append([]string(nil), opts.Env...),
 		stderr:  opts.Stderr,
 		logger:  logger,
+		format:  effectiveCommitFormat(opts.CommitFormat),
 	}
 
 	if strings.TrimSpace(name) == "" {
@@ -165,13 +168,14 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 	}
 
 	req := subprocessRequest{
-		Version:  pluginProtocolVersion,
-		Path:     cc.Path,
-		Op:       cc.Op,
-		OldPath:  cc.OldPath,
-		Diff:     Truncate(RedactDiffSecrets(cc.DiffText), DiffCap),
-		RepoRoot: cc.RepoRoot,
-		Branch:   cc.Branch,
+		Version:      pluginProtocolVersion,
+		CommitFormat: effectiveCommitFormat(firstCommitFormat(cc.CommitFormat, p.format)),
+		Path:         cc.Path,
+		Op:           cc.Op,
+		OldPath:      cc.OldPath,
+		Diff:         Truncate(RedactDiffSecrets(cc.DiffText), DiffCap),
+		RepoRoot:     cc.RepoRoot,
+		Branch:       cc.Branch,
 	}
 	for _, item := range cc.MultiOp {
 		req.MultiOp = append(req.MultiOp, subprocessOp{
@@ -250,6 +254,10 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
 		return Result{}, err
 	}
+	if err := commitFormatValidationError("subprocess:"+p.name, validateCommitMessageFormat(req.CommitFormat, subj, bodyOut)); err != nil {
+		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
+		return Result{}, err
+	}
 	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: bodyOut})
 	return Result{
 		Subject: subj,
@@ -268,10 +276,12 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	if p.resolveErr != nil {
 		return IntentPlan{}, p.resolveErr
 	}
+	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 
 	req := subprocessRequest{
 		Version:        pluginProtocolVersion,
 		RequestType:    "intent_plan",
+		CommitFormat:   plannerReq.CommitFormat,
 		PlannerRequest: &plannerReq,
 	}
 	body, err := marshalSubprocessRequest(req)
@@ -394,10 +404,12 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 	if p.resolveErr != nil {
 		return Result{}, p.resolveErr
 	}
+	rewriteReq.CommitFormat = firstCommitFormat(rewriteReq.CommitFormat, rewriteReq.PlannerRequest.CommitFormat)
 
 	req := subprocessRequest{
 		Version:               pluginProtocolVersion,
 		RequestType:           "intent_message_rewrite",
+		CommitFormat:          rewriteReq.CommitFormat,
 		MessageRewriteRequest: &rewriteReq,
 	}
 	body, err := marshalSubprocessRequest(req)
@@ -466,7 +478,8 @@ func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteRe
 	if p.resolveErr != nil {
 		return Result{}, p.resolveErr
 	}
-	req := subprocessRequest{Version: pluginProtocolVersion, RequestType: "commit_rewrite_proposal", CommitRewriteRequest: &rewriteReq}
+	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
+	req := subprocessRequest{Version: pluginProtocolVersion, RequestType: "commit_rewrite_proposal", CommitFormat: rewriteReq.CommitFormat, CommitRewriteRequest: &rewriteReq}
 	body, err := marshalSubprocessRequest(req)
 	if err != nil {
 		return Result{}, err
@@ -616,6 +629,7 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 type subprocessRequest struct {
 	Version               int                          `json:"version"`
 	RequestType           string                       `json:"request_type,omitempty"`
+	CommitFormat          CommitFormat                 `json:"commit_format,omitempty"`
 	Path                  string                       `json:"path,omitempty"`
 	Op                    string                       `json:"op,omitempty"`
 	OldPath               string                       `json:"old_path,omitempty"`

@@ -40,6 +40,7 @@ type CommitRewriteRequest struct {
 	NeighborCommits []CommitSummary          `json:"neighbor_commits,omitempty"`
 	DecisionContext []RewriteDecisionContext `json:"acd_decision_context,omitempty"`
 	Now             time.Time                `json:"now,omitempty"`
+	CommitFormat    CommitFormat             `json:"commit_format,omitempty"`
 }
 
 // BuildCommitRewriteUserPrompt serializes a stable rewrite prompt. The output
@@ -52,7 +53,7 @@ func BuildCommitRewriteUserPrompt(req CommitRewriteRequest) (string, error) {
 	return "Rewrite the git commit subject and body for this existing commit.\n" +
 		"Use the old message, changed paths, diff stat, allowed redacted diff, neighboring commits, and ACD decision context as evidence.\n" +
 		"Return only the commit_message tool output. Do not invent behavior not supported by the evidence.\n" +
-		commitMessageFormatInstructions + "\n" + string(body), nil
+		CommitMessageFormatInstructions(req.CommitFormat) + "\n" + string(body), nil
 }
 
 // ValidateCommitRewriteProposal sanitizes and quality-checks a proposal before
@@ -70,7 +71,7 @@ func ValidateCommitRewriteProposal(req CommitRewriteRequest, result Result) (Res
 	if strings.TrimSpace(out.Subject) == "" {
 		return Result{}, errors.New("commit rewrite: empty subject after sanitize")
 	}
-	planReq := IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 1, Path: firstRewritePath(req.ChangedPaths), CapturedDiff: req.RedactedDiff}}}
+	planReq := IntentPlanRequest{CommitFormat: effectiveCommitFormat(req.CommitFormat), OfferedCaptures: []OfferedCapture{{Seq: 1, Path: firstRewritePath(req.ChangedPaths), CapturedDiff: req.RedactedDiff}}}
 	plan := IntentPlan{SelectedSeqs: []int64{1}, Subject: out.Subject, Body: out.Body, GroupingReason: "commit rewrite proposal"}
 	report := EvaluateIntentPlanMessageQuality(planReq, plan)
 	if report.Action != MessageQualityClean && report.Action != MessageQualitySanitizeAccept {

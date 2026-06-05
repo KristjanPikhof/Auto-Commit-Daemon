@@ -5,6 +5,59 @@ import (
 	"testing"
 )
 
+func TestCommitMessageFormatInstructionsImperativePreservesExistingContract(t *testing.T) {
+	got := CommitMessageFormatInstructions(CommitFormatImperative)
+	if got != commitMessageFormatInstructions {
+		t.Fatalf("imperative instructions changed from legacy constant")
+	}
+	for _, want := range []string{
+		"Line 1: <imperative verb> <what changed>",
+		"Line 1 must start with an imperative verb such as Add, Fix, Refactor, Remove, Rename, Simplify, Update, or Document",
+		"Avoid generic messages such as Update file, WIP, or changes",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("imperative instructions missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestCommitMessageFormatInstructionsConventional(t *testing.T) {
+	got := CommitMessageFormatInstructions(CommitFormatConventional)
+	for _, want := range []string{
+		"Line 1: <type>: <description>",
+		"scope-less Conventional Commit type",
+		"Allowed types are feat, fix, docs, refactor, test, build, ci, chore, perf, style, and revert",
+		"Do not include scopes",
+		"`feat: add commit format selection`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("conventional instructions missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestConventionalCommitTypes(t *testing.T) {
+	want := []string{"feat", "fix", "docs", "refactor", "test", "build", "ci", "chore", "perf", "style", "revert"}
+	got := ConventionalCommitTypes()
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("ConventionalCommitTypes=%v want %v", got, want)
+	}
+	got[0] = "mutated"
+	if ConventionalCommitTypes()[0] != "feat" {
+		t.Fatalf("ConventionalCommitTypes did not return a copy")
+	}
+	for _, typ := range want {
+		if !isConventionalCommitType(typ) {
+			t.Fatalf("isConventionalCommitType(%q)=false", typ)
+		}
+	}
+	for _, typ := range []string{"", "feature", "feat(api)", "Fix"} {
+		if isConventionalCommitType(typ) {
+			t.Fatalf("isConventionalCommitType(%q)=true", typ)
+		}
+	}
+}
+
 // TestSanitize_Empty: empty input yields the safe placeholder.
 func TestSanitize_Empty(t *testing.T) {
 	for _, s := range []string{"", "   ", "\n\n\n", "\t \r\n"} {

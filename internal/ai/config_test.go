@@ -55,6 +55,7 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvTimeout, "45s")
 	t.Setenv(EnvCAFile, "  /tmp/acd-test-ca.pem  ")
 	t.Setenv(EnvCommitStrategy, "  intent  ")
+	t.Setenv(EnvCommitFormat, "  conventional  ")
 	t.Setenv(EnvIntentWindow, "25")
 	t.Setenv(EnvIntentMinPending, "12")
 	t.Setenv(EnvIntentMaxPendingAge, "90s")
@@ -84,6 +85,9 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	if cfg.CommitStrategy != CommitStrategyIntent {
 		t.Fatalf("CommitStrategy=%q want intent", cfg.CommitStrategy)
 	}
+	if cfg.CommitFormat != CommitFormatConventional {
+		t.Fatalf("CommitFormat=%q want conventional", cfg.CommitFormat)
+	}
 	if cfg.IntentWindow != 25 {
 		t.Fatalf("IntentWindow=%d want 25", cfg.IntentWindow)
 	}
@@ -110,6 +114,7 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	t.Setenv(EnvModel, "")
 	t.Setenv(EnvTimeout, "")
 	t.Setenv(EnvCommitStrategy, "")
+	t.Setenv(EnvCommitFormat, "")
 	t.Setenv(EnvIntentWindow, "")
 	t.Setenv(EnvIntentMinPending, "")
 	t.Setenv(EnvIntentMaxPendingAge, "")
@@ -131,6 +136,9 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	}
 	if cfg.CommitStrategy != CommitStrategyEvent {
 		t.Fatalf("CommitStrategy=%q want event", cfg.CommitStrategy)
+	}
+	if cfg.CommitFormat != CommitFormatImperative {
+		t.Fatalf("CommitFormat=%q want imperative", cfg.CommitFormat)
 	}
 	if cfg.IntentWindow != DefaultIntentWindow {
 		t.Fatalf("IntentWindow=%d want %d", cfg.IntentWindow, DefaultIntentWindow)
@@ -178,6 +186,28 @@ func TestLoadProviderConfigFromEnv_CommitStrategy(t *testing.T) {
 			cfg := LoadProviderConfigFromEnv()
 			if cfg.CommitStrategy != tc.want {
 				t.Fatalf("CommitStrategy=%q want %q", cfg.CommitStrategy, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadProviderConfigFromEnv_CommitFormat(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want CommitFormat
+	}{
+		{raw: "", want: CommitFormatImperative},
+		{raw: "imperative", want: CommitFormatImperative},
+		{raw: " IMPERATIVE ", want: CommitFormatImperative},
+		{raw: "conventional", want: CommitFormatConventional},
+		{raw: " CONVENTIONAL ", want: CommitFormatConventional},
+		{raw: "unknown", want: CommitFormatImperative},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv(EnvCommitFormat, tc.raw)
+			cfg := LoadProviderConfigFromEnv()
+			if cfg.CommitFormat != tc.want {
+				t.Fatalf("CommitFormat=%q want %q", cfg.CommitFormat, tc.want)
 			}
 		})
 	}

@@ -40,6 +40,9 @@ type CommitContext struct {
 	Commits  []string  // recent parent commit subjects for additional context
 	MultiOp  []OpItem  // present when one event carries > 1 ops
 	Now      time.Time // injected clock for deterministic tests
+	// CommitFormat selects the message subject format. Empty keeps the
+	// historical imperative default.
+	CommitFormat CommitFormat
 }
 
 // OpItem is one entry of CommitContext.MultiOp. Mirrors the per-op subset
@@ -88,16 +91,7 @@ const DiffCap = 4000
 // limit even at the upper window value.
 const IntentStageDiffCap = 16000
 
-const commitMessageFormatInstructions = "Commit message format: " +
-	"Line 1: <imperative verb> <what changed>, max 50 characters, no trailing period. " +
-	"Line 2: blank. " +
-	"Line 3+: bullet list for why/context; each bullet starts with '- '; max 72 characters per line; wrapped continuation lines must not start with '- '. " +
-	"Line 1 must start with an imperative verb such as Add, Fix, Refactor, Remove, Rename, Simplify, Update, or Document. " +
-	"Describe the semantic change, not just the filename. " +
-	"Prefer a concise subject and practical body focused on what changed and why. " +
-	"The body should explain why, intent, impact, or context, not restate the diff. " +
-	"Avoid generic messages such as Update file, WIP, or changes. " +
-	"Do not mention filenames in line 1 unless the change is specifically about that file itself."
+const commitMessageFormatInstructions = imperativeCommitMessageFormatInstructions
 
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
@@ -133,8 +127,15 @@ var (
 
 // IntentPlannerSystemPrompt returns the stable system instructions used by
 // network and plugin planner providers.
-func IntentPlannerSystemPrompt() string {
-	return intentPlannerSystemPrompt
+func IntentPlannerSystemPrompt(format ...CommitFormat) string {
+	selected := CommitFormatImperative
+	if len(format) > 0 {
+		selected = format[0]
+	}
+	if effectiveCommitFormat(selected) == CommitFormatImperative {
+		return intentPlannerSystemPrompt
+	}
+	return strings.Replace(intentPlannerSystemPrompt, commitMessageFormatInstructions, CommitMessageFormatInstructions(selected), 1)
 }
 
 // BuildIntentPlanUserPrompt serializes req into the planner user message. When
@@ -167,6 +168,7 @@ func BuildIntentMessageRewriteUserPrompt(req IntentMessageRewriteRequest) (strin
 	return "Rewrite only the git commit subject and body for this accepted intent plan.\n" +
 		"Do not change selected_seqs, deferred_seqs, grouping_reason, deferred_reasons, or any offered capture data.\n" +
 		"Return only the commit_message tool output with a replacement subject and body that fixes the listed quality_failures.\n" +
+		CommitMessageFormatInstructions(req.PlannerRequest.CommitFormat) + "\n" +
 		"If body_required is true, include body bullets. Keep grouping rationale out of the body.\n" +
 		string(body), nil
 }

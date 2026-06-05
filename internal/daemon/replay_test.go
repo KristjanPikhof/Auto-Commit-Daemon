@@ -3195,6 +3195,39 @@ func TestReplay_IntentStrategyForcedAgingSingletonDeterministicUsesDiffSubject(t
 	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: forced-aging singleton: provider skipped")
 }
 
+func TestPlanIntentSingletonMessagePathConventionalDefault(t *testing.T) {
+	item := intentReplayItem{
+		event: state.CaptureEvent{Seq: 7, Path: "fast.txt", Operation: "create"},
+		ops: []state.CaptureOp{{
+			EventSeq: 7,
+			Path:     "fast.txt",
+			Op:       "create",
+		}},
+	}
+	plan, err := planIntentSingletonMessagePath(context.Background(), nil, item, ai.CommitFormatConventional)
+	if err != nil {
+		t.Fatalf("planIntentSingletonMessagePath: %v", err)
+	}
+	if plan.Subject != "chore: add fast.txt" {
+		t.Fatalf("subject=%q want conventional deterministic singleton", plan.Subject)
+	}
+}
+
+func TestPlanIntentSingletonFastPathConventionalDefault(t *testing.T) {
+	item := intentReplayItem{
+		event: state.CaptureEvent{Seq: 8, Path: "overdue.go", Operation: "modify"},
+		ops: []state.CaptureOp{{
+			EventSeq: 8,
+			Path:     "overdue.go",
+			Op:       "modify",
+		}},
+	}
+	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item, ai.CommitFormatConventional)
+	if plan.Subject != "chore: update overdue.go" {
+		t.Fatalf("subject=%q want conventional forced singleton", plan.Subject)
+	}
+}
+
 // assertIntentForcedDecision finds the intent_forced ledger row for a seq.
 // The forced marker is recorded before the commit lands so it has no
 // commit_oid; assertReplayDecision is too strict for this case.
@@ -5987,6 +6020,7 @@ func TestReplay_PathQuiescence_SnapshotSkipsWritesWhenDisabled(t *testing.T) {
 // claiming a seq the items list does not contain.
 func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
 	ResetPathQuiescenceForTest(t)
+	t.Setenv(ai.EnvCommitFormat, string(ai.CommitFormatConventional))
 
 	// The forced-singleton fast path is exercised below by:
 	//   - capturing one event,
@@ -6027,7 +6061,10 @@ func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
 	// "selected_seqs not in offered" path, exercising the fast-path
 	// validator branch.
 	prev := planIntentSingletonFastPathFn.Load()
-	bad := func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+	bad := func(ctx context.Context, repoRoot string, item intentReplayItem, format ai.CommitFormat) ai.IntentPlan {
+		if format != ai.CommitFormatConventional {
+			t.Fatalf("fast path format=%q want conventional", format)
+		}
 		return ai.IntentPlan{
 			SelectedSeqs:   []int64{item.event.Seq + 999}, // not offered
 			Subject:        "unsafe forced-singleton plan",
@@ -6069,6 +6106,13 @@ func TestReplay_ForcedSingleton_SafetyValidatorRunsOnFastPath(t *testing.T) {
 	}
 	if !hasErr {
 		t.Fatalf("expected intent_planner_error decision after fast-path validator failed; rows=%+v", rows)
+	}
+	subject, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "-1", "--pretty=%s", "HEAD")
+	if err != nil {
+		t.Fatalf("git log subject: %v", err)
+	}
+	if got := strings.TrimSpace(string(subject)); got != "chore: add force.txt" {
+		t.Fatalf("fallback subject=%q want conventional deterministic fallback", got)
 	}
 }
 
@@ -6159,7 +6203,7 @@ func TestReplay_ForcedSingleton_SubjectBudgetFallsBackOnTimeout(t *testing.T) {
 		ops:   []state.CaptureOp{{EventSeq: 1, Path: "slow.go", Op: "modify"}},
 	}
 	start := time.Now()
-	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item)
+	plan := planIntentSingletonFastPath(context.Background(), "/tmp/notreal", item, ai.CommitFormatImperative)
 	elapsed := time.Since(start)
 	if elapsed > time.Second {
 		t.Fatalf("subject budget exceeded; elapsed=%s want <= ~50ms+overhead", elapsed)

@@ -531,6 +531,7 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 	fmt.Fprintln(out, "Saved plan display loaded without AI provider check; no AI call was made.")
 	fmt.Fprintf(out, "Plan ID: %s\n", plan.ID)
 	fmt.Fprintf(out, "Branch: %s @ %s\n", plan.BranchRef, shortenSHA(plan.ExpectedHead))
+	fmt.Fprintf(out, "Commit format: %s\n", normalizeRewritePlanCommitFormat(plan.CommitFormat))
 	fmt.Fprintf(out, "Validation status: %s\n", plan.ValidationStatus)
 	if plan.ValidationError.Valid && strings.TrimSpace(plan.ValidationError.String) != "" {
 		fmt.Fprintf(out, "Validation error: %s\n", plan.ValidationError.String)
@@ -599,6 +600,7 @@ func readRewritePlanFile(path string) (state.RewritePlan, error) {
 	if err := json.NewDecoder(f).Decode(&plan); err != nil {
 		return state.RewritePlan{}, err
 	}
+	plan.CommitFormat = normalizeRewritePlanCommitFormat(plan.CommitFormat)
 	return plan, nil
 }
 
@@ -633,6 +635,7 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		ExpectedHead:     selection.Head,
 		Provider:         sql.NullString{String: ai.PrimaryProviderName(provider), Valid: ai.PrimaryProviderName(provider) != ""},
 		Model:            sql.NullString{String: cfg.Model, Valid: cfg.Model != ""},
+		CommitFormat:     string(cfg.CommitFormat),
 		ValidationStatus: state.RewritePlanValidationValid,
 		ApplyStatus:      state.RewritePlanApplyPending,
 	}
@@ -647,7 +650,7 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		}); err != nil {
 			return state.RewritePlan{}, err
 		}
-		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider))
+		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider), cfg.CommitFormat)
 		if err != nil {
 			return state.RewritePlan{}, err
 		}
@@ -709,7 +712,7 @@ func rewriteStateDBPath(ctx context.Context, repo string) (string, error) {
 	return state.DBPathFromGitDir(gitDir), nil
 }
 
-func buildCommitRewriteRequest(ctx context.Context, repo string, db *state.DB, all []git.RewriteCommitRecord, idx int, c git.RewriteCommitRecord, providerNeedsDiff bool) (ai.CommitRewriteRequest, error) {
+func buildCommitRewriteRequest(ctx context.Context, repo string, db *state.DB, all []git.RewriteCommitRecord, idx int, c git.RewriteCommitRecord, providerNeedsDiff bool, commitFormat ai.CommitFormat) (ai.CommitRewriteRequest, error) {
 	paths, err := gitOutputLines(ctx, repo, "diff-tree", "--no-commit-id", "--name-only", "-r", c.OID)
 	if err != nil {
 		return ai.CommitRewriteRequest{}, err
@@ -718,7 +721,7 @@ func buildCommitRewriteRequest(ctx context.Context, repo string, db *state.DB, a
 	if err != nil {
 		return ai.CommitRewriteRequest{}, err
 	}
-	req := ai.CommitRewriteRequest{OldOID: c.OID, OriginalMessage: c.Message, ChangedPaths: paths, DiffStat: strings.TrimSpace(stat), DiffIncluded: false}
+	req := ai.CommitRewriteRequest{OldOID: c.OID, OriginalMessage: c.Message, ChangedPaths: paths, DiffStat: strings.TrimSpace(stat), DiffIncluded: false, CommitFormat: commitFormat}
 	if providerNeedsDiff && rewriteDiffEgressOptIn() {
 		diff, err := gitOutputString(ctx, repo, "show", "--format=", "--no-ext-diff", "--unified=80", c.OID)
 		if err != nil {
@@ -737,6 +740,15 @@ func buildCommitRewriteRequest(ctx context.Context, repo string, db *state.DB, a
 		}
 	}
 	return req, nil
+}
+
+func normalizeRewritePlanCommitFormat(format string) string {
+	switch ai.CommitFormat(strings.ToLower(strings.TrimSpace(format))) {
+	case ai.CommitFormatConventional:
+		return string(ai.CommitFormatConventional)
+	default:
+		return string(ai.CommitFormatImperative)
+	}
 }
 
 func rewriteNeighbors(all []git.RewriteCommitRecord, idx int) []git.RewriteCommitRecord {

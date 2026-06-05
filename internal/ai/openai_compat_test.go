@@ -139,6 +139,58 @@ func TestOpenAI_HappyPath(t *testing.T) {
 	}
 }
 
+func TestOpenAI_ConventionalPromptAndSchema(t *testing.T) {
+	p, last, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
+		return 200, cannedToolCall("fix: validate AI messages", "")
+	})
+	p.Format = CommitFormatConventional
+	if _, err := p.Generate(context.Background(), CommitContext{Op: "modify", Path: "internal/ai/openai_compat.go"}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Tools []struct {
+			Function struct {
+				Parameters struct {
+					Properties map[string]struct {
+						Description string `json:"description"`
+					} `json:"properties"`
+				} `json:"parameters"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(last.rawBody, &sent); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if !strings.Contains(sent.Messages[0].Content, "<type>: <description>") {
+		t.Fatalf("system prompt missing conventional format: %s", sent.Messages[0].Content)
+	}
+	if got := sent.Tools[0].Function.Parameters.Properties["subject"].Description; !strings.Contains(got, "Conventional Commit") {
+		t.Fatalf("subject schema description=%q", got)
+	}
+}
+
+func TestOpenAI_ConventionalWrongFormatFallsBack(t *testing.T) {
+	p, _, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
+		return 200, cannedToolCall("Update openai_compat.go", "")
+	})
+	p.Format = CommitFormatConventional
+	prov := Compose(p, DeterministicProvider{CommitFormat: CommitFormatConventional})
+	got, err := prov.Generate(context.Background(), CommitContext{Op: "modify", Path: "internal/ai/openai_compat.go"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if got.Source != "deterministic" {
+		t.Fatalf("Source=%q want deterministic", got.Source)
+	}
+	if got.Subject != "chore: update openai_compat.go" {
+		t.Fatalf("Subject=%q", got.Subject)
+	}
+}
+
 func TestOpenAI_PromptTraceDisabledWritesNothing(t *testing.T) {
 	t.Setenv(prompttrace.EnvTrace, "")
 	gitDir := t.TempDir()

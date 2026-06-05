@@ -79,6 +79,7 @@ type IntentPlanRequest struct {
 	PathCommitContext []PathCommitContext `json:"path_commit_context,omitempty"`
 	OfferedCaptures   []OfferedCapture    `json:"offered_captures"`
 	ForcedAging       bool                `json:"forced_aging,omitempty"`
+	CommitFormat      CommitFormat        `json:"commit_format,omitempty"`
 	// PathRecentCommits surfaces the prior-commit affinity hint computed by
 	// the daemon (see ACD_RECENT_COMMIT_AFFINITY_SECONDS). The planner is
 	// expected to read it as guidance only — v1 does not amend; the hint
@@ -111,6 +112,7 @@ type IntentPlanRequestOptions struct {
 	// into IntentPlanRequest. The slice is shallow-cloned so callers can
 	// reuse the input without observing in-place mutation.
 	PathRecentCommits []PathRecentCommit
+	CommitFormat      CommitFormat
 }
 
 // NewIntentPlanRequest builds a planner request and applies the egress policy
@@ -125,6 +127,7 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 		PathCommitContext: clonePathCommitContext(opts.PathCommitContext),
 		OfferedCaptures:   make([]OfferedCapture, 0, len(opts.OfferedCaptures)),
 		ForcedAging:       opts.ForcedAging,
+		CommitFormat:      effectiveCommitFormat(opts.CommitFormat),
 		PathRecentCommits: clonePathRecentCommits(opts.PathRecentCommits),
 	}
 	for _, offered := range opts.OfferedCaptures {
@@ -227,6 +230,7 @@ type IntentMessageRewriteRequest struct {
 	SanitizedSubject string                 `json:"sanitized_subject,omitempty"`
 	SanitizedBody    string                 `json:"sanitized_body,omitempty"`
 	QualityAction    MessageQualityAction   `json:"quality_action"`
+	CommitFormat     CommitFormat           `json:"commit_format,omitempty"`
 }
 
 // NewIntentMessageRewriteRequest builds the message-only rewrite payload from
@@ -245,6 +249,7 @@ func NewIntentMessageRewriteRequest(plannerReq IntentPlanRequest, plan IntentPla
 		SanitizedSubject: report.SanitizedSubject,
 		SanitizedBody:    report.SanitizedBody,
 		QualityAction:    report.Action,
+		CommitFormat:     plannerReq.CommitFormat,
 	}
 }
 

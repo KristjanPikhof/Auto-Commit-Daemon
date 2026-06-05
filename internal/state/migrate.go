@@ -51,6 +51,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // pruning cannot erase denormalized ledger identity. v7 adds planner_state for
 // bounded intent-planner deferrals. v8 adds reusable rewrite plan storage.
 // v9 adds rewrite_plans.validation_error for structured proposal failures.
+// v10 adds rewrite_plans.commit_format so saved plans preserve the validation
+// policy used when they were generated or edited.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -92,6 +94,11 @@ func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 	}
 	if cur < 9 {
 		if err := addColumnIfMissing(ctx, tx, "rewrite_plans", "validation_error", "TEXT"); err != nil {
+			return err
+		}
+	}
+	if cur < 10 {
+		if err := addColumnIfMissing(ctx, tx, "rewrite_plans", "commit_format", "TEXT NOT NULL DEFAULT 'imperative'"); err != nil {
 			return err
 		}
 	}

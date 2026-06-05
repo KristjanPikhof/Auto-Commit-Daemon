@@ -811,6 +811,7 @@ type intentReplayConfig struct {
 	// the matching HEAD commit for any offered path whose most recent
 	// HEAD commit landed within the window.
 	recentCommitAffinity time.Duration
+	commitFormat         ai.CommitFormat
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -838,6 +839,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		bypassBatchWait:      opts.IntentBypassBatchWait,
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
+		commitFormat:         cfg.CommitFormat,
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
@@ -878,13 +880,13 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	provider, closer, err := ai.BuildProvider(providerCfg)
 	if err != nil {
 		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
-		out.planner = ai.DeterministicProvider{}
+		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		return out, nil, nil
 	}
 	planner, ok := provider.(ai.IntentPlanner)
 	if !ok {
 		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
-		out.planner = ai.DeterministicProvider{}
+		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		if closer != nil {
 			return out, func() {
 				if err := closer.Close(); err != nil {
@@ -1031,7 +1033,7 @@ func replayIntentBatch(
 	// their message can pass the quality/rewrite policy instead of landing
 	// generic "Update parsed" style subjects.
 	if forced && len(items) == 1 && isDeterministicIntentPlanner(cfg.planner) {
-		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
+		plan := planIntentSingletonFastPathHook(ctx, repoRoot, items[0], cfg.commitFormat)
 		// Defense in depth: even though forced-aging narrows the window to
 		// one self-determined seq, run the safety + plan validators before
 		// publishing. A future regression in planIntentSingletonFastPath or
@@ -1063,11 +1065,11 @@ func replayIntentBatch(
 		// Validation failure: fall through to the standard deterministic
 		// path. We replace the planner with the deterministic provider so
 		// PlanIntent below cannot produce another bad plan.
-		cfg.planner = ai.DeterministicProvider{}
+		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
 	}
 
 	if !forced && isSingletonProviderFastPath(items) {
-		plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0])
+		plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0], cfg.commitFormat)
 		if err != nil {
 			return sum, err
 		}
@@ -1091,7 +1093,7 @@ func replayIntentBatch(
 			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
 		}
-		cfg.planner = ai.DeterministicProvider{}
+		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
 	}
 
 	if !forced {
@@ -1482,6 +1484,7 @@ func buildIntentPlanRequest(
 		ForcedAging:          forced,
 		IncludeCapturedDiffs: cfg.includeDiffs,
 		PathRecentCommits:    pathRecent,
+		CommitFormat:         cfg.commitFormat,
 	})
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
@@ -1670,13 +1673,13 @@ func setBuildOpsDiffForForcedSingletonForTest(fn func(context.Context, string, [
 // path so the validator branches in replayIntentBatch can be exercised
 // against a deliberately invalid plan. nil falls through to the real
 // planIntentSingletonFastPath.
-var planIntentSingletonFastPathFn atomic.Pointer[func(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan]
+var planIntentSingletonFastPathFn atomic.Pointer[func(ctx context.Context, repoRoot string, item intentReplayItem, format ai.CommitFormat) ai.IntentPlan]
 
-func planIntentSingletonFastPathHook(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+func planIntentSingletonFastPathHook(ctx context.Context, repoRoot string, item intentReplayItem, format ai.CommitFormat) ai.IntentPlan {
 	if fn := planIntentSingletonFastPathFn.Load(); fn != nil && *fn != nil {
-		return (*fn)(ctx, repoRoot, item)
+		return (*fn)(ctx, repoRoot, item, format)
 	}
-	return planIntentSingletonFastPath(ctx, repoRoot, item)
+	return planIntentSingletonFastPath(ctx, repoRoot, item, format)
 }
 
 func isDeterministicIntentPlanner(planner ai.IntentPlanner) bool {
@@ -1686,7 +1689,7 @@ func isDeterministicIntentPlanner(planner ai.IntentPlanner) bool {
 	return planner.Name() == (ai.DeterministicProvider{}).Name()
 }
 
-func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem) ai.IntentPlan {
+func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item intentReplayItem, format ai.CommitFormat) ai.IntentPlan {
 	op := singletonFallbackOp(item)
 	subject := ""
 	// Bounded subject budget: a slow BuildOpsDiff on the forced-aging path
@@ -1719,6 +1722,7 @@ func planIntentSingletonFastPath(ctx context.Context, repoRoot string, item inte
 		// commit still ships within the forced-aging budget.
 		subject = ai.DiffAwareSubject(op, "")
 	}
+	subject = ai.DeterministicProvider{CommitFormat: format}.FormatSubjectForOps(subject, []ai.OpItem{op})
 	return ai.IntentPlan{
 		SelectedSeqs:   []int64{item.event.Seq},
 		Subject:        subject,
@@ -1735,9 +1739,25 @@ func isSingletonProviderFastPath(items []intentReplayItem) bool {
 	return item.coalesce == nil || len(item.coalesce.OriginalSeqs) <= 1
 }
 
-func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item intentReplayItem) (ai.IntentPlan, error) {
+func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item intentReplayItem, format ai.CommitFormat) (ai.IntentPlan, error) {
 	if msgFn == nil {
-		msgFn = DeterministicMessage
+		provider := ai.DeterministicProvider{CommitFormat: format}
+		res, err := provider.Generate(ctx, ai.CommitContext{
+			Op:      item.event.Operation,
+			Path:    item.event.Path,
+			OldPath: stringFromNull(item.event.OldPath),
+			MultiOp: opItemsFromCaptureOps(item),
+		})
+		if err != nil {
+			return ai.IntentPlan{}, fmt.Errorf("singleton fast path message: %w", err)
+		}
+		return ai.IntentPlan{
+			SelectedSeqs:   []int64{item.event.Seq},
+			Subject:        strings.TrimSpace(res.Subject),
+			Body:           strings.TrimSpace(res.Body),
+			GroupingReason: "singleton fast path",
+			Source:         "per-event",
+		}, nil
 	}
 	msg, err := msgFn(ctx, EventContext{Event: item.event, Ops: item.ops})
 	if err != nil {
@@ -1761,6 +1781,28 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 		plan.Subject = "Update files"
 	}
 	return plan, nil
+}
+
+func stringFromNull(s sql.NullString) string {
+	if !s.Valid {
+		return ""
+	}
+	return s.String
+}
+
+func opItemsFromCaptureOps(item intentReplayItem) []ai.OpItem {
+	if len(item.ops) == 0 {
+		return nil
+	}
+	out := make([]ai.OpItem, 0, len(item.ops))
+	for _, op := range item.ops {
+		out = append(out, ai.OpItem{
+			Path:    op.Path,
+			Op:      op.Op,
+			OldPath: stringFromNull(op.OldPath),
+		})
+	}
+	return out
 }
 
 // singletonFallbackOp picks the OpItem fed to DiffAwareSubject. For a
@@ -1793,7 +1835,7 @@ func singletonFallbackOp(item intentReplayItem) ai.OpItem {
 
 func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
 	if planner == nil {
-		planner = ai.DeterministicProvider{}
+		planner = ai.DeterministicProvider{CommitFormat: req.CommitFormat}
 	}
 	var validationFailure string
 	plan, err := planner.PlanIntent(ctx, req)
@@ -1834,7 +1876,7 @@ func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, 
 		}
 	}
 	if req.ForcedAging && len(items) == 1 {
-		plan = planIntentSingletonFastPathHook(ctx, repoRoot, items[0])
+		plan = planIntentSingletonFastPathHook(ctx, repoRoot, items[0], req.CommitFormat)
 		if err := ai.ValidateIntentPlan(req, plan); err != nil {
 			return ai.IntentPlan{}, validationFailure, err
 		}
@@ -1843,7 +1885,7 @@ func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, 
 		}
 		return plan, validationFailure, nil
 	}
-	fallback := ai.DeterministicProvider{}
+	fallback := ai.DeterministicProvider{CommitFormat: req.CommitFormat}
 	plan, err = fallback.PlanIntent(ctx, req)
 	if err != nil {
 		return ai.IntentPlan{}, validationFailure, err
