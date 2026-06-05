@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v2026-06-06
+
+### Added
+
+- Optional `ACD_COMMIT_FORMAT=conventional` output for scope-less Conventional
+  Commit subjects, while keeping the existing imperative format as the default.
+- Commit format validation and deterministic fallback handling across event,
+  intent, provider, subprocess, and rewrite-plan flows.
+
 ## v2026-06-05
 
 ### Added
