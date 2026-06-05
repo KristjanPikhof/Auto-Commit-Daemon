@@ -46,6 +46,7 @@ const (
 	EnvTimeout              = "ACD_AI_TIMEOUT"
 	EnvCAFile               = "ACD_AI_CA_FILE"
 	EnvCommitStrategy       = "ACD_COMMIT_STRATEGY"
+	EnvCommitFormat         = "ACD_COMMIT_FORMAT"
 	EnvIntentWindow         = "ACD_INTENT_WINDOW"
 	EnvIntentMinPending     = "ACD_INTENT_MIN_PENDING"
 	EnvIntentMaxPendingAge  = "ACD_INTENT_MAX_PENDING_AGE"
@@ -89,6 +90,16 @@ const (
 	CommitStrategyIntent CommitStrategy = "intent"
 )
 
+// CommitFormat selects the subject-line contract providers must satisfy.
+// Imperative is the historical default and remains unchanged unless the
+// operator explicitly opts into another supported format.
+type CommitFormat string
+
+const (
+	CommitFormatImperative   CommitFormat = "imperative"
+	CommitFormatConventional CommitFormat = "conventional"
+)
+
 // ProviderConfig captures the env-driven configuration for the replay
 // provider chain. Mode is the user-facing selector; the remaining fields
 // are consumed by the OpenAI-compat provider (or ignored when irrelevant).
@@ -124,6 +135,10 @@ type ProviderConfig struct {
 	// preserving one capture event per commit until intent planning is
 	// explicitly enabled.
 	CommitStrategy CommitStrategy
+
+	// CommitFormat chooses the commit-message subject format. The default
+	// is imperative, preserving the existing ACD message contract.
+	CommitFormat CommitFormat
 
 	// IntentWindow caps how many pending events the intent planner may
 	// consider at once.
@@ -163,6 +178,7 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		Model:               strings.TrimSpace(os.Getenv(EnvModel)),
 		CAFile:              strings.TrimSpace(os.Getenv(EnvCAFile)),
 		CommitStrategy:      normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
+		CommitFormat:        normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
 		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
 		IntentMinPending:    parsePositiveIntEnv(EnvIntentMinPending, DefaultIntentMinPending),
 		IntentMaxPendingAge: parsePositiveDurationEnv(EnvIntentMaxPendingAge, DefaultIntentMaxPendingAge),
@@ -186,6 +202,17 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		cfg.Timeout = DefaultProviderTimeout
 	}
 	return cfg
+}
+
+func normalizeCommitFormat(raw string) CommitFormat {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(CommitFormatImperative):
+		return CommitFormatImperative
+	case string(CommitFormatConventional):
+		return CommitFormatConventional
+	default:
+		return CommitFormatImperative
+	}
 }
 
 func normalizeCommitStrategy(raw string) CommitStrategy {
