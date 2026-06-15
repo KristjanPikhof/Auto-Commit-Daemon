@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Raised the minimum Go toolchain to 1.26.4 for building from source and
+  updated pinned dependencies, including `modernc.org/sqlite v1.52.0`, as part
+  of a security and toolchain maintenance bump.
+
 ## v2026-06-06
 
 ### Added
