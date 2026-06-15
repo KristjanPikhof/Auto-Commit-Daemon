@@ -8,6 +8,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    open-pull-requests-limit: 5
     groups:
       go-minor-patch:
         patterns:
@@ -15,12 +16,18 @@ updates:
         update-types:
           - minor
           - patch
+      go-major:
+        patterns:
+          - "*"
+        update-types:
+          - major
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
       day: monday
+    open-pull-requests-limit: 5
     groups:
       actions-minor-patch:
         patterns:
