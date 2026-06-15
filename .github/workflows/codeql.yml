@@ -27,5 +27,9 @@ jobs:
       - uses: github/codeql-action/init@ed410739ba306e4ebe5e123421a6bd694e494a2b # v4
         with:
           languages: ${{ matrix.language }}
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.4'
+          cache: true
       - uses: github/codeql-action/autobuild@ed410739ba306e4ebe5e123421a6bd694e494a2b # v4
       - uses: github/codeql-action/analyze@ed410739ba306e4ebe5e123421a6bd694e494a2b # v4
