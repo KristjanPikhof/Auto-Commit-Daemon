@@ -3,7 +3,7 @@
 ## Project
 
 - Static Go CLI/daemon for macOS/Linux `arm64`/`amd64`; no Windows v1.
-- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.22; `modernc.org/sqlite v1.36.0`; MIT.
+- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.26.4; `modernc.org/sqlite v1.52.0`; MIT.
 - Tags use `vYYYY-MM-DD`. Verify latest with `git tag --sort=-creatordate | head`; local latest at this refresh was `v2026-05-29`. `v2026-05-10` exists at `4d9dfef`. Do not move published tags unless requested.
 - `AGENTS.md -> CLAUDE.md`; edit `CLAUDE.md`, preserve the symlink.
 
