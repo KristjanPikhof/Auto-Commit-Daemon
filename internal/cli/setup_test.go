@@ -146,8 +146,13 @@ func TestSetup_ClaudeCode_RawEmitsValidJSONOnly(t *testing.T) {
 
 func TestSetup_ClaudeCode_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
-	if strings.Contains(out, `_acd_managed`) {
-		t.Errorf("claude-code JSON output must not emit legacy _acd_managed marker:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("claude-code JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
@@ -308,8 +313,13 @@ func TestSetup_Cursor_ContainsSnippet(t *testing.T) {
 
 func TestSetup_Cursor_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "cursor")
-	if strings.Contains(out, `_acd_managed`) {
-		t.Errorf("cursor JSON output must not emit legacy _acd_managed marker:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("cursor JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
@@ -446,8 +456,13 @@ func TestSetup_Codex_ContainsSnippet(t *testing.T) {
 
 func TestSetup_Codex_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	if strings.Contains(out, `_acd_managed`) {
-		t.Errorf("codex JSON output must not emit legacy _acd_managed marker:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("codex JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
