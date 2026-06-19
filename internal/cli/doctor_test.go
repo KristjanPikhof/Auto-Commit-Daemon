@@ -1244,7 +1244,7 @@ func TestDoctor_FallbackOnEACCESPrimaryConfig(t *testing.T) {
 		t.Fatalf("mkdir codex: %v", err)
 	}
 	hooksPath := filepath.Join(home, ".codex", "hooks.json")
-	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	// Make primary config unreadable so the read produces EACCES.
@@ -1295,7 +1295,7 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 
@@ -1354,7 +1354,7 @@ func TestDoctor_CodexHookLogQuietWhenNoErrors(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.MkdirAll(roots.State, 0o700); err != nil {
@@ -1529,12 +1529,12 @@ func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 }
 
 func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
-	note := scanHookBodyDrift("cursor", []byte(`{"_acd_managed":true,"hooks":{}}`))
+	note := scanHookBodyDrift("cursor", []byte(`{"version":1,"hooks":{}}`))
 	if note == "" {
-		t.Fatalf("empty managed cursor hooks should report drift")
+		t.Fatalf("empty cursor hooks should report drift")
 	}
 	if !strings.Contains(note, "5 active hook(s)") {
-		t.Fatalf("empty managed cursor hooks should count five missing lifecycle hooks, got %q", note)
+		t.Fatalf("empty cursor hooks should count five missing lifecycle hooks, got %q", note)
 	}
 }
 
@@ -1564,13 +1564,12 @@ func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
 	}
 	body := `{
 		"version": 1,
-		"_acd_managed": true,
 		"hooks": {
 			"postToolUse": [
 				{ "command": "echo no-op", "timeout": 15 }
 			],
 			"afterFileEdit": [
-				{ "command": "acd start --harness cursor && acd wake", "timeout": 15 }
+				{ "command": "acd hook-cursor-extract && acd start --harness cursor && acd wake", "timeout": 15 }
 			]
 		}
 	}`
@@ -1852,7 +1851,7 @@ func TestDoctor_UnreadablePrimaryConfigSetsConfigReadError(t *testing.T) {
 		t.Fatalf("mkdir codex: %v", err)
 	}
 	hooksPath := filepath.Join(home, ".codex", "hooks.json")
-	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.Chmod(hooksPath, 0o000); err != nil {

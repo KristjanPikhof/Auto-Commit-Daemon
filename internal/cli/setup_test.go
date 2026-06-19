@@ -129,6 +129,21 @@ func TestSetup_ClaudeCode_ValidJSON(t *testing.T) {
 	}
 }
 
+func TestSetup_ClaudeCode_RawEmitsValidJSONOnly(t *testing.T) {
+	out, _, err := runSetupCmd(t, "claude-code", "--raw")
+	if err != nil {
+		t.Fatalf("acd setup claude-code --raw exit=%v\nstdout=%s", err, out)
+	}
+	var v interface{}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
+	}
+	assertTopLevelJSONKeys(t, []byte(out), "hooks")
+	if strings.HasPrefix(strings.TrimSpace(out), "//") {
+		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
+	}
+}
+
 func TestSetup_ClaudeCode_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
 	if strings.Contains(out, `_acd_managed`) {
@@ -314,6 +329,7 @@ func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
 	}
+	assertTopLevelJSONKeys(t, []byte(out), "version", "hooks")
 	if strings.HasPrefix(strings.TrimSpace(out), "//") {
 		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
 	}
@@ -453,6 +469,7 @@ func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
 	}
+	assertTopLevelJSONKeys(t, []byte(out), "hooks")
 	if strings.HasPrefix(strings.TrimSpace(out), "//") {
 		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
 	}
