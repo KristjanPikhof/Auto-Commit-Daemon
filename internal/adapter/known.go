@@ -1,40 +1,151 @@
 package adapter
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-// pathSpec binds a config path candidate to the marker strings that prove
-// acd installed it. Different paths for the same harness can use different
-// marker syntaxes (e.g., codex JSON vs TOML).
+// pathSpec binds a config path candidate to the detector that proves acd
+// installed it. Different paths for the same harness can use different
+// detection strategies (e.g., JSON command signatures vs TOML comments).
 type pathSpec struct {
 	path      string
-	markers   []string
+	detector  installDetector
 	repoLocal bool
 }
 
-func fileContainsAny(path string, markers []string) bool {
+type installDetector func([]byte) bool
+
+func textInstallDetector(markers ...string) installDetector {
+	return func(body []byte) bool {
+		text := string(body)
+		for _, m := range markers {
+			if strings.Contains(text, m) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func jsonCommandSignatureDetector(required ...string) installDetector {
+	return func(body []byte) bool {
+		if hasLegacyJSONManagedKey(body) {
+			return true
+		}
+		var decoded any
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			return false
+		}
+		for _, command := range jsonCommandStrings(decoded) {
+			if containsAll(command, required) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func containsAll(text string, required []string) bool {
+	for _, needle := range required {
+		if !strings.Contains(text, needle) {
+			return false
+		}
+	}
+	return true
+}
+
+func jsonCommandStrings(v any) []string {
+	var out []string
+	var walk func(any)
+	walk = func(cur any) {
+		switch x := cur.(type) {
+		case map[string]any:
+			for key, value := range x {
+				if key == "command" {
+					if s, ok := value.(string); ok {
+						out = append(out, s)
+					}
+				}
+				walk(value)
+			}
+		case []any:
+			for _, value := range x {
+				walk(value)
+			}
+		}
+	}
+	walk(v)
+	return out
+}
+
+func hasLegacyJSONManagedKey(body []byte) bool {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return false
+	}
+	raw, ok := top["_acd_managed"]
+	if !ok {
+		return false
+	}
+	var managed bool
+	return json.Unmarshal(raw, &managed) == nil && managed
+}
+
+// HasLegacyJSONManagedKey reports whether a JSON config still carries the
+// pre-schema-clean ACD marker. Current ACD JSON templates do not emit this key,
+// but doctor uses it to guide users through legacy migrations.
+func HasLegacyJSONManagedKey(body []byte) bool {
+	return hasLegacyJSONManagedKey(body)
+}
+
+func legacyJSONInstallDetector() installDetector {
+	return func(body []byte) bool {
+		if hasLegacyJSONManagedKey(body) {
+			return true
+		}
+		// Older tests and hand-written files may preserve compact/minified marker
+		// text that is still valid JSON but avoid relying on spacing.
+		text := string(body)
+		return strings.Contains(text, `"_acd_managed": true`) ||
+			strings.Contains(text, `"_acd_managed":true`)
+	}
+}
+
+func orInstallDetector(detectors ...installDetector) installDetector {
+	return func(body []byte) bool {
+		for _, detector := range detectors {
+			if detector != nil && detector(body) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func jsonSignatureOrLegacyDetector(required ...string) installDetector {
+	return orInstallDetector(jsonCommandSignatureDetector(required...), legacyJSONInstallDetector())
+}
+
+func textFileContains(path string, detector installDetector) bool {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	text := string(body)
-	for _, m := range markers {
-		if strings.Contains(text, m) {
-			return true
-		}
-	}
-	return false
+	return detector != nil && detector(body)
 }
 
 var (
-	jsonAcdManagedMarkers = []string{`"_acd_managed": true`, `"_acd_managed":true`}
+	claudeCodeJSONDetector = jsonSignatureOrLegacyDetector("acd hook-stdin-extract", "--harness claude-code")
+	codexJSONDetector      = jsonSignatureOrLegacyDetector("acd hook-stdin-extract", "--harness codex")
+	cursorJSONDetector     = jsonSignatureOrLegacyDetector("acd hook-cursor-extract", "--harness cursor")
 	// tomlAcdManagedMarkers requires the leading `#` comment prefix because
 	// TOML has no other way to embed a free-form line, and the canonical acd
 	// install writes a `# acd-managed: true` comment block.
 	tomlAcdManagedMarkers = []string{"# acd-managed: true"}
+	tomlAcdManagedDetector = textInstallDetector(tomlAcdManagedMarkers...)
 	// yamlAcdManagedMarkers matches only the canonical comment form
 	// `# acd-managed: true`. acd-managed YAML templates always write the
 	// comment-prefixed form (never a bare key), so this is sufficient to
@@ -43,16 +154,15 @@ var (
 	// a user-config key that happens to use the same identifier — from
 	// being misclassified as an acd install (which would cause `acd doctor`
 	// to recommend overwrite remediation against a file acd never wrote).
-	// All three marker slices now require the canonical prefix:
-	// JSON uses the `_acd_managed` key; TOML and YAML use `# acd-managed: true`.
 	yamlAcdManagedMarkers = []string{"# acd-managed: true"}
+	yamlAcdManagedDetector = textInstallDetector(yamlAcdManagedMarkers...)
 )
 
 var knownHarnesses = []knownHarness{
 	{
 		name: "claude-code",
 		paths: []pathSpec{
-			{path: "~/.claude/settings.json", markers: jsonAcdManagedMarkers},
+			{path: "~/.claude/settings.json", detector: claudeCodeJSONDetector},
 		},
 	},
 	{
@@ -65,11 +175,11 @@ var knownHarnesses = []knownHarness{
 		// install is detected without treating arbitrary cwd-relative
 		// `.codex/*` files as global installs.
 		paths: []pathSpec{
-			{path: "~/.codex/hooks.json", markers: jsonAcdManagedMarkers},
-			{path: "~/.codex/config.toml", markers: tomlAcdManagedMarkers},
-			{path: "~/.config/codex/config.toml", markers: tomlAcdManagedMarkers},
-			{path: ".codex/hooks.json", markers: jsonAcdManagedMarkers, repoLocal: true},
-			{path: ".codex/config.toml", markers: tomlAcdManagedMarkers, repoLocal: true},
+			{path: "~/.codex/hooks.json", detector: codexJSONDetector},
+			{path: "~/.codex/config.toml", detector: tomlAcdManagedDetector},
+			{path: "~/.config/codex/config.toml", detector: tomlAcdManagedDetector},
+			{path: ".codex/hooks.json", detector: codexJSONDetector, repoLocal: true},
+			{path: ".codex/config.toml", detector: tomlAcdManagedDetector, repoLocal: true},
 		},
 	},
 	{
@@ -77,7 +187,7 @@ var knownHarnesses = []knownHarness{
 		// User-scoped hooks.json only; Cursor does not use a repo-local
 		// `.cursor/hooks.json` install path for acd (unlike Codex).
 		paths: []pathSpec{
-			{path: "~/.cursor/hooks.json", markers: jsonAcdManagedMarkers},
+			{path: "~/.cursor/hooks.json", detector: cursorJSONDetector},
 		},
 	},
 	{
@@ -91,9 +201,9 @@ var knownHarnesses = []knownHarness{
 		// at the canonical location regardless of which file holds the
 		// existing marker.
 		paths: []pathSpec{
-			{path: "~/.config/opencode/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+			{path: "~/.config/opencode/hook/hooks.yaml", detector: yamlAcdManagedDetector},
 			// legacy fallback (pre-canonical default).
-			{path: "~/.config/opencode/hooks.yaml", markers: yamlAcdManagedMarkers},
+			{path: "~/.config/opencode/hooks.yaml", detector: yamlAcdManagedDetector},
 		},
 	},
 	{
@@ -103,15 +213,15 @@ var knownHarnesses = []knownHarness{
 		// fallback so existing installs still register; doctor remediation
 		// uses the canonical path so users are nudged forward.
 		paths: []pathSpec{
-			{path: "~/.pi/agent/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+			{path: "~/.pi/agent/hook/hooks.yaml", detector: yamlAcdManagedDetector},
 			// legacy fallback (pre-canonical default).
-			{path: "~/.pi/hook/hooks.yaml", markers: yamlAcdManagedMarkers},
+			{path: "~/.pi/hook/hooks.yaml", detector: yamlAcdManagedDetector},
 		},
 	},
 	{
 		name: "shell",
 		paths: []pathSpec{
-			{path: "~/.zshrc", markers: yamlAcdManagedMarkers},
+			{path: "~/.zshrc", detector: yamlAcdManagedDetector},
 		},
 	},
 }
@@ -135,36 +245,32 @@ func Lookup(name string) (Harness, bool) {
 	return nil, false
 }
 
-// PrimaryPathMatchesMarker reports whether `body` contains a marker
+// PrimaryPathMatchesMarker reports whether `body` matches the detector
 // registered for the harness's primary candidate path. Doctor uses this to
 // avoid cross-format false positives (e.g., a TOML marker string inside a
-// JSON config).
+// JSON config). The legacy name is kept for doctor JSON compatibility.
 func PrimaryPathMatchesMarker(harnessName string, body []byte) bool {
 	for _, h := range knownHarnesses {
 		if h.name != harnessName || len(h.paths) == 0 {
 			continue
 		}
-		text := string(body)
-		for _, m := range h.paths[0].markers {
-			if strings.Contains(text, m) {
-				return true
-			}
-		}
+		return h.paths[0].detector != nil && h.paths[0].detector(body)
 	}
 	return false
 }
 
-// CodexInstalls reports whether the user-scoped Codex hooks.json carries the
-// JSON acd marker and whether the legacy ~/.codex/config.toml still carries
-// the TOML acd marker. Used by `acd doctor` to warn about shadowed installs.
+// CodexInstalls reports whether the user-scoped Codex hooks.json contains ACD
+// hook commands (or a legacy JSON marker) and whether the legacy
+// ~/.codex/config.toml still carries the TOML acd marker. Used by `acd doctor`
+// to warn about shadowed installs.
 func CodexInstalls() (jsonInstalled, legacyTOMLInstalled bool) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return false, false
 	}
-	jsonInstalled = fileContainsAny(filepath.Join(home, ".codex", "hooks.json"), jsonAcdManagedMarkers)
+	jsonInstalled = textFileContains(filepath.Join(home, ".codex", "hooks.json"), codexJSONDetector)
 	legacyTOMLInstalled =
-		fileContainsAny(filepath.Join(home, ".codex", "config.toml"), tomlAcdManagedMarkers) ||
-			fileContainsAny(filepath.Join(home, ".config", "codex", "config.toml"), tomlAcdManagedMarkers)
+		textFileContains(filepath.Join(home, ".codex", "config.toml"), tomlAcdManagedDetector) ||
+			textFileContains(filepath.Join(home, ".config", "codex", "config.toml"), tomlAcdManagedDetector)
 	return
 }
