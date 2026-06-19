@@ -307,7 +307,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			hr.MarkerFound = adapter.PrimaryPathMatchesMarker(name, body)
 			hr.Installed = hr.MarkerFound
 			if !hr.Installed && detected[name] {
-				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
+				hr.Notes = append(hr.Notes, "ACD managed install detected in an alternate config path")
 				hr.Installed = true
 			}
 			if hr.Installed {
@@ -323,7 +323,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 		case errors.Is(err, os.ErrNotExist):
 			if detected[name] {
-				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
+				hr.Notes = append(hr.Notes, "ACD managed install detected in an alternate config path")
 				hr.Installed = true
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
@@ -363,7 +363,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
-				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml carry acd markers; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
+				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
 			}
 			if note := tailCodexHookLog(); note != "" {
 				hr.Notes = append(hr.Notes, note)
