@@ -129,10 +129,10 @@ func TestSetup_ClaudeCode_ValidJSON(t *testing.T) {
 	}
 }
 
-func TestSetup_ClaudeCode_AcdManagedMarker(t *testing.T) {
+func TestSetup_ClaudeCode_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in output:\n%s", out)
+	if strings.Contains(out, `_acd_managed`) {
+		t.Errorf("claude-code JSON output must not emit legacy _acd_managed marker:\n%s", out)
 	}
 }
 
@@ -157,6 +157,8 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 	if start == -1 || end == -1 || end <= start {
 		t.Fatalf("no JSON block found in output:\n%s", out)
 	}
+	block := []byte(out[start : end+1])
+	assertTopLevelJSONKeys(t, block, "hooks")
 	var settings struct {
 		Hooks map[string][]struct {
 			Matcher *string `json:"matcher,omitempty"`
@@ -166,8 +168,8 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
-		t.Fatalf("parse JSON: %v\nblock:\n%s", err, out[start:end+1])
+	if err := json.Unmarshal(block, &settings); err != nil {
+		t.Fatalf("parse JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"}
 	for _, ev := range required {
@@ -289,10 +291,10 @@ func TestSetup_Cursor_ContainsSnippet(t *testing.T) {
 	}
 }
 
-func TestSetup_Cursor_AcdManagedMarker(t *testing.T) {
+func TestSetup_Cursor_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "cursor")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in cursor output:\n%s", out)
+	if strings.Contains(out, `_acd_managed`) {
+		t.Errorf("cursor JSON output must not emit legacy _acd_managed marker:\n%s", out)
 	}
 }
 
@@ -429,10 +431,10 @@ func TestSetup_Codex_ContainsSnippet(t *testing.T) {
 	}
 }
 
-func TestSetup_Codex_AcdManagedMarker(t *testing.T) {
+func TestSetup_Codex_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in codex output:\n%s", out)
+	if strings.Contains(out, `_acd_managed`) {
+		t.Errorf("codex JSON output must not emit legacy _acd_managed marker:\n%s", out)
 	}
 }
 
