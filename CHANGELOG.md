@@ -8,6 +8,13 @@
   updated pinned dependencies, including `modernc.org/sqlite v1.52.0`, as part
   of a security and toolchain maintenance bump.
 
+### Fixed
+
+- Codex 0.141+ rejects unknown top-level hook fields, so JSON hook templates for
+  Codex, Claude Code, and Cursor no longer emit `_acd_managed`. ACD now detects
+  JSON installs from ACD hook command signatures while still recognizing legacy
+  `_acd_managed` files for migration and doctor guidance.
+
 ## v2026-06-06
 
 ### Added
