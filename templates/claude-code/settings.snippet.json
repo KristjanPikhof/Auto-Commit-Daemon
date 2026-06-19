@@ -1,5 +1,4 @@
 {
-  "_acd_managed": true,
   "hooks": {
     "SessionStart": [
       {
