@@ -320,7 +320,7 @@ func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
 }
 
 func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
-	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	bad := []byte(`{"version": 1, "hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})
 
 	out, stderr, err := runSetupCmd(t, "cursor", "--raw")
@@ -352,10 +352,10 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 		t.Fatalf("no JSON block found in cursor output:\n%s", out)
 	}
 	block := tail[:end+1]
+	assertTopLevelJSONKeys(t, []byte(block), "version", "hooks")
 	var settings struct {
-		Version    int  `json:"version"`
-		ACDManaged bool `json:"_acd_managed"`
-		Hooks      map[string][]struct {
+		Version int `json:"version"`
+		Hooks   map[string][]struct {
 			Command string `json:"command"`
 			Timeout int    `json:"timeout"`
 		} `json:"hooks"`
@@ -365,9 +365,6 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 	}
 	if settings.Version != 1 {
 		t.Errorf("version=%d want 1", settings.Version)
-	}
-	if !settings.ACDManaged {
-		t.Errorf("_acd_managed not true at top level")
 	}
 	required := []string{"sessionStart", "postToolUse", "afterFileEdit", "stop", "sessionEnd"}
 	for _, ev := range required {
@@ -469,7 +466,7 @@ func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
 // P1-11 (invalid template JSON would cause Codex to silently disable hooks).
 func TestSetup_Codex_RawRejectsInvalidJSON(t *testing.T) {
 	// Trailing comma after first key — clearly invalid per RFC 8259.
-	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	bad := []byte(`{"hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"codex/hooks.json": bad})
 
 	out, stderr, err := runSetupCmd(t, "codex", "--raw")
@@ -515,9 +512,10 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	if start == -1 || end == -1 || end <= start {
 		t.Fatalf("no JSON block found in codex output:\n%s", out)
 	}
+	block := []byte(out[start : end+1])
+	assertTopLevelJSONKeys(t, block, "hooks")
 	var settings struct {
-		ACDManaged bool `json:"_acd_managed"`
-		Hooks      map[string][]struct {
+		Hooks map[string][]struct {
 			Matcher *string `json:"matcher,omitempty"`
 			Hooks   []struct {
 				Type    string `json:"type"`
@@ -526,11 +524,8 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
-		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, out[start:end+1])
-	}
-	if !settings.ACDManaged {
-		t.Errorf("_acd_managed not true at top level")
+	if err := json.Unmarshal(block, &settings); err != nil {
+		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
 	for _, ev := range required {
