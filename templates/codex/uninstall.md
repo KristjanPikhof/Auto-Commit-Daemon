@@ -4,8 +4,8 @@
    contains only the acd block you can delete it outright. If you have merged
    custom (non-acd) hooks, remove the five acd event entries
    (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`)
-   and the top-level `_acd_managed` key instead of deleting the file, so your
-   other hooks are preserved.
+   instead of deleting the file, so your other hooks are preserved. Older
+   installs may also have a top-level `_acd_managed` key; remove it if present.
 2. If you still have the legacy TOML install, remove the `# acd-managed: true` block from `~/.codex/config.toml`.
 3. If you no longer use any Codex hooks and had explicitly enabled them, you can
    also remove `hooks = true` from the `[features]` table in

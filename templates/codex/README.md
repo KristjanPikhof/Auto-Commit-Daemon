@@ -11,7 +11,7 @@
    ~~~
    Do not set `hooks = false`; that disables Codex lifecycle hooks. The older
    `codex_hooks` key still works as a deprecated alias.
-3. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
+3. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. The raw output is strict Codex-compatible JSON with only `hooks` at the top level. Codex now reads `hooks.json` before `~/.codex/config.toml`. (`acd setup codex` without `--raw` prints the same JSON wrapped in `// `-prefixed instructions; copy only the JSON block if you go that route — JSON does not allow comments.)
 
    **Overwrite warning:** the shell redirect above replaces the entire file. If
    you have custom non-acd hooks in `~/.codex/hooks.json`, back up that file
@@ -36,7 +36,15 @@ If you previously installed the legacy TOML snippet, delete the
 (`hooks.json` and inline `[hooks]` in `config.toml` both fire), so leaving the
 legacy block in place causes every event to fire twice — doubled
 `acd start`/`acd wake`/`acd touch` per turn. `acd doctor` warns when the JSON
-file and a legacy TOML config both carry an acd marker.
+file and a legacy TOML config both contain ACD hook installs.
+
+If `/hooks` reports an unknown top-level `_acd_managed` field, regenerate the
+schema-clean JSON with `acd setup codex --raw > ~/.codex/hooks.json`, or remove
+only that legacy key as a temporary workaround:
+
+~~~bash
+tmp="$(mktemp)" && jq 'del(._acd_managed)' ~/.codex/hooks.json > "$tmp" && mv "$tmp" ~/.codex/hooks.json
+~~~
 
 Note: the official Codex hooks docs use `[features].hooks` as the canonical
 feature key and keep `codex_hooks` only as a deprecated alias. The
