@@ -358,6 +358,9 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		}
 
 		if name == "codex" {
+			if hr.ConfigReadable && adapter.HasLegacyJSONManagedKey(body) {
+				hr.Notes = append(hr.Notes, "legacy top-level _acd_managed in ~/.codex/hooks.json is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > ~/.codex/hooks.json` or remove only that key with `jq 'del(._acd_managed)' ~/.codex/hooks.json`.")
+			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
 				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml carry acd markers; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")

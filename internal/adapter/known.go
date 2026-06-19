@@ -32,9 +32,6 @@ func textInstallDetector(markers ...string) installDetector {
 
 func jsonCommandSignatureDetector(required ...string) installDetector {
 	return func(body []byte) bool {
-		if hasLegacyJSONManagedKey(body) {
-			return true
-		}
 		var decoded any
 		if err := json.Unmarshal(body, &decoded); err != nil {
 			return false
