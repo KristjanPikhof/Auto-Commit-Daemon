@@ -141,7 +141,7 @@ var (
 	// tomlAcdManagedMarkers requires the leading `#` comment prefix because
 	// TOML has no other way to embed a free-form line, and the canonical acd
 	// install writes a `# acd-managed: true` comment block.
-	tomlAcdManagedMarkers = []string{"# acd-managed: true"}
+	tomlAcdManagedMarkers  = []string{"# acd-managed: true"}
 	tomlAcdManagedDetector = textInstallDetector(tomlAcdManagedMarkers...)
 	// yamlAcdManagedMarkers matches only the canonical comment form
 	// `# acd-managed: true`. acd-managed YAML templates always write the
@@ -151,7 +151,7 @@ var (
 	// a user-config key that happens to use the same identifier — from
 	// being misclassified as an acd install (which would cause `acd doctor`
 	// to recommend overwrite remediation against a file acd never wrote).
-	yamlAcdManagedMarkers = []string{"# acd-managed: true"}
+	yamlAcdManagedMarkers  = []string{"# acd-managed: true"}
 	yamlAcdManagedDetector = textInstallDetector(yamlAcdManagedMarkers...)
 )
 
