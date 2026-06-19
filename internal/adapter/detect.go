@@ -44,12 +44,12 @@ func (h knownHarness) IsInstalled() bool {
 	return h.HasMarker()
 }
 
-// HasMarker returns true when any candidate path contains a marker
-// registered for that path. Markers are checked per-path so JSON files do
-// not match TOML markers and vice versa.
+// HasMarker returns true when any candidate path matches the install
+// detector registered for that path. Detectors are checked per-path so JSON
+// files do not match TOML markers and vice versa.
 func (h knownHarness) HasMarker() bool {
 	for _, p := range h.candidatePaths() {
-		if fileContainsAny(p.path, p.markers) {
+		if textFileContains(p.path, p.detector) {
 			return true
 		}
 	}
@@ -72,7 +72,7 @@ func (h knownHarness) allPaths() []string {
 // marker. Returns "", false when no candidate carries a marker.
 func (h knownHarness) MatchedPath() (string, bool) {
 	for _, p := range h.candidatePaths() {
-		if fileContainsAny(p.path, p.markers) {
+		if textFileContains(p.path, p.detector) {
 			return p.path, true
 		}
 	}
@@ -101,8 +101,8 @@ func DetectInstalledFromDir(dir string) []Harness {
 }
 
 type expandedPathSpec struct {
-	path    string
-	markers []string
+	path     string
+	detector installDetector
 }
 
 func (h knownHarness) candidatePaths() []expandedPathSpec {
@@ -116,7 +116,7 @@ func (h knownHarness) candidatePaths() []expandedPathSpec {
 		if expanded == "" {
 			continue
 		}
-		out = append(out, expandedPathSpec{path: expanded, markers: p.markers})
+		out = append(out, expandedPathSpec{path: expanded, detector: p.detector})
 	}
 	return out
 }
