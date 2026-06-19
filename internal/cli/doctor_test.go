@@ -753,7 +753,7 @@ func TestDoctor_CodexLegacyJSONMarkerWarning(t *testing.T) {
 	}
 	var rep doctorReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", jsonOut.String(), jsonOut.String())
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
 	codex := findDoctorHarness(t, rep, "codex")
 	if !codex.Installed || !codex.MarkerFound {
@@ -780,7 +780,7 @@ func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o700); err != nil {
 		t.Fatalf("mkdir .codex: %v", err)
 	}
-	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write repo-local hooks.json: %v", err)
 	}
 	chdirForTest(t, repo)
@@ -852,7 +852,7 @@ func TestDoctor_CodexShadowWarningWithConfigHomeLegacyTOML(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".config", "codex"), 0o700); err != nil {
 		t.Fatalf("mkdir config codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".config", "codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
@@ -1010,18 +1010,18 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 		t.Fatalf("mkdir claude: %v", err)
 	}
 	// Drifted snippet: PreToolUse only fires `acd wake`, PostToolUse is
-	// canonical. Marker is present so the harness counts as installed.
+	// canonical. A hook command carries the ACD signature so the harness
+	// counts as installed without a legacy JSON marker.
 	body := `{
-		"_acd_managed": true,
 		"hooks": {
 			"PreToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
 				]}
 			],
 			"PostToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code --session-id \"$SID\" --repo \"$PWD\"; acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code --session-id \"$SID\" --repo \"$PWD\"; acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
 				]}
 			]
 		}
@@ -1065,16 +1065,15 @@ func TestDoctor_DriftCleanWhenSnippetMatchesTemplate(t *testing.T) {
 		t.Fatalf("mkdir claude: %v", err)
 	}
 	body := `{
-		"_acd_managed": true,
 		"hooks": {
 			"PreToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code; acd wake'" }
 				]}
 			],
 			"PostToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code; acd wake'" }
 				]}
 			]
 		}
