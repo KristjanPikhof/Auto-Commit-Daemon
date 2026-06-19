@@ -80,6 +80,23 @@ func snippetBody(t *testing.T, path string) string {
 	return string(b)
 }
 
+func assertTopLevelJSONKeys(t *testing.T, block []byte, want ...string) map[string]json.RawMessage {
+	t.Helper()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(block, &top); err != nil {
+		t.Fatalf("parse top-level JSON object: %v\nblock:\n%s", err, block)
+	}
+	if len(top) != len(want) {
+		t.Errorf("top-level JSON key count=%d, want %d; keys=%v", len(top), len(want), top)
+	}
+	for _, key := range want {
+		if _, ok := top[key]; !ok {
+			t.Errorf("top-level JSON key %q missing; keys=%v", key, top)
+		}
+	}
+	return top
+}
+
 // --- per-harness happy-path tests ------------------------------------------
 
 func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {
