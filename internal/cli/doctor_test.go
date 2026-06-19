@@ -640,19 +640,19 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
 		t.Fatalf("mkdir claude: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), readSnippet(t, "claude-code/settings.snippet.json"), 0o600); err != nil {
 		t.Fatalf("write claude settings: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
 		t.Fatalf("mkdir cursor: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), readSnippet(t, "cursor/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write cursor hooks.json: %v", err)
 	}
 
@@ -675,8 +675,8 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if !strings.HasSuffix(codex.ConfigPath, "/.codex/hooks.json") {
 		t.Fatalf("codex ConfigPath=%q, want ~/.codex/hooks.json", codex.ConfigPath)
 	}
-	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "legacy") {
-		t.Fatalf("codex should not show legacy warning when only hooks.json exists: %+v", codex)
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "_acd_managed") {
+		t.Fatalf("codex should not show schema-incompatibility warning for schema-clean hooks.json: %+v", codex)
 	}
 	cursor := findDoctorHarness(t, rep, "cursor")
 	if !cursor.Installed || !cursor.MarkerFound {
@@ -708,7 +708,7 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
@@ -730,6 +730,40 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	got := strings.Join(codex.Notes, "\n")
 	if !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
 		t.Fatalf("codex duplicate-hook warning missing: %+v", codex)
+	}
+}
+
+func TestDoctor_CodexLegacyJSONMarkerWarning(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write legacy codex hooks.json: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", jsonOut.String(), jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed || !codex.MarkerFound {
+		t.Fatalf("legacy codex hooks.json should still detect as installed: %+v", codex)
+	}
+	notes := strings.Join(codex.Notes, "\n")
+	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "jq 'del(._acd_managed)'"} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("legacy marker note missing %q in notes=%v", want, codex.Notes)
+		}
 	}
 }
 
