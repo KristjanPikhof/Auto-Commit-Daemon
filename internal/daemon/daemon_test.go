@@ -42,7 +42,11 @@ func newDaemonFixture(t *testing.T) *daemonFixture {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "acd-daemon-test-*")
+	if err != nil {
+		t.Fatalf("mkdir temp dir: %v", err)
+	}
+	t.Cleanup(func() { removeAllWithRetry(t, dir) })
 	if err := git.Init(ctx, dir); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
@@ -83,6 +87,19 @@ func newDaemonFixture(t *testing.T) *daemonFixture {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return &daemonFixture{dir: dir, gitDir: gitDir, db: db}
+}
+
+func removeAllWithRetry(t *testing.T, path string) {
+	t.Helper()
+	var err error
+	for i := 0; i < 10; i++ {
+		err = os.RemoveAll(path)
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(i+1) * 25 * time.Millisecond)
+	}
+	t.Fatalf("remove temp dir %s: %v", path, err)
 }
 
 // fastScheduler keeps the test loop responsive (~10ms ticks).
