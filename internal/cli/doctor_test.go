@@ -1089,6 +1089,78 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 	}
 }
 
+func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "claude-code",
+			path: filepath.Join(".claude", "settings.json"),
+			body: `{
+				"hooks": {
+					"SessionStart": [
+						{ "hooks": [
+							{ "type": "command", "command": "acd hook-stdin-extract session_id && acd start --harness claude-code" }
+						]}
+					]
+				}
+			}`,
+		},
+		{
+			name: "codex",
+			path: filepath.Join(".codex", "hooks.json"),
+			body: `{
+				"hooks": {
+					"SessionStart": [
+						{ "hooks": [
+							{ "type": "command", "command": "acd hook-stdin-extract session_id cwd? && acd start --harness codex" }
+						]}
+					]
+				}
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_ = withIsolatedHome(t)
+			ctx := context.Background()
+			t.Setenv(ai.EnvProvider, "")
+			t.Setenv(ai.EnvAPIKey, "")
+
+			path := filepath.Join(os.Getenv("HOME"), tc.path)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir config dir: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			var jsonOut bytes.Buffer
+			if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+				t.Fatalf("runDoctor json: %v", err)
+			}
+			var rep doctorReport
+			if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+			}
+			h := findDoctorHarness(t, rep, tc.name)
+			if !h.Installed || !h.MarkerFound {
+				t.Fatalf("%s should be installed via JSON command signature: %+v", tc.name, h)
+			}
+			notes := strings.Join(h.Notes, "\n")
+			if !strings.Contains(notes, "installed snippet drift") {
+				t.Fatalf("%s missing active hooks should report drift, got notes=%v", tc.name, h.Notes)
+			}
+			if !strings.Contains(notes, "2 active hook(s)") {
+				t.Fatalf("%s should count missing PreToolUse/PostToolUse hooks, got notes=%v", tc.name, h.Notes)
+			}
+		})
+	}
+}
+
 // TestDoctor_DriftCleanWhenSnippetMatchesTemplate seeds a fully canonical
 // claude-code snippet (both `acd start` and `acd wake` present in every
 // active hook) and asserts no drift warning fires.

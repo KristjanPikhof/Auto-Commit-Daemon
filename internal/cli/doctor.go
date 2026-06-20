@@ -445,9 +445,12 @@ func scanHookBodyDrift(name string, body []byte) string {
 // the canonical-path remediation.
 func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	var stale int
-	if name == "cursor" {
+	switch name {
+	case "claude-code", "codex":
+		stale = countJSONActiveHookDrift(name, body)
+	case "cursor":
 		stale = countCursorStaleLifecycleCommands(body)
-	} else {
+	default:
 		bodies := extractActiveHookBodies(name, body)
 		if len(bodies) == 0 {
 			return ""
@@ -494,6 +497,27 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 		return cursorLifecycleCommandOK("wake", body)
 	}
 	return false
+}
+
+func countJSONActiveHookDrift(name string, body []byte) int {
+	byEvent, ok := extractJSONHookCommandsByEvent(body)
+	if !ok {
+		return 0
+	}
+	stale := 0
+	for _, event := range []string{"PreToolUse", "PostToolUse"} {
+		cmds := byEvent[event]
+		if len(cmds) == 0 {
+			stale++
+			continue
+		}
+		for _, cmd := range cmds {
+			if !activeHookBodyHasStartWake(name, cmd) {
+				stale++
+			}
+		}
+	}
+	return stale
 }
 
 func countCursorStaleLifecycleCommands(body []byte) int {
@@ -589,6 +613,18 @@ func extractActiveHookBodies(name string, body []byte) []string {
 //	  }
 //	}
 func extractJSONHookBodies(body []byte, events []string) []string {
+	byEvent, ok := extractJSONHookCommandsByEvent(body)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, ev := range events {
+		out = append(out, byEvent[ev]...)
+	}
+	return out
+}
+
+func extractJSONHookCommandsByEvent(body []byte) (map[string][]string, bool) {
 	var top struct {
 		Hooks map[string][]struct {
 			Hooks []struct {
@@ -597,26 +633,22 @@ func extractJSONHookBodies(body []byte, events []string) []string {
 		} `json:"hooks"`
 	}
 	if err := json.Unmarshal(body, &top); err != nil {
-		return nil
+		return nil, false
 	}
 	if len(top.Hooks) == 0 {
-		return nil
+		return map[string][]string{}, true
 	}
-	var out []string
-	for _, ev := range events {
-		entries, ok := top.Hooks[ev]
-		if !ok {
-			continue
-		}
+	out := make(map[string][]string)
+	for ev, entries := range top.Hooks {
 		for _, e := range entries {
 			for _, h := range e.Hooks {
 				if strings.TrimSpace(h.Command) != "" {
-					out = append(out, h.Command)
+					out[ev] = append(out[ev], h.Command)
 				}
 			}
 		}
 	}
-	return out
+	return out, true
 }
 
 // extractCursorFlatHookBodies parses Cursor hooks.json (version 1 flat schema)
