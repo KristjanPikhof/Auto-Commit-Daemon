@@ -8,6 +8,18 @@
   updated pinned dependencies, including `modernc.org/sqlite v1.52.0`, as part
   of a security and toolchain maintenance bump.
 
+### Fixed
+
+- Codex 0.141+ rejects unknown top-level hook fields, so JSON hook templates for
+  Codex, Claude Code, and Cursor no longer emit `_acd_managed`. ACD now detects
+  JSON installs from ACD hook command signatures while still recognizing legacy
+  `_acd_managed` files for migration and doctor guidance.
+- `acd doctor` now reports schema-clean Codex and Claude Code installs as
+  drifted when their active hooks are missing, instead of treating a
+  `SessionStart`-only install as healthy.
+- JSON harness uninstall docs now match all ACD lifecycle hooks, including
+  stop/flush/touch commands that do not carry a `--harness` flag.
+
 ## v2026-06-06
 
 ### Added

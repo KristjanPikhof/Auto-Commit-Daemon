@@ -209,8 +209,8 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 
 - `acd start` failure is no longer masked by wake; active hook exits nonzero. AdapterE2E covers stop-all self-heal and corrupt-DB negatives.
 - Existing-user migration: rerun `acd setup <harness>` and replace installed hooks. `acd doctor` flags drift.
-- Markers: TOML/YAML use leading `# acd-managed: true`; JSON detects `"_acd_managed": true`. Keep hookhelper, setup tests, templates, AdapterE2E in sync.
-- Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted; `_acd_managed: true` is top-level JSON; `acd doctor` warns when both Codex files carry acd markers because events double.
+- Markers: TOML/YAML/shell snippets use leading `# acd-managed: true` comments. JSON harnesses are schema-clean and detected by ACD hook command signatures; top-level `_acd_managed` is legacy-only fallback detection. Keep hookhelper, setup tests, templates, AdapterE2E in sync.
+- Codex: `~/.codex/hooks.json` wins over `~/.codex/config.toml`; legacy TOML deleted; hooks JSON must have only `hooks` at the root. Current Codex rejects old top-level `_acd_managed`; `acd doctor` warns when JSON hooks and legacy TOML both contain ACD installs because events double.
 - Codex Stop deliberately stays on `acd touch`: Codex Stop fires on every assistant turn and overlaps tool runs, so `flush --logical` there would chain commits per tool turn. If Codex later adds a true session-idle event, mirror the Claude/OpenCode/Pi flush behavior.
 - Codex `/hooks` re-approval is required after every `~/.codex/hooks.json` change; until approved, `SessionStart` never fires.
 - `acd setup codex --raw > ~/.codex/hooks.json` destroys non-ACD entries; custom-hook users must merge manually.

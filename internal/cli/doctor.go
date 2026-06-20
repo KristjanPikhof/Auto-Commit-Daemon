@@ -299,6 +299,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		if matchedPath != "" && matchedPath != path {
 			hr.MatchedPath = matchedPath
 		}
+		var matchedBody []byte
+		matchedBodyPath := ""
 		body, err := os.ReadFile(path)
 		switch {
 		case err == nil:
@@ -307,7 +309,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			hr.MarkerFound = adapter.PrimaryPathMatchesMarker(name, body)
 			hr.Installed = hr.MarkerFound
 			if !hr.Installed && detected[name] {
-				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
+				hr.Notes = append(hr.Notes, "ACD managed install detected in an alternate config path")
 				hr.Installed = true
 			}
 			if hr.Installed {
@@ -315,6 +317,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
 						driftBody = mb
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 					}
 				}
 				if note := scanHookBodyDriftAt(name, driftBody, hr.MatchedPath); note != "" {
@@ -323,10 +327,12 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 		case errors.Is(err, os.ErrNotExist):
 			if detected[name] {
-				hr.Notes = append(hr.Notes, "acd-managed marker detected in an alternate config path")
+				hr.Notes = append(hr.Notes, "ACD managed install detected in an alternate config path")
 				hr.Installed = true
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
 							hr.Notes = append(hr.Notes, note)
 						}
@@ -349,6 +355,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Installed = true
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
 							hr.Notes = append(hr.Notes, note)
 						}
@@ -358,9 +366,20 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		}
 
 		if name == "codex" {
+			legacyPath := path
+			legacyBody := body
+			legacyReadable := hr.ConfigReadable
+			if matchedBodyPath != "" {
+				legacyPath = matchedBodyPath
+				legacyBody = matchedBody
+				legacyReadable = true
+			}
+			if legacyReadable && adapter.HasLegacyJSONManagedKey(legacyBody) {
+				hr.Notes = append(hr.Notes, codexLegacyJSONManagedKeyNote(legacyPath))
+			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
-				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml carry acd markers; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
+				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
 			}
 			if note := tailCodexHookLog(); note != "" {
 				hr.Notes = append(hr.Notes, note)
@@ -374,6 +393,17 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		reports = append(reports, hr)
 	}
 	return reports
+}
+
+func codexLegacyJSONManagedKeyNote(path string) string {
+	if path == "" {
+		path = "~/.codex/hooks.json"
+	}
+	pathArg := path
+	if !strings.HasPrefix(pathArg, "~") {
+		pathArg = strconv.Quote(pathArg)
+	}
+	return fmt.Sprintf("legacy top-level _acd_managed in %s is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > %s`; if the file also has custom hooks, remove only the top-level `_acd_managed` key manually and keep the `hooks` object.", path, pathArg)
 }
 
 // driftRemediationCommands maps each supported harness to the recommended
@@ -415,9 +445,12 @@ func scanHookBodyDrift(name string, body []byte) string {
 // the canonical-path remediation.
 func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	var stale int
-	if name == "cursor" {
+	switch name {
+	case "claude-code", "codex":
+		stale = countJSONActiveHookDrift(name, body)
+	case "cursor":
 		stale = countCursorStaleLifecycleCommands(body)
-	} else {
+	default:
 		bodies := extractActiveHookBodies(name, body)
 		if len(bodies) == 0 {
 			return ""
@@ -464,6 +497,27 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 		return cursorLifecycleCommandOK("wake", body)
 	}
 	return false
+}
+
+func countJSONActiveHookDrift(name string, body []byte) int {
+	byEvent, ok := extractJSONHookCommandsByEvent(body)
+	if !ok {
+		return 0
+	}
+	stale := 0
+	for _, event := range []string{"PreToolUse", "PostToolUse"} {
+		cmds := byEvent[event]
+		if len(cmds) == 0 {
+			stale++
+			continue
+		}
+		for _, cmd := range cmds {
+			if !activeHookBodyHasStartWake(name, cmd) {
+				stale++
+			}
+		}
+	}
+	return stale
 }
 
 func countCursorStaleLifecycleCommands(body []byte) int {
@@ -559,6 +613,18 @@ func extractActiveHookBodies(name string, body []byte) []string {
 //	  }
 //	}
 func extractJSONHookBodies(body []byte, events []string) []string {
+	byEvent, ok := extractJSONHookCommandsByEvent(body)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, ev := range events {
+		out = append(out, byEvent[ev]...)
+	}
+	return out
+}
+
+func extractJSONHookCommandsByEvent(body []byte) (map[string][]string, bool) {
 	var top struct {
 		Hooks map[string][]struct {
 			Hooks []struct {
@@ -567,26 +633,22 @@ func extractJSONHookBodies(body []byte, events []string) []string {
 		} `json:"hooks"`
 	}
 	if err := json.Unmarshal(body, &top); err != nil {
-		return nil
+		return nil, false
 	}
 	if len(top.Hooks) == 0 {
-		return nil
+		return map[string][]string{}, true
 	}
-	var out []string
-	for _, ev := range events {
-		entries, ok := top.Hooks[ev]
-		if !ok {
-			continue
-		}
+	out := make(map[string][]string)
+	for ev, entries := range top.Hooks {
 		for _, e := range entries {
 			for _, h := range e.Hooks {
 				if strings.TrimSpace(h.Command) != "" {
-					out = append(out, h.Command)
+					out[ev] = append(out[ev], h.Command)
 				}
 			}
 		}
 	}
-	return out
+	return out, true
 }
 
 // extractCursorFlatHookBodies parses Cursor hooks.json (version 1 flat schema)

@@ -21,7 +21,7 @@ commands, so no auxiliary script path is required.
 After install:
 
 ~~~text
-~/.cursor/hooks.json          # version 1, _acd_managed, event -> command entries
+~/.cursor/hooks.json          # version 1, hooks event -> command entries
 ~~~
 
 Hook log (convention, same as other harnesses):
@@ -108,7 +108,8 @@ Suggested timeouts (implementer default): `sessionStart` / active hooks 15s;
 
    - **Merge (recommended):** if you already have custom hooks, copy the five
      event entries from `acd setup cursor --raw` (or `templates/cursor/hooks.json`)
-     into your file. Ensure top-level `"version": 1` and `"_acd_managed": true`.
+     into your file. Ensure top-level `"version": 1` and keep the ACD hook
+     commands intact so `acd doctor` can recognize the install.
    - **Replace:** only when the file has no non-acd hooks:
 
      ~~~bash

@@ -2,11 +2,13 @@
 
 1. Remove the acd-managed entries from `~/.codex/hooks.json`. If the file
    contains only the acd block you can delete it outright. If you have merged
-   custom (non-acd) hooks, remove the five acd event entries
-   (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`)
-   and the top-level `_acd_managed` key instead of deleting the file, so your
-   other hooks are preserved.
-2. If you still have the legacy TOML install, remove the `# acd-managed: true` block from `~/.codex/config.toml`.
+   custom (non-acd) hooks, remove only hook objects whose command contains
+   `acd hook-stdin-extract` and calls `acd start`, `acd wake`, or `acd touch`,
+   then delete an event key (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+   `PostToolUse`, `Stop`) only if no hooks remain under it. Older installs may
+   also have a top-level `_acd_managed` key; remove it if present.
+2. If you still have the legacy TOML install, remove the `# acd-managed: true`
+   block from `~/.codex/config.toml` or `~/.config/codex/config.toml`.
 3. If you no longer use any Codex hooks and had explicitly enabled them, you can
    also remove `hooks = true` from the `[features]` table in
    `~/.codex/config.toml`. Do not add `hooks = false` unless you want to disable

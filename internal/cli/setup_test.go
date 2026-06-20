@@ -80,6 +80,54 @@ func snippetBody(t *testing.T, path string) string {
 	return string(b)
 }
 
+func assertTopLevelJSONKeys(t *testing.T, block []byte, want ...string) map[string]json.RawMessage {
+	t.Helper()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(block, &top); err != nil {
+		t.Fatalf("parse top-level JSON object: %v\nblock:\n%s", err, block)
+	}
+	if len(top) != len(want) {
+		t.Errorf("top-level JSON key count=%d, want %d; keys=%v", len(top), len(want), top)
+	}
+	for _, key := range want {
+		if _, ok := top[key]; !ok {
+			t.Errorf("top-level JSON key %q missing; keys=%v", key, top)
+		}
+	}
+	return top
+}
+
+func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
+	cases := []struct {
+		path string
+		want []string
+	}{
+		{
+			path: "claude-code/uninstall.md",
+			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+		},
+		{
+			path: "codex/uninstall.md",
+			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd touch"},
+		},
+		{
+			path: "cursor/uninstall.md",
+			want: []string{"acd hook-cursor-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.path, func(t *testing.T) {
+			body := snippetBody(t, tc.path)
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Fatalf("%s uninstall docs missing %q:\n%s", tc.path, want, body)
+				}
+			}
+		})
+	}
+}
+
 // --- per-harness happy-path tests ------------------------------------------
 
 func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {
@@ -112,10 +160,30 @@ func TestSetup_ClaudeCode_ValidJSON(t *testing.T) {
 	}
 }
 
-func TestSetup_ClaudeCode_AcdManagedMarker(t *testing.T) {
+func TestSetup_ClaudeCode_RawEmitsValidJSONOnly(t *testing.T) {
+	out, _, err := runSetupCmd(t, "claude-code", "--raw")
+	if err != nil {
+		t.Fatalf("acd setup claude-code --raw exit=%v\nstdout=%s", err, out)
+	}
+	var v interface{}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
+	}
+	assertTopLevelJSONKeys(t, []byte(out), "hooks")
+	if strings.HasPrefix(strings.TrimSpace(out), "//") {
+		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
+	}
+}
+
+func TestSetup_ClaudeCode_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in output:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("claude-code JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
@@ -140,6 +208,8 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 	if start == -1 || end == -1 || end <= start {
 		t.Fatalf("no JSON block found in output:\n%s", out)
 	}
+	block := []byte(out[start : end+1])
+	assertTopLevelJSONKeys(t, block, "hooks")
 	var settings struct {
 		Hooks map[string][]struct {
 			Matcher *string `json:"matcher,omitempty"`
@@ -149,8 +219,8 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
-		t.Fatalf("parse JSON: %v\nblock:\n%s", err, out[start:end+1])
+	if err := json.Unmarshal(block, &settings); err != nil {
+		t.Fatalf("parse JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"}
 	for _, ev := range required {
@@ -272,10 +342,15 @@ func TestSetup_Cursor_ContainsSnippet(t *testing.T) {
 	}
 }
 
-func TestSetup_Cursor_AcdManagedMarker(t *testing.T) {
+func TestSetup_Cursor_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "cursor")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in cursor output:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("cursor JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
@@ -295,13 +370,14 @@ func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
 	}
+	assertTopLevelJSONKeys(t, []byte(out), "version", "hooks")
 	if strings.HasPrefix(strings.TrimSpace(out), "//") {
 		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
 	}
 }
 
 func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
-	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	bad := []byte(`{"version": 1, "hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})
 
 	out, stderr, err := runSetupCmd(t, "cursor", "--raw")
@@ -333,10 +409,10 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 		t.Fatalf("no JSON block found in cursor output:\n%s", out)
 	}
 	block := tail[:end+1]
+	assertTopLevelJSONKeys(t, []byte(block), "version", "hooks")
 	var settings struct {
-		Version    int  `json:"version"`
-		ACDManaged bool `json:"_acd_managed"`
-		Hooks      map[string][]struct {
+		Version int `json:"version"`
+		Hooks   map[string][]struct {
 			Command string `json:"command"`
 			Timeout int    `json:"timeout"`
 		} `json:"hooks"`
@@ -346,9 +422,6 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 	}
 	if settings.Version != 1 {
 		t.Errorf("version=%d want 1", settings.Version)
-	}
-	if !settings.ACDManaged {
-		t.Errorf("_acd_managed not true at top level")
 	}
 	required := []string{"sessionStart", "postToolUse", "afterFileEdit", "stop", "sessionEnd"}
 	for _, ev := range required {
@@ -412,10 +485,15 @@ func TestSetup_Codex_ContainsSnippet(t *testing.T) {
 	}
 }
 
-func TestSetup_Codex_AcdManagedMarker(t *testing.T) {
+func TestSetup_Codex_NoLegacyJSONMarker(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
-	if !strings.Contains(out, `"_acd_managed": true`) {
-		t.Errorf("acd-managed marker not found in codex output:\n%s", out)
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("no JSON block found in output:\n%s", out)
+	}
+	if strings.Contains(out[start:end+1], `_acd_managed`) {
+		t.Errorf("codex JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
 	}
 }
 
@@ -437,6 +515,7 @@ func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &v); err != nil {
 		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
 	}
+	assertTopLevelJSONKeys(t, []byte(out), "hooks")
 	if strings.HasPrefix(strings.TrimSpace(out), "//") {
 		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
 	}
@@ -450,7 +529,7 @@ func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
 // P1-11 (invalid template JSON would cause Codex to silently disable hooks).
 func TestSetup_Codex_RawRejectsInvalidJSON(t *testing.T) {
 	// Trailing comma after first key — clearly invalid per RFC 8259.
-	bad := []byte(`{"_acd_managed": true, "hooks": {},}`)
+	bad := []byte(`{"hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"codex/hooks.json": bad})
 
 	out, stderr, err := runSetupCmd(t, "codex", "--raw")
@@ -496,9 +575,10 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	if start == -1 || end == -1 || end <= start {
 		t.Fatalf("no JSON block found in codex output:\n%s", out)
 	}
+	block := []byte(out[start : end+1])
+	assertTopLevelJSONKeys(t, block, "hooks")
 	var settings struct {
-		ACDManaged bool `json:"_acd_managed"`
-		Hooks      map[string][]struct {
+		Hooks map[string][]struct {
 			Matcher *string `json:"matcher,omitempty"`
 			Hooks   []struct {
 				Type    string `json:"type"`
@@ -507,11 +587,8 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := json.Unmarshal([]byte(out[start:end+1]), &settings); err != nil {
-		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, out[start:end+1])
-	}
-	if !settings.ACDManaged {
-		t.Errorf("_acd_managed not true at top level")
+	if err := json.Unmarshal(block, &settings); err != nil {
+		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
 	for _, ev := range required {
@@ -740,24 +817,6 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 		t.Fatalf("no JSON block")
 	}
 	jsonBlock := out[start : end+1]
-	// Top-level JSON marker check (P2 #18). The acd-managed marker
-	// shape is format-specific: JSON harnesses (Claude Code, Codex)
-	// use the boolean key `_acd_managed: true` at the top level. Doctor
-	// and setup both rely on this exact marker shape; a future template
-	// edit that drops it would silently break drift detection.
-	var markerCheck map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(jsonBlock), &markerCheck); err != nil {
-		t.Fatalf("parse JSON for marker check: %v", err)
-	}
-	rawMarker, present := markerCheck["_acd_managed"]
-	if !present {
-		t.Errorf("claude-code settings snippet missing top-level _acd_managed marker:\n%s", jsonBlock)
-	} else {
-		var managed bool
-		if err := json.Unmarshal(rawMarker, &managed); err != nil || !managed {
-			t.Errorf("claude-code _acd_managed must be JSON true; got %s (err=%v)", string(rawMarker), err)
-		}
-	}
 
 	var settings struct {
 		Hooks map[string][]struct {
@@ -1265,7 +1324,7 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir .codex: %v", err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooks, []byte(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"acd hook-stdin-extract session_id cwd? && acd start --harness codex && acd wake"}]}]}}`), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	chdirForTest(t, repo)

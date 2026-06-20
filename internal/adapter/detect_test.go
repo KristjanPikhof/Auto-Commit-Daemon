@@ -6,7 +6,34 @@ import (
 	"testing"
 )
 
-func TestDetectInstalled_ClaudeCodeMarker(t *testing.T) {
+const (
+	schemaCleanClaudeCodeHooks = `{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"acd hook-stdin-extract session_id && acd start --harness claude-code && acd wake"}]}]}}`
+	schemaCleanCodexHooks      = `{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"acd hook-stdin-extract session_id cwd? && acd start --harness codex && acd wake"}]}]}}`
+	schemaCleanCursorHooks     = `{"version":1,"hooks":{"postToolUse":[{"command":"acd hook-cursor-extract && acd start --harness cursor && acd wake"}]}}`
+)
+
+func TestDetectInstalled_ClaudeCodeSignature(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatalf("mkdir settings dir: %v", err)
+	}
+	if err := os.WriteFile(settings, []byte(schemaCleanClaudeCodeHooks), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 {
+		t.Fatalf("DetectInstalled len=%d, want 1: %#v", len(got), got)
+	}
+	if got[0].Name() != "claude-code" {
+		t.Fatalf("DetectInstalled[0]=%q, want claude-code", got[0].Name())
+	}
+}
+
+func TestDetectInstalled_ClaudeCodeLegacyJSONMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -19,11 +46,8 @@ func TestDetectInstalled_ClaudeCodeMarker(t *testing.T) {
 	}
 
 	got := DetectInstalled()
-	if len(got) != 1 {
-		t.Fatalf("DetectInstalled len=%d, want 1: %#v", len(got), got)
-	}
-	if got[0].Name() != "claude-code" {
-		t.Fatalf("DetectInstalled[0]=%q, want claude-code", got[0].Name())
+	if len(got) != 1 || got[0].Name() != "claude-code" {
+		t.Fatalf("DetectInstalled=%#v, want claude-code only", got)
 	}
 }
 
@@ -57,7 +81,7 @@ func TestNamesIncludesSupportedHarnessesInOrder(t *testing.T) {
 	}
 }
 
-func TestDetectInstalled_CursorHooksJSONMarker(t *testing.T) {
+func TestDetectInstalled_CursorHooksJSONSignature(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -65,7 +89,7 @@ func TestDetectInstalled_CursorHooksJSONMarker(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir cursor dir: %v", err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooks, []byte(schemaCleanCursorHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 
@@ -86,6 +110,24 @@ func TestDetectInstalled_CursorHooksJSONMarker(t *testing.T) {
 	}
 }
 
+func TestDetectInstalled_CursorLegacyJSONMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".cursor", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir cursor dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "cursor" {
+		t.Fatalf("DetectInstalled=%#v, want cursor only", got)
+	}
+}
+
 func TestDetectInstalled_CursorIgnoresRepoLocalHooksJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -98,7 +140,7 @@ func TestDetectInstalled_CursorIgnoresRepoLocalHooksJSON(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir cursor dir: %v", err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooks, []byte(schemaCleanCursorHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	chdirForDetectTest(t, repo)
@@ -127,7 +169,29 @@ func TestDetectInstalled_CursorHooksJSONIgnoresYAMLMarker(t *testing.T) {
 	}
 }
 
-func TestDetectInstalled_CodexHooksJSONMarker(t *testing.T) {
+func TestDetectInstalled_CodexHooksJSONSignature(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(hooks, []byte(schemaCleanCodexHooks), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	got := DetectInstalled()
+	if len(got) != 1 || got[0].Name() != "codex" {
+		t.Fatalf("DetectInstalled=%#v, want codex only", got)
+	}
+	h, _ := Lookup("codex")
+	if path := h.ConfigPath(); path != hooks {
+		t.Fatalf("ConfigPath=%q, want %q", path, hooks)
+	}
+}
+
+func TestDetectInstalled_CodexLegacyJSONMarker(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -142,10 +206,6 @@ func TestDetectInstalled_CodexHooksJSONMarker(t *testing.T) {
 	got := DetectInstalled()
 	if len(got) != 1 || got[0].Name() != "codex" {
 		t.Fatalf("DetectInstalled=%#v, want codex only", got)
-	}
-	h, _ := Lookup("codex")
-	if path := h.ConfigPath(); path != hooks {
-		t.Fatalf("ConfigPath=%q, want %q", path, hooks)
 	}
 }
 
@@ -183,7 +243,7 @@ func TestDetectInstalled_CodexRepoLocalHooksJSONMarker(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir codex dir: %v", err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooks, []byte(schemaCleanCodexHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	chdirForDetectTest(t, subdir)
@@ -239,7 +299,7 @@ func TestDetectInstalled_CodexRepoLocalIgnoredOutsideGitRoot(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
 		t.Fatalf("mkdir codex dir: %v", err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooks, []byte(schemaCleanCodexHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	chdirForDetectTest(t, dir)
@@ -263,6 +323,24 @@ func TestDetectInstalled_CodexHooksJSONIgnoresTOMLMarker(t *testing.T) {
 
 	if got := DetectInstalled(); len(got) != 0 {
 		t.Fatalf("DetectInstalled=%#v, want none (TOML marker must not match JSON path)", got)
+	}
+}
+
+func TestDetectInstalled_CodexHooksJSONRequiresCommandSignature(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hooks := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	body := `{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"acd hook-stdin-extract session_id cwd? && acd wake"}]}]}}`
+	if err := os.WriteFile(hooks, []byte(body), 0o600); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
+	}
+
+	if got := DetectInstalled(); len(got) != 0 {
+		t.Fatalf("DetectInstalled=%#v, want none without codex harness signature", got)
 	}
 }
 
@@ -290,7 +368,7 @@ func TestCodexInstalls_BothShadow(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(schemaCleanCodexHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n"), 0o600); err != nil {
@@ -313,7 +391,7 @@ func TestCodexInstalls_BothShadowWithConfigHomeLegacyTOML(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".config", "codex"), 0o700); err != nil {
 		t.Fatalf("mkdir config codex dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(schemaCleanCodexHooks), 0o600); err != nil {
 		t.Fatalf("write hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".config", "codex", "config.toml"), []byte("# acd-managed: true\n"), 0o600); err != nil {

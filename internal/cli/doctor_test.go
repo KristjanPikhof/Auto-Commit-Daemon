@@ -640,19 +640,19 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
 		t.Fatalf("mkdir claude: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"_acd_managed": true}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), readSnippet(t, "claude-code/settings.snippet.json"), 0o600); err != nil {
 		t.Fatalf("write claude settings: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
 		t.Fatalf("mkdir cursor: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "hooks.json"), readSnippet(t, "cursor/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write cursor hooks.json: %v", err)
 	}
 
@@ -675,8 +675,8 @@ func TestDoctor_InstallReportsHarnessMarkersAndCodexHooksJSON(t *testing.T) {
 	if !strings.HasSuffix(codex.ConfigPath, "/.codex/hooks.json") {
 		t.Fatalf("codex ConfigPath=%q, want ~/.codex/hooks.json", codex.ConfigPath)
 	}
-	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "legacy") {
-		t.Fatalf("codex should not show legacy warning when only hooks.json exists: %+v", codex)
+	if got := strings.Join(codex.Notes, "\n"); strings.Contains(got, "_acd_managed") {
+		t.Fatalf("codex should not show schema-incompatibility warning for schema-clean hooks.json: %+v", codex)
 	}
 	cursor := findDoctorHarness(t, rep, "cursor")
 	if !cursor.Installed || !cursor.MarkerFound {
@@ -708,7 +708,7 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
@@ -733,7 +733,41 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 	}
 }
 
-func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
+func TestDoctor_CodexLegacyJSONMarkerWarning(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	home := os.Getenv("HOME")
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write legacy codex hooks.json: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+		t.Fatalf("runDoctor json: %v", err)
+	}
+	var rep doctorReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed || !codex.MarkerFound {
+		t.Fatalf("legacy codex hooks.json should still detect as installed: %+v", codex)
+	}
+	notes := strings.Join(codex.Notes, "\n")
+	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "remove only the top-level `_acd_managed` key manually", "keep the `hooks` object"} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("legacy marker note missing %q in notes=%v", want, codex.Notes)
+		}
+	}
+}
+
+func TestDoctor_CodexRepoLocalLegacyJSONMarkerWarning(t *testing.T) {
 	_ = withIsolatedHome(t)
 	t.Setenv(ai.EnvProvider, "")
 	t.Setenv(ai.EnvAPIKey, "")
@@ -747,6 +781,44 @@ func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
 		t.Fatalf("mkdir .codex: %v", err)
 	}
 	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write repo-local legacy hooks.json: %v", err)
+	}
+	chdirForTest(t, repo)
+
+	rep, err := collectDoctorReport(context.Background())
+	if err != nil {
+		t.Fatalf("collectDoctorReport: %v", err)
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed via repo-local legacy hooks.json: %+v", codex)
+	}
+	wantHooksPath := canonicalCLIResolverTestPath(t, hooksPath)
+	if codex.MatchedPath != wantHooksPath {
+		t.Fatalf("MatchedPath=%q, want repo-local %q", codex.MatchedPath, wantHooksPath)
+	}
+	notes := strings.Join(codex.Notes, "\n")
+	for _, want := range []string{"ACD managed install detected in an alternate config path", "legacy top-level _acd_managed in " + wantHooksPath, "Codex 0.141+", "remove only the top-level `_acd_managed` key manually"} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("repo-local legacy marker note missing %q in notes=%v", want, codex.Notes)
+		}
+	}
+}
+
+func TestDoctor_CodexRepoLocalInstallDetected(t *testing.T) {
+	_ = withIsolatedHome(t)
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	hooksPath := filepath.Join(repo, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o700); err != nil {
+		t.Fatalf("mkdir .codex: %v", err)
+	}
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write repo-local hooks.json: %v", err)
 	}
 	chdirForTest(t, repo)
@@ -818,7 +890,7 @@ func TestDoctor_CodexShadowWarningWithConfigHomeLegacyTOML(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".config", "codex"), 0o700); err != nil {
 		t.Fatalf("mkdir config codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, ".config", "codex", "config.toml"), []byte("# acd-managed: true\n[features]\n"), 0o600); err != nil {
@@ -976,18 +1048,18 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 		t.Fatalf("mkdir claude: %v", err)
 	}
 	// Drifted snippet: PreToolUse only fires `acd wake`, PostToolUse is
-	// canonical. Marker is present so the harness counts as installed.
+	// canonical. A hook command carries the ACD signature so the harness
+	// counts as installed without a legacy JSON marker.
 	body := `{
-		"_acd_managed": true,
 		"hooks": {
 			"PreToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
 				]}
 			],
 			"PostToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code --session-id \"$SID\" --repo \"$PWD\"; acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code --session-id \"$SID\" --repo \"$PWD\"; acd wake --session-id \"$SID\" --repo \"$PWD\"'" }
 				]}
 			]
 		}
@@ -1017,6 +1089,78 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 	}
 }
 
+func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "claude-code",
+			path: filepath.Join(".claude", "settings.json"),
+			body: `{
+				"hooks": {
+					"SessionStart": [
+						{ "hooks": [
+							{ "type": "command", "command": "acd hook-stdin-extract session_id && acd start --harness claude-code" }
+						]}
+					]
+				}
+			}`,
+		},
+		{
+			name: "codex",
+			path: filepath.Join(".codex", "hooks.json"),
+			body: `{
+				"hooks": {
+					"SessionStart": [
+						{ "hooks": [
+							{ "type": "command", "command": "acd hook-stdin-extract session_id cwd? && acd start --harness codex" }
+						]}
+					]
+				}
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_ = withIsolatedHome(t)
+			ctx := context.Background()
+			t.Setenv(ai.EnvProvider, "")
+			t.Setenv(ai.EnvAPIKey, "")
+
+			path := filepath.Join(os.Getenv("HOME"), tc.path)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir config dir: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			var jsonOut bytes.Buffer
+			if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
+				t.Fatalf("runDoctor json: %v", err)
+			}
+			var rep doctorReport
+			if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+			}
+			h := findDoctorHarness(t, rep, tc.name)
+			if !h.Installed || !h.MarkerFound {
+				t.Fatalf("%s should be installed via JSON command signature: %+v", tc.name, h)
+			}
+			notes := strings.Join(h.Notes, "\n")
+			if !strings.Contains(notes, "installed snippet drift") {
+				t.Fatalf("%s missing active hooks should report drift, got notes=%v", tc.name, h.Notes)
+			}
+			if !strings.Contains(notes, "2 active hook(s)") {
+				t.Fatalf("%s should count missing PreToolUse/PostToolUse hooks, got notes=%v", tc.name, h.Notes)
+			}
+		})
+	}
+}
+
 // TestDoctor_DriftCleanWhenSnippetMatchesTemplate seeds a fully canonical
 // claude-code snippet (both `acd start` and `acd wake` present in every
 // active hook) and asserts no drift warning fires.
@@ -1031,16 +1175,15 @@ func TestDoctor_DriftCleanWhenSnippetMatchesTemplate(t *testing.T) {
 		t.Fatalf("mkdir claude: %v", err)
 	}
 	body := `{
-		"_acd_managed": true,
 		"hooks": {
 			"PreToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code; acd wake'" }
 				]}
 			],
 			"PostToolUse": [
 				{ "matcher": "", "hooks": [
-					{ "type": "command", "command": "bash -c 'acd start --harness claude-code; acd wake'" }
+					{ "type": "command", "command": "bash -c 'acd hook-stdin-extract session_id && acd start --harness claude-code; acd wake'" }
 				]}
 			]
 		}
@@ -1211,7 +1354,7 @@ func TestDoctor_FallbackOnEACCESPrimaryConfig(t *testing.T) {
 		t.Fatalf("mkdir codex: %v", err)
 	}
 	hooksPath := filepath.Join(home, ".codex", "hooks.json")
-	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	// Make primary config unreadable so the read produces EACCES.
@@ -1262,7 +1405,7 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 
@@ -1321,7 +1464,7 @@ func TestDoctor_CodexHookLogQuietWhenNoErrors(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatalf("mkdir codex: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex", "hooks.json"), readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.MkdirAll(roots.State, 0o700); err != nil {
@@ -1496,12 +1639,12 @@ func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 }
 
 func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
-	note := scanHookBodyDrift("cursor", []byte(`{"_acd_managed":true,"hooks":{}}`))
+	note := scanHookBodyDrift("cursor", []byte(`{"version":1,"hooks":{}}`))
 	if note == "" {
-		t.Fatalf("empty managed cursor hooks should report drift")
+		t.Fatalf("empty cursor hooks should report drift")
 	}
 	if !strings.Contains(note, "5 active hook(s)") {
-		t.Fatalf("empty managed cursor hooks should count five missing lifecycle hooks, got %q", note)
+		t.Fatalf("empty cursor hooks should count five missing lifecycle hooks, got %q", note)
 	}
 }
 
@@ -1531,13 +1674,12 @@ func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
 	}
 	body := `{
 		"version": 1,
-		"_acd_managed": true,
 		"hooks": {
 			"postToolUse": [
 				{ "command": "echo no-op", "timeout": 15 }
 			],
 			"afterFileEdit": [
-				{ "command": "acd start --harness cursor && acd wake", "timeout": 15 }
+				{ "command": "acd hook-cursor-extract && acd start --harness cursor && acd wake", "timeout": 15 }
 			]
 		}
 	}`
@@ -1819,7 +1961,7 @@ func TestDoctor_UnreadablePrimaryConfigSetsConfigReadError(t *testing.T) {
 		t.Fatalf("mkdir codex: %v", err)
 	}
 	hooksPath := filepath.Join(home, ".codex", "hooks.json")
-	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+	if err := os.WriteFile(hooksPath, readSnippet(t, "codex/hooks.json"), 0o600); err != nil {
 		t.Fatalf("write codex hooks.json: %v", err)
 	}
 	if err := os.Chmod(hooksPath, 0o000); err != nil {
