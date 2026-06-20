@@ -97,6 +97,37 @@ func assertTopLevelJSONKeys(t *testing.T, block []byte, want ...string) map[stri
 	return top
 }
 
+func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
+	cases := []struct {
+		path string
+		want []string
+	}{
+		{
+			path: "claude-code/uninstall.md",
+			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+		},
+		{
+			path: "codex/uninstall.md",
+			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd touch"},
+		},
+		{
+			path: "cursor/uninstall.md",
+			want: []string{"acd hook-cursor-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.path, func(t *testing.T) {
+			body := snippetBody(t, tc.path)
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Fatalf("%s uninstall docs missing %q:\n%s", tc.path, want, body)
+				}
+			}
+		})
+	}
+}
+
 // --- per-harness happy-path tests ------------------------------------------
 
 func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {
