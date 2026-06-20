@@ -1,10 +1,11 @@
 # Uninstall acd from Claude Code
 
 1. Remove the ACD hook objects from `~/.claude/settings.json`: entries whose
-   command contains both `acd hook-stdin-extract` and `--harness claude-code`.
-   Delete an event key (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`,
-   or `SessionEnd`) only if no hooks remain under it. Older installs may also
-   have a top-level `_acd_managed` key; remove it if present.
+   command contains `acd hook-stdin-extract` and calls `acd start`, `acd wake`,
+   `acd flush --logical`, or `acd stop`. Delete an event key (`SessionStart`,
+   `PreToolUse`, `PostToolUse`, `Stop`, or `SessionEnd`) only if no hooks
+   remain under it. Older installs may also have a top-level `_acd_managed`
+   key; remove it if present.
 2. Stop any running daemons:
    ~~~bash
    acd stop --all

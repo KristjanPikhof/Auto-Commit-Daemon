@@ -5,10 +5,11 @@
    `sessionStart`, `postToolUse`, `afterFileEdit`, `stop`, and `sessionEnd`,
    plus top-level `"version": 1`. If the file contains only the acd block you
    can delete it outright. If you merged custom (non-acd) hooks, remove only
-   hook objects whose command contains both `acd hook-cursor-extract` and
-   `--harness cursor`, then delete an event key only if no hooks remain under
-   it. Remove `version` only if nothing else needs it. Older installs may also
-   have a top-level `_acd_managed` key; remove it if present.
+   hook objects whose command contains `acd hook-cursor-extract` and calls
+   `acd start`, `acd wake`, `acd flush --logical`, or `acd stop`, then delete
+   an event key only if no hooks remain under it. Remove `version` only if
+   nothing else needs it. Older installs may also have a top-level
+   `_acd_managed` key; remove it if present.
 2. Stop any running daemons (Cursor does not use `watch-pid` refcount; sessions
    may linger until explicitly stopped):
    ~~~bash
