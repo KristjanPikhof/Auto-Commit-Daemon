@@ -299,6 +299,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		if matchedPath != "" && matchedPath != path {
 			hr.MatchedPath = matchedPath
 		}
+		var matchedBody []byte
+		matchedBodyPath := ""
 		body, err := os.ReadFile(path)
 		switch {
 		case err == nil:
@@ -315,6 +317,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
 						driftBody = mb
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 					}
 				}
 				if note := scanHookBodyDriftAt(name, driftBody, hr.MatchedPath); note != "" {
@@ -327,6 +331,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Installed = true
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
 							hr.Notes = append(hr.Notes, note)
 						}
@@ -349,6 +355,8 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 				hr.Installed = true
 				if hr.MatchedPath != "" {
 					if mb, rerr := os.ReadFile(hr.MatchedPath); rerr == nil {
+						matchedBody = mb
+						matchedBodyPath = hr.MatchedPath
 						if note := scanHookBodyDriftAt(name, mb, hr.MatchedPath); note != "" {
 							hr.Notes = append(hr.Notes, note)
 						}
@@ -358,8 +366,16 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		}
 
 		if name == "codex" {
-			if hr.ConfigReadable && adapter.HasLegacyJSONManagedKey(body) {
-				hr.Notes = append(hr.Notes, "legacy top-level _acd_managed in ~/.codex/hooks.json is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > ~/.codex/hooks.json` or remove only that key with `jq 'del(._acd_managed)' ~/.codex/hooks.json`.")
+			legacyPath := path
+			legacyBody := body
+			legacyReadable := hr.ConfigReadable
+			if matchedBodyPath != "" {
+				legacyPath = matchedBodyPath
+				legacyBody = matchedBody
+				legacyReadable = true
+			}
+			if legacyReadable && adapter.HasLegacyJSONManagedKey(legacyBody) {
+				hr.Notes = append(hr.Notes, codexLegacyJSONManagedKeyNote(legacyPath))
 			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
@@ -377,6 +393,17 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 		reports = append(reports, hr)
 	}
 	return reports
+}
+
+func codexLegacyJSONManagedKeyNote(path string) string {
+	if path == "" {
+		path = "~/.codex/hooks.json"
+	}
+	pathArg := path
+	if !strings.HasPrefix(pathArg, "~") {
+		pathArg = strconv.Quote(pathArg)
+	}
+	return fmt.Sprintf("legacy top-level _acd_managed in %s is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > %s` or remove only that key with `tmp=\"$(mktemp)\" && jq 'del(._acd_managed)' %s > \"$tmp\" && mv \"$tmp\" %s`.", path, pathArg, pathArg, pathArg)
 }
 
 // driftRemediationCommands maps each supported harness to the recommended

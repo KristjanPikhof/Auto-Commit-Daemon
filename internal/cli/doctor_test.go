@@ -760,9 +760,47 @@ func TestDoctor_CodexLegacyJSONMarkerWarning(t *testing.T) {
 		t.Fatalf("legacy codex hooks.json should still detect as installed: %+v", codex)
 	}
 	notes := strings.Join(codex.Notes, "\n")
-	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "jq 'del(._acd_managed)'"} {
+	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "tmp=\"$(mktemp)\"", "jq 'del(._acd_managed)'", "> \"$tmp\" && mv \"$tmp\""} {
 		if !strings.Contains(notes, want) {
 			t.Fatalf("legacy marker note missing %q in notes=%v", want, codex.Notes)
+		}
+	}
+}
+
+func TestDoctor_CodexRepoLocalLegacyJSONMarkerWarning(t *testing.T) {
+	_ = withIsolatedHome(t)
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	hooksPath := filepath.Join(repo, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooksPath), 0o700); err != nil {
+		t.Fatalf("mkdir .codex: %v", err)
+	}
+	if err := os.WriteFile(hooksPath, []byte(`{"_acd_managed": true,"hooks":{}}`), 0o600); err != nil {
+		t.Fatalf("write repo-local legacy hooks.json: %v", err)
+	}
+	chdirForTest(t, repo)
+
+	rep, err := collectDoctorReport(context.Background())
+	if err != nil {
+		t.Fatalf("collectDoctorReport: %v", err)
+	}
+	codex := findDoctorHarness(t, rep, "codex")
+	if !codex.Installed {
+		t.Fatalf("codex should be installed via repo-local legacy hooks.json: %+v", codex)
+	}
+	wantHooksPath := canonicalCLIResolverTestPath(t, hooksPath)
+	if codex.MatchedPath != wantHooksPath {
+		t.Fatalf("MatchedPath=%q, want repo-local %q", codex.MatchedPath, wantHooksPath)
+	}
+	notes := strings.Join(codex.Notes, "\n")
+	for _, want := range []string{"ACD managed install detected in an alternate config path", "legacy top-level _acd_managed in " + wantHooksPath, "Codex 0.141+", "tmp=\"$(mktemp)\""} {
+		if !strings.Contains(notes, want) {
+			t.Fatalf("repo-local legacy marker note missing %q in notes=%v", want, codex.Notes)
 		}
 	}
 }
