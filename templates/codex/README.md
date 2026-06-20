@@ -39,12 +39,9 @@ legacy block in place causes every event to fire twice — doubled
 file and a legacy TOML config both contain ACD hook installs.
 
 If `/hooks` reports an unknown top-level `_acd_managed` field, regenerate the
-schema-clean JSON with `acd setup codex --raw > ~/.codex/hooks.json`, or remove
-only that legacy key as a temporary workaround:
-
-~~~bash
-tmp="$(mktemp)" && jq 'del(._acd_managed)' ~/.codex/hooks.json > "$tmp" && mv "$tmp" ~/.codex/hooks.json
-~~~
+schema-clean JSON with `acd setup codex --raw > ~/.codex/hooks.json`. If the
+file also has custom hooks, remove only the top-level `_acd_managed` key
+manually and keep the `hooks` object.
 
 Note: the official Codex hooks docs use `[features].hooks` as the canonical
 feature key and keep `codex_hooks` only as a deprecated alias. The

@@ -760,7 +760,7 @@ func TestDoctor_CodexLegacyJSONMarkerWarning(t *testing.T) {
 		t.Fatalf("legacy codex hooks.json should still detect as installed: %+v", codex)
 	}
 	notes := strings.Join(codex.Notes, "\n")
-	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "tmp=\"$(mktemp)\"", "jq 'del(._acd_managed)'", "> \"$tmp\" && mv \"$tmp\""} {
+	for _, want := range []string{"_acd_managed", "Codex 0.141+", "current Codex rejects unknown top-level fields", "remove only the top-level `_acd_managed` key manually", "keep the `hooks` object"} {
 		if !strings.Contains(notes, want) {
 			t.Fatalf("legacy marker note missing %q in notes=%v", want, codex.Notes)
 		}
@@ -798,7 +798,7 @@ func TestDoctor_CodexRepoLocalLegacyJSONMarkerWarning(t *testing.T) {
 		t.Fatalf("MatchedPath=%q, want repo-local %q", codex.MatchedPath, wantHooksPath)
 	}
 	notes := strings.Join(codex.Notes, "\n")
-	for _, want := range []string{"ACD managed install detected in an alternate config path", "legacy top-level _acd_managed in " + wantHooksPath, "Codex 0.141+", "tmp=\"$(mktemp)\""} {
+	for _, want := range []string{"ACD managed install detected in an alternate config path", "legacy top-level _acd_managed in " + wantHooksPath, "Codex 0.141+", "remove only the top-level `_acd_managed` key manually"} {
 		if !strings.Contains(notes, want) {
 			t.Fatalf("repo-local legacy marker note missing %q in notes=%v", want, codex.Notes)
 		}

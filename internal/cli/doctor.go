@@ -403,7 +403,7 @@ func codexLegacyJSONManagedKeyNote(path string) string {
 	if !strings.HasPrefix(pathArg, "~") {
 		pathArg = strconv.Quote(pathArg)
 	}
-	return fmt.Sprintf("legacy top-level _acd_managed in %s is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > %s` or remove only that key with `tmp=\"$(mktemp)\" && jq 'del(._acd_managed)' %s > \"$tmp\" && mv \"$tmp\" %s`.", path, pathArg, pathArg, pathArg)
+	return fmt.Sprintf("legacy top-level _acd_managed in %s is incompatible with Codex 0.141+ hooks schemas because current Codex rejects unknown top-level fields. Regenerate schema-clean hooks with `acd setup codex --raw > %s`; if the file also has custom hooks, remove only the top-level `_acd_managed` key manually and keep the `hooks` object.", path, pathArg)
 }
 
 // driftRemediationCommands maps each supported harness to the recommended
