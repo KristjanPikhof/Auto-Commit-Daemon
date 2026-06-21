@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## v2026-06-21
+
 ### Changed
 
+- Updated pinned GitHub Actions dependencies: `actions/checkout` from `v5.0.1`
+  to `v6.0.3`, and `goreleaser/goreleaser-action` from `v6.4.0` to `v7.2.2`.
 - Raised the minimum Go toolchain to 1.26.4 for building from source and
   updated pinned dependencies, including `modernc.org/sqlite v1.52.0`, as part
   of a security and toolchain maintenance bump.
@@ -19,6 +23,9 @@
   `SessionStart`-only install as healthy.
 - JSON harness uninstall docs now match all ACD lifecycle hooks, including
   stop/flush/touch commands that do not carry a `--harness` flag.
+- The same-SHA rewind regression test now uses explicit daemon wakes instead of
+  idle ticks, avoiding slow Ubuntu race-test timing failures while keeping the
+  assertion focused on cross-tick rewind detection.
 
 ## v2026-06-06
 
