@@ -2933,6 +2933,11 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
+	manual := Scheduler{
+		Base:         1 * time.Hour,
+		IdleCeiling:  1 * time.Hour,
+		ErrorCeiling: 1 * time.Hour,
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -2944,7 +2949,7 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 			RepoPath:    f.dir,
 			GitDir:      f.gitDir,
 			DB:          f.db,
-			Scheduler:   fastScheduler(),
+			Scheduler:   manual,
 			BootGrace:   30 * time.Second,
 			WakeCh:      wakeCh,
 			ShutdownCh:  shutdownCh,
