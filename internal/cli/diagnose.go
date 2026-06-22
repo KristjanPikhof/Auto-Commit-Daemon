@@ -678,16 +678,24 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				report.IntentStrategy.ForcedAgingReady))
 	}
 	if report.IntentStrategy.BatchWaitActive {
-		wait := formatDurationCompact(time.Duration(report.IntentStrategy.AgeTriggerInSeconds) * time.Second)
-		need := report.IntentStrategy.MinPending - report.IntentStrategy.VisiblePendingEvents
-		if need < 0 {
-			need = 0
+		if report.IntentStrategy.BatchWaitReason == "skipped_due_intent_settle_window" {
+			wait := formatDurationCompact(time.Duration(report.IntentStrategy.SettleTriggerInSeconds) * time.Second)
+			remediation = append(remediation,
+				fmt.Sprintf("intent replay reached min pending and is waiting for the latest capture to stay quiet for %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_SETTLE_WINDOW, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
+					formatDurationCompact(time.Duration(report.IntentStrategy.SettleWindowSeconds)*time.Second),
+					wait))
+		} else {
+			wait := formatDurationCompact(time.Duration(report.IntentStrategy.AgeTriggerInSeconds) * time.Second)
+			need := report.IntentStrategy.MinPending - report.IntentStrategy.VisiblePendingEvents
+			if need < 0 {
+				need = 0
+			}
+			remediation = append(remediation,
+				fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
+					need,
+					formatDurationCompact(time.Duration(report.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
+					wait))
 		}
-		remediation = append(remediation,
-			fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
-				need,
-				formatDurationCompact(time.Duration(report.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
-				wait))
 	}
 	if report.StaleOperationMarker {
 		remediation = append(remediation,

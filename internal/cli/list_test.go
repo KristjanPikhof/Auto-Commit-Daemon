@@ -629,6 +629,69 @@ func TestList_IntentBatchWaitShowsCountdown(t *testing.T) {
 	}
 }
 
+func TestList_IntentSettleWaitShowsCountdown(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon: %v", err)
+	}
+	for k, v := range map[string]string{
+		"commit.strategy":        "intent",
+		"intent.min_pending":     "2",
+		"intent.settle_window":   "1m",
+		"intent.max_pending_age": "2m",
+		"intent.defer_limit":     "1",
+	} {
+		if err := state.MetaSet(ctx, d, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	appendIntentPendingEvent(t, ctx, d, "settle-a.go", nowFloat()-10)
+	appendIntentPendingEvent(t, ctx, d, "settle-b.go", nowFloat()-5)
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	var compactOut, compactErr bytes.Buffer
+	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
+		t.Fatalf("runList compact: %v", err)
+	}
+	if !strings.Contains(compactOut.String(), "wait") {
+		t.Fatalf("compact output missing wait status:\n%s", compactOut.String())
+	}
+
+	var verboseOut, verboseErr bytes.Buffer
+	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
+		t.Fatalf("runList verbose: %v", err)
+	}
+	if !strings.Contains(verboseOut.String(), "intent settle wait: pending=2, trigger in") {
+		t.Fatalf("verbose output missing intent settle note:\n%s", verboseOut.String())
+	}
+
+	var jsonOut, jsonErr bytes.Buffer
+	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("runList json: %v", err)
+	}
+	var got struct {
+		Repos []listEntry `json:"repos"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if len(got.Repos) != 1 {
+		t.Fatalf("repos=%d, want 1", len(got.Repos))
+	}
+	entry := got.Repos[0]
+	if entry.Status != "waiting" || entry.IntentVisiblePending != 2 || entry.IntentMinPending != 2 {
+		t.Fatalf("json entry missing intent settle fields: %+v", entry)
+	}
+	if entry.IntentWaitSeconds <= 0 || entry.IntentWaitSeconds > 60 {
+		t.Fatalf("intent wait seconds=%d, want 1..60", entry.IntentWaitSeconds)
+	}
+}
+
 func TestListStatusCompact(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
