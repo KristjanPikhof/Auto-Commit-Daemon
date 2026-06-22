@@ -412,25 +412,25 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 			{
 				"selected_seqs":   []int64{sameSeqs[0]},
 				"subject":         "Update alpha helper",
-				"body":            "Keep the alpha function change atomic.",
+				"body":            "- Keep the alpha function change atomic.",
 				"grouping_reason": "same-file alpha edit is independent",
 			},
 			{
 				"selected_seqs":   []int64{sameSeqs[1]},
 				"subject":         "Update beta helper",
-				"body":            "Keep the beta function change atomic.",
+				"body":            "- Keep the beta function change atomic.",
 				"grouping_reason": "same-file beta edit is independent",
 			},
 			{
 				"selected_seqs":   []int64{byPath["feature-api.txt"], byPath["feature-ui.txt"]},
 				"subject":         "Add related feature files",
-				"body":            "Group related API and UI notes together.",
+				"body":            "- Group related API and UI notes together.",
 				"grouping_reason": "feature API and UI edits share one intent",
 			},
 			{
 				"selected_seqs":   []int64{byPath["unrelated-note.txt"]},
 				"subject":         "Add unrelated note",
-				"body":            "Keep the unrelated note separately revertable.",
+				"body":            "- Keep the unrelated note separately revertable.",
 				"grouping_reason": "unrelated note should not join feature work",
 			},
 		}
@@ -445,7 +445,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 			"selected_seqs":    selected,
 			"deferred_seqs":    []int64{},
 			"subject":          "Partition intent window",
-			"body":             "Split one planner window into atomic groups.",
+			"body":             "- Split one planner window into atomic groups.",
 			"grouping_reason":  "partition close-together edits by intent",
 			"commit_groups":    commitGroups,
 			"deferred_reasons": []map[string]any{},
