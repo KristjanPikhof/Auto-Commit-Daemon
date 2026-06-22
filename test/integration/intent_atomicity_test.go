@@ -46,6 +46,19 @@ import (
 	"time"
 )
 
+type plannerWindowRow struct {
+	OfferedSeqs         []int64 `json:"offered_seqs"`
+	VisibleOriginalSeqs []int64 `json:"visible_original_seqs"`
+	HiddenSeqs          []int64 `json:"hidden_seqs"`
+	SelectedGroups      []struct {
+		SelectedSeqs   []int64 `json:"selected_seqs"`
+		OriginalSeqs   []int64 `json:"original_seqs"`
+		Subject        string  `json:"subject"`
+		GroupingReason string  `json:"grouping_reason"`
+	} `json:"selected_groups"`
+	DeferredSeqs []int64 `json:"deferred_seqs"`
+}
+
 // TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit drives four
 // distinct creates through the real daemon under intent strategy. The
 // mock planner accepts every offered seq; the daemon must publish ONE
@@ -354,4 +367,245 @@ func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 	if hits.Load() != 1 {
 		t.Fatalf("planner hits=%d want 1 (single offered window for the three creates)", hits.Load())
 	}
+}
+
+func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	samePath := filepath.Join(repo, "same.go")
+	writeFile(t, samePath, "package main\n\nfunc alpha() string { return \"a0\" }\n\nfunc beta() string { return \"b0\" }\n")
+	gitCommitAll(t, repo, "seed same.go", "same.go")
+
+	var hits atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		captures := offeredIntentCaptures(t, req)
+		if len(captures) != 5 {
+			http.Error(w, "expected five offered captures", http.StatusBadRequest)
+			return
+		}
+		var sameSeqs []int64
+		byPath := map[string]int64{}
+		for _, capture := range captures {
+			if capture.Path == "same.go" {
+				sameSeqs = append(sameSeqs, capture.Seq)
+				continue
+			}
+			byPath[capture.Path] = capture.Seq
+		}
+		if len(sameSeqs) != 2 || byPath["feature-api.txt"] == 0 ||
+			byPath["feature-ui.txt"] == 0 || byPath["unrelated-note.txt"] == 0 {
+			http.Error(w, "unexpected offered paths", http.StatusBadRequest)
+			return
+		}
+		commitGroups := []map[string]any{
+			{
+				"selected_seqs":   []int64{sameSeqs[0]},
+				"subject":         "Update alpha helper",
+				"body":            "Keep the alpha function change atomic.",
+				"grouping_reason": "same-file alpha edit is independent",
+			},
+			{
+				"selected_seqs":   []int64{sameSeqs[1]},
+				"subject":         "Update beta helper",
+				"body":            "Keep the beta function change atomic.",
+				"grouping_reason": "same-file beta edit is independent",
+			},
+			{
+				"selected_seqs":   []int64{byPath["feature-api.txt"], byPath["feature-ui.txt"]},
+				"subject":         "Add related feature files",
+				"body":            "Group related API and UI notes together.",
+				"grouping_reason": "feature API and UI edits share one intent",
+			},
+			{
+				"selected_seqs":   []int64{byPath["unrelated-note.txt"]},
+				"subject":         "Add unrelated note",
+				"body":            "Keep the unrelated note separately revertable.",
+				"grouping_reason": "unrelated note should not join feature work",
+			},
+		}
+		selected := []int64{
+			sameSeqs[0],
+			sameSeqs[1],
+			byPath["feature-api.txt"],
+			byPath["feature-ui.txt"],
+			byPath["unrelated-note.txt"],
+		}
+		plan := map[string]any{
+			"selected_seqs":    selected,
+			"deferred_seqs":    []int64{},
+			"subject":          "Partition intent window",
+			"body":             "Split one planner window into atomic groups.",
+			"grouping_reason":  "partition close-together edits by intent",
+			"commit_groups":    commitGroups,
+			"deferred_reasons": []map[string]any{},
+		}
+		args, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatalf("marshal intent plan: %v", err)
+		}
+		resp := map[string]any{
+			"id":     "chatcmpl-partition-window",
+			"object": "chat.completion",
+			"model":  "gpt-5.4-mini",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "",
+					"tool_calls": []map[string]any{{
+						"id":   "call_partition_window",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "capture_intent_plan",
+							"arguments": string(args),
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+		}
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_INTENT_WINDOW=10",
+		"ACD_INTENT_MIN_PENDING=5",
+		"ACD_INTENT_SETTLE_WINDOW=0",
+		"ACD_INTENT_MAX_PENDING_AGE=1h",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-5.4-mini",
+		trustEnv,
+	}
+	sessionID := "intent-partition-window"
+	startSession(t, ctx, env, repo, sessionID, "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+	fullEnv := envWith(env, extra...)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+
+	startCount := commitCount(t, repo)
+	steps := []struct {
+		path string
+		body string
+		want string
+	}{
+		{"same.go", "package main\n\nfunc alpha() string { return \"a1\" }\n\nfunc beta() string { return \"b0\" }\n", "1"},
+		{"same.go", "package main\n\nfunc alpha() string { return \"a1\" }\n\nfunc beta() string { return \"b1\" }\n", "2"},
+		{"feature-api.txt", "api half of a related feature\n", "3"},
+		{"feature-ui.txt", "ui half of a related feature\n", "4"},
+		{"unrelated-note.txt", "independent note\n", ""},
+	}
+	for _, step := range steps {
+		writeFile(t, filepath.Join(repo, step.path), step.body)
+		wakeSession(t, ctx, fullEnv, repo, sessionID)
+		if step.want == "" {
+			continue
+		}
+		waitFor(t, "pending captures="+step.want, 10*time.Second, func() bool {
+			return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") == step.want
+		})
+	}
+
+	waitForEventState(t, dbPath, "same.go", "published", 25*time.Second)
+	for _, path := range []string{"feature-api.txt", "feature-ui.txt", "unrelated-note.txt"} {
+		waitForEventState(t, dbPath, path, "published", 25*time.Second)
+	}
+	waitFor(t, "two same.go captures published", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE path='same.go' AND state='published'") == "2"
+	})
+
+	if hits.Load() != 1 {
+		t.Fatalf("planner hits=%d want 1 for one five-capture window", hits.Load())
+	}
+	if got, want := commitCount(t, repo), startCount+4; got != want {
+		t.Fatalf("commit count=%d want %d (two same-file commits, one related group, one unrelated commit)", got, want)
+	}
+
+	sameDistinct := sqliteScalar(t, dbPath,
+		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='same.go' AND state='published'")
+	if sameDistinct != "2" {
+		t.Fatalf("same.go distinct commit_oids=%s want 2 (independent same-file edits should split)", sameDistinct)
+	}
+	featureAPI := sqliteScalar(t, dbPath,
+		"SELECT commit_oid FROM capture_events WHERE path='feature-api.txt' AND state='published'")
+	featureUI := sqliteScalar(t, dbPath,
+		"SELECT commit_oid FROM capture_events WHERE path='feature-ui.txt' AND state='published'")
+	unrelated := sqliteScalar(t, dbPath,
+		"SELECT commit_oid FROM capture_events WHERE path='unrelated-note.txt' AND state='published'")
+	if featureAPI == "" || featureAPI != featureUI {
+		t.Fatalf("feature commit_oids api=%q ui=%q want one related commit", featureAPI, featureUI)
+	}
+	if unrelated == "" || unrelated == featureAPI {
+		t.Fatalf("unrelated commit_oid=%q feature_oid=%q want separate commits", unrelated, featureAPI)
+	}
+
+	win := loadLastPlannerWindowRow(t, dbPath)
+	if len(win.OfferedSeqs) != 5 || len(win.VisibleOriginalSeqs) != 5 || len(win.HiddenSeqs) != 0 {
+		t.Fatalf("planner window seqs = %+v, want five offered/visible and no hidden coalesce", win)
+	}
+	if len(win.SelectedGroups) != 4 || len(win.DeferredSeqs) != 0 {
+		t.Fatalf("planner selected groups = %+v deferred=%v, want four groups and no defers", win.SelectedGroups, win.DeferredSeqs)
+	}
+
+	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
+	if status.ExitCode != 0 {
+		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
+	}
+	if !strings.Contains(status.Stdout, `"last_planner_window"`) ||
+		!strings.Contains(status.Stdout, `"selected_groups"`) {
+		t.Fatalf("status JSON missing planner-window summary:\n%s", status.Stdout)
+	}
+	events := runAcd(t, ctx, fullEnv, "events", "--repo", repo, "--json", "--limit", "20")
+	if events.ExitCode != 0 {
+		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
+	}
+	if !strings.Contains(events.Stdout, `"planner_window"`) ||
+		!strings.Contains(events.Stdout, `"visible_original_seqs"`) {
+		t.Fatalf("events JSON missing planner-window summary:\n%s", events.Stdout)
+	}
+}
+
+func loadLastPlannerWindowRow(t *testing.T, dbPath string) plannerWindowRow {
+	t.Helper()
+	raw := sqliteScalar(t, dbPath, `
+SELECT json_object(
+  'offered_seqs', json(offered_seqs),
+  'visible_original_seqs', json(visible_original_seqs),
+  'hidden_seqs', json(hidden_seqs),
+  'selected_groups', json(selected_groups),
+  'deferred_seqs', json(deferred_seqs)
+)
+FROM intent_planner_windows
+ORDER BY id DESC
+LIMIT 1`)
+	if raw == "" {
+		t.Fatalf("missing intent_planner_windows row")
+	}
+	var row plannerWindowRow
+	if err := json.Unmarshal([]byte(raw), &row); err != nil {
+		t.Fatalf("decode planner window row: %v\n%s", err, raw)
+	}
+	return row
 }

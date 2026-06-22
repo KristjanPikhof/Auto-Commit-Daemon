@@ -247,6 +247,13 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 	if subj := headSubject(t, repo); subj != "Group rapid five" {
 		t.Fatalf("subject=%q want grouped rapid-five subject", subj)
 	}
+	win := loadLastPlannerWindowRow(t, dbPath)
+	if len(win.OfferedSeqs) != 5 || len(win.VisibleOriginalSeqs) != 5 || len(win.HiddenSeqs) != 0 {
+		t.Fatalf("rapid-five planner window = %+v, want five offered/visible seqs and no hidden coalesce", win)
+	}
+	if len(win.SelectedGroups) != 1 || len(win.SelectedGroups[0].OriginalSeqs) != 5 {
+		t.Fatalf("rapid-five selected groups = %+v, want one five-seq group", win.SelectedGroups)
+	}
 }
 
 type intentChatRequest struct {
