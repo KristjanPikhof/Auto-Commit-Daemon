@@ -202,6 +202,16 @@ type DeferredReason struct {
 	Reason string `json:"reason"`
 }
 
+// IntentCommitGroup is one ordered commit inside a partitioned intent plan.
+// Legacy plans leave CommitGroups empty and use IntentPlan's top-level
+// SelectedSeqs/Subject/Body/GroupingReason as a single group.
+type IntentCommitGroup struct {
+	SelectedSeqs   []int64 `json:"selected_seqs"`
+	Subject        string  `json:"subject"`
+	Body           string  `json:"body,omitempty"`
+	GroupingReason string  `json:"grouping_reason"`
+}
+
 // IntentPlan is the structured planner response. Every offered capture seq must
 // appear in exactly one of SelectedSeqs or DeferredSeqs.
 type IntentPlan struct {
@@ -211,6 +221,7 @@ type IntentPlan struct {
 	Body                 string               `json:"body,omitempty"`
 	GroupingReason       string               `json:"grouping_reason"`
 	DeferredReasons      []DeferredReason     `json:"deferred_reasons,omitempty"`
+	CommitGroups         []IntentCommitGroup  `json:"commit_groups,omitempty"`
 	Source               string               `json:"-"`
 	MessageQuality       MessageQualityAction `json:"-"`
 	MessageQualityReason string               `json:"-"`
@@ -300,6 +311,9 @@ const IntentReasonCap = 512
 // control characters, and caps them to a bounded size for diagnostics.
 func NormalizeIntentPlanReasons(plan IntentPlan) IntentPlan {
 	plan.GroupingReason = NormalizeIntentReason(plan.GroupingReason)
+	for i := range plan.CommitGroups {
+		plan.CommitGroups[i].GroupingReason = NormalizeIntentReason(plan.CommitGroups[i].GroupingReason)
+	}
 	for i := range plan.DeferredReasons {
 		plan.DeferredReasons[i].Reason = NormalizeIntentReason(plan.DeferredReasons[i].Reason)
 	}
@@ -380,25 +394,6 @@ func (e *IntentPlanValidationError) Error() string { return e.Message }
 // field classifies the failure for telemetry and future provider-side
 // normalization.
 func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
-	if len(plan.SelectedSeqs) == 0 {
-		return &IntentPlanValidationError{
-			Code:    IntentPlanValidationShape,
-			Message: "intent planner: selected_seqs must be non-empty",
-		}
-	}
-	if strings.TrimSpace(plan.Subject) == "" {
-		return &IntentPlanValidationError{
-			Code:    IntentPlanValidationShape,
-			Message: "intent planner: subject must be non-empty",
-		}
-	}
-	if strings.TrimSpace(plan.GroupingReason) == "" {
-		return &IntentPlanValidationError{
-			Code:    IntentPlanValidationShape,
-			Message: "intent planner: grouping_reason must be non-empty",
-		}
-	}
-
 	offered := make(map[int64]struct{}, len(req.OfferedCaptures))
 	for _, capture := range req.OfferedCaptures {
 		if capture.Seq == 0 {
@@ -417,23 +412,74 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 		offered[capture.Seq] = struct{}{}
 	}
 
-	selected := make(map[int64]struct{}, len(plan.SelectedSeqs))
-	for _, seq := range plan.SelectedSeqs {
-		if _, ok := offered[seq]; !ok {
-			return &IntentPlanValidationError{
-				Code:    IntentPlanValidationOfferedWindow,
-				Seq:     seq,
-				Message: fmt.Sprintf("intent planner: selected seq %d outside offered window", seq),
-			}
-		}
-		if _, exists := selected[seq]; exists {
+	groups, err := IntentPlanCommitGroups(plan)
+	if err != nil {
+		return err
+	}
+	selected := make(map[int64]struct{}, len(groups))
+	var selectedSeqs []int64
+	lastGroupFirstSeq := int64(0)
+	for groupIndex, group := range groups {
+		if len(group.SelectedSeqs) == 0 {
 			return &IntentPlanValidationError{
 				Code:    IntentPlanValidationShape,
-				Seq:     seq,
-				Message: fmt.Sprintf("intent planner: duplicate selected seq %d", seq),
+				Message: fmt.Sprintf("intent planner: commit_groups[%d].selected_seqs must be non-empty", groupIndex),
 			}
 		}
-		selected[seq] = struct{}{}
+		if strings.TrimSpace(group.Subject) == "" {
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: fmt.Sprintf("intent planner: commit_groups[%d].subject must be non-empty", groupIndex),
+			}
+		}
+		if strings.TrimSpace(group.GroupingReason) == "" {
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: fmt.Sprintf("intent planner: commit_groups[%d].grouping_reason must be non-empty", groupIndex),
+			}
+		}
+		groupFirstSeq := group.SelectedSeqs[0]
+		if lastGroupFirstSeq != 0 && groupFirstSeq < lastGroupFirstSeq {
+			return &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Seq:     groupFirstSeq,
+				Message: "intent planner: commit_groups must be ordered by selected seq",
+			}
+		}
+		lastGroupFirstSeq = groupFirstSeq
+		lastSeq := int64(0)
+		for _, seq := range group.SelectedSeqs {
+			if lastSeq != 0 && seq < lastSeq {
+				return &IntentPlanValidationError{
+					Code:    IntentPlanValidationShape,
+					Seq:     seq,
+					Message: "intent planner: selected seqs within a commit group must be ordered",
+				}
+			}
+			lastSeq = seq
+			if _, ok := offered[seq]; !ok {
+				return &IntentPlanValidationError{
+					Code:    IntentPlanValidationOfferedWindow,
+					Seq:     seq,
+					Message: fmt.Sprintf("intent planner: selected seq %d outside offered window", seq),
+				}
+			}
+			if _, exists := selected[seq]; exists {
+				return &IntentPlanValidationError{
+					Code:    IntentPlanValidationShape,
+					Seq:     seq,
+					Message: fmt.Sprintf("intent planner: duplicate selected seq %d", seq),
+				}
+			}
+			selected[seq] = struct{}{}
+			selectedSeqs = append(selectedSeqs, seq)
+		}
+	}
+	if len(plan.CommitGroups) > 0 && len(plan.SelectedSeqs) > 0 && !sameSeqSet(plan.SelectedSeqs, selectedSeqs) {
+		return &IntentPlanValidationError{
+			Code:    IntentPlanValidationShape,
+			Message: "intent planner: selected_seqs must match commit_groups selected seqs when both are provided",
+		}
 	}
 
 	deferred := make(map[int64]struct{}, len(plan.DeferredSeqs))
@@ -523,6 +569,76 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	}
 
 	return nil
+}
+
+// IntentPlanCommitGroups returns the ordered publish groups for a plan.
+// Legacy single-group plans are projected into one group.
+func IntentPlanCommitGroups(plan IntentPlan) ([]IntentCommitGroup, error) {
+	if len(plan.CommitGroups) == 0 {
+		if len(plan.SelectedSeqs) == 0 {
+			return nil, &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: "intent planner: selected_seqs must be non-empty",
+			}
+		}
+		if strings.TrimSpace(plan.Subject) == "" {
+			return nil, &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: "intent planner: subject must be non-empty",
+			}
+		}
+		if strings.TrimSpace(plan.GroupingReason) == "" {
+			return nil, &IntentPlanValidationError{
+				Code:    IntentPlanValidationShape,
+				Message: "intent planner: grouping_reason must be non-empty",
+			}
+		}
+		return []IntentCommitGroup{{
+			SelectedSeqs:   append([]int64(nil), plan.SelectedSeqs...),
+			Subject:        plan.Subject,
+			Body:           plan.Body,
+			GroupingReason: plan.GroupingReason,
+		}}, nil
+	}
+	groups := make([]IntentCommitGroup, len(plan.CommitGroups))
+	for i, group := range plan.CommitGroups {
+		groups[i] = IntentCommitGroup{
+			SelectedSeqs:   append([]int64(nil), group.SelectedSeqs...),
+			Subject:        group.Subject,
+			Body:           group.Body,
+			GroupingReason: group.GroupingReason,
+		}
+	}
+	return groups, nil
+}
+
+// IntentPlanForCommitGroup projects one partition group back into the legacy
+// single-group shape used by message-quality and publish helpers.
+func IntentPlanForCommitGroup(plan IntentPlan, group IntentCommitGroup) IntentPlan {
+	out := plan
+	out.SelectedSeqs = append([]int64(nil), group.SelectedSeqs...)
+	out.Subject = group.Subject
+	out.Body = group.Body
+	out.GroupingReason = group.GroupingReason
+	out.CommitGroups = nil
+	return out
+}
+
+func sameSeqSet(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[int64]int, len(a))
+	for _, seq := range a {
+		counts[seq]++
+	}
+	for _, seq := range b {
+		counts[seq]--
+		if counts[seq] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // IntentPlanReasonMarker is the synthesized reason text used by
