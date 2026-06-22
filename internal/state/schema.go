@@ -20,8 +20,9 @@ package state
 // than a foreign key cleared by capture_events pruning; v7 adds planner_state
 // for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage;
 // v9 adds structured rewrite proposal failure storage; v10 preserves the
-// commit-message format used to validate rewrite plans.
-const SchemaVersion = 10
+// commit-message format used to validate rewrite plans; v11 adds durable
+// intent planner-window summaries for captured-vs-offered observability.
+const SchemaVersion = 11
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -128,6 +129,47 @@ CREATE INDEX IF NOT EXISTS idx_planner_state_defer_count_planned
 
 CREATE INDEX IF NOT EXISTS idx_planner_state_last_planned
     ON planner_state(last_planned_ts, event_seq);
+
+CREATE TABLE IF NOT EXISTS intent_planner_windows(
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    planned_ts            REAL NOT NULL,
+    provider              TEXT,
+    model                 TEXT,
+    branch_ref            TEXT NOT NULL,
+    branch_generation     INTEGER NOT NULL,
+    source                TEXT,
+    commit_format         TEXT,
+    forced                INTEGER NOT NULL DEFAULT 0,
+    forced_reason         TEXT,
+    validation_failure    TEXT,
+    offered_seqs          TEXT NOT NULL,
+    visible_original_seqs TEXT NOT NULL,
+    hidden_seqs           TEXT NOT NULL,
+    selected_groups       TEXT NOT NULL,
+    deferred_seqs         TEXT NOT NULL,
+    deferred_reasons      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_ts_id
+    ON intent_planner_windows(planned_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_branch_id
+    ON intent_planner_windows(branch_ref, branch_generation, id);
+
+CREATE TABLE IF NOT EXISTS intent_planner_window_events(
+    window_id  INTEGER NOT NULL,
+    event_seq  INTEGER NOT NULL,
+    offered    INTEGER NOT NULL DEFAULT 0,
+    hidden     INTEGER NOT NULL DEFAULT 0,
+    selected   INTEGER NOT NULL DEFAULT 0,
+    deferred   INTEGER NOT NULL DEFAULT 0,
+    group_ord  INTEGER,
+    PRIMARY KEY (window_id, event_seq),
+    FOREIGN KEY (window_id) REFERENCES intent_planner_windows(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_planner_window_events_seq_window
+    ON intent_planner_window_events(event_seq, window_id);
 
 CREATE TABLE IF NOT EXISTS rewrite_plans(
     id                  TEXT PRIMARY KEY,

@@ -52,7 +52,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // bounded intent-planner deferrals. v8 adds reusable rewrite plan storage.
 // v9 adds rewrite_plans.validation_error for structured proposal failures.
 // v10 adds rewrite_plans.commit_format so saved plans preserve the validation
-// policy used when they were generated or edited.
+// policy used when they were generated or edited. v11 adds
+// intent_planner_windows and intent_planner_window_events for lossless,
+// privacy-safe planner-window observability.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
