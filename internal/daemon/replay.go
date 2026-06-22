@@ -1085,6 +1085,9 @@ func replayIntentBatch(
 			}
 		} else {
 			traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+			if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, ""); err != nil {
+				return sum, err
+			}
 			selected := []intentReplayItem{items[0]}
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
 		}
@@ -1117,6 +1120,9 @@ func replayIntentBatch(
 			}
 		} else {
 			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
+			if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, ""); err != nil {
+				return sum, err
+			}
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
 		}
 		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
@@ -1148,6 +1154,9 @@ func replayIntentBatch(
 		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
 	}
 	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, validationFailure); err != nil {
+		return sum, err
+	}
 	if plan.MessageQuality != "" {
 		if err := recordIntentMessageQualityDecision(ctx, db, items, activeCtx, nowSec, plan); err != nil {
 			return sum, err
@@ -2113,6 +2122,141 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 		}
 	}
 	return nil
+}
+
+func recordIntentPlannerWindow(
+	ctx context.Context,
+	db *state.DB,
+	cfg intentReplayConfig,
+	req ai.IntentPlanRequest,
+	plan ai.IntentPlan,
+	items []intentReplayItem,
+	cctx CaptureContext,
+	ts float64,
+	forced bool,
+	validationFailure string,
+) error {
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return err
+	}
+	itemBySeq := make(map[int64]intentReplayItem, len(items))
+	eventRows := make(map[int64]*state.IntentPlannerWindowEvent, len(items))
+	ensureEvent := func(seq int64) *state.IntentPlannerWindowEvent {
+		row := eventRows[seq]
+		if row == nil {
+			row = &state.IntentPlannerWindowEvent{EventSeq: seq}
+			eventRows[seq] = row
+		}
+		return row
+	}
+
+	var visibleOriginalSeqs []int64
+	var hiddenSeqs []int64
+	for _, item := range items {
+		itemBySeq[item.event.Seq] = item
+		ensureEvent(item.event.Seq).Offered = true
+		for _, ev := range item.allCoveredEvents() {
+			visibleOriginalSeqs = appendUniqueSeq(visibleOriginalSeqs, ev.Seq)
+			row := ensureEvent(ev.Seq)
+			if ev.Seq != item.event.Seq {
+				row.Hidden = true
+				hiddenSeqs = appendUniqueSeq(hiddenSeqs, ev.Seq)
+			}
+		}
+	}
+
+	selectedGroups := make([]state.IntentPlannerWindowGroup, 0, len(groups))
+	for i, group := range groups {
+		summary := state.IntentPlannerWindowGroup{
+			SelectedSeqs:   append([]int64(nil), group.SelectedSeqs...),
+			Subject:        strings.TrimSpace(group.Subject),
+			GroupingReason: strings.TrimSpace(group.GroupingReason),
+		}
+		for _, seq := range group.SelectedSeqs {
+			item, ok := itemBySeq[seq]
+			if !ok {
+				continue
+			}
+			for _, ev := range item.allCoveredEvents() {
+				summary.OriginalSeqs = appendUniqueSeq(summary.OriginalSeqs, ev.Seq)
+				row := ensureEvent(ev.Seq)
+				row.Selected = true
+				row.GroupOrd = sql.NullInt64{Int64: int64(i), Valid: true}
+			}
+		}
+		selectedGroups = append(selectedGroups, summary)
+	}
+
+	for _, seq := range plan.DeferredSeqs {
+		item, ok := itemBySeq[seq]
+		if !ok {
+			continue
+		}
+		for _, ev := range item.allCoveredEvents() {
+			ensureEvent(ev.Seq).Deferred = true
+		}
+	}
+
+	rows := make([]state.IntentPlannerWindowEvent, 0, len(eventRows))
+	for _, row := range eventRows {
+		rows = append(rows, *row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].EventSeq < rows[j].EventSeq
+	})
+	deferredReasons := make([]state.IntentPlannerWindowDeferredReason, 0, len(plan.DeferredReasons))
+	for _, reason := range plan.DeferredReasons {
+		deferredReasons = append(deferredReasons, state.IntentPlannerWindowDeferredReason{
+			Seq:    reason.Seq,
+			Reason: strings.TrimSpace(reason.Reason),
+		})
+	}
+
+	provider := strings.TrimSpace(cfg.plannerProvider)
+	if provider == "" && cfg.planner != nil {
+		provider = ai.PrimaryProviderName(cfg.planner)
+	}
+	if provider == "" {
+		provider = strings.TrimSpace(plan.Source)
+	}
+	model := ""
+	if provider == "openai-compat" {
+		model = strings.TrimSpace(cfg.plannerModel)
+	}
+	forcedReason := ""
+	if forced {
+		forcedReason = "defer_limit"
+	}
+	_, err = state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS:           ts,
+		Provider:            nullString(provider),
+		Model:               nullString(model),
+		BranchRef:           cctx.BranchRef,
+		BranchGeneration:    cctx.BranchGeneration,
+		Source:              nullString(strings.TrimSpace(plan.Source)),
+		CommitFormat:        nullString(string(req.CommitFormat)),
+		Forced:              forced,
+		ForcedReason:        nullString(forcedReason),
+		ValidationFailure:   nullString(strings.TrimSpace(validationFailure)),
+		OfferedSeqs:         intentOfferedSeqs(req),
+		VisibleOriginalSeqs: visibleOriginalSeqs,
+		HiddenSeqs:          hiddenSeqs,
+		SelectedGroups:      selectedGroups,
+		DeferredSeqs:        append([]int64(nil), plan.DeferredSeqs...),
+		DeferredReasons:     deferredReasons,
+		Events:              rows,
+	})
+	return err
+}
+
+func appendUniqueSeq(seqs []int64, seq int64) []int64 {
+	for _, existing := range seqs {
+		if existing == seq {
+			return seqs
+		}
+	}
+	return append(seqs, seq)
 }
 
 func recordIntentMessageQualityDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, plan ai.IntentPlan) error {
