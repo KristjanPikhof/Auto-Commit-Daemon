@@ -265,6 +265,79 @@ func TestEventsJSONGroupedSeqsDoNotImplyIntentGroup(t *testing.T) {
 	}
 }
 
+func TestEventsJSONIncludesPlannerWindowForEvent(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	ctx := context.Background()
+
+	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS:           40,
+		Provider:            sqlNullStr("openai-compat"),
+		Model:               sqlNullStr("gpt-test"),
+		BranchRef:           "refs/heads/main",
+		BranchGeneration:    1,
+		Source:              sqlNullStr("openai-compat"),
+		CommitFormat:        sqlNullStr("imperative"),
+		OfferedSeqs:         []int64{10, 12},
+		VisibleOriginalSeqs: []int64{10, 11, 12},
+		HiddenSeqs:          []int64{11},
+		SelectedGroups: []state.IntentPlannerWindowGroup{{
+			SelectedSeqs:   []int64{10},
+			OriginalSeqs:   []int64{10, 11},
+			Subject:        "Update parser",
+			GroupingReason: "related parser edits",
+		}},
+		DeferredSeqs: []int64{12},
+		DeferredReasons: []state.IntentPlannerWindowDeferredReason{{
+			Seq:    12,
+			Reason: "separate docs change",
+		}},
+		Events: []state.IntentPlannerWindowEvent{
+			{EventSeq: 10, Offered: true, Selected: true, GroupOrd: sql.NullInt64{Int64: 0, Valid: true}},
+			{EventSeq: 11, Hidden: true, Selected: true, GroupOrd: sql.NullInt64{Int64: 0, Valid: true}},
+			{EventSeq: 12, Offered: true, Deferred: true},
+		},
+	}); err != nil {
+		t.Fatalf("AppendIntentPlannerWindow: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS:  41,
+		Kind:        state.DecisionKindCommitted,
+		Path:        sqlNullStr("src/parser.go"),
+		EventSeq:    sql.NullInt64{Int64: 11, Valid: true},
+		CommitOID:   sqlNullStr("commit123"),
+		ActionTaken: sqlNullStr("intent_group_committed"),
+		UserMessage: sqlNullStr("committed"),
+	}); err != nil {
+		t.Fatalf("AppendDecision: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runEvents(ctx, &out, repo, "", 0, 10, false, time.Millisecond, true); err != nil {
+		t.Fatalf("runEvents json: %v", err)
+	}
+	var rep eventsReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("decode events: %v\n%s", err, out.String())
+	}
+	if len(rep.Events) != 1 {
+		t.Fatalf("events len = %d, want 1: %+v", len(rep.Events), rep.Events)
+	}
+	win := rep.Events[0].PlannerWindow
+	if win == nil || win.Provider != "openai-compat" || win.Model != "gpt-test" {
+		t.Fatalf("planner window = %+v", win)
+	}
+	if len(win.HiddenSeqs) != 1 || win.HiddenSeqs[0] != 11 ||
+		win.Event == nil || !win.Event.Hidden || !win.Event.Selected || win.Event.GroupOrd != 0 {
+		t.Fatalf("planner event participation = %+v window=%+v", win.Event, win)
+	}
+	if len(win.SelectedGroups) != 1 || len(win.SelectedGroups[0].OriginalSeqs) != 2 ||
+		win.SelectedGroups[0].OriginalSeqs[1] != 11 {
+		t.Fatalf("planner selected groups = %+v", win.SelectedGroups)
+	}
+}
+
 func preparePreDecisionLedgerDB(t *testing.T, db *state.DB, dbPath string) {
 	t.Helper()
 	if _, err := db.SQL().ExecContext(context.Background(), `DROP TABLE decision_records`); err != nil {

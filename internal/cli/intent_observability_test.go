@@ -78,6 +78,61 @@ func TestStatus_MessageQualitySummary(t *testing.T) {
 	}
 }
 
+func TestStatus_LastPlannerWindowSummary(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+
+	if _, err := state.AppendIntentPlannerWindow(ctx, d, state.IntentPlannerWindow{
+		PlannedTS:           100,
+		Provider:            sqlNullStr("openai-compat"),
+		Model:               sqlNullStr("gpt-test"),
+		BranchRef:           "refs/heads/main",
+		BranchGeneration:    1,
+		Source:              sqlNullStr("deterministic"),
+		CommitFormat:        sqlNullStr("imperative"),
+		ValidationFailure:   sqlNullStr("planner validation failed"),
+		OfferedSeqs:         []int64{4, 5},
+		VisibleOriginalSeqs: []int64{4, 5, 6},
+		HiddenSeqs:          []int64{6},
+		SelectedGroups: []state.IntentPlannerWindowGroup{{
+			SelectedSeqs:   []int64{4},
+			OriginalSeqs:   []int64{4, 6},
+			Subject:        "Update parser",
+			GroupingReason: "related parser edits",
+		}},
+		DeferredSeqs: []int64{5},
+		DeferredReasons: []state.IntentPlannerWindowDeferredReason{{
+			Seq:    5,
+			Reason: "separate docs change",
+		}},
+	}); err != nil {
+		t.Fatalf("AppendIntentPlannerWindow: %v", err)
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	win := report.IntentStrategy.LastPlannerWindow
+	if win == nil || win.Provider != "openai-compat" || win.Model != "gpt-test" {
+		t.Fatalf("last planner window = %+v", win)
+	}
+	if len(win.OfferedSeqs) != 2 || win.OfferedSeqs[0] != 4 ||
+		len(win.HiddenSeqs) != 1 || win.HiddenSeqs[0] != 6 ||
+		win.ValidationFailure != "planner validation failed" {
+		t.Fatalf("last planner window seq/failure fields = %+v", win)
+	}
+
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	for _, want := range []string{"Last planner window", "offered=4,5", "Hidden/coalesced seqs: 6", "Validation fallback"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("status human missing %q:\n%s", want, human.String())
+		}
+	}
+}
+
 // TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator asserts
 // that with 50 decisions of which all 50 are planner errors, the rate is
 // 50/100 = 0.5 (NOT 50/50 = 1.0). Documents the fixed-denominator policy
