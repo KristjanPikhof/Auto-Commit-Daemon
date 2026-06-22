@@ -16,6 +16,8 @@
 - Intent planning can partition one visible window into multiple ordered commit
   groups, letting unrelated close-together changes and independent same-file
   edits publish as separate atomic commits.
+- The intent planner prompt now explicitly asks for ordered `commit_groups`
+  when one visible window contains multiple independent commit intents.
 - Consecutive same-path captures are planner-visible by default. Set
   `ACD_INTENT_PATH_COALESCE=1` to restore the legacy folding behavior.
 

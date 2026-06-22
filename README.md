@@ -143,6 +143,10 @@ settle window lets a burst of related edits reach one planner-visible window,
 while `acd flush --logical` still drains the current visible batch from an
 active harness session.
 
+When one visible window contains separate intents, the planner prompt asks for
+ordered `commit_groups` so replay can publish atomic commits instead of forcing
+the whole window into one commit.
+
 Message format:
 
 | Format | Example subject | Notes |

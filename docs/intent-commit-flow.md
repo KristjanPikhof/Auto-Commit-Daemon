@@ -105,6 +105,11 @@ the returned order, each with its own selected seqs, message, and grouping
 reason. Top-level `selected_seqs` remains the union of all group selections for
 legacy compatibility.
 
+The built-in planner prompt asks for `commit_groups` when one visible window
+contains multiple independent commit intents. It also requires chronological
+groups, so replay can apply each group in order without selecting a later
+same-path capture before an earlier one.
+
 ## Message rules
 
 `ACD_COMMIT_FORMAT=imperative` is the default and keeps the existing rules.

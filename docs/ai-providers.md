@@ -223,6 +223,10 @@ required for legacy compatibility. When `commit_groups` is present,
 `selected_seqs` must be the union of all group selections; the top-level
 message can mirror the first group or summarize the selected window.
 
+ACD's built-in prompt tells the planner to use `commit_groups` for independent
+intents inside one visible window. Custom subprocess planners should follow the
+same contract instead of returning one broad selected group for unrelated work.
+
 Rules:
 
 | Rule | Why it exists |
