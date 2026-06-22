@@ -171,12 +171,20 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		fmt.Fprintf(out, "Commit strategy: %s format=%s\n", status, valueOrUnset(r.CommitFormat))
 	}
 	if r.BatchWaitActive {
-		fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
-			r.VisiblePendingEvents,
-			r.MinPending,
-			formatDurationCompact(time.Duration(r.OldestPendingAgeSeconds)*time.Second),
-			formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second),
-			formatDurationCompact(time.Duration(r.AgeTriggerInSeconds)*time.Second))
+		if r.BatchWaitReason == "skipped_due_intent_settle_window" {
+			fmt.Fprintf(out, "Intent settle wait: pending=%d newest_age=%s settle=%s trigger_in=%s\n",
+				r.VisiblePendingEvents,
+				formatDurationCompact(time.Duration(r.NewestPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.SettleTriggerInSeconds)*time.Second))
+		} else {
+			fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+				r.VisiblePendingEvents,
+				r.MinPending,
+				formatDurationCompact(time.Duration(r.OldestPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.AgeTriggerInSeconds)*time.Second))
+		}
 	}
 	if r.DeferredEvents > 0 || r.ForcedAgingReady > 0 || r.LastPlannerError != "" {
 		fmt.Fprintf(out, "Intent planner: deferred=%d max_defer=%d forced_ready=%d\n",
@@ -628,6 +636,8 @@ func loadIntentBatchWait(ctx context.Context, conn *sql.DB, report *intentStrate
 	var oldestSeq sql.NullInt64
 	var oldestPath sql.NullString
 	var oldestCaptured sql.NullFloat64
+	var newestSeq sql.NullInt64
+	var newestCaptured sql.NullFloat64
 	if err := conn.QueryRowContext(ctx, `
 WITH barriers AS (
     SELECT branch_ref, branch_generation, MIN(seq) AS first_seq
@@ -647,12 +657,18 @@ SELECT COUNT(*), MIN(seq), (
     SELECT path FROM visible_pending ORDER BY seq ASC LIMIT 1
 ), (
     SELECT captured_ts FROM visible_pending ORDER BY seq ASC LIMIT 1
+), (
+    SELECT seq FROM visible_pending ORDER BY seq DESC LIMIT 1
+), (
+    SELECT captured_ts FROM visible_pending ORDER BY seq DESC LIMIT 1
 )
 FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending).Scan(
 		&report.VisiblePendingEvents,
 		&oldestSeq,
 		&oldestPath,
 		&oldestCaptured,
+		&newestSeq,
+		&newestCaptured,
 	); err != nil {
 		return fmt.Errorf("intent batch wait summary: %w", err)
 	}
@@ -666,6 +682,9 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	}
 	if oldestPath.Valid {
 		report.OldestPendingPath = oldestPath.String
+	}
+	if newestSeq.Valid {
+		report.NewestPendingEventSeq = newestSeq.Int64
 	}
 	// Path-quiescence aware reporting: when the daemon stamped a recent
 	// gated-count snapshot we subtract it from VisiblePendingEvents so the
@@ -710,12 +729,33 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	if remaining := report.AgeTriggerTS - int64(nowSec); remaining > 0 {
 		report.AgeTriggerInSeconds = remaining
 	}
+	if newestCaptured.Valid {
+		newestAgeSeconds := int64(nowSec - newestCaptured.Float64)
+		if newestAgeSeconds < 0 {
+			newestAgeSeconds = 0
+		}
+		report.NewestPendingAgeSeconds = newestAgeSeconds
+		if report.SettleWindowSeconds > 0 {
+			report.SettleTriggerTS = int64(newestCaptured.Float64) + report.SettleWindowSeconds
+			if remaining := report.SettleTriggerTS - int64(nowSec); remaining > 0 {
+				report.SettleTriggerInSeconds = remaining
+			}
+		}
+	}
 	if report.Active &&
 		report.ForcedAgingReady == 0 &&
 		report.VisiblePendingEvents < report.MinPending &&
 		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds {
 		report.BatchWaitActive = true
 		report.BatchWaitReason = "skipped_due_intent_batch_wait"
+	} else if report.Active &&
+		report.ForcedAgingReady == 0 &&
+		report.VisiblePendingEvents >= report.MinPending &&
+		report.SettleWindowSeconds > 0 &&
+		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds &&
+		report.NewestPendingAgeSeconds < report.SettleWindowSeconds {
+		report.BatchWaitActive = true
+		report.BatchWaitReason = "skipped_due_intent_settle_window"
 	}
 	return nil
 }
