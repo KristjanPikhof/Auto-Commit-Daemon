@@ -4505,6 +4505,27 @@ func assertReplayDecision(t *testing.T, ctx context.Context, db *state.DB, seq i
 	t.Fatalf("missing replay decision kind=%q reason=%q for seq %d: %+v", kind, reason, seq, decisions)
 }
 
+func captureCommitOID(t *testing.T, ctx context.Context, db *state.DB, seq int64) string {
+	t.Helper()
+	var oid sql.NullString
+	if err := db.SQL().QueryRowContext(ctx, `SELECT commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&oid); err != nil {
+		t.Fatalf("capture commit_oid seq=%d: %v", seq, err)
+	}
+	if !oid.Valid {
+		return ""
+	}
+	return oid.String
+}
+
+func captureEventState(t *testing.T, ctx context.Context, db *state.DB, seq int64) string {
+	t.Helper()
+	var st string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&st); err != nil {
+		t.Fatalf("capture state seq=%d: %v", seq, err)
+	}
+	return st
+}
+
 func assertIntentPlannerErrorDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64, reasonContains string) {
 	t.Helper()
 	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
