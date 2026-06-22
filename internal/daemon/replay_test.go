@@ -4068,6 +4068,14 @@ func (p *recordingIntentPlanner) PlanIntent(ctx context.Context, req ai.IntentPl
 	return p.plan, nil
 }
 
+func offeredCaptureSeqs(req ai.IntentPlanRequest) []int64 {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return seqs
+}
+
 type qualityRewriteIntentProvider struct {
 	name         string
 	planSubject  string
@@ -5086,11 +5094,12 @@ func captureSamePathEdit(t *testing.T, ctx context.Context, f *captureFixture, p
 	return newest
 }
 
-// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer: four sequential
-// modifies on the same path produce one offered window entry, one commit, and
-// four decision_records rows joined by commit_oid (so the CLI's grouped_seqs
+// TestReplay_IntentSamePathCapturesRemainPlannerVisible: four sequential
+// modifies on the same path remain four offered planner entries. The planner
+// may still select all four into one commit, and decision_records must carry
+// one row per original seq joined by commit_oid (so the CLI's grouped_seqs
 // derivation reports len 4).
-func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
+func TestReplay_IntentSamePathCapturesRemainPlannerVisible(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5117,11 +5126,11 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	}
 
 	planner := &recordingIntentPlanner{}
-	// Plan the single coalesced offer the planner is expected to see.
+	// Plan every captured seq the planner is expected to see.
 	planner.plan = ai.IntentPlan{
-		SelectedSeqs:   []int64{seq1},
-		Subject:        "Coalesced burst",
-		GroupingReason: "single-path edit chain",
+		SelectedSeqs:   []int64{seq1, seq2, seq3, seq4},
+		Subject:        "Grouped burst",
+		GroupingReason: "same-path edit chain selected atomically",
 	}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
@@ -5141,13 +5150,15 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	if planner.calls != 1 {
 		t.Fatalf("planner calls=%d want 1", planner.calls)
 	}
-	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
-		t.Fatalf("offered captures=%d want 1 (coalesced)", len(got))
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{seq1, seq2, seq3, seq4}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v (same-path captures must stay planner-visible)", gotOffered, wantOffered)
 	}
-	// One commit on top of the seed for the coalesced burst.
+	// One commit on top of the seed for the planner-selected burst.
 	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
-		// seed (gitignore) + seed (burst.txt v0) + 1 coalesced commit = 3
-		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 coalesced)", got)
+		// seed (gitignore) + seed (burst.txt v0) + 1 grouped commit = 3
+		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 grouped)", got)
 	}
 	// HEAD's blob for burst.txt must be v4 (the LAST captured after-state).
 	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "burst.txt")
