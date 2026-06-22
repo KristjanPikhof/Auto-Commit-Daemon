@@ -396,16 +396,16 @@ func TestCoalesceIntentWindow_MultiPathEventDoesNotCoalesce(t *testing.T) {
 
 func TestCoalesceIntentWindow_PathCoalesceEnabledRespectsEnv(t *testing.T) {
 	t.Setenv(envIntentPathCoalesce, "")
-	if !pathCoalesceEnabled() {
-		t.Fatal("empty env should default ON")
+	if pathCoalesceEnabled() {
+		t.Fatal("empty env should default OFF")
 	}
-	for _, off := range []string{"0", "false", "FALSE", "no", "NO", "off", "Off"} {
+	for _, off := range []string{"0", "false", "FALSE", "no", "NO", "off", "Off", "anything-else"} {
 		t.Setenv(envIntentPathCoalesce, off)
 		if pathCoalesceEnabled() {
 			t.Fatalf("env=%q should disable coalesce", off)
 		}
 	}
-	for _, on := range []string{"1", "true", "TRUE", "yes", "on", "anything-else"} {
+	for _, on := range []string{"1", "true", "TRUE", "yes", "on"} {
 		t.Setenv(envIntentPathCoalesce, on)
 		if !pathCoalesceEnabled() {
 			t.Fatalf("env=%q should enable coalesce", on)

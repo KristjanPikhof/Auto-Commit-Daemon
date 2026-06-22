@@ -1,5 +1,5 @@
-// coalesce.go folds runs of consecutive single-path captures into a single
-// offered window entry before the intent planner sees them.
+// coalesce.go contains the legacy same-path squash helper for runs of
+// consecutive single-path captures.
 //
 // Why: a burst of edits on one file (save, save, save, save) currently fans
 // the planner request out to N entries. The planner sees N decisions where
@@ -35,10 +35,11 @@
 // either change the path identity or the path's existence, both of which
 // break the "single same-path edit chain" invariant.
 //
-// ACD_INTENT_PATH_COALESCE controls the feature. It defaults ON; set to
-// "0", "false", "no", or "off" (case-insensitive) to disable. The daemon
-// resolves the env once per replay pass, so changes require a daemon
-// restart (matches the existing env-restart pattern documented in
+// ACD_INTENT_PATH_COALESCE controls the legacy feature. It defaults OFF so
+// every durable capture remains planner-visible; set to "1", "true", "yes",
+// or "on" (case-insensitive) to opt back into destructive same-path squash.
+// The daemon resolves the env once per replay pass, so changes require a
+// daemon restart (matches the existing env-restart pattern documented in
 // CLAUDE.md).
 package daemon
 
@@ -90,25 +91,25 @@ type coalescedOffer struct {
 	Token coalesceToken
 }
 
-// envIntentPathCoalesce is the env var that controls the coalesce pass.
-// Default ON to ship the new behavior automatically; "0"/"false"/"no"/"off"
-// (case-insensitive) opts out. Mirrors the existing env-restart pattern —
-// the daemon resolves the env once per replay pass, so toggling requires a
-// restart.
+// envIntentPathCoalesce is the env var that controls the legacy coalesce
+// pass. Empty / unset disables coalescing; "1"/"true"/"yes"/"on"
+// (case-insensitive) opts in. Mirrors the existing env-restart pattern — the
+// daemon resolves the env once per replay pass, so toggling requires a restart.
 const envIntentPathCoalesce = "ACD_INTENT_PATH_COALESCE"
 
 // pathCoalesceEnabled reports whether ACD_INTENT_PATH_COALESCE permits
-// folding. Empty / unset / any non-disable spelling enables coalesce.
+// folding. Empty / unset / unrecognized spellings keep coalesce disabled so
+// the planner sees every original capture seq.
 func pathCoalesceEnabled() bool {
 	raw := strings.TrimSpace(os.Getenv(envIntentPathCoalesce))
 	if raw == "" {
-		return true
+		return false
 	}
 	switch strings.ToLower(raw) {
-	case "0", "false", "no", "off":
-		return false
-	default:
+	case "1", "true", "yes", "on":
 		return true
+	default:
+		return false
 	}
 }
 
