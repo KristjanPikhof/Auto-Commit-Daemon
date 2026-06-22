@@ -40,27 +40,27 @@ type eventsReport struct {
 }
 
 type eventEntry struct {
-	ID               int64   `json:"id"`
-	Timestamp        int64   `json:"timestamp"`
-	Time             string  `json:"time"`
-	Kind             string  `json:"kind"`
-	Path             string  `json:"path,omitempty"`
-	Reason           string  `json:"reason,omitempty"`
-	EventSeq         int64   `json:"event_seq,omitempty"`
-	HeadSHA          string  `json:"head_sha,omitempty"`
-	CommitOID        string  `json:"commit_oid,omitempty"`
-	BranchRef        string  `json:"branch_ref,omitempty"`
-	BranchGeneration int64   `json:"branch_generation,omitempty"`
-	ActionTaken      string  `json:"action_taken,omitempty"`
-	UserMessage      string  `json:"user_message,omitempty"`
-	DecisionTS       float64 `json:"decision_ts"`
-	GroupedSeqs      []int64 `json:"grouped_seqs,omitempty"`
-	GroupSize        int     `json:"group_size,omitempty"`
-	IntentGroup      bool    `json:"intent_group,omitempty"`
+	ID               int64                       `json:"id"`
+	Timestamp        int64                       `json:"timestamp"`
+	Time             string                      `json:"time"`
+	Kind             string                      `json:"kind"`
+	Path             string                      `json:"path,omitempty"`
+	Reason           string                      `json:"reason,omitempty"`
+	EventSeq         int64                       `json:"event_seq,omitempty"`
+	HeadSHA          string                      `json:"head_sha,omitempty"`
+	CommitOID        string                      `json:"commit_oid,omitempty"`
+	BranchRef        string                      `json:"branch_ref,omitempty"`
+	BranchGeneration int64                       `json:"branch_generation,omitempty"`
+	ActionTaken      string                      `json:"action_taken,omitempty"`
+	UserMessage      string                      `json:"user_message,omitempty"`
+	DecisionTS       float64                     `json:"decision_ts"`
+	GroupedSeqs      []int64                     `json:"grouped_seqs,omitempty"`
+	GroupSize        int                         `json:"group_size,omitempty"`
+	IntentGroup      bool                        `json:"intent_group,omitempty"`
 	PlannerWindow    *intentPlannerWindowSummary `json:"planner_window,omitempty"`
-	Deferred         bool    `json:"deferred,omitempty"`
-	ForcedAging      bool    `json:"forced_aging,omitempty"`
-	PlannerError     bool    `json:"planner_error,omitempty"`
+	Deferred         bool                        `json:"deferred,omitempty"`
+	ForcedAging      bool                        `json:"forced_aging,omitempty"`
+	PlannerError     bool                        `json:"planner_error,omitempty"`
 }
 
 func newEventsCmd() *cobra.Command {

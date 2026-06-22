@@ -29,7 +29,7 @@ type intentPlannerWindowSummary struct {
 	SelectedGroups      []state.IntentPlannerWindowGroup              `json:"selected_groups,omitempty"`
 	DeferredSeqs        []int64                                       `json:"deferred_seqs,omitempty"`
 	DeferredReasons     []state.IntentPlannerWindowDeferredReason     `json:"deferred_reasons,omitempty"`
-	Event                *intentPlannerWindowEventParticipationSummary `json:"event,omitempty"`
+	Event               *intentPlannerWindowEventParticipationSummary `json:"event,omitempty"`
 }
 
 type intentPlannerWindowEventParticipationSummary struct {

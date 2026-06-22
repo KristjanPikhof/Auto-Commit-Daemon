@@ -56,43 +56,43 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 }
 
 type intentStrategyReport struct {
-	Strategy                          string `json:"strategy"`
-	CommitFormat                      string `json:"commit_format"`
-	Active                            bool   `json:"active"`
-	Window                            int    `json:"window,omitempty"`
-	RecentCommits                     int    `json:"recent_commits,omitempty"`
-	DeferLimit                        int    `json:"defer_limit,omitempty"`
-	MinPending                        int    `json:"min_pending,omitempty"`
-	SettleWindowSeconds               int64  `json:"settle_window_seconds"`
-	MaxPendingAgeSeconds              int64  `json:"max_pending_age_seconds,omitempty"`
-	IntentStageDiffCap                int    `json:"intent_stage_diff_cap,omitempty"`
-	VisiblePendingEvents              int    `json:"visible_pending_events,omitempty"`
-	OldestPendingEventSeq             int64  `json:"oldest_pending_event_seq,omitempty"`
-	OldestPendingPath                 string `json:"oldest_pending_path,omitempty"`
-	OldestPendingAgeSeconds           int64  `json:"oldest_pending_age_seconds,omitempty"`
-	NewestPendingEventSeq             int64  `json:"newest_pending_event_seq,omitempty"`
-	NewestPendingAgeSeconds           int64  `json:"newest_pending_age_seconds,omitempty"`
-	AgeTriggerTS                      int64  `json:"age_trigger_ts,omitempty"`
-	AgeTriggerInSeconds               int64  `json:"age_trigger_in_seconds,omitempty"`
-	SettleTriggerTS                   int64  `json:"settle_trigger_ts,omitempty"`
-	SettleTriggerInSeconds            int64  `json:"settle_trigger_in_seconds,omitempty"`
-	BatchWaitActive                   bool   `json:"batch_wait_active,omitempty"`
-	BatchWaitReason                   string `json:"batch_wait_reason,omitempty"`
-	DeferredEvents                    int    `json:"deferred_events,omitempty"`
-	MaxDeferCount                     int    `json:"max_defer_count,omitempty"`
-	ForcedAgingReady                  int    `json:"forced_aging_ready,omitempty"`
-	LastDeferredEventSeq              int64  `json:"last_deferred_event_seq,omitempty"`
-	LastDeferredPath                  string `json:"last_deferred_path,omitempty"`
-	LastDeferredReason                string `json:"last_deferred_reason,omitempty"`
-	LastPlannerErrorEventSeq          int64  `json:"last_planner_error_event_seq,omitempty"`
-	LastPlannerErrorPath              string `json:"last_planner_error_path,omitempty"`
-	LastPlannerError                  string `json:"last_planner_error,omitempty"`
-	MessageQualityRewriteCountRecent  int    `json:"message_quality_rewrite_count_recent,omitempty"`
-	MessageQualityFallbackCountRecent int    `json:"message_quality_fallback_count_recent,omitempty"`
-	LastMessageQualityEventSeq        int64  `json:"last_message_quality_event_seq,omitempty"`
-	LastMessageQualityPath            string `json:"last_message_quality_path,omitempty"`
-	LastMessageQualityAction          string `json:"last_message_quality_action,omitempty"`
-	LastMessageQualityReason          string `json:"last_message_quality_reason,omitempty"`
+	Strategy                          string                      `json:"strategy"`
+	CommitFormat                      string                      `json:"commit_format"`
+	Active                            bool                        `json:"active"`
+	Window                            int                         `json:"window,omitempty"`
+	RecentCommits                     int                         `json:"recent_commits,omitempty"`
+	DeferLimit                        int                         `json:"defer_limit,omitempty"`
+	MinPending                        int                         `json:"min_pending,omitempty"`
+	SettleWindowSeconds               int64                       `json:"settle_window_seconds"`
+	MaxPendingAgeSeconds              int64                       `json:"max_pending_age_seconds,omitempty"`
+	IntentStageDiffCap                int                         `json:"intent_stage_diff_cap,omitempty"`
+	VisiblePendingEvents              int                         `json:"visible_pending_events,omitempty"`
+	OldestPendingEventSeq             int64                       `json:"oldest_pending_event_seq,omitempty"`
+	OldestPendingPath                 string                      `json:"oldest_pending_path,omitempty"`
+	OldestPendingAgeSeconds           int64                       `json:"oldest_pending_age_seconds,omitempty"`
+	NewestPendingEventSeq             int64                       `json:"newest_pending_event_seq,omitempty"`
+	NewestPendingAgeSeconds           int64                       `json:"newest_pending_age_seconds,omitempty"`
+	AgeTriggerTS                      int64                       `json:"age_trigger_ts,omitempty"`
+	AgeTriggerInSeconds               int64                       `json:"age_trigger_in_seconds,omitempty"`
+	SettleTriggerTS                   int64                       `json:"settle_trigger_ts,omitempty"`
+	SettleTriggerInSeconds            int64                       `json:"settle_trigger_in_seconds,omitempty"`
+	BatchWaitActive                   bool                        `json:"batch_wait_active,omitempty"`
+	BatchWaitReason                   string                      `json:"batch_wait_reason,omitempty"`
+	DeferredEvents                    int                         `json:"deferred_events,omitempty"`
+	MaxDeferCount                     int                         `json:"max_defer_count,omitempty"`
+	ForcedAgingReady                  int                         `json:"forced_aging_ready,omitempty"`
+	LastDeferredEventSeq              int64                       `json:"last_deferred_event_seq,omitempty"`
+	LastDeferredPath                  string                      `json:"last_deferred_path,omitempty"`
+	LastDeferredReason                string                      `json:"last_deferred_reason,omitempty"`
+	LastPlannerErrorEventSeq          int64                       `json:"last_planner_error_event_seq,omitempty"`
+	LastPlannerErrorPath              string                      `json:"last_planner_error_path,omitempty"`
+	LastPlannerError                  string                      `json:"last_planner_error,omitempty"`
+	MessageQualityRewriteCountRecent  int                         `json:"message_quality_rewrite_count_recent,omitempty"`
+	MessageQualityFallbackCountRecent int                         `json:"message_quality_fallback_count_recent,omitempty"`
+	LastMessageQualityEventSeq        int64                       `json:"last_message_quality_event_seq,omitempty"`
+	LastMessageQualityPath            string                      `json:"last_message_quality_path,omitempty"`
+	LastMessageQualityAction          string                      `json:"last_message_quality_action,omitempty"`
+	LastMessageQualityReason          string                      `json:"last_message_quality_reason,omitempty"`
 	LastPlannerWindow                 *intentPlannerWindowSummary `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
@@ -358,6 +358,11 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	}
 	if err := loadIntentMessageQualitySummary(ctx, conn, &report); err != nil {
 		return report, err
+	}
+	if lastWindow, err := loadLastIntentPlannerWindowSQL(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.LastPlannerWindow = lastWindow
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {
