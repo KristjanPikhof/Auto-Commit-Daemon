@@ -1290,6 +1290,19 @@ func doctorIntentStrategyNotes(r intentStrategyReport, repoPath, sessionID strin
 	if !r.BatchWaitActive {
 		return nil
 	}
+	if r.BatchWaitReason == "skipped_due_intent_settle_window" {
+		wait := formatDurationCompact(time.Duration(r.SettleTriggerInSeconds) * time.Second)
+		sessionHint := sessionID
+		if sessionHint == "" {
+			sessionHint = "<active-session-id>"
+		}
+		return []string{
+			fmt.Sprintf("intent replay reached min pending and is waiting for the latest capture to stay quiet for %s (about %s remaining)", formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second), wait),
+			fmt.Sprintf("to publish now, run acd flush --logical --repo %s --session-id %s; explicit flushes bypass intent batch wait and require a registered active session id", repoPath, sessionHint),
+			"to shorten burst collection, lower ACD_INTENT_SETTLE_WINDOW and restart acd",
+			"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
+		}
+	}
 	wait := formatDurationCompact(time.Duration(r.AgeTriggerInSeconds) * time.Second)
 	need := r.MinPending - r.VisiblePendingEvents
 	if need < 0 {
@@ -1462,12 +1475,20 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
 				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
 			if rr.IntentStrategy.BatchWaitActive {
-				fmt.Fprintf(out, "      batch wait : pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
-					rr.IntentStrategy.VisiblePendingEvents,
-					rr.IntentStrategy.MinPending,
-					formatDurationCompact(time.Duration(rr.IntentStrategy.OldestPendingAgeSeconds)*time.Second),
-					formatDurationCompact(time.Duration(rr.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
-					formatDurationCompact(time.Duration(rr.IntentStrategy.AgeTriggerInSeconds)*time.Second))
+				if rr.IntentStrategy.BatchWaitReason == "skipped_due_intent_settle_window" {
+					fmt.Fprintf(out, "      settle wait: pending=%d newest_age=%s settle=%s trigger_in=%s\n",
+						rr.IntentStrategy.VisiblePendingEvents,
+						formatDurationCompact(time.Duration(rr.IntentStrategy.NewestPendingAgeSeconds)*time.Second),
+						formatDurationCompact(time.Duration(rr.IntentStrategy.SettleWindowSeconds)*time.Second),
+						formatDurationCompact(time.Duration(rr.IntentStrategy.SettleTriggerInSeconds)*time.Second))
+				} else {
+					fmt.Fprintf(out, "      batch wait : pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+						rr.IntentStrategy.VisiblePendingEvents,
+						rr.IntentStrategy.MinPending,
+						formatDurationCompact(time.Duration(rr.IntentStrategy.OldestPendingAgeSeconds)*time.Second),
+						formatDurationCompact(time.Duration(rr.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
+						formatDurationCompact(time.Duration(rr.IntentStrategy.AgeTriggerInSeconds)*time.Second))
+				}
 			}
 			if rr.IntentStrategy.LastPlannerError != "" {
 				fmt.Fprintf(out, "      planner err: seq %d %s\n",
