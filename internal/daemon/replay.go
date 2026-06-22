@@ -2278,12 +2278,30 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 			"offered_seqs": intentItemSeqs(items),
 		},
 		Output: map[string]any{
+			"commit_groups":  intentTraceCommitGroups(plan),
 			"selected_seqs": plan.SelectedSeqs,
 			"deferred_seqs": plan.DeferredSeqs,
 			"source":        plan.Source,
 		},
 		Generation: cctx.BranchGeneration,
 	})
+}
+
+func intentTraceCommitGroups(plan ai.IntentPlan) []map[string]any {
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(groups))
+	for _, group := range groups {
+		out = append(out, map[string]any{
+			"selected_seqs":    append([]int64(nil), group.SelectedSeqs...),
+			"subject":          group.Subject,
+			"grouping_reason":  group.GroupingReason,
+			"body_present":     strings.TrimSpace(group.Body) != "",
+		})
+	}
+	return out
 }
 
 func traceIntentSingletonShortCircuit(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, item intentReplayItem, plan ai.IntentPlan) {
