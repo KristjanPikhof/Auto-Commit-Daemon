@@ -337,6 +337,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		Body:            resp.Body,
 		GroupingReason:  resp.GroupingReason,
 		DeferredReasons: resp.DeferredReasons,
+		CommitGroups:    resp.CommitGroups,
 		Source:          p.Name(),
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
@@ -661,6 +662,7 @@ type subprocessResponse struct {
 	DeferredSeqs    []int64          `json:"deferred_seqs,omitempty"`
 	GroupingReason  string           `json:"grouping_reason,omitempty"`
 	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
+	CommitGroups    []IntentCommitGroup `json:"commit_groups,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner

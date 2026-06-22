@@ -1148,14 +1148,39 @@ func replayIntentBatch(
 		return sum, err
 	}
 
-	selected, err := selectedIntentItems(items, plan.SelectedSeqs)
+	groups, err := ai.IntentPlanCommitGroups(plan)
 	if err != nil {
 		return sum, err
 	}
-	sort.Slice(selected, func(i, j int) bool {
-		return selected[i].event.Seq < selected[j].event.Seq
-	})
-	return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+	currentParent := parent
+	currentParentTree := parentTree
+	for _, group := range groups {
+		groupPlan := ai.IntentPlanForCommitGroup(plan, group)
+		selected, err := selectedIntentItems(items, group.SelectedSeqs)
+		if err != nil {
+			return sum, err
+		}
+		sort.Slice(selected, func(i, j int) bool {
+			return selected[i].event.Seq < selected[j].event.Seq
+		})
+		before := sum
+		sum, err = publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, groupPlan, currentParent, currentParentTree, sum)
+		if err != nil {
+			return sum, err
+		}
+		if sum.Conflicts > before.Conflicts || sum.Failed > before.Failed || sum.Published == before.Published {
+			return sum, nil
+		}
+		if sum.BaseHead == "" || sum.BaseHead == currentParent {
+			return sum, nil
+		}
+		currentParent = sum.BaseHead
+		currentParentTree, err = resolveTreeOID(ctx, repoRoot, currentParent)
+		if err != nil {
+			return sum, err
+		}
+	}
+	return sum, nil
 }
 
 func rejectInvalidIntentWindowEvents(
@@ -1969,8 +1994,14 @@ func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, r
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
 	selected := map[int64]struct{}{}
-	for _, seq := range plan.SelectedSeqs {
-		selected[seq] = struct{}{}
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return err
+	}
+	for _, group := range groups {
+		for _, seq := range group.SelectedSeqs {
+			selected[seq] = struct{}{}
+		}
 	}
 	for i, item := range items {
 		if _, ok := selected[item.event.Seq]; !ok {
