@@ -20,7 +20,7 @@ make tidy       # go mod tidy
 Pre-PR gate:
 
 ```bash
-cleanenv() { env -u ACD_INTENT_MIN_PENDING -u ACD_INTENT_MAX_PENDING_AGE -u ACD_INTENT_WINDOW -u ACD_INTENT_RECENT_COMMITS -u ACD_INTENT_DEFER_LIMIT ACD_COMMIT_STRATEGY=event "$@"; }
+cleanenv() { env -u ACD_INTENT_MIN_PENDING -u ACD_INTENT_MAX_PENDING_AGE -u ACD_INTENT_SETTLE_WINDOW -u ACD_INTENT_WINDOW -u ACD_INTENT_RECENT_COMMITS -u ACD_INTENT_DEFER_LIMIT ACD_COMMIT_STRATEGY=event "$@"; }
 cleanenv make lint
 cleanenv make test
 cleanenv go test ./test/integration/... -tags=integration -race -count=1 -timeout 5m
@@ -49,7 +49,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands: setup, hooks, status, diagnose, doctor, fix, commit-all, start cache |
 | `internal/daemon` | run loop, capture/replay, intent, branch tokens, bootstrap/shadow, fsnotify, refcount, live-index repair, trace |
-| `internal/state` | SQLite v7: events/ops, decisions, planner_state, shadow/meta/clients/flush/safe-ignore/sensitive |
+| `internal/state` | SQLite v11: events/ops, decisions, planner_state, planner windows, shadow/meta/clients/flush/safe-ignore/sensitive |
 | `internal/git` | bounded refs/tree/diff/blob/scratch-index/history/ignore helpers |
 | `internal/ai` | deterministic/openai-compat/subprocess providers, commit message prompts, intent planner |
 | `internal/adapter` | harness detection and markers; do not restore TODO stubs |
@@ -104,7 +104,7 @@ Line 3+: bullet list for why/context
 
 - Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG state/share.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2. `acd stop` removes matching/all caches. Atomic tmp+rename prevents corruption.
-- `SchemaVersion = 10`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`; v8-v9 rewrite-plan state; v10 `rewrite_plans.commit_format`.
+- `SchemaVersion = 11`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`; v8-v9 rewrite-plan state; v10 `rewrite_plans.commit_format`; v11 `intent_planner_windows`.
 - `shadow_paths` key `(branch_ref, branch_generation, path)`; read-heavy paths use `state.DB.ReadSQL()`.
 - Shadow bootstrap: 5000-row chunks; marker `shadow.bootstrapped:<branch_ref>:<generation>` only after all chunks commit; clean partial rows on failure. Empty active shadow with marker means delete marker and re-bootstrap.
 - Reseed prunes old generations via `ACD_SHADOW_RETENTION_GENERATIONS` default `1`.
@@ -124,13 +124,15 @@ Line 3+: bullet list for why/context
 
 - Default `ACD_COMMIT_STRATEGY=event`: one capture per commit; must not call planner.
 - `ACD_COMMIT_STRATEGY=intent`: AI planner selects one capture or a non-empty subset; capture durability unchanged.
-- Intent defaults: `ACD_INTENT_WINDOW=10`, `ACD_INTENT_MIN_PENDING=10`, `ACD_INTENT_MAX_PENDING_AGE=5m`, `ACD_INTENT_RECENT_COMMITS=5`, `ACD_INTENT_DEFER_LIMIT=1`, `ACD_INTENT_PATH_COALESCE=1`.
+- Intent defaults: `ACD_INTENT_WINDOW=10`, `ACD_INTENT_MIN_PENDING=10`, `ACD_INTENT_SETTLE_WINDOW=10s`, `ACD_INTENT_MAX_PENDING_AGE=5m`, `ACD_INTENT_RECENT_COMMITS=5`, `ACD_INTENT_DEFER_LIMIT=1`; `ACD_INTENT_PATH_COALESCE` is off by default.
 - Planner must classify every offered seq as selected or deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to deterministic one-item.
+- Planner may return ordered `commit_groups` to partition one visible window into multiple atomic commits. Replay publishes valid groups sequentially.
 - `deferred_reasons[i].seq` must appear in `deferred_seqs`. Providers normalize spurious deferred reasons before validation and warn with dropped seqs.
 - Deferred stays pending in `planner_state`; at `defer_count >= ACD_INTENT_DEFER_LIMIT`, oldest overdue is forced one-item.
-- Same-path coalesce folds consecutive captures touching one shared path into one planner entry. Boundaries: different path, multi-path, rename, delete, or `(branch_ref, branch_generation, base_head)` change. On success every original seq is marked published with the same `commit_oid`; `acd events --json grouped_seqs` shows the run.
+- Same-path coalesce is legacy opt-in with truthy `ACD_INTENT_PATH_COALESCE`. By default, consecutive same-path captures remain separate planner-visible seqs. If coalescing is enabled, boundaries are different path, multi-path, rename, delete, or `(branch_ref, branch_generation, base_head)` change. On success every original seq is marked published with the same `commit_oid`; `acd events --json grouped_seqs` and planner-window `hidden_seqs` show the run.
+- Planner windows persist in `intent_planner_windows`/`intent_planner_window_events`: offered seqs, visible original seqs, hidden/coalesced seqs, selected groups, deferred seqs/reasons, forced/fallback metadata, provider/model/source/format, and per-event flags. They are privacy-safe summaries, not raw diffs.
 - Planner rejects log: `<gitDir>/acd/planner-rejects.jsonl`, 5 MiB + `.1`, best effort. Fields include `ts`, `provider`, `offered_seqs`, `code`, `message`, raw response size, sha256, and parsed-plan summary. `raw_response` is redacted by default; verbatim only with truthy `ACD_INTENT_REJECTS_RAW`, which logs a startup warning.
-- `acd status --json` and `acd diagnose --json` expose `intent_strategy`, including recent planner/singleton rates over fixed denominator 100. `diagnose` hints when `planner_error_rate_recent > 0.05`.
+- `acd status --json` and `acd diagnose --json` expose `intent_strategy`, including settle fields, `last_planner_window`, and recent planner/singleton rates over fixed denominator 100. `diagnose` hints when `planner_error_rate_recent > 0.05`.
 - Per-pass scratch index `<gitDir>/acd/replay-*.index` is seeded from `cctx.BaseHead`; reads via `git.LsFilesIndex(...)`.
 - CAS targets literal `HEAD` via `git.UpdateRef`; named refs use `--no-deref`.
 - `DefaultReplayLimit = 64`; query `Limit+1`, trim, set `ReplaySummary.HasMore`. `DefaultReplayPerEventTimeout = 60s`; timeout/cancel marks event `failed` and stops batch.
@@ -143,7 +145,7 @@ Line 3+: bullet list for why/context
 
 - `processBranchTokenChange` runs before capture and after flush drain; do not collapse. Post-flush recheck handles git surgery outside `wakeCh`.
 - Branch settle `100ms`; flush drain `DefaultFlushLimit = 256`.
-- Daemon stamps `commit.strategy`, `intent.{window,min_pending,max_pending_age,recent_commits,defer_limit,diff_egress}`; CLI reads meta before env.
+- Daemon stamps `commit.strategy`, `intent.{window,min_pending,settle_window,max_pending_age,recent_commits,defer_limit,diff_egress}`; CLI reads meta before env.
 - Startup sweeps `acknowledged` flush requests older than `OrphanFlushAckThreshold = 5m` to `failed`.
 - fsnotify dispatch must not block: runtime creates use `rewalkCh`/`rewalkWorker`; diagnostics `diagCh`; tail clamps `MaxDebounceTail = 500ms`; ENOSPC -> `errBudgetExceeded`.
 - Daemon log: `paths.Roots.RepoLogPath(repoHash)` (`~/.local/state/acd/<repo-hash>/daemon.log`) with rotation/compression. Hook log: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log`.
@@ -227,5 +229,5 @@ LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log"
 | Shadow/rewind | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60` (`0` disables); `ACD_KEEP_DEAD_BRANCH_BARRIERS` disables auto-prune |
 | Capture | `ACD_SENSITIVE_GLOBS`; `ACD_SAFE_IGNORE`; `ACD_SAFE_IGNORE_EXTRA`; `ACD_MAX_PENDING_EVENTS`; `ACD_PATH_QUIESCENCE_SECONDS=0` (off; restart to apply; capture remains durable, planner offer waits for quiet path) |
 | AI | `ACD_AI_PROVIDER=deterministic|openai-compat|subprocess:<name>`; `ACD_AI_BASE_URL`; `ACD_AI_API_KEY`; `ACD_AI_MODEL`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS`; `ACD_COMMIT_FORMAT=imperative|conventional`; `ACD_INTENT_REJECTS_RAW` |
-| Strategy | `ACD_COMMIT_STRATEGY=event|intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=1`; `ACD_INTENT_PATH_COALESCE=1`; `ACD_RECENT_COMMIT_AFFINITY_SECONDS=0`; planner cap `ai.IntentStageDiffCap=16000` |
+| Strategy | `ACD_COMMIT_STRATEGY=event|intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_SETTLE_WINDOW=10s`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=1`; `ACD_INTENT_PATH_COALESCE` off by default; `ACD_RECENT_COMMIT_AFFINITY_SECONDS=0`; planner cap `ai.IntentStageDiffCap=16000` |
 | Watcher/client | `ACD_FSNOTIFY_ENABLED`; `ACD_DISABLE_FSNOTIFY`; `ACD_MAX_INOTIFY_WATCHES`; `ACD_CLIENT_TTL_SECONDS` |

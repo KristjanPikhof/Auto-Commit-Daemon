@@ -18,6 +18,7 @@ export ACD_AI_API_KEY=...
 export ACD_AI_DIFF_EGRESS=1
 export ACD_INTENT_WINDOW=5
 export ACD_INTENT_MIN_PENDING=3
+export ACD_INTENT_SETTLE_WINDOW=10s
 export ACD_INTENT_MAX_PENDING_AGE=60s
 export ACD_INTENT_DEFER_LIMIT=1
 ~~~
@@ -31,6 +32,7 @@ export ACD_AI_API_KEY=...
 export ACD_AI_DIFF_EGRESS=1
 export ACD_INTENT_WINDOW=10
 export ACD_INTENT_MIN_PENDING=8
+export ACD_INTENT_SETTLE_WINDOW=10s
 export ACD_INTENT_MAX_PENDING_AGE=5m
 export ACD_INTENT_DEFER_LIMIT=1
 export ACD_INTENT_RETRY_ON_INVALID=1
@@ -52,27 +54,29 @@ flowchart TB
   A["Capture rows<br/>state=pending"] --> B{"Batch ready?"}
   B -->|no| C["Wait for count,<br/>age, or logical flush"]
   C --> B
-  B -->|yes| D["Build planner window"]
-  D --> E["AI planner"]
-  E --> F{"Plan valid?"}
-  F -->|no| G["Deterministic<br/>one-capture fallback"]
-  F -->|yes| H{"Message OK?"}
-  H -->|needs rewrite| I["Locked message rewrite"]
-  I --> J{"Rewrite valid?"}
-  J -->|no| G
-  H -->|yes| K["Replay selected seqs"]
-  J -->|yes| K
-  G --> K
-  K --> L[("decision ledger")]
+  B -->|yes| D{"Burst settled?"}
+  D -->|no| C
+  D -->|yes| E["Build planner window"]
+  E --> F["AI planner"]
+  F --> G{"Plan valid?"}
+  G -->|no| H["Deterministic<br/>one-capture fallback"]
+  G -->|yes| I{"Message OK?"}
+  I -->|needs rewrite| J["Locked message rewrite"]
+  J --> K{"Rewrite valid?"}
+  K -->|no| H
+  I -->|yes| L["Replay selected group(s)"]
+  K -->|yes| L
+  H --> L
+  L --> M[("decision ledger")]
 
   classDef queue fill:#243447,stroke:#7aa2f7,color:#e6edf3
   classDef decision fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
   classDef provider fill:#203a31,stroke:#9ece6a,color:#eaffdf
   classDef fallback fill:#402b2b,stroke:#f7768e,color:#ffe8ee
-  class A,L queue
-  class B,F,H,J decision
-  class E,I provider
-  class G fallback
+  class A,M queue
+  class B,D,G,I,K decision
+  class F,J provider
+  class H fallback
 ~~~
 
 ## Planner input
@@ -85,9 +89,21 @@ flowchart TB
 | `forced_aging` | True when a repeatedly deferred capture is forced into a one-capture window. |
 | `path_recent_commits` | Optional hint that an offered path recently changed at HEAD. It is not an amend feature. |
 
+By default, consecutive captures that touch the same path remain separate
+planner-visible seqs. This lets the planner split independent edits inside one
+file when replay can apply them safely. `ACD_INTENT_PATH_COALESCE=1` restores
+the legacy behavior that folds consecutive same-path captures into one planner
+offer; `hidden_seqs` then records the original seqs covered by that folded
+offer.
+
 The planner must put every offered seq in either `selected_seqs` or
 `deferred_seqs`. It may select one seq or a larger related subset. Deferred
 seqs need reasons.
+
+For a mixed window, the planner may return `commit_groups`. Groups publish in
+the returned order, each with its own selected seqs, message, and grouping
+reason. Top-level `selected_seqs` remains the union of all group selections for
+legacy compatibility.
 
 ## Message rules
 
@@ -139,6 +155,11 @@ deterministic one-capture message in the selected format.
 Deferral is normal. It means the planner decided a capture did not belong in the
 current commit.
 
+After `ACD_INTENT_MIN_PENDING` is reached, ACD waits for
+`ACD_INTENT_SETTLE_WINDOW` with no newer visible capture before planning. A full
+`ACD_INTENT_WINDOW`, `ACD_INTENT_MAX_PENDING_AGE`, forced aging, or
+`acd flush --logical` bypasses that settle wait.
+
 When a capture reaches `ACD_INTENT_DEFER_LIMIT`, ACD forces it through a
 one-capture planning window unless an earlier related-path capture must land
 first. If the provider fails there, deterministic fallback publishes the
@@ -155,5 +176,12 @@ capture safely.
 | Where are rejected planner responses? | `<gitDir>/acd/planner-rejects.jsonl` |
 
 `intent_strategy` reports `commit_format`, window settings, batch wait state,
-deferred counts, forced-aging readiness, planner error rate, singleton commit
-rate, and message-quality rewrite or fallback counts.
+settle countdowns, deferred counts, forced-aging readiness, planner error rate,
+singleton commit rate, message-quality rewrite or fallback counts, and the most
+recent privacy-safe `last_planner_window` summary.
+
+`acd events --json` adds `planner_window` to decisions with a known planner
+window. The summary shows `offered_seqs`, `visible_original_seqs`,
+`hidden_seqs`, `selected_groups`, `deferred_seqs`, forced/fallback metadata,
+and per-event participation flags. It never stores raw diffs; use prompt traces
+only when the exact provider payload is needed.

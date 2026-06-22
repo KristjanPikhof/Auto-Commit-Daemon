@@ -130,12 +130,18 @@ export ACD_AI_DIFF_EGRESS=1
 export ACD_COMMIT_STRATEGY=intent
 export ACD_INTENT_WINDOW=10
 export ACD_INTENT_MIN_PENDING=4
+export ACD_INTENT_SETTLE_WINDOW=10s
 export ACD_INTENT_MAX_PENDING_AGE=5m
 export ACD_INTENT_DEFER_LIMIT=1
 ~~~
 
 `ACD_AI_DIFF_EGRESS=1` lets the planner see redacted captured diffs. Leave it
 unset when the endpoint should receive metadata only.
+
+Intent mode waits briefly after the pending-count gate before planning. This
+settle window lets a burst of related edits reach one planner-visible window,
+while `acd flush --logical` still drains the current visible batch from an
+active harness session.
 
 Message format:
 
@@ -317,6 +323,7 @@ git reset --hard <backup-ref-or-sha>
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs to providers that ask for diffs. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred count before planning. Lower it for sparse repos. |
+| `ACD_INTENT_SETTLE_WINDOW` | `10s` | Burst settle delay after the count gate. `0` disables it. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age escape hatch for sparse queues. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before ACD forces a one-capture window. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after invalid planner output. |

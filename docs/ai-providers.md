@@ -95,10 +95,11 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending count before planning. |
+| `ACD_INTENT_SETTLE_WINDOW` | `10s` | Burst settle delay after the count gate. `0` disables it. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age trigger for sparse queues. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent commits sent as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before forced one-capture planning. |
-| `ACD_INTENT_PATH_COALESCE` | `1` | Folds consecutive same-path captures into one planner offer. |
+| `ACD_INTENT_PATH_COALESCE` | off | Truthy restores legacy folding of consecutive same-path captures into one planner offer. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after typed planner validation errors. `0` or false-like values disable retries. |
 | `ACD_INTENT_REJECTS_RAW` | off | Truthy stores raw rejected planner responses. Sensitive. |
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
@@ -168,7 +169,7 @@ Commit-message response:
 
 Intent planner requests set `request_type` to `intent_plan`, include
 `commit_format`, and include `planner_request.offered_captures`. The response
-must classify every offered seq:
+must classify every offered seq. A single-group response still works:
 
 ~~~json
 {
@@ -185,12 +186,42 @@ must classify every offered seq:
 }
 ~~~
 
+For windows that contain several independent intents, return ordered
+`commit_groups`:
+
+~~~json
+{
+  "version": 1,
+  "selected_seqs": [101, 103],
+  "deferred_seqs": [102],
+  "commit_groups": [
+    {
+      "selected_seqs": [101],
+      "subject": "Add auth retry handling",
+      "body": "- Keep transient failures available for retry",
+      "grouping_reason": "Auth behavior change"
+    },
+    {
+      "selected_seqs": [103],
+      "subject": "Document retry configuration",
+      "body": "",
+      "grouping_reason": "Documentation-only update"
+    }
+  ],
+  "deferred_reasons": [
+    {"seq": 102, "reason": "Separate billing cleanup"}
+  ],
+  "error": ""
+}
+~~~
+
 Rules:
 
 | Rule | Why it exists |
 |---|---|
 | `selected_seqs` must be non-empty | Replay must make progress. |
 | Every offered seq must be selected or deferred | The planner cannot ignore work. |
+| `commit_groups`, when present, must be ordered and non-overlapping | Replay publishes groups sequentially and must preserve chronology. |
 | `deferred_reasons` may mention only deferred seqs | Reasons stay aligned with the plan. |
 | `subject` must match `commit_format` | Wrong-format output gets rejected, corrected, or falls back deterministically. |
 | Non-empty `error` is a soft error | ACD keeps the plugin alive and falls back for that request. |
