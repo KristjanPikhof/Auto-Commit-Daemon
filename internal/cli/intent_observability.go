@@ -93,6 +93,7 @@ type intentStrategyReport struct {
 	LastMessageQualityPath            string `json:"last_message_quality_path,omitempty"`
 	LastMessageQualityAction          string `json:"last_message_quality_action,omitempty"`
 	LastMessageQualityReason          string `json:"last_message_quality_reason,omitempty"`
+	LastPlannerWindow                 *intentPlannerWindowSummary `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
@@ -207,6 +208,21 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 				valueOrUnset(r.LastMessageQualityPath),
 				valueOrUnset(r.LastMessageQualityAction),
 				r.LastMessageQualityReason)
+		}
+	}
+	if r.LastPlannerWindow != nil {
+		win := r.LastPlannerWindow
+		fmt.Fprintf(out, "Last planner window: #%d provider=%s offered=%s selected_groups=%d deferred=%s\n",
+			win.ID,
+			valueOrUnset(win.Provider),
+			formatSeqs(win.OfferedSeqs),
+			len(win.SelectedGroups),
+			valueOrUnset(formatSeqs(win.DeferredSeqs)))
+		if len(win.HiddenSeqs) > 0 {
+			fmt.Fprintf(out, "  Hidden/coalesced seqs: %s\n", formatSeqs(win.HiddenSeqs))
+		}
+		if win.ValidationFailure != "" {
+			fmt.Fprintf(out, "  Validation fallback: %s\n", win.ValidationFailure)
 		}
 	}
 	if r.PlannerErrorRateRecent > 0 || r.SingletonCommitRateRecent > 0 {
