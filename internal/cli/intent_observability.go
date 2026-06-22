@@ -63,6 +63,7 @@ type intentStrategyReport struct {
 	RecentCommits                     int    `json:"recent_commits,omitempty"`
 	DeferLimit                        int    `json:"defer_limit,omitempty"`
 	MinPending                        int    `json:"min_pending,omitempty"`
+	SettleWindowSeconds               int64  `json:"settle_window_seconds"`
 	MaxPendingAgeSeconds              int64  `json:"max_pending_age_seconds,omitempty"`
 	IntentStageDiffCap                int    `json:"intent_stage_diff_cap,omitempty"`
 	VisiblePendingEvents              int    `json:"visible_pending_events,omitempty"`
@@ -160,8 +161,8 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		status = r.Strategy
 	}
 	if r.Active {
-		fmt.Fprintf(out, "Commit strategy: %s format=%s (window %d, min pending %d, max age %s, recent commits %d, defer limit %d)\n",
-			status, valueOrUnset(r.CommitFormat), r.Window, r.MinPending, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
+		fmt.Fprintf(out, "Commit strategy: %s format=%s (window %d, min pending %d, settle %s, max age %s, recent commits %d, defer limit %d)\n",
+			status, valueOrUnset(r.CommitFormat), r.Window, r.MinPending, formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second), formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
 	} else {
 		fmt.Fprintf(out, "Commit strategy: %s format=%s\n", status, valueOrUnset(r.CommitFormat))
 	}
@@ -268,6 +269,9 @@ func intentStrategyFromEnv() intentStrategyReport {
 		RecentCommits: cfg.IntentRecentCommits,
 		DeferLimit:    cfg.IntentDeferLimit,
 		MinPending:    cfg.IntentMinPending,
+		SettleWindowSeconds: int64(
+			cfg.IntentSettleWindow / time.Second,
+		),
 		MaxPendingAgeSeconds: int64(
 			cfg.IntentMaxPendingAge / time.Second,
 		),
@@ -310,6 +314,11 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 		return report, fmt.Errorf("intent.min_pending: %w", err)
 	} else if ok {
 		report.MinPending = parseIntentMetaInt(v, report.MinPending)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.settle_window"); err != nil {
+		return report, fmt.Errorf("intent.settle_window: %w", err)
+	} else if ok {
+		report.SettleWindowSeconds = parseIntentMetaNonNegativeDurationSeconds(v, report.SettleWindowSeconds)
 	}
 	if v, ok, err := metaLookup(ctx, conn, "intent.max_pending_age"); err != nil {
 		return report, fmt.Errorf("intent.max_pending_age: %w", err)
@@ -718,6 +727,18 @@ func parseIntentMetaInt(raw string, fallback int) int {
 func parseIntentMetaDurationSeconds(raw string, fallback int64) int64 {
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		return fallback
+	}
+	return int64(d / time.Second)
+}
+
+func parseIntentMetaNonNegativeDurationSeconds(raw string, fallback int64) int64 {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d < 0 {
 		return fallback
 	}
 	return int64(d / time.Second)

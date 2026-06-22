@@ -431,6 +431,7 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 		"commit.strategy":       "intent",
 		"commit.format":         "conventional",
 		"intent.window":         "7",
+		"intent.settle_window":  "15s",
 		"intent.recent_commits": "3",
 		"intent.defer_limit":    "1",
 	} {
@@ -451,6 +452,7 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 	if !rep.IntentStrategy.Active || rep.IntentStrategy.Strategy != "intent" ||
 		rep.IntentStrategy.CommitFormat != "conventional" ||
 		rep.IntentStrategy.Window != 7 || rep.IntentStrategy.RecentCommits != 3 ||
+		rep.IntentStrategy.SettleWindowSeconds != 15 ||
 		rep.IntentStrategy.DeferLimit != 1 {
 		t.Fatalf("intent strategy = %+v, want daemon metadata", rep.IntentStrategy)
 	}
@@ -471,6 +473,7 @@ func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 		"commit.strategy":        "intent",
 		"intent.window":          "7",
 		"intent.min_pending":     "3",
+		"intent.settle_window":   "0s",
 		"intent.max_pending_age": "2m",
 		"intent.recent_commits":  "3",
 		"intent.defer_limit":     "1",
