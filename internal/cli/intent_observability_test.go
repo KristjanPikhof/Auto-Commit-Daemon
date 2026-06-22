@@ -316,6 +316,9 @@ func TestStatus_IntentStageDiffCapExposedInJSON(t *testing.T) {
 	if got := report.IntentStrategy.IntentStageDiffCap; got != ai.IntentStageDiffCap {
 		t.Fatalf("IntentStageDiffCap=%d want %d", got, ai.IntentStageDiffCap)
 	}
+	if got, want := report.IntentStrategy.SettleWindowSeconds, int64(ai.DefaultIntentSettleWindow/time.Second); got != want {
+		t.Fatalf("SettleWindowSeconds=%d want %d", got, want)
+	}
 }
 
 // TestDiagnose_IntentStageDiffCapExposedInJSON mirrors the status check
@@ -337,6 +340,9 @@ func TestDiagnose_IntentStageDiffCapExposedInJSON(t *testing.T) {
 	}
 	if got := report.IntentStrategy.IntentStageDiffCap; got != ai.IntentStageDiffCap {
 		t.Fatalf("diagnose IntentStageDiffCap=%d want %d", got, ai.IntentStageDiffCap)
+	}
+	if got, want := report.IntentStrategy.SettleWindowSeconds, int64(ai.DefaultIntentSettleWindow/time.Second); got != want {
+		t.Fatalf("diagnose SettleWindowSeconds=%d want %d", got, want)
 	}
 }
 

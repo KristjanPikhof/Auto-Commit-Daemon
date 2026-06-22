@@ -497,6 +497,7 @@ func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 		rep.IntentStrategy.BatchWaitReason != "skipped_due_intent_batch_wait" ||
 		rep.IntentStrategy.VisiblePendingEvents != 2 ||
 		rep.IntentStrategy.MinPending != 3 ||
+		rep.IntentStrategy.SettleWindowSeconds != 0 ||
 		rep.IntentStrategy.MaxPendingAgeSeconds != 120 ||
 		rep.IntentStrategy.OldestPendingEventSeq != seq ||
 		rep.IntentStrategy.OldestPendingPath != "wait-a.go" {
