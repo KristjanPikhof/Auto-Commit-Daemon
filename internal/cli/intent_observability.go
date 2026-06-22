@@ -70,8 +70,12 @@ type intentStrategyReport struct {
 	OldestPendingEventSeq             int64  `json:"oldest_pending_event_seq,omitempty"`
 	OldestPendingPath                 string `json:"oldest_pending_path,omitempty"`
 	OldestPendingAgeSeconds           int64  `json:"oldest_pending_age_seconds,omitempty"`
+	NewestPendingEventSeq             int64  `json:"newest_pending_event_seq,omitempty"`
+	NewestPendingAgeSeconds           int64  `json:"newest_pending_age_seconds,omitempty"`
 	AgeTriggerTS                      int64  `json:"age_trigger_ts,omitempty"`
 	AgeTriggerInSeconds               int64  `json:"age_trigger_in_seconds,omitempty"`
+	SettleTriggerTS                   int64  `json:"settle_trigger_ts,omitempty"`
+	SettleTriggerInSeconds            int64  `json:"settle_trigger_in_seconds,omitempty"`
 	BatchWaitActive                   bool   `json:"batch_wait_active,omitempty"`
 	BatchWaitReason                   string `json:"batch_wait_reason,omitempty"`
 	DeferredEvents                    int    `json:"deferred_events,omitempty"`

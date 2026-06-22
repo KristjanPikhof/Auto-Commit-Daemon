@@ -2145,6 +2145,7 @@ func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx Captu
 			"path_commit_context_count": len(req.PathCommitContext),
 			"window":                    cfg.window,
 			"min_pending":               cfg.minPending,
+			"settle_window_seconds":     cfg.settleWindow.Seconds(),
 			"max_pending_age_seconds":   cfg.maxPendingAge.Seconds(),
 			"recent_commits":            cfg.recent,
 			"defer_limit":               cfg.deferLimit,
@@ -2159,6 +2160,8 @@ func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureC
 	}
 	oldest := pending[0]
 	oldestAgeSeconds := time.Now().Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second)))).Seconds()
+	newest := pending[len(pending)-1]
+	newestAgeSeconds := time.Now().Sub(time.Unix(0, int64(newest.CapturedTS*float64(time.Second)))).Seconds()
 	logger.Record(acdtrace.Event{
 		Repo:       repoRoot,
 		BranchRef:  cctx.BranchRef,
@@ -2171,6 +2174,9 @@ func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureC
 			"min_pending":             cfg.minPending,
 			"oldest_seq":              oldest.Seq,
 			"oldest_age_seconds":      oldestAgeSeconds,
+			"newest_seq":              newest.Seq,
+			"newest_age_seconds":      newestAgeSeconds,
+			"settle_window_seconds":   cfg.settleWindow.Seconds(),
 			"max_pending_age_seconds": cfg.maxPendingAge.Seconds(),
 			"window":                  cfg.window,
 		},
