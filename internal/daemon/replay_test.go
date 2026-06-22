@@ -2490,6 +2490,90 @@ func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "rapid-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "rapid-b.txt", "b\n")
+
+	prematurePlanner := &recordingIntentPlanner{
+		err: errors.New("planner must not run before settle window elapses"),
+	}
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Trace:               trace,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       prematurePlanner,
+		IntentWindow:        10,
+		IntentMinPending:    2,
+		IntentSettleWindow:  time.Hour,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay before settle: %v", err)
+	}
+	if prematurePlanner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 while rapid burst is settling", prematurePlanner.calls)
+	}
+	if sum.Published != 0 || !sum.Skipped || sum.SkippedReason != "skipped_due_intent_settle_window" {
+		t.Fatalf("summary=%+v want skipped_due_intent_settle_window with no publish", sum)
+	}
+	events := traceEventsByClass(trace.Events(), "intent.batch_wait")
+	if len(events) != 1 || events[0].Reason != "skipped_due_intent_settle_window" {
+		t.Fatalf("intent.batch_wait trace=%+v want skipped_due_intent_settle_window", events)
+	}
+
+	captureOnePendingFile(t, ctx, f, "rapid-c.txt", "c\n")
+	captureOnePendingFile(t, ctx, f, "rapid-d.txt", "d\n")
+	captureOnePendingFile(t, ctx, f, "rapid-e.txt", "e\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 5 {
+		t.Fatalf("pending=%d want 5 rapid captures", len(pending))
+	}
+	allSeqs := make([]int64, 0, len(pending))
+	for _, ev := range pending {
+		allSeqs = append(allSeqs, ev.Seq)
+		setCaptureEventTimestamp(t, ctx, f.db, ev.Seq, time.Now().Add(-time.Minute))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   allSeqs,
+			Subject:        "Group rapid five",
+			GroupingReason: "settle window collected the rapid burst",
+		},
+	}
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    2,
+		IntentSettleWindow:  10 * time.Second,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay after settle: %v", err)
+	}
+	if sum.Published != 5 || sum.Skipped {
+		t.Fatalf("summary=%+v want five rapid captures published together", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1 after settle", planner.calls)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	if !reflect.DeepEqual(gotOffered, allSeqs) {
+		t.Fatalf("offered seqs=%v want all rapid seqs %v", gotOffered, allSeqs)
+	}
+}
+
 func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()

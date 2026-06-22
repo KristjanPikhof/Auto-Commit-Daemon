@@ -1228,8 +1228,10 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return []state.CaptureEvent{forcedEvent}, true, "", nil
 	}
-	if !cfg.bypassBatchWait && intentBatchShouldWait(pending, cfg, time.Now()) {
-		return nil, false, "skipped_due_intent_batch_wait", nil
+	if !cfg.bypassBatchWait {
+		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
+			return nil, false, waitReason, nil
+		}
 	}
 	n := cfg.window
 	if n > len(pending) {
@@ -1361,12 +1363,32 @@ func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int,
 }
 
 func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
+	return intentBatchWaitReason(pending, cfg, now) != ""
+}
+
+func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) string {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
-		return false
+		if len(pending) == 0 || cfg.settleWindow <= 0 {
+			return ""
+		}
+		oldest := pending[0]
+		oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
+		if oldestAge >= cfg.maxPendingAge {
+			return ""
+		}
+		newest := pending[len(pending)-1]
+		newestAge := now.Sub(time.Unix(0, int64(newest.CapturedTS*float64(time.Second))))
+		if newestAge < cfg.settleWindow {
+			return "skipped_due_intent_settle_window"
+		}
+		return ""
 	}
 	oldest := pending[0]
 	oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
-	return oldestAge < cfg.maxPendingAge
+	if oldestAge < cfg.maxPendingAge {
+		return "skipped_due_intent_batch_wait"
+	}
+	return ""
 }
 
 func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
