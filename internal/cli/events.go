@@ -57,6 +57,7 @@ type eventEntry struct {
 	GroupedSeqs      []int64 `json:"grouped_seqs,omitempty"`
 	GroupSize        int     `json:"group_size,omitempty"`
 	IntentGroup      bool    `json:"intent_group,omitempty"`
+	PlannerWindow    *intentPlannerWindowSummary `json:"planner_window,omitempty"`
 	Deferred         bool    `json:"deferred,omitempty"`
 	ForcedAging      bool    `json:"forced_aging,omitempty"`
 	PlannerError     bool    `json:"planner_error,omitempty"`
@@ -357,6 +358,13 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 		if len(entry.GroupedSeqs) > 1 {
 			message = fmt.Sprintf("%s seqs=%s", message, formatSeqs(entry.GroupedSeqs))
 		}
+		if entry.PlannerWindow != nil {
+			message = fmt.Sprintf("%s planner_window=%d offered=%s",
+				message, entry.PlannerWindow.ID, formatSeqs(entry.PlannerWindow.OfferedSeqs))
+			if len(entry.PlannerWindow.HiddenSeqs) > 0 {
+				message = fmt.Sprintf("%s hidden=%s", message, formatSeqs(entry.PlannerWindow.HiddenSeqs))
+			}
+		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
 			entry.ID, entry.Time, entry.Kind, path, action, message)
 	}
@@ -425,26 +433,36 @@ func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) e
 		return nil
 	}
 	cache := map[string]decisionCommitSummary{}
+	hasPlannerWindows, err := sqliteTableExists(ctx, db, "intent_planner_window_events")
+	if err != nil {
+		return fmt.Errorf("acd events: intent planner window table check: %w", err)
+	}
 	for i := range entries {
 		commit := entries[i].CommitOID
-		if commit == "" {
-			continue
+		if commit != "" {
+			summary, ok := cache[commit]
+			if !ok {
+				var err error
+				summary, err = decisionCommitSummarySQL(ctx, db, commit)
+				if err != nil {
+					return err
+				}
+				cache[commit] = summary
+			}
+			if len(summary.Seqs) > 1 {
+				entries[i].GroupedSeqs = append([]int64(nil), summary.Seqs...)
+				entries[i].GroupSize = len(summary.Seqs)
+			}
+			if summary.IntentGroup {
+				entries[i].IntentGroup = true
+			}
 		}
-		summary, ok := cache[commit]
-		if !ok {
-			var err error
-			summary, err = decisionCommitSummarySQL(ctx, db, commit)
+		if hasPlannerWindows && entries[i].EventSeq > 0 {
+			window, err := loadIntentPlannerWindowForEventSQL(ctx, db, entries[i].EventSeq)
 			if err != nil {
 				return err
 			}
-			cache[commit] = summary
-		}
-		if len(summary.Seqs) > 1 {
-			entries[i].GroupedSeqs = append([]int64(nil), summary.Seqs...)
-			entries[i].GroupSize = len(summary.Seqs)
-		}
-		if summary.IntentGroup {
-			entries[i].IntentGroup = true
+			entries[i].PlannerWindow = window
 		}
 	}
 	return nil
