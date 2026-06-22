@@ -194,6 +194,11 @@ type ReplayOpts struct {
 	// planning starts. Zero resolves from env.
 	IntentMinPending int
 
+	// IntentSettleWindow is the burst-settle delay after IntentMinPending is
+	// reached. Zero resolves from env; use a negative value in tests to force
+	// zero/off.
+	IntentSettleWindow time.Duration
+
 	// IntentMaxPendingAge is the bounded wait escape hatch for sparse pending
 	// queues that have not reached IntentMinPending. Zero resolves from env.
 	IntentMaxPendingAge time.Duration
@@ -794,6 +799,7 @@ type intentReplayConfig struct {
 	planner         ai.IntentPlanner
 	window          int
 	minPending      int
+	settleWindow    time.Duration
 	maxPendingAge   time.Duration
 	recent          int
 	deferLimit      int
@@ -832,6 +838,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		enabled:              true,
 		window:               cfg.IntentWindow,
 		minPending:           cfg.IntentMinPending,
+		settleWindow:         cfg.IntentSettleWindow,
 		maxPendingAge:        cfg.IntentMaxPendingAge,
 		recent:               cfg.IntentRecentCommits,
 		deferLimit:           cfg.IntentDeferLimit,
@@ -846,6 +853,11 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 	if opts.IntentMinPending > 0 {
 		out.minPending = opts.IntentMinPending
+	}
+	if opts.IntentSettleWindow > 0 {
+		out.settleWindow = opts.IntentSettleWindow
+	} else if opts.IntentSettleWindow < 0 {
+		out.settleWindow = 0
 	}
 	if opts.IntentMaxPendingAge > 0 {
 		out.maxPendingAge = opts.IntentMaxPendingAge
@@ -863,6 +875,9 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 	if out.minPending <= 0 {
 		out.minPending = ai.DefaultIntentMinPending
+	}
+	if out.settleWindow < 0 {
+		out.settleWindow = 0
 	}
 	if out.maxPendingAge <= 0 {
 		out.maxPendingAge = ai.DefaultIntentMaxPendingAge
