@@ -5221,6 +5221,53 @@ func TestReplay_IntentSamePathCapturesRemainPlannerVisible(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentSameFileIndependentFunctionsRemainPlannerVisible(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "module.py", "def price():\n    return 10\n\n\ndef slug():\n    return 'old'\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	seq1 := captureSamePathEdit(t, ctx, f, "module.py", "def price():\n    return 12\n\n\ndef slug():\n    return 'old'\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "module.py", "def price():\n    return 12\n\n\ndef slug():\n    return 'new'\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2 same-file captures", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{seq1, seq2},
+			Subject:        "Group module updates",
+			GroupingReason: "test selects both visible same-file captures",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 2,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published, 0 conflicts/failed", sum)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{seq1, seq2}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v (independent same-file captures must stay planner-visible)", gotOffered, wantOffered)
+	}
+}
+
 // TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce: a same-path capture
 // surrounded by an other-path capture stays as 3 separate offers.
 func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
@@ -5269,12 +5316,8 @@ func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
 	if got := planner.requests[0].OfferedCaptures; len(got) != 3 {
 		t.Fatalf("planner offered captures=%d want 3 (P/Q/P must split)", len(got))
 	}
-	// Verify each offer is a distinct seq (no coalesce_token) — read from
-	// the offered captures' seqs.
-	offeredSeqs := make([]int64, 0, 3)
-	for _, c := range planner.requests[0].OfferedCaptures {
-		offeredSeqs = append(offeredSeqs, c.Seq)
-	}
+	// Verify each offer is a distinct seq (no coalesce_token).
+	offeredSeqs := offeredCaptureSeqs(planner.requests[0])
 	wantOffered := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq}
 	if !reflect.DeepEqual(offeredSeqs, wantOffered) {
 		t.Fatalf("offered seqs=%v want %v", offeredSeqs, wantOffered)
