@@ -194,6 +194,9 @@ For windows that contain several independent intents, return ordered
   "version": 1,
   "selected_seqs": [101, 103],
   "deferred_seqs": [102],
+  "subject": "Add auth retry handling",
+  "body": "- Keep transient failures available for retry",
+  "grouping_reason": "Auth retry handling and retry docs are separate commits",
   "commit_groups": [
     {
       "selected_seqs": [101],
@@ -214,6 +217,11 @@ For windows that contain several independent intents, return ordered
   "error": ""
 }
 ~~~
+
+The top-level `selected_seqs`, `subject`, `body`, and `grouping_reason` remain
+required for legacy compatibility. When `commit_groups` is present,
+`selected_seqs` must be the union of all group selections; the top-level
+message can mirror the first group or summarize the selected window.
 
 Rules:
 

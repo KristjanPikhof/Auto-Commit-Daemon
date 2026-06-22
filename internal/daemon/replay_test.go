@@ -3227,6 +3227,68 @@ func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T)
 	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: second capture is independent")
 }
 
+func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "chain.txt", "v0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	seq1 := captureSamePathEdit(t, ctx, f, "chain.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "chain.txt", "v2\n")
+	seq3 := captureSamePathEdit(t, ctx, f, "chain.txt", "v3\n")
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs: []int64{seq1, seq2, seq3},
+			CommitGroups: []ai.IntentCommitGroup{
+				{SelectedSeqs: []int64{seq1, seq3}, Subject: "Update chain endpoints", GroupingReason: "invalid interleaved same-path group"},
+				{SelectedSeqs: []int64{seq2}, Subject: "Update chain middle", GroupingReason: "middle same-path capture"},
+			},
+			DeferredSeqs:    []int64{},
+			DeferredReasons: []ai.DeferredReason{},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want deterministic fallback publish without blocking", sum)
+	}
+	if state1 := captureEventState(t, ctx, f.db, seq1); state1 != state.EventStatePublished {
+		t.Fatalf("seq1 state=%q want published fallback", state1)
+	}
+	for _, seq := range []int64{seq2, seq3} {
+		if got := captureEventState(t, ctx, f.db, seq); got != state.EventStatePending {
+			t.Fatalf("seq=%d state=%q want pending after fallback", seq, got)
+		}
+	}
+	decisions, err := state.DecisionsForEvent(ctx, f.db, seq1, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	foundPlannerError := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindIntentPlannerError &&
+			decision.Reason.Valid &&
+			decision.Reason.String == "intent planner: commit_groups must be ordered by non-overlapping selected seq ranges" {
+			foundPlannerError = true
+		}
+	}
+	if !foundPlannerError {
+		t.Fatalf("missing planner error decision for seq %d: %+v", seq1, decisions)
+	}
+}
+
 func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()

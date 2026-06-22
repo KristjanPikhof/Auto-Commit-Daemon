@@ -356,6 +356,34 @@ func TestValidateIntentPlanRejectsUnorderedCommitGroups(t *testing.T) {
 	}
 }
 
+func TestValidateIntentPlanRejectsInterleavedCommitGroups(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	req.OfferedCaptures = append(req.OfferedCaptures, OfferedCapture{
+		Seq:       103,
+		Path:      "checkout/service.go",
+		Op:        "modify",
+		Timestamp: req.OfferedCaptures[1].Timestamp,
+		Fidelity:  "exact",
+	})
+	plan := IntentPlan{
+		SelectedSeqs: []int64{101, 102, 103},
+		CommitGroups: []IntentCommitGroup{
+			{SelectedSeqs: []int64{101, 103}, Subject: "Update checkout service", GroupingReason: "interleaved range"},
+			{SelectedSeqs: []int64{102}, Subject: "Update checkout docs", GroupingReason: "middle capture"},
+		},
+		DeferredSeqs:    []int64{},
+		DeferredReasons: []DeferredReason{},
+	}
+	err := ValidateIntentPlan(req, plan)
+	if err == nil {
+		t.Fatalf("expected interleaved commit_groups rejection")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) || typed.Code != IntentPlanValidationShape {
+		t.Fatalf("error=%T %v want shape validation error", err, err)
+	}
+}
+
 func TestValidateIntentPlanReturnsTypedErrorForSelectedDeferredOverlap(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan := IntentPlan{

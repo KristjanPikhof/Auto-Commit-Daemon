@@ -7,12 +7,12 @@ package integration_test
 // the b1 outcome (intent grouped publishes are atomic) that landed earlier
 // in this branch.
 //
-// The exhaustive same-path 4-edit coalesce proof lives at the daemon
+// The exhaustive same-path 4-edit visibility proof lives at the daemon
 // package level in internal/daemon/replay_test.go (see
-// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer): four sequential
-// captures on burst.txt fold into a single planner offer, every covered seq
-// shares the resulting commit_oid, and decision_records carries one row per
-// original seq joined by commit_oid.
+// TestReplay_IntentSamePathCapturesRemainPlannerVisible): four sequential
+// captures on burst.txt stay planner-visible, the planner may select them
+// into one commit, and decision_records carries one row per original seq
+// joined by commit_oid.
 //
 // The integration suite cannot drive four sequential same-path captures
 // deterministically: `acd pause` halts capture as well as replay, so a

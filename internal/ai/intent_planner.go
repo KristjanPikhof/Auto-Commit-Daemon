@@ -418,7 +418,7 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	}
 	selected := make(map[int64]struct{}, len(groups))
 	var selectedSeqs []int64
-	lastGroupFirstSeq := int64(0)
+	lastGroupMaxSeq := int64(0)
 	for groupIndex, group := range groups {
 		if len(group.SelectedSeqs) == 0 {
 			return &IntentPlanValidationError{
@@ -438,20 +438,15 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 				Message: fmt.Sprintf("intent planner: commit_groups[%d].grouping_reason must be non-empty", groupIndex),
 			}
 		}
-		groupFirstSeq := int64(0)
-		for _, seq := range group.SelectedSeqs {
-			if groupFirstSeq == 0 || seq < groupFirstSeq {
-				groupFirstSeq = seq
-			}
-		}
-		if lastGroupFirstSeq != 0 && groupFirstSeq < lastGroupFirstSeq {
+		groupMinSeq, groupMaxSeq := groupSeqRange(group.SelectedSeqs)
+		if lastGroupMaxSeq != 0 && groupMinSeq < lastGroupMaxSeq {
 			return &IntentPlanValidationError{
 				Code:    IntentPlanValidationShape,
-				Seq:     groupFirstSeq,
-				Message: "intent planner: commit_groups must be ordered by selected seq",
+				Seq:     groupMinSeq,
+				Message: "intent planner: commit_groups must be ordered by non-overlapping selected seq ranges",
 			}
 		}
-		lastGroupFirstSeq = groupFirstSeq
+		lastGroupMaxSeq = groupMaxSeq
 		for _, seq := range group.SelectedSeqs {
 			if _, ok := offered[seq]; !ok {
 				return &IntentPlanValidationError{
@@ -565,6 +560,19 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 	}
 
 	return nil
+}
+
+func groupSeqRange(seqs []int64) (int64, int64) {
+	minSeq, maxSeq := int64(0), int64(0)
+	for _, seq := range seqs {
+		if minSeq == 0 || seq < minSeq {
+			minSeq = seq
+		}
+		if maxSeq == 0 || seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return minSeq, maxSeq
 }
 
 // IntentPlanCommitGroups returns the ordered publish groups for a plan.
