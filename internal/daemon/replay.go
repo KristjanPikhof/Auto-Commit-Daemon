@@ -195,8 +195,8 @@ type ReplayOpts struct {
 	IntentMinPending int
 
 	// IntentSettleWindow is the burst-settle delay after IntentMinPending is
-	// reached. Zero resolves from env; use a negative value in tests to force
-	// zero/off.
+	// reached. Zero resolves from env for normal callers. Tests that inject
+	// IntentPlanner must set this explicitly to exercise the settle gate.
 	IntentSettleWindow time.Duration
 
 	// IntentMaxPendingAge is the bounded wait escape hatch for sparse pending
@@ -858,6 +858,8 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		out.settleWindow = opts.IntentSettleWindow
 	} else if opts.IntentSettleWindow < 0 {
 		out.settleWindow = 0
+	} else if opts.IntentPlanner != nil {
+		out.settleWindow = 0
 	}
 	if opts.IntentMaxPendingAge > 0 {
 		out.maxPendingAge = opts.IntentMaxPendingAge
@@ -1445,9 +1447,9 @@ func buildIntentPlanRequest(
 	forced bool,
 	cfg intentReplayConfig,
 ) ([]intentReplayItem, ai.IntentPlanRequest, error) {
-	// Same-path coalesce runs ahead of the planner offer so a burst of
-	// edits to one file folds into one offered entry. Default ON; opt out
-	// via ACD_INTENT_PATH_COALESCE=0|false|no|off (restart to apply).
+	// Legacy same-path coalesce can run ahead of the planner offer, but it
+	// defaults off so every durable capture remains planner-visible. Operators
+	// can opt in via ACD_INTENT_PATH_COALESCE=1|true|yes|on (restart to apply).
 	offers, err := coalesceIntentWindow(ctx, db, events, pathCoalesceEnabled(), state.LoadCaptureOps)
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
