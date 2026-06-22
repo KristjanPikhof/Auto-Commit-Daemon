@@ -2278,7 +2278,7 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 			"offered_seqs": intentItemSeqs(items),
 		},
 		Output: map[string]any{
-			"commit_groups":  intentTraceCommitGroups(plan),
+			"commit_groups": intentTraceCommitGroups(plan),
 			"selected_seqs": plan.SelectedSeqs,
 			"deferred_seqs": plan.DeferredSeqs,
 			"source":        plan.Source,
@@ -2295,10 +2295,10 @@ func intentTraceCommitGroups(plan ai.IntentPlan) []map[string]any {
 	out := make([]map[string]any, 0, len(groups))
 	for _, group := range groups {
 		out = append(out, map[string]any{
-			"selected_seqs":    append([]int64(nil), group.SelectedSeqs...),
-			"subject":          group.Subject,
-			"grouping_reason":  group.GroupingReason,
-			"body_present":     strings.TrimSpace(group.Body) != "",
+			"selected_seqs":   append([]int64(nil), group.SelectedSeqs...),
+			"subject":         group.Subject,
+			"grouping_reason": group.GroupingReason,
+			"body_present":    strings.TrimSpace(group.Body) != "",
 		})
 	}
 	return out
