@@ -438,7 +438,12 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 				Message: fmt.Sprintf("intent planner: commit_groups[%d].grouping_reason must be non-empty", groupIndex),
 			}
 		}
-		groupFirstSeq := group.SelectedSeqs[0]
+		groupFirstSeq := int64(0)
+		for _, seq := range group.SelectedSeqs {
+			if groupFirstSeq == 0 || seq < groupFirstSeq {
+				groupFirstSeq = seq
+			}
+		}
 		if lastGroupFirstSeq != 0 && groupFirstSeq < lastGroupFirstSeq {
 			return &IntentPlanValidationError{
 				Code:    IntentPlanValidationShape,
@@ -447,16 +452,7 @@ func ValidateIntentPlan(req IntentPlanRequest, plan IntentPlan) error {
 			}
 		}
 		lastGroupFirstSeq = groupFirstSeq
-		lastSeq := int64(0)
 		for _, seq := range group.SelectedSeqs {
-			if lastSeq != 0 && seq < lastSeq {
-				return &IntentPlanValidationError{
-					Code:    IntentPlanValidationShape,
-					Seq:     seq,
-					Message: "intent planner: selected seqs within a commit group must be ordered",
-				}
-			}
-			lastSeq = seq
 			if _, ok := offered[seq]; !ok {
 				return &IntentPlanValidationError{
 					Code:    IntentPlanValidationOfferedWindow,
