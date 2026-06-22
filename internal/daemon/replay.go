@@ -1373,6 +1373,9 @@ func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig,
 		if len(pending) == 0 || cfg.settleWindow <= 0 {
 			return ""
 		}
+		if cfg.window > 0 && len(pending) >= cfg.window {
+			return ""
+		}
 		oldest := pending[0]
 		oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
 		if oldestAge >= cfg.maxPendingAge {

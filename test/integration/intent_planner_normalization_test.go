@@ -365,6 +365,7 @@ func TestIntentStrategy_SingletonShortCircuitUsesMessageProvider(t *testing.T) {
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=1",
+		"ACD_INTENT_SETTLE_WINDOW=0",
 		"ACD_INTENT_MAX_PENDING_AGE=1h",
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
