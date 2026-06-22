@@ -2574,6 +2574,54 @@ func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "full-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "full-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Full window",
+			GroupingReason: "full window bypasses settle wait",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    2,
+		IntentSettleWindow:  time.Hour,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want full window to plan without settle wait", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{pending[0].Seq, pending[1].Seq}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v", gotOffered, wantOffered)
+	}
+}
+
 func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()

@@ -751,6 +751,7 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	} else if report.Active &&
 		report.ForcedAgingReady == 0 &&
 		report.VisiblePendingEvents >= report.MinPending &&
+		(report.Window <= 0 || report.VisiblePendingEvents < report.Window) &&
 		report.SettleWindowSeconds > 0 &&
 		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds &&
 		report.NewestPendingAgeSeconds < report.SettleWindowSeconds {
