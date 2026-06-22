@@ -516,6 +516,62 @@ func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 	}
 }
 
+func TestStatus_IntentStrategyReportsSettleWaitState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	for k, v := range map[string]string{
+		"commit.strategy":        "intent",
+		"intent.window":          "7",
+		"intent.min_pending":     "2",
+		"intent.settle_window":   "1m",
+		"intent.max_pending_age": "2m",
+		"intent.recent_commits":  "3",
+		"intent.defer_limit":     "1",
+	} {
+		if err := state.MetaSet(ctx, d, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	appendIntentPendingEvent(t, ctx, d, "settle-a.go", nowFloat()-10)
+	newest := appendIntentPendingEvent(t, ctx, d, "settle-b.go", nowFloat()-5)
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if !rep.IntentStrategy.BatchWaitActive ||
+		rep.IntentStrategy.BatchWaitReason != "skipped_due_intent_settle_window" ||
+		rep.IntentStrategy.VisiblePendingEvents != 2 ||
+		rep.IntentStrategy.MinPending != 2 ||
+		rep.IntentStrategy.SettleWindowSeconds != 60 ||
+		rep.IntentStrategy.NewestPendingEventSeq != newest {
+		t.Fatalf("intent strategy = %+v, want active settle wait", rep.IntentStrategy)
+	}
+	if rep.IntentStrategy.NewestPendingAgeSeconds <= 0 || rep.IntentStrategy.SettleTriggerInSeconds <= 0 {
+		t.Fatalf("intent settle ages = %+v, want positive newest age and trigger countdown", rep.IntentStrategy)
+	}
+
+	var humanOut bytes.Buffer
+	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	if !strings.Contains(humanOut.String(), "Intent settle wait: pending=2") {
+		t.Fatalf("status human missing settle wait line:\n%s", humanOut.String())
+	}
+}
+
 func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

@@ -253,10 +253,16 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 				e.IntentWaitSeconds = summary.intentWait.waitSeconds
 				e.IntentVisiblePending = summary.intentWait.visiblePending
 				e.IntentMinPending = summary.intentWait.minPending
-				e.StatusNote = fmt.Sprintf("intent batch wait: pending=%d/%d, trigger in %s",
-					summary.intentWait.visiblePending,
-					summary.intentWait.minPending,
-					formatDurationCompact(time.Duration(summary.intentWait.waitSeconds)*time.Second))
+				if summary.intentWait.reason == "skipped_due_intent_settle_window" {
+					e.StatusNote = fmt.Sprintf("intent settle wait: pending=%d, trigger in %s",
+						summary.intentWait.visiblePending,
+						formatDurationCompact(time.Duration(summary.intentWait.waitSeconds)*time.Second))
+				} else {
+					e.StatusNote = fmt.Sprintf("intent batch wait: pending=%d/%d, trigger in %s",
+						summary.intentWait.visiblePending,
+						summary.intentWait.minPending,
+						formatDurationCompact(time.Duration(summary.intentWait.waitSeconds)*time.Second))
+				}
 			}
 		}
 		if summary.pause != nil {
@@ -405,6 +411,7 @@ type listIntentWaitSummary struct {
 	waitSeconds    int64
 	visiblePending int
 	minPending     int
+	reason         string
 }
 
 // summarizeRepo opens the per-repo state.db read-only and pulls a small
@@ -573,13 +580,21 @@ WHERE e.state = ? AND ps.defer_count >= ?
 	if err := loadIntentBatchWait(ctx, conn, &report); err != nil {
 		return nil, err
 	}
-	if !report.BatchWaitActive || report.AgeTriggerInSeconds <= 0 {
+	if !report.BatchWaitActive {
+		return nil, nil
+	}
+	waitSeconds := report.AgeTriggerInSeconds
+	if report.BatchWaitReason == "skipped_due_intent_settle_window" {
+		waitSeconds = report.SettleTriggerInSeconds
+	}
+	if waitSeconds <= 0 {
 		return nil, nil
 	}
 	return &listIntentWaitSummary{
-		waitSeconds:    report.AgeTriggerInSeconds,
+		waitSeconds:    waitSeconds,
 		visiblePending: report.VisiblePendingEvents,
 		minPending:     report.MinPending,
+		reason:         report.BatchWaitReason,
 	}, nil
 }
 
