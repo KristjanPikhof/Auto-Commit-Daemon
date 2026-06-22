@@ -101,6 +101,8 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"Do not group unrelated captures. " +
 	"Do not invent intent beyond the supplied evidence. " +
 	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture and leave deferred_seqs and deferred_reasons empty. " +
+	"When one visible window contains multiple independent commit intents, return commit_groups in chronological order; each group has its own selected_seqs, subject, body, and grouping_reason. " +
+	"When commit_groups is present, top-level selected_seqs must be the union of all group selected_seqs and top-level subject/body/grouping_reason may describe the first group for legacy compatibility. " +
 	"Same-path causality: when you defer an offered seq for path P, every later offered seq that touches P must also be deferred (or the entire same-path chain must be selected together); never split a same-path chain by selecting a later seq while deferring an earlier one. " +
 	"Defer_count guidance: prefer captures whose defer_count >= 1 for inclusion when the evidence permits, so a capture deferred in earlier windows does not churn forever. " +
 	"selected_seqs and deferred_seqs MUST be disjoint and their union MUST equal offered_seqs. " +

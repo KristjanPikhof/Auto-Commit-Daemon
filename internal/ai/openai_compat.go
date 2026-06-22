@@ -146,6 +146,34 @@ func openAIIntentPlanParameters(format CommitFormat) map[string]any {
 					"additionalProperties": false,
 				},
 			},
+			"commit_groups": map[string]any{
+				"type":        "array",
+				"description": "Optional ordered commit partition for selected captures. Use when one offered window contains multiple independent commits.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"selected_seqs": map[string]any{
+							"type":        "array",
+							"description": "Non-empty seqs selected for this commit group.",
+							"items":       map[string]any{"type": "integer"},
+						},
+						"subject": map[string]any{
+							"type":        "string",
+							"description": subjectDescription,
+						},
+						"body": map[string]any{
+							"type":        "string",
+							"description": "Optional final commit body bullets for why/context/impact.",
+						},
+						"grouping_reason": map[string]any{
+							"type":        "string",
+							"description": "Evidence-grounded rationale for why this group is one commit.",
+						},
+					},
+					"required":             []string{"selected_seqs", "subject", "body", "grouping_reason"},
+					"additionalProperties": false,
+				},
+			},
 		},
 		"required":             []string{"selected_seqs", "deferred_seqs", "subject", "body", "grouping_reason", "deferred_reasons"},
 		"additionalProperties": false,
