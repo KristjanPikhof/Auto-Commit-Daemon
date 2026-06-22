@@ -300,6 +300,62 @@ func TestValidateIntentPlanRejectsInvalidShapes(t *testing.T) {
 	}
 }
 
+func TestValidateIntentPlanAcceptsCommitGroups(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	plan := IntentPlan{
+		DeferredSeqs: []int64{102},
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "documentation belongs later",
+		}},
+		CommitGroups: []IntentCommitGroup{{
+			SelectedSeqs:   []int64{101},
+			Subject:        "Update checkout validation",
+			GroupingReason: "code capture is one focused commit",
+		}},
+	}
+	if err := ValidateIntentPlan(req, plan); err != nil {
+		t.Fatalf("ValidateIntentPlan partition: %v", err)
+	}
+	groups, err := IntentPlanCommitGroups(plan)
+	if err != nil {
+		t.Fatalf("IntentPlanCommitGroups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].SelectedSeqs[0] != 101 {
+		t.Fatalf("groups=%+v want one group selecting 101", groups)
+	}
+}
+
+func TestValidateIntentPlanRejectsUnorderedCommitGroups(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	req.OfferedCaptures = append(req.OfferedCaptures, OfferedCapture{
+		Seq:       103,
+		Path:      "docs/checkout.md",
+		Op:        "modify",
+		Timestamp: req.OfferedCaptures[1].Timestamp,
+		Fidelity:  "exact",
+	})
+	plan := IntentPlan{
+		CommitGroups: []IntentCommitGroup{
+			{SelectedSeqs: []int64{103}, Subject: "Update docs", GroupingReason: "docs first"},
+			{SelectedSeqs: []int64{101}, Subject: "Update checkout", GroupingReason: "code second"},
+		},
+		DeferredSeqs: []int64{102},
+		DeferredReasons: []DeferredReason{{
+			Seq:    102,
+			Reason: "separate later work",
+		}},
+	}
+	err := ValidateIntentPlan(req, plan)
+	if err == nil {
+		t.Fatalf("expected unordered commit_groups rejection")
+	}
+	var typed *IntentPlanValidationError
+	if !errors.As(err, &typed) || typed.Code != IntentPlanValidationShape {
+		t.Fatalf("error=%T %v want shape validation error", err, err)
+	}
+}
+
 func TestValidateIntentPlanReturnsTypedErrorForSelectedDeferredOverlap(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan := IntentPlan{
