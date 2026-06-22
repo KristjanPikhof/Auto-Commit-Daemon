@@ -3159,6 +3159,74 @@ func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T)
 	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: same user intent")
 }
 
+func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "partition-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "partition-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "partition-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			DeferredSeqs: []int64{pending[2].Seq},
+			DeferredReasons: []ai.DeferredReason{{
+				Seq:    pending[2].Seq,
+				Reason: "third capture is unrelated",
+			}},
+			CommitGroups: []ai.IntentCommitGroup{
+				{
+					SelectedSeqs:   []int64{pending[0].Seq},
+					Subject:        "Add partition A",
+					GroupingReason: "first capture is one intent",
+				},
+				{
+					SelectedSeqs:   []int64{pending[1].Seq},
+					Subject:        "Add partition B",
+					GroupingReason: "second capture is independent",
+				},
+			},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published partition events", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		t.Fatalf("commit count=%d want seed+2 partition commits", got)
+	}
+	oidA := captureCommitOID(t, ctx, f.db, pending[0].Seq)
+	oidB := captureCommitOID(t, ctx, f.db, pending[1].Seq)
+	if oidA == "" || oidB == "" || oidA == oidB {
+		t.Fatalf("partition commit oids A=%q B=%q want distinct non-empty commits", oidA, oidB)
+	}
+	stateC := captureEventState(t, ctx, f.db, pending[2].Seq)
+	if stateC != state.EventStatePending {
+		t.Fatalf("third capture state=%q want pending", stateC)
+	}
+	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: first capture is one intent")
+	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: second capture is independent")
+}
+
 func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
