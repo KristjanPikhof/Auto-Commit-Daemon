@@ -818,6 +818,8 @@ type intentReplayConfig struct {
 	// HEAD commit landed within the window.
 	recentCommitAffinity time.Duration
 	commitFormat         ai.CommitFormat
+	plannerProvider      string
+	plannerModel         string
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -890,6 +892,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 
 	if opts.IntentPlanner != nil {
 		out.planner = opts.IntentPlanner
+		out.plannerProvider = ai.PrimaryProviderName(opts.IntentPlanner)
 		return out, nil, nil
 	}
 
@@ -898,12 +901,14 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	if err != nil {
 		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
+		out.plannerProvider = out.planner.Name()
 		return out, nil, nil
 	}
 	planner, ok := provider.(ai.IntentPlanner)
 	if !ok {
 		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
+		out.plannerProvider = out.planner.Name()
 		if closer != nil {
 			return out, func() {
 				if err := closer.Close(); err != nil {
@@ -914,6 +919,10 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		return out, nil, nil
 	}
 	out.planner = planner
+	out.plannerProvider = ai.PrimaryProviderName(planner)
+	if out.plannerProvider == "openai-compat" {
+		out.plannerModel = providerCfg.Model
+	}
 	if ai.ProviderNeedsDiff(provider) && diffEgressOptIn() {
 		out.includeDiffs = true
 	}
