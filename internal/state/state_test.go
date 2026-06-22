@@ -82,9 +82,10 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	// Confirm every §6.1 table exists.
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
-		"capture_events", "capture_ops", "planner_state", "rewrite_plans",
-		"rewrite_plan_commits", "flush_requests", "decision_records", "publish_state",
-		"daemon_meta", "daily_rollups",
+		"capture_events", "capture_ops", "planner_state", "intent_planner_windows",
+		"intent_planner_window_events", "rewrite_plans", "rewrite_plan_commits",
+		"flush_requests", "decision_records", "publish_state", "daemon_meta",
+		"daily_rollups",
 	}
 	for _, table := range tables {
 		var name string
@@ -749,6 +750,33 @@ func TestPlannerStateIndexesExist(t *testing.T) {
 		}
 		if name != idx {
 			t.Fatalf("planner_state index name=%q want %q", name, idx)
+		}
+	}
+}
+
+func TestIntentPlannerWindowIndexesExist(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	checks := []struct {
+		table string
+		index string
+	}{
+		{"intent_planner_windows", "idx_intent_planner_windows_ts_id"},
+		{"intent_planner_windows", "idx_intent_planner_windows_branch_id"},
+		{"intent_planner_window_events", "idx_intent_planner_window_events_seq_window"},
+	}
+	for _, check := range checks {
+		var name string
+		err := d.SQL().QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name = ?`,
+			check.table, check.index).Scan(&name)
+		if err != nil {
+			t.Fatalf("%s index %q missing: %v", check.table, check.index, err)
+		}
+		if name != check.index {
+			t.Fatalf("%s index name=%q want %q", check.table, name, check.index)
 		}
 	}
 }
