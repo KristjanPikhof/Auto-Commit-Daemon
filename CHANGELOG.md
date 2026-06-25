@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-06-26
+
 ### Added
 
 - Intent mode now has a short `ACD_INTENT_SETTLE_WINDOW` burst delay after the
