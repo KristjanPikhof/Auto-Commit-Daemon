@@ -20,6 +20,8 @@
   when one visible window contains multiple independent commit intents.
 - Consecutive same-path captures are planner-visible by default. Set
   `ACD_INTENT_PATH_COALESCE=1` to restore the legacy folding behavior.
+- Updated maintenance dependencies: `modernc.org/sqlite` from `v1.52.0` to
+  `v1.53.0`, and pinned `actions/checkout` from `v6.0.3` to `v7.0.0`.
 
 ## v2026-06-21
 
