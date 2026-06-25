@@ -337,6 +337,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		Body:            resp.Body,
 		GroupingReason:  resp.GroupingReason,
 		DeferredReasons: resp.DeferredReasons,
+		CommitGroups:    resp.CommitGroups,
 		Source:          p.Name(),
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
@@ -653,14 +654,15 @@ type subprocessOp struct {
 
 // subprocessResponse is the JSONL response envelope.
 type subprocessResponse struct {
-	Version         int              `json:"version"`
-	Subject         string           `json:"subject"`
-	Body            string           `json:"body"`
-	Error           string           `json:"error"`
-	SelectedSeqs    []int64          `json:"selected_seqs,omitempty"`
-	DeferredSeqs    []int64          `json:"deferred_seqs,omitempty"`
-	GroupingReason  string           `json:"grouping_reason,omitempty"`
-	DeferredReasons []DeferredReason `json:"deferred_reasons,omitempty"`
+	Version         int                 `json:"version"`
+	Subject         string              `json:"subject"`
+	Body            string              `json:"body"`
+	Error           string              `json:"error"`
+	SelectedSeqs    []int64             `json:"selected_seqs,omitempty"`
+	DeferredSeqs    []int64             `json:"deferred_seqs,omitempty"`
+	GroupingReason  string              `json:"grouping_reason,omitempty"`
+	DeferredReasons []DeferredReason    `json:"deferred_reasons,omitempty"`
+	CommitGroups    []IntentCommitGroup `json:"commit_groups,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner

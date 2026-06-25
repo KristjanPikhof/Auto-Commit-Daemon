@@ -166,7 +166,9 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=1",
+		"ACD_INTENT_SETTLE_WINDOW=0",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
+		"ACD_INTENT_PATH_COALESCE=1",
 		"ACD_PATH_QUIESCENCE_SECONDS=2",
 	)
 

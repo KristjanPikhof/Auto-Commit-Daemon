@@ -58,6 +58,7 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvCommitFormat, "  conventional  ")
 	t.Setenv(EnvIntentWindow, "25")
 	t.Setenv(EnvIntentMinPending, "12")
+	t.Setenv(EnvIntentSettleWindow, "12s")
 	t.Setenv(EnvIntentMaxPendingAge, "90s")
 	t.Setenv(EnvIntentRecentCommits, "8")
 	t.Setenv(EnvIntentDeferLimit, "4")
@@ -94,6 +95,9 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	if cfg.IntentMinPending != 12 {
 		t.Fatalf("IntentMinPending=%d want 12", cfg.IntentMinPending)
 	}
+	if cfg.IntentSettleWindow != 12*time.Second {
+		t.Fatalf("IntentSettleWindow=%v want 12s", cfg.IntentSettleWindow)
+	}
 	if cfg.IntentMaxPendingAge != 90*time.Second {
 		t.Fatalf("IntentMaxPendingAge=%v want 90s", cfg.IntentMaxPendingAge)
 	}
@@ -117,6 +121,7 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	t.Setenv(EnvCommitFormat, "")
 	t.Setenv(EnvIntentWindow, "")
 	t.Setenv(EnvIntentMinPending, "")
+	t.Setenv(EnvIntentSettleWindow, "")
 	t.Setenv(EnvIntentMaxPendingAge, "")
 	t.Setenv(EnvIntentRecentCommits, "")
 	t.Setenv(EnvIntentDeferLimit, "")
@@ -145,6 +150,9 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	}
 	if cfg.IntentMinPending != DefaultIntentMinPending {
 		t.Fatalf("IntentMinPending=%d want %d", cfg.IntentMinPending, DefaultIntentMinPending)
+	}
+	if cfg.IntentSettleWindow != DefaultIntentSettleWindow {
+		t.Fatalf("IntentSettleWindow=%v want %v", cfg.IntentSettleWindow, DefaultIntentSettleWindow)
 	}
 	if cfg.IntentMaxPendingAge != DefaultIntentMaxPendingAge {
 		t.Fatalf("IntentMaxPendingAge=%v want %v", cfg.IntentMaxPendingAge, DefaultIntentMaxPendingAge)
@@ -216,6 +224,7 @@ func TestLoadProviderConfigFromEnv_CommitFormat(t *testing.T) {
 func TestLoadProviderConfigFromEnv_InvalidIntentNumbersFallBack(t *testing.T) {
 	t.Setenv(EnvIntentWindow, "0")
 	t.Setenv(EnvIntentMinPending, "0")
+	t.Setenv(EnvIntentSettleWindow, "not-a-duration")
 	t.Setenv(EnvIntentMaxPendingAge, "0")
 	t.Setenv(EnvIntentRecentCommits, "not-a-number")
 	t.Setenv(EnvIntentDeferLimit, "-1")
@@ -226,6 +235,9 @@ func TestLoadProviderConfigFromEnv_InvalidIntentNumbersFallBack(t *testing.T) {
 	}
 	if cfg.IntentMinPending != DefaultIntentMinPending {
 		t.Fatalf("IntentMinPending=%d want %d", cfg.IntentMinPending, DefaultIntentMinPending)
+	}
+	if cfg.IntentSettleWindow != DefaultIntentSettleWindow {
+		t.Fatalf("IntentSettleWindow=%v want %v", cfg.IntentSettleWindow, DefaultIntentSettleWindow)
 	}
 	if cfg.IntentMaxPendingAge != DefaultIntentMaxPendingAge {
 		t.Fatalf("IntentMaxPendingAge=%v want %v", cfg.IntentMaxPendingAge, DefaultIntentMaxPendingAge)
@@ -251,6 +263,18 @@ func TestLoadProviderConfigFromEnv_ZeroIntentDeferLimitAllowed(t *testing.T) {
 	cfg := LoadProviderConfigFromEnv()
 	if cfg.IntentDeferLimit != 0 {
 		t.Fatalf("IntentDeferLimit=%d want 0", cfg.IntentDeferLimit)
+	}
+}
+
+func TestLoadProviderConfigFromEnv_ZeroIntentSettleWindowAllowed(t *testing.T) {
+	for _, raw := range []string{"0", "0s"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv(EnvIntentSettleWindow, raw)
+			cfg := LoadProviderConfigFromEnv()
+			if cfg.IntentSettleWindow != 0 {
+				t.Fatalf("IntentSettleWindow=%v want 0", cfg.IntentSettleWindow)
+			}
+		})
 	}
 }
 

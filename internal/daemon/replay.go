@@ -194,6 +194,11 @@ type ReplayOpts struct {
 	// planning starts. Zero resolves from env.
 	IntentMinPending int
 
+	// IntentSettleWindow is the burst-settle delay after IntentMinPending is
+	// reached. Zero resolves from env for normal callers. Tests that inject
+	// IntentPlanner must set this explicitly to exercise the settle gate.
+	IntentSettleWindow time.Duration
+
 	// IntentMaxPendingAge is the bounded wait escape hatch for sparse pending
 	// queues that have not reached IntentMinPending. Zero resolves from env.
 	IntentMaxPendingAge time.Duration
@@ -794,6 +799,7 @@ type intentReplayConfig struct {
 	planner         ai.IntentPlanner
 	window          int
 	minPending      int
+	settleWindow    time.Duration
 	maxPendingAge   time.Duration
 	recent          int
 	deferLimit      int
@@ -812,6 +818,8 @@ type intentReplayConfig struct {
 	// HEAD commit landed within the window.
 	recentCommitAffinity time.Duration
 	commitFormat         ai.CommitFormat
+	plannerProvider      string
+	plannerModel         string
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -832,6 +840,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		enabled:              true,
 		window:               cfg.IntentWindow,
 		minPending:           cfg.IntentMinPending,
+		settleWindow:         cfg.IntentSettleWindow,
 		maxPendingAge:        cfg.IntentMaxPendingAge,
 		recent:               cfg.IntentRecentCommits,
 		deferLimit:           cfg.IntentDeferLimit,
@@ -846,6 +855,13 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 	if opts.IntentMinPending > 0 {
 		out.minPending = opts.IntentMinPending
+	}
+	if opts.IntentSettleWindow > 0 {
+		out.settleWindow = opts.IntentSettleWindow
+	} else if opts.IntentSettleWindow < 0 {
+		out.settleWindow = 0
+	} else if opts.IntentPlanner != nil {
+		out.settleWindow = 0
 	}
 	if opts.IntentMaxPendingAge > 0 {
 		out.maxPendingAge = opts.IntentMaxPendingAge
@@ -864,6 +880,9 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	if out.minPending <= 0 {
 		out.minPending = ai.DefaultIntentMinPending
 	}
+	if out.settleWindow < 0 {
+		out.settleWindow = 0
+	}
 	if out.maxPendingAge <= 0 {
 		out.maxPendingAge = ai.DefaultIntentMaxPendingAge
 	}
@@ -873,6 +892,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 
 	if opts.IntentPlanner != nil {
 		out.planner = opts.IntentPlanner
+		out.plannerProvider = ai.PrimaryProviderName(opts.IntentPlanner)
 		return out, nil, nil
 	}
 
@@ -881,12 +901,14 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	if err != nil {
 		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
+		out.plannerProvider = out.planner.Name()
 		return out, nil, nil
 	}
 	planner, ok := provider.(ai.IntentPlanner)
 	if !ok {
 		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
+		out.plannerProvider = out.planner.Name()
 		if closer != nil {
 			return out, func() {
 				if err := closer.Close(); err != nil {
@@ -897,6 +919,10 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		return out, nil, nil
 	}
 	out.planner = planner
+	out.plannerProvider = ai.PrimaryProviderName(planner)
+	if out.plannerProvider == "openai-compat" {
+		out.plannerModel = providerCfg.Model
+	}
 	if ai.ProviderNeedsDiff(provider) && diffEgressOptIn() {
 		out.includeDiffs = true
 	}
@@ -1059,6 +1085,9 @@ func replayIntentBatch(
 			}
 		} else {
 			traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+			if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, ""); err != nil {
+				return sum, err
+			}
 			selected := []intentReplayItem{items[0]}
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
 		}
@@ -1091,6 +1120,9 @@ func replayIntentBatch(
 			}
 		} else {
 			traceIntentSingletonShortCircuit(opts.Trace, repoRoot, activeCtx, items[0], plan)
+			if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, ""); err != nil {
+				return sum, err
+			}
 			return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, items, plan, parent, parentTree, sum)
 		}
 		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
@@ -1122,6 +1154,9 @@ func replayIntentBatch(
 		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
 	}
 	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, plan)
+	if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, items, activeCtx, nowSec, forced, validationFailure); err != nil {
+		return sum, err
+	}
 	if plan.MessageQuality != "" {
 		if err := recordIntentMessageQualityDecision(ctx, db, items, activeCtx, nowSec, plan); err != nil {
 			return sum, err
@@ -1131,14 +1166,39 @@ func replayIntentBatch(
 		return sum, err
 	}
 
-	selected, err := selectedIntentItems(items, plan.SelectedSeqs)
+	groups, err := ai.IntentPlanCommitGroups(plan)
 	if err != nil {
 		return sum, err
 	}
-	sort.Slice(selected, func(i, j int) bool {
-		return selected[i].event.Seq < selected[j].event.Seq
-	})
-	return publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, plan, parent, parentTree, sum)
+	currentParent := parent
+	currentParentTree := parentTree
+	for _, group := range groups {
+		groupPlan := ai.IntentPlanForCommitGroup(plan, group)
+		selected, err := selectedIntentItems(items, group.SelectedSeqs)
+		if err != nil {
+			return sum, err
+		}
+		sort.Slice(selected, func(i, j int) bool {
+			return selected[i].event.Seq < selected[j].event.Seq
+		})
+		before := sum
+		sum, err = publishIntentSelection(ctx, repoRoot, db, activeCtx, opts, indexFile, selected, groupPlan, currentParent, currentParentTree, sum)
+		if err != nil {
+			return sum, err
+		}
+		if sum.Conflicts > before.Conflicts || sum.Failed > before.Failed || sum.Published == before.Published {
+			return sum, nil
+		}
+		if sum.BaseHead == "" || sum.BaseHead == currentParent {
+			return sum, nil
+		}
+		currentParent = sum.BaseHead
+		currentParentTree, err = resolveTreeOID(ctx, repoRoot, currentParent)
+		if err != nil {
+			return sum, err
+		}
+	}
+	return sum, nil
 }
 
 func rejectInvalidIntentWindowEvents(
@@ -1213,8 +1273,10 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return []state.CaptureEvent{forcedEvent}, true, "", nil
 	}
-	if !cfg.bypassBatchWait && intentBatchShouldWait(pending, cfg, time.Now()) {
-		return nil, false, "skipped_due_intent_batch_wait", nil
+	if !cfg.bypassBatchWait {
+		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
+			return nil, false, waitReason, nil
+		}
 	}
 	n := cfg.window
 	if n > len(pending) {
@@ -1346,12 +1408,35 @@ func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int,
 }
 
 func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
+	return intentBatchWaitReason(pending, cfg, now) != ""
+}
+
+func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) string {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
-		return false
+		if len(pending) == 0 || cfg.settleWindow <= 0 {
+			return ""
+		}
+		if cfg.window > 0 && len(pending) >= cfg.window {
+			return ""
+		}
+		oldest := pending[0]
+		oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
+		if oldestAge >= cfg.maxPendingAge {
+			return ""
+		}
+		newest := pending[len(pending)-1]
+		newestAge := now.Sub(time.Unix(0, int64(newest.CapturedTS*float64(time.Second))))
+		if newestAge < cfg.settleWindow {
+			return "skipped_due_intent_settle_window"
+		}
+		return ""
 	}
 	oldest := pending[0]
 	oldestAge := now.Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second))))
-	return oldestAge < cfg.maxPendingAge
+	if oldestAge < cfg.maxPendingAge {
+		return "skipped_due_intent_batch_wait"
+	}
+	return ""
 }
 
 func intentPreflightEvents(pending, window []state.CaptureEvent, forced bool) []state.CaptureEvent {
@@ -1408,9 +1493,9 @@ func buildIntentPlanRequest(
 	forced bool,
 	cfg intentReplayConfig,
 ) ([]intentReplayItem, ai.IntentPlanRequest, error) {
-	// Same-path coalesce runs ahead of the planner offer so a burst of
-	// edits to one file folds into one offered entry. Default ON; opt out
-	// via ACD_INTENT_PATH_COALESCE=0|false|no|off (restart to apply).
+	// Legacy same-path coalesce can run ahead of the planner offer, but it
+	// defaults off so every durable capture remains planner-visible. Operators
+	// can opt in via ACD_INTENT_PATH_COALESCE=1|true|yes|on (restart to apply).
 	offers, err := coalesceIntentWindow(ctx, db, events, pathCoalesceEnabled(), state.LoadCaptureOps)
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
@@ -1927,8 +2012,14 @@ func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, r
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
 	selected := map[int64]struct{}{}
-	for _, seq := range plan.SelectedSeqs {
-		selected[seq] = struct{}{}
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return err
+	}
+	for _, group := range groups {
+		for _, seq := range group.SelectedSeqs {
+			selected[seq] = struct{}{}
+		}
 	}
 	for i, item := range items {
 		if _, ok := selected[item.event.Seq]; !ok {
@@ -2033,6 +2124,141 @@ func recordIntentDeferrals(ctx context.Context, db *state.DB, plan ai.IntentPlan
 	return nil
 }
 
+func recordIntentPlannerWindow(
+	ctx context.Context,
+	db *state.DB,
+	cfg intentReplayConfig,
+	req ai.IntentPlanRequest,
+	plan ai.IntentPlan,
+	items []intentReplayItem,
+	cctx CaptureContext,
+	ts float64,
+	forced bool,
+	validationFailure string,
+) error {
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return err
+	}
+	itemBySeq := make(map[int64]intentReplayItem, len(items))
+	eventRows := make(map[int64]*state.IntentPlannerWindowEvent, len(items))
+	ensureEvent := func(seq int64) *state.IntentPlannerWindowEvent {
+		row := eventRows[seq]
+		if row == nil {
+			row = &state.IntentPlannerWindowEvent{EventSeq: seq}
+			eventRows[seq] = row
+		}
+		return row
+	}
+
+	var visibleOriginalSeqs []int64
+	var hiddenSeqs []int64
+	for _, item := range items {
+		itemBySeq[item.event.Seq] = item
+		ensureEvent(item.event.Seq).Offered = true
+		for _, ev := range item.allCoveredEvents() {
+			visibleOriginalSeqs = appendUniqueSeq(visibleOriginalSeqs, ev.Seq)
+			row := ensureEvent(ev.Seq)
+			if ev.Seq != item.event.Seq {
+				row.Hidden = true
+				hiddenSeqs = appendUniqueSeq(hiddenSeqs, ev.Seq)
+			}
+		}
+	}
+
+	selectedGroups := make([]state.IntentPlannerWindowGroup, 0, len(groups))
+	for i, group := range groups {
+		summary := state.IntentPlannerWindowGroup{
+			SelectedSeqs:   append([]int64(nil), group.SelectedSeqs...),
+			Subject:        strings.TrimSpace(group.Subject),
+			GroupingReason: strings.TrimSpace(group.GroupingReason),
+		}
+		for _, seq := range group.SelectedSeqs {
+			item, ok := itemBySeq[seq]
+			if !ok {
+				continue
+			}
+			for _, ev := range item.allCoveredEvents() {
+				summary.OriginalSeqs = appendUniqueSeq(summary.OriginalSeqs, ev.Seq)
+				row := ensureEvent(ev.Seq)
+				row.Selected = true
+				row.GroupOrd = sql.NullInt64{Int64: int64(i), Valid: true}
+			}
+		}
+		selectedGroups = append(selectedGroups, summary)
+	}
+
+	for _, seq := range plan.DeferredSeqs {
+		item, ok := itemBySeq[seq]
+		if !ok {
+			continue
+		}
+		for _, ev := range item.allCoveredEvents() {
+			ensureEvent(ev.Seq).Deferred = true
+		}
+	}
+
+	rows := make([]state.IntentPlannerWindowEvent, 0, len(eventRows))
+	for _, row := range eventRows {
+		rows = append(rows, *row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].EventSeq < rows[j].EventSeq
+	})
+	deferredReasons := make([]state.IntentPlannerWindowDeferredReason, 0, len(plan.DeferredReasons))
+	for _, reason := range plan.DeferredReasons {
+		deferredReasons = append(deferredReasons, state.IntentPlannerWindowDeferredReason{
+			Seq:    reason.Seq,
+			Reason: strings.TrimSpace(reason.Reason),
+		})
+	}
+
+	provider := strings.TrimSpace(cfg.plannerProvider)
+	if provider == "" && cfg.planner != nil {
+		provider = ai.PrimaryProviderName(cfg.planner)
+	}
+	if provider == "" {
+		provider = strings.TrimSpace(plan.Source)
+	}
+	model := ""
+	if provider == "openai-compat" {
+		model = strings.TrimSpace(cfg.plannerModel)
+	}
+	forcedReason := ""
+	if forced {
+		forcedReason = "defer_limit"
+	}
+	_, err = state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS:           ts,
+		Provider:            nullString(provider),
+		Model:               nullString(model),
+		BranchRef:           cctx.BranchRef,
+		BranchGeneration:    cctx.BranchGeneration,
+		Source:              nullString(strings.TrimSpace(plan.Source)),
+		CommitFormat:        nullString(string(req.CommitFormat)),
+		Forced:              forced,
+		ForcedReason:        nullString(forcedReason),
+		ValidationFailure:   nullString(strings.TrimSpace(validationFailure)),
+		OfferedSeqs:         intentOfferedSeqs(req),
+		VisibleOriginalSeqs: visibleOriginalSeqs,
+		HiddenSeqs:          hiddenSeqs,
+		SelectedGroups:      selectedGroups,
+		DeferredSeqs:        append([]int64(nil), plan.DeferredSeqs...),
+		DeferredReasons:     deferredReasons,
+		Events:              rows,
+	})
+	return err
+}
+
+func appendUniqueSeq(seqs []int64, seq int64) []int64 {
+	for _, existing := range seqs {
+		if existing == seq {
+			return seqs
+		}
+	}
+	return append(seqs, seq)
+}
+
 func recordIntentMessageQualityDecision(ctx context.Context, db *state.DB, items []intentReplayItem, cctx CaptureContext, ts float64, plan ai.IntentPlan) error {
 	if plan.MessageQuality == "" {
 		return nil
@@ -2108,6 +2334,7 @@ func traceIntentPlannerInput(logger acdtrace.Logger, repoRoot string, cctx Captu
 			"path_commit_context_count": len(req.PathCommitContext),
 			"window":                    cfg.window,
 			"min_pending":               cfg.minPending,
+			"settle_window_seconds":     cfg.settleWindow.Seconds(),
 			"max_pending_age_seconds":   cfg.maxPendingAge.Seconds(),
 			"recent_commits":            cfg.recent,
 			"defer_limit":               cfg.deferLimit,
@@ -2122,6 +2349,8 @@ func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureC
 	}
 	oldest := pending[0]
 	oldestAgeSeconds := time.Now().Sub(time.Unix(0, int64(oldest.CapturedTS*float64(time.Second)))).Seconds()
+	newest := pending[len(pending)-1]
+	newestAgeSeconds := time.Now().Sub(time.Unix(0, int64(newest.CapturedTS*float64(time.Second)))).Seconds()
 	logger.Record(acdtrace.Event{
 		Repo:       repoRoot,
 		BranchRef:  cctx.BranchRef,
@@ -2134,6 +2363,9 @@ func traceIntentBatchWait(logger acdtrace.Logger, repoRoot string, cctx CaptureC
 			"min_pending":             cfg.minPending,
 			"oldest_seq":              oldest.Seq,
 			"oldest_age_seconds":      oldestAgeSeconds,
+			"newest_seq":              newest.Seq,
+			"newest_age_seconds":      newestAgeSeconds,
+			"settle_window_seconds":   cfg.settleWindow.Seconds(),
 			"max_pending_age_seconds": cfg.maxPendingAge.Seconds(),
 			"window":                  cfg.window,
 		},
@@ -2199,12 +2431,30 @@ func traceIntentPlannerOutput(logger acdtrace.Logger, repoRoot string, cctx Capt
 			"offered_seqs": intentItemSeqs(items),
 		},
 		Output: map[string]any{
+			"commit_groups": intentTraceCommitGroups(plan),
 			"selected_seqs": plan.SelectedSeqs,
 			"deferred_seqs": plan.DeferredSeqs,
 			"source":        plan.Source,
 		},
 		Generation: cctx.BranchGeneration,
 	})
+}
+
+func intentTraceCommitGroups(plan ai.IntentPlan) []map[string]any {
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(groups))
+	for _, group := range groups {
+		out = append(out, map[string]any{
+			"selected_seqs":   append([]int64(nil), group.SelectedSeqs...),
+			"subject":         group.Subject,
+			"grouping_reason": group.GroupingReason,
+			"body_present":    strings.TrimSpace(group.Body) != "",
+		})
+	}
+	return out
 }
 
 func traceIntentSingletonShortCircuit(logger acdtrace.Logger, repoRoot string, cctx CaptureContext, item intentReplayItem, plan ai.IntentPlan) {

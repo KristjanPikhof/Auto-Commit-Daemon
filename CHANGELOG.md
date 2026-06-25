@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- Intent mode now has a short `ACD_INTENT_SETTLE_WINDOW` burst delay after the
+  pending-count gate, so rapid related edits can reach one planner-visible
+  window before AI grouping runs.
+- `acd events --json`, `acd status --json`, and `acd diagnose --json` now expose
+  privacy-safe planner-window summaries showing offered, selected, deferred,
+  forced, hidden, and grouped seqs without requiring prompt-trace parsing.
+
+### Changed
+
+- Intent planning can partition one visible window into multiple ordered commit
+  groups, letting unrelated close-together changes and independent same-file
+  edits publish as separate atomic commits.
+- The intent planner prompt now explicitly asks for ordered `commit_groups`
+  when one visible window contains multiple independent commit intents.
+- Consecutive same-path captures are planner-visible by default. Set
+  `ACD_INTENT_PATH_COALESCE=1` to restore the legacy folding behavior.
+
 ## v2026-06-21
 
 ### Changed

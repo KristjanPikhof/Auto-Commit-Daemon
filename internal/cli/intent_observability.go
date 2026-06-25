@@ -56,38 +56,44 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 }
 
 type intentStrategyReport struct {
-	Strategy                          string `json:"strategy"`
-	CommitFormat                      string `json:"commit_format"`
-	Active                            bool   `json:"active"`
-	Window                            int    `json:"window,omitempty"`
-	RecentCommits                     int    `json:"recent_commits,omitempty"`
-	DeferLimit                        int    `json:"defer_limit,omitempty"`
-	MinPending                        int    `json:"min_pending,omitempty"`
-	MaxPendingAgeSeconds              int64  `json:"max_pending_age_seconds,omitempty"`
-	IntentStageDiffCap                int    `json:"intent_stage_diff_cap,omitempty"`
-	VisiblePendingEvents              int    `json:"visible_pending_events,omitempty"`
-	OldestPendingEventSeq             int64  `json:"oldest_pending_event_seq,omitempty"`
-	OldestPendingPath                 string `json:"oldest_pending_path,omitempty"`
-	OldestPendingAgeSeconds           int64  `json:"oldest_pending_age_seconds,omitempty"`
-	AgeTriggerTS                      int64  `json:"age_trigger_ts,omitempty"`
-	AgeTriggerInSeconds               int64  `json:"age_trigger_in_seconds,omitempty"`
-	BatchWaitActive                   bool   `json:"batch_wait_active,omitempty"`
-	BatchWaitReason                   string `json:"batch_wait_reason,omitempty"`
-	DeferredEvents                    int    `json:"deferred_events,omitempty"`
-	MaxDeferCount                     int    `json:"max_defer_count,omitempty"`
-	ForcedAgingReady                  int    `json:"forced_aging_ready,omitempty"`
-	LastDeferredEventSeq              int64  `json:"last_deferred_event_seq,omitempty"`
-	LastDeferredPath                  string `json:"last_deferred_path,omitempty"`
-	LastDeferredReason                string `json:"last_deferred_reason,omitempty"`
-	LastPlannerErrorEventSeq          int64  `json:"last_planner_error_event_seq,omitempty"`
-	LastPlannerErrorPath              string `json:"last_planner_error_path,omitempty"`
-	LastPlannerError                  string `json:"last_planner_error,omitempty"`
-	MessageQualityRewriteCountRecent  int    `json:"message_quality_rewrite_count_recent,omitempty"`
-	MessageQualityFallbackCountRecent int    `json:"message_quality_fallback_count_recent,omitempty"`
-	LastMessageQualityEventSeq        int64  `json:"last_message_quality_event_seq,omitempty"`
-	LastMessageQualityPath            string `json:"last_message_quality_path,omitempty"`
-	LastMessageQualityAction          string `json:"last_message_quality_action,omitempty"`
-	LastMessageQualityReason          string `json:"last_message_quality_reason,omitempty"`
+	Strategy                          string                      `json:"strategy"`
+	CommitFormat                      string                      `json:"commit_format"`
+	Active                            bool                        `json:"active"`
+	Window                            int                         `json:"window,omitempty"`
+	RecentCommits                     int                         `json:"recent_commits,omitempty"`
+	DeferLimit                        int                         `json:"defer_limit,omitempty"`
+	MinPending                        int                         `json:"min_pending,omitempty"`
+	SettleWindowSeconds               int64                       `json:"settle_window_seconds"`
+	MaxPendingAgeSeconds              int64                       `json:"max_pending_age_seconds,omitempty"`
+	IntentStageDiffCap                int                         `json:"intent_stage_diff_cap,omitempty"`
+	VisiblePendingEvents              int                         `json:"visible_pending_events,omitempty"`
+	OldestPendingEventSeq             int64                       `json:"oldest_pending_event_seq,omitempty"`
+	OldestPendingPath                 string                      `json:"oldest_pending_path,omitempty"`
+	OldestPendingAgeSeconds           int64                       `json:"oldest_pending_age_seconds,omitempty"`
+	NewestPendingEventSeq             int64                       `json:"newest_pending_event_seq,omitempty"`
+	NewestPendingAgeSeconds           int64                       `json:"newest_pending_age_seconds,omitempty"`
+	AgeTriggerTS                      int64                       `json:"age_trigger_ts,omitempty"`
+	AgeTriggerInSeconds               int64                       `json:"age_trigger_in_seconds,omitempty"`
+	SettleTriggerTS                   int64                       `json:"settle_trigger_ts,omitempty"`
+	SettleTriggerInSeconds            int64                       `json:"settle_trigger_in_seconds,omitempty"`
+	BatchWaitActive                   bool                        `json:"batch_wait_active,omitempty"`
+	BatchWaitReason                   string                      `json:"batch_wait_reason,omitempty"`
+	DeferredEvents                    int                         `json:"deferred_events,omitempty"`
+	MaxDeferCount                     int                         `json:"max_defer_count,omitempty"`
+	ForcedAgingReady                  int                         `json:"forced_aging_ready,omitempty"`
+	LastDeferredEventSeq              int64                       `json:"last_deferred_event_seq,omitempty"`
+	LastDeferredPath                  string                      `json:"last_deferred_path,omitempty"`
+	LastDeferredReason                string                      `json:"last_deferred_reason,omitempty"`
+	LastPlannerErrorEventSeq          int64                       `json:"last_planner_error_event_seq,omitempty"`
+	LastPlannerErrorPath              string                      `json:"last_planner_error_path,omitempty"`
+	LastPlannerError                  string                      `json:"last_planner_error,omitempty"`
+	MessageQualityRewriteCountRecent  int                         `json:"message_quality_rewrite_count_recent,omitempty"`
+	MessageQualityFallbackCountRecent int                         `json:"message_quality_fallback_count_recent,omitempty"`
+	LastMessageQualityEventSeq        int64                       `json:"last_message_quality_event_seq,omitempty"`
+	LastMessageQualityPath            string                      `json:"last_message_quality_path,omitempty"`
+	LastMessageQualityAction          string                      `json:"last_message_quality_action,omitempty"`
+	LastMessageQualityReason          string                      `json:"last_message_quality_reason,omitempty"`
+	LastPlannerWindow                 *intentPlannerWindowSummary `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
@@ -160,18 +166,26 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		status = r.Strategy
 	}
 	if r.Active {
-		fmt.Fprintf(out, "Commit strategy: %s format=%s (window %d, min pending %d, max age %s, recent commits %d, defer limit %d)\n",
-			status, valueOrUnset(r.CommitFormat), r.Window, r.MinPending, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
+		fmt.Fprintf(out, "Commit strategy: %s format=%s (window %d, min pending %d, settle %s, max age %s, recent commits %d, defer limit %d)\n",
+			status, valueOrUnset(r.CommitFormat), r.Window, r.MinPending, formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second), formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), r.RecentCommits, r.DeferLimit)
 	} else {
 		fmt.Fprintf(out, "Commit strategy: %s format=%s\n", status, valueOrUnset(r.CommitFormat))
 	}
 	if r.BatchWaitActive {
-		fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
-			r.VisiblePendingEvents,
-			r.MinPending,
-			formatDurationCompact(time.Duration(r.OldestPendingAgeSeconds)*time.Second),
-			formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second),
-			formatDurationCompact(time.Duration(r.AgeTriggerInSeconds)*time.Second))
+		if r.BatchWaitReason == "skipped_due_intent_settle_window" {
+			fmt.Fprintf(out, "Intent settle wait: pending=%d newest_age=%s settle=%s trigger_in=%s\n",
+				r.VisiblePendingEvents,
+				formatDurationCompact(time.Duration(r.NewestPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.SettleTriggerInSeconds)*time.Second))
+		} else {
+			fmt.Fprintf(out, "Intent batch wait: pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
+				r.VisiblePendingEvents,
+				r.MinPending,
+				formatDurationCompact(time.Duration(r.OldestPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second),
+				formatDurationCompact(time.Duration(r.AgeTriggerInSeconds)*time.Second))
+		}
 	}
 	if r.DeferredEvents > 0 || r.ForcedAgingReady > 0 || r.LastPlannerError != "" {
 		fmt.Fprintf(out, "Intent planner: deferred=%d max_defer=%d forced_ready=%d\n",
@@ -194,6 +208,21 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 				valueOrUnset(r.LastMessageQualityPath),
 				valueOrUnset(r.LastMessageQualityAction),
 				r.LastMessageQualityReason)
+		}
+	}
+	if r.LastPlannerWindow != nil {
+		win := r.LastPlannerWindow
+		fmt.Fprintf(out, "Last planner window: #%d provider=%s offered=%s selected_groups=%d deferred=%s\n",
+			win.ID,
+			valueOrUnset(win.Provider),
+			formatSeqs(win.OfferedSeqs),
+			len(win.SelectedGroups),
+			valueOrUnset(formatSeqs(win.DeferredSeqs)))
+		if len(win.HiddenSeqs) > 0 {
+			fmt.Fprintf(out, "  Hidden/coalesced seqs: %s\n", formatSeqs(win.HiddenSeqs))
+		}
+		if win.ValidationFailure != "" {
+			fmt.Fprintf(out, "  Validation fallback: %s\n", win.ValidationFailure)
 		}
 	}
 	if r.PlannerErrorRateRecent > 0 || r.SingletonCommitRateRecent > 0 {
@@ -268,6 +297,9 @@ func intentStrategyFromEnv() intentStrategyReport {
 		RecentCommits: cfg.IntentRecentCommits,
 		DeferLimit:    cfg.IntentDeferLimit,
 		MinPending:    cfg.IntentMinPending,
+		SettleWindowSeconds: int64(
+			cfg.IntentSettleWindow / time.Second,
+		),
 		MaxPendingAgeSeconds: int64(
 			cfg.IntentMaxPendingAge / time.Second,
 		),
@@ -311,6 +343,11 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	} else if ok {
 		report.MinPending = parseIntentMetaInt(v, report.MinPending)
 	}
+	if v, ok, err := metaLookup(ctx, conn, "intent.settle_window"); err != nil {
+		return report, fmt.Errorf("intent.settle_window: %w", err)
+	} else if ok {
+		report.SettleWindowSeconds = parseIntentMetaNonNegativeDurationSeconds(v, report.SettleWindowSeconds)
+	}
 	if v, ok, err := metaLookup(ctx, conn, "intent.max_pending_age"); err != nil {
 		return report, fmt.Errorf("intent.max_pending_age: %w", err)
 	} else if ok {
@@ -321,6 +358,11 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	}
 	if err := loadIntentMessageQualitySummary(ctx, conn, &report); err != nil {
 		return report, err
+	}
+	if lastWindow, err := loadLastIntentPlannerWindowSQL(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.LastPlannerWindow = lastWindow
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {
@@ -615,6 +657,8 @@ func loadIntentBatchWait(ctx context.Context, conn *sql.DB, report *intentStrate
 	var oldestSeq sql.NullInt64
 	var oldestPath sql.NullString
 	var oldestCaptured sql.NullFloat64
+	var newestSeq sql.NullInt64
+	var newestCaptured sql.NullFloat64
 	if err := conn.QueryRowContext(ctx, `
 WITH barriers AS (
     SELECT branch_ref, branch_generation, MIN(seq) AS first_seq
@@ -634,12 +678,18 @@ SELECT COUNT(*), MIN(seq), (
     SELECT path FROM visible_pending ORDER BY seq ASC LIMIT 1
 ), (
     SELECT captured_ts FROM visible_pending ORDER BY seq ASC LIMIT 1
+), (
+    SELECT seq FROM visible_pending ORDER BY seq DESC LIMIT 1
+), (
+    SELECT captured_ts FROM visible_pending ORDER BY seq DESC LIMIT 1
 )
 FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending).Scan(
 		&report.VisiblePendingEvents,
 		&oldestSeq,
 		&oldestPath,
 		&oldestCaptured,
+		&newestSeq,
+		&newestCaptured,
 	); err != nil {
 		return fmt.Errorf("intent batch wait summary: %w", err)
 	}
@@ -653,6 +703,9 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	}
 	if oldestPath.Valid {
 		report.OldestPendingPath = oldestPath.String
+	}
+	if newestSeq.Valid {
+		report.NewestPendingEventSeq = newestSeq.Int64
 	}
 	// Path-quiescence aware reporting: when the daemon stamped a recent
 	// gated-count snapshot we subtract it from VisiblePendingEvents so the
@@ -697,12 +750,34 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	if remaining := report.AgeTriggerTS - int64(nowSec); remaining > 0 {
 		report.AgeTriggerInSeconds = remaining
 	}
+	if newestCaptured.Valid {
+		newestAgeSeconds := int64(nowSec - newestCaptured.Float64)
+		if newestAgeSeconds < 0 {
+			newestAgeSeconds = 0
+		}
+		report.NewestPendingAgeSeconds = newestAgeSeconds
+		if report.SettleWindowSeconds > 0 {
+			report.SettleTriggerTS = int64(newestCaptured.Float64) + report.SettleWindowSeconds
+			if remaining := report.SettleTriggerTS - int64(nowSec); remaining > 0 {
+				report.SettleTriggerInSeconds = remaining
+			}
+		}
+	}
 	if report.Active &&
 		report.ForcedAgingReady == 0 &&
 		report.VisiblePendingEvents < report.MinPending &&
 		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds {
 		report.BatchWaitActive = true
 		report.BatchWaitReason = "skipped_due_intent_batch_wait"
+	} else if report.Active &&
+		report.ForcedAgingReady == 0 &&
+		report.VisiblePendingEvents >= report.MinPending &&
+		(report.Window <= 0 || report.VisiblePendingEvents < report.Window) &&
+		report.SettleWindowSeconds > 0 &&
+		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds &&
+		report.NewestPendingAgeSeconds < report.SettleWindowSeconds {
+		report.BatchWaitActive = true
+		report.BatchWaitReason = "skipped_due_intent_settle_window"
 	}
 	return nil
 }
@@ -718,6 +793,18 @@ func parseIntentMetaInt(raw string, fallback int) int {
 func parseIntentMetaDurationSeconds(raw string, fallback int64) int64 {
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		return fallback
+	}
+	return int64(d / time.Second)
+}
+
+func parseIntentMetaNonNegativeDurationSeconds(raw string, fallback int64) int64 {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d < 0 {
 		return fallback
 	}
 	return int64(d / time.Second)

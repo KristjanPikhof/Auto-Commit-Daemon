@@ -49,6 +49,7 @@ const (
 	EnvCommitFormat         = "ACD_COMMIT_FORMAT"
 	EnvIntentWindow         = "ACD_INTENT_WINDOW"
 	EnvIntentMinPending     = "ACD_INTENT_MIN_PENDING"
+	EnvIntentSettleWindow   = "ACD_INTENT_SETTLE_WINDOW"
 	EnvIntentMaxPendingAge  = "ACD_INTENT_MAX_PENDING_AGE"
 	EnvIntentRecentCommits  = "ACD_INTENT_RECENT_COMMITS"
 	EnvIntentDeferLimit     = "ACD_INTENT_DEFER_LIMIT"
@@ -62,6 +63,7 @@ const DefaultProviderTimeout = 30 * time.Second
 const (
 	DefaultIntentWindow        = 10
 	DefaultIntentMinPending    = 10
+	DefaultIntentSettleWindow  = 10 * time.Second
 	DefaultIntentMaxPendingAge = 5 * time.Minute
 	DefaultIntentRecentCommits = 5
 	// DefaultIntentRetryOnInvalid caps correction retries after typed
@@ -148,6 +150,10 @@ type ProviderConfig struct {
 	// intent planning pass starts.
 	IntentMinPending int
 
+	// IntentSettleWindow is the extra burst-settle delay after the pending
+	// queue reaches IntentMinPending. Zero disables the settle gate.
+	IntentSettleWindow time.Duration
+
 	// IntentMaxPendingAge is the bounded wait escape hatch for sparse
 	// pending queues that have not reached IntentMinPending.
 	IntentMaxPendingAge time.Duration
@@ -181,6 +187,7 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		CommitFormat:        normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
 		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
 		IntentMinPending:    parsePositiveIntEnv(EnvIntentMinPending, DefaultIntentMinPending),
+		IntentSettleWindow:  parseNonNegativeDurationEnv(EnvIntentSettleWindow, DefaultIntentSettleWindow),
 		IntentMaxPendingAge: parsePositiveDurationEnv(EnvIntentMaxPendingAge, DefaultIntentMaxPendingAge),
 		IntentRecentCommits: parsePositiveIntEnv(EnvIntentRecentCommits, DefaultIntentRecentCommits),
 		IntentDeferLimit:    parseNonNegativeIntEnv(EnvIntentDeferLimit, DefaultIntentDeferLimit),
@@ -257,6 +264,21 @@ func parsePositiveDurationEnv(name string, fallback time.Duration) time.Duration
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func parseNonNegativeDurationEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	if raw == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
 		return fallback
 	}
 	return d

@@ -132,6 +132,130 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 	}
 }
 
+func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+
+	var hits atomic.Int32
+	var firstOffered atomic.Value
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		seqs := offeredIntentSeqs(t, req)
+		if firstOffered.Load() == nil {
+			copied := append([]int64(nil), seqs...)
+			firstOffered.Store(copied)
+		}
+		if len(seqs) != 5 {
+			http.Error(w, "expected exactly five offered captures", http.StatusBadRequest)
+			return
+		}
+		plan := map[string]any{
+			"selected_seqs":    seqs,
+			"deferred_seqs":    []int64{},
+			"subject":          "Group rapid five",
+			"body":             "Publish all rapid captures together.",
+			"grouping_reason":  "settle window collected the rapid burst",
+			"deferred_reasons": []map[string]any{},
+		}
+		args, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatalf("marshal intent plan: %v", err)
+		}
+		resp := map[string]any{
+			"id":     "chatcmpl-rapid-five",
+			"object": "chat.completion",
+			"model":  "gpt-5.4-mini",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "",
+					"tool_calls": []map[string]any{{
+						"id":   "call_rapid_five",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "capture_intent_plan",
+							"arguments": string(args),
+						},
+					}},
+				},
+				"finish_reason": "tool_calls",
+			}},
+		}
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_INTENT_WINDOW=10",
+		"ACD_INTENT_MIN_PENDING=2",
+		"ACD_INTENT_SETTLE_WINDOW=1s",
+		"ACD_INTENT_MAX_PENDING_AGE=30s",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-5.4-mini",
+		trustEnv,
+	}
+	sessionID := "intent-rapid-five"
+	startSession(t, ctx, env, repo, sessionID, "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+	fullEnv := envWith(env, extra...)
+
+	files := []string{"rapid-one.txt", "rapid-two.txt", "rapid-three.txt", "rapid-four.txt", "rapid-five.txt"}
+	startCount := commitCount(t, repo)
+	for _, name := range files {
+		writeFile(t, filepath.Join(repo, name), "rapid content for "+name+"\n")
+	}
+	wake := runAcd(t, ctx, fullEnv, "wake", "--repo", repo, "--session-id", sessionID, "--json")
+	if wake.ExitCode != 0 {
+		t.Fatalf("acd wake exit=%d\nstdout=%s\nstderr=%s", wake.ExitCode, wake.Stdout, wake.Stderr)
+	}
+
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	for _, name := range files {
+		waitForEventState(t, dbPath, name, "published", 25*time.Second)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("planner hits=%d want 1", hits.Load())
+	}
+	seqs, ok := firstOffered.Load().([]int64)
+	if !ok || len(seqs) != 5 {
+		t.Fatalf("first offered seqs=%v want 5 seqs", firstOffered.Load())
+	}
+	if got := commitCount(t, repo); got != startCount+1 {
+		t.Fatalf("commit count=%d want %d (one grouped rapid-five commit)", got, startCount+1)
+	}
+	if subj := headSubject(t, repo); subj != "Group rapid five" {
+		t.Fatalf("subject=%q want grouped rapid-five subject", subj)
+	}
+	win := loadLastPlannerWindowRow(t, dbPath)
+	if len(win.OfferedSeqs) != 5 || len(win.VisibleOriginalSeqs) != 5 || len(win.HiddenSeqs) != 0 {
+		t.Fatalf("rapid-five planner window = %+v, want five offered/visible seqs and no hidden coalesce", win)
+	}
+	if len(win.SelectedGroups) != 1 || len(win.SelectedGroups[0].OriginalSeqs) != 5 {
+		t.Fatalf("rapid-five selected groups = %+v, want one five-seq group", win.SelectedGroups)
+	}
+}
+
 type intentChatRequest struct {
 	Messages []struct {
 		Content string `json:"content"`

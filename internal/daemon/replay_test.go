@@ -2490,6 +2490,138 @@ func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "rapid-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "rapid-b.txt", "b\n")
+
+	prematurePlanner := &recordingIntentPlanner{
+		err: errors.New("planner must not run before settle window elapses"),
+	}
+	trace := &memoryTraceLogger{}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		Trace:               trace,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       prematurePlanner,
+		IntentWindow:        10,
+		IntentMinPending:    2,
+		IntentSettleWindow:  time.Hour,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay before settle: %v", err)
+	}
+	if prematurePlanner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 while rapid burst is settling", prematurePlanner.calls)
+	}
+	if sum.Published != 0 || !sum.Skipped || sum.SkippedReason != "skipped_due_intent_settle_window" {
+		t.Fatalf("summary=%+v want skipped_due_intent_settle_window with no publish", sum)
+	}
+	events := traceEventsByClass(trace.Events(), "intent.batch_wait")
+	if len(events) != 1 || events[0].Reason != "skipped_due_intent_settle_window" {
+		t.Fatalf("intent.batch_wait trace=%+v want skipped_due_intent_settle_window", events)
+	}
+
+	captureOnePendingFile(t, ctx, f, "rapid-c.txt", "c\n")
+	captureOnePendingFile(t, ctx, f, "rapid-d.txt", "d\n")
+	captureOnePendingFile(t, ctx, f, "rapid-e.txt", "e\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 5 {
+		t.Fatalf("pending=%d want 5 rapid captures", len(pending))
+	}
+	allSeqs := make([]int64, 0, len(pending))
+	for _, ev := range pending {
+		allSeqs = append(allSeqs, ev.Seq)
+		setCaptureEventTimestamp(t, ctx, f.db, ev.Seq, time.Now().Add(-time.Minute))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   allSeqs,
+			Subject:        "Group rapid five",
+			GroupingReason: "settle window collected the rapid burst",
+		},
+	}
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    2,
+		IntentSettleWindow:  10 * time.Second,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay after settle: %v", err)
+	}
+	if sum.Published != 5 || sum.Skipped {
+		t.Fatalf("summary=%+v want five rapid captures published together", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1 after settle", planner.calls)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	if !reflect.DeepEqual(gotOffered, allSeqs) {
+		t.Fatalf("offered seqs=%v want all rapid seqs %v", gotOffered, allSeqs)
+	}
+}
+
+func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "full-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "full-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+			Subject:        "Full window",
+			GroupingReason: "full window bypasses settle wait",
+		},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    2,
+		IntentSettleWindow:  time.Hour,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Skipped {
+		t.Fatalf("summary=%+v want full window to plan without settle wait", sum)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{pending[0].Seq, pending[1].Seq}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v", gotOffered, wantOffered)
+	}
+}
+
 func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -3025,6 +3157,136 @@ func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T)
 	}
 	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: same user intent")
 	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: same user intent")
+}
+
+func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "partition-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "partition-b.txt", "b\n")
+	captureOnePendingFile(t, ctx, f, "partition-c.txt", "c\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			DeferredSeqs: []int64{pending[2].Seq},
+			DeferredReasons: []ai.DeferredReason{{
+				Seq:    pending[2].Seq,
+				Reason: "third capture is unrelated",
+			}},
+			CommitGroups: []ai.IntentCommitGroup{
+				{
+					SelectedSeqs:   []int64{pending[0].Seq},
+					Subject:        "Add partition A",
+					GroupingReason: "first capture is one intent",
+				},
+				{
+					SelectedSeqs:   []int64{pending[1].Seq},
+					Subject:        "Add partition B",
+					GroupingReason: "second capture is independent",
+				},
+			},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published partition events", sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		t.Fatalf("commit count=%d want seed+2 partition commits", got)
+	}
+	oidA := captureCommitOID(t, ctx, f.db, pending[0].Seq)
+	oidB := captureCommitOID(t, ctx, f.db, pending[1].Seq)
+	if oidA == "" || oidB == "" || oidA == oidB {
+		t.Fatalf("partition commit oids A=%q B=%q want distinct non-empty commits", oidA, oidB)
+	}
+	stateC := captureEventState(t, ctx, f.db, pending[2].Seq)
+	if stateC != state.EventStatePending {
+		t.Fatalf("third capture state=%q want pending", stateC)
+	}
+	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: first capture is one intent")
+	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: second capture is independent")
+}
+
+func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "chain.txt", "v0\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	seq1 := captureSamePathEdit(t, ctx, f, "chain.txt", "v1\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "chain.txt", "v2\n")
+	seq3 := captureSamePathEdit(t, ctx, f, "chain.txt", "v3\n")
+
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs: []int64{seq1, seq2, seq3},
+			CommitGroups: []ai.IntentCommitGroup{
+				{SelectedSeqs: []int64{seq1, seq3}, Subject: "Update chain endpoints", GroupingReason: "invalid interleaved same-path group"},
+				{SelectedSeqs: []int64{seq2}, Subject: "Update chain middle", GroupingReason: "middle same-path capture"},
+			},
+			DeferredSeqs:    []int64{},
+			DeferredReasons: []ai.DeferredReason{},
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 3,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want deterministic fallback publish without blocking", sum)
+	}
+	if state1 := captureEventState(t, ctx, f.db, seq1); state1 != state.EventStatePublished {
+		t.Fatalf("seq1 state=%q want published fallback", state1)
+	}
+	for _, seq := range []int64{seq2, seq3} {
+		if got := captureEventState(t, ctx, f.db, seq); got != state.EventStatePending {
+			t.Fatalf("seq=%d state=%q want pending after fallback", seq, got)
+		}
+	}
+	decisions, err := state.DecisionsForEvent(ctx, f.db, seq1, 10)
+	if err != nil {
+		t.Fatalf("DecisionsForEvent: %v", err)
+	}
+	foundPlannerError := false
+	for _, decision := range decisions {
+		if decision.Kind == state.DecisionKindIntentPlannerError &&
+			decision.Reason.Valid &&
+			decision.Reason.String == "intent planner: commit_groups must be ordered by non-overlapping selected seq ranges" {
+			foundPlannerError = true
+		}
+	}
+	if !foundPlannerError {
+		t.Fatalf("missing planner error decision for seq %d: %+v", seq1, decisions)
+	}
 }
 
 func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T) {
@@ -4068,6 +4330,14 @@ func (p *recordingIntentPlanner) PlanIntent(ctx context.Context, req ai.IntentPl
 	return p.plan, nil
 }
 
+func offeredCaptureSeqs(req ai.IntentPlanRequest) []int64 {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return seqs
+}
+
 type qualityRewriteIntentProvider struct {
 	name         string
 	planSubject  string
@@ -4295,6 +4565,27 @@ func assertReplayDecision(t *testing.T, ctx context.Context, db *state.DB, seq i
 		return
 	}
 	t.Fatalf("missing replay decision kind=%q reason=%q for seq %d: %+v", kind, reason, seq, decisions)
+}
+
+func captureCommitOID(t *testing.T, ctx context.Context, db *state.DB, seq int64) string {
+	t.Helper()
+	var oid sql.NullString
+	if err := db.SQL().QueryRowContext(ctx, `SELECT commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(&oid); err != nil {
+		t.Fatalf("capture commit_oid seq=%d: %v", seq, err)
+	}
+	if !oid.Valid {
+		return ""
+	}
+	return oid.String
+}
+
+func captureEventState(t *testing.T, ctx context.Context, db *state.DB, seq int64) string {
+	t.Helper()
+	var st string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&st); err != nil {
+		t.Fatalf("capture state seq=%d: %v", seq, err)
+	}
+	return st
 }
 
 func assertIntentPlannerErrorDecision(t *testing.T, ctx context.Context, db *state.DB, seq int64, reasonContains string) {
@@ -5086,11 +5377,12 @@ func captureSamePathEdit(t *testing.T, ctx context.Context, f *captureFixture, p
 	return newest
 }
 
-// TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer: four sequential
-// modifies on the same path produce one offered window entry, one commit, and
-// four decision_records rows joined by commit_oid (so the CLI's grouped_seqs
+// TestReplay_IntentSamePathCapturesRemainPlannerVisible: four sequential
+// modifies on the same path remain four offered planner entries. The planner
+// may still select all four into one commit, and decision_records must carry
+// one row per original seq joined by commit_oid (so the CLI's grouped_seqs
 // derivation reports len 4).
-func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
+func TestReplay_IntentSamePathCapturesRemainPlannerVisible(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5117,11 +5409,11 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	}
 
 	planner := &recordingIntentPlanner{}
-	// Plan the single coalesced offer the planner is expected to see.
+	// Plan every captured seq the planner is expected to see.
 	planner.plan = ai.IntentPlan{
-		SelectedSeqs:   []int64{seq1},
-		Subject:        "Coalesced burst",
-		GroupingReason: "single-path edit chain",
+		SelectedSeqs:   []int64{seq1, seq2, seq3, seq4},
+		Subject:        "Grouped burst",
+		GroupingReason: "same-path edit chain selected atomically",
 	}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
@@ -5141,13 +5433,15 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	if planner.calls != 1 {
 		t.Fatalf("planner calls=%d want 1", planner.calls)
 	}
-	if got := planner.requests[0].OfferedCaptures; len(got) != 1 {
-		t.Fatalf("offered captures=%d want 1 (coalesced)", len(got))
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{seq1, seq2, seq3, seq4}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v (same-path captures must stay planner-visible)", gotOffered, wantOffered)
 	}
-	// One commit on top of the seed for the coalesced burst.
+	// One commit on top of the seed for the planner-selected burst.
 	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
-		// seed (gitignore) + seed (burst.txt v0) + 1 coalesced commit = 3
-		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 coalesced)", got)
+		// seed (gitignore) + seed (burst.txt v0) + 1 grouped commit = 3
+		t.Fatalf("commit count=%d want 3 (gitignore seed + burst seed + 1 grouped)", got)
 	}
 	// HEAD's blob for burst.txt must be v4 (the LAST captured after-state).
 	headOID, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", "burst.txt")
@@ -5210,6 +5504,53 @@ func TestReplay_IntentPathCoalesce_FoldsFourEditsIntoOneOffer(t *testing.T) {
 	}
 }
 
+func TestReplay_IntentSameFileIndependentFunctionsRemainPlannerVisible(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	seedTrackedFileCommit(t, ctx, f, "module.py", "def price():\n    return 10\n\n\ndef slug():\n    return 'old'\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+
+	seq1 := captureSamePathEdit(t, ctx, f, "module.py", "def price():\n    return 12\n\n\ndef slug():\n    return 'old'\n")
+	seq2 := captureSamePathEdit(t, ctx, f, "module.py", "def price():\n    return 12\n\n\ndef slug():\n    return 'new'\n")
+
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d want 2 same-file captures", len(pending))
+	}
+	planner := &recordingIntentPlanner{
+		plan: ai.IntentPlan{
+			SelectedSeqs:   []int64{seq1, seq2},
+			Subject:        "Group module updates",
+			GroupingReason: "test selects both visible same-file captures",
+		},
+	}
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 2,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.Conflicts != 0 || sum.Failed != 0 {
+		t.Fatalf("summary=%+v want 2 published, 0 conflicts/failed", sum)
+	}
+	gotOffered := offeredCaptureSeqs(planner.requests[0])
+	wantOffered := []int64{seq1, seq2}
+	if !reflect.DeepEqual(gotOffered, wantOffered) {
+		t.Fatalf("offered seqs=%v want %v (independent same-file captures must stay planner-visible)", gotOffered, wantOffered)
+	}
+}
+
 // TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce: a same-path capture
 // surrounded by an other-path capture stays as 3 separate offers.
 func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
@@ -5258,12 +5599,8 @@ func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
 	if got := planner.requests[0].OfferedCaptures; len(got) != 3 {
 		t.Fatalf("planner offered captures=%d want 3 (P/Q/P must split)", len(got))
 	}
-	// Verify each offer is a distinct seq (no coalesce_token) — read from
-	// the offered captures' seqs.
-	offeredSeqs := make([]int64, 0, 3)
-	for _, c := range planner.requests[0].OfferedCaptures {
-		offeredSeqs = append(offeredSeqs, c.Seq)
-	}
+	// Verify each offer is a distinct seq (no coalesce_token).
+	offeredSeqs := offeredCaptureSeqs(planner.requests[0])
 	wantOffered := []int64{pending[0].Seq, pending[1].Seq, pending[2].Seq}
 	if !reflect.DeepEqual(offeredSeqs, wantOffered) {
 		t.Fatalf("offered seqs=%v want %v", offeredSeqs, wantOffered)

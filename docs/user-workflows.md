@@ -168,6 +168,7 @@ Intent mode may wait before asking the planner.
 | Gate | Meaning |
 |---|---|
 | `ACD_INTENT_MIN_PENDING` | Wait for this many visible pending captures. |
+| `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait for a quiet burst boundary before planning. |
 | `ACD_INTENT_MAX_PENDING_AGE` | Publish when the oldest visible capture reaches this age. |
 | `ACD_INTENT_WINDOW` | Offer at most this many captures to the planner. |
 | `ACD_INTENT_DEFER_LIMIT` | Force a capture after this many deferrals. |
@@ -188,6 +189,15 @@ acd flush --repo . --session-id "$ACD_SESSION_ID" --logical
 ~~~
 
 Plain `acd wake` does not bypass intent batch gates.
+
+To check whether work was captured, planner-visible, and committed as intended:
+
+| Question | Command |
+|---|---|
+| Which captures are still waiting? | `acd status --json` |
+| What did the last planner window contain? | `acd status --json` and inspect `intent_strategy.last_planner_window` |
+| Was one seq offered, selected, deferred, or hidden? | `acd events --json --since <cursor>` and inspect `planner_window` |
+| Why is the planner waiting? | `acd diagnose --json` and inspect `batch_wait_reason` plus settle fields |
 
 ## Inspect an AI prompt
 
@@ -216,8 +226,10 @@ acd prompt --last
 acd prompt --seq 42
 ~~~
 
-In intent mode, `--seq` can match any planner window where that seq was
-offered. Remove `<gitDir>/acd/prompt-trace/` after debugging.
+In intent mode, `--seq` can match any prompt-traced planner window where that
+seq was offered. For privacy-safe metadata without raw prompts or diffs, use
+`acd events --json` or `acd status --json`. Remove
+`<gitDir>/acd/prompt-trace/` after debugging.
 
 ## Branch surgery
 

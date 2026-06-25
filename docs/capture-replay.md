@@ -139,19 +139,25 @@ rewrite diffs are capped at 16000 bytes.
 | Strategy | Replay behavior |
 |---|---|
 | `event` | FIFO replay. One capture can become one commit. |
-| `intent` | A bounded pending window goes to the planner. Selected seqs replay as one commit; deferred seqs stay pending. |
+| `intent` | A bounded pending window goes to the planner. Selected groups publish sequentially; deferred seqs stay pending. |
 
 Intent waits for one of these:
 
 | Trigger | Meaning |
 |---|---|
 | `ACD_INTENT_MIN_PENDING` | Enough visible pending captures exist. |
+| `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait briefly for bursty edits to stop arriving. |
 | `ACD_INTENT_MAX_PENDING_AGE` | Oldest visible capture reached the age escape hatch. |
 | `acd flush --logical --session-id <active-session>` | A registered harness session asks to drain the visible batch now. |
 | Forced aging | A repeatedly deferred capture reached `ACD_INTENT_DEFER_LIMIT`. |
 
 Plain `acd wake` nudges capture and replay. It does not bypass intent batch
 gates.
+
+Planner-window records are stored separately from raw prompt traces. They show
+which seqs were offered, selected, deferred, forced, or hidden by legacy
+same-path coalescing. Prompt traces remain the opt-in source for exact provider
+requests and may contain source text.
 
 ## One-shot capture with `commit-all`
 

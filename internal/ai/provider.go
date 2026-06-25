@@ -298,6 +298,23 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 }
 
 func applyIntentMessageQuality(ctx context.Context, provider Provider, req IntentPlanRequest, plan IntentPlan) (IntentPlan, error) {
+	if len(plan.CommitGroups) > 0 {
+		out := plan
+		for i, group := range plan.CommitGroups {
+			groupPlan := IntentPlanForCommitGroup(plan, group)
+			checked, err := applyIntentMessageQuality(ctx, provider, req, groupPlan)
+			if err != nil {
+				return IntentPlan{}, err
+			}
+			out.CommitGroups[i].Subject = checked.Subject
+			out.CommitGroups[i].Body = checked.Body
+			if checked.MessageQuality != "" {
+				out.MessageQuality = checked.MessageQuality
+				out.MessageQualityReason = checked.MessageQualityReason
+			}
+		}
+		return out, nil
+	}
 	report := EvaluateIntentPlanMessageQuality(req, plan)
 	switch report.Action {
 	case MessageQualityClean:
