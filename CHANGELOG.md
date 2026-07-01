@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Updated pinned GitHub Actions dependency `actions/setup-go` from `v6.4.0` to
+  `v6.5.0`.
+
 ## v2026-06-26
 
 ### Added
