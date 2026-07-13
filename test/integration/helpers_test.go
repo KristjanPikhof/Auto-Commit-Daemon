@@ -293,10 +293,13 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 		t.Skip("script(1) PTY utility required")
 	}
 	body := "stty cols " + strconv.Itoa(cols) + " rows " + strconv.Itoa(rows)
+	inputDelay := 850 * time.Millisecond
 	if resizeCols > 0 && resizeRows > 0 {
-		body += "; (sleep 0.5; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) & "
+		body += "; (sleep 0.9; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) & exec \"$@\""
+		inputDelay = 1400 * time.Millisecond
+	} else {
+		body += "; exec \"$@\""
 	}
-	body += "exec \"$@\""
 	commandArgs := append([]string{"/bin/sh", "-c", body, "sh"}, args...)
 	var scriptArgs []string
 	if runtime.GOOS == "darwin" {
@@ -316,7 +319,7 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start PTY command: %v", err)
 	}
-	time.Sleep(850 * time.Millisecond)
+	time.Sleep(inputDelay)
 	if input != "" {
 		_, _ = io.WriteString(stdin, input)
 	}
