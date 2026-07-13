@@ -19,6 +19,7 @@ type Overrides map[string]json.RawMessage
 // Unknown fields are retained in Extra when a known section is updated.
 type Document struct {
 	Version       int
+	Generation    uint64
 	RepoLifecycle json.RawMessage
 	Settings      SettingsDocument
 	Extra         map[string]json.RawMessage
@@ -85,6 +86,11 @@ func ParseDocument(body []byte) (*Document, error) {
 		}
 		if doc.Version > SettingsSchemaVersion {
 			return nil, fmt.Errorf("acd config: version %d is newer than supported version %d", doc.Version, SettingsSchemaVersion)
+		}
+	}
+	if value, ok := takeRaw(raw, "generation"); ok {
+		if err := json.Unmarshal(value, &doc.Generation); err != nil {
+			return nil, fmt.Errorf("acd config: generation: %w", err)
 		}
 	}
 	if value, ok := takeRaw(raw, "repo_lifecycle"); ok {
@@ -180,36 +186,73 @@ func parseRepository(body json.RawMessage) (RepositorySettings, error) {
 // MarshalJSON merges known sections back into their retained unknown fields.
 func (d Document) MarshalJSON() ([]byte, error) {
 	raw := cloneRawMap(d.Extra)
-	raw["version"] = mustRaw(d.Version)
+	version, err := json.Marshal(d.Version)
+	if err != nil {
+		return nil, err
+	}
+	raw["version"] = version
+	generation, err := json.Marshal(d.Generation)
+	if err != nil {
+		return nil, err
+	}
+	raw["generation"] = generation
 	if len(d.RepoLifecycle) > 0 {
 		raw["repo_lifecycle"] = cloneRaw(d.RepoLifecycle)
 	}
-	raw["settings"] = mustRaw(d.Settings)
+	settings, err := json.Marshal(d.Settings)
+	if err != nil {
+		return nil, err
+	}
+	raw["settings"] = settings
 	return json.Marshal(raw)
 }
 
 func (s SettingsDocument) MarshalJSON() ([]byte, error) {
 	raw := cloneRawMap(s.Extra)
-	raw["global"] = mustRaw(nonNilOverrides(s.Global))
-	raw["profiles"] = mustRaw(nonNilProfiles(s.Profiles))
-	raw["repositories"] = mustRaw(nonNilRepositories(s.Repositories))
+	global, err := json.Marshal(nonNilOverrides(s.Global))
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := json.Marshal(nonNilProfiles(s.Profiles))
+	if err != nil {
+		return nil, err
+	}
+	repositories, err := json.Marshal(nonNilRepositories(s.Repositories))
+	if err != nil {
+		return nil, err
+	}
+	raw["global"] = global
+	raw["profiles"] = profiles
+	raw["repositories"] = repositories
 	return json.Marshal(raw)
 }
 
 func (p Profile) MarshalJSON() ([]byte, error) {
 	raw := cloneRawMap(p.Extra)
-	raw["fields"] = mustRaw(nonNilOverrides(p.Fields))
+	fields, err := json.Marshal(nonNilOverrides(p.Fields))
+	if err != nil {
+		return nil, err
+	}
+	raw["fields"] = fields
 	return json.Marshal(raw)
 }
 
 func (r RepositorySettings) MarshalJSON() ([]byte, error) {
 	raw := cloneRawMap(r.Extra)
 	if r.Profile != "" {
-		raw["profile"] = mustRaw(r.Profile)
+		profile, err := json.Marshal(r.Profile)
+		if err != nil {
+			return nil, err
+		}
+		raw["profile"] = profile
 	} else {
 		delete(raw, "profile")
 	}
-	raw["fields"] = mustRaw(nonNilOverrides(r.Fields))
+	fields, err := json.Marshal(nonNilOverrides(r.Fields))
+	if err != nil {
+		return nil, err
+	}
+	raw["fields"] = fields
 	return json.Marshal(raw)
 }
 
@@ -227,14 +270,6 @@ func cloneRawMap(in map[string]json.RawMessage) map[string]json.RawMessage {
 		out[key] = cloneRaw(value)
 	}
 	return out
-}
-
-func mustRaw(value any) json.RawMessage {
-	body, err := json.Marshal(value)
-	if err != nil {
-		panic(err)
-	}
-	return body
 }
 
 func nonNilOverrides(value Overrides) Overrides {

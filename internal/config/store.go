@@ -14,6 +14,10 @@ import (
 // Store safely reads and updates the XDG operator configuration.
 type Store struct{ Roots paths.Roots }
 
+// ErrStaleGeneration means a caller attempted to update a document that has
+// changed since its snapshot was read.
+var ErrStaleGeneration = errors.New("acd config: stale generation")
+
 func NewStore(roots paths.Roots) *Store { return &Store{Roots: roots} }
 
 // Load reads config.json without creating it.
@@ -39,6 +43,17 @@ func (s *Store) Load() (*Document, error) {
 // Update serializes the complete read-modify-write transaction with a
 // dedicated advisory lock. Returning an error from fn leaves disk unchanged.
 func (s *Store) Update(fn func(*Document) error) error {
+	return s.update(nil, fn)
+}
+
+// UpdateExpected performs a compare-and-swap update against the saved
+// generation. It lets interactive settings sessions fail visibly instead of
+// overwriting a newer concurrent edit.
+func (s *Store) UpdateExpected(expected uint64, fn func(*Document) error) error {
+	return s.update(&expected, fn)
+}
+
+func (s *Store) update(expected *uint64, fn func(*Document) error) error {
 	if fn == nil {
 		return errors.New("acd config: nil update")
 	}
@@ -62,9 +77,13 @@ func (s *Store) Update(fn func(*Document) error) error {
 	if err != nil {
 		return err
 	}
+	if expected != nil && doc.Generation != *expected {
+		return fmt.Errorf("%w: expected %d, found %d", ErrStaleGeneration, *expected, doc.Generation)
+	}
 	if err := fn(doc); err != nil {
 		return err
 	}
+	doc.Generation++
 	if err := ValidateDocument(doc); err != nil {
 		return err
 	}

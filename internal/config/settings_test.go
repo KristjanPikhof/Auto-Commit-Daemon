@@ -145,6 +145,51 @@ func TestConfigStoreCallbackErrorLeavesDiskUnchanged(t *testing.T) {
 	}
 }
 
+func TestConfigStoreExpectedGenerationRejectsStaleWriter(t *testing.T) {
+	roots := testConfigRoots(t)
+	store := NewStore(roots)
+	if err := store.Update(func(doc *Document) error {
+		doc.Settings.Global[FieldModel] = rawString("first")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Generation != 1 {
+		t.Fatalf("generation = %d, want 1", first.Generation)
+	}
+	if err := store.Update(func(doc *Document) error {
+		doc.Settings.Global[FieldModel] = rawString("second")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = store.UpdateExpected(first.Generation, func(doc *Document) error {
+		doc.Settings.Global[FieldModel] = rawString("stale")
+		return nil
+	})
+	if !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("UpdateExpected error = %v", err)
+	}
+	current, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", current.Generation)
+	}
+	resolved, err := ResolveField(FieldModel, ResolveInput{Global: current.Settings.Global})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Value != "second" {
+		t.Fatalf("stale writer replaced value: %#v", resolved)
+	}
+}
+
 func TestResolvePrecedenceAndShadowedEnvironment(t *testing.T) {
 	input := ResolveInput{
 		Experiment: Overrides{FieldModel: rawString("experiment")},
