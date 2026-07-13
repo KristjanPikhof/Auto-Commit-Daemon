@@ -387,7 +387,7 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if callerErr := callerCancellation(ctx); callerErr != nil {
+	if callerErr := ctx.Err(); callerErr != nil {
 		h.releaseCanceledHalfOpenProbe(ctx, permit)
 		return callerErr
 	}
@@ -400,7 +400,7 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 	now := h.now().UTC()
 	changed := false
 	h.mu.Lock()
-	if callerErr := callerCancellation(ctx); callerErr != nil {
+	if callerErr := ctx.Err(); callerErr != nil {
 		changed = h.releaseCanceledHalfOpenProbeLocked(now, permit)
 		h.mu.Unlock()
 		if changed {
@@ -423,10 +423,6 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 		h.persistLatest(ctx)
 	}
 	return nil
-}
-
-func callerCancellation(ctx context.Context) error {
-	return ctx.Err()
 }
 
 func (h *IntentPlannerHealth) releaseCanceledHalfOpenProbe(ctx context.Context, permit IntentPlannerHealthPermit) {
