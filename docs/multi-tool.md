@@ -76,9 +76,12 @@ acd events --watch
 acd explain --path path/to/file
 acd diagnose --repo .
 acd fix --dry-run
+acd off
 acd fix --yes
 acd fix --force --dry-run
 acd fix --force --yes
+acd on
+acd
 ~~~
 
 Normal `acd fix --yes` proves a chain at stable `HEAD` when possible and archives

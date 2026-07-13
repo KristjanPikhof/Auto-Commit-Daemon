@@ -18,13 +18,16 @@ appear, or how to recover a stuck queue.
 | Explain one commit | `acd explain --commit HEAD` | Read |
 | Inspect latest AI prompt trace | `acd prompt --last` | Read |
 | Tail raw daemon log | `acd logs --follow` | Read |
-| Create support bundle | `acd doctor --bundle` | Read |
+| Create support bundle | `acd doctor --bundle` | Read diagnostics and write a sanitized zip |
 
 `acd prompt` only works after a non-deterministic provider ran with
 `ACD_AI_PROMPT_TRACE=1`.
 
 `acd events --watch` starts at the current ledger tail unless you pass
 `--since <cursor>`.
+
+See [commands.md](commands.md) for the complete public command reference,
+including repo administration, maintenance, and the hook protocol.
 
 ## Repo registration
 
@@ -106,10 +109,12 @@ Run these in order. Stop when the queue is healthy again.
 | Inspect one path | `acd explain --path FILE` | Is the file captured, skipped, protected, or blocked? |
 | Inspect blockers | `acd diagnose --json` | Which branch anchor or terminal row is holding replay? |
 | Preview reconciliation | `acd fix --dry-run` | Does the exact-chain proof match what happened? |
+| Prevent hook restart during repair | `acd off` | Stop the daemon and keep the repo disabled while state changes. |
 | Apply reconciliation | `acd fix --yes` | Prove the chain at `HEAD`; otherwise preserve it at an archive ref. |
-| Preview archive-only recovery | `acd fix --force --dry-run` | Which complete chain and recovery ref would be used? |
-| Apply archive-only recovery | `acd fix --force --yes` | Preserve the complete chain before marking it recovered. |
-| Post-check | `acd status` | Confirm `blk`/`blocked` cleared. |
+| Preview archive-only recovery | `acd fix --force --dry-run` | Show which complete chain and recovery ref would be used. |
+| Apply archive-only recovery | `acd fix --force --yes` | Save the complete chain without trying the publish proof. |
+| Start normal operation again | `acd on` | Enable the repo and ensure the daemon is healthy. |
+| Post-check | `acd` | Confirm the repo no longer needs attention. |
 
 `acd fix` creates and verifies a SQLite-consistent backup before migration or
 recovery mutation, and refuses a live daemon owner. It never retargets captures
@@ -321,7 +326,7 @@ acd doctor
 |---|---|
 | `ACD_SAFE_IGNORE=0` | Disable generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated-tree patterns. |
-| `ACD_SENSITIVE_GLOBS=...` | Configure sensitive globs. Empty keeps defaults. |
+| `ACD_SENSITIVE_GLOBS=...` | Replace the protected path globs. Unset or empty uses the defaults. |
 
 Restart the daemon after changing these settings.
 
@@ -334,8 +339,9 @@ for example `.derivedData-provider-core/`.
 |---|---|---|
 | Inspect | `acd diagnose --json` | Shows `generated_pending` roots, queued delete count, and tracked count. |
 | Preview ACD cleanup | `acd fix --dry-run` | Shows `drop_generated_pending` actions. |
-| Stop if needed | `acd stop` | Required when a live daemon owns the state DB. |
+| Turn ACD off | `acd off` | Stops the daemon and prevents hooks from restarting it during cleanup. |
 | Clean ACD queue | `acd fix --yes` | Removes only protected generated pending rows from ACD state. |
+| Turn ACD on | `acd on` | Restarts normal capture and replay after cleanup. |
 | Review Git cleanup | `git status -- .derivedData-provider-core` | Confirms which tracked generated files are deleted. |
 | Stage Git cleanup | `git add -u -- .derivedData-provider-core` | Stages the tracked generated file removals. |
 | Commit Git cleanup | `git commit -m "Remove tracked generated cache files"` | Records the repository cleanup. |
@@ -362,8 +368,10 @@ acd fix --dry-run
 Apply only after reading the plan:
 
 ~~~bash
+acd off
 acd fix --yes
-acd status
+acd on
+acd
 ~~~
 
 Use the force path when the chain cannot be proven at `HEAD` and you want an
@@ -371,11 +379,13 @@ explicit archive-only recovery:
 
 ~~~bash
 acd fix --force --dry-run
+acd off
 acd fix --force --yes
-acd status
+acd on
+acd
 ~~~
 
-## Cold start commit cleanup
+## Commit work made while ACD was off
 
 Use `commit-all` when the daemon was off and the worktree is dirty:
 
@@ -408,7 +418,7 @@ Refusals:
 | Detached HEAD | Check out a branch. |
 | Git operation in progress | Finish the operation. |
 | Manual pause marker | `acd resume --yes` |
-| Authorized mutation while the per-repo daemon is running | `acd stop` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
+| The daemon is running when the command is ready to write | `acd off` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
 | No initial commit | Create an initial commit. |
 
 ## Support bundle
@@ -447,6 +457,8 @@ fsnotify information, state/meta JSON, and daemon log tails.
 | `handled_external` | Another commit already contains the captured after-state. |
 | `handled_external_after_block` | A blocked row was promoted after `HEAD` matched its after-state. |
 | `superseded_external` | External history made queued work obsolete. |
+| `recovery_published` | ACD proved that the branch already contains every captured change in the unpublished chain. |
+| `recovery_archived` | ACD saved the unpublished chain under a hidden recovery ref before removing it from replay. |
 | `blocked` | Replay stopped because applying the event was not safe. |
 | `paused` / `resumed` | Manual pause, rewind grace, or Git operation state changed. |
 

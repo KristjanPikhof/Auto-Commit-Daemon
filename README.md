@@ -159,7 +159,7 @@ Message format:
 
 | Format | Example subject | Notes |
 |---|---|---|
-| `imperative` | `Add commit format selection` | Default and recommended. Existing behavior is unchanged. |
+| `imperative` | `Add commit format selection` | Default. Subjects start with an imperative verb. |
 | `conventional` | `feat: add commit format selection` | Optional scope-less Conventional Commit style. |
 
 ~~~bash
@@ -182,7 +182,7 @@ automatic.
 | Check this repo and get one recommended next action | `acd` |
 | Enable ACD and ensure the daemon is running | `acd on` |
 | Disable ACD and stop the daemon without deleting state | `acd off` |
-| Watch all registered repos | `acd list` |
+| Watch enabled repos | `acd list` |
 | Show this repo state | `acd status` |
 | Follow capture, group, publish, and block decisions | `acd events --watch` |
 | Ask why a path behaved a certain way | `acd explain --path FILE` |
@@ -192,7 +192,9 @@ automatic.
 
 Bare `acd` is read-only. `acd on` and `acd off` are idempotent, work from a
 subdirectory, and preserve `.git/acd/state.db`. Harness integrations continue
-to use the lower-level `start`, `wake`, `flush`, and `stop` commands.
+to use the lower-level `start`, `wake`, `touch`, `flush`, and `stop` commands.
+See the [command reference](docs/commands.md) for every public command and its
+read or write behavior.
 
 ## When commits stop
 
@@ -216,13 +218,16 @@ acd diagnose
 acd events --watch
 ~~~
 
-Use `fix` when the daemon is stopped and you want to preview or run the same
-pair-level reconciliation manually:
+Use `fix` when you want to preview or run the same recovery manually. Preview
+first, turn ACD off so hooks cannot restart the daemon during repair, then turn
+it on again:
 
 ~~~bash
 acd fix --dry-run
+acd off
 acd fix --yes
-acd status
+acd on
+acd
 ~~~
 
 `--force` means archive-only recovery. It does not purge, retarget, or discard
@@ -230,7 +235,9 @@ captured events:
 
 ~~~bash
 acd fix --force --dry-run
+acd off
 acd fix --force --yes
+acd on
 ~~~
 
 `acd fix` creates a SQLite-consistent backup before it mutates state and refuses
@@ -368,7 +375,7 @@ git reset --hard <backup-ref-or-sha>
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after invalid planner output. |
 | `ACD_SAFE_IGNORE` | enabled | Set false-like value to stop pruning generated trees. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Extra generated trees, such as `dist/,build/`. |
-| `ACD_SENSITIVE_GLOBS` | built in | Extra sensitive path globs. Empty keeps defaults. |
+| `ACD_SENSITIVE_GLOBS` | built in | Non-empty values replace the protected path globs. Unset or empty uses the defaults. |
 | `ACD_TRACE` | off | Writes daemon decision summaries under `<gitDir>/acd/trace/`. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local AI request diagnostics. Treat as sensitive. |
 
@@ -379,6 +386,7 @@ Restart a running daemon after changing daemon runtime environment.
 | Doc | Use it for |
 |---|---|
 | [docs/overview.md](docs/overview.md) | A short system map. |
+| [docs/commands.md](docs/commands.md) | Every public command, its side effects, and safe examples. |
 | [docs/user-workflows.md](docs/user-workflows.md) | Daily status, recovery, support bundles, and `commit-all`. |
 | [docs/capture-replay.md](docs/capture-replay.md) | Storage, replay, branch safety, blockers, and trace classes. |
 | [docs/intent-commit-flow.md](docs/intent-commit-flow.md) | Intent grouping behavior and planner observability. |

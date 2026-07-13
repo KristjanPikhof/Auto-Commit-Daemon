@@ -47,7 +47,7 @@ flowchart LR
 | Strategy | Behavior |
 |---|---|
 | `event` | FIFO replay. One capture can produce one commit. This is the default. |
-| `intent` | A bounded window of pending captures goes to the planner. Selected captures replay as one commit; deferred captures stay pending. |
+| `intent` | A bounded window goes to the planner. It can split selected captures into ordered groups, and replay publishes one commit per group. Deferred captures stay pending. |
 
 Both strategies use the same capture rows and replay safety checks. Intent mode
 changes grouping, not durability.
@@ -72,6 +72,7 @@ failures.
 | Task | Doc |
 |---|---|
 | Install and set up hooks | [README](../README.md) |
+| Find the right command | [commands.md](commands.md) |
 | Recover from a stuck queue | [user-workflows.md](user-workflows.md) |
 | Understand replay safety | [capture-replay.md](capture-replay.md) |
 | Configure AI providers | [ai-providers.md](ai-providers.md) |

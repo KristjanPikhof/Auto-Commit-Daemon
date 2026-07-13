@@ -207,7 +207,7 @@ Refusals:
 | Detached HEAD | Check out a branch. |
 | Rebase, merge, cherry-pick, or bisect in progress | Finish the Git operation. |
 | Manual pause marker | `acd resume --yes` |
-| Authorized mutation while the per-repo daemon is running | `acd stop` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
+| The daemon is running when the command is ready to write | `acd off` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
 | No initial commit | Create the first commit yourself. |
 
 ## Blocked conflicts
@@ -233,9 +233,12 @@ acd events
 acd explain --path path/from/status
 acd diagnose --json
 acd fix --dry-run
+acd off
 acd fix --yes
 acd fix --force --dry-run
 acd fix --force --yes
+acd on
+acd
 ~~~
 
 Safe apply runs the same exact-chain proof used by the daemon and archives the
@@ -245,8 +248,14 @@ before marking rows recovered; neither purges, retargets, or discards captures.
 
 ## Operator commands
 
+See [commands.md](commands.md) for the full command reference. These are the
+commands most useful while reading the capture and replay internals:
+
 | Task | Command |
 |---|---|
+| Quick health and next action | `acd` |
+| Enable and start this repo | `acd on` |
+| Disable and stop while preserving state | `acd off` |
 | Current repo health | `acd status` |
 | Live status refresh | `acd status --watch` |
 | Decision ledger | `acd events` |
@@ -278,9 +287,9 @@ before marking rows recovered; neither purges, retargets, or discards captures.
 
 Disabled repos are hidden from normal `acd list` snapshots. A disabled registry
 row makes hook-driven `start`, `wake`, `touch`, and `flush` skip with
-`repo_disabled` before capture or replay state is opened. Re-enable with
-`acd repo enable --repo <path>`, or use `acd repo manage` /
-`acd list --interactive` to toggle from the manager.
+`repo_disabled` before capture or replay state is opened. Run `acd on` for
+normal use, or use `acd repo manage` / `acd list --interactive` for registry
+administration.
 
 ## Safe-ignore and sensitive paths
 
@@ -298,7 +307,7 @@ acd doctor
 |---|---|
 | `ACD_SAFE_IGNORE=0` | Disable generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated trees. |
-| `ACD_SENSITIVE_GLOBS=...` | Replace or extend sensitive path handling. Empty keeps defaults. |
+| `ACD_SENSITIVE_GLOBS=...` | Replace the protected path globs. Unset or empty uses the defaults. |
 
 Restart the daemon after changing these values.
 

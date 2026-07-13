@@ -116,7 +116,7 @@ func newDiagnoseCmd() *cobra.Command {
 		Short: "Inspect replay blockers and branch anchors without mutating state",
 		Long: `Inspect replay blockers, pending depth, branch anchor state, git-operation markers, and remediation hints for one repo.
 
-The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Pending-only intent queues are reported as waiting/draining, while terminal barriers point to acd fix --dry-run and force-only purge previews when needed.`,
+The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Pending-only intent queues are reported as waiting/draining, while terminal barriers point to acd fix --dry-run and archive-only recovery previews when needed.`,
 		Example: `  acd diagnose
   acd diagnose --repo /path/to/repo
   acd diagnose --json
