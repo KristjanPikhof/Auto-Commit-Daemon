@@ -676,9 +676,10 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 }
 
 // PrunePublishedEventsBefore deletes old published rows that do not belong to
-// a recovery snapshot. Snapshot members require repo-aware Git-ref locking and
-// are pruned separately by the daemon, regardless of whether reconciliation
-// classified them as published or recovered.
+// a recovery snapshot and are not materialization context for a later
+// unpublished same-base chain. Snapshot members require repo-aware Git-ref
+// locking and are pruned separately by the daemon, regardless of whether
+// reconciliation classified them as published or recovered.
 func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
 	res, err := d.conn.ExecContext(ctx, `
 DELETE FROM capture_events
@@ -688,7 +689,16 @@ WHERE state = 'published'
       SELECT 1
       FROM recovery_snapshot_events member
       WHERE member.event_seq = capture_events.seq
-  )`, cutoff)
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events unpublished
+      WHERE unpublished.branch_ref = capture_events.branch_ref
+        AND unpublished.branch_generation = capture_events.branch_generation
+        AND unpublished.base_head = capture_events.base_head
+        AND unpublished.seq > capture_events.seq
+        AND unpublished.state IN (?, ?, ?)
+  )`, cutoff, EventStatePending, EventStateBlockedConflict, EventStateFailed)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune published events: %w", err)
 	}

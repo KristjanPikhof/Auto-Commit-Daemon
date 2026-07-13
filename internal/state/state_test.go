@@ -983,6 +983,71 @@ INSERT INTO recovery_snapshots(
 	}
 }
 
+func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T) {
+	for _, unpublishedState := range []string{
+		EventStatePending,
+		EventStateBlockedConflict,
+		EventStateFailed,
+	} {
+		t.Run(unpublishedState, func(t *testing.T) {
+			t.Parallel()
+			d, _ := openTestDB(t)
+			ctx := context.Background()
+			appendEvent := func(baseHead, path, eventState string) int64 {
+				t.Helper()
+				seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+					BranchRef: "refs/heads/main", BranchGeneration: 7,
+					BaseHead: baseHead, Operation: "modify", Path: path,
+					Fidelity: "exact", CapturedTS: 10, State: eventState,
+				}, []CaptureOp{{
+					Op: "modify", Path: path,
+					BeforeOID: sqlNullStr("before-" + path), BeforeMode: sqlNullStr("100644"),
+					AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+					Fidelity: "exact",
+				}})
+				if err != nil {
+					t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+				}
+				return seq
+			}
+
+			prefix := appendEvent("shared-base", "prefix.txt", EventStatePublished)
+			ordinary := appendEvent("other-base", "ordinary.txt", EventStatePublished)
+			suffix := appendEvent("shared-base", "suffix.txt", unpublishedState)
+
+			n, err := PrunePublishedEventsBefore(ctx, d, 100)
+			if err != nil {
+				t.Fatalf("PrunePublishedEventsBefore: %v", err)
+			}
+			if n != 1 {
+				t.Fatalf("pruned=%d want only ordinary published row", n)
+			}
+			for _, seq := range []int64{prefix, suffix} {
+				var eventCount, opCount int
+				if err := d.SQL().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&eventCount); err != nil {
+					t.Fatalf("count event seq=%d: %v", seq, err)
+				}
+				if err := d.SQL().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM capture_ops WHERE event_seq = ?`, seq).Scan(&opCount); err != nil {
+					t.Fatalf("count ops seq=%d: %v", seq, err)
+				}
+				if eventCount != 1 || opCount != 1 {
+					t.Fatalf("recovery context seq=%d event=%d ops=%d want 1,1", seq, eventCount, opCount)
+				}
+			}
+			var ordinaryCount int
+			if err := d.SQL().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+				t.Fatalf("count ordinary published: %v", err)
+			}
+			if ordinaryCount != 0 {
+				t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
+			}
+		})
+	}
+}
+
 func TestRollupsAppendOnly(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)

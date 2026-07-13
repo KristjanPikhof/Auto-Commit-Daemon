@@ -560,7 +560,7 @@ SELECT outcome, event_count, recovery_ref FROM recovery_snapshots`).Scan(
 	}
 }
 
-func TestReplay_ReconcilesBarrierAfterPublishedSameBasePrefix(t *testing.T) {
+func TestReplay_ReconcilesBarrierAfterAgedPublishedSameBasePrefix(t *testing.T) {
 	runBoundedParallel(t)
 
 	f := newCaptureFixture(t)
@@ -594,6 +594,15 @@ func TestReplay_ReconcilesBarrierAfterPublishedSameBasePrefix(t *testing.T) {
 		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
 	})
 	markRecoveryBarrier(t, ctx, f, seq2, base, "modify before-state mismatch for doc.md")
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET captured_ts = 1 WHERE seq = ?`, seq1); err != nil {
+		t.Fatalf("age published prefix: %v", err)
+	}
+	if pruned, err := state.PrunePublishedEventsBefore(ctx, f.db, 100); err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	} else if pruned != 0 {
+		t.Fatalf("pruned=%d want aged materialization prefix retained", pruned)
+	}
 	commitC := commitSingleFileTree(t, ctx, f.dir, "doc.md", c, "publish C", commitB)
 	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, commitC, base); err != nil {
 		t.Fatalf("update HEAD to C: %v", err)
