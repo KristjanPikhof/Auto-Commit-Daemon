@@ -238,7 +238,7 @@ before, and `acd on` can register and start it in one command.
 |---|---|
 | `acd stats` | Reports central commit, event, file, byte, and error totals for the last seven days. Use `--since 30d` to change the window. |
 | `acd gc` | Merges duplicate registry rows and removes missing or long-dead entries. It does not delete repo state databases or captured events. |
-| `acd version` | Prints the release tag, commit, Go version, operating system, and architecture available in the build. |
+| `acd version` | Prints the version and commit embedded in the binary. |
 
 `acd stats` may initialize the central statistics database. `acd gc` changes
 the central registry, so run `acd list` or `acd repo list` first when you want
@@ -260,4 +260,3 @@ of wiring them by hand unless you are building an adapter.
 Logical flush requires an already registered session. It bypasses only the
 intent batch wait. Detached HEAD, Git operations, manual pauses, validation,
 and replay safety still apply.
-

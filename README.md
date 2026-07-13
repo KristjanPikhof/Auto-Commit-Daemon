@@ -341,8 +341,10 @@ explicit local cleanup before sharing a branch:
 ~~~bash
 acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
 acd rewrite-commits --show-plan rewrite.json
+acd off
 acd rewrite-commits --apply-plan rewrite.json --dry-run
 acd rewrite-commits --apply-plan rewrite.json --yes
+acd on
 ~~~
 
 Use `--from-sha <sha>` when you want a commit-ish selector, `--range-nr 5-12`

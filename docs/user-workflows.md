@@ -390,10 +390,12 @@ acd
 Use `commit-all` when the daemon was off and the worktree is dirty:
 
 ~~~bash
+acd off
 acd commit-all --dry-run
 acd commit-all --yes
 acd commit-all --yes --json
 acd commit-all --repo /path/to/repo --yes
+acd on
 ~~~
 
 What it does:

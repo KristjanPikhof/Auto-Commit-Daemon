@@ -164,7 +164,7 @@ Plain `acd wake` nudges capture and replay. It does not bypass intent batch
 gates.
 
 Planner-window records are stored separately from raw prompt traces. They show
-which seqs were offered, selected, deferred, forced, or hidden by legacy
+which seqs were offered, selected, deferred, forced, or hidden by optional
 same-path coalescing. Prompt traces remain the opt-in source for exact provider
 requests and may contain source text.
 
@@ -235,16 +235,16 @@ acd diagnose --json
 acd fix --dry-run
 acd off
 acd fix --yes
-acd fix --force --dry-run
-acd fix --force --yes
 acd on
 acd
 ~~~
 
 Safe apply runs the same exact-chain proof used by the daemon and archives the
-chain when stable `HEAD` does not match. Force apply skips the publish proof and
-is archive-only. Both reconstruct the full chain at a hidden recovery ref
-before marking rows recovered; neither purges, retargets, or discards captures.
+chain when stable `HEAD` does not match. If you specifically want to save the
+chain without trying the publish proof, preview and apply
+`acd fix --force`. Both paths reconstruct the full chain at a hidden recovery
+ref before marking rows recovered. Neither path purges, retargets, or discards
+captures.
 
 ## Operator commands
 
