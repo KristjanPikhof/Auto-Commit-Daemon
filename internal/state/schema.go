@@ -22,8 +22,10 @@ package state
 // v9 adds structured rewrite proposal failure storage; v10 preserves the
 // commit-message format used to validate rewrite plans; v11 adds durable
 // intent planner-window summaries for captured-vs-offered observability; v12
-// adds immutable recovery snapshots with ordered, exact event membership.
-const SchemaVersion = 12
+// adds immutable recovery snapshots with ordered, exact event membership; v13
+// adds an index for published-prefix retention while unresolved same-base
+// recovery chains remain in the ledger.
+const SchemaVersion = 13
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -100,6 +102,12 @@ CREATE INDEX IF NOT EXISTS idx_capture_events_branch_generation_seq_state
 -- the matching rows without scanning unrelated branch_ref/generation pairs.
 CREATE INDEX IF NOT EXISTS idx_capture_events_barrier
     ON capture_events(branch_ref, branch_generation, state, seq);
+
+-- v13: recovery-prefix pruning correlates an aged published row with later
+-- unresolved rows from the same exact immutable base. Keep that minute-level
+-- maintenance query bounded even when the pending ledger reaches its cap.
+CREATE INDEX IF NOT EXISTS idx_capture_events_recovery_prefix
+    ON capture_events(branch_ref, branch_generation, base_head, state, seq);
 
 CREATE TABLE IF NOT EXISTS capture_ops(
     event_seq    INTEGER NOT NULL,
