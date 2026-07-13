@@ -79,7 +79,7 @@ type diagnoseReport struct {
 	BackpressurePausedAt       string                          `json:"backpressure_paused_at,omitempty"`
 	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
 	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
-	RuntimeConfig              runtimeConfigReport              `json:"runtime_config"`
+	RuntimeConfig              runtimeConfigReport             `json:"runtime_config"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
