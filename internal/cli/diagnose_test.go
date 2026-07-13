@@ -811,6 +811,59 @@ func makeDiagnoseRepo(t *testing.T, roots paths.Roots) (repoDir, dbPath string, 
 	return repoDir, dbPath, d
 }
 
+func TestDiagnoseRuntimeConfigHumanJSONParity(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+	baseline := cliRuntimeRevision(t, d, "baseline", 1)
+	candidate := cliRuntimeRevision(t, d, "candidate", 1)
+	request, ok, err := state.RequestConfigActivation(ctx, d, baseline.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("baseline request: %v %v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(ctx, d, request.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(ctx, d, request.ID, baseline.ID)
+	if _, ok, err := state.RequestConfigActivation(ctx, d, candidate.ID, sql.NullInt64{Int64: baseline.ID, Valid: true}); err != nil || !ok {
+		t.Fatalf("candidate request: %v %v", ok, err)
+	}
+	experiment, err := state.CreateConfigExperiment(ctx, d, state.ConfigExperimentInput{
+		BaselineRevisionID: baseline.ID, CandidateRevisionID: candidate.ID,
+		WindowBudget: 8, ExpiresTS: sql.NullFloat64{Float64: float64(time.Now().Add(time.Hour).Unix()), Valid: true},
+		FailurePolicy: "continue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var jsonOut bytes.Buffer
+	if err := runDiagnose(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report diagnoseReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	runtime := report.RuntimeConfig
+	if runtime.DesiredRevisionID != candidate.ID || runtime.AppliedRevisionID != baseline.ID ||
+		runtime.LastKnownGoodRevisionID != baseline.ID || runtime.ApplyState != "pending" ||
+		runtime.Profile != "profile-a" || runtime.ApplyBoundary != "next_work_boundary" ||
+		runtime.Experiment == nil || runtime.Experiment.ID != experiment.ID ||
+		runtime.Experiment.WindowBudget != 8 {
+		t.Fatalf("diagnose runtime JSON projection = %+v", runtime)
+	}
+	var human bytes.Buffer
+	if err := runDiagnose(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Runtime settings: pending", "desired=", "applied=", "boundary=next_work_boundary", "Experiment #", "windows=0/8"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("diagnose runtime output missing %q:\n%s", want, human.String())
+		}
+	}
+}
+
 func blockDiagnoseEvent(t *testing.T, ctx context.Context, d *state.DB, path, message string) int64 {
 	t.Helper()
 	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
