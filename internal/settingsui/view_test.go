@@ -50,7 +50,7 @@ func TestResponsiveGoldenViews(t *testing.T) {
 }
 
 func TestViewQueuedFailureAndDirtyExit(t *testing.T) {
-	m := viewModel(88, 28)
+	m := viewModel(120, 36)
 	m.Snapshot.PendingError = "provider rejected"
 	m.Status = "FAILED: candidate rejected"
 	got := m.Render()
@@ -126,5 +126,16 @@ func TestViewStableFocusDuringPolling(t *testing.T) {
 	m, _ = updated(t, m, PollMsg{})
 	if m.Focus != 2 || m.ActiveField().Key != before {
 		t.Fatal("poll moved focus")
+	}
+}
+
+func TestSettingsViewShowsActiveDraftSourceShadowAndApply(t *testing.T) {
+	m := viewModel(120, 36)
+	m.Focus = 1
+	got := m.Render()
+	for _, want := range []string{"Active: active-model", "Draft: new-model", "Source: profile; shadows environment", "Apply: next safe boundary"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q\n%s", want, got)
+		}
 	}
 }

@@ -48,6 +48,7 @@ func (m Model) Render() string {
 	detail := []string{"DETAILS"}
 	if active.Key != "" {
 		detail = append(detail, active.Label, active.Description, "Source: "+fieldSource(m.Snapshot.Fields, active.Key), "Changed: "+changed(m, active.Key), "Apply: "+active.Apply)
+		detail = append(detail, "Active: "+fieldActive(m.Snapshot.Fields, active.Key), "Draft: "+fieldDraft(m, active))
 		if active.Sensitive {
 			detail = append(detail, "Value: [set/unset only; never displayed]")
 		}
@@ -58,6 +59,9 @@ func (m Model) Render() string {
 	}
 	if m.Experiment.Active {
 		state = append(state, fmt.Sprintf("Experiment: %d/%d windows (descriptive)", m.Experiment.CompletedWindows, m.Experiment.TotalWindows))
+	}
+	if m.Snapshot.Comparison != "" {
+		state = append(state, "Comparison: "+m.Snapshot.Comparison)
 	}
 	if m.Status != "" {
 		state = append(state, m.Status)
@@ -84,10 +88,15 @@ func (m Model) Render() string {
 			"Source: " + fieldSource(m.Snapshot.Fields, active.Key),
 			"Changed: " + changed(m, active.Key),
 			"Apply: " + fallback(active.Apply, "next safe boundary"),
+			"Active: " + fieldActive(m.Snapshot.Fields, active.Key),
+			"Draft: " + fieldDraft(m, active),
 			"REVISION", draftRail, applyRail,
 		}
 		if m.Experiment.Active {
 			compact = append(compact, fmt.Sprintf("Experiment: %d/%d windows (descriptive)", m.Experiment.CompletedWindows, m.Experiment.TotalWindows))
+		}
+		if m.Snapshot.Comparison != "" {
+			compact = append(compact, "Comparison: "+m.Snapshot.Comparison)
 		}
 		if m.Status != "" {
 			compact = append(compact, m.Status)
@@ -202,6 +211,23 @@ func fieldSource(values []FieldValue, key string) string {
 		}
 	}
 	return "default"
+}
+func fieldActive(values []FieldValue, key string) string {
+	for _, value := range values {
+		if value.Key == key {
+			if descriptor(key).Sensitive {
+				return secretState(values, key)
+			}
+			return fallback(value.ActiveValue, "not active")
+		}
+	}
+	return "not active"
+}
+func fieldDraft(m Model, field FieldDescriptor) string {
+	if field.Sensitive {
+		return secretState(m.Snapshot.Fields, field.Key)
+	}
+	return fallback(m.Draft[field.Key], "inherit")
 }
 func secretState(values []FieldValue, key string) string {
 	for _, v := range values {
