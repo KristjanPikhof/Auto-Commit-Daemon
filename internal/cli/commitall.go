@@ -112,11 +112,11 @@ The active commit strategy is read from existing config (daemon meta first,
 then ACD_COMMIT_STRATEGY env, then the canonical default). There is no
 --strategy override: commit-all matches what the daemon would do on its own.
 
-	Detached HEAD, an in-progress git operation
-	(rebase/merge/cherry-pick/bisect), and a manual pause marker are refused for
-	both previews and apply. If an authorized run reaches its mutation phase, it
-	also refuses while the per-repo daemon is alive; dry-run and a clean no-op do
-	not acquire daemon.lock.`,
+Detached HEAD, an in-progress git operation
+(rebase/merge/cherry-pick/bisect), and a manual pause marker are refused for
+both previews and apply. If an authorized run reaches its mutation phase, it
+also refuses while the per-repo daemon is alive; dry-run and a clean no-op do
+not acquire daemon.lock.`,
 		Example: `  acd commit-all --dry-run
   acd commit-all --yes
   acd commit-all --repo /path/to/repo --yes --json`,
