@@ -578,9 +578,9 @@ done
 
 // TestSubprocess_Timeout makes the plugin sleep longer than the timeout.
 // The runner must kill the plugin on timeout and respawn on the next
-// Generate. We point the second invocation at a *different* script (via
-// a fresh provider sharing the same temp dir prefix) to keep the test
-// straightforward.
+// Generate. We point the same provider at a different script before the
+// second invocation so the killed shell cannot race an in-place rewrite of
+// its executable.
 func TestSubprocess_Timeout(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -610,14 +610,14 @@ done
 		t.Errorf("timeout fired far too late: %v", elapsed)
 	}
 
-	// After timeout the provider should be ready to respawn. Swap the
-	// plugin to a fast one and retry — the new process is a fresh pid.
-	fastBin := writePluginScript(t, dir, "slow", `
+	// After timeout the provider should be ready to respawn. Point it at a
+	// distinct fast plugin and retry — the new process is a fresh pid.
+	fastBin := writePluginScript(t, dir, "fast", `
 while IFS= read -r line; do
   printf '{"version":1,"subject":"fast","body":"","error":""}\n'
 done
 `)
-	_ = fastBin // same path as slowBin, overwritten in place
+	p.binary = fastBin
 	r, err := p.Generate(context.Background(), CommitContext{Path: "a", Op: "modify"})
 	if err != nil {
 		t.Fatalf("respawn Generate: %v", err)
