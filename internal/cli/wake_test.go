@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -88,6 +89,34 @@ func TestWake_RefreshesAndSignals(t *testing.T) {
 	}
 	if !got.OK || !got.SentSignal {
 		t.Fatalf("expected ok+sent_signal true, got %+v", got)
+	}
+}
+
+func TestSignalDaemonSettingsActivationDoesNotEnqueueWake(t *testing.T) {
+	count, calls, restore := installFakeSignal(t)
+	defer restore()
+	sent, err := signalSettingsActivation(state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		DaemonFingerprint: sql.NullString{String: "expected-fingerprint", Valid: true},
+	})
+	if err != nil || !sent || count.Load() != 1 || len(*calls) != 1 || (*calls)[0].sig != syscall.SIGUSR1 {
+		t.Fatalf("signalSettingsActivation sent=%v err=%v calls=%+v", sent, err, *calls)
+	}
+	// The helper receives state and signals only; it has no DB handle and
+	// therefore cannot enqueue the ordinary wake/flush protocol.
+}
+
+func TestSignalDaemonSettingsActivationStoppedAndFingerprintRequired(t *testing.T) {
+	count, _, restore := installFakeSignal(t)
+	defer restore()
+	if sent, err := signalSettingsActivation(state.DaemonState{PID: os.Getpid(), Mode: "stopped"}); err != nil || sent {
+		t.Fatalf("stopped signal sent=%v err=%v", sent, err)
+	}
+	if sent, err := signalSettingsActivation(state.DaemonState{PID: os.Getpid(), Mode: "running"}); err == nil || sent {
+		t.Fatalf("missing fingerprint sent=%v err=%v", sent, err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("unsafe settings activation signaled %d times", count.Load())
 	}
 }
 
