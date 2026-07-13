@@ -139,7 +139,7 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: 1,
-			BaseHead:         "abc123",
+			BaseHead:         fmt.Sprintf("base-%s", tc.name),
 			Operation:        "modify",
 			Path:             path,
 			Fidelity:         "exact",
