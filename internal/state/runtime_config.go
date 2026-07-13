@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode"
 )
@@ -101,7 +102,15 @@ func InsertConfigRevision(ctx context.Context, d *DB, in ConfigRevisionInput) (C
 	if d == nil {
 		return ConfigRevision{}, fmt.Errorf("state: InsertConfigRevision: nil db")
 	}
-	if strings.TrimSpace(in.Profile) == "" || strings.TrimSpace(in.Scope) == "" {
+	profile, err := safeConfigLabel("profile", in.Profile)
+	if err != nil {
+		return ConfigRevision{}, err
+	}
+	scope, err := safeConfigLabel("scope", in.Scope)
+	if err != nil {
+		return ConfigRevision{}, err
+	}
+	if profile == "" || scope == "" {
 		return ConfigRevision{}, fmt.Errorf("state: config revision profile and scope are required")
 	}
 	if in.SourceGeneration < 0 {
@@ -122,7 +131,7 @@ INSERT INTO config_revisions(
     created_ts, profile, scope, snapshot_json, snapshot_hash,
     source_generation, reason
 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		created, strings.TrimSpace(in.Profile), strings.TrimSpace(in.Scope),
+		created, profile, scope,
 		string(canonical), hex.EncodeToString(sum[:]), in.SourceGeneration, reason)
 	if err != nil {
 		return ConfigRevision{}, fmt.Errorf("state: insert config revision: %w", err)
@@ -318,6 +327,9 @@ func CreateConfigExperiment(ctx context.Context, d *DB, in ConfigExperimentInput
 	if policy == "" {
 		policy = "continue"
 	}
+	if _, err := safeConfigLabel("failure policy", policy); err != nil {
+		return ConfigExperiment{}, err
+	}
 	now := nowSeconds()
 	res, err := d.conn.ExecContext(ctx, `
 INSERT INTO config_experiments(
@@ -393,27 +405,23 @@ func transitionActivation(ctx context.Context, d *DB, requestID, revisionID int6
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := nowSeconds()
-	fromClause := "status=?"
-	args := []any{to}
+	var q string
+	var args []any
 	if to == ActivationAcknowledged {
-		args = append(args, now)
-	} else {
-		args = append(args, now, nullableSanitizedText(reason))
-	}
-	if from == "pending|acknowledged" {
-		fromClause = "status IN ('pending','acknowledged')"
-	} else {
-		args = append(args, from)
-	}
-	setClause := "status=?, acknowledged_ts=?"
-	if to != ActivationAcknowledged {
-		setClause = "status=?, completed_ts=?, error=?"
-	}
-	args = append(args, requestID, revisionID, requestID, revisionID)
-	q := `UPDATE config_activation_requests SET ` + setClause + `
-WHERE id=? AND revision_id=? AND ` + fromClause + `
+		q = `UPDATE config_activation_requests
+SET status=?, acknowledged_ts=?
+WHERE id=? AND revision_id=? AND status=?
   AND EXISTS (SELECT 1 FROM runtime_config_state
               WHERE id=1 AND desired_request_id=? AND desired_revision_id=?)`
+		args = []any{to, now, requestID, revisionID, from, requestID, revisionID}
+	} else {
+		q = `UPDATE config_activation_requests
+SET status=?, completed_ts=?, error=?
+WHERE id=? AND revision_id=? AND status IN ('pending','acknowledged')
+  AND EXISTS (SELECT 1 FROM runtime_config_state
+              WHERE id=1 AND desired_request_id=? AND desired_revision_id=?)`
+		args = []any{to, now, nullableSanitizedText(reason), requestID, revisionID, requestID, revisionID}
+	}
 	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
 		return false, fmt.Errorf("state: transition activation request: %w", err)
@@ -453,14 +461,21 @@ func canonicalNonSecretJSON(raw []byte) ([]byte, error) {
 	if err := dec.Decode(&value); err != nil {
 		return nil, fmt.Errorf("state: invalid config snapshot JSON: %w", err)
 	}
-	if dec.More() {
-		return nil, fmt.Errorf("state: invalid config snapshot JSON: trailing value")
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("state: invalid config snapshot JSON: trailing value")
+		}
+		return nil, fmt.Errorf("state: invalid config snapshot JSON: %w", err)
 	}
 	if _, ok := value.(map[string]any); !ok {
 		return nil, fmt.Errorf("state: config snapshot must be a JSON object")
 	}
 	if key, ok := secretBearingKey(value); ok {
 		return nil, fmt.Errorf("state: config snapshot contains forbidden secret key %q", key)
+	}
+	if hasUnsafeConfigString(value) {
+		return nil, fmt.Errorf("state: config snapshot contains unsafe control text")
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil {
@@ -491,6 +506,38 @@ func secretBearingKey(value any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func hasUnsafeConfigString(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.IndexFunc(typed, func(r rune) bool {
+			return r == '\x1b' || (!unicode.IsPrint(r) && !unicode.IsSpace(r))
+		}) >= 0
+	case map[string]any:
+		for key, child := range typed {
+			if hasUnsafeConfigString(key) || hasUnsafeConfigString(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if hasUnsafeConfigString(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func safeConfigLabel(name, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) > 128 || strings.IndexFunc(value, func(r rune) bool {
+		return r == '\x1b' || !unicode.IsPrint(r)
+	}) >= 0 {
+		return "", fmt.Errorf("state: config %s contains unsafe text", name)
+	}
+	return value, nil
 }
 
 func nullableSanitizedText(value string) sql.NullString {

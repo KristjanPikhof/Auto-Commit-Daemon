@@ -86,6 +86,8 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 		"intent_planner_window_events", "rewrite_plans", "rewrite_plan_commits",
 		"flush_requests", "decision_records", "recovery_snapshots",
 		"recovery_snapshot_events", "publish_state", "daemon_meta", "daily_rollups",
+		"config_revisions", "runtime_config_state", "config_activation_requests",
+		"config_experiments",
 	}
 	for _, table := range tables {
 		var name string

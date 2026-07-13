@@ -95,6 +95,11 @@ func appendDecision(ctx context.Context, execer decisionExecer, rec DecisionReco
 	if rec.DecisionTS == 0 {
 		rec.DecisionTS = nowSeconds()
 	}
+	if rec.ConfigProfile.Valid {
+		if _, err := safeConfigLabel("profile", rec.ConfigProfile.String); err != nil {
+			return 0, err
+		}
+	}
 	const q = `
 INSERT INTO decision_records(
     decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,

@@ -281,8 +281,7 @@ CREATE TABLE IF NOT EXISTS config_revisions(
     snapshot_json       TEXT NOT NULL,
     snapshot_hash       TEXT NOT NULL,
     source_generation   INTEGER NOT NULL CHECK (source_generation >= 0),
-    reason              TEXT,
-    UNIQUE(snapshot_hash, profile, scope, source_generation)
+    reason              TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_config_revisions_scope_created
