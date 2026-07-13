@@ -75,6 +75,32 @@ func fastScheduler() Scheduler {
 	}
 }
 
+func oneShotBranchTokenCheckGate() (hook func(), entered <-chan struct{}, release func()) {
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	hook = func() {
+		enterOnce.Do(func() {
+			close(enteredCh)
+			<-releaseCh
+		})
+	}
+	release = func() {
+		releaseOnce.Do(func() { close(releaseCh) })
+	}
+	return hook, enteredCh, release
+}
+
+func waitForBranchTokenCheckGate(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not reach branch-token check gate")
+	}
+}
+
 // registerLiveClient inserts a daemon_clients row keyed to the test process
 // itself so SweepClients sees alive>0 and the run loop does not
 // self-terminate during the happy-path test.
@@ -2057,23 +2083,27 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 
 	var wg sync.WaitGroup
 	var runErr error
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runErr = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-			MessageFn:   DeterministicMessage,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			MessageFn:              DeterministicMessage,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 3*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	upstreamBody := []byte("from upstream\n")
 	upstreamBlob, err := git.HashObjectStdin(ctx, f.dir, upstreamBody)
@@ -2107,6 +2137,7 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "-q", upstreamHead, "--", "upstream.txt"); err != nil {
 		t.Fatalf("checkout upstream worktree: %v", err)
 	}
+	releaseCheck()
 	for i := 0; i < 4; i++ {
 		select {
 		case wakeCh <- struct{}{}:
@@ -2390,18 +2421,21 @@ func TestRun_RuntimeDivergedRecoversDeadBranchTerminals(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 
@@ -2410,6 +2444,7 @@ func TestRun_RuntimeDivergedRecoversDeadBranchTerminals(t *testing.T) {
 	// is the closure variable observable through MetaKeyBranchToken meta.
 	want := "rev:" + seedHead + " refs/heads/feat-x"
 	waitForMetaValue(t, f.db, MetaKeyBranchToken, want, 5*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	// Now switch the worktree back to refs/heads/main and delete feat-x.
 	// The daemon's next tick classifies the change as Diverged (ref change
@@ -2420,6 +2455,7 @@ func TestRun_RuntimeDivergedRecoversDeadBranchTerminals(t *testing.T) {
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", "refs/heads/feat-x"); err != nil {
 		t.Fatalf("delete refs/heads/feat-x: %v", err)
 	}
+	releaseCheck()
 	for i := 0; i < 4; i++ {
 		select {
 		case wakeCh <- struct{}{}:
@@ -3268,18 +3304,21 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   manual,
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              manual,
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 	t.Cleanup(func() {
@@ -3291,6 +3330,9 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	// Wait until startup has settled — persisted MetaKeyBranchHead =
 	// seedHead, currentToken in-memory = "rev:seedHead refs/heads/main".
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		"rev:"+seedHead+" refs/heads/main", 2*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	// Simulate an out-of-band observer (acd recover, manual sqlite edit,
 	// or a previous-tick observation that has since been lost from
@@ -3300,10 +3342,10 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	if err := state.MetaSet(ctx, f.db, MetaKeyBranchHead, advanced); err != nil {
 		t.Fatalf("MetaSet branch.head=advanced: %v", err)
 	}
-	// Wake. The next processBranchTokenChange should observe
+	// Release the gated token check. processBranchTokenChange should observe
 	// SameGeneration (live token == currentToken), enter the cross-tick
 	// probe, and arm the grace marker.
-	wakeCh <- struct{}{}
+	releaseCheck()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

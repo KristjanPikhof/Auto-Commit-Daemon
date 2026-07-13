@@ -233,6 +233,9 @@ type Options struct {
 	// afterBranchTransitionRollback fires after prospective shadow
 	// invalidation and in-memory context restoration.
 	afterBranchTransitionRollback func()
+	// beforeBranchTokenCheck is a test-only synchronization point immediately
+	// before the run loop samples the live branch token.
+	beforeBranchTokenCheck func()
 	// beforeStartupDeadBranchPairSafetyCheck is a test-only synchronization
 	// point immediately before a startup dead-branch pair's final safety gate.
 	// The sweep-owned context lets blocking tests release on daemon shutdown.
@@ -1073,6 +1076,9 @@ func Run(ctx context.Context, opts Options) error {
 	forceShadowRefresh := startupShadowRefreshRequired
 
 	processBranchTokenChange := func(logPrefix string) bool {
+		if opts.beforeBranchTokenCheck != nil {
+			opts.beforeBranchTokenCheck()
+		}
 		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
 			logger.Warn(logPrefix+" resolve failed", "err", terr.Error())
