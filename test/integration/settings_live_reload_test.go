@@ -99,7 +99,14 @@ func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
 		}
 	}
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, fmt.Sprintf("\"desired_revision\":%d", b.ID)) || !strings.Contains(status.Stdout, fmt.Sprintf("\"applied_revision\":%d", b.ID)) {
+	var statusPayload struct {
+		RuntimeConfig struct {
+			Desired int64 `json:"desired_revision"`
+			Applied int64 `json:"applied_revision"`
+		} `json:"runtime_config"`
+	}
+	decodeErr := json.Unmarshal([]byte(status.Stdout), &statusPayload)
+	if status.ExitCode != 0 || decodeErr != nil || statusPayload.RuntimeConfig.Desired != b.ID || statusPayload.RuntimeConfig.Applied != b.ID {
 		t.Fatalf("status/runtime mismatch exit=%d\n%s\n%s", status.ExitCode, status.Stdout, status.Stderr)
 	}
 }
@@ -256,7 +263,7 @@ func openSettingsRuntimeDB(t *testing.T, repo string) *state.DB {
 func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, model string, generation int64, values map[string]any) (state.ConfigRevision, state.ConfigActivationRequest) {
 	t.Helper()
 	if values == nil {
-		values = map[string]any{"ai.provider": "openai-compat", "ai.model": model, "commit.strategy": "intent", "intent.window": 1, "intent.min_pending": 1, "intent.settle_window": "0s", "intent.max_pending_age": "30s"}
+		values = map[string]any{"ai.provider": "openai-compat", "ai.model": model, "commit.strategy": "intent", "intent.window": 1, "intent.min_pending": 1, "intent.settle_window": "0s", "intent.max_pending_age": "30s", "confirmations": []string{"endpoint_credentials"}}
 	}
 	body, err := json.Marshal(values)
 	if err != nil {
@@ -275,10 +282,18 @@ func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, m
 
 func waitSettingsApplied(t *testing.T, db *state.DB, revisionID int64, timeout time.Duration) {
 	t.Helper()
-	waitFor(t, "runtime revision "+strconv.FormatInt(revisionID, 10)+" applied", timeout, func() bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
 		projection, err := state.RuntimeConfigActivationState(context.Background(), db)
-		return err == nil && projection.DesiredRevisionID.Valid && projection.DesiredRevisionID.Int64 == revisionID && projection.AppliedRevisionID.Valid && projection.AppliedRevisionID.Int64 == revisionID
-	})
+		if err == nil && projection.DesiredRevisionID.Valid && projection.DesiredRevisionID.Int64 == revisionID && projection.AppliedRevisionID.Valid && projection.AppliedRevisionID.Int64 == revisionID {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	projection, err := state.RuntimeConfigActivationState(context.Background(), db)
+	var status, activationError string
+	_ = db.ReadSQL().QueryRow(`SELECT status, COALESCE(error, '') FROM config_activation_requests WHERE revision_id=? ORDER BY id DESC LIMIT 1`, revisionID).Scan(&status, &activationError)
+	t.Fatalf("runtime revision %s not applied within %v: projection=%+v err=%v request_status=%q request_error=%q", strconv.FormatInt(revisionID, 10), timeout, projection, err, status, activationError)
 }
 
 func waitSettingsRequest(t *testing.T, db *state.DB, requestID int64, status string, timeout time.Duration) {
