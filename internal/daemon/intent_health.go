@@ -377,9 +377,9 @@ func (h *IntentPlannerHealth) Acquire(ctx context.Context) (IntentPlannerHealthP
 }
 
 // Complete records a validated success when failure is nil, or a typed
-// transport/validation failure otherwise. Cancellation matching a canceled
-// caller context does not mutate state; a provider-internal cancellation with
-// a live caller is a transport failure.
+// transport/validation failure otherwise. Caller cancellation wins over any
+// concurrently returned provider failure and does not mutate state; a
+// provider-internal cancellation with a live caller is a transport failure.
 func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlannerHealthPermit, failure error) error {
 	if h == nil || permit.deterministic || h.deterministic {
 		return nil
@@ -387,7 +387,7 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if callerErr := matchingCallerCancellation(ctx, failure); callerErr != nil {
+	if callerErr := callerCancellation(ctx); callerErr != nil {
 		h.releaseCanceledHalfOpenProbe(ctx, permit)
 		return callerErr
 	}
@@ -400,7 +400,7 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 	now := h.now().UTC()
 	changed := false
 	h.mu.Lock()
-	if callerErr := matchingCallerCancellation(ctx, failure); callerErr != nil {
+	if callerErr := callerCancellation(ctx); callerErr != nil {
 		changed = h.releaseCanceledHalfOpenProbeLocked(now, permit)
 		h.mu.Unlock()
 		if changed {
@@ -425,12 +425,8 @@ func (h *IntentPlannerHealth) Complete(ctx context.Context, permit IntentPlanner
 	return nil
 }
 
-func matchingCallerCancellation(ctx context.Context, failure error) error {
-	callerErr := ctx.Err()
-	if callerErr != nil && (failure == nil || errors.Is(failure, callerErr)) {
-		return callerErr
-	}
-	return nil
+func callerCancellation(ctx context.Context) error {
+	return ctx.Err()
 }
 
 func (h *IntentPlannerHealth) releaseCanceledHalfOpenProbe(ctx context.Context, permit IntentPlannerHealthPermit) {

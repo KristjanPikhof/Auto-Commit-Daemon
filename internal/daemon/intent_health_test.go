@@ -481,6 +481,26 @@ func TestIntentPlannerHealthWrappedCallerCancellationDoesNotMutate(t *testing.T)
 	}
 }
 
+func TestIntentPlannerHealthCallerCancellationWinsUnrelatedFailureWithoutMutation(t *testing.T) {
+	health := NewIntentPlannerHealth(context.Background(), nil, IntentPlannerHealthOptions{
+		Provider: openAIIntentHealthIdentity("https://planner.example/v1"),
+	})
+	permit, err := health.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	before := health.Snapshot()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	failure := &IntentPlannerTransportFailure{Err: errors.New("provider failed independently")}
+	if err := health.Complete(canceled, permit, failure); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Complete error=%v want context.Canceled", err)
+	}
+	if after := health.Snapshot(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("caller cancellation mutated health\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
 func TestIntentPlannerHealthCanceledHalfOpenProbeReturnsToOpen(t *testing.T) {
 	clock := newIntentHealthClock()
 	db := newIntentHealthTestDB(t)
@@ -504,13 +524,16 @@ func TestIntentPlannerHealthCanceledHalfOpenProbeReturnsToOpen(t *testing.T) {
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := health.Complete(canceled, probe, context.Canceled); !errors.Is(err, context.Canceled) {
+	failure := &IntentPlannerTransportFailure{Err: errors.New("provider failed independently")}
+	if err := health.Complete(canceled, probe, failure); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Complete error=%v want context.Canceled", err)
 	}
 	after := health.Snapshot()
 	if after.State != IntentPlannerCircuitOpen ||
 		after.ConsecutiveFailures != before.ConsecutiveFailures ||
 		after.BackoffLevel != before.BackoffLevel ||
+		after.LastFailureClass != before.LastFailureClass ||
+		after.LastError != before.LastError ||
 		after.NextProbeTS != intentPlannerHealthTimestamp(clock.Now()) {
 		t.Fatalf("canceled half-open snapshot=%+v before=%+v", after, before)
 	}
