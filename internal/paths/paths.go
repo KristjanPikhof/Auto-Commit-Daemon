@@ -88,6 +88,12 @@ func (r Roots) ConfigPath() string {
 	return filepath.Join(r.Config, "config.json")
 }
 
+// ConfigLockPath returns the dedicated lock protecting config.json
+// read-modify-write updates.
+func (r Roots) ConfigLockPath() string {
+	return filepath.Join(r.Config, "config.lock")
+}
+
 // xdgRoot reads an XDG_*_HOME env var. If unset, empty, or not absolute,
 // it falls back to the supplied default. Per the XDG spec, "If $XDG_...
 // is either not set or empty, a default ... should be used. ... All paths
