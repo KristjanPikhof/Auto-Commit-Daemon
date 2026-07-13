@@ -118,6 +118,16 @@ func initTestRepoFixtures() {
 		testRepoFixturesErr = err
 		return
 	}
+	for _, setting := range [][2]string{
+		{"user.name", "ACD Test"},
+		{"user.email", "acd@example.invalid"},
+		{"commit.gpgsign", "false"},
+	} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: empty}, "config", setting[0], setting[1]); err != nil {
+			testRepoFixturesErr = err
+			return
+		}
+	}
 	dbPath := state.DBPathFromGitDir(filepath.Join(empty, ".git"))
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
@@ -157,9 +167,7 @@ func initTestRepoFixtures() {
 		testRepoFixturesErr = err
 		return
 	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: seeded},
-		"-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid",
-		"commit", "-q", "-m", "seed"); err != nil {
+	if _, err := git.Run(ctx, git.RunOpts{Dir: seeded}, "commit", "-q", "-m", "seed"); err != nil {
 		testRepoFixturesErr = err
 	}
 }
