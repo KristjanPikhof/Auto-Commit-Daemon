@@ -70,11 +70,12 @@ func (s *Service) StartExperiment(ctx context.Context, req ExperimentRequest) (E
 		req.ExpectedDesiredRevision != baselineID {
 		return ExperimentResult{}, errors.New("acd settings: desired revision changed; refresh before starting experiment")
 	}
-	candidate, err := s.apply(ctx, ApplyRequest{
+	applyReq := ApplyRequest{
 		Values: req.Values, TestedFingerprint: req.TestedFingerprint,
 		Confirmations: req.Confirmations, ExpectedGeneration: req.ExpectedGeneration,
 		ExpectedDesiredRevision: req.ExpectedDesiredRevision,
-	}, false)
+	}
+	revision, err := s.prepareRevision(ctx, applyReq)
 	if err != nil {
 		return ExperimentResult{}, err
 	}
@@ -82,14 +83,19 @@ func (s *Service) StartExperiment(ctx context.Context, req ExperimentRequest) (E
 	if !req.ExpiresAt.IsZero() {
 		expires = sql.NullFloat64{Float64: float64(req.ExpiresAt.UnixNano()) / float64(time.Second), Valid: true}
 	}
-	experiment, err := state.CreateConfigExperiment(ctx, s.db, state.ConfigExperimentInput{
-		BaselineRevisionID: baselineID, CandidateRevisionID: candidate.RevisionID,
+	experiment, activation, ok, err := state.RequestConfigExperimentActivation(ctx, s.db, state.ConfigExperimentInput{
+		BaselineRevisionID: baselineID, CandidateRevisionID: revision.ID,
 		WindowBudget: req.WindowBudget, ExpiresTS: expires, FailurePolicy: policy,
-	})
+	}, nullableID(req.ExpectedDesiredRevision))
 	if err != nil {
-		_, _ = state.CancelConfigActivation(ctx, s.db, candidate.RequestID, candidate.RevisionID,
-			"experiment setup failed")
 		return ExperimentResult{}, sanitizeError(err)
+	}
+	if !ok {
+		return ExperimentResult{}, errors.New("acd settings: desired revision changed; refresh before starting experiment")
+	}
+	candidate, err := s.finishApply(ctx, revision, activation, false)
+	if err != nil {
+		return ExperimentResult{}, err
 	}
 	result := ExperimentResult{Experiment: experimentSnapshot(experiment), Candidate: candidate}
 	if candidate.DaemonMode != "stopped" {

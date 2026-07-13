@@ -35,6 +35,16 @@ func TestSettingsExperimentLifecycleIsBoundedAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var desiredWithoutExperiment int
+	if err := svc.db.ReadSQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_config_state s
+WHERE s.desired_revision_id=? AND NOT EXISTS (
+  SELECT 1 FROM config_experiments e WHERE e.candidate_revision_id=s.desired_revision_id
+)`, started.Candidate.RevisionID).Scan(&desiredWithoutExperiment); err != nil {
+		t.Fatal(err)
+	}
+	if desiredWithoutExperiment != 0 || started.Experiment.ID == 0 {
+		t.Fatalf("candidate became desired without durable experiment: %+v", started)
+	}
 	if started.Experiment.BaselineRevisionID != baseline.ID ||
 		started.Experiment.CandidateRevisionID != started.Candidate.RevisionID ||
 		started.Experiment.WindowBudget != 10 || started.Experiment.Status != state.ExperimentActive {

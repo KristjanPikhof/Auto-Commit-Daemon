@@ -37,36 +37,52 @@ func (s *Service) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, err
 }
 
 func (s *Service) apply(ctx context.Context, req ApplyRequest, signal bool) (ApplyResult, error) {
-	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
+	revision, err := s.prepareRevision(ctx, req)
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	if validation.SourceGeneration != req.ExpectedGeneration {
-		return ApplyResult{}, errors.New("acd settings: stale saved generation; refresh before applying")
-	}
-	if len(validation.Missing) > 0 {
-		return ApplyResult{}, &ConfirmationRequiredError{Missing: validation.Missing}
-	}
-	if len(validation.RestartChanged) > 0 {
-		return ApplyResult{}, fmt.Errorf("acd settings: restart required for changed fields: %s",
-			strings.Join(validation.RestartChanged, ", "))
-	}
-	if req.TestedFingerprint == "" || req.TestedFingerprint != validation.Fingerprint {
-		return ApplyResult{}, errors.New("acd settings: tested settings are stale; test the current draft again")
-	}
-	if req.ExpectedGeneration > math.MaxInt64 {
-		return ApplyResult{}, errors.New("acd settings: saved generation is out of range")
-	}
-	body, err := revisionSnapshotJSON(validation.ResolvedHot, req.Confirmations)
-	if err != nil {
-		return ApplyResult{}, err
-	}
-	doc, err := s.store.Load()
+	activation, ok, err := state.RequestConfigActivation(ctx, s.db, revision.ID,
+		nullableID(req.ExpectedDesiredRevision))
 	if err != nil {
 		return ApplyResult{}, sanitizeError(err)
 	}
+	if !ok {
+		return ApplyResult{}, errors.New("acd settings: desired revision changed; refresh before applying")
+	}
+	return s.finishApply(ctx, revision, activation, signal)
+}
+
+func (s *Service) prepareRevision(ctx context.Context, req ApplyRequest) (state.ConfigRevision, error) {
+	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
+	if err != nil {
+		return state.ConfigRevision{}, err
+	}
+	if validation.SourceGeneration != req.ExpectedGeneration {
+		return state.ConfigRevision{}, errors.New("acd settings: stale saved generation; refresh before applying")
+	}
+	if len(validation.Missing) > 0 {
+		return state.ConfigRevision{}, &ConfirmationRequiredError{Missing: validation.Missing}
+	}
+	if len(validation.RestartChanged) > 0 {
+		return state.ConfigRevision{}, fmt.Errorf("acd settings: restart required for changed fields: %s",
+			strings.Join(validation.RestartChanged, ", "))
+	}
+	if req.TestedFingerprint == "" || req.TestedFingerprint != validation.Fingerprint {
+		return state.ConfigRevision{}, errors.New("acd settings: tested settings are stale; test the current draft again")
+	}
+	if req.ExpectedGeneration > math.MaxInt64 {
+		return state.ConfigRevision{}, errors.New("acd settings: saved generation is out of range")
+	}
+	body, err := revisionSnapshotJSON(validation.ResolvedHot, req.Confirmations)
+	if err != nil {
+		return state.ConfigRevision{}, err
+	}
+	doc, err := s.store.Load()
+	if err != nil {
+		return state.ConfigRevision{}, sanitizeError(err)
+	}
 	if doc.Generation != req.ExpectedGeneration {
-		return ApplyResult{}, errors.New("acd settings: stale saved generation; refresh before applying")
+		return state.ConfigRevision{}, errors.New("acd settings: stale saved generation; refresh before applying")
 	}
 	profile := doc.Settings.Repositories[s.repoHash].Profile
 	if profile == "" {
@@ -77,16 +93,12 @@ func (s *Service) apply(ctx context.Context, req ApplyRequest, signal bool) (App
 		SourceGeneration: int64(req.ExpectedGeneration), Reason: "settings apply",
 	})
 	if err != nil {
-		return ApplyResult{}, sanitizeError(err)
+		return state.ConfigRevision{}, sanitizeError(err)
 	}
-	activation, ok, err := state.RequestConfigActivation(ctx, s.db, revision.ID,
-		nullableID(req.ExpectedDesiredRevision))
-	if err != nil {
-		return ApplyResult{}, sanitizeError(err)
-	}
-	if !ok {
-		return ApplyResult{}, errors.New("acd settings: desired revision changed; refresh before applying")
-	}
+	return revision, nil
+}
+
+func (s *Service) finishApply(ctx context.Context, revision state.ConfigRevision, activation state.ConfigActivationRequest, signal bool) (ApplyResult, error) {
 	daemonState, _, err := state.LoadDaemonState(ctx, s.db)
 	if err != nil {
 		return ApplyResult{}, sanitizeError(err)
