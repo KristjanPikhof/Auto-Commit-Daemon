@@ -91,10 +91,9 @@ flowchart TB
 
 By default, consecutive captures that touch the same path remain separate
 planner-visible seqs. This lets the planner split independent edits inside one
-file when replay can apply them safely. `ACD_INTENT_PATH_COALESCE=1` restores
-the legacy behavior that folds consecutive same-path captures into one planner
-offer; `hidden_seqs` then records the original seqs covered by that folded
-offer.
+file when replay can apply them safely. Set `ACD_INTENT_PATH_COALESCE=1` to fold
+consecutive same-path captures into one planner offer. `hidden_seqs` records
+the original seqs covered by that folded offer.
 
 The planner must put every offered seq in either `selected_seqs` or
 `deferred_seqs`. It may select one seq or a larger related subset. Deferred
@@ -102,8 +101,7 @@ seqs need reasons.
 
 For a mixed window, the planner may return `commit_groups`. Groups publish in
 the returned order, each with its own selected seqs, message, and grouping
-reason. Top-level `selected_seqs` remains the union of all group selections for
-legacy compatibility.
+reason. Top-level `selected_seqs` is the union of all group selections.
 
 The built-in planner prompt asks for `commit_groups` when one visible window
 contains multiple independent commit intents. It also requires chronological
@@ -112,7 +110,8 @@ same-path capture before an earlier one.
 
 ## Message rules
 
-`ACD_COMMIT_FORMAT=imperative` is the default and keeps the existing rules.
+`ACD_COMMIT_FORMAT=imperative` is the default. Subjects start with an
+imperative verb and stay within 50 characters.
 Small single-file commits can use only a subject:
 
 ~~~text

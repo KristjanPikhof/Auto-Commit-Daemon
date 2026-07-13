@@ -77,8 +77,6 @@ Before sending, it redacts common secret shapes and truncates:
 Redaction is a backstop, not a guarantee. Do not enable diff egress for a
 private repo unless the endpoint or plugin is trusted.
 
-`ACD_AI_SEND_DIFF` is removed. Use `ACD_AI_DIFF_EGRESS=1`.
-
 ## Environment reference
 
 | Variable | Default | Notes |
@@ -92,14 +90,14 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local prompt diagnostics under `<gitDir>/acd/prompt-trace/`. |
 | `ACD_COMMIT_STRATEGY` | `event` | Set `intent` to ask the planner to group captures. |
-| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
+| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` uses verb-led subjects; `conventional` uses scope-less Conventional Commit subjects. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending count before planning. |
 | `ACD_INTENT_SETTLE_WINDOW` | `10s` | Burst settle delay after the count gate. `0` disables it. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age trigger for sparse queues. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent commits sent as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before forced one-capture planning. |
-| `ACD_INTENT_PATH_COALESCE` | off | Truthy restores legacy folding of consecutive same-path captures into one planner offer. |
+| `ACD_INTENT_PATH_COALESCE` | off | Truthy folds consecutive same-path captures into one planner offer. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after typed planner validation errors. `0` or false-like values disable retries. |
 | `ACD_INTENT_REJECTS_RAW` | off | Truthy stores raw rejected planner responses. Sensitive. |
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
@@ -219,8 +217,8 @@ For windows that contain several independent intents, return ordered
 }
 ~~~
 
-The top-level `selected_seqs`, `subject`, `body`, and `grouping_reason` remain
-required for legacy compatibility. When `commit_groups` is present,
+The top-level `selected_seqs`, `subject`, `body`, and `grouping_reason` are
+required. When `commit_groups` is present,
 `selected_seqs` must be the union of all group selections; the top-level
 message can mirror the first group or summarize the selected window.
 
@@ -238,7 +236,7 @@ Rules:
 | `deferred_reasons` may mention only deferred seqs | Reasons stay aligned with the plan. |
 | `subject` must match `commit_format` | Wrong-format output gets rejected, corrected, or falls back deterministically. |
 | Non-empty `error` is a soft error | ACD keeps the plugin alive and falls back for that request. |
-| Timeout, EOF, crash, or I/O error is a hard error | ACD kills the plugin and respawns it on the next request. |
+| Timeout, EOF, crash, or I/O error is a hard error | ACD kills the plugin. Event mode restarts it on the next request; intent mode waits until the circuit allows a provider probe. |
 
 Minimal smoke test:
 
