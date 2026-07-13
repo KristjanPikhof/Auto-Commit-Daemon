@@ -24,9 +24,7 @@ func TestAccessibleFormUsesSharedDescriptors(t *testing.T) {
 
 func TestAccessibleNoColorControlSanitize(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
-	var out bytes.Buffer
-	form, _ := AccessibleForm(map[string]string{"ai.model": "safe\x1b[31m\x00"}, strings.NewReader(""), &out)
-	view := form.View()
+	view := AccessibleTranscript(map[string]string{"ai.model": "safe\x1b[31m\x00"})
 	if strings.Contains(view, "\x1b[") || strings.Contains(view, "\x00") {
 		t.Fatalf("control output %q", view)
 	}
@@ -36,8 +34,7 @@ func TestAccessibleNoColorControlSanitize(t *testing.T) {
 }
 
 func TestAccessibleFormLabelsTestAndApplyRisk(t *testing.T) {
-	form, _ := AccessibleForm(nil, strings.NewReader(""), &bytes.Buffer{})
-	view := form.View()
+	view := AccessibleTranscript(nil)
 	for _, s := range []string{"Next action", "strict synthetic test", "next safe boundary", "paid synthetic request"} {
 		if !strings.Contains(strings.ToLower(view), strings.ToLower(s)) {
 			t.Errorf("missing %q", s)

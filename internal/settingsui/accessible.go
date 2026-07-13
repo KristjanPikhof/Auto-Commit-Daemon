@@ -34,6 +34,25 @@ func AccessibleForm(draft map[string]string, input io.Reader, output io.Writer) 
 	return form, values
 }
 
+// AccessibleTranscript is the stable, redraw-free description screen readers
+// receive before Huh begins its linear prompts.
+func AccessibleTranscript(draft map[string]string) string {
+	var lines []string
+	lines = append(lines, "ACD SETTINGS - accessible mode")
+	for _, desc := range Fields() {
+		if desc.Sensitive {
+			lines = append(lines, desc.Label+": [set/unset only; value never displayed]")
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s (apply: %s)", desc.Label, fallback(safeText(draft[desc.Key]), "inherit"), desc.Apply))
+	}
+	lines = append(lines,
+		"Next action: save draft, run strict synthetic test, or apply tested draft at next safe boundary.",
+		"Confirmation: a provider test may make one paid synthetic request and never sends repository content.",
+	)
+	return strings.Join(lines, "\n")
+}
+
 func RunAccessible(ctx context.Context, draft map[string]string, input io.Reader, output io.Writer) (AccessibleValues, error) {
 	form, values := AccessibleForm(draft, input, output)
 	if err := form.RunWithContext(ctx); err != nil {
