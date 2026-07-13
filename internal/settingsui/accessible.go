@@ -22,7 +22,7 @@ type AccessibleValues struct {
 
 func AccessibleForm(draft map[string]string, input io.Reader, output io.Writer) (*huh.Form, *AccessibleValues) {
 	values := &AccessibleValues{Values: map[string]string{}, raw: map[string]*string{},
-		ExperimentBudget: "10", ExperimentExpiry: "none", ExperimentPolicy: "continue"}
+		Action: "save", ExperimentBudget: "10", ExperimentExpiry: "none", ExperimentPolicy: "continue"}
 	var fields []huh.Field
 	for _, desc := range Fields() {
 		if desc.Sensitive {
@@ -31,15 +31,19 @@ func AccessibleForm(draft map[string]string, input io.Reader, output io.Writer) 
 		value := safeText(draft[desc.Key])
 		values.Values[desc.Key] = value
 		values.raw[desc.Key] = &value
-		fields = append(fields, huh.NewInput().Key(desc.Key).Title(desc.Label+" ("+desc.Apply+")").Value(&value))
+		fields = append(fields, huh.NewInput().Key(desc.Key).Title(accessibleRetainedValueTitle(
+			desc.Label+" ("+desc.Apply+")", value)).Value(&value))
 	}
 	fields = append(fields,
 		huh.NewInput().Key("profile").Title("Repository profile to select (blank keeps current)").Value(&values.Profile),
-		huh.NewInput().Key("experiment_budget").Title("Experiment window budget (1-1000)").Value(&values.ExperimentBudget),
-		huh.NewInput().Key("experiment_expiry").Title("Experiment expiry (none, 15m, or 1h)").Value(&values.ExperimentExpiry),
-		huh.NewSelect[string]().Key("experiment_policy").Title("Experiment failure policy").Options(
+		huh.NewInput().Key("experiment_budget").Title(accessibleRetainedValueTitle(
+			"Experiment window budget (1-1000)", values.ExperimentBudget)).Value(&values.ExperimentBudget),
+		huh.NewInput().Key("experiment_expiry").Title(accessibleRetainedValueTitle(
+			"Experiment expiry (none, 15m, or 1h)", values.ExperimentExpiry)).Value(&values.ExperimentExpiry),
+		huh.NewSelect[string]().Key("experiment_policy").Title(accessibleRetainedValueTitle(
+			"Experiment failure policy", values.ExperimentPolicy)).Options(
 			huh.NewOption("Continue until budget/expiry", "continue"), huh.NewOption("Revert on provider failure", "revert")).Value(&values.ExperimentPolicy),
-		huh.NewSelect[string]().Key("action").Title("Next action").Options(
+		huh.NewSelect[string]().Key("action").Title(accessibleRetainedValueTitle("Next action", "save draft only")).Options(
 			huh.NewOption("Save draft only", "save"),
 			huh.NewOption("Run strict synthetic test", "test"),
 			huh.NewOption("Apply tested draft at next safe boundary", "apply"),
@@ -47,9 +51,14 @@ func AccessibleForm(draft map[string]string, input io.Reader, output io.Writer) 
 			huh.NewOption("Select repository profile", "profile"),
 			huh.NewOption("Start bounded experiment", "experiment"),
 			huh.NewOption("Cancel active experiment and revert", "cancel_experiment")).Value(&values.Action))
-	fields = append(fields, huh.NewConfirm().Key("confirm").Title("Confirm selected action? Provider tests may make one paid synthetic request.").Value(&values.Confirm))
+	fields = append(fields, huh.NewConfirm().Key("confirm").Title(
+		"Confirm selected action? Provider tests may make one paid synthetic request. (Enter keeps no)").Value(&values.Confirm))
 	form := huh.NewForm(huh.NewGroup(fields...)).WithAccessible(true).WithInput(input).WithOutput(output).WithShowHelp(true)
 	return form, values
+}
+
+func accessibleRetainedValueTitle(title, value string) string {
+	return fmt.Sprintf("%s [current: %s; Enter keeps current]", safeText(title), fallback(safeText(value), "inherit"))
 }
 
 // AccessibleTranscript is the stable, redraw-free description screen readers

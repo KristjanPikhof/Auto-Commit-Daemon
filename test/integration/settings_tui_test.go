@@ -104,6 +104,9 @@ func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	if !strings.Contains(accessible.Stdout, "ACD SETTINGS - accessible mode") || !strings.Contains(accessible.Stdout, "set/unset only; value never displayed") {
 		t.Fatalf("accessible transcript missing\n%s", accessible.Stdout)
 	}
+	if !strings.Contains(accessible.Stdout, "Provider (next safe boundary) [current: deterministic; Enter keeps current]") {
+		t.Fatalf("accessible prompt omitted retained value\n%s", accessible.Stdout)
+	}
 	if strings.Contains(accessible.Stdout, "\x1b[?1049h") {
 		t.Fatalf("accessible mode entered alternate screen\n%q", accessible.Stdout)
 	}
