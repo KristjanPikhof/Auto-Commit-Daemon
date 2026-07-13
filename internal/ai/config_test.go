@@ -561,11 +561,11 @@ func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
 
 func TestValidateProviderConfigConfirmationsAreDistinct(t *testing.T) {
 	validation, err := ValidateProviderConfig(ProviderConfig{
-		Mode:        "openai-compat",
-		BaseURL:     "https://gateway.example/v1",
-		APIKey:      "secret-value",
-		Model:       "model",
-		DiffEgress:  true,
+		Mode:         "openai-compat",
+		BaseURL:      "https://gateway.example/v1",
+		APIKey:       "secret-value",
+		Model:        "model",
+		DiffEgress:   true,
 		CommitFormat: CommitFormatImperative,
 	})
 	if err != nil {
