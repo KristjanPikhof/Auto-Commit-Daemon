@@ -16,6 +16,11 @@ import (
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
+const (
+	recoveryCommitIdentityName  = "Auto Commit Daemon"
+	recoveryCommitIdentityEmail = "acd-recovery@localhost"
+)
+
 // RecoveryReconcileOptions identifies one immutable unpublished suffix. The
 // generic entrypoint deliberately accepts a pending first row: branch changes
 // and dead-branch cleanup must preserve pending-only chains before changing
@@ -930,7 +935,8 @@ func ensureRecoveryCommit(
 		"Preserve ACD recovery chain\n\nBranch: %s\nGeneration: %d\nEvents: %d-%d\n",
 		first.BranchRef, first.BranchGeneration, first.Seq, last.Seq,
 	)
-	commitOID, err := git.CommitTree(ctx, repoRoot, treeOID, message, baseHead)
+	commitOID, err := git.CommitTreeWithIdentity(ctx, repoRoot, treeOID, message,
+		recoveryCommitIdentityName, recoveryCommitIdentityEmail, baseHead)
 	if err != nil {
 		return "", fmt.Errorf("daemon: reconcile recovery chain: create recovery commit: %w", err)
 	}

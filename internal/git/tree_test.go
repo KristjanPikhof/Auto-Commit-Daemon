@@ -169,6 +169,31 @@ func TestCommitTreeAndUpdateRefProduceValidCommit(t *testing.T) {
 	}
 }
 
+func TestCommitTreeWithIdentityOverridesRepositoryIdentity(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	tree, err := Mktree(ctx, dir, nil)
+	if err != nil {
+		t.Fatalf("mktree: %v", err)
+	}
+	commit, err := CommitTreeWithIdentity(ctx, dir, tree, "recovery snapshot",
+		"Auto Commit Daemon", "acd-recovery@localhost")
+	if err != nil {
+		t.Fatalf("commit-tree with identity: %v", err)
+	}
+	out, err := Run(ctx, RunOpts{Dir: dir}, "show", "-s",
+		"--format=%an%x00%ae%x00%cn%x00%ce", commit)
+	if err != nil {
+		t.Fatalf("show identity: %v", err)
+	}
+	got := strings.TrimSpace(string(out))
+	want := "Auto Commit Daemon\x00acd-recovery@localhost\x00" +
+		"Auto Commit Daemon\x00acd-recovery@localhost"
+	if got != want {
+		t.Fatalf("commit identity=%q want %q", got, want)
+	}
+}
+
 func TestUpdateIndexInfoWithIsolatedIndex(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()
