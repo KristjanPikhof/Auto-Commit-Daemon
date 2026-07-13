@@ -58,6 +58,8 @@ type DecisionRecord struct {
 	BranchGeneration sql.NullInt64
 	ActionTaken      sql.NullString
 	UserMessage      sql.NullString
+	ConfigRevisionID sql.NullInt64
+	ConfigProfile    sql.NullString
 }
 
 // DecisionCommitGroup summarizes all decision rows attached to a commit. It is
@@ -96,11 +98,13 @@ func appendDecision(ctx context.Context, execer decisionExecer, rec DecisionReco
 	const q = `
 INSERT INTO decision_records(
     decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-    branch_ref, branch_generation, action_taken, user_message
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    branch_ref, branch_generation, action_taken, user_message,
+    config_revision_id, config_profile
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	res, err := execer.ExecContext(ctx, q,
 		rec.DecisionTS, rec.Kind, rec.Path, rec.Reason, rec.EventSeq, rec.HeadSHA,
-		rec.CommitOID, rec.BranchRef, rec.BranchGeneration, rec.ActionTaken, rec.UserMessage,
+		rec.CommitOID, rec.BranchRef, rec.BranchGeneration, rec.ActionTaken,
+		rec.UserMessage, rec.ConfigRevisionID, rec.ConfigProfile,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("state: append decision: %w", err)
@@ -116,7 +120,8 @@ INSERT INTO decision_records(
 func RecentDecisions(ctx context.Context, d *DB, limit int) ([]DecisionRecord, error) {
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 ORDER BY id DESC
 LIMIT ?`, clampDecisionLimit(limit))
@@ -129,7 +134,8 @@ func DecisionsForPath(ctx context.Context, d *DB, path string, limit int) ([]Dec
 	}
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 WHERE path = ?
 ORDER BY id DESC
@@ -147,7 +153,8 @@ func DecisionsForPathSince(ctx context.Context, d *DB, path string, cursorID int
 	}
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 WHERE path = ? AND id > ?
 ORDER BY id ASC
@@ -162,7 +169,8 @@ func DecisionsForEvent(ctx context.Context, d *DB, eventSeq int64, limit int) ([
 	}
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 WHERE event_seq = ?
 ORDER BY id ASC
@@ -176,7 +184,8 @@ func DecisionsForCommit(ctx context.Context, d *DB, commitOID string, limit int)
 	}
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 WHERE commit_oid = ?
 ORDER BY id DESC
@@ -225,7 +234,8 @@ func DecisionsSince(ctx context.Context, d *DB, cursorID int64, limit int) ([]De
 	}
 	return queryDecisions(ctx, d, `
 SELECT id, decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-       branch_ref, branch_generation, action_taken, user_message
+       branch_ref, branch_generation, action_taken, user_message,
+       config_revision_id, config_profile
 FROM decision_records
 WHERE id > ?
 ORDER BY id ASC
@@ -257,7 +267,8 @@ func queryDecisions(ctx context.Context, d *DB, q string, args ...any) ([]Decisi
 		var rec DecisionRecord
 		if err := rows.Scan(&rec.ID, &rec.DecisionTS, &rec.Kind, &rec.Path, &rec.Reason,
 			&rec.EventSeq, &rec.HeadSHA, &rec.CommitOID, &rec.BranchRef,
-			&rec.BranchGeneration, &rec.ActionTaken, &rec.UserMessage); err != nil {
+			&rec.BranchGeneration, &rec.ActionTaken, &rec.UserMessage,
+			&rec.ConfigRevisionID, &rec.ConfigProfile); err != nil {
 			return nil, fmt.Errorf("state: scan decision: %w", err)
 		}
 		out = append(out, rec)

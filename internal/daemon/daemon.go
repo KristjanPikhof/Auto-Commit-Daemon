@@ -454,7 +454,6 @@ func Run(ctx context.Context, opts Options) error {
 		intentHealthOptions   IntentPlannerHealthOptions
 		intentPlannerProvider string
 		intentPlannerModel    string
-		intentIncludeDiffs    bool
 	)
 	if runIntentPlanner != nil {
 		intentPlannerProvider = ai.PrimaryProviderName(runIntentPlanner)
@@ -464,15 +463,13 @@ func Run(ctx context.Context, opts Options) error {
 		deterministic := intentPlannerProvider == (ai.DeterministicProvider{}).Name()
 		intentHealthOptions = IntentPlannerHealthOptions{
 			Provider: IntentPlannerProviderIdentity{
-				Provider:      intentPlannerProvider,
-				Model:         intentPlannerModel,
-				Endpoint:      providerCfg.BaseURL,
-				Deterministic: deterministic,
+				Provider:         intentPlannerProvider,
+				Model:            intentPlannerModel,
+				Endpoint:         providerCfg.BaseURL,
+				TrustFingerprint: runtimeTrustFingerprint(providerCfg.CAFile),
+				Deterministic:    deterministic,
 			},
 			Now: now,
-		}
-		if plannerProvider, ok := runIntentPlanner.(ai.Provider); ok {
-			intentIncludeDiffs = ai.ProviderNeedsDiff(plannerProvider) && diffEgressOptIn()
 		}
 	}
 	bootGrace := opts.BootGrace
@@ -512,6 +509,33 @@ func Run(ctx context.Context, opts Options) error {
 	if runIntentPlanner != nil {
 		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
 	}
+	initialIdentity := intentHealthOptions.Provider
+	initialFingerprint := IntentPlannerProviderFingerprint(initialIdentity)
+	initialBundle := &RuntimeBundle{
+		Provider: provider, ProviderCloser: providerCloser, MessageFn: msgFn,
+		IntentPlanner: runIntentPlanner, IntentHealth: intentHealth,
+		HealthIdentity: initialIdentity, HealthFingerprint: initialFingerprint,
+		Model: intentPlannerModel, DiffEgress: providerCfg.DiffEgress,
+		CommitStrategy:       providerCfg.CommitStrategy,
+		CommitFormat:         providerCfg.CommitFormat,
+		IntentRetryLimit:     resolvedIntentRetryLimit(),
+		IntentWindow:         providerCfg.IntentWindow,
+		IntentMinPending:     providerCfg.IntentMinPending,
+		IntentSettleWindow:   providerCfg.IntentSettleWindow,
+		IntentMaxPendingAge:  providerCfg.IntentMaxPendingAge,
+		IntentRecentCommits:  providerCfg.IntentRecentCommits,
+		IntentDeferLimit:     providerCfg.IntentDeferLimit,
+		IntentPathCoalescing: pathCoalesceEnabled(),
+	}
+	runtimeBundles := NewRuntimeBundleManager(initialBundle, RuntimeBundleBuilder{
+		DB: opts.DB, RepoRoot: opts.RepoPath, PromptTrace: promptTracer,
+		Logger: logger, Now: now,
+	}, closeTimeout)
+	// RuntimeBundleManager now owns the initial closer. Leave the legacy
+	// deferred guard installed with a nil target for compatibility with early
+	// returns above this point.
+	providerCloser = nil
+	defer runtimeBundles.Close()
 
 	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
 	// OrphanFlushAckThreshold are presumed orphans from a previous daemon
@@ -1621,6 +1645,19 @@ func Run(ctx context.Context, opts Options) error {
 			return gracefulWithSweep("signal shutdown")
 		default:
 		}
+		// The prior capture/replay pass has fully returned. Converge desired
+		// runtime revisions before any new pass can obtain a lease.
+		if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+			logger.Warn("activate desired runtime config; retaining last-known-good",
+				"err", ai.SanitizePlannerError(err.Error()))
+		}
+		if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
+			logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+		} else if queued {
+			if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+				logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+			}
+		}
 
 		// 4c. Drain any pending wake (the wake channel is buffered cap=1
 		// so we just non-blocking receive once; a real wake is observed
@@ -1849,6 +1886,9 @@ func Run(ctx context.Context, opts Options) error {
 		// reflect that transient state. Otherwise the post-pause replay drain
 		// would resurrect work the operator just rewound. Detached HEAD has
 		// its own dedicated gate above.
+		runtimeLease := runtimeBundles.Lease()
+		passBundle := runtimeLease.Bundle()
+		passCtx := withRuntimeTelemetry(ctx, passBundle)
 		var (
 			capSum     CaptureSummary
 			capErr     error
@@ -1899,7 +1939,7 @@ func Run(ctx context.Context, opts Options) error {
 			// prevents Capture from re-tracing the same decision. GitDir
 			// is still wired through so that direct callers (tests,
 			// future CLI wrappers) honor the same gate symmetrically.
-			capSum, capErr = Capture(ctx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
+			capSum, capErr = Capture(passCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:     ignoreChecker,
 				SensitiveMatcher:  matcher,
 				SafeIgnoreMatcher: safeIgnore,
@@ -1920,25 +1960,27 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
-			repSum, repErr = Replay(ctx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn:             msgFn,
+			repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+				MessageFn:             passBundle.MessageFn,
 				GitDir:                opts.GitDir,
 				Trace:                 tracer,
 				PromptTrace:           promptTracer,
 				Limit:                 DefaultReplayLimit,
-				CommitStrategy:        providerCfg.CommitStrategy,
-				IntentWindow:          providerCfg.IntentWindow,
-				IntentMinPending:      providerCfg.IntentMinPending,
-				IntentSettleWindow:    providerCfg.IntentSettleWindow,
-				IntentMaxPendingAge:   providerCfg.IntentMaxPendingAge,
-				IntentRecentCommits:   providerCfg.IntentRecentCommits,
-				IntentDeferLimit:      providerCfg.IntentDeferLimit,
+				CommitStrategy:        passBundle.CommitStrategy,
+				IntentWindow:          passBundle.IntentWindow,
+				IntentMinPending:      passBundle.IntentMinPending,
+				IntentSettleWindow:    passBundle.IntentSettleWindow,
+				IntentMaxPendingAge:   passBundle.IntentMaxPendingAge,
+				IntentRecentCommits:   passBundle.IntentRecentCommits,
+				IntentDeferLimit:      passBundle.IntentDeferLimit,
+				IntentRetryLimit:      &passBundle.IntentRetryLimit,
+				IntentPathCoalescing:  &passBundle.IntentPathCoalescing,
 				IntentBypassBatchWait: flushedLogical > 0,
-				IntentPlanner:         runIntentPlanner,
-				IntentHealth:          intentHealth,
-				IntentPlannerProvider: intentPlannerProvider,
-				IntentPlannerModel:    intentPlannerModel,
-				IntentIncludeDiffs:    intentIncludeDiffs,
+				IntentPlanner:         passBundle.IntentPlanner,
+				IntentHealth:          passBundle.IntentHealth,
+				IntentPlannerProvider: passBundle.HealthIdentity.Provider,
+				IntentPlannerModel:    passBundle.Model,
+				IntentIncludeDiffs:    passBundle.DiffEgress && ai.ProviderNeedsDiff(passBundle.Provider),
 			})
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
@@ -1952,6 +1994,10 @@ func Run(ctx context.Context, opts Options) error {
 					logger.Warn("persist replay branch token", "err", err.Error())
 				}
 			}
+		}
+		runtimeLease.Release()
+		if _, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
+			logger.Warn("queue settled experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
 		}
 
 		// Tick error counters.

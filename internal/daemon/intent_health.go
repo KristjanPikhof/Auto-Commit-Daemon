@@ -64,10 +64,11 @@ const (
 // IntentPlannerProviderIdentity contains only non-secret provider identity.
 // API keys and authorization headers intentionally have no field here.
 type IntentPlannerProviderIdentity struct {
-	Provider      string
-	Model         string
-	Endpoint      string
-	Deterministic bool
+	Provider         string
+	Model            string
+	Endpoint         string
+	TrustFingerprint string
+	Deterministic    bool
 }
 
 // IntentPlannerHealthOptions configures one process-local circuit. Now is a
@@ -311,11 +312,12 @@ func IntentPlannerProviderFingerprint(identity IntentPlannerProviderIdentity) st
 	provider := strings.TrimSpace(identity.Provider)
 	model := strings.TrimSpace(identity.Model)
 	endpoint := sanitizeIntentPlannerEndpoint(identity.Endpoint)
+	trust := strings.TrimSpace(identity.TrustFingerprint)
 	mode := "remote"
 	if identity.Deterministic {
 		mode = "deterministic"
 	}
-	sum := sha256.Sum256([]byte(provider + "\x00" + model + "\x00" + endpoint + "\x00" + mode))
+	sum := sha256.Sum256([]byte(provider + "\x00" + model + "\x00" + endpoint + "\x00" + trust + "\x00" + mode))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 

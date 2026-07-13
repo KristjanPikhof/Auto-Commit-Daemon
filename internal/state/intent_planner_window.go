@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // IntentPlannerWindowGroup is a privacy-safe summary of one commit group
