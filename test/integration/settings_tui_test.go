@@ -120,8 +120,14 @@ func TestSettingsTUIProductionBinaryIsCGODisabled(t *testing.T) {
 		t.Fatalf("Linux integration binary is not static: %s", metadata)
 	}
 	if runtime.GOOS == "darwin" {
-		if deps, depErr := exec.Command("otool", "-L", bin).CombinedOutput(); depErr == nil && strings.Contains(string(deps), ".dylib") {
-			t.Fatalf("CGO-disabled integration binary has dynamic library dependencies:\n%s", deps)
+		// Pure-Go Darwin binaries still link Apple's system frameworks. The
+		// relevant release invariant is that no cgo bridge was compiled in.
+		symbols, symErr := exec.Command("go", "tool", "nm", bin).CombinedOutput()
+		if symErr != nil {
+			t.Fatalf("inspect binary symbols: %v\n%s", symErr, symbols)
+		}
+		if strings.Contains(string(symbols), "runtime/cgo") || strings.Contains(string(symbols), "_cgo_") {
+			t.Fatalf("integration binary contains cgo symbols")
 		}
 	}
 }
