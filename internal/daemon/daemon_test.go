@@ -1251,7 +1251,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	// Insert one old published row and one fresh pending row.
 	old, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "create", Path: "old.txt",
+		BaseHead: "old-base", Operation: "create", Path: "old.txt",
 		Fidelity: "full", CapturedTS: 1,
 		State: "published",
 	}, []state.CaptureOp{{
@@ -1264,7 +1264,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	}
 	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "create", Path: "fresh.txt",
+		BaseHead: "fresh-base", Operation: "create", Path: "fresh.txt",
 		Fidelity: "full",
 		// captured_ts default = now()
 		State: "pending",
