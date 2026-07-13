@@ -618,6 +618,10 @@ while IFS= read -r line; do
 done
 `)
 	p.binary = fastBin
+	// The timeout behavior was proved above. Give process startup a wider
+	// budget for the respawn assertion because package-level race tests run in
+	// parallel and can delay a healthy child under load.
+	p.timeout = 10 * time.Second
 	r, err := p.Generate(context.Background(), CommitContext{Path: "a", Op: "modify"})
 	if err != nil {
 		t.Fatalf("respawn Generate: %v", err)
