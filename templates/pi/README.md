@@ -15,25 +15,13 @@ For [`KristjanPikhof/Pi-YAML-Hooks`](https://github.com/KristjanPikhof/Pi-YAML-H
 
 4. Restart Pi
 
-If you previously installed a snippet that predates the v2026-05-08 release,
-re-run `acd setup pi` and replace the acd block in `~/.pi/agent/hook/hooks.yaml` so
-the new self-heal hooks take effect. Run `acd doctor` to check whether your
-installed snippet is current; it warns when active hooks are missing `acd start`
-or `acd wake` and shows the remediation command.
+Run `acd doctor` after setup. It compares the installed hook with the current
+template and tells you when to regenerate the ACD block with `acd setup pi`.
 
-**Hook file detected but `acd doctor` still reports detection as `no`?**
-The hook file exists but lacks the `# acd-managed: true` marker on its first
-line, so `acd doctor` cannot recognise it as an acd-managed file. To fix this,
-either:
-
-- **Prepend the marker manually** — open `~/.pi/agent/hook/hooks.yaml` in an
-  editor and add `# acd-managed: true` as the very first line.
-- **Re-run setup and merge** — run `acd setup pi` (no `>`), copy the printed
-  YAML, and merge the acd block into your existing file.
-
-  **Do not use `>` to redirect** when you have custom hooks — `acd setup pi --raw
-  > ~/.pi/agent/hook/hooks.yaml` overwrites the entire file and destroys any
-  existing entries.
+If the hook file exists but `acd doctor` does not recognize it, check its first
+line for `# acd-managed: true`. Add the marker or run `acd setup pi` and merge
+the printed YAML into the existing file. Do not redirect raw output over a file
+that contains custom hooks.
 
 Tool hooks run idempotent `acd start` before `acd wake`, so later tool activity
 can recover if you manually ran `acd stop` while the Pi session stayed open.
@@ -42,7 +30,7 @@ can recover if you manually ran `acd stop` while the Pi session stayed open.
 `acd wake` refreshes the heartbeat and nudges capture/replay, but it does not
 bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. The
 `session.idle` hook uses `acd flush --logical` for the prompt-end commit
-boundary; re-run `acd setup pi` if your installed snippet predates that hook.
+boundary. `acd doctor` reports template drift when that wiring is missing.
 
 Repo autodiscovery is enabled by default. If you disable it with
 `repo_lifecycle.autodiscovery` in `~/.config/acd/config.json` or with
