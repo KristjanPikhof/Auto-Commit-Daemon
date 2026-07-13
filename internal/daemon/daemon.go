@@ -447,7 +447,9 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	var (
-		intentHealth          *IntentPlannerHealth
+		intentHealth        *IntentPlannerHealth
+		intentHealthOptions IntentPlannerHealthOptions
+
 		intentPlannerProvider string
 		intentPlannerModel    string
 		intentIncludeDiffs    bool
@@ -458,7 +460,7 @@ func Run(ctx context.Context, opts Options) error {
 			intentPlannerModel = providerCfg.Model
 		}
 		deterministic := intentPlannerProvider == (ai.DeterministicProvider{}).Name()
-		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, IntentPlannerHealthOptions{
+		intentHealthOptions = IntentPlannerHealthOptions{
 			Provider: IntentPlannerProviderIdentity{
 				Provider:      intentPlannerProvider,
 				Model:         intentPlannerModel,
@@ -466,7 +468,7 @@ func Run(ctx context.Context, opts Options) error {
 				Deterministic: deterministic,
 			},
 			Now: now,
-		})
+		}
 		if plannerProvider, ok := runIntentPlanner.(ai.Provider); ok {
 			intentIncludeDiffs = ai.ProviderNeedsDiff(plannerProvider) && diffEgressOptIn()
 		}
@@ -505,6 +507,9 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
 	}
 	defer func() { _ = dlock.Release() }()
+	if runIntentPlanner != nil {
+		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
+	}
 
 	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
 	// OrphanFlushAckThreshold are presumed orphans from a previous daemon

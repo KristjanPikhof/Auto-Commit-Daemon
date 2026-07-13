@@ -1134,6 +1134,56 @@ func TestRun_FlockContention(t *testing.T) {
 	}
 }
 
+func TestRun_FlockContentionDoesNotResetIntentPlannerHealth(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	f := newDaemonFixture(t)
+	seed := intentPlannerHealthRecord{
+		Version: intentPlannerHealthVersion,
+		IntentPlannerHealthSnapshot: IntentPlannerHealthSnapshot{
+			State:               IntentPlannerCircuitOpen,
+			ProviderFingerprint: IntentPlannerProviderFingerprint(openAIIntentHealthIdentity("https://previous.example/v1")),
+			ConsecutiveFailures: 1,
+			BackoffLevel:        0,
+			LastFailureClass:    IntentPlannerFailureTransport,
+			LastError:           "previous provider unavailable",
+		},
+	}
+	if err := state.MetaSetJSON(context.Background(), f.db, MetaKeyIntentPlannerHealth, seed); err != nil {
+		t.Fatalf("seed intent planner health: %v", err)
+	}
+	before, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyIntentPlannerHealth)
+	if err != nil || !ok {
+		t.Fatalf("read seeded intent planner health: ok=%v err=%v", ok, err)
+	}
+
+	lock, err := AcquireDaemonLock(f.gitDir)
+	if err != nil {
+		t.Fatalf("AcquireDaemonLock: %v", err)
+	}
+	defer func() { _ = lock.Release() }()
+
+	err = Run(context.Background(), Options{
+		RepoPath: f.dir,
+		GitDir:   f.gitDir,
+		DB:       f.db,
+		MessageFn: func(context.Context, EventContext) (string, error) {
+			return "unused", nil
+		},
+		IntentPlanner: &recordingIntentPlanner{name: "openai-compat"},
+		SkipSignals:   true,
+	})
+	if !errors.Is(err, ErrDaemonLockHeld) {
+		t.Fatalf("Run returned %v want ErrDaemonLockHeld", err)
+	}
+	after, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyIntentPlannerHealth)
+	if err != nil || !ok {
+		t.Fatalf("read intent planner health after contention: ok=%v err=%v", ok, err)
+	}
+	if after != before {
+		t.Fatalf("intent planner health changed under lock contention\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 // TestRun_RealSIGUSR1: covers the real-OS signal path. Sends SIGUSR1 to the
 // current process and asserts the loop wakes and produces a commit. Skipped
 // on Windows (which we don't target anyway).
