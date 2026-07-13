@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -57,6 +59,17 @@ func runAccessibleBackend(ctx context.Context, backend Backend, opts Options) er
 	if _, err := fmt.Fprintln(out, AccessibleTranscript(draft)); err != nil {
 		return err
 	}
+	if snapshot.Experiment.Active {
+		if _, err := fmt.Fprintf(out, "Experiment progress: %d/%d windows; expiry %s; policy %s\n", snapshot.Experiment.CompletedWindows,
+			snapshot.Experiment.TotalWindows, snapshot.Experiment.ExpiresAt.Format(time.RFC3339), safeText(snapshot.Experiment.FailurePolicy)); err != nil {
+			return err
+		}
+	}
+	if snapshot.Comparison != "" {
+		if _, err := fmt.Fprintln(out, "Descriptive comparison:", safeText(snapshot.Comparison)); err != nil {
+			return err
+		}
+	}
 	values, err := RunAccessible(ctx, draft, in, out)
 	if err != nil {
 		return fmt.Errorf("settings accessible: %s", safeText(err.Error()))
@@ -94,6 +107,55 @@ func dispatchAccessible(ctx context.Context, backend Backend, values AccessibleV
 			label = "QUEUED:"
 		}
 		_, err = fmt.Fprintln(out, label, safeText(result.Summary))
+		return err
+	case "revert":
+		result, err := backend.Revert(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("settings revert: %s", safeText(err.Error()))
+		}
+		_, err = fmt.Fprintln(out, "QUEUED:", safeText(result.Summary))
+		return err
+	case "profile":
+		result, err := backend.SelectProfile(ctx, values.Profile)
+		if err != nil {
+			return fmt.Errorf("settings profile: %s", safeText(err.Error()))
+		}
+		_, err = fmt.Fprintln(out, "SAVED:", safeText(result.Summary))
+		return err
+	case "experiment":
+		budget, err := strconv.Atoi(values.ExperimentBudget)
+		if err != nil {
+			return fmt.Errorf("settings experiment: invalid window budget")
+		}
+		var expiry time.Duration
+		switch values.ExperimentExpiry {
+		case "", "none":
+		case "15m":
+			expiry = 15 * time.Minute
+		case "1h":
+			expiry = time.Hour
+		default:
+			return fmt.Errorf("settings experiment: invalid expiry")
+		}
+		result, err := backend.StartExperiment(ctx, values.Values, ExperimentOptions{WindowBudget: budget, ExpiresAfter: expiry, FailurePolicy: values.ExperimentPolicy})
+		if err != nil {
+			return fmt.Errorf("settings experiment: %s", safeText(err.Error()))
+		}
+		_, err = fmt.Fprintf(out, "QUEUED: experiment %d, 0/%d windows, policy %s\n", result.ID, result.TotalWindows, safeText(result.FailurePolicy))
+		return err
+	case "cancel_experiment":
+		snapshot, err := backend.Snapshot(ctx)
+		if err != nil {
+			return fmt.Errorf("settings experiment: %s", safeText(err.Error()))
+		}
+		if !snapshot.Experiment.Active {
+			return fmt.Errorf("settings experiment: no active experiment")
+		}
+		result, err := backend.CancelExperiment(ctx, snapshot.Experiment.ID)
+		if err != nil {
+			return fmt.Errorf("settings experiment: %s", safeText(err.Error()))
+		}
+		_, err = fmt.Fprintln(out, "QUEUED:", safeText(result.Summary), safeText(snapshot.Comparison))
 		return err
 	default:
 		return fmt.Errorf("settings accessible: unsupported action")

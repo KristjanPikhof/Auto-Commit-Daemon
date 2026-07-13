@@ -39,11 +39,15 @@ func (f *fakeBackend) Apply(_ context.Context, v map[string]string, _ string) (A
 func (f *fakeBackend) Revert(context.Context, int64) (ApplyResult, error) {
 	return ApplyResult{DesiredRevision: 9, AppliedRevision: 7, Queued: true, Summary: "revert queued"}, nil
 }
-func (f *fakeBackend) StartExperiment(context.Context, map[string]string, int) (Experiment, error) {
+func (f *fakeBackend) StartExperiment(context.Context, map[string]string, ExperimentOptions) (Experiment, error) {
 	return Experiment{ID: 3, Active: true, TotalWindows: 10}, nil
 }
 func (f *fakeBackend) CancelExperiment(context.Context, int64) (ApplyResult, error) {
 	return ApplyResult{DesiredRevision: 10, Queued: true, Summary: "experiment cancellation queued"}, nil
+}
+func (f *fakeBackend) SelectProfile(_ context.Context, profile string) (ApplyResult, error) {
+	f.snapshot.Profile = profile
+	return ApplyResult{Summary: "repository profile selected"}, nil
 }
 
 func baseSnapshot() Snapshot {
@@ -202,6 +206,31 @@ func TestModelOperationErrorSanitized(t *testing.T) {
 	m, _ = updated(t, m, operationMsg{id: 1, err: errors.New("oops\x1b[2J\x00")})
 	if m.Err != "oops" {
 		t.Fatalf("error=%q", m.Err)
+	}
+}
+
+func TestLifecycleRejectsFreshAndRejectedFalseLabels(t *testing.T) {
+	fresh := New(nil)
+	if got := lifecycle(fresh); got != "DRAFT" {
+		t.Fatalf("fresh lifecycle=%q", got)
+	}
+	rejected := New(nil)
+	rejected.PendingRevision, rejected.AppliedRevision = 2, 1
+	rejected.Snapshot.PendingStatus = "rejected"
+	rejected.Snapshot.PendingError = "provider rejected"
+	if got := lifecycle(rejected); got != "REJECTED" {
+		t.Fatalf("rejected lifecycle=%q", got)
+	}
+	active := New(nil)
+	active.PendingRevision, active.AppliedRevision = 1, 1
+	if got := lifecycle(active); got != "ACTIVE" {
+		t.Fatalf("active lifecycle=%q", got)
+	}
+}
+
+func TestSafeTextCollapsesLayoutControls(t *testing.T) {
+	if got := safeText("row1\n\trow2\x1b[2J\x00"); got != "row1 row2" {
+		t.Fatalf("safeText=%q", got)
 	}
 }
 

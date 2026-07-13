@@ -13,8 +13,15 @@ type Backend interface {
 	Test(context.Context, map[string]string) (TestResult, error)
 	Apply(context.Context, map[string]string, string) (ApplyResult, error)
 	Revert(context.Context, int64) (ApplyResult, error)
-	StartExperiment(context.Context, map[string]string, int) (Experiment, error)
+	StartExperiment(context.Context, map[string]string, ExperimentOptions) (Experiment, error)
 	CancelExperiment(context.Context, int64) (ApplyResult, error)
+	SelectProfile(context.Context, string) (ApplyResult, error)
+}
+
+type ExperimentOptions struct {
+	WindowBudget  int
+	ExpiresAfter  time.Duration
+	FailurePolicy string
 }
 
 type Snapshot struct {
@@ -25,11 +32,13 @@ type Snapshot struct {
 	LastKnownGood   int64
 	PendingSince    time.Time
 	PendingError    string
+	PendingStatus   string
 	DaemonRunning   bool
 	Experiment      Experiment
 	SavedGeneration uint64
 	Profile         string
 	Comparison      string
+	Profiles        []string
 }
 
 type FieldValue struct {
@@ -62,4 +71,6 @@ type Experiment struct {
 	TotalWindows     int
 	ExpiresAt        time.Time
 	Active           bool
+	FailurePolicy    string
+	Status           string
 }

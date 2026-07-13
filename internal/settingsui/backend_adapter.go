@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
@@ -180,7 +181,8 @@ func (b *ServiceBackend) Revert(ctx context.Context, _ int64) (ApplyResult, erro
 		Queued: result.RevisionID != last.AppliedRevisionID, Summary: "known-good revision queued"}, nil
 }
 
-func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]string, windows int) (Experiment, error) {
+func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]string, options ExperimentOptions) (Experiment, error) {
+	windows := options.WindowBudget
 	if windows <= 0 || windows > settings.MaxExperimentWindows {
 		return Experiment{}, errors.New("experiment window budget must be between 1 and 1000")
 	}
@@ -203,10 +205,18 @@ func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]s
 	if err != nil {
 		return Experiment{}, sanitizeAdapterError(err)
 	}
+	policy := options.FailurePolicy
+	if policy == "" {
+		policy = settings.ExperimentPolicyContinue
+	}
+	var expires time.Time
+	if options.ExpiresAfter > 0 {
+		expires = time.Now().Add(options.ExpiresAfter)
+	}
 	result, err := experiments.StartExperiment(ctx, settings.ExperimentRequest{Values: clean,
 		TestedFingerprint: testedFingerprint, Confirmations: b.opts.Confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: last.DesiredRevisionID,
-		WindowBudget: windows, FailurePolicy: settings.ExperimentPolicyContinue})
+		WindowBudget: windows, ExpiresAt: expires, FailurePolicy: policy})
 	if err != nil {
 		return Experiment{}, sanitizeAdapterError(err)
 	}
@@ -228,11 +238,32 @@ func (b *ServiceBackend) CancelExperiment(ctx context.Context, id int64) (ApplyR
 	return projectExperimentApply(result, applied, "experiment cancelled; baseline revert queued"), nil
 }
 
+func (b *ServiceBackend) SelectProfile(ctx context.Context, profile string) (ApplyResult, error) {
+	if b.opts.Scope != settings.ScopeRepository {
+		return ApplyResult{}, errors.New("profile selection requires repository scope")
+	}
+	b.mu.Lock()
+	last := b.last
+	b.mu.Unlock()
+	profile = safeText(strings.TrimSpace(profile))
+	_, err := b.service.Save(ctx, settings.SaveRequest{Scope: settings.ScopeRepository,
+		RepositoryProfile: &profile, Values: map[string]*string{}, ExpectedGeneration: last.SavedGeneration})
+	if err != nil {
+		return ApplyResult{}, sanitizeAdapterError(err)
+	}
+	return ApplyResult{DesiredRevision: last.DesiredRevisionID, AppliedRevision: last.AppliedRevisionID,
+		Summary: "repository profile selected; test and apply explicitly"}, nil
+}
+
 func projectSnapshot(s settings.Snapshot) Snapshot {
 	out := Snapshot{ActiveRevision: s.AppliedRevisionID, DesiredRevision: s.DesiredRevisionID,
 		AppliedRevision: s.AppliedRevisionID, LastKnownGood: s.LastKnownGoodRevisionID,
 		PendingSince: s.PendingSince, PendingError: safeText(s.PendingError), DaemonRunning: s.DaemonRunning,
+		PendingStatus:   safeText(s.PendingStatus),
 		SavedGeneration: s.SavedGeneration, Profile: safeText(s.Profile)}
+	for _, profile := range s.Profiles {
+		out.Profiles = append(out.Profiles, safeText(profile))
+	}
 	for _, field := range s.Fields {
 		value := safeText(field.DraftValue)
 		set := field.Sensitive && value == "set"
@@ -260,7 +291,8 @@ func projectSnapshot(s settings.Snapshot) Snapshot {
 
 func projectExperiment(value settings.ExperimentSnapshot, profile string) Experiment {
 	return Experiment{ID: value.ID, Profile: safeText(profile), CompletedWindows: value.CompletedWindows,
-		TotalWindows: value.WindowBudget, ExpiresAt: value.ExpiresAt, Active: value.Status == "active"}
+		TotalWindows: value.WindowBudget, ExpiresAt: value.ExpiresAt, Active: value.Status == "active",
+		FailurePolicy: safeText(value.FailurePolicy), Status: safeText(value.Status)}
 }
 
 func projectExperimentApply(result settings.ExperimentResult, applied int64, summary string) ApplyResult {

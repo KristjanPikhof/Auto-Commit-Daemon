@@ -113,6 +113,23 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	if got := fieldByName(t, snapshot, "capture.max_file_bytes").Boundary; got != config.ApplyRestart {
 		t.Fatalf("restart boundary = %q", got)
 	}
+	globalSnapshot, err := svc.Snapshot(context.Background(), ScopeGlobal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fieldByName(t, globalSnapshot, config.FieldCommitStrategy); got.Source == config.SourceRepository || got.DraftValue == "intent" {
+		t.Fatalf("global snapshot leaked repository override: %+v", got)
+	}
+	profileSnapshot, err := svc.Snapshot(context.Background(), ScopeProfile, "fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fieldByName(t, profileSnapshot, config.FieldCommitStrategy); got.Source == config.SourceRepository || got.DraftValue == "intent" {
+		t.Fatalf("profile snapshot leaked repository override: %+v", got)
+	}
+	if len(snapshot.Profiles) != 1 || snapshot.Profiles[0] != "fast" {
+		t.Fatalf("profiles=%v", snapshot.Profiles)
+	}
 }
 
 func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {

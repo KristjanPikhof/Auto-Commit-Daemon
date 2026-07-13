@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
@@ -49,9 +50,11 @@ type Snapshot struct {
 	PendingSince            time.Time
 	PendingAge              time.Duration
 	PendingError            string
+	PendingStatus           string
 	DaemonMode              string
 	DaemonRunning           bool
 	Experiment              *ExperimentSnapshot
+	Profiles                []string
 }
 
 // Snapshot projects authoring and runtime state without writing config or DB.
@@ -67,8 +70,19 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	activeProfile := repo.Profile
 	if scope == ScopeProfile {
 		activeProfile = profileName
+	} else if scope == ScopeGlobal {
+		activeProfile = ""
 	}
 	profile := doc.Settings.Profiles[activeProfile]
+	repositoryFields := repo.Fields
+	profileFields := profile.Fields
+	switch scope {
+	case ScopeGlobal:
+		repositoryFields = nil
+		profileFields = nil
+	case ScopeProfile:
+		repositoryFields = nil
+	}
 	runtimeState, err := state.RuntimeConfigActivationState(ctx, s.db)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
@@ -96,7 +110,7 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	fields := make([]FieldSnapshot, 0, len(config.Catalog()))
 	for _, field := range config.Catalog() {
 		resolved, err := config.ResolveField(field.Name, config.ResolveInput{
-			Repository: repo.Fields, Profile: profile.Fields, Global: doc.Settings.Global,
+			Repository: repositoryFields, Profile: profileFields, Global: doc.Settings.Global,
 			LookupEnv: s.lookupEnv,
 		})
 		if err != nil {
@@ -129,7 +143,12 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	out := Snapshot{Scope: scope, Profile: activeProfile, RepoHash: s.repoHash,
+	profiles := make([]string, 0, len(doc.Settings.Profiles))
+	for name := range doc.Settings.Profiles {
+		profiles = append(profiles, cleanText(name))
+	}
+	sort.Strings(profiles)
+	out := Snapshot{Scope: scope, Profile: activeProfile, RepoHash: s.repoHash, Profiles: profiles,
 		SavedGeneration: doc.Generation, Fields: fields,
 		DesiredRevisionID:       nullableValue(runtimeState.DesiredRevisionID),
 		AppliedRevisionID:       nullableValue(runtimeState.AppliedRevisionID),
@@ -137,6 +156,12 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		DesiredRequestID:        nullableValue(runtimeState.DesiredRequestID),
 		PendingError:            cleanText(runtimeState.LastError.String), DaemonMode: cleanText(ds.Mode),
 		DaemonRunning: running, Experiment: experiment}
+	if runtimeState.DesiredRequestID.Valid {
+		request, requestErr := state.ActivationRequestByID(ctx, s.db, runtimeState.DesiredRequestID.Int64)
+		if requestErr == nil {
+			out.PendingStatus = cleanText(request.Status)
+		}
+	}
 	if runtimeState.DesiredTS.Valid && out.DesiredRevisionID != out.AppliedRevisionID {
 		out.PendingSince = time.Unix(0, int64(runtimeState.DesiredTS.Float64*float64(time.Second)))
 		out.PendingAge = s.now().Sub(out.PendingSince)

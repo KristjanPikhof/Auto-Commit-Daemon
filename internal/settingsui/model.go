@@ -30,21 +30,25 @@ type Model struct {
 	backend Backend
 	keys    KeyMap
 
-	Snapshot        Snapshot
-	Draft           map[string]string
-	Dirty           map[string]bool
-	Test            TestResult
-	TestFingerprint string
-	PendingRevision int64
-	AppliedRevision int64
-	Operation       *Operation
-	Experiment      Experiment
-	Focus           int
-	Mode            Mode
-	Width, Height   int
-	Search          string
-	Status          string
-	Err             string
+	Snapshot         Snapshot
+	Draft            map[string]string
+	Dirty            map[string]bool
+	Test             TestResult
+	TestFingerprint  string
+	PendingRevision  int64
+	AppliedRevision  int64
+	Operation        *Operation
+	Experiment       Experiment
+	Focus            int
+	Mode             Mode
+	Width, Height    int
+	Search           string
+	Status           string
+	Err              string
+	ExperimentBudget int
+	ExperimentExpiry int
+	ExperimentPolicy string
+	ProfileIndex     int
 
 	input         textinput.Model
 	nextOperation uint64
@@ -57,7 +61,8 @@ func New(backend Backend) Model {
 	in := textinput.New()
 	in.CharLimit = 512
 	in.SetWidth(42)
-	return Model{backend: backend, keys: DefaultKeyMap(), Draft: map[string]string{}, Dirty: map[string]bool{}, input: in, Width: 80, Height: 24}
+	return Model{backend: backend, keys: DefaultKeyMap(), Draft: map[string]string{}, Dirty: map[string]bool{}, input: in, Width: 80, Height: 24,
+		ExperimentBudget: 10, ExperimentPolicy: "continue"}
 }
 
 func (m Model) Init() tea.Cmd { return m.snapshotCmd() }
