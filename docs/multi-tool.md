@@ -78,8 +78,6 @@ acd diagnose --repo .
 acd fix --dry-run
 acd off
 acd fix --yes
-acd fix --force --dry-run
-acd fix --force --yes
 acd on
 acd
 ~~~
