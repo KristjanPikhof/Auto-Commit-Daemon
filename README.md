@@ -266,11 +266,11 @@ acd commit-all --yes --json
 
 Detached HEAD, in-progress Git operations, and manual pause markers are refused
 for previews and apply. If an authorized run reaches its mutation phase, it
-also refuses while the per-repo daemon is alive; dry-run and a clean no-op do
-not acquire `daemon.lock`. Dry-run and a declined confirmation are read-only:
-they do not capture files, start the AI provider, create recovery refs, or write
-ACD state. An incomplete drain exits non-zero and leaves the captured queue
-protected for diagnosis.
+also refuses while the per-repo daemon is alive. Dry-run, a declined
+confirmation, and a clean no-op do not acquire `daemon.lock`; the first two are
+read-only and do not capture files, start the AI provider, create recovery refs,
+or write ACD state. An incomplete drain exits non-zero and leaves the captured
+queue protected for diagnosis.
 
 ## Repo registration
 

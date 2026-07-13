@@ -207,7 +207,7 @@ Refusals:
 | Detached HEAD | Check out a branch. |
 | Rebase, merge, cherry-pick, or bisect in progress | Finish the Git operation. |
 | Manual pause marker | `acd resume --yes` |
-| Authorized mutation while the per-repo daemon is running | `acd stop` first. Dry-run and a clean no-op do not acquire `daemon.lock`. |
+| Authorized mutation while the per-repo daemon is running | `acd stop` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
 | No initial commit | Create the first commit yourself. |
 
 ## Blocked conflicts

@@ -183,6 +183,29 @@ func TestCommitAll_CleanNoOpAllowedWhileDaemonLockHeld(t *testing.T) {
 	}
 }
 
+func TestCommitAll_DeclineAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, strings.NewReader("n\n"), repo, false, false, false)
+	if !errors.Is(err, errCommitAllAborted) {
+		t.Fatalf("runCommitAll decline with daemon.lock held: %v", err)
+	}
+	if !strings.Contains(out.String(), "aborted by user") {
+		t.Fatalf("decline output missing abort result: %s", out.String())
+	}
+}
+
 // TestCommitAll_CleanWorktreeNoOp covers the success path on a clean worktree:
 // capture finds no events, command exits zero with PendingBefore=0.
 func TestCommitAll_CleanWorktreeNoOp(t *testing.T) {
