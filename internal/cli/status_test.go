@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -150,7 +150,7 @@ func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 		}
 	}
 	combined := jsonOut.String() + human.String()
-	for _, forbidden := range []string{"user:password", "sk-visible", "private", "repository_diff=secret", "provider_response=raw", "\x1b"} {
+	for _, forbidden := range []string{"user:password", "sk-visible", "prompt=private", "repository_diff=secret", "provider_response=raw", "\x1b"} {
 		if strings.Contains(combined, forbidden) {
 			t.Fatalf("runtime observability leaked %q:\n%s", forbidden, combined)
 		}
@@ -194,6 +194,21 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 	after, _ := fileSHA256(dbPath)
 	if before != after {
 		t.Fatalf("status mutated pre-v14 DB: %s -> %s", before, after)
+	}
+	var diagnoseOut bytes.Buffer
+	if err := runDiagnose(ctx, &diagnoseOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var diagnose diagnoseReport
+	if err := json.Unmarshal(diagnoseOut.Bytes(), &diagnose); err != nil {
+		t.Fatal(err)
+	}
+	if diagnose.RuntimeConfig.ApplyState != "unset" || diagnose.RuntimeConfig.DesiredRevisionID != 0 {
+		t.Fatalf("old schema diagnose projection = %+v", diagnose.RuntimeConfig)
+	}
+	afterDiagnose, _ := fileSHA256(dbPath)
+	if before != afterDiagnose {
+		t.Fatalf("diagnose mutated pre-v14 DB: %s -> %s", before, afterDiagnose)
 	}
 	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
