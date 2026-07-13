@@ -31,68 +31,19 @@ type captureFixture struct {
 
 func newCaptureFixture(t *testing.T) *captureFixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	repo := cloneDaemonTestRepo(t, captureRepoTemplate)
 
-	dir := t.TempDir()
-	if err := git.Init(ctx, dir); err != nil {
-		t.Fatalf("git init: %v", err)
-	}
-	// Force HEAD onto refs/heads/main regardless of host's init.defaultBranch
-	// (CI runners default to master; the fixture's CaptureContext is pinned
-	// to refs/heads/main).
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
-		t.Fatalf("symbolic-ref HEAD: %v", err)
-	}
-	// Configure identity so commit-tree works on hosts without git config.
-	for _, kv := range [][]string{
-		{"user.email", "acd-test@example.com"},
-		{"user.name", "ACD Test"},
-		{"commit.gpgsign", "false"},
-	} {
-		if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "config", kv[0], kv[1]); err != nil {
-			t.Fatalf("git config %s: %v", kv[0], err)
-		}
-	}
-	// Initial commit so HEAD resolves to a real OID.
-	seedFile := filepath.Join(dir, ".gitignore")
-	if err := os.WriteFile(seedFile, []byte("ignored.txt\n"), 0o644); err != nil {
-		t.Fatalf("seed gitignore: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "add", ".gitignore"); err != nil {
-		t.Fatalf("git add: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "commit", "-q", "-m", "seed"); err != nil {
-		t.Fatalf("git commit: %v", err)
-	}
-
-	gitDir, err := git.AbsoluteGitDir(ctx, dir)
-	if err != nil {
-		t.Fatalf("AbsoluteGitDir: %v", err)
-	}
-	dbPath := state.DBPathFromGitDir(gitDir)
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	head, err := git.RevParse(ctx, dir, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-
-	ig := git.NewIgnoreChecker(dir)
+	ig := git.NewIgnoreChecker(repo.dir)
 	t.Cleanup(func() { _ = ig.Close() })
 
 	return &captureFixture{
-		dir:    dir,
-		gitDir: gitDir,
-		db:     db,
+		dir:    repo.dir,
+		gitDir: repo.gitDir,
+		db:     repo.db,
 		cctx: CaptureContext{
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: 1,
-			BaseHead:         head,
+			BaseHead:         repo.head,
 		},
 		ig:      ig,
 		matcher: state.NewSensitiveMatcher(),

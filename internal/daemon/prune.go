@@ -7,11 +7,13 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -38,7 +40,10 @@ func resolveEventRetention(opt time.Duration) time.Duration {
 
 // PruneCaptureEvents drops terminal capture_events older than retention.
 // Returns the number of rows removed.
-func PruneCaptureEvents(ctx context.Context, db *state.DB, now time.Time, retention time.Duration) (int, error) {
+func PruneCaptureEvents(ctx context.Context, repoDir string, db *state.DB, now time.Time, retention time.Duration) (int, error) {
+	if repoDir == "" {
+		return 0, fmt.Errorf("daemon: PruneCaptureEvents: empty repoDir")
+	}
 	if db == nil {
 		return 0, fmt.Errorf("daemon: PruneCaptureEvents: nil db")
 	}
@@ -48,9 +53,69 @@ func PruneCaptureEvents(ctx context.Context, db *state.DB, now time.Time, retent
 	if err != nil {
 		return 0, err
 	}
-	terminal, err := state.PruneTerminalEventsBefore(ctx, db, cutoff)
+	protected, err := pruneVerifiedRecoverySnapshotEvents(ctx, repoDir, db, cutoff)
 	if err != nil {
 		return published, err
 	}
-	return published + terminal, nil
+	terminal, err := state.PruneTerminalEventsBefore(ctx, db, cutoff)
+	if err != nil {
+		return published + protected, err
+	}
+	return published + protected + terminal, nil
+}
+
+func pruneVerifiedRecoverySnapshotEvents(ctx context.Context, repoDir string, db *state.DB, cutoff float64) (int, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT DISTINCT snapshot.id, snapshot.commit_oid, snapshot.recovery_ref
+FROM recovery_snapshots snapshot
+JOIN recovery_snapshot_events member ON member.snapshot_id = snapshot.id
+JOIN capture_events event ON event.seq = member.event_seq
+WHERE event.state IN ('published', 'recovered') AND event.captured_ts < ?
+ORDER BY snapshot.id`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: list protected prune candidates: %w", err)
+	}
+	type candidate struct {
+		id        int64
+		commitOID string
+		ref       string
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.commitOID, &item.ref); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("daemon: scan protected prune candidate: %w", err)
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("daemon: iterate protected prune candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("daemon: close protected prune candidates: %w", err)
+	}
+
+	pruned := 0
+	for _, item := range candidates {
+		actual, err := git.RevParse(ctx, repoDir, item.ref)
+		if errors.Is(err, git.ErrRefNotFound) || (err == nil && actual != item.commitOID) {
+			continue
+		}
+		if err != nil {
+			return pruned, fmt.Errorf("daemon: verify protected snapshot %d ref %s: %w", item.id, item.ref, err)
+		}
+		var n int
+		err = git.WithLockedRecoveryRef(ctx, repoDir, item.ref, item.commitOID, func() error {
+			var pruneErr error
+			n, pruneErr = state.PruneRecoverySnapshotEventsBefore(ctx, db, item.id, cutoff)
+			return pruneErr
+		})
+		if err != nil {
+			return pruned, fmt.Errorf("daemon: prune protected snapshot %d under ref %s: %w", item.id, item.ref, err)
+		}
+		pruned += n
+	}
+	return pruned, nil
 }

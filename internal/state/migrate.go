@@ -54,7 +54,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // v10 adds rewrite_plans.commit_format so saved plans preserve the validation
 // policy used when they were generated or edited. v11 adds
 // intent_planner_windows and intent_planner_window_events for lossless,
-// privacy-safe planner-window observability.
+// privacy-safe planner-window observability. v12 adds recovery_snapshots and
+// recovery_snapshot_events; both are pure DDL applied through schemaDDL.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -63,9 +64,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // and adding idempotent statements to schemaDDL is sufficient for pure-DDL
 // migrations (such as v2→v3). v6 uses an explicit table rebuild for only
 // pre-v6 databases whose decision_records table still has the old event_seq
-// foreign key. v7 and v8 are pure DDL migrations through schemaDDL. Migrate is
-// wired now so future phases requiring separate data backfill have a single
-// entry point to extend.
+// foreign key. v7, v8, v11, and v12 are pure DDL migrations through schemaDDL.
+// Migrate is wired now so future phases requiring separate data backfill have
+// a single entry point to extend.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
 	if err != nil {

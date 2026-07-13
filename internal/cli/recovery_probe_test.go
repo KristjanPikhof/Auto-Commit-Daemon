@@ -67,6 +67,7 @@ func TestRecoveryBlockerCountsDistinguishActiveAndNonActiveRows(t *testing.T) {
 	appendFailed("refs/heads/main", 2, "failed.go")
 	appendPending("refs/heads/main", 2, "failed-hidden.go")
 	appendPending("refs/heads/pending-only", 1, "visible.go")
+	appendFailed("refs/heads/main", 1, "active-tail-failed.go")
 
 	counts, err := loadRecoveryBlockerCounts(ctx, d.SQL(), "refs/heads/main", 1)
 	if err != nil {
@@ -77,6 +78,9 @@ func TestRecoveryBlockerCountsDistinguishActiveAndNonActiveRows(t *testing.T) {
 	}
 	if counts.ActiveBlockedBarriersWithSuccessors != 1 {
 		t.Fatalf("ActiveBlockedBarriersWithSuccessors=%d want 1", counts.ActiveBlockedBarriersWithSuccessors)
+	}
+	if counts.ActiveTerminalEvents != 2 {
+		t.Fatalf("ActiveTerminalEvents=%d want 2", counts.ActiveTerminalEvents)
 	}
 	if counts.FailedBarriersWithSuccessors != 1 {
 		t.Fatalf("FailedBarriersWithSuccessors=%d want 1", counts.FailedBarriersWithSuccessors)
@@ -102,7 +106,7 @@ func TestRecoveryBlockerCountsPendingOnlyRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load counts: %v", err)
 	}
-	if counts.TotalBlockedConflicts != 0 || counts.ActiveBlockedBarriersWithSuccessors != 0 || counts.FailedBarriersWithSuccessors != 0 {
+	if counts.TotalBlockedConflicts != 0 || counts.ActiveBlockedBarriersWithSuccessors != 0 || counts.ActiveTerminalEvents != 0 || counts.FailedBarriersWithSuccessors != 0 {
 		t.Fatalf("blocker counts = %+v, want no blockers", counts)
 	}
 	if counts.PendingOnlyIntentDepth != 2 {

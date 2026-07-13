@@ -5,12 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -73,6 +77,12 @@ func TestIsKeepDeadBranchBarriers(t *testing.T) {
 func seedTerminalEvent(t *testing.T, db *state.DB, branchRef string, generation int64, baseHead, path, eventState string) int64 {
 	t.Helper()
 	ctx := context.Background()
+	gitDir := filepath.Dir(filepath.Dir(db.Path()))
+	repoDir := filepath.Dir(gitDir)
+	afterOID, err := git.HashObjectStdin(ctx, repoDir, []byte(path+"\n"))
+	if err != nil {
+		t.Fatalf("hash after blob: %v", err)
+	}
 	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
 		BranchRef:        branchRef,
 		BranchGeneration: generation,
@@ -86,7 +96,7 @@ func seedTerminalEvent(t *testing.T, db *state.DB, branchRef string, generation 
 		Path:      path,
 		Fidelity:  "full",
 		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
 	}})
 	if err != nil {
 		t.Fatalf("AppendCaptureEvent: %v", err)
@@ -113,13 +123,12 @@ func countEventsByRefState(t *testing.T, db *state.DB, branchRef, eventState str
 	return n
 }
 
-// TestDeadBranchSweep_PrunesDeadRefRows seeds blocked_conflict + failed +
+// TestDeadBranchSweep_RecoversDeadRefRows seeds blocked_conflict + failed +
 // pending rows for refs/heads/old (which is NOT created in the test repo) and
 // terminal rows for the active refs/heads/main; runs the startup sweep;
-// asserts old's pending + terminal rows are all deleted (the helper now drops
-// pending rows together with terminals so the prune does not get reverted on
-// the next replay tick), and main's rows are preserved.
-func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
+// asserts old's pending + terminal rows all become recovered while their
+// provenance rows remain, and main's rows are preserved.
+func TestDeadBranchSweep_RecoversDeadRefRows(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
 	ctx := context.Background()
@@ -132,8 +141,7 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	const activeRef = "refs/heads/main"
 
 	// Dead-ref rows: one of each (terminal + pending). All three must be
-	// deleted — leaving pending rows behind would let replay restamp a
-	// blocked_conflict on the next tick and defeat the prune.
+	// transitioned together so replay cannot restamp a blocked conflict.
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-blocked.txt", state.EventStateBlockedConflict)
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-failed.txt", state.EventStateFailed)
 	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-pending.txt", state.EventStatePending)
@@ -158,10 +166,13 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateFailed); got != 0 {
 		t.Fatalf("dead-ref failed rows=%d want 0", got)
 	}
-	// Pending rows for the dead pair must also be gone so PendingEvents does
-	// not re-expose them on the next replay tick.
+	// Pending lifecycle state must also be gone so PendingEvents does not
+	// re-expose the chain on the next replay tick.
 	if got := countEventsByRefState(t, f.db, deadRef, state.EventStatePending); got != 0 {
-		t.Fatalf("dead-ref pending rows=%d want 0 (helper must drop pending+terminal together)", got)
+		t.Fatalf("dead-ref pending rows=%d want 0 after whole-chain recovery", got)
+	}
+	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateRecovered); got != 3 {
+		t.Fatalf("dead-ref recovered rows=%d want 3", got)
 	}
 	if got := countEventsByRefState(t, f.db, activeRef, state.EventStateBlockedConflict); got != 1 {
 		t.Fatalf("active-ref blocked_conflict rows=%d want 1 (active pair must be preserved)", got)
@@ -174,10 +185,260 @@ func TestDeadBranchSweep_PrunesDeadRefRows(t *testing.T) {
 	}
 }
 
+func TestDeadBranchSweep_ArchivesWhenLiveHeadMissing(t *testing.T) {
+	t.Setenv(EnvKeepDeadBranchBarriers, "")
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	const deadRef = "refs/heads/dead-before-orphan"
+	seedTerminalEvent(t, f.db, deadRef, 1, baseHead, "preserved.txt", state.EventStatePending)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/orphan"); err != nil {
+		t.Fatalf("symbolic-ref orphan: %v", err)
+	}
+
+	runStartupDeadBranchSweep(ctx, f.dir, f.db, CaptureContext{
+		BranchRef: "refs/heads/orphan", BranchGeneration: 2,
+	}, slog.Default(), nil)
+
+	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateRecovered); got != 1 {
+		t.Fatalf("recovered rows=%d want 1", got)
+	}
+	var recoveryRef string
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT recovery_ref FROM recovery_snapshots
+WHERE branch_ref = ? AND branch_generation = ?`, deadRef, 1).Scan(&recoveryRef); err != nil {
+		t.Fatalf("read recovery snapshot: %v", err)
+	}
+	if !strings.HasSuffix(recoveryRef, "/archive") {
+		t.Fatalf("recovery_ref=%q want archive ref", recoveryRef)
+	}
+}
+
+func TestDeadBranchRecoveryRefRecreationPreservesPair(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	const deadRef = "refs/heads/recreated-during-recovery"
+	seq := seedTerminalEvent(t, f.db, deadRef, 1, baseHead, "preserved.txt", state.EventStatePending)
+	var recreateErr error
+	_, err = ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir: f.gitDir, BranchRef: deadRef, BranchGeneration: 1,
+		FirstSeq: seq, Trigger: "dead_ref_race", ExpectedMissingRef: deadRef,
+		beforeStateTransition: func() {
+			recreateErr = git.UpdateRef(ctx, f.dir, deadRef, baseHead, "")
+		},
+	})
+	if recreateErr != nil {
+		t.Fatalf("recreate ref: %v", recreateErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "to remain missing") {
+		t.Fatalf("Reconcile error=%v want recreated-ref refusal", err)
+	}
+	if got := countEventsByRefState(t, f.db, deadRef, state.EventStatePending); got != 1 {
+		t.Fatalf("pending rows=%d want 1 unchanged", got)
+	}
+	if snapshots := countRecoverySnapshots(t, ctx, f.db); snapshots != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", snapshots)
+	}
+}
+
+func TestDeadBranchRecoveryLocksMissingRefThroughTransition(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	const deadRef = "refs/heads/recreated-after-recovery-lock"
+	seq := seedTerminalEvent(t, f.db, deadRef, 1, baseHead, "preserved.txt", state.EventStatePending)
+
+	recreateDone := make(chan error, 1)
+	recreateStarted := make(chan struct{})
+	completedWhileLocked := false
+	var recreateErr error
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir: f.gitDir, BranchRef: deadRef, BranchGeneration: 1,
+		FirstSeq: seq, Trigger: "dead_ref_atomic_race", ExpectedMissingRef: deadRef,
+		afterRecoveryRefLocked: func() {
+			go func() {
+				close(recreateStarted)
+				recreateDone <- git.UpdateRef(ctx, f.dir, deadRef, baseHead, "")
+			}()
+			<-recreateStarted
+			select {
+			case recreateErr = <-recreateDone:
+				completedWhileLocked = true
+			case <-time.After(200 * time.Millisecond):
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if completedWhileLocked && recreateErr == nil {
+		t.Fatal("dead ref was recreated before the recovery DB transition completed")
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered {
+		t.Fatalf("result=%+v want recovered", result)
+	}
+	if !completedWhileLocked {
+		select {
+		case recreateErr = <-recreateDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("dead-ref transaction lock was not released")
+		}
+	}
+	if recreateErr != nil {
+		if err := git.UpdateRef(ctx, f.dir, deadRef, baseHead, ""); err != nil {
+			t.Fatalf("recreate dead ref after transition: %v", err)
+		}
+	}
+	if got := countEventsByRefState(t, f.db, deadRef, state.EventStateRecovered); got != 1 {
+		t.Fatalf("recovered rows=%d want 1", got)
+	}
+}
+
+func TestStartupDeadBranchSweep_RechecksSafetyBeforePair(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *daemonFixture) error
+	}{
+		{
+			name: "manual pause",
+			setup: func(t *testing.T, f *daemonFixture) error {
+				_, err := pausepkg.Write(pausepkg.Path(f.gitDir), pausepkg.Marker{
+					Reason: "operator surgery",
+					SetAt:  time.Now().UTC().Format(time.RFC3339),
+					SetBy:  "test",
+				}, false)
+				return err
+			},
+		},
+		{
+			name: "git operation",
+			setup: func(t *testing.T, f *daemonFixture) error {
+				return os.MkdirAll(filepath.Join(f.gitDir, "rebase-merge"), 0o755)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvKeepDeadBranchBarriers, "")
+			f := newDaemonFixture(t)
+			ctx := context.Background()
+			head, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse HEAD: %v", err)
+			}
+			const deadRef = "refs/heads/safety-race"
+			seedTerminalEvent(t, f.db, deadRef, 1, head, "preserved.txt", state.EventStatePending)
+			var setupErr error
+			runStartupDeadBranchSweepWithOptions(ctx, f.dir, f.db, CaptureContext{
+				BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+			}, slog.Default(), nil, startupDeadBranchSweepOptions{
+				beforePairSafetyCheck: func(context.Context, deadBranchPair) {
+					setupErr = tc.setup(t, f)
+				},
+			})
+			if setupErr != nil {
+				t.Fatalf("setup safety gate: %v", setupErr)
+			}
+			if got := countEventsByRefState(t, f.db, deadRef, state.EventStatePending); got != 1 {
+				t.Fatalf("pending rows=%d want 1 preserved", got)
+			}
+			if snapshots := countRecoverySnapshots(t, ctx, f.db); snapshots != 0 {
+				t.Fatalf("recovery snapshots=%d want 0", snapshots)
+			}
+		})
+	}
+}
+
+// TestRun_ShutdownJoinsStartupDeadBranchSweep proves the asynchronous startup
+// sweep remains owned by Run. Both shutdown mechanisms must cancel a sweep
+// blocked immediately before mutation and wait for it to exit before Run
+// releases daemon.lock or returns control to the DB owner.
+func TestRun_ShutdownJoinsStartupDeadBranchSweep(t *testing.T) {
+	for _, shutdownMode := range []string{"signal", "context"} {
+		t.Run(shutdownMode, func(t *testing.T) {
+			t.Setenv(EnvKeepDeadBranchBarriers, "")
+			f := newDaemonFixture(t)
+			registerLiveClient(t, f.db)
+			ctx := context.Background()
+			head, err := git.RevParse(ctx, f.dir, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse HEAD: %v", err)
+			}
+			const deadRef = "refs/heads/shutdown-sweep"
+			seedTerminalEvent(t, f.db, deadRef, 1, head, "preserved.txt", state.EventStateBlockedConflict)
+
+			sweepStarted := make(chan struct{})
+			sweepExited := make(chan struct{})
+			shutdownCh := make(chan struct{}, 1)
+			runCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			runDone := make(chan error, 1)
+			go func() {
+				runDone <- Run(runCtx, Options{
+					RepoPath:    f.dir,
+					GitDir:      f.gitDir,
+					DB:          f.db,
+					Scheduler:   fastScheduler(),
+					BootGrace:   30 * time.Second,
+					ShutdownCh:  shutdownCh,
+					SkipSignals: true,
+					beforeStartupDeadBranchPairSafetyCheck: func(sweepCtx context.Context, _ deadBranchPair) {
+						close(sweepStarted)
+						<-sweepCtx.Done()
+						close(sweepExited)
+					},
+				})
+			}()
+
+			select {
+			case <-sweepStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("startup dead-branch sweep did not reach synchronization point")
+			}
+			if shutdownMode == "signal" {
+				shutdownCh <- struct{}{}
+			} else {
+				cancel()
+			}
+
+			select {
+			case err := <-runDone:
+				if err != nil {
+					t.Fatalf("Run shutdown: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Run did not join startup dead-branch sweep")
+			}
+			select {
+			case <-sweepExited:
+			default:
+				t.Fatalf("Run returned before startup dead-branch sweep exited")
+			}
+
+			lock, err := AcquireDaemonLock(f.gitDir)
+			if err != nil {
+				t.Fatalf("reacquire daemon.lock after Run: %v", err)
+			}
+			if err := lock.Release(); err != nil {
+				t.Fatalf("release reacquired daemon.lock: %v", err)
+			}
+		})
+	}
+}
+
 // TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier asserts the P1
-// regression: after deleting terminals for a dead branch, no later
+// regression: after recovering a dead branch, no later
 // PendingEvents call must surface pending rows for the same dead pair (which
-// would let replay re-stamp a blocked_conflict and defeat the prune). This
+// would let replay re-stamp a blocked_conflict and defeat recovery). This
 // is the test against the bug cr-expert flagged.
 func TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
@@ -210,15 +471,18 @@ func TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier(t *testing.T) {
 	}
 	runStartupDeadBranchSweep(ctx, f.dir, f.db, cctx, slog.Default(), nil)
 
-	// All capture_events for the dead ref must be gone.
+	// All capture_events remain as durable recovered provenance.
 	var total int
 	if err := f.db.SQL().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, deadRef,
 	).Scan(&total); err != nil {
 		t.Fatalf("count dead-ref rows: %v", err)
 	}
-	if total != 0 {
-		t.Fatalf("dead-ref rows=%d want 0 after sweep", total)
+	if total != 3 {
+		t.Fatalf("dead-ref rows=%d want 3 retained after sweep", total)
+	}
+	if recovered := countEventsByRefState(t, f.db, deadRef, state.EventStateRecovered); recovered != 3 {
+		t.Fatalf("dead-ref recovered rows=%d want 3", recovered)
 	}
 
 	// PendingEvents must not surface anything for the dead ref — this is the
@@ -330,14 +594,14 @@ func TestDeadBranchSweep_LiveRefsErrorPreservesRows(t *testing.T) {
 	}
 }
 
-// TestDivergedHookPrunesDeadBranchTerminals drives a Diverged transition
+// TestDivergedHookRecoversDeadBranchTerminals drives a Diverged transition
 // through the run loop where the previous branch ref no longer resolves.
 // Mirrors TestRun_BranchSwitchDropsPending but adds:
 //   - a blocked_conflict row on refs/heads/old (which we delete before the
 //     transition)
 //   - assertion that after the bump, the terminal row is gone
 //   - assertion that an analogous row on a still-live ref is preserved
-func TestDivergedHookPrunesDeadBranchTerminals(t *testing.T) {
+func TestDivergedHookRecoversDeadBranchTerminals(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -457,10 +721,17 @@ func TestDivergedHookPrunesDeadBranchTerminals(t *testing.T) {
 		t.Fatalf("branch.generation did not bump after sibling reset; runtime Diverged path never fired")
 	}
 
-	// The Diverged hook above deleted pending events for generation 1 (via
-	// state.DeletePendingForGeneration). Our seeded terminal rows survive
-	// that step. Their fate hinges on whether the dead-branch prune sees a
-	// live or dead ref. refs/heads/old is DEAD, refs/heads/keep is ALIVE.
+	// Stop the run loop before invoking the compatibility helper directly.
+	// Resetting main to the sibling leaves the fixture worktree dirty, so an
+	// active daemon may capture and publish that work while reconciliation is
+	// proving a stable live token. Production recovery must fail closed when
+	// HEAD moves; this direct-helper assertion needs a quiescent repository.
+	cancel()
+	wg.Wait()
+
+	// The Diverged hook reconciles its own prior exact pair. These separate
+	// fixtures exercise the compatibility sweep: refs/heads/old is dead and
+	// refs/heads/keep remains live.
 	//
 	// The runtime hook only prunes for tokenBranchRef(oldToken), i.e. the
 	// branch the daemon was on (refs/heads/main). To exercise the dead-ref
@@ -474,21 +745,22 @@ func TestDivergedHookPrunesDeadBranchTerminals(t *testing.T) {
 		"test-direct invocation")
 
 	if n := countEventsByRefState(t, f.db, "refs/heads/old", state.EventStateBlockedConflict); n != 0 {
-		t.Fatalf("dead-ref refs/heads/old terminal rows=%d want 0 after Diverged prune", n)
+		t.Fatalf("dead-ref refs/heads/old blocked rows=%d want 0 after recovery", n)
+	}
+	if n := countEventsByRefState(t, f.db, "refs/heads/old", state.EventStateRecovered); n != 1 {
+		t.Fatalf("dead-ref refs/heads/old recovered rows=%d want 1", n)
 	}
 	if n := countEventsByRefState(t, f.db, "refs/heads/keep", state.EventStateBlockedConflict); n != 1 {
 		t.Fatalf("live-ref refs/heads/keep terminal rows=%d want 1 (must be preserved)", n)
 	}
 
-	cancel()
-	wg.Wait()
 }
 
-// TestDeadBranchSweep_WritesMetaKeysWhenRowsPruned asserts the startup sweep
-// stamps the three operator-facing meta keys when at least one row is pruned.
+// TestDeadBranchSweep_WritesMetaKeysWhenRowsRecovered asserts the startup sweep
+// stamps the three operator-facing legacy meta keys when rows are recovered.
 // This is the input `acd diagnose --json` reads to surface stale-branch
 // hygiene activity.
-func TestDeadBranchSweep_WritesMetaKeysWhenRowsPruned(t *testing.T) {
+func TestDeadBranchSweep_WritesMetaKeysWhenRowsRecovered(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
 	ctx := context.Background()
@@ -557,7 +829,7 @@ func TestDeadBranchSweep_WritesMetaKeysWhenRowsPruned(t *testing.T) {
 }
 
 // TestDeadBranchSweep_NoMetaWhenNoOp asserts the sweep does NOT stamp the meta
-// keys when no rows were pruned (only live-ref terminals exist). The previous
+// keys when no rows were recovered (only live-ref terminals exist). The previous
 // "last action that did something" snapshot must survive a no-op pass.
 func TestDeadBranchSweep_NoMetaWhenNoOp(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
@@ -597,7 +869,7 @@ func TestDeadBranchSweep_NoMetaWhenNoOp(t *testing.T) {
 
 // TestDivergedHookWritesMetaKeys drives the runtime Diverged-hook helper
 // directly with a dead previous ref and asserts the three meta keys are
-// stamped. Mirrors the integration in TestDivergedHookPrunesDeadBranchTerminals
+// stamped. Mirrors the integration in TestDivergedHookRecoversDeadBranchTerminals
 // but isolates the meta-write contract.
 func TestDivergedHookWritesMetaKeys(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")

@@ -17,9 +17,20 @@ import (
 
 func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	requireSQLite(t)
+	t.Parallel()
 
 	repo := tempRepo(t)
-	env := withIsolatedHome(t)
+	env := envWith(withIsolatedHome(t),
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_INTENT_WINDOW=10",
+		"ACD_INTENT_MIN_PENDING=2",
+		"ACD_INTENT_SETTLE_WINDOW=1h",
+		"ACD_INTENT_MAX_PENDING_AGE=1h",
+		"ACD_AI_PROVIDER=deterministic",
+		"ACD_PATH_QUIESCENCE_SECONDS=0",
+		"ACD_REWIND_GRACE_SECONDS=0",
+		"ACD_FSNOTIFY_ENABLED=0",
+	)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -38,18 +49,23 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 		t.Fatalf("initial HEAD=%s want baseline %s", initialHead, baselineHead)
 	}
 
-	pauseReplay(t, ctx, env, repo, "parallel committer test")
 	writeFile(t, target, "same change\n")
-	// Under the new contract, manual pause halts BOTH capture and replay.
-	// The worktree edit will not be captured until after resume; only then
-	// does the daemon diff worktree against shadow_paths and queue events.
+	wakeSession(t, ctx, env, repo, "selfheal-parallel")
+	// Intent mode's count gate holds one capture pending without pausing
+	// capture. This gives the external committer a real unpublished chain to
+	// satisfy; a manual pause would suppress capture and invalidate the test.
+	waitForEventState(t, dbPath, "parallel.txt", "pending", 8*time.Second)
+	pendingSeq := sqliteScalar(t, dbPath,
+		"SELECT seq FROM capture_events WHERE path = 'parallel.txt' AND state = 'pending' ORDER BY seq DESC LIMIT 1")
+	if pendingSeq == "" {
+		t.Fatal("parallel capture did not remain pending before external commit")
+	}
 
 	externalHead := gitCommitAll(t, repo, "external parallel commit", "parallel.txt")
 	if externalHead == initialHead {
 		t.Fatal("external commit did not advance HEAD")
 	}
 
-	resumeReplay(t, ctx, env, repo)
 	wakeSession(t, ctx, env, repo, "selfheal-parallel")
 	waitForEventState(t, dbPath, "parallel.txt", "published", 8*time.Second)
 
@@ -58,6 +74,7 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	if publishedOID != externalHead {
 		t.Fatalf("published commit_oid=%q want external HEAD %q", publishedOID, externalHead)
 	}
+	assertPublishedRecoverySnapshot(t, repo, dbPath, pendingSeq, externalHead, "runtime_branch_transition")
 	assertNoSelfHealTerminalRows(t, dbPath)
 
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))

@@ -5,10 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,35 +19,33 @@ import (
 )
 
 func TestFix_DefaultsToDryRunWhenNoFlagsPassed(t *testing.T) {
-	// Without --yes (and without --force) `acd fix` must be a pure dry-run.
-	// The old "refuse without --yes" guard has been replaced by silent
-	// dry-run default per SPEC LOCK so casual operators see the plan first.
 	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
 	before, err := fileSHA256(stateDB)
 	if err != nil {
 		t.Fatalf("checksum before: %v", err)
 	}
+
 	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, false /*dryRun*/, false /*yes*/, false /*force*/, false /*clearPause*/, true /*jsonOut*/); err != nil {
-		t.Fatalf("runFix without --yes must dry-run silently, got err=%v\n%s", err, out.String())
+	if err := runFix(context.Background(), &out, repo, false, false, false, false, true); err != nil {
+		t.Fatalf("runFix: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
 	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
-	if !plan.DryRun {
-		t.Fatalf("plan.DryRun=false in no-flag default: %+v", plan)
+	if !plan.DryRun || plan.BackupPath != "" {
+		t.Fatalf("default fix was not a pure dry-run: %+v", plan)
 	}
 	after, err := fileSHA256(stateDB)
 	if err != nil {
 		t.Fatalf("checksum after: %v", err)
 	}
 	if before != after {
-		t.Fatalf("no-flag default mutated state.db: before=%s after=%s", before, after)
+		t.Fatalf("dry-run mutated state.db: before=%s after=%s", before, after)
 	}
 }
 
-func TestFix_DryRunPlansSafeActionsWithoutMutation(t *testing.T) {
+func TestFix_DryRunPlansExactPairWithoutMutation(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	seedPurgeFixtureRows(t, db)
 	before, err := fileSHA256(stateDB)
@@ -56,22 +53,13 @@ func TestFix_DryRunPlansSafeActionsWithoutMutation(t *testing.T) {
 		t.Fatalf("checksum before: %v", err)
 	}
 
-	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
-		t.Fatalf("runFix dry-run: %v\n%s", err, out.String())
+	plan := runFixJSON(t, repo, true, false, false, false)
+	action := findFixAction(plan, fixActionReconcileUnpublishedChain)
+	if action == nil {
+		t.Fatalf("plan lacks exact-pair reconciliation: %+v", plan.Actions)
 	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal fix plan: %v\n%s", err, out.String())
-	}
-	if !plan.DryRun {
-		t.Fatalf("plan.DryRun=false: %+v", plan)
-	}
-	if plan.BackupPath != "" {
-		t.Fatalf("dry-run wrote backup %q", plan.BackupPath)
-	}
-	if !hasFixAction(plan, fixActionDeleteObsoleteBarrier) {
-		t.Fatalf("fix plan lacks obsolete barrier cleanup: %+v", plan.Actions)
+	if action.BranchRef != "refs/heads/main" || action.BranchGeneration != 1 || action.Seq < 1 {
+		t.Fatalf("action lost exact provenance: %+v", *action)
 	}
 	after, err := fileSHA256(stateDB)
 	if err != nil {
@@ -89,16 +77,9 @@ func TestFix_DryRunToleratesPreV5DB(t *testing.T) {
 		t.Fatalf("drop decision_records: %v", err)
 	}
 
-	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
-		t.Fatalf("runFix dry-run should tolerate missing decision_records: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal fix plan: %v\n%s", err, out.String())
-	}
-	if !hasFixAction(plan, fixActionDeleteObsoleteBarrier) {
-		t.Fatalf("pre-v5 fix plan lacks obsolete barrier cleanup: %+v", plan.Actions)
+	plan := runFixJSON(t, repo, true, false, false, false)
+	if findFixAction(plan, fixActionReconcileUnpublishedChain) == nil {
+		t.Fatalf("pre-v5 plan lacks exact-pair reconciliation: %+v", plan.Actions)
 	}
 }
 
@@ -111,401 +92,948 @@ func TestFix_ApplyClearsExpiredPauseAndDrainedBackpressure(t *testing.T) {
 	markerPath := filepath.Join(repo, ".git", "acd", "paused")
 	expiredAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
-		Reason:    "old maintenance",
-		SetAt:     time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
-		SetBy:     "test",
-		ExpiresAt: &expiredAt,
+		Reason: "old maintenance", SetAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		SetBy: "test", ExpiresAt: &expiredAt,
 	}, true); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
-		t.Fatalf("runFix apply: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal fix result: %v\n%s", err, out.String())
-	}
-	if plan.BackupPath == "" {
-		t.Fatalf("apply did not create backup: %+v", plan)
-	}
-	if !plan.ManualPauseRemoved {
-		t.Fatalf("manual pause not marked removed: %+v", plan)
+	plan := runFixJSON(t, repo, false, true, false, false)
+	if plan.BackupPath == "" || !plan.ManualPauseRemoved {
+		t.Fatalf("safe housekeeping did not apply: %+v", plan)
 	}
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
 		t.Fatalf("manual pause marker still exists: %v", err)
 	}
-	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil {
-		t.Fatalf("MetaGet backpressure: %v", err)
-	} else if ok {
-		t.Fatalf("backpressure meta still present")
-	}
-	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_overridden_at"); err != nil {
-		t.Fatalf("MetaGet override: %v", err)
-	} else if !ok {
-		t.Fatalf("backpressure override stamp missing")
-	}
-	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyManualPauseResumedAt); err != nil {
-		t.Fatalf("MetaGet manual resume: %v", err)
-	} else if !ok {
-		t.Fatalf("manual pause resume stamp missing")
+	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil || ok {
+		t.Fatalf("backpressure meta remains: ok=%v err=%v", ok, err)
 	}
 }
 
-func TestFix_ApplyDeletesObsoleteBarrierAndLeavesPending(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	seedPurgeFixtureRows(t, db)
+func TestFix_ClearPauseRemovesActiveMarkerOnlyWhenRequested(t *testing.T) {
+	repo, _, _ := makeRegisteredGitRepoStateDB(t)
+	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason: "maintenance", SetAt: time.Now().UTC().Format(time.RFC3339), SetBy: "test",
+	}, true); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	plan := runFixJSON(t, repo, false, true, false, true)
+	if !plan.ManualPauseRemoved {
+		t.Fatalf("--clear-pause did not remove marker: %+v", plan)
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("manual pause marker still exists: %v", err)
+	}
+}
+
+func TestFix_CommitFailureDoesNotReportTransactionalActionApplied(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt,
+		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed backpressure: %v", err)
+	}
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	injected := errors.New("injected transaction commit failure")
+	plan.commitTransaction = func(*sql.Tx) error { return injected }
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if !errors.Is(err, injected) {
+		t.Fatalf("applyFixPlan err=%v want injected commit failure", err)
+	}
+	markFixIncomplete(&plan, err)
+	action := findFixAction(plan, fixActionClearDrainedBackpressure)
+	if action == nil || action.Applied || action.RowsChanged != 0 || plan.RowsChanged != 0 {
+		t.Fatalf("rolled-back action reported applied: action=%+v plan=%+v", action, plan)
+	}
+	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil || !ok {
+		t.Fatalf("rollback lost backpressure marker: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_overridden_at"); err != nil || ok {
+		t.Fatalf("rollback retained override marker: ok=%v err=%v", ok, err)
+	}
 
 	var out bytes.Buffer
-	if err := runFix(context.Background(), &out, repo, false, true, false, false, true); err != nil {
-		t.Fatalf("runFix apply: %v\n%s", err, out.String())
+	if err := renderFix(&out, plan, true); err != nil {
+		t.Fatalf("render commit failure: %v", err)
 	}
-	got := countCaptureRowsByState(t, db)
-	if got[state.EventStateBlockedConflict] != 0 {
-		t.Fatalf("blocked rows remain: %v", got)
+	var rendered fixPlan
+	if err := json.Unmarshal(out.Bytes(), &rendered); err != nil {
+		t.Fatalf("unmarshal commit failure result: %v\n%s", err, out.String())
 	}
-	if got[state.EventStateFailed] != 0 {
-		t.Fatalf("failed rows remain: %v", got)
-	}
-	if got[state.EventStatePending] != 2 {
-		t.Fatalf("pending rows changed unexpectedly: %v", got)
-	}
-	var status string
-	if err := db.SQL().QueryRowContext(context.Background(),
-		`SELECT status FROM publish_state WHERE id = 1`).Scan(&status); err != nil {
-		t.Fatalf("read publish_state: %v", err)
-	}
-	if status == state.EventStateBlockedConflict {
-		t.Fatalf("publish_state.status still blocked_conflict")
+	renderedAction := findFixAction(rendered, fixActionClearDrainedBackpressure)
+	if !rendered.Incomplete || renderedAction == nil || renderedAction.Applied ||
+		renderedAction.RowsChanged != 0 || rendered.RowsChanged != 0 {
+		t.Fatalf("rendered rollback claimed applied rows: action=%+v plan=%+v", renderedAction, rendered)
 	}
 }
 
-func TestFix_ApplyRefusesWhenPlanHasUnsafeReasons(t *testing.T) {
+func TestFix_PreservesAtomicallyReplacedPauseMarker(t *testing.T) {
+	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	original := pausepkg.Marker{
+		Reason: "planned maintenance",
+		SetAt:  time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		SetBy:  "test",
+	}
+	if _, err := pausepkg.Write(markerPath, original, false); err != nil {
+		t.Fatalf("write original marker: %v", err)
+	}
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, true)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	plannedInfo := plan.plannedPauseInfo
+	var replaceErr error
+	plan.beforePauseRemove = func() {
+		_, replaceErr = pausepkg.Write(markerPath, original, true)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if replaceErr != nil {
+		t.Fatalf("replace pause marker: %v", replaceErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "changed since planning") {
+		t.Fatalf("applyFixPlan err=%v want changed-marker refusal", err)
+	}
+	current, ok, readErr := pausepkg.Read(filepath.Join(repo, ".git"))
+	if readErr != nil || !ok || !samePauseMarker(original, current) {
+		t.Fatalf("replacement marker not preserved: marker=%+v ok=%v err=%v", current, ok, readErr)
+	}
+	currentInfo, statErr := os.Lstat(markerPath)
+	if statErr != nil {
+		t.Fatalf("stat replacement marker: %v", statErr)
+	}
+	if os.SameFile(plannedInfo, currentInfo) {
+		t.Fatal("fixture did not atomically replace the planned marker inode")
+	}
+	action := findFixAction(plan, fixActionClearExpiredManualPause)
+	if plan.ManualPauseRemoved || action == nil || action.Applied {
+		t.Fatalf("replacement marker reported removed: action=%+v plan=%+v", action, plan)
+	}
+}
+
+func TestFix_PreservesPauseCreatedAfterQuarantineRename(t *testing.T) {
+	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	markerPath := filepath.Join(repo, ".git", "acd", "paused")
+	original := pausepkg.Marker{
+		Reason: "planned maintenance",
+		SetAt:  time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		SetBy:  "test",
+	}
+	if _, err := pausepkg.Write(markerPath, original, false); err != nil {
+		t.Fatalf("write original marker: %v", err)
+	}
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, true)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	replacement := pausepkg.Marker{
+		Reason: "new operator pause",
+		SetAt:  time.Now().UTC().Format(time.RFC3339),
+		SetBy:  "replacement-test",
+	}
+	var quarantinePath string
+	var replaceErr error
+	plan.afterPauseQuarantine = func(path string) {
+		quarantinePath = path
+		_, replaceErr = pausepkg.Write(markerPath, replacement, false)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if replaceErr != nil {
+		t.Fatalf("create replacement pause marker: %v", replaceErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "new marker was created and preserved") {
+		t.Fatalf("applyFixPlan err=%v want new-marker preservation signal", err)
+	}
+	current, ok, readErr := pausepkg.Read(filepath.Join(repo, ".git"))
+	if readErr != nil || !ok || !samePauseMarker(replacement, current) {
+		t.Fatalf("new marker did not survive quarantine removal: marker=%+v ok=%v err=%v", current, ok, readErr)
+	}
+	if quarantinePath == "" {
+		t.Fatal("quarantine hook did not run")
+	}
+	if _, statErr := os.Stat(quarantinePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("matched planned marker remained quarantined: %v", statErr)
+	}
+	action := findFixAction(plan, fixActionClearExpiredManualPause)
+	if plan.ManualPauseRemoved || action == nil || action.Applied {
+		t.Fatalf("new pause marker reported removed: action=%+v plan=%+v", action, plan)
+	}
+}
+
+func TestFix_ApplyPublishesWholePairAgainstHEAD(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	parent, head, beforeOID, afterOID := commitExternalSeedChange(t, ctx, repo)
+	seq := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: parent,
+		Operation: "modify", Path: "seed.txt", Fidelity: "exact",
+		State: state.EventStateBlockedConflict,
+		Error: sql.NullString{String: "modify before-state mismatch", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "modify", Path: "seed.txt", Fidelity: "exact",
+		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: afterOID, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+
+	plan := runFixJSON(t, repo, false, true, false, false)
+	action := findFixAction(plan, fixActionReconcileUnpublishedChain)
+	if action == nil || !action.Applied || action.State != state.EventStatePublished || action.RecoveryRef == "" {
+		t.Fatalf("published reconciliation missing proof: %+v actions=%+v", action, plan.Actions)
+	}
+	var gotState, gotCommit, branchRef string
+	var generation int64
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid, branch_ref, branch_generation FROM capture_events WHERE seq = ?`, seq,
+	).Scan(&gotState, &gotCommit, &branchRef, &generation); err != nil {
+		t.Fatalf("query event: %v", err)
+	}
+	if gotState != state.EventStatePublished || gotCommit != head || branchRef != "refs/heads/main" || generation != 1 {
+		t.Fatalf("event=%s commit=%s pair=%s/g%d want published %s original pair", gotState, gotCommit, branchRef, generation, head)
+	}
+}
+
+func TestFix_ForceArchivesWholePairWithoutPeelingBarrier(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+
+	plan := runFixJSON(t, repo, false, true, true, false)
+	action := findFixAction(plan, fixActionReconcileUnpublishedChain)
+	if action == nil || !action.ArchiveOnly || action.State != state.EventStateRecovered || action.RowsChanged != 2 || action.RecoveryRef == "" {
+		t.Fatalf("archive-only whole-pair action=%+v plan=%+v", action, plan)
+	}
+	var firstState, secondState, firstCommit, secondCommit string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state, commit_oid FROM capture_events WHERE seq = ?`, first).Scan(&firstState, &firstCommit); err != nil {
+		t.Fatalf("query first: %v", err)
+	}
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state, commit_oid FROM capture_events WHERE seq = ?`, second).Scan(&secondState, &secondCommit); err != nil {
+		t.Fatalf("query second: %v", err)
+	}
+	if firstState != state.EventStateRecovered || secondState != state.EventStateRecovered || firstCommit != secondCommit {
+		t.Fatalf("chain peeled or split: first=%s/%s second=%s/%s", firstState, firstCommit, secondState, secondCommit)
+	}
+	if got := countRowsWhere(t, db, "capture_events", "seq IN (?, ?)", first, second); got != 2 {
+		t.Fatalf("reconciliation deleted capture rows: %d", got)
+	}
+	if plan.BackupPath == "" {
+		t.Fatal("archive-only recovery did not back up state.db")
+	}
+}
+
+func TestFix_BackupIncludesWALOnlyCommittedRows(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if _, err := db.SQL().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint baseline: %v", err)
+	}
+	reader, err := db.ReadSQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin snapshot reader: %v", err)
+	}
+	defer reader.Rollback()
+	var baseline int
+	if err := reader.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&baseline); err != nil {
+		t.Fatalf("establish snapshot reader: %v", err)
+	}
+
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	walInfo, err := os.Stat(stateDB + "-wal")
+	if err != nil || walInfo.Size() == 0 {
+		t.Fatalf("fixture did not retain committed WAL frames: info=%v err=%v", walInfo, err)
+	}
+
+	// A raw main-file copy must not contain the pair, proving the committed rows
+	// are visible only through the live WAL snapshot at backup time.
+	rawMain := filepath.Join(t.TempDir(), "raw-main.db")
+	rawBytes, err := os.ReadFile(stateDB)
+	if err != nil {
+		t.Fatalf("read raw main DB: %v", err)
+	}
+	if err := os.WriteFile(rawMain, rawBytes, 0o600); err != nil {
+		t.Fatalf("write raw main DB copy: %v", err)
+	}
+	rawConn, err := sql.Open("sqlite", "file:"+rawMain+"?immutable=1")
+	if err != nil {
+		t.Fatalf("open raw main DB: %v", err)
+	}
+	defer rawConn.Close()
+	var rawRows int
+	if err := rawConn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq IN (?, ?)`, first, second,
+	).Scan(&rawRows); err != nil {
+		t.Fatalf("query raw main DB: %v", err)
+	}
+	if rawRows != 0 {
+		t.Fatalf("fixture rows unexpectedly checkpointed into main DB: %d", rawRows)
+	}
+
+	plan := runFixJSON(t, repo, false, true, true, false)
+	if plan.BackupPath == "" {
+		t.Fatal("fix did not report a backup path")
+	}
+	backup, err := openStateDBReadOnly(ctx, plan.BackupPath)
+	if err != nil {
+		t.Fatalf("open WAL-safe backup: %v", err)
+	}
+	defer backup.Close()
+	var backedUpRows int
+	if err := backup.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq IN (?, ?)`, first, second,
+	).Scan(&backedUpRows); err != nil {
+		t.Fatalf("query WAL-safe backup: %v", err)
+	}
+	if backedUpRows != 2 {
+		t.Fatalf("WAL-safe backup rows=%d want 2", backedUpRows)
+	}
+	var integrity string
+	if err := backup.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&integrity); err != nil {
+		t.Fatalf("quick_check backup: %v", err)
+	}
+	if integrity != "ok" {
+		t.Fatalf("backup quick_check=%q want ok", integrity)
+	}
+}
+
+func TestFix_BackupPrecedesSchemaMigration(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt,
+		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed backpressure: %v", err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+DROP TABLE recovery_snapshot_events;
+DROP TABLE recovery_snapshots;
+PRAGMA user_version = 11;`); err != nil {
+		t.Fatalf("downgrade recovery schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close downgraded DB: %v", err)
+	}
+
+	plan := runFixJSON(t, repo, false, true, false, false)
+	if plan.BackupPath == "" {
+		t.Fatal("fix did not report a backup path")
+	}
+	backup, err := openStateDBReadOnly(ctx, plan.BackupPath)
+	if err != nil {
+		t.Fatalf("open pre-migration backup: %v", err)
+	}
+	defer backup.Close()
+	var backupVersion, backupRecoveryTables int
+	if err := backup.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&backupVersion); err != nil {
+		t.Fatalf("read backup user_version: %v", err)
+	}
+	if err := backup.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master
+WHERE type = 'table' AND name IN ('recovery_snapshots', 'recovery_snapshot_events')`).Scan(&backupRecoveryTables); err != nil {
+		t.Fatalf("count backup recovery tables: %v", err)
+	}
+	if backupVersion != 11 || backupRecoveryTables != 0 {
+		t.Fatalf("backup captured post-migration schema: version=%d tables=%d", backupVersion, backupRecoveryTables)
+	}
+
+	live, err := openStateDBReadOnly(ctx, stateDB)
+	if err != nil {
+		t.Fatalf("open migrated live DB: %v", err)
+	}
+	defer live.Close()
+	var liveVersion, liveRecoveryTables int
+	if err := live.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&liveVersion); err != nil {
+		t.Fatalf("read live user_version: %v", err)
+	}
+	if err := live.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master
+WHERE type = 'table' AND name IN ('recovery_snapshots', 'recovery_snapshot_events')`).Scan(&liveRecoveryTables); err != nil {
+		t.Fatalf("count live recovery tables: %v", err)
+	}
+	if liveVersion != state.SchemaVersion || liveRecoveryTables != 2 {
+		t.Fatalf("live schema not migrated: version=%d tables=%d", liveVersion, liveRecoveryTables)
+	}
+}
+
+func TestFix_ReconcileIsIdempotent(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+
+	firstPlan := runFixJSON(t, repo, false, true, false, false)
+	firstAction := findFixAction(firstPlan, fixActionReconcileUnpublishedChain)
+	if firstAction == nil || !firstAction.Applied || firstAction.RecoveryRef == "" {
+		t.Fatalf("first reconciliation=%+v", firstAction)
+	}
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 1 {
+		t.Fatalf("snapshots after first run=%d want 1", got)
+	}
+
+	secondPlan := runFixJSON(t, repo, false, true, false, false)
+	if action := findFixAction(secondPlan, fixActionReconcileUnpublishedChain); action != nil {
+		t.Fatalf("idempotent rerun planned reconciliation: %+v", *action)
+	}
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 1 {
+		t.Fatalf("idempotent rerun created snapshot: %d", got)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
+}
+
+func TestFix_HeadChangeBetweenPlanAndApplyFailsClosed(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "advance-head.txt"), []byte("advance\n"), 0o644); err != nil {
+		t.Fatalf("write advance file: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "advance-head.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid",
+		"commit", "-m", "advance head"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if err == nil || !strings.Contains(err.Error(), "HEAD changed during planning") {
+		t.Fatalf("applyFixPlan err=%v want HEAD race refusal", err)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("HEAD race wrote recovery snapshot: %d", got)
+	}
+}
+
+func TestFix_GitOperationAppearsBetweenPlanAndApplyFailsClosed(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".git", "MERGE_HEAD"), []byte(strings.Repeat("0", 40)+"\n"), 0o600); err != nil {
+		t.Fatalf("write MERGE_HEAD: %v", err)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if err == nil || !strings.Contains(err.Error(), "Git operation merge") {
+		t.Fatalf("applyFixPlan err=%v want merge-operation refusal", err)
+	}
+	if plan.BackupPath != "" {
+		t.Fatalf("pre-backup Git-operation refusal created backup: %s", plan.BackupPath)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("Git-operation race wrote recovery snapshot: %d", got)
+	}
+}
+
+func TestFix_GitOperationAppearsAfterBackupFailsClosed(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	var markerErr error
+	plan.afterBackup = func() {
+		markerErr = os.Mkdir(filepath.Join(repo, ".git", "rebase-merge"), 0o700)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if markerErr != nil {
+		t.Fatalf("create rebase-merge marker: %v", markerErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "Git operation rebase-merge") {
+		t.Fatalf("applyFixPlan err=%v want post-backup rebase refusal", err)
+	}
+	if plan.BackupPath == "" {
+		t.Fatal("post-backup Git-operation fixture did not reach backup boundary")
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("post-backup Git-operation race wrote recovery snapshot: %d", got)
+	}
+}
+
+func TestFix_PauseAppearsBetweenPlanAndApplyFailsClosed(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason: "new maintenance", SetAt: time.Now().UTC().Format(time.RFC3339), SetBy: "test",
+	}, false); err != nil {
+		t.Fatalf("write new pause marker: %v", err)
+	}
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if err == nil || !strings.Contains(err.Error(), "pause marker appeared since planning") {
+		t.Fatalf("applyFixPlan err=%v want new-pause refusal", err)
+	}
+	if plan.BackupPath != "" {
+		t.Fatalf("pre-backup pause refusal created backup: %s", plan.BackupPath)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+}
+
+func TestFix_StableManualPauseAllowsRecovery(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
+	marker := pausepkg.Marker{
+		Reason: "stable maintenance", SetAt: time.Now().UTC().Format(time.RFC3339), SetBy: "test",
+	}
+	if _, err := pausepkg.Write(markerPath, marker, false); err != nil {
+		t.Fatalf("write stable pause marker: %v", err)
+	}
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+
+	if err := applyFixPlan(ctx, stateDB, &plan); err != nil {
+		t.Fatalf("applyFixPlan with stable pause: %v", err)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
+	current, ok, err := pausepkg.Read(filepath.Join(repo, ".git"))
+	if err != nil || !ok || !samePauseMarker(marker, current) {
+		t.Fatalf("stable pause was not preserved: marker=%+v ok=%v err=%v", current, ok, err)
+	}
+}
+
+func TestFix_PlannedPauseDisappearsAfterBackupFailsClosed(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
+	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
+		Reason: "planned maintenance", SetAt: time.Now().UTC().Format(time.RFC3339), SetBy: "test",
+	}, false); err != nil {
+		t.Fatalf("write planned pause marker: %v", err)
+	}
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	var removeErr error
+	plan.afterBackup = func() { removeErr = os.Remove(markerPath) }
+
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if removeErr != nil {
+		t.Fatalf("remove planned pause marker: %v", removeErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "pause marker disappeared since planning") {
+		t.Fatalf("applyFixPlan err=%v want disappeared-pause refusal", err)
+	}
+	if plan.BackupPath == "" {
+		t.Fatal("disappeared-pause fixture did not reach backup boundary")
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("pause-state race wrote recovery snapshot: %d", got)
+	}
+}
+
+func TestFix_FirstPairFailureDoesNotMutateOtherPair(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
 	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "unsafe.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "before-state mismatch", Valid: true},
-	}, nil)
-	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
-	}
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
-		Kind:             state.DecisionKindHandledExternal,
-		Path:             sql.NullString{String: "unsafe.txt", Valid: true},
-		Reason:           sql.NullString{String: "already_published_by_external_committer", Valid: true},
-		EventSeq:         sql.NullInt64{Int64: seq, Valid: true},
-		CommitOID:        sql.NullString{String: "1111111111111111111111111111111111111111", Valid: true},
-		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
-	}); err != nil {
-		t.Fatalf("AppendDecision: %v", err)
-	}
+	bad := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/a-bad", BranchGeneration: 2, BaseHead: head,
+		Operation: "create", Path: "bad.txt", Fidelity: "exact",
+		State: state.EventStateFailed, Error: sql.NullString{String: "missing object", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "bad.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("f", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	goodFirst, goodSecond := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/z-good", 3)
 
 	var out bytes.Buffer
 	err = runFix(ctx, &out, repo, false, true, false, false, true)
-	if err == nil {
-		t.Fatalf("runFix apply succeeded despite unsafe plan:\n%s", out.String())
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("runFix err=%v want first-pair failure\n%s", err, out.String())
 	}
-	if !strings.Contains(err.Error(), "unsafe conditions") {
-		t.Fatalf("error=%v want unsafe refusal", err)
-	}
-	var stateName string
-	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&stateName); err != nil {
-		t.Fatalf("query event: %v", err)
-	}
-	if stateName != state.EventStateBlockedConflict {
-		t.Fatalf("event state=%q want blocked_conflict", stateName)
+	assertFixEventState(t, ctx, db, bad, state.EventStateFailed)
+	assertFixEventState(t, ctx, db, goodFirst, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, goodSecond, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("cross-pair failure wrote snapshots: %d", got)
 	}
 }
 
-func TestFix_ApplyMarksDecisionLedExternalRowPublished(t *testing.T) {
+func TestFix_SecondPairFailureReportsIncompleteApply(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	if err := os.WriteFile(filepath.Join(repo, "external.txt"), []byte("landed outside acd\n"), 0o644); err != nil {
-		t.Fatalf("write external: %v", err)
+	goodFirst, goodSecond := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/a-good", 2)
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
 	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "external.txt"); err != nil {
-		t.Fatalf("git add external: %v", err)
+	bad := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/z-bad", BranchGeneration: 3, BaseHead: head,
+		Operation: "create", Path: "missing.txt", Fidelity: "exact",
+		State: state.EventStateFailed, Error: sql.NullString{String: "missing object", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "missing.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("f", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+
+	var out bytes.Buffer
+	err = runFix(ctx, &out, repo, false, true, false, false, true)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("runFix err=%v want second-pair failure\n%s", err, out.String())
 	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid", "commit", "-m", "external"); err != nil {
-		t.Fatalf("git commit external: %v", err)
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal incomplete plan: %v\n%s", err, out.String())
+	}
+	if !plan.Incomplete || plan.RowsChanged != 2 || len(plan.VerifyErrors) == 0 ||
+		!strings.Contains(strings.Join(plan.VerifyErrors, " "), "missing") {
+		t.Fatalf("partial failure not reported as incomplete: %+v", plan)
+	}
+	var goodAction, badAction *fixAction
+	for i := range plan.Actions {
+		switch plan.Actions[i].BranchRef {
+		case "refs/heads/a-good":
+			goodAction = &plan.Actions[i]
+		case "refs/heads/z-bad":
+			badAction = &plan.Actions[i]
+		}
+	}
+	if goodAction == nil || !goodAction.Applied || goodAction.RowsChanged != 2 || goodAction.RecoveryRef == "" {
+		t.Fatalf("first pair success not retained in result: %+v", goodAction)
+	}
+	if badAction == nil || badAction.Applied {
+		t.Fatalf("failed second pair reported applied: %+v", badAction)
+	}
+	assertFixEventState(t, ctx, db, goodFirst, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, goodSecond, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, bad, state.EventStateFailed)
+
+	var human bytes.Buffer
+	if err := renderFix(&human, plan, false); err != nil {
+		t.Fatalf("render incomplete human result: %v", err)
+	}
+	if !strings.Contains(human.String(), "Fix incomplete") || !strings.Contains(human.String(), "missing") {
+		t.Fatalf("human output hid partial failure:\n%s", human.String())
+	}
+}
+
+func TestFix_ReconciliationLeavesLiveGitStateUntouched(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	if err := os.WriteFile(filepath.Join(repo, "staged-user.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "staged-user.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	headBefore, _ := git.RevParse(ctx, repo, "HEAD")
+	indexBefore, err := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--binary")
+	if err != nil {
+		t.Fatalf("index before: %v", err)
+	}
+	statusBefore, err := git.Run(ctx, git.RunOpts{Dir: repo}, "status", "--porcelain=v1")
+	if err != nil {
+		t.Fatalf("status before: %v", err)
+	}
+	worktreeBefore, err := os.ReadFile(filepath.Join(repo, "staged-user.txt"))
+	if err != nil {
+		t.Fatalf("read worktree before: %v", err)
+	}
+
+	runFixJSON(t, repo, false, true, false, false)
+	headAfter, _ := git.RevParse(ctx, repo, "HEAD")
+	indexAfter, _ := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--binary")
+	statusAfter, _ := git.Run(ctx, git.RunOpts{Dir: repo}, "status", "--porcelain=v1")
+	worktreeAfter, _ := os.ReadFile(filepath.Join(repo, "staged-user.txt"))
+	if headAfter != headBefore || string(indexAfter) != string(indexBefore) ||
+		string(statusAfter) != string(statusBefore) || string(worktreeAfter) != string(worktreeBefore) {
+		t.Fatalf("fix mutated live Git state: HEAD %s->%s index_equal=%v status %q->%q worktree_equal=%v",
+			headBefore, headAfter, string(indexAfter) == string(indexBefore), statusBefore, statusAfter,
+			string(worktreeAfter) == string(worktreeBefore))
+	}
+}
+
+func TestFix_RecoveredGeneratedDeleteKeepsCaptureOps(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	generatedPath := ".derivedData-overlap/cache.db"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, generatedPath)), 0o755); err != nil {
+		t.Fatalf("mkdir generated root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, generatedPath), []byte("generated before\n"), 0o644); err != nil {
+		t.Fatalf("write generated file: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "-f", generatedPath); err != nil {
+		t.Fatalf("git add generated file: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid",
+		"commit", "-m", "seed generated file"); err != nil {
+		t.Fatalf("git commit generated file: %v", err)
 	}
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
 	}
-	afterOID, err := git.LsTreeBlobOID(ctx, repo, head, "external.txt")
+	createdOID, err := git.HashObjectStdin(ctx, repo, []byte("captured trigger\n"))
 	if err != nil {
-		t.Fatalf("ls-tree external: %v", err)
+		t.Fatalf("hash trigger: %v", err)
 	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "create",
-		Path:             "external.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "before-state mismatch", Valid: true},
+	first := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "trigger.txt", Fidelity: "exact",
+		State: state.EventStateBlockedConflict,
+		Error: sql.NullString{String: "before-state mismatch", Valid: true},
 	}, []state.CaptureOp{{
-		Op:        "create",
-		Path:      "external.txt",
-		AfterOID:  sql.NullString{String: afterOID, Valid: true},
-		AfterMode: sql.NullString{String: "100644", Valid: true},
-		Fidelity:  "exact",
+		Op: "create", Path: "trigger.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: createdOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
 	}})
+	generatedOID, err := git.LsTreeBlobOID(ctx, repo, head, generatedPath)
 	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
+		t.Fatalf("ls-tree generated file: %v", err)
 	}
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
-		Kind:             state.DecisionKindHandledExternal,
-		Path:             sql.NullString{String: "external.txt", Valid: true},
-		Reason:           sql.NullString{String: "already_published_by_external_committer", Valid: true},
-		EventSeq:         sql.NullInt64{Int64: seq, Valid: true},
-		CommitOID:        sql.NullString{String: head, Valid: true},
-		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+	generated := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "delete", Path: generatedPath, Fidelity: "exact",
+		State: state.EventStatePending,
+	}, []state.CaptureOp{{
+		Op: "delete", Path: generatedPath, Fidelity: "exact",
+		BeforeOID:  sql.NullString{String: generatedOID, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	if err := state.RecordPlannerOffer(ctx, db, generated, 123); err != nil {
+		t.Fatalf("RecordPlannerOffer: %v", err)
+	}
+
+	plan := runFixJSON(t, repo, false, true, false, false)
+	generatedAction := findFixAction(plan, fixActionDropGeneratedPending)
+	if generatedAction == nil || !generatedAction.Applied || generatedAction.RowsChanged != 0 {
+		t.Fatalf("generated cleanup should skip recovered row: %+v", generatedAction)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, generated, state.EventStateRecovered)
+	if got := countRowsWhere(t, db, "capture_ops", "event_seq = ?", generated); got != 1 {
+		t.Fatalf("generated recovery lost capture ops: %d", got)
+	}
+}
+
+func TestFix_ReconcilePreservesUnrelatedPublishBreadcrumb(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	unrelated := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/other", BranchGeneration: 9, BaseHead: head,
+		Operation: "create", Path: "other.txt", Fidelity: "exact", State: state.EventStatePublished,
+		CommitOID: sql.NullString{String: head, Valid: true},
+	}, []state.CaptureOp{{Op: "create", Path: "other.txt", Fidelity: "exact"}})
+	if err := state.SavePublishState(ctx, db, state.Publish{
+		EventSeq:         sql.NullInt64{Int64: unrelated, Valid: true},
+		BranchRef:        sql.NullString{String: "refs/heads/other", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 9, Valid: true},
+		SourceHead:       sql.NullString{String: head, Valid: true},
+		Status:           "blocked_conflict", Error: sql.NullString{String: "unrelated", Valid: true},
 	}); err != nil {
-		t.Fatalf("AppendDecision: %v", err)
+		t.Fatalf("SavePublishState: %v", err)
 	}
+
+	runFixJSON(t, repo, false, true, false, false)
+	publish, ok, err := state.LoadPublishState(ctx, db)
+	if err != nil || !ok {
+		t.Fatalf("LoadPublishState: ok=%v err=%v", ok, err)
+	}
+	if !publish.EventSeq.Valid || publish.EventSeq.Int64 != unrelated || publish.Status != "blocked_conflict" ||
+		!publish.BranchRef.Valid || publish.BranchRef.String != "refs/heads/other" {
+		t.Fatalf("unrelated publish breadcrumb changed: %+v", publish)
+	}
+}
+
+func TestFix_StalePairPreservesOriginalProvenance(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, _ := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/stale", 7)
+
+	plan := runFixJSON(t, repo, false, true, false, false)
+	action := findFixAction(plan, fixActionReconcileUnpublishedChain)
+	if action == nil || action.BranchRef != "refs/heads/stale" || action.BranchGeneration != 7 {
+		t.Fatalf("stale pair not planned exactly: %+v", plan.Actions)
+	}
+	var branchRef, eventState string
+	var generation int64
+	if err := db.SQL().QueryRowContext(ctx,
+		`SELECT branch_ref, branch_generation, state FROM capture_events WHERE seq = ?`, first,
+	).Scan(&branchRef, &generation, &eventState); err != nil {
+		t.Fatalf("query stale event: %v", err)
+	}
+	if branchRef != "refs/heads/stale" || generation != 7 || eventState != state.EventStateRecovered {
+		t.Fatalf("stale provenance rewritten: %s/g%d state=%s", branchRef, generation, eventState)
+	}
+}
+
+func TestFix_MissingObjectLeavesWholePairUnchanged(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	first := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "missing.txt", Fidelity: "exact",
+		State: state.EventStateFailed, Error: sql.NullString{String: "missing object", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "missing.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("f", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	second := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "successor.txt", Fidelity: "exact", State: state.EventStatePending,
+	}, []state.CaptureOp{{
+		Op: "create", Path: "successor.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("e", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
 
 	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
-		t.Fatalf("runFix apply: %v\n%s", err, out.String())
+	err = runFix(ctx, &out, repo, false, true, false, false, true)
+	if err == nil || !strings.Contains(err.Error(), "missing blob object") {
+		t.Fatalf("runFix err=%v want missing-object refusal\n%s", err, out.String())
 	}
-	var stateName, commitOID string
-	var errMsg sql.NullString
-	if err := db.SQL().QueryRowContext(ctx,
-		`SELECT state, commit_oid, error FROM capture_events WHERE seq = ?`, seq,
-	).Scan(&stateName, &commitOID, &errMsg); err != nil {
-		t.Fatalf("query event: %v", err)
-	}
-	if stateName != state.EventStatePublished || commitOID != head || errMsg.Valid {
-		t.Fatalf("event state=%q commit=%q err=%v, want published %s nil", stateName, commitOID, errMsg, head)
+	assertFixEventState(t, ctx, db, first, state.EventStateFailed)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("missing-object failure wrote snapshot: %d", got)
 	}
 }
 
-func hasFixAction(plan fixPlan, kind string) bool {
-	for _, action := range plan.Actions {
-		if action.Kind == kind {
-			return true
-		}
-	}
-	return false
-}
-
-func TestFix_DryRunPlansGeneratedPendingCleanup(t *testing.T) {
+func TestFix_RefusesWhileDaemonIsLive(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running"}); err != nil {
+		t.Fatalf("SaveDaemonState: %v", err)
+	}
 	before, err := fileSHA256(stateDB)
 	if err != nil {
 		t.Fatalf("checksum before: %v", err)
 	}
-
 	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, true, false, false, false, true); err != nil {
-		t.Fatalf("runFix generated dry-run: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	var generated *fixAction
-	for i := range plan.Actions {
-		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
-			generated = &plan.Actions[i]
-			break
-		}
-	}
-	if generated == nil {
-		t.Fatalf("plan missing generated cleanup action: %+v", plan.Actions)
-	}
-	if generated.GeneratedRoot != ".derivedData-provider-core" ||
-		generated.SafeIgnorePattern != ".derivedData*/" ||
-		generated.PendingCount != 2 ||
-		generated.TrackedCount != 2 ||
-		!reflect.DeepEqual(generated.EventSeqs, generatedSeqs) {
-		t.Fatalf("generated action=%+v, seqs=%v", *generated, generatedSeqs)
+	err = runFix(ctx, &out, repo, false, true, false, false, true)
+	if err == nil || !strings.Contains(err.Error(), "unsafe conditions") {
+		t.Fatalf("runFix err=%v want live-daemon refusal", err)
 	}
 	after, err := fileSHA256(stateDB)
 	if err != nil {
 		t.Fatalf("checksum after: %v", err)
 	}
 	if before != after {
-		t.Fatalf("dry-run mutated state.db: before=%s after=%s", before, after)
-	}
-
-	out.Reset()
-	if err := runFix(ctx, &out, repo, true, false, false, false, false); err != nil {
-		t.Fatalf("runFix generated human dry-run: %v\n%s", err, out.String())
-	}
-	human := out.String()
-	for _, want := range []string{
-		"drop protected generated pending deletes",
-		"root=.derivedData-provider-core pending=2 tracked=2",
-		"git add -u -- .derivedData-provider-core",
-		"git commit -m \"Remove tracked generated cache files\"",
-	} {
-		if !strings.Contains(human, want) {
-			t.Fatalf("human output missing %q:\n%s", want, human)
-		}
+		t.Fatalf("live-daemon refusal mutated state.db: before=%s after=%s", before, after)
 	}
 }
 
-func TestFix_ApplyDropsGeneratedPendingOnly(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
+func TestFix_ApplyRefusesDaemonLockAcquiredAfterPlan(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	generatedSeqs := seedGeneratedPendingFixFixture(t, ctx, repo, db)
-	beforeIndex := gitCachedNameStatus(t, ctx, repo)
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	plan, err := buildFixPlan(ctx, repo, stateDB, false, false, false)
+	if err != nil {
+		t.Fatalf("buildFixPlan: %v", err)
+	}
+	gitDir := filepath.Join(repo, ".git")
+	daemonLock, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		t.Fatalf("simulate daemon start after planning: %v", err)
+	}
+	defer daemonLock.Release()
 
+	err = applyFixPlan(ctx, stateDB, &plan)
+	if !errors.Is(err, daemon.ErrDaemonLockHeld) {
+		t.Fatalf("applyFixPlan err=%v want daemon-lock refusal", err)
+	}
+	if plan.BackupPath != "" || plan.RowsChanged != 0 {
+		t.Fatalf("daemon-lock refusal mutated plan: %+v", plan)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db, second, state.EventStatePending)
+	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("daemon-lock refusal wrote recovery snapshot: %d", got)
+	}
+}
+
+func runFixJSON(t *testing.T, repo string, dryRun, yes, force, clearPause bool) fixPlan {
+	t.Helper()
 	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
-		t.Fatalf("runFix generated apply: %v\n%s", err, out.String())
+	if err := runFix(context.Background(), &out, repo, dryRun, yes, force, clearPause, true); err != nil {
+		t.Fatalf("runFix: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
 	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+		t.Fatalf("unmarshal fix result: %v\n%s", err, out.String())
 	}
-	var generated *fixAction
-	for i := range plan.Actions {
-		if plan.Actions[i].Kind == fixActionDropGeneratedPending {
-			generated = &plan.Actions[i]
-			break
-		}
-	}
-	if generated == nil || !generated.Applied || generated.RowsChanged != 2 {
-		t.Fatalf("generated action not applied as expected: %+v actions=%+v", generated, plan.Actions)
-	}
-	if plan.BackupPath == "" {
-		t.Fatalf("apply did not create backup: %+v", plan)
-	}
-	for _, seq := range generatedSeqs {
-		if got := countRowsWhere(t, db, "capture_events", "seq = ?", seq); got != 0 {
-			t.Fatalf("generated capture_event seq=%d remains: %d", seq, got)
-		}
-		if got := countRowsWhere(t, db, "capture_ops", "event_seq = ?", seq); got != 0 {
-			t.Fatalf("generated capture_ops seq=%d remains: %d", seq, got)
-		}
-		if got := countRowsWhere(t, db, "planner_state", "event_seq = ?", seq); got != 0 {
-			t.Fatalf("generated planner_state seq=%d remains: %d", seq, got)
-		}
-	}
-	for _, path := range []string{"build/output.js", "src/ordinary.txt"} {
-		if got := countRowsWhere(t, db, "capture_events", "path = ? AND state = ?", path, state.EventStatePending); got != 1 {
-			t.Fatalf("unrelated pending path %s count=%d want 1", path, got)
-		}
-	}
-	if afterIndex := gitCachedNameStatus(t, ctx, repo); afterIndex != beforeIndex {
-		t.Fatalf("fix mutated git index:\nbefore:\n%s\nafter:\n%s", beforeIndex, afterIndex)
-	}
+	return plan
 }
 
-// TestFix_DryRunListsResolveAlreadyLandedBarrier exercises the Wave 3a
-// resolve_already_landed_barrier action: when an external committer already
-// landed the captured modify at HEAD and the corresponding capture_events
-// row is blocked_conflict with a before-state-mismatch error, the planner
-// must list it for auto-resolution under --yes alone.
-func TestFix_DryRunListsResolveAlreadyLandedBarrier(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-
-	// Land the "external" commit modifying seed.txt so HEAD blob matches what
-	// the captured op claims as after_oid.
-	seedPath := filepath.Join(repo, "seed.txt")
-	if err := os.WriteFile(seedPath, []byte("seed\nlanded externally\n"), 0o644); err != nil {
-		t.Fatalf("write seed.txt: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "seed.txt"); err != nil {
-		t.Fatalf("git add: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid", "commit", "-m", "external modify"); err != nil {
-		t.Fatalf("git commit external: %v", err)
-	}
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	afterOID, err := git.LsTreeBlobOID(ctx, repo, head, "seed.txt")
-	if err != nil {
-		t.Fatalf("ls-tree HEAD seed.txt: %v", err)
-	}
-	parent, err := git.RevParse(ctx, repo, "HEAD~1")
-	if err != nil {
-		t.Fatalf("rev-parse HEAD~1: %v", err)
-	}
-	beforeOID, err := git.LsTreeBlobOID(ctx, repo, parent, "seed.txt")
-	if err != nil {
-		t.Fatalf("ls-tree HEAD~1 seed.txt: %v", err)
-	}
-
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         parent,
-		Operation:        "modify",
-		Path:             "seed.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "modify before-state mismatch", Valid: true},
-	}, []state.CaptureOp{{
-		Op:         "modify",
-		Path:       "seed.txt",
-		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
-		BeforeMode: sql.NullString{String: "100644", Valid: true},
-		AfterOID:   sql.NullString{String: afterOID, Valid: true},
-		AfterMode:  sql.NullString{String: "100644", Valid: true},
-		Fidelity:   "exact",
-	}})
-	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, true, false, false, false, true); err != nil {
-		t.Fatalf("runFix dry-run: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !hasFixAction(plan, fixActionResolveAlreadyLandedBarrier) {
-		t.Fatalf("plan lacks resolve_already_landed_barrier: %+v", plan.Actions)
-	}
-	// Find the action and confirm it carries the expected commit OID + seq.
-	var found *fixAction
+func findFixAction(plan fixPlan, kind string) *fixAction {
 	for i := range plan.Actions {
-		if plan.Actions[i].Kind == fixActionResolveAlreadyLandedBarrier && plan.Actions[i].Seq == seq {
-			found = &plan.Actions[i]
-			break
+		if plan.Actions[i].Kind == kind {
+			return &plan.Actions[i]
 		}
 	}
-	if found == nil {
-		t.Fatalf("no resolve action for seq=%d: %+v", seq, plan.Actions)
-	}
-	if found.CommitOID != head {
-		t.Fatalf("resolve action commit_oid=%q want %q", found.CommitOID, head)
-	}
+	return nil
 }
 
-// TestFix_ApplyYesPromotesAlreadyLandedBarrier confirms --yes alone (no
-// --force) is sufficient to promote the blocked_conflict row to published
-// and append a handled_external_after_block decision row.
-func TestFix_ApplyYesPromotesAlreadyLandedBarrier(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
+func commitExternalSeedChange(t *testing.T, ctx context.Context, repo string) (parent, head, beforeOID, afterOID string) {
+	t.Helper()
+	var err error
+	parent, err = git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse parent: %v", err)
+	}
+	beforeOID, err = git.LsTreeBlobOID(ctx, repo, parent, "seed.txt")
+	if err != nil {
+		t.Fatalf("ls-tree parent: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\nlanded externally\n"), 0o644); err != nil {
 		t.Fatalf("write seed.txt: %v", err)
 	}
@@ -513,460 +1041,86 @@ func TestFix_ApplyYesPromotesAlreadyLandedBarrier(t *testing.T) {
 		t.Fatalf("git add: %v", err)
 	}
 	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid", "commit", "-m", "external modify"); err != nil {
-		t.Fatalf("git commit external: %v", err)
+		t.Fatalf("git commit: %v", err)
 	}
-	head, err := git.RevParse(ctx, repo, "HEAD")
+	head, err = git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
+		t.Fatalf("rev-parse HEAD: %v", err)
 	}
-	afterOID, err := git.LsTreeBlobOID(ctx, repo, head, "seed.txt")
+	afterOID, err = git.LsTreeBlobOID(ctx, repo, head, "seed.txt")
 	if err != nil {
-		t.Fatalf("ls-tree: %v", err)
+		t.Fatalf("ls-tree HEAD: %v", err)
 	}
-	parent, err := git.RevParse(ctx, repo, "HEAD~1")
-	if err != nil {
-		t.Fatalf("rev-parse HEAD~1: %v", err)
-	}
-	beforeOID, err := git.LsTreeBlobOID(ctx, repo, parent, "seed.txt")
-	if err != nil {
-		t.Fatalf("ls-tree HEAD~1: %v", err)
-	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         parent,
-		Operation:        "modify",
-		Path:             "seed.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "modify before-state mismatch", Valid: true},
-	}, []state.CaptureOp{{
-		Op:         "modify",
-		Path:       "seed.txt",
-		BeforeOID:  sql.NullString{String: beforeOID, Valid: true},
-		BeforeMode: sql.NullString{String: "100644", Valid: true},
-		AfterOID:   sql.NullString{String: afterOID, Valid: true},
-		AfterMode:  sql.NullString{String: "100644", Valid: true},
-		Fidelity:   "exact",
-	}})
-	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
-		t.Fatalf("runFix apply: %v\n%s", err, out.String())
-	}
-	var stateName, commitOID string
-	if err := db.SQL().QueryRowContext(ctx,
-		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq,
-	).Scan(&stateName, &commitOID); err != nil {
-		t.Fatalf("query (post-apply event):\n%s\n%v", out.String(), err)
-	}
-	if stateName != state.EventStatePublished || commitOID != head {
-		t.Fatalf("event after fix state=%q commit=%q want published+%s\n%s", stateName, commitOID, head, out.String())
-	}
-	var kind string
-	if err := db.SQL().QueryRowContext(ctx,
-		`SELECT kind FROM decision_records WHERE event_seq = ? AND kind = ?`,
-		seq, state.DecisionKindHandledExternalAfterBlock,
-	).Scan(&kind); err != nil {
-		t.Fatalf("query decision (out=%s): %v", out.String(), err)
-	}
+	return parent, head, beforeOID, afterOID
 }
 
-// TestFix_YesAloneRefusesToIncludePurge pins the SPEC LOCK constraint that
-// --yes WITHOUT --force never plans purge_barrier_with_successors, even when
-// a barrier-with-successors row exists.
-func TestFix_YesAloneRefusesToIncludePurge(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	// Stage a blocked row at seq=N and a pending row at seq=N+1 on the
-	// current branch+head so the barrier-with-successors predicate matches
-	// without also tripping retarget_stale_anchor.
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "barrier.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "old conflict", Valid: true},
-	}, nil); err != nil {
-		t.Fatalf("seed blocked: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "successor.txt",
-		Fidelity:         "exact",
-		State:            state.EventStatePending,
-	}, nil); err != nil {
-		t.Fatalf("seed pending successor: %v", err)
-	}
-
-	// Dry-run plan only — apply-mode here would invoke clearPublishBarrierIfSafe
-	// and other unrelated mutations. The contract we care about is the
-	// presence/absence of purge in the planned action set.
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, true /*dryRun*/, false /*yes*/, false /*force*/, false /*clearPause*/, true); err != nil {
-		t.Fatalf("runFix dry-run (no force): %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if hasFixAction(plan, fixActionPurgeBarrierWithSuccessors) {
-		t.Fatalf("--force not set: plan must NOT include purge: %+v", plan.Actions)
-	}
-	// Operator nudge: when a barrier-with-successors exists we still surface
-	// the --force suggestion so the path is discoverable.
-	foundNudge := false
-	for _, s := range plan.Suggestions {
-		if strings.Contains(s, "--force") {
-			foundNudge = true
-			break
-		}
-	}
-	if !foundNudge {
-		t.Fatalf("plan must surface --force nudge in Suggestions: %+v", plan.Suggestions)
-	}
-	if !plan.ForceRequired {
-		t.Fatalf("plan.force_required=false with active force-only barrier: %+v", plan)
-	}
-	got := countCaptureRowsByState(t, db)
-	if got[state.EventStateBlockedConflict] != 1 || got[state.EventStatePending] != 1 {
-		t.Fatalf("normal fix must not destructively purge barrier rows: %v", got)
-	}
-}
-
-func TestFix_SafePlanPrintsExactForceCommandWithRepoPath(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, repo, db)
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, true, false, false, false, false); err != nil {
-		t.Fatalf("runFix dry-run human: %v\n%s", err, out.String())
-	}
-	want := "acd fix --repo " + repo + " --force --yes"
-	if !strings.Contains(out.String(), want) {
-		t.Fatalf("human output missing exact force command %q:\n%s", want, out.String())
-	}
-}
-
-// TestFix_ForceDryRunListsPurge confirms --force without --yes still plans
-// purge_barrier_with_successors (dry-run) so operators can preview the
-// destructive action before opting in.
-func TestFix_ForceDryRunListsPurge(t *testing.T) {
-	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, repo, db)
-	before, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum before: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, false /*yes*/, true /*force*/, false, true); err != nil {
-		t.Fatalf("runFix --force --dry-run: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !plan.DryRun {
-		t.Fatalf("--force without --yes must dry-run: %+v", plan)
-	}
-	if !hasFixAction(plan, fixActionPurgeBarrierWithSuccessors) {
-		t.Fatalf("--force dry-run did not plan purge: %+v", plan.Actions)
-	}
-	after, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum after: %v", err)
-	}
-	if before != after {
-		t.Fatalf("--force --dry-run mutated state.db: before=%s after=%s", before, after)
-	}
-}
-
-// TestFix_ForceYesAppliesPurge exercises the full destructive path:
-// --force --yes deletes the blocked barrier row and clears the matching
-// publish_state breadcrumb. Pending successors are left untouched.
-func TestFix_ForceYesAppliesPurge(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, repo, db)
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true /*yes*/, true /*force*/, false, true); err != nil {
-		t.Fatalf("runFix --force --yes: %v\n%s", err, out.String())
-	}
-	got := countCaptureRowsByState(t, db)
-	if got[state.EventStateBlockedConflict] != 0 {
-		t.Fatalf("blocked rows remain after --force --yes: %v", got)
-	}
-	if got[state.EventStatePending] == 0 {
-		t.Fatalf("pending successors should remain: %v", got)
-	}
-}
-
-func TestFix_ForceYesPurgesBeforeRetargetResetsBlockedRows(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	stageBarrierWithSuccessors(t, ctx, repo, db)
-	if err := state.MetaSet(ctx, db, "last_replay_error", "stale breadcrumb"); err != nil {
-		t.Fatalf("MetaSet: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, true, false, true); err != nil {
-		t.Fatalf("runFix --force --yes: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	purgeIdx, retargetIdx := -1, -1
-	for i, action := range plan.Actions {
-		switch action.Kind {
-		case fixActionPurgeBarrierWithSuccessors:
-			purgeIdx = i
-			if action.RowsChanged != 1 {
-				t.Fatalf("purge rows=%d want 1: %+v", action.RowsChanged, plan.Actions)
-			}
-		case fixActionRetargetStaleAnchor:
-			retargetIdx = i
-		}
-	}
-	if purgeIdx < 0 || retargetIdx < 0 || purgeIdx > retargetIdx {
-		t.Fatalf("purge must be planned/applied before retarget: purge=%d retarget=%d actions=%+v", purgeIdx, retargetIdx, plan.Actions)
-	}
-	got := countCaptureRowsByState(t, db)
-	if got[state.EventStateBlockedConflict] != 0 {
-		t.Fatalf("blocked rows remain after order-safe force fix: %v", got)
-	}
-	if got[state.EventStatePending] != 1 {
-		t.Fatalf("barrier must be deleted, not reset to pending; row counts: %v", got)
-	}
-	var barrierRows int
-	if err := db.SQL().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE path = 'barrier.txt'`,
-	).Scan(&barrierRows); err != nil {
-		t.Fatalf("query barrier rows: %v", err)
-	}
-	if barrierRows != 0 {
-		t.Fatalf("force purge must delete barrier row, got %d barrier rows", barrierRows)
-	}
-}
-
-func TestFix_ForceYesPurgesFailedBarrierWithSuccessors(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "failed-barrier.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateFailed,
-		Error:            sql.NullString{String: "old failure", Valid: true},
-	}, nil); err != nil {
-		t.Fatalf("seed failed barrier: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "pending-behind-failed.txt",
-		Fidelity:         "exact",
-		State:            state.EventStatePending,
-	}, nil); err != nil {
-		t.Fatalf("seed pending successor: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false, true, true, false, true); err != nil {
-		t.Fatalf("runFix --force --yes: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	var purge *fixAction
-	for i := range plan.Actions {
-		if plan.Actions[i].Kind == fixActionPurgeBarrierWithSuccessors {
-			purge = &plan.Actions[i]
-			break
-		}
-	}
-	if purge == nil {
-		t.Fatalf("plan did not purge failed barrier: %+v", plan.Actions)
-	}
-	if purge.State != state.EventStateFailed || purge.RowsChanged != 1 {
-		t.Fatalf("purge action = %+v, want failed rows=1", *purge)
-	}
-	got := countCaptureRowsByState(t, db)
-	if got[state.EventStateFailed] != 0 {
-		t.Fatalf("failed rows remain after --force --yes: %v", got)
-	}
-	if got[state.EventStatePending] == 0 {
-		t.Fatalf("pending successors should remain: %v", got)
-	}
-}
-
-func TestFix_ForceYesReportsIncompleteWhenPlannedPurgeChangesZeroRows(t *testing.T) {
-	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-	plan := fixPlan{
-		Repo:             repo,
-		StateDB:          stateDB,
-		GitDir:           filepath.Join(repo, ".git"),
-		CurrentBranchRef: "refs/heads/main",
-		CurrentHead:      head,
-		Generation:       1,
-		Force:            true,
-		Actions: []fixAction{{
-			ID:               fixActionPurgeBarrierWithSuccessors + ":9999",
-			Kind:             fixActionPurgeBarrierWithSuccessors,
-			Seq:              9999,
-			BranchRef:        "refs/heads/main",
-			BranchGeneration: 1,
-			RequiresForce:    true,
-		}},
-	}
-	if err := applyFixPlan(ctx, stateDB, &plan); err == nil {
-		t.Fatalf("applyFixPlan succeeded despite zero-row planned purge: %+v", plan)
-	}
-	if !plan.Incomplete || len(plan.VerifyErrors) == 0 {
-		t.Fatalf("plan missing zero-row incomplete verification: %+v", plan)
-	}
-}
-
-// TestFix_RetargetActionLandsWhenStaleAnchorPresent mirrors the recover_test
-// fixture but drives the new action via acd fix. The fixture stages a stale
-// pending row (not blocked, so the older delete_obsolete_barrier path leaves
-// it alone); after --yes the row must be retargeted onto refs/heads/main.
-func TestFix_RetargetActionLandsWhenStaleAnchorPresent(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID:              999999,
-		Mode:             "stopped",
-		BranchRef:        sql.NullString{String: "refs/heads/stale", Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
-	}); err != nil {
-		t.Fatalf("SaveDaemonState: %v", err)
-	}
-	if err := state.MetaSet(ctx, db, "branch.generation", "2"); err != nil {
-		t.Fatalf("MetaSet: %v", err)
-	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/stale",
-		BranchGeneration: 2,
-		BaseHead:         head,
-		Operation:        "create",
-		Path:             "stale.txt",
-		Fidelity:         "full",
-		State:            state.EventStatePending,
-	}, []state.CaptureOp{{
-		Op:        "create",
-		Path:      "stale.txt",
-		Fidelity:  "full",
-		AfterMode: sql.NullString{String: "100644", Valid: true},
-		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
-	}})
-	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runFix(ctx, &out, repo, false /*dryRun*/, true /*yes*/, false, false, true); err != nil {
-		t.Fatalf("runFix --yes: %v\n%s", err, out.String())
-	}
-	var plan fixPlan
-	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !hasFixAction(plan, fixActionRetargetStaleAnchor) {
-		t.Fatalf("plan missing retarget_stale_anchor: %+v", plan.Actions)
-	}
-	var branchRef, eventState string
-	var gen int64
-	if err := db.SQL().QueryRowContext(ctx,
-		`SELECT branch_ref, branch_generation, state FROM capture_events WHERE seq = ?`, seq,
-	).Scan(&branchRef, &gen, &eventState); err != nil {
-		t.Fatalf("query event: %v", err)
-	}
-	if branchRef != "refs/heads/main" || gen != 2 || eventState != state.EventStatePending {
-		t.Fatalf("retarget did not land: branch=%q gen=%d state=%q want main/2/pending",
-			branchRef, gen, eventState)
-	}
-}
-
-// stageBarrierWithSuccessors seeds: 1 blocked_conflict + 1 pending at higher
-// seq on same (refs/heads/main, generation=1) anchored at the current HEAD so
-// the planner sees a barrier with successors WITHOUT also tripping the
-// retarget_stale_anchor predicate. Used by the --force tests.
-func stageBarrierWithSuccessors(t *testing.T, ctx context.Context, repo string, db *state.DB) {
+func stageRecoverableBarrierPair(t *testing.T, ctx context.Context, repo string, db *state.DB, branchRef string, generation int64) (int64, int64) {
 	t.Helper()
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "barrier.txt",
-		Fidelity:         "exact",
-		State:            state.EventStateBlockedConflict,
-		Error:            sql.NullString{String: "old conflict", Valid: true},
-	}, nil); err != nil {
-		t.Fatalf("seed blocked: %v", err)
+	firstBlob, err := git.HashObjectStdin(ctx, repo, []byte("first captured\n"))
+	if err != nil {
+		t.Fatalf("hash first: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 1,
-		BaseHead:         head,
-		Operation:        "modify",
-		Path:             "successor.txt",
-		Fidelity:         "exact",
-		State:            state.EventStatePending,
-	}, nil); err != nil {
-		t.Fatalf("seed pending successor: %v", err)
+	secondBlob, err := git.HashObjectStdin(ctx, repo, []byte("second captured\n"))
+	if err != nil {
+		t.Fatalf("hash second: %v", err)
 	}
-	// Mirror publish_state singleton so the breadcrumb-clear path is exercised.
-	if _, err := db.SQL().ExecContext(ctx, `
-INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, status, error, updated_ts)
-VALUES (1, 1, 'refs/heads/main', 1, ?, 'blocked_conflict', 'modify before-state mismatch', 1.0)
-ON CONFLICT(id) DO UPDATE SET status=excluded.status, error=excluded.error`, head); err != nil {
-		t.Fatalf("seed publish_state: %v", err)
+	first := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: branchRef, BranchGeneration: generation, BaseHead: head,
+		Operation: "create", Path: "first-recovery.txt", Fidelity: "exact",
+		State: state.EventStateBlockedConflict,
+		Error: sql.NullString{String: "before-state mismatch", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "first-recovery.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: firstBlob, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	second := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: branchRef, BranchGeneration: generation, BaseHead: head,
+		Operation: "create", Path: "second-recovery.txt", Fidelity: "exact", State: state.EventStatePending,
+	}, []state.CaptureOp{{
+		Op: "create", Path: "second-recovery.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: secondBlob, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	return first, second
+}
+
+func appendFixEvent(t *testing.T, ctx context.Context, db *state.DB, ev state.CaptureEvent, ops []state.CaptureOp) int64 {
+	t.Helper()
+	seq, err := state.AppendCaptureEvent(ctx, db, ev, ops)
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent(%s): %v", ev.Path, err)
+	}
+	return seq
+}
+
+func assertFixEventState(t *testing.T, ctx context.Context, db *state.DB, seq int64, want string) {
+	t.Helper()
+	var got string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq = ?`, seq).Scan(&got); err != nil {
+		t.Fatalf("query seq=%d: %v", seq, err)
+	}
+	if got != want {
+		t.Fatalf("seq=%d state=%s want %s", seq, got, want)
 	}
 }
 
+func countRowsWhere(t *testing.T, db *state.DB, table, where string, args ...any) int {
+	t.Helper()
+	var n int
+	query := "SELECT COUNT(*) FROM " + table + " WHERE " + where
+	if err := db.SQL().QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// seedGeneratedPendingFixFixture is shared with diagnose tests so both
+// surfaces describe the same protected generated-delete incident.
 func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo string, db *state.DB) []int64 {
 	t.Helper()
 	write := func(rel, body string) {
@@ -993,26 +1147,16 @@ func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo stri
 	}
 	seed := func(path, op string) int64 {
 		t.Helper()
-		seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-			BranchRef:        "refs/heads/main",
-			BranchGeneration: 1,
-			BaseHead:         head,
-			Operation:        op,
-			Path:             path,
-			Fidelity:         "full",
-			State:            state.EventStatePending,
+		seq := appendFixEvent(t, ctx, db, state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+			Operation: op, Path: path, Fidelity: "full", State: state.EventStatePending,
 		}, []state.CaptureOp{{
-			Op:         op,
-			Path:       path,
-			Fidelity:   "full",
-			BeforeOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: op == "delete"},
+			Op: op, Path: path, Fidelity: "full",
+			BeforeOID:  sql.NullString{String: strings.Repeat("a", 40), Valid: op == "delete"},
 			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: op == "delete"},
-			AfterOID:   sql.NullString{String: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Valid: op != "delete"},
+			AfterOID:   sql.NullString{String: strings.Repeat("b", 40), Valid: op != "delete"},
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: op != "delete"},
 		}})
-		if err != nil {
-			t.Fatalf("AppendCaptureEvent(%s,%s): %v", op, path, err)
-		}
 		if err := state.RecordPlannerOffer(ctx, db, seq, 123); err != nil {
 			t.Fatalf("RecordPlannerOffer(%d): %v", seq, err)
 		}
@@ -1025,23 +1169,4 @@ func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo stri
 	seed("build/output.js", "delete")
 	seed("src/ordinary.txt", "modify")
 	return seqs
-}
-
-func countRowsWhere(t *testing.T, db *state.DB, table, where string, args ...any) int {
-	t.Helper()
-	var n int
-	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", table, where)
-	if err := db.SQL().QueryRowContext(context.Background(), q, args...).Scan(&n); err != nil {
-		t.Fatalf("count %s where %s: %v", table, where, err)
-	}
-	return n
-}
-
-func gitCachedNameStatus(t *testing.T, ctx context.Context, repo string) string {
-	t.Helper()
-	out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--name-status")
-	if err != nil {
-		t.Fatalf("git diff --cached --name-status: %v", err)
-	}
-	return string(out)
 }

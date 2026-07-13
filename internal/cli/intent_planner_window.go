@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -172,7 +173,7 @@ func scanIntentPlannerWindowSummary(scan scannerFunc) (intentPlannerWindowSummar
 	win.CommitFormat = commitFormat.String
 	win.Forced = forced != 0
 	win.ForcedReason = forcedReason.String
-	win.ValidationFailure = validationFailure.String
+	win.ValidationFailure = ai.SanitizePlannerError(validationFailure.String)
 	if err := json.Unmarshal([]byte(emptyJSONArray(offered)), &win.OfferedSeqs); err != nil {
 		return intentPlannerWindowSummary{}, fmt.Errorf("unmarshal offered seqs: %w", err)
 	}

@@ -242,6 +242,51 @@ done
 	}
 }
 
+func TestSubprocess_RewriteIntentMessageValidationErrorsAreTyped(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{name: "malformed response", response: "{"},
+		{name: "empty subject", response: `{"version":1,"subject":"","body":"","error":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			skipIfWindows(t)
+			dir := t.TempDir()
+			script := fmt.Sprintf(`
+while IFS= read -r line; do
+  printf '%%s\n' '%s'
+done
+`, tc.response)
+			bin := writePluginScript(t, dir, "test", script)
+			p := NewSubprocessProvider("test", SubprocessOptions{
+				LookPath: fixedLookPath("acd-provider-test", bin),
+				Timeout:  5 * time.Second,
+				Stderr:   io.Discard,
+			})
+			t.Cleanup(func() { _ = p.Close() })
+
+			req := sampleIntentPlanRequest(t)
+			plan := IntentPlan{
+				SelectedSeqs:   []int64{101},
+				DeferredSeqs:   []int64{102},
+				Subject:        "Update parsed",
+				GroupingReason: "checkout service change is focused",
+				DeferredReasons: []DeferredReason{{
+					Seq:    102,
+					Reason: "docs change is independent",
+				}},
+			}
+			rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+			_, err := p.RewriteIntentMessage(context.Background(), rewriteReq)
+			var validationErr *IntentMessageRewriteValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error=%T %v want IntentMessageRewriteValidationError", err, err)
+			}
+		})
+	}
+}
+
 func TestSubprocess_RewriteIntentMessagePromptTraceUsesRewriteStrategy(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRevParseReturnsErrRefNotFoundForMissingRef(t *testing.T) {
@@ -73,6 +74,202 @@ func TestUpdateRefCompareAndSwapRejectsStaleOld(t *testing.T) {
 	// With the correct expected-old, the swap succeeds.
 	if err := UpdateRef(ctx, dir, "refs/heads/main", c2, c1); err != nil {
 		t.Fatalf("CAS with correct old: %v", err)
+	}
+}
+
+func TestEnsureRecoveryRefCreatesAndReusesExactCommit(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	commit := commitFile(t, ctx, dir, "recovery.txt", "saved", "recovery")
+	const ref = "refs/acd/recovery/main/g1/1-2-deadbeef"
+
+	created, err := EnsureRecoveryRef(ctx, dir, ref, commit)
+	if err != nil {
+		t.Fatalf("EnsureRecoveryRef create: %v", err)
+	}
+	if !created.Created || created.Reused || created.Ref != ref || created.CommitOID != commit {
+		t.Fatalf("create result=%+v", created)
+	}
+	reused, err := EnsureRecoveryRef(ctx, dir, ref, commit)
+	if err != nil {
+		t.Fatalf("EnsureRecoveryRef reuse: %v", err)
+	}
+	if reused.Created || !reused.Reused || reused.CommitOID != commit {
+		t.Fatalf("reuse result=%+v", reused)
+	}
+	got, err := RevParse(ctx, dir, ref)
+	if err != nil || got != commit {
+		t.Fatalf("recovery ref=(%q,%v) want (%q,nil)", got, err, commit)
+	}
+}
+
+func TestEnsureRecoveryRefRejectsCollisionWithoutOverwrite(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/acd/recovery/main/g1/3-4-cafebabe"
+	if _, err := EnsureRecoveryRef(ctx, dir, ref, first); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if _, err := EnsureRecoveryRef(ctx, dir, ref, second); !errors.Is(err, ErrRecoveryRefCollision) {
+		t.Fatalf("collision err=%v want ErrRecoveryRefCollision", err)
+	}
+	got, err := RevParse(ctx, dir, ref)
+	if err != nil || got != first {
+		t.Fatalf("collision overwrote ref: got=(%q,%v) want (%q,nil)", got, err, first)
+	}
+}
+
+func TestEnsureRecoveryRefValidatesNamespaceAndCommitType(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	commit := commitFile(t, ctx, dir, "commit.txt", "commit", "commit")
+	if _, err := EnsureRecoveryRef(ctx, dir, "refs/heads/not-hidden", commit); err == nil {
+		t.Fatal("EnsureRecoveryRef accepted a user branch ref")
+	}
+	blob, err := HashObjectStdin(ctx, dir, []byte("blob"))
+	if err != nil {
+		t.Fatalf("hash blob: %v", err)
+	}
+	if _, err := EnsureRecoveryRef(ctx, dir, "refs/acd/recovery/blob", blob); err == nil {
+		t.Fatal("EnsureRecoveryRef accepted a blob target")
+	}
+}
+
+func TestWithLockedRecoveryRefBlocksConcurrentMutation(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/acd/recovery/prune-race"
+	if _, err := EnsureRecoveryRef(ctx, dir, ref, first); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- WithLockedRecoveryRef(ctx, dir, ref, first, func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery ref lock was not acquired")
+	}
+
+	mutationCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := UpdateRef(mutationCtx, dir, ref, second, first)
+	cancel()
+	if err == nil {
+		t.Fatal("concurrent recovery ref mutation succeeded while proof lock was held")
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WithLockedRecoveryRef: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery ref lock was not released")
+	}
+
+	if err := UpdateRef(ctx, dir, ref, second, first); err != nil {
+		t.Fatalf("mutation after lock release: %v", err)
+	}
+}
+
+func TestWithLockedRecoveryRefFailsBeforeCallbackOnMismatch(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/acd/recovery/prune-mismatch"
+	if _, err := EnsureRecoveryRef(ctx, dir, ref, first); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+
+	called := false
+	err := WithLockedRecoveryRef(ctx, dir, ref, second, func() error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("mismatched proof ref unexpectedly verified")
+	}
+	if called {
+		t.Fatal("callback ran without an exact proof-ref match")
+	}
+}
+
+func TestWithLockedRecoveryRefAbortsOnCallbackError(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/acd/recovery/prune-abort"
+	if _, err := EnsureRecoveryRef(ctx, dir, ref, first); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+
+	want := errors.New("sqlite prune failed")
+	if err := WithLockedRecoveryRef(ctx, dir, ref, first, func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("callback error=%v want %v", err, want)
+	}
+	if err := UpdateRef(ctx, dir, ref, second, first); err != nil {
+		t.Fatalf("mutation after callback abort: %v", err)
+	}
+}
+
+func TestWithLockedRecoveryRefAndAbsentRefBlocksCreation(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	commit := commitFile(t, ctx, dir, "recovery.txt", "saved", "recovery")
+	const recoveryRef = "refs/acd/recovery/dead-branch-race"
+	const absentRef = "refs/heads/recreated"
+	if _, err := EnsureRecoveryRef(ctx, dir, recoveryRef, commit); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+
+	creationDone := make(chan error, 1)
+	creationStarted := make(chan struct{})
+	completedWhileLocked := false
+	var creationErr error
+	err := WithLockedRecoveryRefAndAbsentRef(ctx, dir, recoveryRef, commit, absentRef, func() error {
+		go func() {
+			close(creationStarted)
+			creationDone <- UpdateRef(ctx, dir, absentRef, commit, "")
+		}()
+		<-creationStarted
+		select {
+		case creationErr = <-creationDone:
+			completedWhileLocked = true
+		case <-time.After(200 * time.Millisecond):
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithLockedRecoveryRefAndAbsentRef: %v", err)
+	}
+	if completedWhileLocked && creationErr == nil {
+		t.Fatal("expected-missing ref was created while transaction lock was held")
+	}
+	if !completedWhileLocked {
+		select {
+		case creationErr = <-creationDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("expected-missing ref lock was not released")
+		}
+	}
+	if creationErr != nil {
+		if err := UpdateRef(ctx, dir, absentRef, commit, ""); err != nil {
+			t.Fatalf("create expected-missing ref after lock release: %v", err)
+		}
 	}
 }
 

@@ -50,6 +50,7 @@ type statusReport struct {
 	PendingEvents         int                  `json:"pending_events"`
 	BlockedConflicts      int                  `json:"blocked_conflicts"`
 	ActiveBarriers        int                  `json:"active_barriers,omitempty"`
+	ActiveTerminalEvents  int                  `json:"active_terminal_events,omitempty"`
 	FailedEvents          int                  `json:"failed_events"`
 	FailedBlockingPending int                  `json:"failed_blocking_pending"`
 	LastCommitOID         string               `json:"last_commit_oid,omitempty"`
@@ -271,6 +272,7 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	}
 	report.BlockedConflicts = blockers.TotalBlockedConflicts
 	report.ActiveBarriers = blockers.ActiveBlockedBarriersWithSuccessors
+	report.ActiveTerminalEvents = blockers.ActiveTerminalEvents
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {

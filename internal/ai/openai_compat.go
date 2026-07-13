@@ -376,7 +376,8 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		return IntentPlan{}, err
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
-		err := errors.New("openai-compat: intent plan returned empty subject")
+		cause := errors.New("openai-compat: intent plan returned empty subject")
+		err := intentPlanShapeValidationError(cause.Error(), cause)
 		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
@@ -489,8 +490,16 @@ func (p *OpenAIProvider) RewriteIntentMessage(ctx context.Context, rewriteReq In
 
 	subject, bodyOut, err := parseToolCall(raw)
 	if err != nil {
-		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
-		return Result{}, err
+		validationErr := &IntentMessageRewriteValidationError{Err: err}
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: validationErr.Error()})
+		return Result{}, validationErr
+	}
+	if intentMessageRewriteSubjectEmpty(subject) {
+		validationErr := &IntentMessageRewriteValidationError{
+			Err: errors.New("openai-compat: empty subject after intent message rewrite sanitize"),
+		}
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: validationErr.Error()})
+		return Result{}, validationErr
 	}
 	cleaned := SanitizeMessage(subject + "\n\n" + bodyOut)
 	parts := strings.SplitN(cleaned, "\n\n", 2)
@@ -499,9 +508,11 @@ func (p *OpenAIProvider) RewriteIntentMessage(ctx context.Context, rewriteReq In
 		result.Body = parts[1]
 	}
 	if strings.TrimSpace(result.Subject) == "" {
-		err := errors.New("openai-compat: empty subject after intent message rewrite sanitize")
-		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: err.Error()})
-		return Result{}, err
+		validationErr := &IntentMessageRewriteValidationError{
+			Err: errors.New("openai-compat: empty subject after intent message rewrite sanitize"),
+		}
+		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, ValidationError: validationErr.Error()})
+		return Result{}, validationErr
 	}
 	p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{
 		StatusCode: resp.StatusCode,
@@ -567,6 +578,8 @@ func (p *OpenAIProvider) recordPromptResponse(ctx context.Context, model, strate
 	if meta.Model == "" {
 		meta.Model = model
 	}
+	response.Error = SanitizePlannerError(response.Error)
+	response.ValidationError = SanitizePlannerError(response.ValidationError)
 	meta = promptTraceMetadata(meta, p.Name(), meta.Model)
 	logger.Record(prompttrace.Record{
 		Stage:        "response",
@@ -1069,13 +1082,15 @@ func parseIntentPlanToolCall(raw []byte) (IntentPlan, error) {
 	}
 	var r respShape
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return IntentPlan{}, fmt.Errorf("openai-compat: parse response: %w", err)
+		cause := fmt.Errorf("openai-compat: parse response: %w", err)
+		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 	}
 	if r.Error != nil && r.Error.Message != "" {
 		return IntentPlan{}, fmt.Errorf("openai-compat: api error: %s", r.Error.Message)
 	}
 	if len(r.Choices) == 0 {
-		return IntentPlan{}, errors.New("openai-compat: no choices in response")
+		cause := errors.New("openai-compat: no choices in response")
+		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 	}
 	msg := r.Choices[0].Message
 
@@ -1083,21 +1098,25 @@ func parseIntentPlanToolCall(raw []byte) (IntentPlan, error) {
 	switch {
 	case len(msg.ToolCalls) > 0 && msg.ToolCalls[0].Function.Arguments != "":
 		if msg.ToolCalls[0].Function.Name != "capture_intent_plan" {
-			return IntentPlan{}, fmt.Errorf("openai-compat: unexpected tool %q", msg.ToolCalls[0].Function.Name)
+			cause := fmt.Errorf("openai-compat: unexpected tool %q", msg.ToolCalls[0].Function.Name)
+			return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 		}
 		args = msg.ToolCalls[0].Function.Arguments
 	case msg.FunctionCall != nil && msg.FunctionCall.Arguments != "":
 		if msg.FunctionCall.Name != "capture_intent_plan" {
-			return IntentPlan{}, fmt.Errorf("openai-compat: unexpected function %q", msg.FunctionCall.Name)
+			cause := fmt.Errorf("openai-compat: unexpected function %q", msg.FunctionCall.Name)
+			return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 		}
 		args = msg.FunctionCall.Arguments
 	default:
-		return IntentPlan{}, errors.New("openai-compat: response carried no intent-plan tool_call arguments")
+		cause := errors.New("openai-compat: response carried no intent-plan tool_call arguments")
+		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 	}
 
 	var plan IntentPlan
 	if err := json.Unmarshal([]byte(args), &plan); err != nil {
-		return IntentPlan{}, fmt.Errorf("openai-compat: parse intent-plan tool arguments: %w", err)
+		cause := fmt.Errorf("openai-compat: parse intent-plan tool arguments: %w", err)
+		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
 	}
 	return plan, nil
 }

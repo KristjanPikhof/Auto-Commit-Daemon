@@ -93,3 +93,12 @@ func TestScheduler_ZeroFieldsUseDefaults(t *testing.T) {
 		t.Fatalf("idle ceiling=%v want %v", d, DefaultSchedulerIdleCeiling)
 	}
 }
+
+func TestReplayRecaptureSchedulesImmediateFollowup(t *testing.T) {
+	if !replayNeedsImmediateFollowup(ReplaySummary{RecaptureRequired: true}) {
+		t.Fatal("recovered active chain would be delayed by idle scheduler backoff")
+	}
+	if replayNeedsImmediateFollowup(ReplaySummary{}) {
+		t.Fatal("empty replay summary unexpectedly schedules an immediate follow-up")
+	}
+}

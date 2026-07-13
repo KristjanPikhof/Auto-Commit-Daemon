@@ -20,6 +20,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -88,11 +89,11 @@ type diagnoseReport struct {
 	OperationMarkerDuration    string                          `json:"operation_marker_duration,omitempty"`
 	// DeadBranchPruneLastRunTS / DeadBranchPruneLastCount /
 	// DeadBranchPruneLastRefs surface the most recent non-empty dead-branch
-	// terminal prune action so operators can confirm stale-branch hygiene
+	// recovery action so operators can confirm stale-branch hygiene
 	// is keeping pace. The two int fields are ALWAYS present in the JSON —
 	// a zero value is the documented "daemon has never recorded a non-empty
-	// prune" sentinel, distinguishable from any real prune (real prunes
-	// stamp last_run_ts to the wall-clock unix-second the prune ran and
+	// recovery" sentinel, distinguishable from any real recovery (real actions
+	// stamp last_run_ts to the wall-clock unix-second the recovery ran and
 	// last_count >= 1). The slice keeps `omitempty` so an empty list
 	// serializes as absent rather than `null`/`[]`.
 	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts"`
@@ -376,12 +377,11 @@ func diagnoseGeneratedPending(ctx context.Context, conn *sql.DB, repo string, re
 	return nil
 }
 
-// diagnoseDeadBranchPrune surfaces the daemon-recorded "last non-empty
-// dead-branch prune action" via three meta keys stamped by
-// daemon.recordDeadBranchPruneMeta:
+// diagnoseDeadBranchPrune surfaces the daemon-recorded last non-empty
+// dead-branch recovery action through legacy prune-named meta keys:
 //
 //   - dead_branch_prune.last_run_ts   unix seconds (string-encoded int)
-//   - dead_branch_prune.last_count    rows pruned (string-encoded int)
+//   - dead_branch_prune.last_count    rows recovered (string-encoded int)
 //   - dead_branch_prune.last_refs     JSON-encoded []string of refs
 //
 // Missing keys default to zero / nil. The two int fields render as 0 in the
@@ -654,6 +654,28 @@ func diagnoseRemediation(report diagnoseReport) []string {
 			fmt.Sprintf("capture is in durable backpressure (paused at %s, %d events dropped lifetime); replay must drain pending below the high-water mark, or run `acd resume --accept-overflow` to clear the gate and accept the loss.",
 				report.BackpressurePausedAt, report.EventsDroppedTotal))
 	}
+	if report.IntentStrategy.PlannerHealthWarning != "" {
+		remediation = append(remediation,
+			"Intent planner health metadata is invalid or unsupported; detailed circuit state was omitted and state.db was left unchanged. Check daemon logs and update ACD if the stored record uses a newer schema.")
+	}
+	if health := report.IntentStrategy.PlannerHealth; health != nil {
+		switch health.State {
+		case daemon.IntentPlannerCircuitOpen:
+			nextProbe := "when its backoff expires"
+			if health.NextProbeTS > 0 {
+				nextProbe = "at " + time.Unix(int64(health.NextProbeTS), 0).UTC().Format(time.RFC3339)
+			}
+			remediation = append(remediation,
+				fmt.Sprintf("intent planner circuit is open after %d consecutive %s failure(s); deterministic fallback remains active until the next provider probe %s. Check provider connectivity and configuration; for validation failures, review .git/acd/%s.",
+					health.ConsecutiveFailures,
+					valueOrUnset(string(health.LastFailureClass)),
+					nextProbe,
+					ai.IntentRejectsFileName))
+		case daemon.IntentPlannerCircuitHalfOpen:
+			remediation = append(remediation,
+				"intent planner circuit is half-open with one provider probe in progress; deterministic fallback remains active for other planning windows until that probe succeeds.")
+		}
+	}
 	if report.IntentStrategy.LastPlannerError != "" {
 		remediation = append(remediation,
 			fmt.Sprintf("intent planner last failed validation for seq %d (%s); replay will use deterministic fallback until planner output is valid.",
@@ -796,11 +818,11 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 	}
 
-	// Dead-branch prune surface. Zero last_run_ts means the daemon has
-	// never recorded a non-empty prune — render nothing in that case so a
+	// Dead-branch recovery surface. Zero last_run_ts means the daemon has
+	// never recorded a non-empty recovery — render nothing in that case so a
 	// fresh repo's diagnose output is not cluttered with "never ran" noise.
 	if r.DeadBranchPruneLastRunTS > 0 {
-		fmt.Fprintf(out, "Dead-branch prune: %d row(s) pruned at %s, refs=%v\n",
+		fmt.Fprintf(out, "Dead-branch recovery: %d row(s) preserved at %s, branches=%v\n",
 			r.DeadBranchPruneLastCount,
 			time.Unix(r.DeadBranchPruneLastRunTS, 0).Format(time.RFC3339),
 			r.DeadBranchPruneLastRefs,

@@ -161,6 +161,33 @@ func DeleteShadowGeneration(ctx context.Context, d *DB, branchRef string, gen in
 	return int(n), nil
 }
 
+// InvalidateShadowGeneration atomically removes one exact shadow pair and its
+// bootstrap marker. Branch-transition rollback uses this when a token changes
+// after a prospective reseed: leaving either rows or marker behind could make
+// the next tick accept a shadow built from the wrong HEAD.
+func InvalidateShadowGeneration(ctx context.Context, d *DB, branchRef string, gen int64, markerKey string) error {
+	if d == nil || branchRef == "" || gen < 1 || markerKey == "" {
+		return fmt.Errorf("state: InvalidateShadowGeneration: invalid selector")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("state: invalidate shadow generation: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
+		branchRef, gen); err != nil {
+		return fmt.Errorf("state: invalidate shadow generation rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, markerKey); err != nil {
+		return fmt.Errorf("state: invalidate shadow generation marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: invalidate shadow generation: commit: %w", err)
+	}
+	return nil
+}
+
 // PruneShadowGenerations deletes shadow rows for branch generations older than
 // the configured retention window behind currentGeneration. retainBehind is the
 // number of prior generations to keep in addition to the current generation.

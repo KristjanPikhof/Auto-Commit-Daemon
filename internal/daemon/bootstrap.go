@@ -235,10 +235,8 @@ func ReseedShadowFromHead(ctx context.Context, repoDir string, db *state.DB, cct
 	if cctx.BranchRef == "" {
 		return 0, fmt.Errorf("daemon: ReseedShadowFromHead: empty branch_ref")
 	}
-	if _, err := state.DeleteShadowGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration); err != nil {
-		return 0, err
-	}
-	if _, err := state.MetaDelete(ctx, db, ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration)); err != nil {
+	if err := state.InvalidateShadowGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration,
+		ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration)); err != nil {
 		return 0, err
 	}
 	return BootstrapShadow(ctx, repoDir, db, cctx)

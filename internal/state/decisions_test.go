@@ -177,8 +177,8 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PruneTerminalEventsBefore: %v", err)
 	}
-	if terminalPruned != 2 {
-		t.Fatalf("terminal pruned = %d, want 2", terminalPruned)
+	if terminalPruned != 0 {
+		t.Fatalf("terminal pruned = %d, want 0 without recovery refs", terminalPruned)
 	}
 
 	for _, seq := range seqs {
@@ -187,8 +187,12 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&eventCount); err != nil {
 			t.Fatalf("count event %d: %v", seq, err)
 		}
-		if eventCount != 0 {
-			t.Fatalf("capture event %d survived prune", seq)
+		wantEventCount := 1
+		if seq == seqs[0] {
+			wantEventCount = 0
+		}
+		if eventCount != wantEventCount {
+			t.Fatalf("capture event %d count=%d want %d", seq, eventCount, wantEventCount)
 		}
 		got, err := DecisionsForEvent(ctx, d, seq, 10)
 		if err != nil {

@@ -14,9 +14,8 @@ import (
 	"time"
 )
 
-// TestSelfHeal_BlockedPromotesToPublishedOnReplay drives Wave 2's idempotent
-// self-heal probe (probeBlockedSelfHeal in internal/daemon/replay.go) through
-// the real daemon. Scenario:
+// TestSelfHeal_BlockedPromotesToPublishedOnReplay drives exact-chain
+// reconciliation through the real daemon. Scenario:
 //
 //  1. Seed a baseline commit so the tracked path exists in HEAD with
 //     before_oid resolvable to a real blob.
@@ -27,14 +26,18 @@ import (
 //     update-ref) that contains exactly after_oid at the same path. This
 //     advances HEAD without going through acd, so daemon sees its captured
 //     intent already on disk.
-//  4. Wake the session. probeBlockedSelfHeal must:
+//  4. Wake the session. The runtime branch-transition gate must:
 //     * promote the row state blocked_conflict -> published with
 //     commit_oid = HEAD,
-//     * append decision_records kind=handled_external_after_block,
-//     * upsert publish_state singleton status=published,
+//     * append decision_records kind=recovery_published,
+//     * create an exact one-event recovery snapshot and protected proof ref,
 //     * NOT mint a new commit (HEAD unchanged after settle).
+//
+// The branch-transition gate intentionally runs before replay, so the legacy
+// handled_external_after_block probe is not reached when HEAD has advanced.
 func TestSelfHeal_BlockedPromotesToPublishedOnReplay(t *testing.T) {
 	requireSQLite(t)
+	t.Parallel()
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
@@ -127,22 +130,7 @@ VALUES (last_insert_rowid(), 0, 'modify', 'self-heal.txt', '%s', '100644', '%s',
 		t.Fatalf("published commit_oid=%q want external HEAD %q", publishedOID, externalHead)
 	}
 
-	// decision_records: exactly one handled_external_after_block for this seq.
-	decisionCount := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT COUNT(*) FROM decision_records WHERE event_seq = %s AND kind = 'handled_external_after_block'", blockedSeq))
-	if decisionCount != "1" {
-		dump, _ := exec.Command("sqlite3", dbPath,
-			"SELECT id,kind,event_seq,reason FROM decision_records ORDER BY id").CombinedOutput()
-		t.Fatalf("handled_external_after_block decision count=%s want 1\nrows:\n%s", decisionCount, dump)
-	}
-
-	// publish_state singleton flips to status='published'.
-	pubStatus := sqliteScalar(t, dbPath, "SELECT status FROM publish_state WHERE id = 1")
-	if pubStatus != "published" {
-		dump, _ := exec.Command("sqlite3", dbPath,
-			"SELECT id,status,event_seq,target_commit_oid,error FROM publish_state").CombinedOutput()
-		t.Fatalf("publish_state.status=%q want published\nrows:\n%s", pubStatus, dump)
-	}
+	assertPublishedRecoverySnapshot(t, repo, dbPath, blockedSeq, externalHead, "runtime_branch_transition")
 
 	// HEAD must NOT advance past the external commit. Self-heal cannot mint
 	// a fresh commit.
@@ -158,6 +146,45 @@ VALUES (last_insert_rowid(), 0, 'modify', 'self-heal.txt', '%s', '100644', '%s',
 	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "3" {
 		log := runGitOK(t, repo, "log", "--oneline", "--decorate", "--all")
 		t.Fatalf("commit count=%s want 3 (seed + baseline + external)\nlog:\n%s", count, log)
+	}
+}
+
+// assertPublishedRecoverySnapshot proves that an externally published event
+// has both durable SQLite membership and a live hidden Git proof ref.
+func assertPublishedRecoverySnapshot(t *testing.T, repo, dbPath, eventSeq, wantCommit, wantReason string) {
+	t.Helper()
+	snapshotID := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT snapshot_id FROM recovery_snapshot_events WHERE event_seq = %s", eventSeq))
+	if snapshotID == "" {
+		t.Fatalf("event seq=%s has no recovery snapshot membership", eventSeq)
+	}
+	wantSummary := fmt.Sprintf("published|1|%s|%s|%s|%s", eventSeq, eventSeq, wantCommit, wantReason)
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
+SELECT outcome || '|' || event_count || '|' || first_event_seq || '|' ||
+       last_event_seq || '|' || commit_oid || '|' || reason
+FROM recovery_snapshots WHERE id = %s`, snapshotID)); got != wantSummary {
+		t.Fatalf("recovery snapshot summary=%q want %q", got, wantSummary)
+	}
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
+SELECT COUNT(*) FROM recovery_snapshot_events
+WHERE snapshot_id = %s AND ord = 0 AND event_seq = %s`, snapshotID, eventSeq)); got != "1" {
+		t.Fatalf("recovery snapshot membership=%s want 1", got)
+	}
+	recoveryRef := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT recovery_ref FROM recovery_snapshots WHERE id = %s", snapshotID))
+	if !strings.HasPrefix(recoveryRef, "refs/acd/recovery/") || !strings.HasSuffix(recoveryRef, "/published") {
+		t.Fatalf("recovery ref=%q want refs/acd/recovery/.../published", recoveryRef)
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "show-ref", "--hash", "--verify", recoveryRef)); got != wantCommit {
+		t.Fatalf("recovery ref resolves to %q want external commit %q", got, wantCommit)
+	}
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
+SELECT COUNT(*) FROM decision_records
+WHERE event_seq = %s AND kind = 'recovery_published' AND reason = %s`,
+		eventSeq, sqliteQuote(wantReason))); got != "1" {
+		dump, _ := exec.Command("sqlite3", dbPath,
+			"SELECT id,kind,event_seq,reason FROM decision_records ORDER BY id").CombinedOutput()
+		t.Fatalf("recovery_published decision count=%s want 1\nrows:\n%s", got, dump)
 	}
 }
 

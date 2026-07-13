@@ -23,11 +23,15 @@ import (
 //     terminal — a stuck event would otherwise re-run on every poll tick and
 //     prevent later events from making progress (they would replay on top of a
 //     broken predecessor).
+//   - EventStateRecovered: an unpublished chain was preserved by a durable
+//     recovery snapshot/ref. It is terminal, non-pending, and never a replay
+//     barrier; recovery_snapshot_events retains exact chain membership.
 const (
 	EventStatePending         = "pending"
 	EventStatePublished       = "published"
 	EventStateFailed          = "failed"
 	EventStateBlockedConflict = "blocked_conflict"
+	EventStateRecovered       = "recovered"
 )
 
 // CaptureEvent is one row of capture_events (§6.1). seq is autoincrement and
@@ -44,7 +48,7 @@ type CaptureEvent struct {
 	Fidelity         string
 	CapturedTS       float64
 	PublishedTS      sql.NullFloat64
-	State            string // EventState* constant ("pending"|"published"|"failed"|"blocked_conflict")
+	State            string // EventState* lifecycle constant.
 	CommitOID        sql.NullString
 	Error            sql.NullString
 	Message          sql.NullString
@@ -671,14 +675,20 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 	return out, nil
 }
 
-// PrunePublishedEventsBefore deletes capture_events rows whose state is
-// 'published' (terminal success) AND whose captured_ts is strictly older
-// than cutoff. Returns the number of rows removed.
+// PrunePublishedEventsBefore deletes old published rows that do not belong to
+// a recovery snapshot. Snapshot members require repo-aware Git-ref locking and
+// are pruned separately by the daemon, regardless of whether reconciliation
+// classified them as published or recovered.
 func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
-	res, err := d.conn.ExecContext(ctx,
-		`DELETE FROM capture_events WHERE state = 'published' AND captured_ts < ?`,
-		cutoff,
-	)
+	res, err := d.conn.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE state = 'published'
+  AND captured_ts < ?
+  AND NOT EXISTS (
+      SELECT 1
+      FROM recovery_snapshot_events member
+      WHERE member.event_seq = capture_events.seq
+  )`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune published events: %w", err)
 	}
@@ -689,237 +699,45 @@ func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int
 	return int(n), nil
 }
 
-// DeletePendingForGeneration deletes queued, unpublished events for a stale
-// branch generation after the daemon has classified a branch transition as
-// Diverged. Terminal rows are intentionally retained for operator review, and
-// published rows are never touched.
-func DeletePendingForGeneration(ctx context.Context, d *DB, branchGeneration int64) (int, error) {
-	res, err := d.conn.ExecContext(ctx,
-		`DELETE FROM capture_events WHERE state = ? AND branch_generation = ?`,
-		EventStatePending, branchGeneration,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("state: delete pending generation %d: %w", branchGeneration, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("state: delete pending generation rows: %w", err)
-	}
-	return int(n), nil
-}
-
-// DeletePendingForBranchGeneration is the branch-scoped variant of
-// DeletePendingForGeneration: it deletes queued, unpublished events restricted
-// to (branch_ref, branch_generation). Used by `acd commit-all` to clear stale
-// pending rows for the active branch before forcing a shadow reseed; the broad
-// generation-only variant would also nuke rows on co-existing refs that happen
-// to share the generation number. Terminal rows (`published`, `failed`,
-// `blocked_conflict`) are never touched — operators inspect those.
-func DeletePendingForBranchGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
-	if branchRef == "" {
-		return 0, fmt.Errorf("state: DeletePendingForBranchGeneration: empty branch_ref")
-	}
-	res, err := d.conn.ExecContext(ctx,
-		`DELETE FROM capture_events WHERE state = ? AND branch_ref = ? AND branch_generation = ?`,
-		EventStatePending, branchRef, branchGeneration,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("state: delete pending branch %q generation %d: %w", branchRef, branchGeneration, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("state: delete pending branch generation rows: %w", err)
-	}
-	return int(n), nil
-}
-
-// DeleteStaleUnpublishedForBranchGeneration deletes queued/unpublished rows for
-// the active branch generation whose base_head no longer matches the current
-// branch head. This is used after an external same-branch fast-forward: the
-// worktree will be reclassified against the new HEAD, so old snapshots should
-// not replay or remain as barriers.
-func DeleteStaleUnpublishedForBranchGeneration(ctx context.Context, d *DB, branchRef string, branchGeneration int64, currentHead string) (int, error) {
-	if branchRef == "" {
-		return 0, fmt.Errorf("state: DeleteStaleUnpublishedForBranchGeneration: empty branch_ref")
+// PruneRecoverySnapshotEventsBefore removes old published or recovered rows
+// belonging to one recovery snapshot. The caller must hold a Git transaction
+// lock that verifies recovery_snapshots.recovery_ref still resolves exactly to
+// recovery_snapshots.commit_oid for the duration of this statement.
+func PruneRecoverySnapshotEventsBefore(ctx context.Context, d *DB, snapshotID int64, cutoff float64) (int, error) {
+	if d == nil || snapshotID < 1 {
+		return 0, fmt.Errorf("state: PruneRecoverySnapshotEventsBefore: invalid selector")
 	}
 	res, err := d.conn.ExecContext(ctx, `
 DELETE FROM capture_events
-WHERE branch_ref = ?
-  AND branch_generation = ?
-  AND base_head <> ?
-  AND state IN (?, ?)`,
-		branchRef, branchGeneration, currentHead,
-		EventStatePending, EventStateBlockedConflict)
-	if err != nil {
-		return 0, fmt.Errorf("state: delete stale unpublished branch generation: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("state: delete stale unpublished branch generation rows: %w", err)
-	}
-	return int(n), nil
-}
-
-// PruneTerminalEventsBefore deletes stale terminal failure rows whose state is
-// 'blocked_conflict' or 'failed'. Rows that still form a replay barrier are
-// preserved: if a later pending event exists for the same branch ref and
-// generation, deleting the terminal predecessor would let that pending event
-// leapfrog a broken replay history.
-//
-// CASCADE on capture_ops drops matching op rows in the same transaction.
-func PruneTerminalEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
-	res, err := d.conn.ExecContext(ctx, `
-DELETE FROM capture_events
-WHERE state IN ('blocked_conflict', 'failed')
+WHERE state IN ('published', 'recovered')
   AND captured_ts < ?
-  AND NOT EXISTS (
+  AND EXISTS (
       SELECT 1
-      FROM capture_events pending
-      WHERE pending.branch_ref = capture_events.branch_ref
-        AND pending.branch_generation = capture_events.branch_generation
-        AND pending.seq > capture_events.seq
-        AND pending.state = 'pending'
-  )`, cutoff)
+      FROM recovery_snapshot_events member
+      WHERE member.snapshot_id = ?
+        AND member.event_seq = capture_events.seq
+  )`, cutoff, snapshotID)
 	if err != nil {
-		return 0, fmt.Errorf("state: prune terminal events: %w", err)
+		return 0, fmt.Errorf("state: prune protected recovery snapshot events: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("state: prune terminal events rows: %w", err)
+		return 0, fmt.Errorf("state: prune protected recovery snapshot event rows: %w", err)
 	}
 	return int(n), nil
 }
 
-// PurgeUnpublishedForDeadBranch deletes both pending and terminal
-// (blocked_conflict, failed) capture_events rows for a (branch_ref,
-// branch_generation) pair whose branch ref has since been deleted. Published
-// rows are never touched. If a deleted row was referenced by the
-// publish_state singleton (status='blocked_conflict'), that barrier is
-// lifted and the breadcrumb meta keys (last_replay_conflict,
-// last_replay_conflict_legacy, last_replay_error) are cleared in the same
-// transaction so `acd status` / `acd diagnose` read clean immediately.
-//
-// Empty branchRef returns an error. Returns the total number of capture_events
-// rows deleted (pending + terminal combined). Caller is responsible for
-// confirming the ref is actually dead before invoking — the helper does no
-// liveness check itself.
-//
-// Why pending matters here: leaving pending rows behind while deleting their
-// terminal predecessor lets PendingEvents re-expose them on the next replay
-// pass; replay then re-evaluates them against the (now-irrelevant) prior
-// generation, mismatches in `checkEventGeneration`, and stamps a fresh
-// blocked_conflict, defeating the prune entirely. Pending + terminal must
-// drop together for the dead-branch case.
-func PurgeUnpublishedForDeadBranch(ctx context.Context, d *DB, branchRef string, branchGeneration int64) (int, error) {
-	if branchRef == "" {
-		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: empty branch_ref")
-	}
-	tx, err := d.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	blockedSeqs := make(map[int64]struct{})
-	blockedRows, err := tx.QueryContext(ctx, `
-SELECT seq
-FROM capture_events
-WHERE branch_ref = ?
-  AND branch_generation = ?
-  AND state = ?`,
-		branchRef, branchGeneration, EventStateBlockedConflict)
-	if err != nil {
-		return 0, fmt.Errorf("state: load dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
-	}
-	for blockedRows.Next() {
-		var seq int64
-		if err := blockedRows.Scan(&seq); err != nil {
-			_ = blockedRows.Close()
-			return 0, fmt.Errorf("state: scan dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
-		}
-		blockedSeqs[seq] = struct{}{}
-	}
-	if err := blockedRows.Close(); err != nil {
-		return 0, fmt.Errorf("state: close dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
-	}
-	if err := blockedRows.Err(); err != nil {
-		return 0, fmt.Errorf("state: iterate dead-branch blocked seqs %q generation %d: %w", branchRef, branchGeneration, err)
-	}
-
-	res, err := tx.ExecContext(ctx, `
-DELETE FROM capture_events
-WHERE branch_ref = ?
-  AND branch_generation = ?
-  AND state IN (?, ?, ?)`,
-		branchRef, branchGeneration,
-		EventStatePending, EventStateBlockedConflict, EventStateFailed,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("state: purge unpublished branch %q generation %d: %w", branchRef, branchGeneration, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("state: purge unpublished branch generation rows: %w", err)
-	}
-
-	// Lift the barrier in publish_state if it referenced a row we just
-	// deleted. The singleton row is keyed at id=1; clear status + error so
-	// `acd status` reads "ok" immediately and the breadcrumbs do not point
-	// at a row that no longer exists. Mirrors the pattern in
-	// internal/cli/purge.go (the operator-driven `acd purge-events`).
-	nowSec := nowSeconds()
-	var pubRows int64
-	if len(blockedSeqs) > 0 {
-		var pubSeq sql.NullInt64
-		var pubBranchRef sql.NullString
-		var pubBranchGeneration sql.NullInt64
-		err = tx.QueryRowContext(ctx, `
-SELECT event_seq, branch_ref, branch_generation
-FROM publish_state
-WHERE id = 1 AND status = 'blocked_conflict'`,
-		).Scan(&pubSeq, &pubBranchRef, &pubBranchGeneration)
-		if err != nil && err != sql.ErrNoRows {
-			return 0, fmt.Errorf("state: load publish_state for dead branch %q: %w", branchRef, err)
-		}
-		if err == nil &&
-			pubSeq.Valid &&
-			pubBranchRef.Valid && pubBranchRef.String == branchRef &&
-			pubBranchGeneration.Valid && pubBranchGeneration.Int64 == branchGeneration {
-			if _, ok := blockedSeqs[pubSeq.Int64]; ok {
-				pubRes, err := tx.ExecContext(ctx, `
-UPDATE publish_state
-SET status = 'ok', error = NULL, updated_ts = ?
-WHERE id = 1
-  AND status = 'blocked_conflict'
-  AND event_seq = ?
-  AND branch_ref = ?
-  AND branch_generation = ?`, nowSec, pubSeq.Int64, branchRef, branchGeneration)
-				if err != nil {
-					return 0, fmt.Errorf("state: clear publish_state for dead branch %q: %w", branchRef, err)
-				}
-				pubRows, _ = pubRes.RowsAffected()
-			}
-		}
-	}
-	if pubRows > 0 {
-		// Drop the human-readable breadcrumbs only when we actually lifted
-		// the singleton barrier — otherwise we'd be clearing breadcrumbs
-		// that belong to a different (live) branch's barrier.
-		for _, key := range []string{
-			"last_replay_conflict",
-			"last_replay_conflict_legacy",
-			"last_replay_error",
-		} {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
-				return 0, fmt.Errorf("state: clear daemon_meta %s for dead branch %q: %w", key, branchRef, err)
-			}
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("state: PurgeUnpublishedForDeadBranch: commit: %w", err)
-	}
-	return int(n), nil
+// PruneTerminalEventsBefore deliberately preserves every blocked_conflict and
+// failed row. A valid recovery snapshot transition changes those rows to
+// recovered/published atomically, so a terminal failure can never be both
+// snapshot-protected and still terminal. Keep this compatibility entry point
+// as an explicit no-op; protected-row retention belongs to the daemon's
+// Git-locked recovery-snapshot pruning path.
+func PruneTerminalEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
+	_ = ctx
+	_ = d
+	_ = cutoff
+	return 0, nil
 }
 
 // LatestEventSeq returns the highest seq value present, or 0 if the table is

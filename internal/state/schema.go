@@ -21,8 +21,9 @@ package state
 // for bounded intent-planner deferrals; v8 adds reusable rewrite plan storage;
 // v9 adds structured rewrite proposal failure storage; v10 preserves the
 // commit-message format used to validate rewrite plans; v11 adds durable
-// intent planner-window summaries for captured-vs-offered observability.
-const SchemaVersion = 11
+// intent planner-window summaries for captured-vs-offered observability; v12
+// adds immutable recovery snapshots with ordered, exact event membership.
+const SchemaVersion = 12
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -248,6 +249,46 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_event_seq_id
 
 CREATE INDEX IF NOT EXISTS idx_decision_records_commit_oid_id
     ON decision_records(commit_oid, id);
+
+-- v12: one durable record for an all-or-none unpublished-chain transition.
+-- capture event provenance remains on capture_events; this table records the
+-- terminal recovery outcome and the commit that makes the chain reachable.
+CREATE TABLE IF NOT EXISTS recovery_snapshots(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts          REAL NOT NULL,
+    outcome             TEXT NOT NULL CHECK (outcome IN ('published', 'recovered')),
+    branch_ref          TEXT NOT NULL,
+    branch_generation   INTEGER NOT NULL,
+    first_event_seq     INTEGER NOT NULL,
+    last_event_seq      INTEGER NOT NULL,
+    event_count         INTEGER NOT NULL CHECK (event_count > 0),
+    commit_oid          TEXT NOT NULL,
+    recovery_ref        TEXT NOT NULL CHECK (recovery_ref <> ''),
+    reason              TEXT,
+    CHECK (first_event_seq > 0 AND last_event_seq >= first_event_seq),
+    CHECK (recovery_ref <> '')
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_snapshots_anchor_id
+    ON recovery_snapshots(branch_ref, branch_generation, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_snapshots_recovery_ref
+    ON recovery_snapshots(recovery_ref)
+    WHERE recovery_ref IS NOT NULL;
+
+-- event_seq is deliberately denormalized without a capture_events foreign
+-- key, matching decision_records v6: snapshot membership must survive any
+-- future pruning of terminal capture rows. ord preserves exact chain order.
+CREATE TABLE IF NOT EXISTS recovery_snapshot_events(
+    snapshot_id         INTEGER NOT NULL,
+    ord                 INTEGER NOT NULL CHECK (ord >= 0),
+    event_seq           INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, ord),
+    FOREIGN KEY (snapshot_id) REFERENCES recovery_snapshots(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_snapshot_events_event_seq
+    ON recovery_snapshot_events(event_seq);
 
 CREATE TABLE IF NOT EXISTS publish_state(
     id                  INTEGER PRIMARY KEY CHECK (id = 1),

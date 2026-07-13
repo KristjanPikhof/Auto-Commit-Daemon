@@ -289,6 +289,30 @@ type MessageQualityError struct {
 	Cause    error
 }
 
+// IntentMessageRewriteValidationError identifies a rewrite response that was
+// received successfully but could not be decoded into a valid commit message.
+// It lets planner health distinguish malformed provider output from transport
+// failures that should open the circuit immediately.
+type IntentMessageRewriteValidationError struct{ Err error }
+
+func (e *IntentMessageRewriteValidationError) Error() string {
+	if e == nil || e.Err == nil {
+		return "intent message rewrite validation failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *IntentMessageRewriteValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func intentMessageRewriteSubjectEmpty(subject string) bool {
+	return strings.TrimSpace(reControl.ReplaceAllString(subject, "")) == ""
+}
+
 func (e *MessageQualityError) Error() string {
 	if e == nil {
 		return ""
@@ -301,6 +325,16 @@ func (e *MessageQualityError) Error() string {
 		return fmt.Sprintf("intent planner: %s: %s: %v", e.Provider, reason, e.Cause)
 	}
 	return fmt.Sprintf("intent planner: %s: %s", e.Provider, reason)
+}
+
+// Unwrap preserves provider failures from the message-rewrite round trip so
+// callers can distinguish transport and cancellation failures from a rewrite
+// that completed but still failed message-quality validation.
+func (e *MessageQualityError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 // IntentReasonCap bounds planner explanation fields before they are persisted
@@ -384,9 +418,25 @@ type IntentPlanValidationError struct {
 	Code    IntentPlanValidationCode
 	Seq     int64
 	Message string
+	cause   error
 }
 
 func (e *IntentPlanValidationError) Error() string { return e.Message }
+
+func (e *IntentPlanValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func intentPlanShapeValidationError(message string, cause error) *IntentPlanValidationError {
+	return &IntentPlanValidationError{
+		Code:    IntentPlanValidationShape,
+		Message: message,
+		cause:   cause,
+	}
+}
 
 // ValidateIntentPlan rejects malformed or incomplete planner output before it
 // can influence replay. All failures return *IntentPlanValidationError so the
