@@ -46,6 +46,9 @@ func (s *Store) Update(fn func(*Document) error) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("acd config: mkdir: %w", err)
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("acd config: chmod directory: %w", err)
+	}
 	lock, err := openLock(s.Roots.ConfigLockPath())
 	if err != nil {
 		return err
@@ -76,7 +79,7 @@ func openLock(path string) (*os.File, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("acd config: inspect lock: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("acd config: open lock: %w", err)
 	}
