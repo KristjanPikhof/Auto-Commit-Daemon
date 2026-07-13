@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -85,6 +86,138 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 			t.Errorf("output missing %q in:\n%s", want, got)
 		}
 	}
+}
+
+func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"saved-model"`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	baseline := cliRuntimeRevision(t, d, "baseline", 1)
+	candidate := cliRuntimeRevision(t, d, "candidate", 1)
+	request, ok, err := state.RequestConfigActivation(ctx, d, baseline.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("baseline request: %v %v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(ctx, d, request.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(ctx, d, request.ID, baseline.ID)
+	pending, ok, err := state.RequestConfigActivation(ctx, d, candidate.ID, sql.NullInt64{Int64: baseline.ID, Valid: true})
+	if err != nil || !ok {
+		t.Fatalf("candidate request: %v %v", ok, err)
+	}
+	_, _ = state.RejectConfigActivation(ctx, d, pending.ID, candidate.ID, "rejected")
+	unsafe := "https://user:password@provider.invalid api_key=sk-visible prompt=private repository_diff=secret provider_response=raw\x1b[31m"
+	if _, err := d.SQL().Exec(`UPDATE runtime_config_state SET last_error=? WHERE id=1`, unsafe); err != nil {
+		t.Fatal(err)
+	}
+	experiment, err := state.CreateConfigExperiment(ctx, d, state.ConfigExperimentInput{
+		BaselineRevisionID: baseline.ID, CandidateRevisionID: candidate.ID,
+		WindowBudget: 10, ExpiresTS: sql.NullFloat64{Float64: float64(time.Now().Add(time.Hour).Unix()), Valid: true},
+		FailurePolicy: "continue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	runtime := report.RuntimeConfig
+	if runtime.SavedGeneration != 1 || runtime.DesiredRevisionID != candidate.ID ||
+		runtime.AppliedRevisionID != baseline.ID || runtime.LastKnownGoodRevisionID != baseline.ID ||
+		runtime.Profile != "profile-a" || runtime.ApplyState != "rejected" ||
+		runtime.ApplyBoundary != "next_work_boundary" || runtime.Experiment == nil ||
+		runtime.Experiment.ID != experiment.ID || runtime.Experiment.WindowBudget != 10 {
+		t.Fatalf("runtime JSON projection = %+v", runtime)
+	}
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Runtime settings: rejected", "desired=", "known_good=", "boundary=next_work_boundary", "saved_generation=1", "Experiment #"} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human runtime output missing %q:\n%s", want, human.String())
+		}
+	}
+	combined := jsonOut.String() + human.String()
+	for _, forbidden := range []string{"user:password", "sk-visible", "private", "repository_diff=secret", "provider_response=raw", "\x1b"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("runtime observability leaked %q:\n%s", forbidden, combined)
+		}
+	}
+}
+
+func TestStatusRuntimeConfigPreV14MissingTablesReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if _, err := d.SQL().Exec(`
+DROP TABLE config_experiments;
+DROP TABLE config_activation_requests;
+DROP TABLE runtime_config_state;
+DROP TRIGGER config_revisions_no_update;
+DROP TRIGGER config_revisions_no_delete;
+DROP TABLE config_revisions;
+PRAGMA user_version=13;
+PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.RuntimeConfig.ApplyState != "unset" || report.RuntimeConfig.DesiredRevisionID != 0 {
+		t.Fatalf("old schema runtime projection = %+v", report.RuntimeConfig)
+	}
+	after, _ := fileSHA256(dbPath)
+	if before != after {
+		t.Fatalf("status mutated pre-v14 DB: %s -> %s", before, after)
+	}
+	conn, err := openStateDBReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var version, tables int
+	_ = conn.QueryRow(`PRAGMA user_version`).Scan(&version)
+	_ = conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'config_%'`).Scan(&tables)
+	if version != 13 || tables != 0 {
+		t.Fatalf("old schema changed: version=%d config_tables=%d", version, tables)
+	}
+}
+
+func cliRuntimeRevision(t *testing.T, d *state.DB, model string, generation int64) state.ConfigRevision {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"ai.model": model, "confirmations": []string{}})
+	revision, err := state.InsertConfigRevision(context.Background(), d, state.ConfigRevisionInput{
+		Snapshot: body, Profile: "profile-a", Scope: "repository", SourceGeneration: generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
 }
 
 func TestStatus_StaleHeartbeatOverlay(t *testing.T) {
