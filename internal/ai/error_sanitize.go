@@ -90,12 +90,11 @@ func sanitizePlannerErrorURL(raw string) string {
 	urlText, suffix := splitPlannerURLPunctuation(raw)
 	u, err := url.Parse(urlText)
 	if err != nil {
-		if i := strings.IndexAny(urlText, "?#"); i >= 0 {
-			urlText = urlText[:i]
-		}
-		return urlText + suffix
+		return "[REDACTED_URL]" + suffix
 	}
 	u.User = nil
+	u.Path = ""
+	u.RawPath = ""
 	u.RawQuery = ""
 	u.ForceQuery = false
 	u.Fragment = ""

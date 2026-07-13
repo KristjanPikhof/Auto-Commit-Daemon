@@ -50,10 +50,11 @@ func TestSanitizePlannerErrorBoundsAndNormalizes(t *testing.T) {
 	}
 }
 
-func TestSanitizePlannerErrorPreservesURLPunctuation(t *testing.T) {
-	raw := `openai-compat: Post "https://example.test/v1/chat/completions": timeout`
+func TestSanitizePlannerErrorRedactsURLPathAndPreservesPunctuation(t *testing.T) {
+	raw := `openai-compat: Post "https://example.test/v1/path-secret/chat/completions": timeout`
 	clean := SanitizePlannerError(raw)
-	if clean != raw {
-		t.Fatalf("clean=%q want %q", clean, raw)
+	want := `openai-compat: Post "https://example.test": timeout`
+	if clean != want {
+		t.Fatalf("clean=%q want %q", clean, want)
 	}
 }
