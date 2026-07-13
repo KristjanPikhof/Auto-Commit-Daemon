@@ -134,6 +134,55 @@ func TestCommitAll_RefusesWhileDaemonLockHeld(t *testing.T) {
 	}
 }
 
+func TestCommitAll_DryRunAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, false, true, true); err != nil {
+		t.Fatalf("runCommitAll dry-run with daemon.lock held: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.OK || !got.DryRun || got.PendingBefore == 0 {
+		t.Fatalf("unexpected dry-run result: %+v", got)
+	}
+}
+
+func TestCommitAll_CleanNoOpAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, true, false, true); err != nil {
+		t.Fatalf("runCommitAll clean no-op with daemon.lock held: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.OK || got.DryRun || got.PendingBefore != 0 {
+		t.Fatalf("unexpected clean no-op result: %+v", got)
+	}
+}
+
 // TestCommitAll_CleanWorktreeNoOp covers the success path on a clean worktree:
 // capture finds no events, command exits zero with PendingBefore=0.
 func TestCommitAll_CleanWorktreeNoOp(t *testing.T) {

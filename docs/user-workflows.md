@@ -408,7 +408,7 @@ Refusals:
 | Detached HEAD | Check out a branch. |
 | Git operation in progress | Finish the operation. |
 | Manual pause marker | `acd resume --yes` |
-| Per-repo daemon is running | `acd stop` first. |
+| Authorized mutation while the per-repo daemon is running | `acd stop` first. Dry-run and a clean no-op do not acquire `daemon.lock`. |
 | No initial commit | Create an initial commit. |
 
 ## Support bundle
