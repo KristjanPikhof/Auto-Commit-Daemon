@@ -143,6 +143,14 @@ settle window lets a burst of related edits reach one planner-visible window,
 while `acd flush --logical` still drains the current visible batch from an
 active harness session.
 
+If the configured planner times out or returns unsafe output, ACD commits with
+the deterministic planner instead of stalling the queue. A persisted circuit
+breaker pauses repeated provider calls for 30 seconds, then 2 minutes, then 10
+minutes. One probe is allowed after each cooldown, and a successful validated
+plan closes the circuit. Bare `acd` reports degraded fallback health;
+`acd status` and `acd diagnose` show the circuit state, failure count, bypass
+count, and next probe time.
+
 When one visible window contains separate intents, the planner prompt asks for
 ordered `commit_groups` so replay can publish atomic commits instead of forcing
 the whole window into one commit.
@@ -165,54 +173,76 @@ rules as the default format.
 
 ## Daily commands
 
+After setup, leave ACD running in the background. Use the three short commands
+below for normal health and lifecycle control; the hook protocol stays
+automatic.
+
 | Need | Command |
 |---|---|
-| Start or refresh the current repo daemon | `acd start` |
+| Check this repo and get one recommended next action | `acd` |
+| Enable ACD and ensure the daemon is running | `acd on` |
+| Disable ACD and stop the daemon without deleting state | `acd off` |
 | Watch all registered repos | `acd list` |
 | Show this repo state | `acd status` |
 | Follow capture, group, publish, and block decisions | `acd events --watch` |
 | Ask why a path behaved a certain way | `acd explain --path FILE` |
 | Ask what ACD did for a commit | `acd explain --commit HEAD` |
-| Flush the current visible intent batch from an active harness session | `acd flush --session-id "$ACD_SESSION_ID" --logical` |
-| Nudge capture and replay without bypassing intent batch gates | `acd wake --session-id "$ACD_SESSION_ID"` |
-| Stop this repo daemon | `acd stop` |
-| Stop every registered daemon | `acd stop --all` |
 | Tail the daemon log | `acd logs --follow` |
 | Create a support bundle | `acd doctor --bundle` |
 
-`acd start` resolves your current directory to the canonical Git worktree root,
-so calling it from a subdirectory refreshes the same daemon.
+Bare `acd` is read-only. `acd on` and `acd off` are idempotent, work from a
+subdirectory, and preserve `.git/acd/state.db`. Harness integrations continue
+to use the lower-level `start`, `wake`, `flush`, and `stop` commands.
 
 ## When commits stop
 
-Use the same ladder every time:
+ACD first tries to heal the queue itself. It reconciles the complete unpublished
+chain for one branch generation, never an isolated blocker:
+
+- If stable `HEAD` already has the chain's exact final touched-path state, ACD
+  marks the chain published and keeps a hidden proof ref.
+- Otherwise ACD writes the reconstructed tree to a hidden recovery ref, marks
+  the chain recovered, reseeds from `HEAD`, and captures the still-dirty
+  worktree again.
+- If objects are missing, the branch changes during proof, or a recovery ref
+  collides, ACD leaves the queue, live `HEAD`, index, and worktree unchanged.
+  A hidden evidence ref may remain so a safe retry can reuse the same tree.
+
+Start with the short read-only path:
 
 ~~~bash
-acd status
+acd
+acd diagnose
 acd events --watch
-acd explain --path path/to/file
-acd diagnose --json
+~~~
+
+Use `fix` when the daemon is stopped and you want to preview or run the same
+pair-level reconciliation manually:
+
+~~~bash
 acd fix --dry-run
 acd fix --yes
 acd status
 ~~~
 
-Only use the force path after the dry-run shows terminal barriers with pending
-successors and you have checked that the blocked changes are already in `HEAD`
-or should be discarded:
+`--force` means archive-only recovery. It does not purge, retarget, or discard
+captured events:
 
 ~~~bash
 acd fix --force --dry-run
 acd fix --force --yes
 ~~~
 
-`acd fix` backs up `state.db` before it mutates state and refuses to run while a
-live daemon owns the database. If the problem is only a manual pause marker,
-run:
+`acd fix` creates a SQLite-consistent backup before it mutates state and refuses
+to run while a live daemon owns the database. If the problem is only a manual
+pause marker, run:
 
 ~~~bash
 acd resume --yes
 ~~~
+
+To inspect or restore an archived chain, use the `/archive` ref printed by
+`acd events`; see [Inspect or restore archived work](docs/user-workflows.md#inspect-or-restore-archived-work).
 
 If `acd diagnose --json` reports generated pending deletes under a tracked
 cache directory such as `.derivedData-provider-core`, `acd fix --yes` cleans
@@ -235,16 +265,19 @@ acd commit-all --yes --json
 ~~~
 
 It refuses on detached HEAD, in-progress Git operations, manual pause markers,
-or while the per-repo daemon is alive.
+or while the per-repo daemon is alive. Dry-run and a declined confirmation are
+read-only: they do not capture files, start the AI provider, create recovery
+refs, or write ACD state. An incomplete drain exits non-zero and leaves the
+captured queue protected for diagnosis.
 
 ## Repo registration
 
 Most repos need no manual setup. Harness hooks call `acd start`, which creates
 `<gitDir>/acd/state.db` and registers the repo.
 
-Use explicit lifecycle commands when autodiscovery is disabled or when old rows
-need cleanup, or when you want to keep global autodiscovery on but exclude one
-repo:
+For normal use, prefer `acd on` and `acd off`. Use the explicit lifecycle
+commands below for bulk administration, registry cleanup, or when global
+autodiscovery is disabled:
 
 ~~~bash
 acd repo init

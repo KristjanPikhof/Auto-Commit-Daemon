@@ -2,10 +2,47 @@
 
 ## Unreleased
 
+### Added
+
+- Bare `acd` now gives a read-only health summary and one recommended next
+  action. `acd on` and `acd off` provide idempotent everyday controls while
+  preserving per-repo state.
+- Intent mode now persists planner circuit health. Transport failures open the
+  circuit immediately, repeated invalid plans open it after three failures,
+  and deterministic planning keeps commits moving during 30-second, 2-minute,
+  and 10-minute cooldowns.
+- Recovery snapshots and hidden `refs/acd/recovery/*` refs now preserve exact
+  unpublished branch-generation chains before ACD changes their queue state.
+
 ### Changed
 
+- Replay, branch transitions, dead-branch cleanup, `acd fix`, and `commit-all`
+  now reconcile whole unpublished chains. A stable exact `HEAD` match is proven
+  as published; any unresolved chain is archived without changing the live
+  worktree, index, or branch.
+- `acd fix --force` now selects archive-only recovery. It no longer purges
+  terminal barriers or retargets captures to a different branch generation.
+- `acd status` and `acd diagnose` now show planner circuit state, failures,
+  deterministic bypasses, and the next automatic provider probe.
 - Updated pinned GitHub Actions dependency `actions/setup-go` from `v6.4.0` to
   `v6.5.0`.
+
+### Fixed
+
+- `commit-all --dry-run`, JSON consent refusal, and declined confirmation now
+  leave ACD state and recovery refs unchanged and do not start the AI provider.
+- `acd fix` backups now include committed SQLite WAL frames and pass
+  `PRAGMA quick_check` before recovery mutation continues.
+- `acd fix` and `commit-all` now recheck branch, Git-operation, and manual-pause
+  safety at mutation boundaries instead of relying on an earlier plan snapshot.
+- `commit-all` now exits non-zero when unpublished events remain, instead of
+  reporting a partial drain as successful.
+- Intent `commit-all` now reuses the planner circuit across replay passes, so a
+  provider outage falls back once instead of repeating the remote timeout.
+- Recovery now proves grouped same-path commit prefixes cumulatively and keeps
+  each hidden evidence ref locked through its SQLite lifecycle transition.
+- Daemon shutdown now cancels and joins the asynchronous startup recovery sweep
+  before releasing the daemon lock or returning database ownership.
 
 ## v2026-06-26
 

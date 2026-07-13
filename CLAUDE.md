@@ -3,7 +3,7 @@
 ## Project
 
 - Static Go CLI/daemon for macOS/Linux `arm64`/`amd64`; no Windows v1.
-- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.26.4; `modernc.org/sqlite v1.52.0`; MIT.
+- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.26.4; `modernc.org/sqlite v1.53.0`; MIT.
 - Tags use `vYYYY-MM-DD`. Verify latest with `git tag --sort=-creatordate | head`; local latest at this refresh was `v2026-05-29`. `v2026-05-10` exists at `4d9dfef`. Do not move published tags unless requested.
 - `AGENTS.md -> CLAUDE.md`; edit `CLAUDE.md`, preserve the symlink.
 
@@ -49,7 +49,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands: setup, hooks, status, diagnose, doctor, fix, commit-all, start cache |
 | `internal/daemon` | run loop, capture/replay, intent, branch tokens, bootstrap/shadow, fsnotify, refcount, live-index repair, trace |
-| `internal/state` | SQLite v11: events/ops, decisions, planner_state, planner windows, shadow/meta/clients/flush/safe-ignore/sensitive |
+| `internal/state` | SQLite v12: events/ops, decisions, planner state/windows, recovery snapshots, shadow/meta/clients/flush/safe-ignore/sensitive |
 | `internal/git` | bounded refs/tree/diff/blob/scratch-index/history/ignore helpers |
 | `internal/ai` | deterministic/openai-compat/subprocess providers, commit message prompts, intent planner |
 | `internal/adapter` | harness detection and markers; do not restore TODO stubs |
@@ -104,7 +104,7 @@ Line 3+: bullet list for why/context
 
 - Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG state/share.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2. `acd stop` removes matching/all caches. Atomic tmp+rename prevents corruption.
-- `SchemaVersion = 11`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`; v8-v9 rewrite-plan state; v10 `rewrite_plans.commit_format`; v11 `intent_planner_windows`.
+- `SchemaVersion = 12`: v5 `decision_records`; v6 `decision_records.event_seq`; v7 `planner_state`; v8-v9 rewrite-plan state; v10 `rewrite_plans.commit_format`; v11 `intent_planner_windows`; v12 `recovery_snapshots` plus ordered membership.
 - `shadow_paths` key `(branch_ref, branch_generation, path)`; read-heavy paths use `state.DB.ReadSQL()`.
 - Shadow bootstrap: 5000-row chunks; marker `shadow.bootstrapped:<branch_ref>:<generation>` only after all chunks commit; clean partial rows on failure. Empty active shadow with marker means delete marker and re-bootstrap.
 - Reseed prunes old generations via `ACD_SHADOW_RETENTION_GENERATIONS` default `1`.
@@ -112,8 +112,8 @@ Line 3+: bullet list for why/context
 - Detached HEAD pauses capture/replay and `acd start` refuses. Never fall back to `refs/heads/main` when `git symbolic-ref` fails.
 - Git-op markers pause capture/replay: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`. Non-`ErrNotExist` stat errors fail open.
 - Same-branch rewinds set `daemon_meta.replay.paused_until = now + ACD_REWIND_GRACE_SECONDS`; `0` disables. Manual `<gitDir>/acd/paused` wins.
-- Diverged drops stale `pending` for prior generation, keeps `published`, and handles dead refs through `state.PurgeUnpublishedForDeadBranch`. Live refs preserve blockers.
-- Dead-branch startup sweep runs after running-mode publish, honors manual pause and `ACD_KEEP_DEAD_BRANCH_BARRIERS=1`, stamps `dead_branch_prune.{last_run_ts,last_count,last_refs}`, and surfaces in `acd diagnose --json`. SQLite pause-read errors fail closed.
+- Diverged recovery proves or archives every exact unpublished `(branch_ref, generation)` chain under `refs/acd/recovery/*` before transition acceptance. It never retargets captures to a new generation. Live refs preserve blockers.
+- Dead-branch startup sweep runs after running-mode publish, archives complete unpublished pairs before cleanup, rechecks the missing ref and pause/git-op state immediately before each pair, honors `ACD_KEEP_DEAD_BRANCH_BARRIERS=1`, stamps `dead_branch_prune.{last_run_ts,last_count,last_refs}`, and surfaces as dead-branch recovery in `acd diagnose --json`. SQLite pause-read errors fail closed.
 - Capture compares live worktree to shadow; stale/missing bootstrap creates phantom creates.
 - `walkLive` BFSes by directory; ignore checks batched (`ignoreCheckBatchSize=1000`); ignored/sensitive/safe-ignore dirs pruned before readdir.
 - Never prune worktree-rooted `acd/`; `.git/acd` is daemon state. Symlink mode is `120000`; never descend.
@@ -132,11 +132,14 @@ Line 3+: bullet list for why/context
 - Same-path coalesce is legacy opt-in with truthy `ACD_INTENT_PATH_COALESCE`. By default, consecutive same-path captures remain separate planner-visible seqs. If coalescing is enabled, boundaries are different path, multi-path, rename, delete, or `(branch_ref, branch_generation, base_head)` change. On success every original seq is marked published with the same `commit_oid`; `acd events --json grouped_seqs` and planner-window `hidden_seqs` show the run.
 - Planner windows persist in `intent_planner_windows`/`intent_planner_window_events`: offered seqs, visible original seqs, hidden/coalesced seqs, selected groups, deferred seqs/reasons, forced/fallback metadata, provider/model/source/format, and per-event flags. They are privacy-safe summaries, not raw diffs.
 - Planner rejects log: `<gitDir>/acd/planner-rejects.jsonl`, 5 MiB + `.1`, best effort. Fields include `ts`, `provider`, `offered_seqs`, `code`, `message`, raw response size, sha256, and parsed-plan summary. `raw_response` is redacted by default; verbatim only with truthy `ACD_INTENT_REJECTS_RAW`, which logs a startup warning.
-- `acd status --json` and `acd diagnose --json` expose `intent_strategy`, including settle fields, `last_planner_window`, and recent planner/singleton rates over fixed denominator 100. `diagnose` hints when `planner_error_rate_recent > 0.05`.
+- Planner health persists as versioned JSON in `daemon_meta.intent.planner.health`. Transport failures open immediately; three consecutive validation/safety failures open; cooldowns are 30s, 2m, 10m; one half-open probe runs after cooldown while other windows use deterministic fallback. Provider identity is secret-safe hashed metadata.
+- `acd status --json` and `acd diagnose --json` expose `intent_strategy`, including settle fields, `last_planner_window`, `planner_health`, and recent planner/singleton rates over fixed denominator 100. `diagnose` hints when `planner_error_rate_recent > 0.05`; open-circuit guidance says deterministic fallback and automatic probe, not restart.
 - Per-pass scratch index `<gitDir>/acd/replay-*.index` is seeded from `cctx.BaseHead`; reads via `git.LsFilesIndex(...)`.
 - CAS targets literal `HEAD` via `git.UpdateRef`; named refs use `--no-deref`.
 - `DefaultReplayLimit = 64`; query `Limit+1`, trim, set `ReplaySummary.HasMore`. `DefaultReplayPerEventTimeout = 60s`; timeout/cancel marks event `failed` and stops batch.
 - `blocked_conflict`/`failed` are terminal seq barriers; `PendingEvents` hides later pending behind prior terminal rows for same branch/generation.
+- Whole-chain reconciliation starts at the earliest unpublished seq for the exact pair. Stable `HEAD` plus ancestry and final touched-state proof marks every member published under a `/published` proof ref; otherwise archive mode reconstructs from immutable provenance under an `/archive` ref and marks every member `recovered`. Missing objects, partial proof, ref collisions, or live-state races cause zero DB transition.
+- Active archive recovery atomically invalidates the exact shadow pair, then the run loop reseeds from `HEAD` and recaptures the still-dirty worktree. Reconciliation never changes live `HEAD`, index, or worktree.
 - Idempotent publish checks current `HEAD` before before-state blocking; matching desired blob/mode/absence means publish with `commit_oid=HEAD`.
 - `superseded_external` requires bounded history proof, parent/base tree match, and live worktree before-state match. Incomplete proof means no supersede.
 - Live-index reconciliation is guarded/path-scoped and must not overwrite user-staged changes. See `internal/git/tree.go`, `internal/daemon/replay.go`, `internal/daemon/live_index_repair.go`.
@@ -158,7 +161,8 @@ Line 3+: bullet list for why/context
 - Status JSON includes `decision_counts`, `recent_decisions`, `decision_cursor`, `failed_events`, `failed_blocking_pending`, `intent_strategy`. `explain --since` summarizes newest post-cursor decision.
 - `acd doctor` detects drift when active hooks lack both `acd start` and `acd wake`, falls back on EACCES/EIO, tails Codex hook log, and surfaces error count plus first line.
 - `acd setup <harness> --raw` emits only snippet body. Default keeps comment-wrapped instructions/README. Shell `--raw` writes a `\n` separator between direnv and zshrc snippets.
-- `acd commit-all`: one-shot capture+replay without persistent daemon. Refuses on detached HEAD, git-op markers, manual pause marker, or running per-repo daemon. Force-reseeds shadow from HEAD; drops stale pending for active `(branch_ref, generation)`.
+- Bare `acd` is read-only repo health; `acd on` idempotently registers/enables/starts; `acd off` idempotently disables/stops while preserving state.
+- `acd commit-all`: one-shot capture+replay without persistent daemon. Refuses on detached HEAD, git-op markers, manual pause marker, or running per-repo daemon. Before reseed it proves or archives all existing exact unpublished pairs. Dry-run/decline/JSON-without-yes do not open writable state, create the daemon lock or recovery refs, capture, or build providers. Hold `daemon.lock` only after consent. Remaining unpublished rows return structured incomplete output and nonzero.
 - `acd start` short-circuit: start-cache + central registry can skip control.lock, SQLite migration, registry rewrite. Manual start without `--session-id` registers `human:<repoHash>`. Harness starts require `--session-id` when `--harness` is set.
 - Per-repo disabled lifecycle state lives in the central registry. `acd repo disable` stops a live daemon, clears start caches, preserves `.git/acd/state.db`, and makes hook `start`/`wake`/`touch`/`flush` skip with `repo_disabled`; manual start reports `acd repo enable --repo <path>`. `acd repo enable` clears disabled state without starting the daemon. `acd repo manage` and `acd list --interactive` share the line-oriented manager (`t/e/d N`, `r`, `v`, `q`).
 - Registry-backed early short-circuit runs before `git.ResolveWorktree`; cold path always uses `git.ResolveWorktree`.
@@ -185,9 +189,9 @@ acd status --repo .
 ```
 
 - `acd fix` is the recovery entrypoint. Dry-run is default without `--yes`.
-- `--yes` applies safe actions: resolve already-landed barriers, retarget stale anchors, delete obsolete barriers, drop protected generated pending rows, mark externally-published rows, clear expired manual pauses, clear drained backpressure.
-- `--force` also purges terminal replay barriers with pending successors, including failed rows; combine with `--yes` to apply.
-- Fixes refuse while a live daemon owns the state DB; state.db is backed up before mutation.
+- `--yes` applies exact-pair reconciliation, protected generated-pending cleanup, expired manual-pause cleanup, and drained-backpressure cleanup. It never retargets or deletes captured replay chains.
+- `--force` selects archive-only exact-chain recovery; combine with `--yes` to preserve the reconstructed tree and mark the complete pair recovered.
+- Fixes acquire and hold `daemon.lock` after consent, recheck daemon/HEAD/git-op/pause safety, and refuse a live daemon owner. A WAL-consistent `VACUUM INTO` backup is verified with `PRAGMA quick_check` before migration-capable state open or mutation. Partial apply renders structured incomplete output and returns nonzero.
 - `acd resume --yes` lifts only manual pause.
 - `acd recover` and `acd purge-events` are deprecated and hidden; use `acd fix`.
 

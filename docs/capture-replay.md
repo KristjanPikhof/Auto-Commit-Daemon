@@ -24,9 +24,13 @@ stateDiagram-v2
   pending --> published: commit written or HEAD already matches
   pending --> blocked_conflict: replay not safe
   pending --> failed: replay data or git operation failed
+  blocked_conflict --> published: complete chain proven at HEAD
+  failed --> published: complete chain proven at HEAD
+  blocked_conflict --> recovered: complete chain archived
+  failed --> recovered: complete chain archived
+  pending --> recovered: branch transition archives chain
   published --> [*]
-  blocked_conflict --> [*]
-  failed --> [*]
+  recovered --> [*]
 ~~~
 
 | State | Meaning |
@@ -35,9 +39,12 @@ stateDiagram-v2
 | `published` | ACD wrote a commit or proved the current `HEAD` already has the captured after-state. |
 | `blocked_conflict` | ACD cannot safely apply the event. Later pending rows for the same branch generation wait behind it. |
 | `failed` | Replay could not build or apply the event. It is also a terminal barrier when later pending rows exist. |
+| `recovered` | ACD preserved the complete unpublished chain as a hidden Git commit before taking it out of replay. |
 
-ACD never retries terminal rows automatically. Use `acd fix --dry-run` before
-mutating state.
+ACD reconciles terminal rows automatically. It operates on the complete exact
+branch-generation suffix, not one blocker in isolation. If it cannot prove or
+archive that chain without a race, missing object, or ref collision, it leaves
+the queue unchanged for inspection.
 
 ## Product decisions
 
@@ -53,6 +60,8 @@ daemon logs.
 | `handled_external` | Another commit already contains the captured after-state. |
 | `handled_external_after_block` | A blocked row was promoted after an external commit landed the captured change. |
 | `superseded_external` | External history made the queued work obsolete. |
+| `recovery_published` | The complete unpublished chain was proven at stable `HEAD`. |
+| `recovery_archived` | The complete unpublished chain was preserved at a hidden recovery ref. |
 | `blocked` | Replay stopped because the next event was not provably safe. |
 | `paused` / `resumed` | Capture or replay pause state changed. |
 
@@ -101,9 +110,9 @@ work from replaying on top of the wrong branch history.
 | HEAD movement | Classification | Effect |
 |---|---|---|
 | New HEAD descends from the previous HEAD on the same branch | Fast-forward | Generation stays the same. |
-| Rebase, reset, branch switch, or same-SHA ref switch | Diverged | Generation bumps. Stale pending rows from the old generation are dropped. |
+| Rebase, reset, branch switch, or same-SHA ref switch | Diverged | ACD first proves or archives each exact unpublished pair, then accepts the new generation and reseeds shadow state. |
 | Detached HEAD | Paused/refused | `acd start` refuses and capture/replay stay disabled until HEAD is attached. |
-| Deleted old branch ref | Dead branch | Startup cleanup can prune stale unpublished rows for that ref. |
+| Deleted old branch ref | Dead branch | Startup cleanup archives the complete unpublished pair before it can become eligible for retention pruning. |
 
 Same-branch rewinds set a short grace pause:
 
@@ -159,6 +168,20 @@ which seqs were offered, selected, deferred, forced, or hidden by legacy
 same-path coalescing. Prompt traces remain the opt-in source for exact provider
 requests and may contain source text.
 
+### Planner circuit breaker
+
+| Condition | Circuit action | Replay action |
+|---|---|---|
+| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure, use deterministic planning. |
+| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan, use deterministic planning. |
+| Circuit open | Wait 30 seconds, then 2 minutes, then 10 minutes after repeated probe failures. | Bypass the provider without adding repeated planner-error rows. |
+| Cooldown expired | Allow one half-open provider probe. | Other windows keep using deterministic planning. |
+| Validated probe succeeds | Close and reset the backoff. | Resume configured provider planning. |
+
+Circuit health survives daemon restarts in `daemon_meta`. Bare `acd` reports
+degraded fallback health; `acd status` and `acd diagnose` show the full circuit
+record. A restart is not required to recover from a provider outage.
+
 ## One-shot capture with `commit-all`
 
 `acd commit-all` is for a dirty worktree when the daemon was off.
@@ -169,9 +192,13 @@ acd commit-all --yes
 acd commit-all --yes --json
 ~~~
 
-It reseeds shadow state from `HEAD`, drops stale pending rows for the active
-branch generation, captures the live diff, sorts paths lexicographically, and
-replays with the configured strategy.
+It first proves or preserves every pre-existing exact unpublished pair, then
+reseeds shadow state from `HEAD`, captures the live diff, sorts paths
+lexicographically, and replays with the configured strategy.
+
+Dry-run and a declined confirmation do not open writable state, start the AI
+provider, capture files, or create recovery refs. If unpublished rows remain at
+the end, the command exits non-zero and leaves them protected.
 
 Refusals:
 
@@ -211,8 +238,10 @@ acd fix --force --dry-run
 acd fix --force --yes
 ~~~
 
-Safe apply handles verifiable cleanup. Force apply is only for terminal barriers
-with pending successors after you check the blocked changes.
+Safe apply runs the same exact-chain proof used by the daemon and archives the
+chain when stable `HEAD` does not match. Force apply skips the publish proof and
+is archive-only. Both reconstruct the full chain at a hidden recovery ref
+before marking rows recovered; neither purges, retargets, or discards captures.
 
 ## Operator commands
 
@@ -232,6 +261,8 @@ with pending successors after you check the blocked changes.
 | Recovery report | `acd diagnose --json` |
 | Safe recovery plan | `acd fix --dry-run` |
 | Apply safe recovery plan | `acd fix --yes` |
+| Preview archive-only recovery | `acd fix --force --dry-run` |
+| Apply archive-only recovery | `acd fix --force --yes` |
 | Support zip | `acd doctor --bundle` |
 
 `acd list` compact status tokens:
@@ -240,7 +271,7 @@ with pending successors after you check the blocked changes.
 |---|---|
 | `OK` | Running with no queued or blocked work. |
 | `wait` | Queued work remains. In intent mode this may be a normal batch wait. |
-| `blk` | Terminal barrier needs operator action. |
+| `blk` | A barrier remains after automatic reconciliation and needs inspection. |
 | `pause` | Manual pause or rewind grace is active. |
 | `miss` | Repo or state DB is missing. |
 | `bad` | State DB exists but cannot be read. |
@@ -301,7 +332,7 @@ acd wake --repo . --session-id "$ACD_SESSION_ID"
 | `git revert` | Fast-forward commit. Queued matching work may settle as already handled at `HEAD`. |
 | `git reset --soft` or `--mixed` | Same-branch rewind. Capture and replay pause for rewind grace. |
 | `git reset --hard` | Same rewind behavior, with worktree overwritten by Git. |
-| `git rebase -i` | Git operation marker pauses capture and replay. After rebase, generation bumps and stale pending rows are dropped. |
+| `git rebase -i` | Git operation marker pauses capture and replay. After rebase, the generation bumps and each exact unpublished pair is proved or archived before capture resumes. |
 
 ## Trace event classes
 
@@ -321,6 +352,7 @@ Trace files live under `<gitDir>/acd/trace/` and avoid full prompts and diffs.
 | `capture.pause` | Capture skipped because replay is paused. |
 | `replay.commit` | A queued event published or settled at `HEAD`. |
 | `replay.self_heal` | A blocked row was promoted because `HEAD` now matches the after-state. |
+| `replay.chain_reconcile` | A complete unpublished chain was proven at `HEAD` or preserved under `refs/acd/recovery/*`. |
 | `replay.conflict` | Replay produced `blocked_conflict`. |
 | `replay.failed` | Replay produced `failed`. |
 | `replay.update_ref` | A `git update-ref` attempt ran. |

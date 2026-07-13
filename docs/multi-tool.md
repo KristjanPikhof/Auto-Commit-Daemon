@@ -81,8 +81,10 @@ acd fix --force --dry-run
 acd fix --force --yes
 ~~~
 
-Use force only after checking the blocked changes are already represented in
-`HEAD` or should be discarded.
+Normal `acd fix --yes` proves a chain at stable `HEAD` when possible and archives
+it under `refs/acd/recovery/*` otherwise. Use `--force` only when you explicitly
+want archive-only recovery without attempting the publish proof. Neither path
+discards captured changes.
 
 ## Recommended configurations
 

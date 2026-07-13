@@ -105,7 +105,8 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |
 
-Restart the daemon after changing provider, format, or intent environment.
+Provider, format, and intent environment settings are read when the daemon
+starts.
 
 `ACD_COMMIT_FORMAT=conventional` accepts only `feat`, `fix`, `docs`,
 `refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`
@@ -265,9 +266,48 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 | Provider unset | Deterministic provider. |
 | `openai-compat` succeeds | Provider result is used. |
 | Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
-| `openai-compat` fails, times out, or has no key | Deterministic fallback. |
+| Intent planner transport failure | Open the persisted circuit immediately and use deterministic fallback. |
+| Three consecutive intent validation failures | Open the persisted circuit after configured correction retries are exhausted. |
+| Intent circuit open | Skip the remote planner and use deterministic fallback without repeated planner-error decisions. |
+| Intent circuit half-open | Allow one provider probe; other windows use deterministic fallback. |
+| `openai-compat` has no key | Deterministic provider. |
 | Subprocess response has `error` | Deterministic fallback, plugin stays alive. |
-| Subprocess crashes or times out | Deterministic fallback, plugin restarts next time. |
+| Subprocess crashes or times out | Deterministic fallback; the plugin restarts on the next allowed provider probe. |
 
 The deterministic provider is the final backstop and should always return a
 message.
+
+### Inspect the intent planner circuit
+
+Use either read-only command:
+
+~~~bash
+acd status --repo . --json
+acd diagnose --repo . --json
+~~~
+
+Both expose `intent_strategy.planner_health`. The useful fields are:
+
+| Field | Meaning |
+|---|---|
+| `state` | `closed`, `open`, or `half_open`. |
+| `consecutive_failures` | Failures counted toward the current open state. |
+| `backoff_level` | Cooldown step: 30 seconds, 2 minutes, then 10 minutes. |
+| `next_probe_ts` | Unix timestamp when one half-open probe may run. |
+| `opened_ts` | Unix timestamp when the current circuit-open period began. |
+| `last_failure_ts` | Unix timestamp of the most recent counted failure. |
+| `last_failure_class` | `transport` or `validation`. |
+| `last_error` | Bounded, redacted diagnostic text. |
+| `bypass_count` | Cumulative windows served by fallback while the circuit denied a provider call. |
+| `provider_fingerprint` | Hash of provider, model, sanitized endpoint, and provider mode. |
+| `updated_ts` | Unix timestamp of the latest persisted health update. |
+
+If the persisted record is empty, malformed, unsafe to expose, or uses an
+unsupported version, `status` and `diagnose` omit `planner_health` and return
+`planner_health_warning`. The read path never repairs or deletes the meta row.
+
+The circuit record persists across daemon restarts. A successful half-open
+probe closes it. A failed probe advances cooldown from 30 seconds to 2 minutes,
+then caps at 10 minutes. API keys are never part of the provider fingerprint;
+endpoint credentials, query strings, authorization values, and common token
+shapes are removed from stored errors.

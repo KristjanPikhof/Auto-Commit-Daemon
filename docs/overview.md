@@ -39,8 +39,8 @@ flowchart LR
 |---|---|---|
 | Capture | Walks the worktree, filters ignored or sensitive paths, writes file contents as Git blobs, and records ops in `<gitDir>/acd/state.db`. | `acd events`, `acd explain --path FILE` |
 | Replay | Applies pending ops to a private scratch index, creates commits with `git commit-tree`, and advances the branch with `git update-ref`. | `acd status`, `acd logs --follow` |
-| Settle | Marks queued work as published when another committer already landed the same final state. | `acd explain --commit HEAD` |
-| Block | Stops behind `blocked_conflict` or `failed` terminal rows when replay cannot prove the next commit is safe. | `acd diagnose --json`, `acd fix --dry-run` |
+| Reconcile | Proves a complete unpublished chain already landed, or preserves its reconstructed tree at a hidden recovery ref before reseeding and recapturing. | `acd events`, `acd diagnose` |
+| Block | Stops behind `blocked_conflict` or `failed` only when ACD cannot complete an all-or-none proof or archive safely. | `acd diagnose --json`, `acd fix --dry-run` |
 
 ## Commit strategies
 
@@ -51,6 +51,11 @@ flowchart LR
 
 Both strategies use the same capture rows and replay safety checks. Intent mode
 changes grouping, not durability.
+
+Intent mode also has a persisted provider circuit breaker. A planner outage or
+repeated unsafe output switches planning to the deterministic provider during a
+bounded cooldown, so capture and replay keep moving without repeated network
+failures.
 
 ## Data boundaries
 

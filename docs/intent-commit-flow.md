@@ -170,12 +170,41 @@ one-capture planning window unless an earlier related-path capture must land
 first. If the provider fails there, deterministic fallback publishes the
 capture safely.
 
+One-capture windows use the same planner and circuit as larger windows. There
+is no production shortcut to a separate commit-message provider.
+
+## Recovering from planner failures
+
+ACD keeps replay moving when a remote planner is unhealthy. The first
+transport failure opens a persisted circuit immediately. A planning window
+counts as one validation failure only after configured correction retries are
+exhausted. Three consecutive validation failures open the circuit.
+
+| Open attempt | Cooldown before one probe |
+|---:|---:|
+| 1 | 30 seconds |
+| 2 | 2 minutes |
+| 3 and later | 10 minutes |
+
+While the circuit is open, each planning window publishes through the
+deterministic one-capture fallback. These bypasses do not add repeated
+`intent_planner_error` decisions. When the cooldown expires, one window owns
+the half-open provider probe; other windows continue through deterministic
+fallback. A successful probe closes the circuit and resets the failure count.
+
+Circuit state survives daemon restarts in `daemon_meta` under
+`intent.planner.health`. Changing the provider identity resets state from the
+old provider. The stored identity is a hash of non-secret provider settings,
+not an API key or raw endpoint. Stored errors are bounded and redacted before
+they reach status or diagnose output.
+
 ## Observability
 
 | Question | Command |
 |---|---|
 | What strategy and batch gate are active? | `acd status --json` |
 | Why is intent waiting? | `acd diagnose --json` or `acd doctor` |
+| Is the planner circuit open? | `acd status --json` or `acd diagnose --json` |
 | Which seqs were grouped or deferred? | `acd events --json` |
 | What did the provider see? | `ACD_AI_PROMPT_TRACE=1` then `acd prompt --seq <seq>` |
 | Where are rejected planner responses? | `<gitDir>/acd/planner-rejects.jsonl` |
@@ -183,7 +212,17 @@ capture safely.
 `intent_strategy` reports `commit_format`, window settings, batch wait state,
 settle countdowns, deferred counts, forced-aging readiness, planner error rate,
 singleton commit rate, message-quality rewrite or fallback counts, and the most
-recent privacy-safe `last_planner_window` summary.
+recent privacy-safe `last_planner_window` summary. Its `planner_health` object
+reports `state`, `consecutive_failures`, `backoff_level`, `next_probe_ts`,
+`last_failure_class`, `last_error`, and cumulative `bypass_count`.
+If the persisted record is invalid or uses an unsupported version, the commands
+omit `planner_health` and return a safe `planner_health_warning` without
+changing `state.db`.
+
+When the circuit is open or half-open, `acd diagnose` explains that
+deterministic fallback remains active and shows the next probe time. Check
+provider connectivity and configuration for transport failures. For validation
+failures, inspect `<gitDir>/acd/planner-rejects.jsonl`.
 
 `acd events --json` adds `planner_window` to decisions with a known planner
 window. The summary shows `offered_seqs`, `visible_original_seqs`,
