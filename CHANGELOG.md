@@ -26,6 +26,8 @@
   deterministic bypasses, and the next automatic provider probe.
 - Updated pinned GitHub Actions dependency `actions/setup-go` from `v6.4.0` to
   `v6.5.0`.
+- Raised the minimum Go toolchain to 1.26.5 to include the standard-library
+  fix for GO-2026-5856.
 
 ### Fixed
 

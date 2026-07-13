@@ -44,7 +44,7 @@ flowchart TB
 
 ## Install
 
-Building from source or using `go install` requires Go 1.26.4 or newer.
+Building from source or using `go install` requires Go 1.26.5 or newer.
 
 ~~~bash
 brew install KristjanPikhof/tap/acd
