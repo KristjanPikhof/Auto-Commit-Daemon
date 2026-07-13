@@ -496,19 +496,33 @@ func TestReplay_ArchivesWhenAncestryFails(t *testing.T) {
 	assertRecoverySnapshot(t, ctx, f, seq, commitOID.String, base, afterBlob)
 }
 
-func TestReconcile_PublishesPathspecMagicFilenameLiterally(t *testing.T) {
+func TestReconcile_PublishesLiteralFilenames(t *testing.T) {
 	runBoundedParallel(t)
+	for _, tc := range []struct {
+		name           string
+		capturedPath   string
+		distractorPath string
+	}{
+		{name: "pathspec magic", capturedPath: ":(top)colon.txt", distractorPath: "colon.txt"},
+		{name: "surrounding whitespace", capturedPath: " spaced.txt ", distractorPath: "spaced.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertReconcilePublishesLiteralFilename(t, tc.capturedPath, tc.distractorPath)
+		})
+	}
+}
 
+func assertReconcilePublishesLiteralFilename(t *testing.T, capturedPath, distractorPath string) {
+	t.Helper()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
-	const capturedPath = ":(top)colon.txt"
 	before, _ := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
 	after, _ := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
 	distractor, _ := git.HashObjectStdin(ctx, f.dir, []byte("distractor\n"))
 
 	baseTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
 		{Mode: git.RegularFileMode, Type: "blob", OID: before, Path: capturedPath},
-		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: "colon.txt"},
+		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: distractorPath},
 	})
 	if err != nil {
 		t.Fatalf("Mktree base: %v", err)
@@ -531,7 +545,7 @@ func TestReconcile_PublishesPathspecMagicFilenameLiterally(t *testing.T) {
 
 	externalTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
 		{Mode: git.RegularFileMode, Type: "blob", OID: after, Path: capturedPath},
-		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: "colon.txt"},
+		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: distractorPath},
 	})
 	if err != nil {
 		t.Fatalf("Mktree external: %v", err)
