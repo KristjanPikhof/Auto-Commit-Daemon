@@ -252,8 +252,9 @@ func sanitizeMetricLabel(value string) string {
 		if unicode.IsPrint(r) && r != '\u007f' {
 			return r
 		}
-		return -1
+		return ' '
 	}, value)
+	value = strings.Join(strings.Fields(value), " ")
 	if len(value) > 128 {
 		value = value[:128]
 	}
