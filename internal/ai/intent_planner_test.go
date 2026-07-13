@@ -819,6 +819,27 @@ func TestComposedPlanIntentRetriesOnTypedValidationError(t *testing.T) {
 	}
 }
 
+func TestComposedPlanIntentCountsActualRetriesInContext(t *testing.T) {
+	req := sampleIntentPlanRequest(t)
+	primary := &scriptedIntentPlanner{
+		name: "scripted-primary",
+		plans: []IntentPlan{
+			{SelectedSeqs: []int64{999}, DeferredSeqs: []int64{102}, Subject: "Tighten checkout flow", GroupingReason: "invalid outside selection", DeferredReasons: []DeferredReason{{Seq: 102, Reason: "separate"}}},
+			{SelectedSeqs: []int64{101}, DeferredSeqs: []int64{102}, Subject: "Tighten checkout flow", GroupingReason: "focused checkout change", DeferredReasons: []DeferredReason{{Seq: 102, Reason: "separate"}}},
+		},
+	}
+	ctx, counter := WithIntentAttemptCounter(context.Background())
+	if _, err := Compose(primary, DeterministicProvider{}).(*composed).PlanIntent(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if got := counter.RetryCount(); got != 1 {
+		t.Fatalf("retry count=%d want 1", got)
+	}
+	if got := (&IntentAttemptCounter{}).RetryCount(); got != 0 {
+		t.Fatalf("unused counter=%d", got)
+	}
+}
+
 func TestComposedPlanIntentRetriesOnSelectedDeferredOverlap(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	invalidPlan := IntentPlan{

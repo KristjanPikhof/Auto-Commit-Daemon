@@ -591,3 +591,17 @@ func TestValidateProviderConfigConfirmationsAreDistinct(t *testing.T) {
 		t.Fatalf("subprocess confirmations=%v", subprocess.Confirmations)
 	}
 }
+
+func TestConfigIntentRetryContextOverridePreservesEnvCompatibility(t *testing.T) {
+	t.Setenv(EnvIntentRetryOnInvalid, "7")
+	if got := intentRetryOnInvalidLimit(context.Background()); got != 7 {
+		t.Fatalf("environment retry limit=%d want 7", got)
+	}
+	ctx := WithIntentRetryLimit(context.Background(), 2)
+	if got := intentRetryOnInvalidLimit(ctx); got != 2 {
+		t.Fatalf("context retry limit=%d want 2", got)
+	}
+	if got := intentRetryOnInvalidLimit(context.Background()); got != 7 {
+		t.Fatalf("override leaked outside pass: %d", got)
+	}
+}
