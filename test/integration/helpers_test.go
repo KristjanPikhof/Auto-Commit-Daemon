@@ -294,9 +294,9 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	}
 	body := "stty cols " + strconv.Itoa(cols) + " rows " + strconv.Itoa(rows)
 	if resizeCols > 0 && resizeRows > 0 {
-		body += "; (sleep 0.5; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) &"
+		body += "; (sleep 0.5; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) & "
 	}
-	body += "; exec \"$@\""
+	body += "exec \"$@\""
 	commandArgs := append([]string{"/bin/sh", "-c", body, "sh"}, args...)
 	var scriptArgs []string
 	if runtime.GOOS == "darwin" {
