@@ -447,9 +447,8 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	var (
-		intentHealth        *IntentPlannerHealth
-		intentHealthOptions IntentPlannerHealthOptions
-
+		intentHealth          *IntentPlannerHealth
+		intentHealthOptions   IntentPlannerHealthOptions
 		intentPlannerProvider string
 		intentPlannerModel    string
 		intentIncludeDiffs    bool
