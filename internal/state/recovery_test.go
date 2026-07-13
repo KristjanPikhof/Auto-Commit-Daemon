@@ -50,8 +50,8 @@ PRAGMA user_version = 11;`); err != nil {
 	if err != nil {
 		t.Fatalf("Open migrated v11 fixture: %v", err)
 	}
-	if version, err := d.UserVersion(ctx); err != nil || version != 12 {
-		t.Fatalf("migrated user_version=(%d,%v), want (12,nil)", version, err)
+	if version, err := d.UserVersion(ctx); err != nil || version != SchemaVersion {
+		t.Fatalf("migrated user_version=(%d,%v), want (%d,nil)", version, err, SchemaVersion)
 	}
 	var eventCount, decisionCount int
 	if err := d.SQL().QueryRowContext(ctx,
