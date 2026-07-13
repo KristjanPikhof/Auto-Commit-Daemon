@@ -104,7 +104,7 @@ Run these in order. Stop when the queue is healthy again.
 
 | Step | Command | What to decide |
 |---|---|---|
-| Observe | `acd` | Is the daemon healthy, waiting, degraded, or stopped? |
+| Observe | `acd` | Is the repo healthy, waiting, degraded, off, or in need of attention? |
 | Inspect decisions | `acd events --watch` | What is ACD doing now? |
 | Inspect one path | `acd explain --path FILE` | Is the file captured, skipped, protected, or blocked? |
 | Inspect blockers | `acd diagnose --json` | Which branch anchor or terminal row is holding replay? |
