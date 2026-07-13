@@ -79,6 +79,7 @@ type diagnoseReport struct {
 	BackpressurePausedAt       string                          `json:"backpressure_paused_at,omitempty"`
 	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
 	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
+	RuntimeConfig              runtimeConfigReport              `json:"runtime_config"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
@@ -189,6 +190,11 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.IntentStrategy = intentStrategy
+	}
+	if runtimeConfig, err := loadRuntimeConfigReport(ctx, conn, rec.RepoHash, time.Now()); err != nil {
+		return report, err
+	} else {
+		report.RuntimeConfig = runtimeConfig
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
@@ -778,6 +784,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		fmt.Fprintf(out, "Backpressure: paused at %s\n", valueOrUnset(r.BackpressurePausedAt))
 	}
 	renderIntentStrategyHuman(out, r.IntentStrategy)
+	renderRuntimeConfigHuman(out, r.RuntimeConfig)
 
 	if r.OperationInProgress != "" {
 		stale := ""
