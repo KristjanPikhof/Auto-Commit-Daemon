@@ -31,6 +31,7 @@ func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
 		"acd              Show one read-only health classification and next action",
 		"acd on",
 		"acd off",
+		"acd settings     Inspect, test, and safely activate configuration",
 		"acd status",
 		"acd setup",
 		"acd logs",

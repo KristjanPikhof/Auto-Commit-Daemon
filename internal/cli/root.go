@@ -49,6 +49,7 @@ func newRootCmd() *cobra.Command {
 	cmd.AddCommand(
 		newOnCmd(),
 		newOffCmd(),
+		newSettingsCmd(),
 		newVersionCmd(),
 		newStartCmd(),
 		newStopCmd(),

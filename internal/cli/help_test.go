@@ -14,6 +14,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 	}{
 		{"on", []string{"acd on --repo /path/to/repo", "idempotent", "State is preserved"}},
 		{"off", []string{"acd off --repo /path/to/repo", "idempotent", "preserves .git/acd state"}},
+		{"settings", []string{"acd settings --profile fast", "synthetic content only", "--accessible"}},
 		{"start", []string{"acd start --repo /path/to/repo", "--session-id", "acd status"}},
 		{"stop", []string{"acd stop --session-id", "acd stop --all --json", "active sessions"}},
 		{"status", []string{"current working directory", "blocked-vs-waiting recovery state", "acd explain"}},
