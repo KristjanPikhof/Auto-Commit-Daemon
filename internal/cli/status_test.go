@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -458,6 +459,131 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 	}
 }
 
+func TestStatus_IntentStrategyReportsPlannerHealth(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
+		t.Fatalf("set commit strategy: %v", err)
+	}
+	nextProbe := time.Date(2026, 7, 13, 3, 21, 0, 0, time.UTC)
+	health := daemon.IntentPlannerHealthSnapshot{
+		State:               daemon.IntentPlannerCircuitOpen,
+		ProviderFingerprint: testPlannerHealthFingerprint(),
+		ConsecutiveFailures: 3,
+		BackoffLevel:        1,
+		NextProbeTS:         float64(nextProbe.Unix()),
+		LastFailureClass:    daemon.IntentPlannerFailureValidation,
+		LastError:           "planner returned an invalid group",
+		BypassCount:         7,
+	}
+	if err := state.MetaSetJSON(ctx, d, daemon.MetaKeyIntentPlannerHealth, struct {
+		Version int `json:"version"`
+		daemon.IntentPlannerHealthSnapshot
+	}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
+		t.Fatalf("set planner health: %v", err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("runStatus json: %v", err)
+	}
+	var rep statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+	}
+	if rep.IntentStrategy.PlannerHealth == nil ||
+		rep.IntentStrategy.PlannerHealth.State != daemon.IntentPlannerCircuitOpen ||
+		rep.IntentStrategy.PlannerHealth.ConsecutiveFailures != 3 ||
+		rep.IntentStrategy.PlannerHealth.BypassCount != 7 ||
+		rep.IntentStrategy.PlannerHealth.LastFailureClass != daemon.IntentPlannerFailureValidation {
+		t.Fatalf("planner health=%+v", rep.IntentStrategy.PlannerHealth)
+	}
+	if !bytes.Contains(jsonOut.Bytes(), []byte(`"planner_health"`)) ||
+		!bytes.Contains(jsonOut.Bytes(), []byte(`"next_probe_ts"`)) {
+		t.Fatalf("status JSON missing planner health fields: %s", jsonOut.String())
+	}
+
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatalf("runStatus human: %v", err)
+	}
+	for _, want := range []string{
+		"Intent planner health: open failures=3 bypasses=7",
+		"next_probe=2026-07-13T03:21:00Z",
+		"last_failure_class=validation",
+		"Last circuit failure: planner returned an invalid group",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("status human missing %q:\n%s", want, human.String())
+		}
+	}
+}
+
+func TestStatus_IntentPlannerHealthWarningIsReadOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		warning string
+	}{
+		{name: "empty", raw: "", warning: plannerHealthInvalidWarning},
+		{name: "invalid", raw: `{"version":1,"last_error":"sk-secret`, warning: plannerHealthInvalidWarning},
+		{name: "unsupported", raw: `{"version":99,"state":"open","last_error":"sk-secret"}`, warning: plannerHealthVersionWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			ctx := context.Background()
+			repo, dbPath, d := makeRepoStateDB(t)
+			registerRepo(t, roots, repo, dbPath, "codex")
+			if err := state.MetaSet(ctx, d, daemon.MetaKeyIntentPlannerHealth, tc.raw); err != nil {
+				t.Fatalf("set planner health: %v", err)
+			}
+			if err := d.Close(); err != nil {
+				t.Fatalf("close db: %v", err)
+			}
+			before, err := fileSHA256(dbPath)
+			if err != nil {
+				t.Fatalf("checksum before: %v", err)
+			}
+
+			var jsonOut bytes.Buffer
+			if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+				t.Fatalf("runStatus json: %v", err)
+			}
+			var rep statusReport
+			if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
+			}
+			if rep.IntentStrategy.PlannerHealth != nil || rep.IntentStrategy.PlannerHealthWarning != tc.warning {
+				t.Fatalf("intent strategy=%+v", rep.IntentStrategy)
+			}
+			if strings.Contains(jsonOut.String(), "sk-secret") {
+				t.Fatalf("status leaked malformed metadata: %s", jsonOut.String())
+			}
+
+			var human bytes.Buffer
+			if err := runStatus(ctx, &human, repo, false); err != nil {
+				t.Fatalf("runStatus human: %v", err)
+			}
+			if !strings.Contains(human.String(), "Intent planner health warning: "+tc.warning) {
+				t.Fatalf("status human missing safe warning:\n%s", human.String())
+			}
+			after, err := fileSHA256(dbPath)
+			if err != nil {
+				t.Fatalf("checksum after: %v", err)
+			}
+			if before != after {
+				t.Fatalf("status mutated state.db: before=%q after=%q", before, after)
+			}
+		})
+	}
+}
+
+func testPlannerHealthFingerprint() string {
+	return "sha256:" + strings.Repeat("0", 64)
+}
+
 func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -590,7 +716,7 @@ func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 		DecisionTS:  20,
 		Kind:        state.DecisionKindIntentPlannerError,
 		Path:        sqlNullStr("src/app.go"),
-		Reason:      sqlNullStr("planner returned unsafe seq"),
+		Reason:      sqlNullStr(`planner returned unsafe seq {"token":"legacy-secret"}`),
 		EventSeq:    sql.NullInt64{Int64: 42, Valid: true},
 		ActionTaken: sqlNullStr("planner validation failed"),
 		UserMessage: sqlNullStr("fallback used"),
@@ -611,7 +737,8 @@ func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 	}
 	if rep.IntentStrategy.LastPlannerErrorEventSeq != 42 ||
 		rep.IntentStrategy.LastPlannerErrorPath != "src/app.go" ||
-		rep.IntentStrategy.LastPlannerError != "planner returned unsafe seq" {
+		strings.Contains(rep.IntentStrategy.LastPlannerError, "legacy-secret") ||
+		!strings.Contains(rep.IntentStrategy.LastPlannerError, "[REDACTED]") {
 		t.Fatalf("last planner error = %+v, want durable decision_records error", rep.IntentStrategy)
 	}
 }

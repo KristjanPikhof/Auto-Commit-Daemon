@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -25,33 +23,51 @@ func countShadowRows(t *testing.T, db *state.DB, branchRef string, gen int64) in
 	return n
 }
 
-// addLargeBootstrapFiles writes count files to dir, then commits them. Returns
-// the resulting HEAD OID. The file contents are unique per index so each blob
-// hashes distinctly and ls-tree returns count entries.
+// addLargeBootstrapFiles commits a nested tree with count entries and returns
+// the resulting HEAD OID. Git plumbing avoids materializing thousands of files
+// in the worktree; the bootstrap path under test reads the committed tree.
 func addLargeBootstrapFiles(t *testing.T, dir string, count int) string {
 	t.Helper()
 	ctx := context.Background()
-	for i := 0; i < count; i++ {
-		// Spread across nested directories so we exercise sub-tree paths
-		// in addition to top-level entries.
-		sub := filepath.Join(dir, "data", fmt.Sprintf("d%03d", i/100))
-		if err := os.MkdirAll(sub, 0o755); err != nil {
-			t.Fatalf("mkdirall: %v", err)
-		}
-		fp := filepath.Join(sub, fmt.Sprintf("f%05d.txt", i))
-		if err := os.WriteFile(fp, []byte(fmt.Sprintf("payload %d\n", i)), 0o644); err != nil {
-			t.Fatalf("write file %d: %v", i, err)
-		}
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "add", "."); err != nil {
-		t.Fatalf("git add: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "commit", "-q", "-m", "bulk-seed"); err != nil {
-		t.Fatalf("git commit: %v", err)
-	}
-	head, err := git.RevParse(ctx, dir, "HEAD")
+	parent, err := git.RevParse(ctx, dir, "HEAD")
 	if err != nil {
 		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	seedOID, err := git.RevParse(ctx, dir, "HEAD:.gitignore")
+	if err != nil {
+		t.Fatalf("rev-parse .gitignore: %v", err)
+	}
+	payloadOID, err := git.HashObjectStdin(ctx, dir, []byte("bootstrap payload\n"))
+	if err != nil {
+		t.Fatalf("hash bootstrap payload: %v", err)
+	}
+
+	entries := make([]git.MktreeEntry, 0, count)
+	for i := 0; i < count; i++ {
+		entries = append(entries, git.MktreeEntry{
+			Mode: git.RegularFileMode,
+			Type: "blob",
+			OID:  payloadOID,
+			Path: fmt.Sprintf("f%05d.txt", i),
+		})
+	}
+	dataTree, err := git.Mktree(ctx, dir, entries)
+	if err != nil {
+		t.Fatalf("mktree data: %v", err)
+	}
+	rootTree, err := git.Mktree(ctx, dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: seedOID, Path: ".gitignore"},
+		{Mode: "040000", Type: "tree", OID: dataTree, Path: "data"},
+	})
+	if err != nil {
+		t.Fatalf("mktree root: %v", err)
+	}
+	head, err := git.CommitTree(ctx, dir, rootTree, "bulk-seed\n", parent)
+	if err != nil {
+		t.Fatalf("commit-tree: %v", err)
+	}
+	if err := git.UpdateRef(ctx, dir, "HEAD", head, parent); err != nil {
+		t.Fatalf("update-ref HEAD: %v", err)
 	}
 	return head
 }

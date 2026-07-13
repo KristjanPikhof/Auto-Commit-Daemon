@@ -715,6 +715,32 @@ func TestOpenAIIntentPlan_HappyPath(t *testing.T) {
 	}
 }
 
+func TestOpenAIIntentPlan_ResponseShapeErrorsAreTypedValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{name: "malformed response", response: `{"choices":`},
+		{name: "missing choices", response: `{"choices":[]}`},
+		{name: "missing tool call", response: `{"choices":[{"message":{"content":"no tool"}}]}`},
+		{name: "malformed arguments", response: `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan","arguments":"{"}}]}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+				return 200, tc.response
+			})
+			_, err := p.PlanIntent(context.Background(), sampleIntentPlanRequest(t))
+			var validationErr *IntentPlanValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error=%T %v want *IntentPlanValidationError", err, err)
+			}
+			if validationErr.Code != IntentPlanValidationShape {
+				t.Fatalf("validation code=%v want shape", validationErr.Code)
+			}
+		})
+	}
+}
+
 func TestOpenAIIntentMessageRewrite_HappyPath(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan := IntentPlan{
@@ -770,6 +796,40 @@ func TestOpenAIIntentMessageRewrite_HappyPath(t *testing.T) {
 	}
 	if strings.Contains(string(last.rawBody), "capture_intent_plan") {
 		t.Fatalf("rewrite request must not expose capture_intent_plan tool: %s", string(last.rawBody))
+	}
+}
+
+func TestOpenAIIntentMessageRewrite_ValidationErrorsAreTyped(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{name: "malformed response", response: "{"},
+		{name: "empty subject after sanitize", response: cannedToolCall("\x01", "")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := sampleIntentPlanRequest(t)
+			plan := IntentPlan{
+				SelectedSeqs:   []int64{101},
+				DeferredSeqs:   []int64{102},
+				Subject:        "Update parsed",
+				GroupingReason: "checkout service change is focused",
+				DeferredReasons: []DeferredReason{{
+					Seq:    102,
+					Reason: "docs change is independent",
+				}},
+			}
+			rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+			p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+				return http.StatusOK, tc.response
+			})
+
+			_, err := p.RewriteIntentMessage(context.Background(), rewriteReq)
+			var validationErr *IntentMessageRewriteValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error=%T %v want IntentMessageRewriteValidationError", err, err)
+			}
+		})
 	}
 }
 
@@ -872,6 +932,22 @@ func TestOpenAI_PromptTraceRecordsExactIntentRequest(t *testing.T) {
 	schema, ok := got.ToolSchema.(map[string]any)
 	if !ok || schema["type"] != "object" {
 		t.Fatalf("tool schema not recorded: %#v", got.ToolSchema)
+	}
+}
+
+func TestOpenAI_PromptTraceSanitizesProviderError(t *testing.T) {
+	const secret = "prompt-trace-secret"
+	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+		return 400, `{"error":{"token":"` + secret + `"}}`
+	})
+	writer, records := newPromptTraceTestWriter(t)
+	ctx := prompttrace.With(context.Background(), writer, prompttrace.Metadata{Strategy: string(CommitStrategyIntent)})
+	if _, err := p.PlanIntent(ctx, sampleIntentPlanRequest(t)); err == nil {
+		t.Fatal("PlanIntent unexpectedly succeeded")
+	}
+	got := promptTraceRecordByStage(t, records(), "response")
+	if got.Response == nil || strings.Contains(got.Response.Error, secret) || !strings.Contains(got.Response.Error, "[REDACTED]") {
+		t.Fatalf("prompt response=%+v", got.Response)
 	}
 }
 
@@ -1076,6 +1152,7 @@ type promptTraceJSONRecord struct {
 	UserMessage   string                        `json:"user_message"`
 	ToolSchema    any                           `json:"tool_schema"`
 	Request       json.RawMessage               `json:"request"`
+	Response      *prompttrace.Response         `json:"response"`
 }
 
 func promptTraceRecordByStage(t *testing.T, records []promptTraceJSONRecord, stage string) promptTraceJSONRecord {

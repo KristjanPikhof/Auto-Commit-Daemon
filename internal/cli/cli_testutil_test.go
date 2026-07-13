@@ -2,6 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +15,20 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+var (
+	testRepoFixturesOnce sync.Once
+	testRepoFixturesRoot string
+	testRepoFixturesErr  error
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if testRepoFixturesRoot != "" {
+		_ = os.RemoveAll(testRepoFixturesRoot)
+	}
+	os.Exit(code)
+}
 
 // withIsolatedHome installs a fresh $HOME for the duration of a test so
 // that paths.Resolve() points at a tempdir-scoped XDG layout. Returns the
@@ -40,27 +59,158 @@ func withIsolatedHome(t *testing.T) paths.Roots {
 // process tries to open the file read-only on Windows-y filesystems; on
 // Linux/macOS WAL is fine but we keep the contract explicit.
 func makeRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
+	return makeRepoStateDBFromFixture(t, false)
+}
+
+func makeSeededRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
+	return makeRepoStateDBFromFixture(t, true)
+}
+
+func makeRepoStateDBFromFixture(t *testing.T, seeded bool) (repoDir, stateDB string, db *state.DB) {
 	t.Helper()
-	repoDir = t.TempDir()
-	ctx := context.Background()
-	if err := git.Init(ctx, repoDir); err != nil {
-		t.Fatalf("git init: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repoDir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
-		t.Fatalf("symbolic-ref HEAD: %v", err)
-	}
-	wt, err := git.ResolveWorktree(ctx, repoDir)
-	if err != nil {
-		t.Fatalf("resolve worktree: %v", err)
-	}
-	repoDir = wt.Root
-	dbPath := state.DBPathFromGitDir(wt.GitDir)
+	repoDir = materializeTestRepo(t, seeded)
+	dbPath := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
 	d, err := state.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
 	return repoDir, dbPath, d
+}
+
+func materializeTestRepo(t *testing.T, seeded bool) string {
+	t.Helper()
+	testRepoFixturesOnce.Do(initTestRepoFixtures)
+	if testRepoFixturesErr != nil {
+		t.Fatalf("initialize Git fixtures: %v", testRepoFixturesErr)
+	}
+
+	name := "empty"
+	if seeded {
+		name = "seeded"
+	}
+	repoDir := t.TempDir()
+	if err := copyFixtureTree(filepath.Join(testRepoFixturesRoot, name), repoDir); err != nil {
+		t.Fatalf("materialize %s Git fixture: %v", name, err)
+	}
+	realRepoDir, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		t.Fatalf("canonicalize temp repo: %v", err)
+	}
+	return realRepoDir
+}
+
+func initTestRepoFixtures() {
+	root, err := os.MkdirTemp("", "acd-cli-repo-fixtures-")
+	if err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	testRepoFixturesRoot = root
+
+	empty := filepath.Join(root, "empty")
+	if err := os.MkdirAll(empty, 0o700); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	ctx := context.Background()
+	if _, err := git.Run(ctx, git.RunOpts{Dir: empty}, "init", "-q", "-b", "main"); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	for _, setting := range [][2]string{
+		{"user.name", "ACD Test"},
+		{"user.email", "acd@example.invalid"},
+		{"commit.gpgsign", "false"},
+	} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: empty}, "config", setting[0], setting[1]); err != nil {
+			testRepoFixturesErr = err
+			return
+		}
+	}
+	dbPath := state.DBPathFromGitDir(filepath.Join(empty, ".git"))
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if _, err := db.SQL().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = db.Close()
+		testRepoFixturesErr = err
+		return
+	}
+	if err := db.Close(); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(dbPath + suffix); err != nil && !os.IsNotExist(err) {
+			testRepoFixturesErr = err
+			return
+		}
+	}
+
+	seeded := filepath.Join(root, "seeded")
+	if err := os.MkdirAll(seeded, 0o700); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if err := copyFixtureTree(empty, seeded); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if err := os.WriteFile(filepath.Join(seeded, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: seeded}, "add", "seed.txt"); err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: seeded}, "commit", "-q", "-m", "seed"); err != nil {
+		testRepoFixturesErr = err
+	}
+}
+
+func copyFixtureTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, target)
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+		if err != nil {
+			_ = in.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		return errors.Join(copyErr, out.Close(), in.Close())
+	})
 }
 
 // registerRepo writes a single repo entry into the central registry under

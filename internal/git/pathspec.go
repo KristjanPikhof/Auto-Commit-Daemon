@@ -10,7 +10,7 @@ import (
 // magic in Git pathspec syntax; callers that are proving history for one
 // captured path must not let those characters expand to unrelated files.
 func LiteralPathspec(path string) string {
-	path = strings.TrimSpace(filepath.ToSlash(path))
+	path = filepath.ToSlash(path)
 	path = strings.TrimPrefix(path, "./")
 	if path == "" {
 		return ""

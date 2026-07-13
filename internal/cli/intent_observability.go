@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -22,6 +24,11 @@ import (
 // than this almost certainly means the daemon is dead and the snapshot
 // is no longer tracking the live pending queue.
 const pathQuiescenceStaleness = 30 * time.Second
+
+const (
+	plannerHealthInvalidWarning = "persisted planner health metadata is invalid; planner health details were omitted"
+	plannerHealthVersionWarning = "persisted planner health metadata uses an unsupported version; planner health details were omitted"
+)
 
 // pathQuiescenceSnapshotFresh returns true when the daemon is alive AND
 // the path_quiescence.updated_at meta value is newer than
@@ -56,44 +63,46 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 }
 
 type intentStrategyReport struct {
-	Strategy                          string                      `json:"strategy"`
-	CommitFormat                      string                      `json:"commit_format"`
-	Active                            bool                        `json:"active"`
-	Window                            int                         `json:"window,omitempty"`
-	RecentCommits                     int                         `json:"recent_commits,omitempty"`
-	DeferLimit                        int                         `json:"defer_limit,omitempty"`
-	MinPending                        int                         `json:"min_pending,omitempty"`
-	SettleWindowSeconds               int64                       `json:"settle_window_seconds"`
-	MaxPendingAgeSeconds              int64                       `json:"max_pending_age_seconds,omitempty"`
-	IntentStageDiffCap                int                         `json:"intent_stage_diff_cap,omitempty"`
-	VisiblePendingEvents              int                         `json:"visible_pending_events,omitempty"`
-	OldestPendingEventSeq             int64                       `json:"oldest_pending_event_seq,omitempty"`
-	OldestPendingPath                 string                      `json:"oldest_pending_path,omitempty"`
-	OldestPendingAgeSeconds           int64                       `json:"oldest_pending_age_seconds,omitempty"`
-	NewestPendingEventSeq             int64                       `json:"newest_pending_event_seq,omitempty"`
-	NewestPendingAgeSeconds           int64                       `json:"newest_pending_age_seconds,omitempty"`
-	AgeTriggerTS                      int64                       `json:"age_trigger_ts,omitempty"`
-	AgeTriggerInSeconds               int64                       `json:"age_trigger_in_seconds,omitempty"`
-	SettleTriggerTS                   int64                       `json:"settle_trigger_ts,omitempty"`
-	SettleTriggerInSeconds            int64                       `json:"settle_trigger_in_seconds,omitempty"`
-	BatchWaitActive                   bool                        `json:"batch_wait_active,omitempty"`
-	BatchWaitReason                   string                      `json:"batch_wait_reason,omitempty"`
-	DeferredEvents                    int                         `json:"deferred_events,omitempty"`
-	MaxDeferCount                     int                         `json:"max_defer_count,omitempty"`
-	ForcedAgingReady                  int                         `json:"forced_aging_ready,omitempty"`
-	LastDeferredEventSeq              int64                       `json:"last_deferred_event_seq,omitempty"`
-	LastDeferredPath                  string                      `json:"last_deferred_path,omitempty"`
-	LastDeferredReason                string                      `json:"last_deferred_reason,omitempty"`
-	LastPlannerErrorEventSeq          int64                       `json:"last_planner_error_event_seq,omitempty"`
-	LastPlannerErrorPath              string                      `json:"last_planner_error_path,omitempty"`
-	LastPlannerError                  string                      `json:"last_planner_error,omitempty"`
-	MessageQualityRewriteCountRecent  int                         `json:"message_quality_rewrite_count_recent,omitempty"`
-	MessageQualityFallbackCountRecent int                         `json:"message_quality_fallback_count_recent,omitempty"`
-	LastMessageQualityEventSeq        int64                       `json:"last_message_quality_event_seq,omitempty"`
-	LastMessageQualityPath            string                      `json:"last_message_quality_path,omitempty"`
-	LastMessageQualityAction          string                      `json:"last_message_quality_action,omitempty"`
-	LastMessageQualityReason          string                      `json:"last_message_quality_reason,omitempty"`
-	LastPlannerWindow                 *intentPlannerWindowSummary `json:"last_planner_window,omitempty"`
+	Strategy                          string                              `json:"strategy"`
+	CommitFormat                      string                              `json:"commit_format"`
+	Active                            bool                                `json:"active"`
+	Window                            int                                 `json:"window,omitempty"`
+	RecentCommits                     int                                 `json:"recent_commits,omitempty"`
+	DeferLimit                        int                                 `json:"defer_limit,omitempty"`
+	MinPending                        int                                 `json:"min_pending,omitempty"`
+	SettleWindowSeconds               int64                               `json:"settle_window_seconds"`
+	MaxPendingAgeSeconds              int64                               `json:"max_pending_age_seconds,omitempty"`
+	IntentStageDiffCap                int                                 `json:"intent_stage_diff_cap,omitempty"`
+	VisiblePendingEvents              int                                 `json:"visible_pending_events,omitempty"`
+	OldestPendingEventSeq             int64                               `json:"oldest_pending_event_seq,omitempty"`
+	OldestPendingPath                 string                              `json:"oldest_pending_path,omitempty"`
+	OldestPendingAgeSeconds           int64                               `json:"oldest_pending_age_seconds,omitempty"`
+	NewestPendingEventSeq             int64                               `json:"newest_pending_event_seq,omitempty"`
+	NewestPendingAgeSeconds           int64                               `json:"newest_pending_age_seconds,omitempty"`
+	AgeTriggerTS                      int64                               `json:"age_trigger_ts,omitempty"`
+	AgeTriggerInSeconds               int64                               `json:"age_trigger_in_seconds,omitempty"`
+	SettleTriggerTS                   int64                               `json:"settle_trigger_ts,omitempty"`
+	SettleTriggerInSeconds            int64                               `json:"settle_trigger_in_seconds,omitempty"`
+	BatchWaitActive                   bool                                `json:"batch_wait_active,omitempty"`
+	BatchWaitReason                   string                              `json:"batch_wait_reason,omitempty"`
+	DeferredEvents                    int                                 `json:"deferred_events,omitempty"`
+	MaxDeferCount                     int                                 `json:"max_defer_count,omitempty"`
+	ForcedAgingReady                  int                                 `json:"forced_aging_ready,omitempty"`
+	LastDeferredEventSeq              int64                               `json:"last_deferred_event_seq,omitempty"`
+	LastDeferredPath                  string                              `json:"last_deferred_path,omitempty"`
+	LastDeferredReason                string                              `json:"last_deferred_reason,omitempty"`
+	LastPlannerErrorEventSeq          int64                               `json:"last_planner_error_event_seq,omitempty"`
+	LastPlannerErrorPath              string                              `json:"last_planner_error_path,omitempty"`
+	LastPlannerError                  string                              `json:"last_planner_error,omitempty"`
+	MessageQualityRewriteCountRecent  int                                 `json:"message_quality_rewrite_count_recent,omitempty"`
+	MessageQualityFallbackCountRecent int                                 `json:"message_quality_fallback_count_recent,omitempty"`
+	LastMessageQualityEventSeq        int64                               `json:"last_message_quality_event_seq,omitempty"`
+	LastMessageQualityPath            string                              `json:"last_message_quality_path,omitempty"`
+	LastMessageQualityAction          string                              `json:"last_message_quality_action,omitempty"`
+	LastMessageQualityReason          string                              `json:"last_message_quality_reason,omitempty"`
+	PlannerHealth                     *daemon.IntentPlannerHealthSnapshot `json:"planner_health,omitempty"`
+	PlannerHealthWarning              string                              `json:"planner_health_warning,omitempty"`
+	LastPlannerWindow                 *intentPlannerWindowSummary         `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
 	// is always IntentRecentDecisionWindow (default 100) regardless of how
@@ -209,6 +218,24 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 				valueOrUnset(r.LastMessageQualityAction),
 				r.LastMessageQualityReason)
 		}
+	}
+	if r.PlannerHealth != nil {
+		health := r.PlannerHealth
+		fmt.Fprintf(out, "Intent planner health: %s failures=%d bypasses=%d",
+			valueOrUnset(string(health.State)), health.ConsecutiveFailures, health.BypassCount)
+		if health.NextProbeTS > 0 {
+			fmt.Fprintf(out, " next_probe=%s", time.Unix(int64(health.NextProbeTS), 0).UTC().Format(time.RFC3339))
+		}
+		if health.LastFailureClass != "" {
+			fmt.Fprintf(out, " last_failure_class=%s", health.LastFailureClass)
+		}
+		fmt.Fprintln(out)
+		if health.LastError != "" {
+			fmt.Fprintf(out, "  Last circuit failure: %s\n", health.LastError)
+		}
+	}
+	if r.PlannerHealthWarning != "" {
+		fmt.Fprintf(out, "Intent planner health warning: %s\n", r.PlannerHealthWarning)
 	}
 	if r.LastPlannerWindow != nil {
 		win := r.LastPlannerWindow
@@ -353,6 +380,12 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	} else if ok {
 		report.MaxPendingAgeSeconds = parseIntentMetaDurationSeconds(v, report.MaxPendingAgeSeconds)
 	}
+	if plannerHealth, warning, err := loadIntentPlannerHealth(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.PlannerHealth = plannerHealth
+		report.PlannerHealthWarning = warning
+	}
 	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
 		return report, err
 	}
@@ -441,6 +474,27 @@ LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlock
 	}
 
 	return report, nil
+}
+
+func loadIntentPlannerHealth(ctx context.Context, conn *sql.DB) (*daemon.IntentPlannerHealthSnapshot, string, error) {
+	raw, ok, err := metaLookup(ctx, conn, daemon.MetaKeyIntentPlannerHealth)
+	if err != nil {
+		return nil, "", fmt.Errorf("intent planner health: %w", err)
+	}
+	if !ok {
+		return nil, "", nil
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, plannerHealthInvalidWarning, nil
+	}
+	health, err := daemon.DecodeIntentPlannerHealthSnapshot(raw)
+	if errors.Is(err, daemon.ErrIntentPlannerHealthUnsupportedVersion) {
+		return nil, plannerHealthVersionWarning, nil
+	}
+	if err != nil {
+		return nil, plannerHealthInvalidWarning, nil
+	}
+	return &health, "", nil
 }
 
 func normalizeCommitFormatForReport(raw, fallback string) string {
@@ -589,7 +643,7 @@ LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPa
 		report.LastPlannerErrorPath = lastErrorPath.String
 	}
 	if lastError.Valid {
-		report.LastPlannerError = lastError.String
+		report.LastPlannerError = ai.SanitizePlannerError(lastError.String)
 	}
 	return nil
 }

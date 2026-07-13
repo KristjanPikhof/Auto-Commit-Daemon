@@ -7,6 +7,9 @@ appear, or how to recover a stuck queue.
 
 | Need | Command | Reads or writes |
 |---|---|---|
+| Health summary and one next action | `acd` | Read |
+| Enable and ensure the daemon is running | `acd on` | Write desired state, start if needed |
+| Disable and stop while preserving state | `acd off` | Write desired state, stop if needed |
 | Current repo state | `acd status` | Read |
 | Live state refresh | `acd status --watch` | Read |
 | Product decision ledger | `acd events` | Read |
@@ -15,7 +18,7 @@ appear, or how to recover a stuck queue.
 | Explain one commit | `acd explain --commit HEAD` | Read |
 | Inspect latest AI prompt trace | `acd prompt --last` | Read |
 | Tail raw daemon log | `acd logs --follow` | Read |
-| Create support bundle | `acd doctor --bundle` | Read |
+| Create support bundle | `acd doctor --bundle` | Read diagnostics and write a sanitized zip |
 
 `acd prompt` only works after a non-deterministic provider ran with
 `ACD_AI_PROMPT_TRACE=1`.
@@ -23,10 +26,17 @@ appear, or how to recover a stuck queue.
 `acd events --watch` starts at the current ledger tail unless you pass
 `--since <cursor>`.
 
+See [commands.md](commands.md) for the complete public command reference,
+including repo administration, maintenance, and the hook protocol.
+
 ## Repo registration
 
 Most repos are automatic. A harness hook calls `acd start`, which creates
 `<gitDir>/acd/state.db` and registers the canonical worktree root.
+
+For normal manual control, use `acd on` and `acd off`. Both are idempotent and
+preserve `.git/acd` state. The commands below are for registry administration
+or bulk lifecycle work.
 
 | Task | Command |
 |---|---|
@@ -85,26 +95,60 @@ seen, harnesses, and status details.
 
 ## Recovery ladder
 
+ACD automatically reconciles a blocked or failed queue as one complete,
+immutable branch-generation chain. It either proves that stable `HEAD` already
+contains the final touched-path state or archives the reconstructed chain under
+`refs/acd/recovery/*`, then reseeds and captures the live worktree again.
+
 Run these in order. Stop when the queue is healthy again.
 
 | Step | Command | What to decide |
 |---|---|---|
-| Observe | `acd status` | Is the daemon running, paused, waiting, or blocked? |
+| Observe | `acd` | Is the repo healthy, waiting, degraded, off, or in need of attention? |
 | Inspect decisions | `acd events --watch` | What is ACD doing now? |
 | Inspect one path | `acd explain --path FILE` | Is the file captured, skipped, protected, or blocked? |
 | Inspect blockers | `acd diagnose --json` | Which branch anchor or terminal row is holding replay? |
-| Preview cleanup | `acd fix --dry-run` | Does the plan match what happened? |
-| Safe apply | `acd fix --yes` | Apply only verifiable cleanup. |
-| Force preview | `acd fix --force --dry-run` | Use only when terminal barriers still hold pending successors. |
-| Force apply | `acd fix --force --yes` | Apply only after checking the blocked changes. |
-| Post-check | `acd status` | Confirm `blk`/`blocked` cleared. |
+| Preview reconciliation | `acd fix --dry-run` | Does the exact-chain proof match what happened? |
+| Prevent hook restart during repair | `acd off` | Stop the daemon and keep the repo disabled while state changes. |
+| Apply reconciliation | `acd fix --yes` | Prove the chain at `HEAD`; otherwise preserve it at an archive ref. |
+| Preview archive-only recovery | `acd fix --force --dry-run` | Show which complete chain and recovery ref would be used. |
+| Apply archive-only recovery | `acd fix --force --yes` | Save the complete chain without trying the publish proof. |
+| Start normal operation again | `acd on` | Enable the repo and ensure the daemon is healthy. |
+| Post-check | `acd` | Confirm the repo no longer needs attention. |
 
-`acd fix` backs up `state.db` before mutation and refuses a live daemon owner.
+`acd fix` creates and verifies a SQLite-consistent backup before migration or
+recovery mutation, and refuses a live daemon owner. It never retargets captures
+to another branch generation, deletes terminal rows, or changes the live
+worktree, index, or branch.
 If the only problem is a manual pause marker, use:
 
 ~~~bash
 acd resume --yes
 ~~~
+
+## Inspect or restore archived work
+
+Recovery decisions name the exact hidden ref. Find recent archive decisions and
+list the refs without changing your worktree:
+
+~~~bash
+acd events --json --limit 50
+git for-each-ref --format='%(refname) %(objectname:short)' refs/acd/recovery/
+~~~
+
+Use the `/archive` ref from the `recovery_archived` decision:
+
+| Task | Command |
+|---|---|
+| Compare the archive with current `HEAD` | `git diff HEAD <archive-ref> --` |
+| Read one archived file | `git show <archive-ref>:path/to/file` |
+| Restore one path into the worktree | `git restore --source=<archive-ref> -- path/to/file` |
+| Keep the whole archive as a review branch | `git branch acd-recovery-review <archive-ref>` |
+
+The first two commands are read-only. The restore and branch commands are
+explicit operator actions; ACD never applies an archive back onto the active
+branch by itself. `/published` refs are proof that stable `HEAD` already held
+the final captured state, so they normally need no restore.
 
 ## Common symptoms
 
@@ -112,8 +156,8 @@ acd resume --yes
 |---|---|---|
 | File was not committed | `acd explain --path FILE` | It may be pending, skipped, protected, or unseen. |
 | Queue says `wait` | `acd status` | Intent mode may be waiting for count or age. |
-| Queue says `blk` | `acd diagnose --json` | A terminal barrier needs operator action. |
-| Commit message is generic | `acd status --json` | Provider may be deterministic fallback. |
+| Queue says `blk` | `acd diagnose --json` | ACD may be reconciling a complete chain, or proof needs inspection. |
+| Commit message is generic | `acd status --json` | Planner circuit may be using deterministic fallback. |
 | Path under generated tree is ignored | `acd doctor` | Safe-ignore pruned it. |
 | Prompt trace is missing | `acd prompt --last` | Tracing was not enabled before the provider call. |
 | External tool already committed the file | `acd explain --commit HEAD` | Expect `handled_external` or `superseded_external`. |
@@ -134,7 +178,7 @@ acd events --path path/to/file
 | `committed` | ACD already published it. | Check `git log -- path/to/file`. |
 | `protected` or `skipped` | ACD intentionally left it alone. | Check safe-ignore, sensitive globs, `.gitignore`, or path location. |
 | No decision | ACD has not seen it. | Check daemon liveness and ignore settings. |
-| `blocked` | Replay stopped first. | Run `acd diagnose --json`, then `acd fix --dry-run`. |
+| `blocked` | Replay stopped first. | Let automatic chain reconciliation run, then use `acd diagnose --json` if it remains. |
 
 If the daemon is alive and the path still has no decision:
 
@@ -157,6 +201,8 @@ acd explain --commit HEAD
 | `handled_external` | Current `HEAD` already has the captured after-state. |
 | `handled_external_after_block` | A blocked row self-healed after an external commit landed the captured state. |
 | `superseded_external` | External history made the queued event obsolete. |
+| `recovery_published` | ACD proved the complete unpublished chain at stable `HEAD`. |
+| `recovery_archived` | ACD preserved the complete chain under a hidden recovery ref. |
 
 No action is needed when `explain` says `HEAD` contains the change. If the queue
 stays blocked, go through the recovery ladder.
@@ -189,6 +235,13 @@ acd flush --repo . --session-id "$ACD_SESSION_ID" --logical
 ~~~
 
 Plain `acd wake` does not bypass intent batch gates.
+
+Planner failure does not block intent replay. Transport failures open a
+persisted circuit immediately; three consecutive invalid or unsafe plans also
+open it. During the 30-second, 2-minute, and 10-minute cooldowns ACD uses the
+deterministic planner, then sends one automatic probe. Inspect
+`intent_strategy.planner_health` in status or diagnose JSON for the circuit
+state, failure class, bypass count, and next probe time.
 
 To check whether work was captured, planner-visible, and committed as intended:
 
@@ -254,10 +307,10 @@ acd wake --repo . --session-id "$ACD_SESSION_ID"
 | `git reset --soft` or `--mixed` | Same-branch rewind. Capture and replay pause for rewind grace. |
 | `git reset --hard` | Same rewind behavior, with worktree overwritten by Git. |
 | `git rebase -i` | Git operation marker pauses capture and replay. Generation bumps after rebase. |
-| Deleted merged branch | Startup cleanup can remove stale unpublished rows for that dead ref. |
+| Deleted merged branch | Startup cleanup archives complete unpublished pairs before accepting cleanup. |
 
-Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` before daemon start if you need to inspect
-deleted-branch rows before cleanup.
+Set `ACD_KEEP_DEAD_BRANCH_BARRIERS=1` before daemon start if you need to keep
+deleted-branch unpublished rows in their original queue state for inspection.
 
 ## Skipped generated or sensitive files
 
@@ -273,7 +326,7 @@ acd doctor
 |---|---|
 | `ACD_SAFE_IGNORE=0` | Disable generated-tree pruning. |
 | `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated-tree patterns. |
-| `ACD_SENSITIVE_GLOBS=...` | Configure sensitive globs. Empty keeps defaults. |
+| `ACD_SENSITIVE_GLOBS=...` | Replace the protected path globs. Unset or empty uses the defaults. |
 
 Restart the daemon after changing these settings.
 
@@ -286,8 +339,9 @@ for example `.derivedData-provider-core/`.
 |---|---|---|
 | Inspect | `acd diagnose --json` | Shows `generated_pending` roots, queued delete count, and tracked count. |
 | Preview ACD cleanup | `acd fix --dry-run` | Shows `drop_generated_pending` actions. |
-| Stop if needed | `acd stop` | Required when a live daemon owns the state DB. |
+| Turn ACD off | `acd off` | Stops the daemon and prevents hooks from restarting it during cleanup. |
 | Clean ACD queue | `acd fix --yes` | Removes only protected generated pending rows from ACD state. |
+| Turn ACD on | `acd on` | Restarts normal capture and replay after cleanup. |
 | Review Git cleanup | `git status -- .derivedData-provider-core` | Confirms which tracked generated files are deleted. |
 | Stage Git cleanup | `git add -u -- .derivedData-provider-core` | Stages the tracked generated file removals. |
 | Commit Git cleanup | `git commit -m "Remove tracked generated cache files"` | Records the repository cleanup. |
@@ -299,8 +353,9 @@ stages or commits those removals for you.
 
 ## Blocked conflicts and failed barriers
 
-`blocked_conflict` and `failed` are terminal. Later pending rows for the same
-branch generation wait behind them.
+`blocked_conflict` and `failed` stop ordinary FIFO replay. Later pending rows for
+the same branch generation wait while ACD tries all-or-none chain
+reconciliation.
 
 ~~~bash
 acd status
@@ -313,41 +368,50 @@ acd fix --dry-run
 Apply only after reading the plan:
 
 ~~~bash
+acd off
 acd fix --yes
-acd status
+acd on
+acd
 ~~~
 
-Use the force path only when the plan says barriers still have pending
-successors:
+Use the force path when the chain cannot be proven at `HEAD` and you want an
+explicit archive-only recovery:
 
 ~~~bash
 acd fix --force --dry-run
+acd off
 acd fix --force --yes
-acd status
+acd on
+acd
 ~~~
 
-## Cold start commit cleanup
+## Commit work made while ACD was off
 
 Use `commit-all` when the daemon was off and the worktree is dirty:
 
 ~~~bash
+acd off
 acd commit-all --dry-run
 acd commit-all --yes
 acd commit-all --yes --json
 acd commit-all --repo /path/to/repo --yes
+acd on
 ~~~
 
 What it does:
 
 | Step | Behavior |
 |---|---|
+| Preserve | Proves or archives every pre-existing exact unpublished pair. |
 | Reseed | Rebuilds shadow state from `HEAD`. |
-| Drop stale pending | Removes old pending rows for the active branch generation. |
 | Capture | Captures live worktree vs `HEAD`. |
 | Sort | Orders paths lexicographically. |
 | Replay | Uses the configured commit strategy. |
 
 `--json` requires `--yes` because there is no interactive prompt.
+`--dry-run` and declined confirmation are read-only and do not start the AI
+provider. If unpublished rows remain after replay, `commit-all` exits non-zero
+with an incomplete result instead of reporting success.
 
 Refusals:
 
@@ -356,7 +420,7 @@ Refusals:
 | Detached HEAD | Check out a branch. |
 | Git operation in progress | Finish the operation. |
 | Manual pause marker | `acd resume --yes` |
-| Per-repo daemon is running | `acd stop` first. |
+| The daemon is running when the command is ready to write | `acd off` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
 | No initial commit | Create an initial commit. |
 
 ## Support bundle
@@ -395,6 +459,8 @@ fsnotify information, state/meta JSON, and daemon log tails.
 | `handled_external` | Another commit already contains the captured after-state. |
 | `handled_external_after_block` | A blocked row was promoted after `HEAD` matched its after-state. |
 | `superseded_external` | External history made queued work obsolete. |
+| `recovery_published` | ACD proved that the branch already contains every captured change in the unpublished chain. |
+| `recovery_archived` | ACD saved the unpublished chain under a hidden recovery ref before removing it from replay. |
 | `blocked` | Replay stopped because applying the event was not safe. |
 | `paused` / `resumed` | Manual pause, rewind grace, or Git operation state changed. |
 

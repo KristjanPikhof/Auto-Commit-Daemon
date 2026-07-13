@@ -187,6 +187,16 @@ type ReplayOpts struct {
 	// and then deterministic planning if that provider is unavailable.
 	IntentPlanner ai.IntentPlanner
 
+	// IntentHealth gates production planner calls. Nil preserves the direct
+	// Replay test/CLI behavior; Run supplies one process-scoped instance so
+	// cooldown and half-open leases survive across replay passes.
+	IntentHealth *IntentPlannerHealth
+
+	// IntentPlannerProvider/Model preserve the primary provider identity when
+	// IntentPlanner is injected from Run instead of rebuilt from env per pass.
+	IntentPlannerProvider string
+	IntentPlannerModel    string
+
 	// IntentWindow caps the normal planning window. Zero resolves from env.
 	IntentWindow int
 
@@ -233,8 +243,12 @@ type ReplaySummary struct {
 	Published int // events that produced a new commit
 	Conflicts int // events terminally settled in state.EventStateBlockedConflict
 	Failed    int // events marked failed (validation/commit errors)
-	BaseHead  string
-	Skipped   bool // replay drain was intentionally skipped without publishing
+	// RecaptureRequired means an active unpublished chain was archived and
+	// its shadow invalidated. Persistent run loops will reseed on the next
+	// pass; one-shot callers must perform that pass before reporting drained.
+	RecaptureRequired bool
+	BaseHead          string
+	Skipped           bool // replay drain was intentionally skipped without publishing
 	// SkippedReason distinguishes intentional no-op passes from an empty
 	// pending queue. Empty means replay was not skipped or the legacy pause
 	// skip path set only Skipped.
@@ -348,7 +362,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	// predecessors, so clearing the barrier now lets the very next query
 	// drain the suffix.
 	if cctx.BranchRef != "" {
-		if err := probeBlockedSelfHeal(ctx, repoRoot, db, cctx, opts.Trace); err != nil {
+		selfHealResult, err := probeBlockedSelfHeal(ctx, repoRoot, db, cctx, opts.Trace)
+		if err != nil {
 			// Self-heal is best-effort: a failure must not stop the rest
 			// of the replay pass (the offending row simply stays
 			// blocked). Surface it via slog so an operator running with
@@ -357,6 +372,21 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 				"branch_ref", cctx.BranchRef,
 				"generation", cctx.BranchGeneration,
 				"err", err.Error())
+		} else if selfHealResult.Handled && selfHealResult.Outcome == state.EventStateRecovered {
+			sum.RecaptureRequired = true
+		}
+		recoveryResult, err := reconcileActiveBarrierChain(ctx, repoRoot, db, cctx, opts)
+		if err != nil {
+			// Chain reconciliation fails closed. The barrier and every
+			// successor remain byte-for-byte unchanged; a recovery ref may
+			// remain only when it was already fully materialized before a
+			// later HEAD/state race was observed.
+			slog.Default().Warn("daemon: recovery chain reconciliation failed",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", err.Error())
+		} else if recoveryResult.Handled && recoveryResult.Outcome == state.EventStateRecovered {
+			sum.RecaptureRequired = true
 		}
 	}
 
@@ -797,6 +827,7 @@ func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
 type intentReplayConfig struct {
 	enabled         bool
 	planner         ai.IntentPlanner
+	health          *IntentPlannerHealth
 	window          int
 	minPending      int
 	settleWindow    time.Duration
@@ -849,6 +880,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 		commitFormat:         cfg.CommitFormat,
+		health:               opts.IntentHealth,
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
@@ -860,7 +892,10 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		out.settleWindow = opts.IntentSettleWindow
 	} else if opts.IntentSettleWindow < 0 {
 		out.settleWindow = 0
-	} else if opts.IntentPlanner != nil {
+	} else if opts.IntentPlanner != nil && opts.IntentHealth == nil {
+		// Direct tests historically use an injected planner with zero settle
+		// delay. Production Run also injects its reused planner now, but always
+		// supplies IntentHealth and must retain the configured settle window.
 		out.settleWindow = 0
 	}
 	if opts.IntentMaxPendingAge > 0 {
@@ -893,13 +928,17 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	if opts.IntentPlanner != nil {
 		out.planner = opts.IntentPlanner
 		out.plannerProvider = ai.PrimaryProviderName(opts.IntentPlanner)
+		if strings.TrimSpace(opts.IntentPlannerProvider) != "" {
+			out.plannerProvider = strings.TrimSpace(opts.IntentPlannerProvider)
+		}
+		out.plannerModel = strings.TrimSpace(opts.IntentPlannerModel)
 		return out, nil, nil
 	}
 
 	providerCfg := cfg
 	provider, closer, err := ai.BuildProvider(providerCfg)
 	if err != nil {
-		slog.Default().Warn("build intent planner; falling back to deterministic", "err", err.Error())
+		slog.Default().Warn("build intent planner; falling back to deterministic", "err", ai.SanitizePlannerError(err.Error()))
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		out.plannerProvider = out.planner.Name()
 		return out, nil, nil
@@ -912,7 +951,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		if closer != nil {
 			return out, func() {
 				if err := closer.Close(); err != nil {
-					slog.Default().Warn("close unused intent planner provider", "err", err.Error())
+					slog.Default().Warn("close unused intent planner provider", "err", ai.SanitizePlannerError(err.Error()))
 				}
 			}, nil
 		}
@@ -929,7 +968,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	if closer != nil {
 		return out, func() {
 			if err := closer.Close(); err != nil {
-				slog.Default().Warn("close intent planner provider", "err", err.Error())
+				slog.Default().Warn("close intent planner provider", "err", ai.SanitizePlannerError(err.Error()))
 			}
 		}, nil
 	}
@@ -1068,19 +1107,21 @@ func replayIntentBatch(
 		// failure, fall through to the standard planner path which records
 		// the error decision and degrades to the deterministic fallback.
 		if safetyErr := validateIntentSelectionSafety(items, plan); safetyErr != nil {
-			recordIntentPromptFallback(ctx, cfg.planner, safetyErr.Error())
-			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, safetyErr.Error()); err != nil {
+			failure := ai.SanitizePlannerError(safetyErr.Error())
+			recordIntentPromptFallback(ctx, cfg.planner, failure)
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, failure); err != nil {
 				return sum, err
 			}
-			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, safetyErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, failure, "forced-singleton fast path validation failed", "Forced-singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
 				return sum, err
 			}
 		} else if planErr := ai.ValidateIntentPlan(req, plan); planErr != nil {
-			recordIntentPromptFallback(ctx, cfg.planner, planErr.Error())
-			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, planErr.Error()); err != nil {
+			failure := ai.SanitizePlannerError(planErr.Error())
+			recordIntentPromptFallback(ctx, cfg.planner, failure)
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, failure); err != nil {
 				return sum, err
 			}
-			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, planErr.Error(), "forced-singleton fast path validation failed", "Forced-singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, failure, "forced-singleton fast path validation failed", "Forced-singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
 				return sum, err
 			}
 		} else {
@@ -1097,25 +1138,31 @@ func replayIntentBatch(
 		cfg.planner = ai.DeterministicProvider{CommitFormat: cfg.commitFormat}
 	}
 
-	if !forced && isSingletonProviderFastPath(items) {
+	// Direct Replay callers without a circuit keep the legacy per-event message
+	// fast path. Production Run supplies cfg.health, so even a one-item window
+	// goes through the same planner gate and cannot spend a remote timeout while
+	// the circuit is open.
+	if !forced && cfg.health == nil && isSingletonProviderFastPath(items) {
 		plan, err := planIntentSingletonMessagePath(ctx, opts.MessageFn, items[0], cfg.commitFormat)
 		if err != nil {
 			return sum, err
 		}
 		if safetyErr := validateIntentSelectionSafety(items, plan); safetyErr != nil {
-			recordIntentPromptFallback(ctx, cfg.planner, safetyErr.Error())
-			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, safetyErr.Error()); err != nil {
+			failure := ai.SanitizePlannerError(safetyErr.Error())
+			recordIntentPromptFallback(ctx, cfg.planner, failure)
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, failure); err != nil {
 				return sum, err
 			}
-			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, safetyErr.Error(), "singleton fast path validation failed", "Singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, failure, "singleton fast path validation failed", "Singleton fast path produced an unsafe plan; deterministic fallback will choose a safe one-item plan."); err != nil {
 				return sum, err
 			}
 		} else if planErr := ai.ValidateIntentPlan(req, plan); planErr != nil {
-			recordIntentPromptFallback(ctx, cfg.planner, planErr.Error())
-			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, planErr.Error()); err != nil {
+			failure := ai.SanitizePlannerError(planErr.Error())
+			recordIntentPromptFallback(ctx, cfg.planner, failure)
+			if err := state.RecordPlannerError(ctx, db, items[0].event.Seq, nowSec, failure); err != nil {
 				return sum, err
 			}
-			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, planErr.Error(), "singleton fast path validation failed", "Singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
+			if err := appendIntentPlannerDecision(ctx, db, items[0].event, activeCtx, nowSec, state.DecisionKindIntentPlannerError, failure, "singleton fast path validation failed", "Singleton fast path produced an invalid plan; deterministic fallback will choose a safe one-item plan."); err != nil {
 				return sum, err
 			}
 		} else {
@@ -1135,7 +1182,8 @@ func replayIntentBatch(
 	if opts.PromptTrace != nil {
 		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
 			Strategy:     string(ai.CommitStrategyIntent),
-			Provider:     cfg.planner.Name(),
+			Provider:     cfg.plannerProvider,
+			Model:        cfg.plannerModel,
 			OfferedSeqs:  intentOfferedSeqs(req),
 			BranchRef:    activeCtx.BranchRef,
 			Generation:   activeCtx.BranchGeneration,
@@ -1146,7 +1194,7 @@ func replayIntentBatch(
 			DiffCap: ai.IntentStageDiffCap,
 		})
 	}
-	plan, validationFailure, err := planIntentWithFallback(plannerCtx, repoRoot, db, cfg.planner, req, items, activeCtx, nowSec)
+	plan, validationFailure, err := planIntentWithFallback(plannerCtx, repoRoot, db, cfg.planner, cfg.health, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
@@ -1918,17 +1966,52 @@ func singletonFallbackOp(item intentReplayItem) ai.OpItem {
 	}
 }
 
-func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, planner ai.IntentPlanner, req ai.IntentPlanRequest, items []intentReplayItem, cctx CaptureContext, ts float64) (ai.IntentPlan, string, error) {
+func planIntentWithFallback(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	planner ai.IntentPlanner,
+	health *IntentPlannerHealth,
+	req ai.IntentPlanRequest,
+	items []intentReplayItem,
+	cctx CaptureContext,
+	ts float64,
+) (ai.IntentPlan, string, error) {
 	if planner == nil {
 		planner = ai.DeterministicProvider{CommitFormat: req.CommitFormat}
 	}
+
+	var permit IntentPlannerHealthPermit
+	if health != nil {
+		var acquireErr error
+		permit, acquireErr = health.Acquire(ctx)
+		if acquireErr != nil {
+			var openErr *IntentPlannerCircuitOpenError
+			if !errors.As(acquireErr, &openErr) {
+				return ai.IntentPlan{}, "", acquireErr
+			}
+			// A circuit bypass is an expected deterministic degradation, not a
+			// fresh planner error. Keep validationFailure empty so no
+			// intent_planner_error rows or decisions are emitted on every tick.
+			bypassReason := "intent planner circuit bypass: open"
+			if openErr.HalfOpen {
+				bypassReason = "intent planner circuit bypass: half-open probe in progress"
+			}
+			recordIntentPromptFallback(ctx, planner, bypassReason)
+			plan, err := deterministicIntentFallback(ctx, repoRoot, req, items)
+			return plan, "", err
+		}
+	}
+
 	var validationFailure string
 	plan, err := planner.PlanIntent(ctx, req)
+	plannerCallFailed := err != nil
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
 		// Discard the dropped/synthesized lists: provider-side warns already
 		// fired upstream; emitting another warn here would duplicate the
 		// log entry for the same response.
+		plan = ai.NormalizeIntentPlanReasons(plan)
 		plan, _, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
 		err = ai.ValidateIntentPlan(req, plan)
 	}
@@ -1936,15 +2019,26 @@ func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, 
 		err = validateIntentSelectionSafety(items, plan)
 	}
 	if err == nil {
+		if health != nil {
+			if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
+				return ai.IntentPlan{}, "", healthErr
+			}
+		}
 		return plan, "", nil
 	}
-	validationFailure = err.Error()
+	if health != nil {
+		failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+			return ai.IntentPlan{}, "", healthErr
+		}
+	}
+	validationFailure = ai.SanitizePlannerError(err.Error())
 	recordIntentPromptFallback(ctx, planner, validationFailure)
 	for _, item := range items {
-		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, err.Error()); recErr != nil {
+		if recErr := state.RecordPlannerError(ctx, db, item.event.Seq, ts, validationFailure); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
 		}
-		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, err.Error(), "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
+		if recErr := appendIntentPlannerDecision(ctx, db, item.event, cctx, ts, state.DecisionKindIntentPlannerError, validationFailure, "planner validation failed", "Intent planner validation failed; deterministic fallback will choose a safe one-item plan."); recErr != nil {
 			return ai.IntentPlan{}, validationFailure, recErr
 		}
 	}
@@ -1960,25 +2054,62 @@ func planIntentWithFallback(ctx context.Context, repoRoot string, db *state.DB, 
 			}
 		}
 	}
+	plan, err = deterministicIntentFallback(ctx, repoRoot, req, items)
+	return plan, validationFailure, err
+}
+
+func classifyIntentPlannerHealthFailure(err error, plannerCallFailed bool) error {
+	if !plannerCallFailed {
+		return &IntentPlannerValidationFailure{Err: err}
+	}
+	var qualityErr *ai.MessageQualityError
+	if errors.As(err, &qualityErr) {
+		// The composed planner adds message-quality context around both rewrite
+		// transport failures and malformed rewrite responses. Provider boundary
+		// typing keeps those outcomes distinct.
+		if qualityErr.Cause != nil {
+			var rewriteValidation *ai.IntentMessageRewriteValidationError
+			if !errors.As(qualityErr.Cause, &rewriteValidation) {
+				return &IntentPlannerTransportFailure{Err: err}
+			}
+		}
+		return &IntentPlannerValidationFailure{Err: err}
+	}
+	var validationErr *ai.IntentPlanValidationError
+	if errors.As(err, &validationErr) {
+		return &IntentPlannerValidationFailure{Err: err}
+	}
+	return &IntentPlannerTransportFailure{Err: err}
+}
+
+func deterministicIntentFallback(
+	ctx context.Context,
+	repoRoot string,
+	req ai.IntentPlanRequest,
+	items []intentReplayItem,
+) (ai.IntentPlan, error) {
+	var (
+		plan ai.IntentPlan
+		err  error
+	)
 	if req.ForcedAging && len(items) == 1 {
 		plan = planIntentSingletonFastPathHook(ctx, repoRoot, items[0], req.CommitFormat)
-		if err := ai.ValidateIntentPlan(req, plan); err != nil {
-			return ai.IntentPlan{}, validationFailure, err
+	} else {
+		fallback := ai.DeterministicProvider{CommitFormat: req.CommitFormat}
+		plan, err = fallback.PlanIntent(ctx, req)
+		if err != nil {
+			return ai.IntentPlan{}, err
 		}
-		if err := validateIntentSelectionSafety(items, plan); err != nil {
-			return ai.IntentPlan{}, validationFailure, err
-		}
-		return plan, validationFailure, nil
 	}
-	fallback := ai.DeterministicProvider{CommitFormat: req.CommitFormat}
-	plan, err = fallback.PlanIntent(ctx, req)
-	if err != nil {
-		return ai.IntentPlan{}, validationFailure, err
+	plan = ai.NormalizeIntentPlanReasons(plan)
+	plan, _, _, _ = ai.NormalizeIntentPlanDeferredReasons(plan)
+	if err := ai.ValidateIntentPlan(req, plan); err != nil {
+		return ai.IntentPlan{}, err
 	}
 	if err := validateIntentSelectionSafety(items, plan); err != nil {
-		return ai.IntentPlan{}, validationFailure, err
+		return ai.IntentPlan{}, err
 	}
-	return plan, validationFailure, nil
+	return plan, nil
 }
 
 func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, reason string) {
@@ -2238,7 +2369,7 @@ func recordIntentPlannerWindow(
 		CommitFormat:        nullString(string(req.CommitFormat)),
 		Forced:              forced,
 		ForcedReason:        nullString(forcedReason),
-		ValidationFailure:   nullString(strings.TrimSpace(validationFailure)),
+		ValidationFailure:   nullString(ai.SanitizePlannerError(validationFailure)),
 		OfferedSeqs:         intentOfferedSeqs(req),
 		VisibleOriginalSeqs: visibleOriginalSeqs,
 		HiddenSeqs:          hiddenSeqs,
@@ -2411,7 +2542,7 @@ func traceIntentPlannerValidationFailure(logger acdtrace.Logger, repoRoot string
 		Input: map[string]any{
 			"offered_seqs": intentItemSeqs(items),
 		},
-		Error:      errMsg,
+		Error:      ai.SanitizePlannerError(errMsg),
 		Generation: cctx.BranchGeneration,
 	})
 }
@@ -3166,104 +3297,75 @@ func traceReplayUpdateRef(
 //
 // Errors during the per-row probe are logged and skipped — one bad row
 // must not abort the rest of the self-heal pass or the replay loop.
-func probeBlockedSelfHeal(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, logger acdtrace.Logger) error {
+func probeBlockedSelfHeal(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, logger acdtrace.Logger) (RecoveryChainResult, error) {
+	var result RecoveryChainResult
 	if cctx.BranchRef == "" {
-		return nil
+		return result, nil
 	}
-	blocked, err := state.BlockedEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration, 0)
+	seq, barrierState, ok, err := firstRecoveryBarrier(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 	if err != nil {
-		return fmt.Errorf("daemon: self-heal: load blocked rows: %w", err)
+		return result, fmt.Errorf("daemon: self-heal: find first barrier: %w", err)
 	}
-	if len(blocked) == 0 {
-		return nil
+	if !ok || barrierState != state.EventStateBlockedConflict {
+		return result, nil
 	}
-	healed := 0
-	for _, ev := range blocked {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if !selfHealEligibleByClass(ev) {
-			continue
-		}
-		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
-		if err != nil {
-			slog.Default().Warn("daemon: self-heal: load ops",
-				"seq", ev.Seq, "err", err.Error())
-			continue
-		}
-		if !selfHealEligibleByOps(ops) {
-			continue
-		}
-		headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ev.BaseHead, ops)
-		if err != nil {
-			slog.Default().Warn("daemon: self-heal: probe HEAD",
-				"seq", ev.Seq, "path", ev.Path, "err", err.Error())
-			continue
-		}
-		if !alreadyPublished {
-			continue
-		}
-		nowSec := float64(time.Now().UnixNano()) / 1e9
-		if err := state.TransitionBlockedToPublished(ctx, db,
-			ev.Seq, headOID, nowSec,
-			cctx.BranchRef, cctx.BranchGeneration, ev.BaseHead,
-		); err != nil {
-			if errors.Is(err, state.ErrBlockedRowNotEligible) {
-				// Race: another writer moved the row out of
-				// blocked_conflict between our load and our update.
-				// Treat as a no-op — the row is no longer ours to
-				// self-heal.
-				continue
-			}
-			slog.Default().Warn("daemon: self-heal: transition row",
-				"seq", ev.Seq, "path", ev.Path, "err", err.Error())
-			continue
-		}
-		decisionCtx := cctx
-		decisionCtx.BaseHead = ev.BaseHead
-		recordReplayDecision(ctx, db, ev, decisionCtx, nowSec,
-			state.DecisionKindHandledExternalAfterBlock,
-			"handled_external_after_block",
-			headOID,
-		)
-		traceReplay(logger, repoRoot, decisionCtx, ev,
-			"replay.self_heal", state.DecisionKindHandledExternalAfterBlock,
-			"handled_external_after_block", map[string]any{
-				"commit":      headOID,
-				"head":        headOID,
-				"source_head": ev.BaseHead,
-				"branch_ref":  cctx.BranchRef,
-				"generation":  cctx.BranchGeneration,
-			})
-		healed++
-	}
-	if healed == 0 {
-		return nil
-	}
-	// Best-effort meta cleanup: only when no blocked rows remain on this
-	// (branch_ref, branch_generation). Other live anchors may still own
-	// the breadcrumbs, so we narrow the check to the active anchor before
-	// dropping the keys.
-	remaining, err := state.BlockedEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration, 1)
+	firstSeq, ok, err := firstUnpublishedRecoverySeq(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 	if err != nil {
-		slog.Default().Warn("daemon: self-heal: count remaining blocked",
-			"branch_ref", cctx.BranchRef, "err", err.Error())
-		return nil
+		return result, fmt.Errorf("daemon: self-heal: find first unpublished row: %w", err)
 	}
-	if len(remaining) > 0 {
-		return nil
+	if !ok || firstSeq != seq {
+		return result, nil
 	}
-	for _, key := range []string{
-		metaKeyLastReplayConflict,
-		metaKeyLastReplayConflictLegacy,
-		"last_replay_error",
-	} {
-		if _, err := state.MetaDelete(ctx, db, key); err != nil {
-			slog.Default().Warn("daemon: self-heal: clear meta",
-				"key", key, "err", err.Error())
-		}
+	chain, err := state.LoadUnpublishedRecoveryChain(ctx, db, cctx.BranchRef, cctx.BranchGeneration, firstSeq)
+	if err != nil {
+		return result, fmt.Errorf("daemon: self-heal: load barrier suffix: %w", err)
 	}
-	return nil
+	// Preserve the established single-event decision kind without peeling a
+	// multi-event chain one barrier at a time. Whole chains are handled by
+	// reconcileActiveBarrierChain immediately after this probe.
+	if len(chain) != 1 || chain[0].Event.Seq != seq {
+		return result, nil
+	}
+	ev := chain[0].Event
+	ops := chain[0].Ops
+	if !selfHealEligibleByClass(ev) || !selfHealEligibleByOps(ops) {
+		return result, nil
+	}
+	headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, ev.BaseHead, ops)
+	if err != nil {
+		return result, fmt.Errorf("daemon: self-heal: probe HEAD seq=%d path=%s: %w", ev.Seq, ev.Path, err)
+	}
+	if !alreadyPublished {
+		return result, nil
+	}
+	result, err = ReconcileUnpublishedChain(ctx, repoRoot, db, RecoveryReconcileOptions{
+		BranchRef:        cctx.BranchRef,
+		BranchGeneration: cctx.BranchGeneration,
+		FirstSeq:         ev.Seq,
+		Trigger:          "handled_external_after_block",
+		Trace:            logger,
+		InvalidateShadow: true,
+		decisionKind:     state.DecisionKindHandledExternalAfterBlock,
+	})
+	if err != nil {
+		return RecoveryChainResult{}, fmt.Errorf("daemon: self-heal: protected transition seq=%d path=%s: %w", ev.Seq, ev.Path, err)
+	}
+	if !result.Handled || result.Outcome != state.EventStatePublished {
+		return result, nil
+	}
+	decisionCtx := cctx
+	decisionCtx.BaseHead = ev.BaseHead
+	traceReplay(logger, repoRoot, decisionCtx, ev,
+		"replay.self_heal", state.DecisionKindHandledExternalAfterBlock,
+		"handled_external_after_block", map[string]any{
+			"commit":       result.CommitOID,
+			"head":         headOID,
+			"recovery_ref": result.RecoveryRef,
+			"source_head":  ev.BaseHead,
+			"branch_ref":   cctx.BranchRef,
+			"generation":   cctx.BranchGeneration,
+		})
+	return result, nil
 }
 
 // selfHealEligibleByClass narrows blocked rows to the before_state_mismatch

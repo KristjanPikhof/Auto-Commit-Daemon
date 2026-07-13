@@ -15,112 +15,61 @@ import (
 	"time"
 )
 
-// TestFix_BarrierWithSuccessorsRequiresForce pins the SPEC LOCK rule that
-// purge_barrier_with_successors is gated behind --force. Without --force,
-// even with --yes, the planner must NOT include the purge action and the
-// CLI must refuse to delete a blocked barrier that has pending successors.
-// With --force the dry-run plan must list the action; with --force --yes
-// the row is deleted and publish_state cleared.
-//
-// Scenario shape mirrors the real Trekoon incident: blocked_conflict row at
-// seq=N hides one or more pending captures at seq>N for the same anchor.
-// HEAD does NOT match the captured after_oid, so resolve_already_landed_barrier
-// is intentionally OUT of the plan.
-func TestFix_BarrierWithSuccessorsRequiresForce(t *testing.T) {
+// TestFix_ReconcilesWholeExactPairs pins the immutable recovery contract:
+// exact HEAD matches publish the full pair, while explicit --force archives a
+// non-matching pair without deleting or retargeting its captured rows.
+func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 	requireSQLite(t)
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// Bring schema up via a start/stop cycle so seed SQL has all tables and
-	// register the repo in the central registry (acd fix looks it up there).
-	dbPath := initStateDBSchema(t, ctx, env, repo, "fix-barrier-init")
-
+	baseHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repo, "published-a.txt"), "published a\n")
+	writeFile(t, filepath.Join(repo, "published-b.txt"), "published b\n")
+	runGitOK(t, repo, "add", "published-a.txt", "published-b.txt")
+	runGitOK(t, repo, "commit", "-q", "-m", "publish captured pair externally")
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	publishedAOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:published-a.txt"))
+	publishedBOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:published-b.txt"))
+
+	dbPath := initStateDBSchema(t, ctx, env, repo, "fix-barrier-init")
 	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
 	if gen == "" {
 		gen = "1"
 	}
 
-	// Captured after_oid is a content hash that does NOT exist anywhere in
-	// HEAD's tree — guarantees alreadyPublishedAtHEAD returns false and so
-	// resolve_already_landed_barrier is not eligible. The blocker is keyed
-	// by an error string that does NOT classify as before_state_mismatch,
-	// so the daemon's self-heal probe stays out of the picture even if a
-	// daemon happened to be alive.
-	bogusBefore := "1111111111111111111111111111111111111111"
-	bogusAfter := "2222222222222222222222222222222222222222"
-	successorAfter := gitHashObjectStdin(t, repo, "successor body\n")
-	now := nowFloatSeconds()
-	seedSQL := fmt.Sprintf(`
-INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/main', %s, '%s', 'modify', 'barrier.txt', 'rescan', %f, 'blocked_conflict', 'cas_fail: ref moved during update');
-INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, after_oid, after_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'modify', 'barrier.txt', '%s', '100644', '%s', '100644', 'rescan');
-INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
-VALUES ('refs/heads/main', %s, '%s', 'create', 'successor.txt', 'exact', %f, 'pending');
-INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'create', 'successor.txt', '%s', '100644', 'exact');
-INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid, status, error, updated_ts)
-VALUES (1, NULL, 'refs/heads/main', %s, '%s', NULL, 'blocked_conflict', 'cas_fail: ref moved', %f);
-`, gen, head, now, bogusBefore, bogusAfter,
-		gen, head, now+0.001, successorAfter,
-		gen, head, now+0.002)
-	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
-		t.Fatalf("seed barrier rows: %v\n%s", err, out)
+	publishedPair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, baseHead,
+		"published-a.txt", publishedAOID, "published-b.txt", publishedBOID)
+	apply := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	if apply.ExitCode != 0 {
+		t.Fatalf("fix --yes exit=%d\nstdout=%s\nstderr=%s", apply.ExitCode, apply.Stdout, apply.Stderr)
 	}
-	barrierSeq := sqliteScalar(t, dbPath,
-		"SELECT seq FROM capture_events WHERE path = 'barrier.txt' ORDER BY seq DESC LIMIT 1")
-	if barrierSeq == "" {
-		t.Fatalf("seeded barrier seq missing")
+	publishedPlan := decodeFixPlan(t, apply.Stdout)
+	publishedAction := findFixActionForSeq(publishedPlan.Actions, "reconcile_unpublished_chain", publishedPair.FirstSeq)
+	if publishedAction == nil || !publishedAction.Applied || publishedAction.State != "published" || publishedAction.RecoveryRef == "" {
+		t.Fatalf("normal fix did not publish exact HEAD pair: action=%+v\n%s", publishedAction, apply.Stdout)
 	}
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT group_concat(value, ',') FROM (SELECT state || '|' || commit_oid || '|' || branch_ref || '|' || branch_generation AS value FROM capture_events WHERE seq IN (%s,%s) ORDER BY seq)",
+		publishedPair.FirstSeq, publishedPair.SecondSeq)); got != fmt.Sprintf("published|%s|refs/heads/main|%s,published|%s|refs/heads/main|%s", head, gen, head, gen) {
+		t.Fatalf("published pair provenance/state=%q", got)
+	}
+	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", publishedPair.FirstSeq, publishedPair.SecondSeq)); rows != "2" {
+		t.Fatalf("normal fix deleted captured rows: %s", rows)
+	}
+	runGitOK(t, repo, "show-ref", "--verify", publishedAction.RecoveryRef)
 
-	// --dry-run WITHOUT --force: plan must NOT include purge_barrier_with_successors
-	// and the JSON suggestions block must nudge the operator toward --force.
-	dryRun := runAcd(t, ctx, env, "fix", "--repo", repo, "--dry-run", "--json")
-	if dryRun.ExitCode != 0 {
-		t.Fatalf("fix --dry-run exit=%d\nstdout=%s\nstderr=%s", dryRun.ExitCode, dryRun.Stdout, dryRun.Stderr)
-	}
-	plan := decodeFixPlan(t, dryRun.Stdout)
-	if !plan.DryRun {
-		t.Fatalf("plan.dry_run=false on --dry-run invocation\n%s", dryRun.Stdout)
-	}
-	if hasFixActionKind(plan.Actions, "purge_barrier_with_successors") {
-		t.Fatalf("--dry-run without --force planned purge_barrier_with_successors\n%s", dryRun.Stdout)
-	}
-	if hasFixActionKind(plan.Actions, "resolve_already_landed_barrier") {
-		t.Fatalf("--dry-run planned resolve_already_landed_barrier; HEAD must not match captured after_oid\n%s", dryRun.Stdout)
-	}
-	if !suggestionsMentionForce(plan.Suggestions) {
-		t.Fatalf("--dry-run suggestions did not nudge operator toward --force:\n%v", plan.Suggestions)
-	}
-
-	// --yes WITHOUT --force: must refuse to mint the destructive purge.
-	// The plan rendered must still omit purge_barrier_with_successors and
-	// the seeded blocked row must survive.
-	yesNoForce := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
-	// `acd fix --yes` may exit 0 (no qualifying safe actions) or non-zero
-	// (refused due to a daemon-alive unsafe reason). Either way, no
-	// destructive purge has been applied and the blocked row must still be
-	// present at its seeded seq.
-	if remaining := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", barrierSeq)); remaining != "blocked_conflict" {
-		t.Fatalf("--yes without --force mutated blocked row to state=%q (seq=%s)\nstdout=%s\nstderr=%s",
-			remaining, barrierSeq, yesNoForce.Stdout, yesNoForce.Stderr)
-	}
-	yesPlan := decodeFixPlan(t, yesNoForce.Stdout)
-	if hasFixActionKind(yesPlan.Actions, "purge_barrier_with_successors") {
-		// Even if Applied=false, the kind being in the plan would indicate
-		// the planner ignored the --force gate.
-		t.Fatalf("--yes without --force planned purge_barrier_with_successors:\n%s", yesNoForce.Stdout)
-	}
-
-	// --force --dry-run: plan now includes the purge action keyed at the
-	// blocked seq. Still no mutation.
+	archiveAOID := gitHashObjectStdin(t, repo, "archive a\n")
+	archiveBOID := gitHashObjectStdin(t, repo, "archive b\n")
+	archivePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, head,
+		"archive-a.txt", archiveAOID, "archive-b.txt", archiveBOID)
+	refsBefore := recoveryRefList(t, repo)
 	forceDry := runAcd(t, ctx, env, "fix", "--repo", repo, "--force", "--dry-run", "--json")
 	if forceDry.ExitCode != 0 {
 		t.Fatalf("fix --force --dry-run exit=%d\nstdout=%s\nstderr=%s", forceDry.ExitCode, forceDry.Stdout, forceDry.Stderr)
@@ -129,41 +78,47 @@ VALUES (1, NULL, 'refs/heads/main', %s, '%s', NULL, 'blocked_conflict', 'cas_fai
 	if !forcePlan.DryRun {
 		t.Fatalf("--force --dry-run did not flag dry_run=true\n%s", forceDry.Stdout)
 	}
-	if !hasFixActionKindForSeq(forcePlan.Actions, "purge_barrier_with_successors", barrierSeq) {
-		t.Fatalf("--force --dry-run plan missing purge_barrier_with_successors for seq=%s\n%s",
-			barrierSeq, forceDry.Stdout)
+	forceAction := findFixActionForSeq(forcePlan.Actions, "reconcile_unpublished_chain", archivePair.FirstSeq)
+	if forceAction == nil || !forceAction.ArchiveOnly || !forceAction.RequiresForce || forceAction.Applied {
+		t.Fatalf("--force --dry-run action=%+v\n%s", forceAction, forceDry.Stdout)
 	}
-	if rem := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", barrierSeq)); rem != "blocked_conflict" {
-		t.Fatalf("--force --dry-run mutated state to %q", rem)
+	if got := exactPairStates(t, dbPath, archivePair); got != "blocked_conflict,pending" {
+		t.Fatalf("--force --dry-run mutated pair states to %q", got)
+	}
+	if refsAfter := recoveryRefList(t, repo); refsAfter != refsBefore {
+		t.Fatalf("--force --dry-run mutated recovery refs:\nbefore=%s\nafter=%s", refsBefore, refsAfter)
 	}
 
-	// --force --yes: row is deleted, publish_state singleton flips to ok.
 	forceApply := runAcd(t, ctx, env, "fix", "--repo", repo, "--force", "--yes", "--json")
 	if forceApply.ExitCode != 0 {
 		t.Fatalf("fix --force --yes exit=%d\nstdout=%s\nstderr=%s",
 			forceApply.ExitCode, forceApply.Stdout, forceApply.Stderr)
 	}
-	if rem := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT COUNT(*) FROM capture_events WHERE seq = %s", barrierSeq)); rem != "0" {
-		t.Fatalf("blocked seq %s still present after --force --yes\n%s", barrierSeq, forceApply.Stdout)
+	appliedPlan := decodeFixPlan(t, forceApply.Stdout)
+	appliedAction := findFixActionForSeq(appliedPlan.Actions, "reconcile_unpublished_chain", archivePair.FirstSeq)
+	if appliedAction == nil || !appliedAction.Applied || appliedAction.State != "recovered" ||
+		appliedAction.RowsChanged != 2 || !strings.HasPrefix(appliedAction.RecoveryRef, "refs/acd/recovery/") {
+		t.Fatalf("--force --yes archive action=%+v\n%s", appliedAction, forceApply.Stdout)
 	}
-	if pubStatus := sqliteScalar(t, dbPath, "SELECT status FROM publish_state WHERE id = 1"); pubStatus != "ok" {
-		dump, _ := exec.Command("sqlite3", dbPath,
-			"SELECT id,status,event_seq,error FROM publish_state").CombinedOutput()
-		t.Fatalf("publish_state.status=%q want ok after purge\nrows:\n%s", pubStatus, dump)
+	if got := exactPairStates(t, dbPath, archivePair); got != "recovered,recovered" {
+		t.Fatalf("--force --yes pair states=%q", got)
 	}
-	// Successor must remain pending — purge only removes the blocked row.
-	if rem := sqliteScalar(t, dbPath,
-		"SELECT state FROM capture_events WHERE path = 'successor.txt' ORDER BY seq DESC LIMIT 1"); rem != "pending" {
-		t.Fatalf("successor row state=%q want pending", rem)
+	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", archivePair.FirstSeq, archivePair.SecondSeq)); rows != "2" {
+		t.Fatalf("--force --yes deleted captured rows: %s", rows)
 	}
+	if ops := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_ops WHERE event_seq IN (%s,%s)", archivePair.FirstSeq, archivePair.SecondSeq)); ops != "2" {
+		t.Fatalf("--force --yes deleted captured ops: %s", ops)
+	}
+	runGitOK(t, repo, "show-ref", "--verify", appliedAction.RecoveryRef)
 }
 
 // TestRecoverAndPurgeDeprecationWarnings asserts the legacy `acd recover`
-// and `acd purge-events` entrypoints still work for one release while
-// emitting the documented deprecation stderr line. Both must forward to the
-// new acd fix paths so existing scripts keep functioning.
+// and `acd purge-events` entrypoints retain their safe compatibility contract
+// while emitting the documented deprecation stderr line. Recover delegates to
+// immutable whole-pair recovery; purge refuses ambiguous selectors and requires
+// explicit --all before preserving every planned pair.
 func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 	requireSQLite(t)
 
@@ -183,21 +138,10 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 		gen = "1"
 	}
 
-	// Seed a stale-anchor row: branch_ref/generation differs from current
-	// HEAD so acd recover --auto retargets it back onto refs/heads/main.
-	staleAfter := gitHashObjectStdin(t, repo, "stale anchor body\n")
-	now := nowFloatSeconds()
-	staleSQL := fmt.Sprintf(`
-INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/stale', 99, '%s', 'create', 'stale.txt', 'exact', %f, 'blocked_conflict', 'old anchor');
-INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'create', 'stale.txt', '%s', '100644', 'exact');
-`, head, now, staleAfter)
-	if out, err := exec.Command("sqlite3", dbPath, staleSQL).CombinedOutput(); err != nil {
-		t.Fatalf("seed stale anchor: %v\n%s", err, out)
-	}
-	staleSeq := sqliteScalar(t, dbPath,
-		"SELECT seq FROM capture_events WHERE path = 'stale.txt' ORDER BY seq DESC LIMIT 1")
+	staleAOID := gitHashObjectStdin(t, repo, "stale a\n")
+	staleBOID := gitHashObjectStdin(t, repo, "stale b\n")
+	stalePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/stale", "99", head,
+		"stale-a.txt", staleAOID, "stale-b.txt", staleBOID)
 
 	// Deprecated path: acd recover --auto --yes.
 	recover := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--yes", "--json")
@@ -210,38 +154,50 @@ VALUES (last_insert_rowid(), 0, 'create', 'stale.txt', '%s', '100644', 'exact');
 		t.Fatalf("recover stderr missing deprecation banner\nwant: %q\nstderr: %q",
 			wantRecoverDeprec, recover.Stderr)
 	}
-	// Retarget must still complete — branch_ref/generation flip back to
-	// the current main/gen anchor on the stale row.
-	got := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT branch_ref || '|' || branch_generation || '|' || state FROM capture_events WHERE seq = %s", staleSeq))
-	wantPrefix := "refs/heads/main|"
-	if !strings.HasPrefix(got, wantPrefix) {
-		t.Fatalf("stale row after recover=%q want prefix %q", got, wantPrefix)
+	recoverPlan := decodeFixPlan(t, recover.Stdout)
+	recoverAction := findFixActionForSeq(recoverPlan.Actions, "reconcile_unpublished_chain", stalePair.FirstSeq)
+	if recoverAction == nil || !recoverAction.Applied || recoverAction.State != "recovered" || recoverAction.RecoveryRef == "" {
+		t.Fatalf("recover alias action=%+v\n%s", recoverAction, recover.Stdout)
 	}
-	if !strings.HasSuffix(got, "|pending") {
-		t.Fatalf("stale row after recover=%q want suffix |pending (blocked rows reset)", got)
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT group_concat(value, ',') FROM (SELECT branch_ref || '|' || branch_generation || '|' || state AS value FROM capture_events WHERE seq IN (%s,%s) ORDER BY seq)",
+		stalePair.FirstSeq, stalePair.SecondSeq)); got != "refs/heads/stale|99|recovered,refs/heads/stale|99|recovered" {
+		t.Fatalf("recover alias retargeted or split stale pair: %q", got)
 	}
+	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", stalePair.FirstSeq, stalePair.SecondSeq)); rows != "2" {
+		t.Fatalf("recover alias deleted captured rows: %s", rows)
+	}
+	runGitOK(t, repo, "show-ref", "--verify", recoverAction.RecoveryRef)
 
-	// Seed a fresh blocked row so the purge-events alias has work to do.
-	blockedSeed := fmt.Sprintf(`
-INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/main', %s, '%s', 'modify', 'purge-me.txt', 'rescan', %f, 'blocked_conflict', 'cas_fail');
-INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, after_oid, after_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'modify', 'purge-me.txt', '1111111111111111111111111111111111111111', '100644', '2222222222222222222222222222222222222222', '100644', 'rescan');
-`, gen, head, now+1)
-	if out, err := exec.Command("sqlite3", dbPath, blockedSeed).CombinedOutput(); err != nil {
-		t.Fatalf("seed purge target: %v\n%s", err, out)
-	}
-	purgeSeq := sqliteScalar(t, dbPath,
-		"SELECT seq FROM capture_events WHERE path = 'purge-me.txt' ORDER BY seq DESC LIMIT 1")
-	if purgeSeq == "" {
-		t.Fatalf("purge target seq missing")
-	}
+	purgeAOID := gitHashObjectStdin(t, repo, "purge alias a\n")
+	purgeBOID := gitHashObjectStdin(t, repo, "purge alias b\n")
+	purgePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, head,
+		"purge-a.txt", purgeAOID, "purge-b.txt", purgeBOID)
 
-	// Deprecated path: acd purge-events --blocked --yes.
+	// The old selective spelling is now fail-closed because delegating it to a
+	// whole-repository fix could preserve unrelated failed or stale pairs.
+	snapshotsBefore := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots")
 	purge := runAcd(t, ctx, env, "purge-events", "--repo", repo, "--blocked", "--yes", "--json")
+	if purge.ExitCode == 0 {
+		t.Fatalf("acd purge-events --blocked --yes unexpectedly succeeded\nstdout=%s\nstderr=%s",
+			purge.Stdout, purge.Stderr)
+	}
+	if !strings.Contains(purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
+		t.Fatalf("purge-events selective refusal missing\nstdout=%s\nstderr=%s",
+			purge.Stdout, purge.Stderr)
+	}
+	if got := exactPairStates(t, dbPath, purgePair); got != "blocked_conflict,pending" {
+		t.Fatalf("refused purge alias changed pair states=%q", got)
+	}
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots"); got != snapshotsBefore {
+		t.Fatalf("refused purge alias snapshots=%s want unchanged %s", got, snapshotsBefore)
+	}
+
+	// Explicit --all retains the deprecated safe alias for one release.
+	purge = runAcd(t, ctx, env, "purge-events", "--repo", repo, "--all", "--yes", "--json")
 	if purge.ExitCode != 0 {
-		t.Fatalf("acd purge-events --blocked --yes exit=%d\nstdout=%s\nstderr=%s",
+		t.Fatalf("acd purge-events --all --yes exit=%d\nstdout=%s\nstderr=%s",
 			purge.ExitCode, purge.Stdout, purge.Stderr)
 	}
 	const wantPurgeDeprec = "acd purge-events is deprecated; use acd fix --force [--yes]. See acd fix --help."
@@ -249,11 +205,20 @@ VALUES (last_insert_rowid(), 0, 'modify', 'purge-me.txt', '111111111111111111111
 		t.Fatalf("purge-events stderr missing deprecation banner\nwant: %q\nstderr: %q",
 			wantPurgeDeprec, purge.Stderr)
 	}
-	// Purge must still complete — the seeded blocked row is gone.
-	if cnt := sqliteScalar(t, dbPath,
-		fmt.Sprintf("SELECT COUNT(*) FROM capture_events WHERE seq = %s", purgeSeq)); cnt != "0" {
-		t.Fatalf("purge-events left blocked seq %s in DB (count=%s)", purgeSeq, cnt)
+	purgePlan := decodeFixPlan(t, purge.Stdout)
+	purgeAction := findFixActionForSeq(purgePlan.Actions, "reconcile_unpublished_chain", purgePair.FirstSeq)
+	if purgeAction == nil || !purgeAction.Applied || purgeAction.State != "recovered" ||
+		!purgeAction.ArchiveOnly || purgeAction.RecoveryRef == "" {
+		t.Fatalf("purge alias action=%+v\n%s", purgeAction, purge.Stdout)
 	}
+	if got := exactPairStates(t, dbPath, purgePair); got != "recovered,recovered" {
+		t.Fatalf("purge alias pair states=%q", got)
+	}
+	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", purgePair.FirstSeq, purgePair.SecondSeq)); rows != "2" {
+		t.Fatalf("purge alias deleted captured rows: %s", rows)
+	}
+	runGitOK(t, repo, "show-ref", "--verify", purgeAction.RecoveryRef)
 }
 
 func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
@@ -276,6 +241,8 @@ func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
 		".derivedData-provider-core/Index.noindex/a.db",
 		".derivedData-provider-core/Index.noindex/b.db")
 	runGitOK(t, repo, "commit", "-q", "-m", "track generated cache files")
+	aOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:.derivedData-provider-core/Index.noindex/a.db"))
+	bOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:.derivedData-provider-core/Index.noindex/b.db"))
 	if err := os.RemoveAll(filepath.Join(repo, ".derivedData-provider-core")); err != nil {
 		t.Fatalf("remove generated root: %v", err)
 	}
@@ -292,19 +259,19 @@ func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
 VALUES ('refs/heads/main', %s, '%s', 'delete', '.derivedData-provider-core/Index.noindex/a.db', 'rescan', %f, 'pending');
 INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/a.db', '1111111111111111111111111111111111111111', '100644', 'rescan');
+VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/a.db', '%s', '100644', 'rescan');
 INSERT INTO planner_state(event_seq, defer_count, last_planned_ts)
 VALUES ((SELECT seq FROM capture_events WHERE path = '.derivedData-provider-core/Index.noindex/a.db' ORDER BY seq DESC LIMIT 1), 0, %f);
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
 VALUES ('refs/heads/main', %s, '%s', 'delete', '.derivedData-provider-core/Index.noindex/b.db', 'rescan', %f, 'pending');
 INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, fidelity)
-VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/b.db', '2222222222222222222222222222222222222222', '100644', 'rescan');
+VALUES (last_insert_rowid(), 0, 'delete', '.derivedData-provider-core/Index.noindex/b.db', '%s', '100644', 'rescan');
 INSERT INTO planner_state(event_seq, defer_count, last_planned_ts)
 VALUES ((SELECT seq FROM capture_events WHERE path = '.derivedData-provider-core/Index.noindex/b.db' ORDER BY seq DESC LIMIT 1), 0, %f);
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
 VALUES ('refs/heads/main', %s, '%s', 'delete', 'build/output.js', 'rescan', %f, 'pending');
-`, gen, head, now, now,
-		gen, head, now+0.001, now+0.001,
+`, gen, head, now, aOID, now,
+		gen, head, now+0.001, bOID, now+0.001,
 		gen, head, now+0.002)
 	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
 		t.Fatalf("seed generated pending rows: %v\n%s", err, out)
@@ -366,10 +333,18 @@ type fixPlanProbe struct {
 }
 
 type fixActionProbe struct {
-	Kind          string `json:"kind"`
-	Seq           int64  `json:"seq"`
-	Path          string `json:"path"`
-	RequiresForce bool   `json:"requires_force"`
+	Kind             string `json:"kind"`
+	Seq              int64  `json:"seq"`
+	Path             string `json:"path"`
+	BranchRef        string `json:"branch_ref"`
+	BranchGeneration int64  `json:"branch_generation"`
+	PendingCount     int    `json:"pending_count"`
+	RequiresForce    bool   `json:"requires_force"`
+	ArchiveOnly      bool   `json:"archive_only"`
+	Applied          bool   `json:"applied"`
+	RowsChanged      int64  `json:"rows_changed"`
+	State            string `json:"state"`
+	RecoveryRef      string `json:"recovery_ref"`
 }
 
 func decodeFixPlan(t *testing.T, body string) fixPlanProbe {
@@ -393,23 +368,60 @@ func hasFixActionKind(actions []fixActionProbe, kind string) bool {
 	return false
 }
 
-func hasFixActionKindForSeq(actions []fixActionProbe, kind, seq string) bool {
-	for _, a := range actions {
-		if a.Kind != kind {
-			continue
-		}
-		if fmt.Sprintf("%d", a.Seq) == seq {
-			return true
+func findFixActionForSeq(actions []fixActionProbe, kind, seq string) *fixActionProbe {
+	for i := range actions {
+		if actions[i].Kind == kind && fmt.Sprintf("%d", actions[i].Seq) == seq {
+			return &actions[i]
 		}
 	}
-	return false
+	return nil
 }
 
-func suggestionsMentionForce(suggestions []string) bool {
-	for _, s := range suggestions {
-		if strings.Contains(s, "--force") {
-			return true
-		}
+type seededRecoveryPair struct {
+	FirstSeq  string
+	SecondSeq string
+}
+
+func seedCreateRecoveryPair(
+	t *testing.T,
+	dbPath, branchRef, generation, baseHead, firstPath, firstOID, secondPath, secondOID string,
+) seededRecoveryPair {
+	t.Helper()
+	now := nowFloatSeconds()
+	seedSQL := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
+VALUES ('%s', %s, '%s', 'create', '%s', 'exact', %f, 'blocked_conflict', 'integration recovery barrier');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', '%s', '%s', '100644', 'exact');
+INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state)
+VALUES ('%s', %s, '%s', 'create', '%s', 'exact', %f, 'pending');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', '%s', '%s', '100644', 'exact');
+`, branchRef, generation, baseHead, firstPath, now, firstPath, firstOID,
+		branchRef, generation, baseHead, secondPath, now+0.001, secondPath, secondOID)
+	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
+		t.Fatalf("seed exact recovery pair: %v\n%s", err, out)
 	}
-	return false
+	pair := seededRecoveryPair{
+		FirstSeq: sqliteScalar(t, dbPath, fmt.Sprintf(
+			"SELECT seq FROM capture_events WHERE path = '%s' ORDER BY seq DESC LIMIT 1", firstPath)),
+		SecondSeq: sqliteScalar(t, dbPath, fmt.Sprintf(
+			"SELECT seq FROM capture_events WHERE path = '%s' ORDER BY seq DESC LIMIT 1", secondPath)),
+	}
+	if pair.FirstSeq == "" || pair.SecondSeq == "" {
+		t.Fatalf("seeded recovery pair missing seqs: %+v", pair)
+	}
+	return pair
+}
+
+func exactPairStates(t *testing.T, dbPath string, pair seededRecoveryPair) string {
+	t.Helper()
+	return sqliteScalar(t, dbPath, fmt.Sprintf(
+		"SELECT group_concat(state, ',') FROM (SELECT state FROM capture_events WHERE seq IN (%s,%s) ORDER BY seq)",
+		pair.FirstSeq, pair.SecondSeq))
+}
+
+func recoveryRefList(t *testing.T, repo string) string {
+	t.Helper()
+	return runGitOK(t, repo, "for-each-ref", "--format=%(refname):%(objectname)", "refs/acd/recovery/")
 }

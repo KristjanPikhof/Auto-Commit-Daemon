@@ -115,6 +115,9 @@ func TestCommitAll_RefusesManualPauseMarker(t *testing.T) {
 func TestCommitAll_RefusesWhileDaemonLockHeld(t *testing.T) {
 	repo, _, _ := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
 	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
 	if err != nil {
 		t.Fatalf("pre-acquire daemon.lock: %v", err)
@@ -128,6 +131,78 @@ func TestCommitAll_RefusesWhileDaemonLockHeld(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "daemon") {
 		t.Fatalf("expected daemon-alive refusal, got: %v", err)
+	}
+}
+
+func TestCommitAll_DryRunAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, false, true, true); err != nil {
+		t.Fatalf("runCommitAll dry-run with daemon.lock held: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.OK || !got.DryRun || got.PendingBefore == 0 {
+		t.Fatalf("unexpected dry-run result: %+v", got)
+	}
+}
+
+func TestCommitAll_CleanNoOpAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, true, false, true); err != nil {
+		t.Fatalf("runCommitAll clean no-op with daemon.lock held: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.OK || got.DryRun || got.PendingBefore != 0 {
+		t.Fatalf("unexpected clean no-op result: %+v", got)
+	}
+}
+
+func TestCommitAll_DeclineAllowedWhileDaemonLockHeld(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	held, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("pre-acquire daemon.lock: %v", err)
+	}
+	defer func() { _ = held.Release() }()
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, strings.NewReader("n\n"), repo, false, false, false)
+	if !errors.Is(err, errCommitAllAborted) {
+		t.Fatalf("runCommitAll decline with daemon.lock held: %v", err)
+	}
+	if !strings.Contains(out.String(), "aborted by user") {
+		t.Fatalf("decline output missing abort result: %s", out.String())
 	}
 }
 
@@ -157,7 +232,7 @@ func TestCommitAll_CleanWorktreeNoOp(t *testing.T) {
 // TestCommitAll_DryRunNeverCommits pins that --dry-run leaves HEAD unchanged
 // even with a dirty worktree.
 func TestCommitAll_DryRunNeverCommits(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	_ = db.Close()
 	ctx := context.Background()
 	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
@@ -167,6 +242,11 @@ func TestCommitAll_DryRunNeverCommits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rev-parse HEAD: %v", err)
 	}
+	dbBefore, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum state.db before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
 
 	var out bytes.Buffer
 	if err := runCommitAll(ctx, &out, nil, repo, true, true, true); err != nil {
@@ -186,25 +266,80 @@ func TestCommitAll_DryRunNeverCommits(t *testing.T) {
 	if headAfter != headBefore {
 		t.Fatalf("dry-run mutated HEAD: before=%s after=%s", headBefore, headAfter)
 	}
+	dbAfter, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum state.db after: %v", err)
+	}
+	if dbAfter != dbBefore {
+		t.Fatalf("dry-run mutated state.db: before=%s after=%s", dbBefore, dbAfter)
+	}
+	if refsAfter := commitAllRecoveryRefs(t, ctx, repo); refsAfter != refsBefore {
+		t.Fatalf("dry-run mutated recovery refs: before=%q after=%q", refsBefore, refsAfter)
+	}
+}
+
+func TestCommitAll_PreviewAndDeclineDoNotBuildProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		yes    bool
+		dryRun bool
+		input  string
+	}{
+		{name: "dry-run", yes: true, dryRun: true},
+		{name: "decline", input: "n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ACD_AI_PROVIDER", "openai-compat")
+			t.Setenv("ACD_AI_API_KEY", "sk-test")
+			t.Setenv("ACD_AI_BASE_URL", "http://insecure.example/v1")
+			repo, _, db := makeRegisteredGitRepoStateDB(t)
+			_ = db.Close()
+			if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+				t.Fatalf("write dirty file: %v", err)
+			}
+
+			var out bytes.Buffer
+			err := runCommitAll(context.Background(), &out, strings.NewReader(tc.input), repo, tc.yes, tc.dryRun, false)
+			if tc.dryRun && err != nil {
+				t.Fatalf("dry-run built invalid provider: %v", err)
+			}
+			if !tc.dryRun && !errors.Is(err, errCommitAllAborted) {
+				t.Fatalf("decline built invalid provider: %v", err)
+			}
+		})
+	}
 }
 
 // TestCommitAll_JSONRequiresYesWhenInteractive pins that --json without --yes
 // refuses because there is no interactive prompt available.
 func TestCommitAll_JSONRequiresYesWhenInteractive(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	_ = db.Close()
 	ctx := context.Background()
 	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
 		t.Fatalf("write dirty file: %v", err)
 	}
+	dbBefore, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
 
 	var out bytes.Buffer
-	err := runCommitAll(ctx, &out, nil, repo, false, false, true)
+	err = runCommitAll(ctx, &out, nil, repo, false, false, true)
 	if err == nil {
 		t.Fatalf("expected --json without --yes to refuse")
 	}
 	if !strings.Contains(err.Error(), "--yes") {
 		t.Fatalf("expected --yes prompt error, got: %v", err)
+	}
+	dbAfter, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if dbAfter != dbBefore || commitAllRecoveryRefs(t, ctx, repo) != refsBefore {
+		t.Fatalf("--json refusal mutated state: db %s->%s refs %q->%q",
+			dbBefore, dbAfter, refsBefore, commitAllRecoveryRefs(t, ctx, repo))
 	}
 }
 
@@ -428,59 +563,9 @@ func TestCommitAllEstimatePasses_Boundaries(t *testing.T) {
 	}
 }
 
-// TestPreviewIntentDryRun_NonIntentNoPlannerCalls confirms previewIntentDryRun
-// is a no-op planner-wise when strategy is event: it adds the standard
-// "would be processed" note and returns without consulting the planner.
-func TestPreviewIntentDryRun_EventStrategyAddsBaseNoteOnly(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	ctx := context.Background()
-
-	// Dirty the worktree and let runCommitAll do bootstrap + capture so
-	// pending > 0, then call previewIntentDryRun directly.
-	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("x\n"), 0o644); err != nil {
-		t.Fatalf("write dirty: %v", err)
-	}
-	gitDir := filepath.Join(repo, ".git")
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
-	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
-		t.Fatalf("BootstrapShadow: %v", err)
-	}
-	checker := git.NewIgnoreChecker(repo)
-	defer func() { _ = checker.Close() }()
-	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
-		IgnoreChecker:    checker,
-		SensitiveMatcher: state.NewSensitiveMatcher(),
-		GitDir:           gitDir,
-	}); err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-
-	cfg := ai.LoadProviderConfigFromEnv()
-	provider, closer, err := ai.BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer != nil {
-		defer func() { _ = closer.Close() }()
-	}
-
-	res := commitAllResult{PendingBefore: 1, Strategy: string(ai.CommitStrategyEvent)}
-	previewIntentDryRun(ctx, repo, db, cctx, ai.CommitStrategyEvent, cfg, provider, &res)
-	if len(res.Notes) != 1 {
-		t.Fatalf("event strategy should add exactly one base note, got: %+v", res.Notes)
-	}
-	if !strings.Contains(res.Notes[0], "would be processed") {
-		t.Fatalf("note format changed: %q", res.Notes[0])
-	}
-}
-
 // TestCommitAll_DryRunWithPendingPreservesHEAD asserts that even when the
-// worktree is dirty and pending > 0, --dry-run does NOT mutate HEAD or
-// touch capture_events state beyond the normal capture pass.
+// worktree is dirty and the read-only estimate is non-zero, --dry-run does
+// not mutate HEAD or publish commits.
 func TestCommitAll_DryRunWithPendingPreservesHEAD(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	_ = db.Close()
@@ -528,119 +613,273 @@ func TestCommitAll_DryRunWithPendingPreservesHEAD(t *testing.T) {
 	}
 }
 
-// TestCommitAll_ReseedsStaleShadowAndDropsStalePending exercises the
-// real-world bug: the daemon previously captured edits into shadow_paths
-// without successful replay, so the bootstrap marker is set AND the shadow
-// already mirrors live worktree. A stale pending event from that session is
-// also still on disk. Without the fix, commit-all skipped reseed (marker
-// present) and Capture saw zero diff -> "0 pending, no commits". With the
-// fix, commit-all force-reseeds shadow from HEAD, drops the stale pending
-// row, then captures a real diff against HEAD. We assert dry-run reports
-// dropped_stale_pending > 0 and pending_before > 0.
-func TestCommitAll_ReseedsStaleShadowAndDropsStalePending(t *testing.T) {
+func TestCommitAll_DryRunReportsPreexistingPairWithoutReconciling(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	_ = db.Close()
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, true, true, true); err != nil {
+		t.Fatalf("runCommitAll dry-run: %v\n%s", err, out.String())
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if got.PreservedPending != 2 || got.DroppedStalePending != 0 || len(got.RecoveryRefs) != 0 {
+		t.Fatalf("dry-run preservation report=%+v", got)
+	}
+	if !containsStringWith(got.Notes, "would preserve 2 pre-existing event(s)") {
+		t.Fatalf("dry-run notes=%v", got.Notes)
+	}
+	after, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("dry-run reconciled state: before=%s after=%s", before, after)
+	}
+	db2, err := state.Open(ctx, stateDB)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db2.Close()
+	assertFixEventState(t, ctx, db2, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db2, second, state.EventStatePending)
+	if got := countRowsWhere(t, db2, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("dry-run created recovery snapshot: %d", got)
+	}
+}
+
+func TestCommitAll_PreservesBarrierThenCommitsDirtyWork(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-
-	// Drop two dirty files so a real reseed-then-capture would see them.
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
 	if err := os.WriteFile(filepath.Join(repo, "dirty-a.txt"), []byte("aa\n"), 0o644); err != nil {
 		t.Fatalf("write dirty-a: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "dirty-b.txt"), []byte("bb\n"), 0o644); err != nil {
 		t.Fatalf("write dirty-b: %v", err)
 	}
-
-	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-	branchRef := "refs/heads/main"
-	gen := int64(1)
-
-	// Simulate a poisoned shadow: write rows that already mirror live
-	// worktree blobs, plus the bootstrap completion marker. This is what a
-	// previous daemon capture pass + failed replay leaves behind.
-	hashAndStage := func(path, content string) string {
-		t.Helper()
-		// Use git hash-object to compute the OID the same way bootstrap
-		// would after a successful capture absorbed the edit.
-		out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "hash-object", "-w", path)
-		if err != nil {
-			t.Fatalf("hash-object %s: %v", path, err)
-		}
-		_ = content
-		return strings.TrimSpace(string(out))
-	}
-	for _, p := range []string{"dirty-a.txt", "dirty-b.txt"} {
-		oid := hashAndStage(p, "")
-		if err := state.UpsertShadowPath(ctx, db, state.ShadowPath{
-			BranchRef:        branchRef,
-			BranchGeneration: gen,
-			Path:             p,
-			Operation:        "create",
-			Mode:             sql.NullString{String: "100644", Valid: true},
-			OID:              sql.NullString{String: oid, Valid: true},
-			BaseHead:         head,
-			Fidelity:         "full",
-		}); err != nil {
-			t.Fatalf("UpsertShadowPath %s: %v", p, err)
-		}
-	}
-	// Mark the (branch_ref, gen) pair as fully bootstrapped — this is the
-	// idempotency gate that BootstrapShadow checks. Without ReseedShadowFromHead
-	// the daemon helper short-circuits here.
-	if err := state.MetaSet(ctx, db, daemon.ShadowBootstrappedKey(branchRef, gen), "1"); err != nil {
-		t.Fatalf("set bootstrap marker: %v", err)
-	}
-	// Seed a stale pending event from a "previous session".
-	staleSeq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef:        branchRef,
-		BranchGeneration: gen,
-		BaseHead:         "stale-base",
-		Operation:        "modify",
-		Path:             "stale-pending.txt",
-		Fidelity:         "full",
-	}, []state.CaptureOp{{Op: "modify", Path: "stale-pending.txt", Fidelity: "full"}})
-	if err != nil {
-		t.Fatalf("seed stale pending: %v", err)
-	}
-	if staleSeq <= 0 {
-		t.Fatalf("staleSeq=%d", staleSeq)
-	}
-	// Close the test handle before runCommitAll opens its own.
 	_ = db.Close()
 
 	var out bytes.Buffer
-	if err := runCommitAll(ctx, &out, nil, repo, true, true, true); err != nil {
-		t.Fatalf("runCommitAll dry-run: %v", err)
+	if err := runCommitAll(ctx, &out, nil, repo, true, false, true); err != nil {
+		t.Fatalf("runCommitAll apply: %v\n%s", err, out.String())
 	}
 	var got commitAllResult
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
-
-	// Without the fix, PendingBefore would be 0 (bug behavior). With the
-	// fix, ReseedShadowFromHead nukes the stale shadow, DeletePendingForBranchGeneration
-	// drops the stale pending row, and Capture re-classifies the dirty
-	// files as new pending events.
-	if got.PendingBefore == 0 {
-		t.Fatalf("PendingBefore=0 reproduces the bug; want >=2 after reseed.\nresult=%+v\nout=%s", got, out.String())
+	if got.PreservedPending != 2 || got.DroppedStalePending != 0 || len(got.RecoveryRefs) != 1 {
+		t.Fatalf("preservation result=%+v", got)
 	}
-	if got.PendingBefore < 2 {
-		t.Fatalf("PendingBefore=%d, want >=2 (two dirty files)", got.PendingBefore)
+	if got.PendingAfter != 0 || got.Commits < 2 {
+		t.Fatalf("commit-all did not converge: %+v", got)
 	}
-	if got.DroppedStalePending < 1 {
-		t.Fatalf("DroppedStalePending=%d, want >=1 (stale pending row should have been dropped)", got.DroppedStalePending)
+	db2, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
 	}
-	// The "shadow reseeded" note must be present so users see what happened.
-	gotReseedNote := false
-	for _, n := range got.Notes {
-		if strings.Contains(n, "shadow reseeded from HEAD") {
-			gotReseedNote = true
-			break
+	defer db2.Close()
+	assertFixEventState(t, ctx, db2, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db2, second, state.EventStateRecovered)
+	for _, path := range []string{"dirty-a.txt", "dirty-b.txt"} {
+		if _, err := git.LsTreeBlobOID(ctx, repo, "HEAD", path); err != nil {
+			t.Fatalf("HEAD missing %s: %v", path, err)
 		}
 	}
-	if !gotReseedNote {
-		t.Fatalf("expected 'shadow reseeded from HEAD' note; got: %+v", got.Notes)
+	status, err := git.Run(ctx, git.RunOpts{Dir: repo}, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		t.Fatalf("commit-all left dirty worktree: %s", status)
+	}
+}
+
+func TestCommitAll_PreservesNonActivePairBeforeActiveDirtyWork(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	staleFirst, staleSecond := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/stale", 4)
+	if err := os.WriteFile(filepath.Join(repo, "active-dirty.txt"), []byte("active\n"), 0o644); err != nil {
+		t.Fatalf("write active dirty file: %v", err)
+	}
+	_ = db.Close()
+
+	var out bytes.Buffer
+	if err := runCommitAll(ctx, &out, nil, repo, true, false, true); err != nil {
+		t.Fatalf("runCommitAll: %v\n%s", err, out.String())
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if got.PreservedPending != 2 || len(got.RecoveryRefs) != 1 || got.PendingAfter != 0 || got.Commits < 1 {
+		t.Fatalf("nonactive preservation result=%+v", got)
+	}
+	db2, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db2.Close()
+	assertFixEventState(t, ctx, db2, staleFirst, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db2, staleSecond, state.EventStateRecovered)
+	var branchRef string
+	var generation int64
+	if err := db2.SQL().QueryRowContext(ctx,
+		`SELECT branch_ref, branch_generation FROM capture_events WHERE seq = ?`, staleFirst,
+	).Scan(&branchRef, &generation); err != nil {
+		t.Fatalf("query stale provenance: %v", err)
+	}
+	if branchRef != "refs/heads/stale" || generation != 4 {
+		t.Fatalf("stale pair was retargeted: %s/g%d", branchRef, generation)
+	}
+	if _, err := git.LsTreeBlobOID(ctx, repo, "HEAD", "active-dirty.txt"); err != nil {
+		t.Fatalf("active dirty file not committed: %v", err)
+	}
+}
+
+func TestCommitAll_PreflightRecoveryLeavesGitStateUntouched(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, _ := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	if err := os.WriteFile(filepath.Join(repo, "staged-user.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "staged-user.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	headBefore, _ := git.RevParse(ctx, repo, "HEAD")
+	indexBefore, err := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--name-status")
+	if err != nil {
+		t.Fatalf("index before: %v", err)
+	}
+	worktreeBefore, err := os.ReadFile(filepath.Join(repo, "staged-user.txt"))
+	if err != nil {
+		t.Fatalf("read worktree before: %v", err)
+	}
+
+	result, err := reconcileCommitAllExistingPair(ctx, repo, filepath.Join(repo, ".git"), db, commitAllExistingPair{
+		BranchRef: "refs/heads/main", Generation: 1, FirstSeq: first, EventCount: 2, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("reconcile preflight: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.RecoveryRef == "" {
+		t.Fatalf("reconcile result=%+v", result)
+	}
+	headAfter, _ := git.RevParse(ctx, repo, "HEAD")
+	indexAfter, _ := git.Run(ctx, git.RunOpts{Dir: repo}, "diff", "--cached", "--name-status")
+	worktreeAfter, _ := os.ReadFile(filepath.Join(repo, "staged-user.txt"))
+	if headAfter != headBefore || string(indexAfter) != string(indexBefore) || string(worktreeAfter) != string(worktreeBefore) {
+		t.Fatalf("preflight mutated Git state: HEAD %s->%s index %q->%q worktree %q->%q",
+			headBefore, headAfter, indexBefore, indexAfter, worktreeBefore, worktreeAfter)
+	}
+}
+
+func TestCommitAll_MissingPreexistingObjectFailsClosed(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	seq := appendFixEvent(t, ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "missing-preflight.txt", Fidelity: "exact",
+		State: state.EventStateFailed, Error: sql.NullString{String: "missing object", Valid: true},
+	}, []state.CaptureOp{{
+		Op: "create", Path: "missing-preflight.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("f", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	_ = db.Close()
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, nil, repo, true, false, true)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("runCommitAll err=%v want missing-object refusal\n%s", err, out.String())
+	}
+	db2, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer db2.Close()
+	assertFixEventState(t, ctx, db2, seq, state.EventStateFailed)
+	if got := countRowsWhere(t, db2, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("missing object wrote snapshot: %d", got)
+	}
+}
+
+func TestCommitAll_RecaptureLoopFailsWhenRecoveryDoesNotConverge(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "never-converges.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	calls := 0
+	replayFn := func(context.Context, string, *state.DB, daemon.CaptureContext, daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		calls++
+		return daemon.ReplaySummary{RecaptureRequired: true, BaseHead: head}, nil
+	}
+	var notes []string
+	_, _, _, _, _, err = commitAllReplayLoopWith(ctx, repo, filepath.Join(repo, ".git"), db, daemon.CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+	}, ai.CommitStrategyEvent, ai.ProviderConfig{}, nil, 1, replayFn, &notes)
+	if err == nil || !strings.Contains(err.Error(), "did not converge") {
+		t.Fatalf("commitAllReplayLoopWith err=%v want bounded nonconvergence", err)
+	}
+	if calls != commitAllRecaptureLimit+1 {
+		t.Fatalf("replay calls=%d want %d", calls, commitAllRecaptureLimit+1)
+	}
+}
+
+func TestCommitAll_RecaptureLoopReplaysFreshCapture(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "recaptured.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	calls := 0
+	replayFn := func(ctx context.Context, repo string, db *state.DB, cctx daemon.CaptureContext, opts daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		calls++
+		if calls == 1 {
+			return daemon.ReplaySummary{RecaptureRequired: true, BaseHead: head}, nil
+		}
+		return daemon.Replay(ctx, repo, db, cctx, opts)
+	}
+	var notes []string
+	commits, _, conflicts, failed, after, err := commitAllReplayLoopWith(
+		ctx, repo, filepath.Join(repo, ".git"), db,
+		daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head},
+		ai.CommitStrategyEvent, ai.ProviderConfig{}, nil, 1, replayFn, &notes,
+	)
+	if err != nil {
+		t.Fatalf("commitAllReplayLoopWith: %v", err)
+	}
+	if calls < 2 || commits != 1 || conflicts != 0 || failed != 0 || after != 0 {
+		t.Fatalf("recapture result calls=%d commits=%d conflicts=%d failed=%d after=%d notes=%v",
+			calls, commits, conflicts, failed, after, notes)
+	}
+	if !containsStringWith(notes, "recaptured 1 event(s)") {
+		t.Fatalf("recapture note missing: %v", notes)
+	}
+	if _, err := git.LsTreeBlobOID(ctx, repo, "HEAD", "recaptured.txt"); err != nil {
+		t.Fatalf("recaptured file not committed: %v", err)
 	}
 }
 
@@ -658,6 +897,252 @@ func (e *errOnReadReader) Read(p []byte) (int, error) {
 
 // errStdinUnexpected is a sentinel returned by errOnReadReader.
 var errStdinUnexpected = errors.New("stdin must not be read on this path")
+
+type commitAllPromptHookReader struct {
+	hook   func() error
+	reader *strings.Reader
+	ran    bool
+}
+
+func (r *commitAllPromptHookReader) Read(p []byte) (int, error) {
+	if !r.ran {
+		r.ran = true
+		if err := r.hook(); err != nil {
+			return 0, err
+		}
+	}
+	return r.reader.Read(p)
+}
+
+func TestCommitAll_RechecksHEADAfterConfirmation(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	dbBefore, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
+	reader := &commitAllPromptHookReader{
+		reader: strings.NewReader("y\n"),
+		hook: func() error {
+			_, err := git.Run(ctx, git.RunOpts{Dir: repo},
+				"-c", "user.name=ACD Test", "-c", "user.email=acd@example.invalid",
+				"commit", "--allow-empty", "-m", "advance while prompting")
+			return err
+		},
+	}
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, reader, repo, false, false, false)
+	if err == nil || !strings.Contains(err.Error(), "HEAD changed after preflight") {
+		t.Fatalf("runCommitAll err=%v want post-prompt HEAD refusal\n%s", err, out.String())
+	}
+	dbAfter, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if dbAfter != dbBefore || commitAllRecoveryRefs(t, ctx, repo) != refsBefore {
+		t.Fatalf("post-prompt HEAD refusal mutated ACD state")
+	}
+}
+
+func TestCommitAll_AcquiresDaemonLockAfterConfirmation(t *testing.T) {
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	dbBefore, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
+	var held *daemon.DaemonLock
+	reader := &commitAllPromptHookReader{
+		reader: strings.NewReader("y\n"),
+		hook: func() error {
+			var err error
+			held, err = daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+			return err
+		},
+	}
+	defer func() {
+		if held != nil {
+			_ = held.Release()
+		}
+	}()
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, reader, repo, false, false, false)
+	if err == nil || !strings.Contains(err.Error(), "per-repo daemon is alive") {
+		t.Fatalf("runCommitAll err=%v want post-consent daemon-lock refusal\n%s", err, out.String())
+	}
+	dbAfter, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	if dbAfter != dbBefore || commitAllRecoveryRefs(t, ctx, repo) != refsBefore {
+		t.Fatalf("daemon-lock refusal mutated ACD state")
+	}
+}
+
+func TestCommitAll_StopsBeforeRecoveryWhenPauseAppears(t *testing.T) {
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	_ = db.Close()
+	headBefore, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("HEAD before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
+	gitDir := filepath.Join(repo, ".git")
+	paused := false
+	hooks := commitAllHooks{BeforeMutationCheck: func(_ context.Context, stage commitAllMutationStage) error {
+		if stage != commitAllStageRecoveryPair || paused {
+			return nil
+		}
+		paused = true
+		_, err := pausepkg.Write(pausepkg.Path(gitDir), pausepkg.Marker{
+			Reason: "operator paused during commit-all",
+			SetBy:  "test",
+		}, false)
+		return err
+	}}
+
+	var out bytes.Buffer
+	err = runCommitAllWithHooks(ctx, &out, nil, repo, true, false, true, hooks)
+	if err == nil || !strings.Contains(err.Error(), "manual pause marker") {
+		t.Fatalf("runCommitAllWithHooks err=%v want pause refusal\n%s", err, out.String())
+	}
+	if !paused {
+		t.Fatal("recovery-stage hook did not run")
+	}
+	if refsAfter := commitAllRecoveryRefs(t, ctx, repo); refsAfter != refsBefore {
+		t.Fatalf("pause refusal wrote recovery ref: before=%q after=%q", refsBefore, refsAfter)
+	}
+	headAfter, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil || headAfter != headBefore {
+		t.Fatalf("pause refusal changed HEAD: %q -> %q err=%v", headBefore, headAfter, err)
+	}
+	dbAfter, err := state.Open(ctx, state.DBPathFromGitDir(gitDir))
+	if err != nil {
+		t.Fatalf("reopen state: %v", err)
+	}
+	defer dbAfter.Close()
+	assertFixEventState(t, ctx, dbAfter, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, dbAfter, second, state.EventStatePending)
+	if got := countRowsWhere(t, dbAfter, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("pause refusal wrote %d recovery snapshot(s)", got)
+	}
+}
+
+func TestCommitAll_StopsBeforeCaptureWhenPauseAppears(t *testing.T) {
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	_ = db.Close()
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "paused-before-capture.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	headBefore, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("HEAD before: %v", err)
+	}
+	gitDir := filepath.Join(repo, ".git")
+	paused := false
+	hooks := commitAllHooks{BeforeMutationCheck: func(_ context.Context, stage commitAllMutationStage) error {
+		if stage != commitAllStageCapture || paused {
+			return nil
+		}
+		paused = true
+		_, err := pausepkg.Write(pausepkg.Path(gitDir), pausepkg.Marker{
+			Reason: "operator paused before capture",
+			SetBy:  "test",
+		}, false)
+		return err
+	}}
+
+	var out bytes.Buffer
+	err = runCommitAllWithHooks(ctx, &out, nil, repo, true, false, true, hooks)
+	if err == nil || !strings.Contains(err.Error(), "manual pause marker") {
+		t.Fatalf("runCommitAllWithHooks err=%v want pause refusal", err)
+	}
+	if !paused {
+		t.Fatal("capture-stage hook did not run")
+	}
+	dbAfter, err := state.Open(ctx, state.DBPathFromGitDir(gitDir))
+	if err != nil {
+		t.Fatalf("reopen state: %v", err)
+	}
+	defer dbAfter.Close()
+	if got := countRowsWhere(t, dbAfter, "capture_events", "1 = 1"); got != 0 {
+		t.Fatalf("pause refusal captured %d event(s)", got)
+	}
+	headAfter, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil || headAfter != headBefore {
+		t.Fatalf("pause refusal changed HEAD: %q -> %q err=%v", headBefore, headAfter, err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "paused-before-capture.txt")); err != nil {
+		t.Fatalf("dirty worktree file was not preserved: %v", err)
+	}
+}
+
+func TestCommitAll_RechecksGitOperationBeforeEveryReplayPass(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "pending.txt", Fidelity: "full",
+	}, []state.CaptureOp{{Op: "create", Path: "pending.txt", Fidelity: "full"}})
+	if err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+	gitDir := filepath.Join(repo, ".git")
+	replayCalls := 0
+	stub := func(context.Context, string, *state.DB, daemon.CaptureContext, daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		replayCalls++
+		return daemon.ReplaySummary{}, nil
+	}
+	checks := 0
+	guard := &commitAllMutationGuard{
+		repo: repo, gitDir: gitDir, expectedBranch: "refs/heads/main",
+		hooks: commitAllHooks{BeforeMutationCheck: func(_ context.Context, stage commitAllMutationStage) error {
+			if stage != commitAllStageReplay {
+				return nil
+			}
+			checks++
+			if checks == 2 {
+				return os.WriteFile(filepath.Join(gitDir, "MERGE_HEAD"), []byte(head+"\n"), 0o600)
+			}
+			return nil
+		}},
+	}
+	_, _, _, _, _, err = commitAllReplayLoopWithSafety(
+		ctx, repo, gitDir, db,
+		daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head},
+		ai.CommitStrategyEvent, ai.ProviderConfig{}, nil, 1, stub, nil, guard,
+	)
+	if err == nil || !strings.Contains(err.Error(), "git operation") {
+		t.Fatalf("replay loop err=%v want git-operation refusal", err)
+	}
+	if replayCalls != 1 {
+		t.Fatalf("replay called %d times; want one call before marker appeared", replayCalls)
+	}
+	assertFixEventState(t, ctx, db, seq, state.EventStatePending)
+}
 
 // TestCommitAll_RefusesOrphanBranch covers P1-2: an empty repo with a
 // branch ref pointing to no commits (orphan branch) used to silently
@@ -695,16 +1180,22 @@ func TestCommitAll_RefusesOrphanBranch(t *testing.T) {
 // prompt receives "no" the renderer must still emit a payload, but the
 // caller must observe a non-nil sentinel error so cobra exits non-zero.
 func TestCommitAll_UserDeclineExitsNonZero(t *testing.T) {
-	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	_ = db.Close()
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	_ = db.Close()
 	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
 		t.Fatalf("write dirty: %v", err)
 	}
+	dbBefore, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum before: %v", err)
+	}
+	refsBefore := commitAllRecoveryRefs(t, ctx, repo)
 
 	var out bytes.Buffer
 	in := strings.NewReader("n\n")
-	err := runCommitAll(ctx, &out, in, repo, false, false, false)
+	err = runCommitAll(ctx, &out, in, repo, false, false, false)
 	if err == nil {
 		t.Fatalf("expected non-nil error on user decline; got nil")
 	}
@@ -716,6 +1207,235 @@ func TestCommitAll_UserDeclineExitsNonZero(t *testing.T) {
 	if !strings.Contains(out.String(), "aborted by user") {
 		t.Fatalf("decline output missing aborted note: %q", out.String())
 	}
+	if strings.Contains(out.String(), "commit-all complete") {
+		t.Fatalf("decline output claimed completion: %q", out.String())
+	}
+	dbAfter, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatalf("checksum after: %v", err)
+	}
+	refsAfter := commitAllRecoveryRefs(t, ctx, repo)
+	if dbAfter != dbBefore || refsAfter != refsBefore {
+		t.Fatalf("decline mutated state: db %s->%s refs %q->%q", dbBefore, dbAfter, refsBefore, refsAfter)
+	}
+	db2, err := state.Open(ctx, stateDB)
+	if err != nil {
+		t.Fatalf("reopen state DB: %v", err)
+	}
+	defer db2.Close()
+	assertFixEventState(t, ctx, db2, first, state.EventStateBlockedConflict)
+	assertFixEventState(t, ctx, db2, second, state.EventStatePending)
+	if got := countRowsWhere(t, db2, "recovery_snapshots", "1 = 1"); got != 0 {
+		t.Fatalf("decline created recovery snapshot: %d", got)
+	}
+}
+
+func TestFinishCommitAll_IncompleteReturnsTypedError(t *testing.T) {
+	res := commitAllResult{
+		OK:           true,
+		Repo:         "/tmp/repo",
+		BranchRef:    "refs/heads/main",
+		PendingAfter: 2,
+		Conflicts:    1,
+		Failed:       1,
+		RecoveryRefs: []string{"refs/acd/recovery/example"},
+	}
+	var out bytes.Buffer
+	err := finishCommitAll(&out, res, true)
+	var incomplete *commitAllIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("finishCommitAll err=%v want *commitAllIncompleteError", err)
+	}
+	if incomplete.PendingAfter != 2 || incomplete.Conflicts != 1 || incomplete.Failed != 1 {
+		t.Fatalf("typed incomplete counts=%+v", incomplete)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if got.OK || !got.Incomplete || got.PendingAfter != 2 || len(got.RecoveryRefs) != 1 {
+		t.Fatalf("incomplete result=%+v", got)
+	}
+
+	out.Reset()
+	if err := finishCommitAll(&out, res, false); err == nil {
+		t.Fatal("human incomplete result returned nil")
+	}
+	if strings.Contains(out.String(), "commit-all complete") || !strings.Contains(out.String(), "commit-all incomplete") {
+		t.Fatalf("human incomplete wording=%q", out.String())
+	}
+}
+
+func TestFinishCommitAll_RecoveredThenDrainedSucceeds(t *testing.T) {
+	res := commitAllResult{
+		OK:           true,
+		Repo:         "/tmp/repo",
+		BranchRef:    "refs/heads/main",
+		PendingAfter: 0,
+		Conflicts:    1,
+		Failed:       1,
+		RecoveryRefs: []string{"refs/acd/recovery/example"},
+	}
+	var out bytes.Buffer
+	if err := finishCommitAll(&out, res, true); err != nil {
+		t.Fatalf("recovered-and-drained result: %v", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	}
+	if !got.OK || got.Incomplete || got.PendingAfter != 0 || len(got.RecoveryRefs) != 1 {
+		t.Fatalf("recovered-and-drained result=%+v", got)
+	}
+}
+
+func TestFinishCommitAllReplay_RendersPartialProgress(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	cctx := daemon.CaptureContext{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		BaseHead:         head,
+	}
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        cctx.BranchRef,
+		BranchGeneration: cctx.BranchGeneration,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "still-pending.txt",
+		Fidelity:         "exact",
+	}, []state.CaptureOp{{
+		Op: "create", Path: "still-pending.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("a", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}}); err != nil {
+		t.Fatalf("append pending event: %v", err)
+	}
+	replayFailure := errors.New("provider stopped after first commit")
+	res := commitAllResult{
+		OK:            true,
+		Repo:          repo,
+		BranchRef:     cctx.BranchRef,
+		HeadBefore:    head,
+		PendingBefore: 2,
+		Commits:       1,
+		Drained:       1,
+		RecoveryRefs:  []string{"refs/acd/recovery/protected"},
+	}
+	var out bytes.Buffer
+	err = finishCommitAllReplay(ctx, &out, repo, db, cctx, res, true, replayFailure)
+	var partial *commitAllReplayError
+	if !errors.As(err, &partial) || !errors.Is(err, replayFailure) {
+		t.Fatalf("finishCommitAllReplay err=%v want wrapped *commitAllReplayError", err)
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal partial result: %v\n%s", err, out.String())
+	}
+	if got.OK || !got.Incomplete || got.Error != replayFailure.Error() ||
+		got.PendingAfter != 1 || got.HeadAfter != head || got.Commits != 1 || got.Drained != 1 ||
+		len(got.RecoveryRefs) != 1 {
+		t.Fatalf("partial replay result=%+v", got)
+	}
+}
+
+func TestCommitAll_RendersPartialPreexistingRecovery(t *testing.T) {
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	validOIDRaw, err := git.Run(ctx, git.RunOpts{
+		Dir:   repo,
+		Stdin: strings.NewReader("protected first pair\n"),
+	}, "hash-object", "-w", "--stdin")
+	if err != nil {
+		t.Fatalf("hash valid recovery object: %v", err)
+	}
+	validOID := strings.TrimSpace(string(validOIDRaw))
+	firstSeq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/old-first",
+		BranchGeneration: 2,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "first-protected.txt",
+		Fidelity:         "exact",
+	}, []state.CaptureOp{{
+		Op: "create", Path: "first-protected.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: validOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("append valid first pair: %v", err)
+	}
+	secondSeq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef:        "refs/heads/old-second",
+		BranchGeneration: 3,
+		BaseHead:         head,
+		Operation:        "create",
+		Path:             "second-missing.txt",
+		Fidelity:         "exact",
+	}, []state.CaptureOp{{
+		Op: "create", Path: "second-missing.txt", Fidelity: "exact",
+		AfterOID:  sql.NullString{String: strings.Repeat("b", 40), Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}})
+	if err != nil {
+		t.Fatalf("append missing-object second pair: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = runCommitAll(ctx, &out, strings.NewReader(""), repo, true, false, true)
+	var partial *commitAllRecoveryError
+	if !errors.As(err, &partial) {
+		t.Fatalf("runCommitAll err=%v want *commitAllRecoveryError\n%s", err, out.String())
+	}
+	var got commitAllResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode partial recovery result: %v\n%s", err, out.String())
+	}
+	if got.OK || !got.Incomplete || got.PendingBefore != 2 || got.PendingAfter != 1 ||
+		got.Drained != 1 || len(got.RecoveryRefs) != 1 || got.Error == "" {
+		t.Fatalf("partial recovery result=%+v", got)
+	}
+	if !strings.Contains(got.Error, "missing blob object") {
+		t.Fatalf("partial recovery error=%q", got.Error)
+	}
+	var firstState, secondState string
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq = ?`, firstSeq).Scan(&firstState); err != nil {
+		t.Fatalf("read first pair state: %v", err)
+	}
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq = ?`, secondSeq).Scan(&secondState); err != nil {
+		t.Fatalf("read second pair state: %v", err)
+	}
+	if firstState != state.EventStateRecovered {
+		t.Fatalf("first pair state=%q want recovered", firstState)
+	}
+	if secondState != state.EventStatePending {
+		t.Fatalf("second pair state=%q want pending", secondState)
+	}
+	if _, err := git.RevParse(ctx, repo, got.RecoveryRefs[0]); err != nil {
+		t.Fatalf("completed recovery ref is not reachable: %v", err)
+	}
+}
+
+func commitAllRecoveryRefs(t *testing.T, ctx context.Context, repo string) string {
+	t.Helper()
+	out, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"for-each-ref", "--format=%(refname):%(objectname)", "refs/acd/recovery/")
+	if err != nil {
+		t.Fatalf("list recovery refs: %v", err)
+	}
+	return string(out)
 }
 
 // fakePlannerProvider is an ai.Provider + IntentPlanner whose calls are
@@ -727,6 +1447,7 @@ type fakePlannerProvider struct {
 	planCalls   int
 	genCalls    int
 	planSubject string
+	planErr     error
 }
 
 func (p *fakePlannerProvider) Name() string    { return p.name }
@@ -737,6 +1458,9 @@ func (p *fakePlannerProvider) Generate(ctx context.Context, cc ai.CommitContext)
 }
 func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
 	p.planCalls++
+	if p.planErr != nil {
+		return ai.IntentPlan{}, p.planErr
+	}
 	seqs := make([]int64, 0, len(req.OfferedCaptures))
 	for _, c := range req.OfferedCaptures {
 		seqs = append(seqs, c.Seq)
@@ -744,51 +1468,83 @@ func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanR
 	return ai.IntentPlan{SelectedSeqs: seqs, Subject: p.planSubject}, nil
 }
 
-// TestPreviewIntentDryRun_SkipsNetworkPlanner covers P1-5: dry-run must
-// never fan out a planner request to a network-bound provider.
-func TestPreviewIntentDryRun_SkipsNetworkPlanner(t *testing.T) {
+func TestCommitAllReplayLoop_ReusesPlannerHealthAfterTransportFailure(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	if err := os.WriteFile(filepath.Join(repo, "new.txt"), []byte("x\n"), 0o644); err != nil {
-		t.Fatalf("write dirty: %v", err)
-	}
-	gitDir := filepath.Join(repo, ".git")
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
+		t.Fatalf("HEAD: %v", err)
 	}
-	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
+	cctx := daemon.CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+	}
 	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
-		t.Fatalf("BootstrapShadow: %v", err)
+		t.Fatalf("bootstrap shadow: %v", err)
+	}
+	for _, path := range []string{"transport-a.txt", "transport-b.txt"} {
+		if err := os.WriteFile(filepath.Join(repo, path), []byte(path+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
 	}
 	checker := git.NewIgnoreChecker(repo)
 	defer func() { _ = checker.Close() }()
-	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
-		IgnoreChecker:    checker,
-		SensitiveMatcher: state.NewSensitiveMatcher(),
-		GitDir:           gitDir,
+	if summary, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
+		IgnoreChecker:     checker,
+		SensitiveMatcher:  state.NewSensitiveMatcher(),
+		SafeIgnoreMatcher: state.NewSafeIgnoreMatcher(),
+		GitDir:            filepath.Join(repo, ".git"),
+		SortByPath:        true,
+		DisablePendingCap: true,
 	}); err != nil {
-		t.Fatalf("Capture: %v", err)
+		t.Fatalf("capture: %v", err)
+	} else if summary.EventsAppended < 2 {
+		t.Fatalf("captured %d events; want at least two passes", summary.EventsAppended)
 	}
 
+	planner := &fakePlannerProvider{
+		name:      "openai-compat",
+		planErr:   errors.New("planner transport unavailable"),
+		needsDiff: false,
+	}
 	cfg := ai.LoadProviderConfigFromEnv()
-	cfg.Mode = "openai-compat" // pretend a network provider was wired up
-	provider := &fakePlannerProvider{name: "fake-network", needsDiff: true}
-	res := commitAllResult{PendingBefore: 1, Strategy: string(ai.CommitStrategyIntent)}
-	previewIntentDryRun(ctx, repo, db, cctx, ai.CommitStrategyIntent, cfg, provider, &res)
-	if provider.planCalls != 0 {
-		t.Fatalf("network provider PlanIntent called %d times during dry-run; want 0", provider.planCalls)
+	cfg.CommitStrategy = ai.CommitStrategyIntent
+	cfg.CommitFormat = ai.CommitFormatImperative
+	cfg.IntentWindow = 1
+	cfg.IntentMinPending = 1
+	cfg.IntentDeferLimit = 1
+	cfg.Model = "test-model"
+	cfg.BaseURL = "https://user:secret@planner.example/v1?token=hidden"
+
+	commits, _, conflicts, failed, after, err := commitAllReplayLoopWithSafety(
+		ctx, repo, filepath.Join(repo, ".git"), db, cctx,
+		ai.CommitStrategyIntent, cfg, planner, 2,
+		commitAllRunReplayDefault, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("commitAllReplayLoopWithSafety: %v", err)
 	}
-	// The note must explain why the planner peek was skipped.
-	found := false
-	for _, n := range res.Notes {
-		if strings.Contains(n, "planner peek skipped") {
-			found = true
-			break
-		}
+	if commits < 2 || conflicts != 0 || failed != 0 || after != 0 {
+		t.Fatalf("replay result commits=%d conflicts=%d failed=%d after=%d", commits, conflicts, failed, after)
 	}
-	if !found {
-		t.Fatalf("expected 'planner peek skipped' note; got: %+v", res.Notes)
+	if planner.planCalls != 1 {
+		t.Fatalf("primary planner called %d times; want once before circuit bypass", planner.planCalls)
+	}
+	raw, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyIntentPlannerHealth)
+	if err != nil || !ok {
+		t.Fatalf("load planner health ok=%v err=%v", ok, err)
+	}
+	health, err := daemon.DecodeIntentPlannerHealthSnapshot(raw)
+	if err != nil {
+		t.Fatalf("decode planner health: %v", err)
+	}
+	wantFingerprint := daemon.IntentPlannerProviderFingerprint(daemon.IntentPlannerProviderIdentity{
+		Provider: "openai-compat",
+		Model:    cfg.Model,
+		Endpoint: cfg.BaseURL,
+	})
+	if health.State != daemon.IntentPlannerCircuitOpen || health.BypassCount < 1 ||
+		health.ProviderFingerprint != wantFingerprint {
+		t.Fatalf("planner health=%+v want open shared circuit fingerprint=%q", health, wantFingerprint)
 	}
 }
 
@@ -876,6 +1632,30 @@ func TestCommitAllReplayLoop_UsesProviderMessageFn(t *testing.T) {
 	_ = failed
 	_ = after
 	_ = replayCalls
+}
+
+func TestCommitAllReplayLoop_PreservesPartialSummaryOnError(t *testing.T) {
+	ctx := context.Background()
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	replayFailure := errors.New("replay stopped after partial pass")
+	stub := func(context.Context, string, *state.DB, daemon.CaptureContext, daemon.ReplayOpts) (daemon.ReplaySummary, error) {
+		return daemon.ReplaySummary{Published: 2, Conflicts: 1, Failed: 1}, replayFailure
+	}
+	commits, _, conflicts, failed, _, err := commitAllReplayLoopWith(
+		ctx, repo, filepath.Join(repo, ".git"), db,
+		daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head},
+		ai.CommitStrategyEvent, ai.ProviderConfig{}, nil, 4, stub, nil,
+	)
+	if !errors.Is(err, replayFailure) {
+		t.Fatalf("commitAllReplayLoopWith err=%v want wrapped replay failure", err)
+	}
+	if commits != 2 || conflicts != 1 || failed != 1 {
+		t.Fatalf("partial summary lost: commits=%d conflicts=%d failed=%d", commits, conflicts, failed)
+	}
 }
 
 // TestCommitAllReplayLoop_ZeroProgressEscape covers P2-6: when Replay

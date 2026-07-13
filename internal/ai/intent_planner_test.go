@@ -1302,6 +1302,7 @@ func TestComposedPlanIntentRejectsMalformedRewriteBody(t *testing.T) {
 
 func TestComposedPlanIntentSurfacesRewriteProviderError(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
+	rewriteErr := errors.New("rewrite unavailable")
 	plan := IntentPlan{
 		SelectedSeqs:   []int64{101},
 		DeferredSeqs:   []int64{102},
@@ -1315,7 +1316,7 @@ func TestComposedPlanIntentSurfacesRewriteProviderError(t *testing.T) {
 	primary := &scriptedIntentPlanner{
 		name:        "scripted-primary",
 		plans:       []IntentPlan{plan},
-		rewriteErrs: []error{errors.New("rewrite unavailable")},
+		rewriteErrs: []error{rewriteErr},
 	}
 	planner := Compose(primary, DeterministicProvider{})
 	_, err := planner.(IntentPlanner).PlanIntent(context.Background(), req)
@@ -1324,6 +1325,9 @@ func TestComposedPlanIntentSurfacesRewriteProviderError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rewrite unavailable") {
 		t.Fatalf("error=%v missing provider cause", err)
+	}
+	if !errors.Is(err, rewriteErr) {
+		t.Fatalf("error=%v does not unwrap provider cause", err)
 	}
 }
 

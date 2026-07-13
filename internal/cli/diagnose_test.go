@@ -677,6 +677,120 @@ func TestDiagnose_IntentBatchWaitUsesDefaultsWithoutNewMetadata(t *testing.T) {
 	}
 }
 
+func TestDiagnose_IntentPlannerHealthIsReadOnly(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, _, d := makeDiagnoseRepo(t, roots)
+
+	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
+		t.Fatalf("set commit strategy: %v", err)
+	}
+	nextProbe := time.Date(2026, 7, 13, 4, 30, 0, 0, time.UTC)
+	health := daemon.IntentPlannerHealthSnapshot{
+		State:               daemon.IntentPlannerCircuitOpen,
+		ProviderFingerprint: testPlannerHealthFingerprint(),
+		ConsecutiveFailures: 1,
+		BackoffLevel:        1,
+		NextProbeTS:         float64(nextProbe.Unix()),
+		LastFailureClass:    daemon.IntentPlannerFailureTransport,
+		LastError:           "provider request timed out",
+		BypassCount:         4,
+	}
+	if err := state.MetaSetJSON(ctx, d, daemon.MetaKeyIntentPlannerHealth, struct {
+		Version int `json:"version"`
+		daemon.IntentPlannerHealthSnapshot
+	}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
+		t.Fatalf("set planner health: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runDiagnose(ctx, &out, repo, true); err != nil {
+		t.Fatalf("runDiagnose: %v", err)
+	}
+	var rep diagnoseReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+	}
+	if rep.IntentStrategy.PlannerHealth == nil ||
+		rep.IntentStrategy.PlannerHealth.State != daemon.IntentPlannerCircuitOpen ||
+		rep.IntentStrategy.PlannerHealth.BypassCount != 4 {
+		t.Fatalf("planner health=%+v", rep.IntentStrategy.PlannerHealth)
+	}
+	if !rep.StateDBChecksumVerified || rep.StateDBChecksumBefore != rep.StateDBChecksumAfter {
+		t.Fatalf("diagnose mutated state.db: before=%q after=%q verified=%v",
+			rep.StateDBChecksumBefore, rep.StateDBChecksumAfter, rep.StateDBChecksumVerified)
+	}
+	var sawCircuitHint bool
+	for _, item := range rep.Remediation {
+		if strings.Contains(item, "intent planner circuit is open") &&
+			strings.Contains(item, "deterministic fallback remains active") &&
+			strings.Contains(item, "2026-07-13T04:30:00Z") {
+			sawCircuitHint = true
+			break
+		}
+	}
+	if !sawCircuitHint {
+		t.Fatalf("remediation lacks circuit-open hint: %v", rep.Remediation)
+	}
+}
+
+func TestDiagnose_IntentPlannerHealthWarningIsReadOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		warning string
+	}{
+		{name: "empty", raw: "", warning: plannerHealthInvalidWarning},
+		{name: "invalid", raw: `{"version":1,"last_error":"token=secret-value`, warning: plannerHealthInvalidWarning},
+		{name: "unsupported", raw: `{"version":99,"state":"open","last_error":"token=secret-value"}`, warning: plannerHealthVersionWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			ctx := context.Background()
+			repo, _, d := makeDiagnoseRepo(t, roots)
+			if err := state.MetaSet(ctx, d, daemon.MetaKeyIntentPlannerHealth, tc.raw); err != nil {
+				t.Fatalf("set planner health: %v", err)
+			}
+			if err := d.Close(); err != nil {
+				t.Fatalf("close db: %v", err)
+			}
+
+			var out bytes.Buffer
+			if err := runDiagnose(ctx, &out, repo, true); err != nil {
+				t.Fatalf("runDiagnose: %v", err)
+			}
+			var rep diagnoseReport
+			if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+				t.Fatalf("unmarshal diagnose: %v\n%s", err, out.String())
+			}
+			if rep.IntentStrategy.PlannerHealth != nil || rep.IntentStrategy.PlannerHealthWarning != tc.warning {
+				t.Fatalf("intent strategy=%+v", rep.IntentStrategy)
+			}
+			if !rep.StateDBChecksumVerified || rep.StateDBChecksumBefore != rep.StateDBChecksumAfter {
+				t.Fatalf("diagnose mutated state.db: before=%q after=%q verified=%v",
+					rep.StateDBChecksumBefore, rep.StateDBChecksumAfter, rep.StateDBChecksumVerified)
+			}
+			if strings.Contains(out.String(), "secret-value") {
+				t.Fatalf("diagnose leaked malformed metadata: %s", out.String())
+			}
+			var sawWarning bool
+			for _, item := range rep.Remediation {
+				if strings.Contains(item, "health metadata is invalid or unsupported") &&
+					strings.Contains(item, "state.db was left unchanged") {
+					sawWarning = true
+					break
+				}
+			}
+			if !sawWarning {
+				t.Fatalf("diagnose remediation missing safe warning: %v", rep.Remediation)
+			}
+		})
+	}
+}
+
 func makeDiagnoseRepo(t *testing.T, roots paths.Roots) (repoDir, dbPath string, d *state.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -733,8 +847,8 @@ func itoa64(v int64) string {
 // TestDiagnose_DeadBranchPrune_Populated seeds the three daemon_meta keys
 // stamped by daemon.recordDeadBranchPruneMeta and asserts diagnose surfaces
 // them on the JSON report with the agreed snake_case field names. This is
-// the operator-visible signal that stale-branch hygiene ran and what it
-// pruned.
+// the operator-visible signal that stale-branch recovery ran and what it
+// preserved. The legacy JSON key names remain stable.
 func TestDiagnose_DeadBranchPrune_Populated(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -873,12 +987,12 @@ func TestDiagnose_RenderHumanIncludesDeadBranchPrune(t *testing.T) {
 	if err := runDiagnose(ctx, &out, repo, false); err != nil {
 		t.Fatalf("runDiagnose human: %v", err)
 	}
-	want := "Dead-branch prune: 5 row(s) pruned at " + time.Unix(wantTS, 0).Format(time.RFC3339)
+	want := "Dead-branch recovery: 5 row(s) preserved at " + time.Unix(wantTS, 0).Format(time.RFC3339)
 	if !strings.Contains(out.String(), want) {
-		t.Fatalf("human renderer missing dead-branch prune line %q in:\n%s", want, out.String())
+		t.Fatalf("human renderer missing dead-branch recovery line %q in:\n%s", want, out.String())
 	}
 	if !strings.Contains(out.String(), "refs/heads/old-feature") {
-		t.Fatalf("human renderer missing pruned ref name in:\n%s", out.String())
+		t.Fatalf("human renderer missing recovered branch name in:\n%s", out.String())
 	}
 }
 
@@ -897,8 +1011,8 @@ func TestDiagnose_RenderHumanOmitsDeadBranchPruneWhenZero(t *testing.T) {
 	if err := runDiagnose(ctx, &out, repo, false); err != nil {
 		t.Fatalf("runDiagnose human: %v", err)
 	}
-	if strings.Contains(out.String(), "Dead-branch prune") {
-		t.Fatalf("human renderer included dead-branch prune line on never-ran repo:\n%s", out.String())
+	if strings.Contains(out.String(), "Dead-branch recovery") {
+		t.Fatalf("human renderer included dead-branch recovery line on never-ran repo:\n%s", out.String())
 	}
 }
 

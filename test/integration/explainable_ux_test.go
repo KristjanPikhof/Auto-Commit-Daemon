@@ -88,6 +88,7 @@ func TestExplainableUX_DecisionLedgerDrivesEventsExplainAndFix(t *testing.T) {
 	manualHead := gitCommitAll(t, repo, "manual external commit", "manual.txt")
 	manualOID := strings.Fields(runGitOK(t, repo, "ls-tree", manualHead, "manual.txt"))[2]
 	revertedAfterOID := gitHashObjectStdin(t, repo, "queued work that was later reverted\n")
+	obsoleteAfterOID := gitHashObjectStdin(t, repo, "obsolete blocked work\n")
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
 	if gen == "" {
@@ -109,14 +110,20 @@ VALUES (last_insert_rowid(), 0, 'create', 'reverted.txt', '%s', '100644', 'exact
 INSERT INTO decision_records(decision_ts, kind, path, reason, event_seq, commit_oid, branch_ref, branch_generation, action_taken, user_message)
 VALUES (%f, 'superseded_external', 'reverted.txt', 'superseded_external_current_head_matches_captured_before_state', (SELECT seq FROM capture_events WHERE path = 'reverted.txt' ORDER BY seq DESC LIMIT 1), '%s', 'refs/heads/main', %s, 'marked_published', 'Manual revert superseded queued ACD work.');
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
-VALUES ('refs/heads/main', %s, '%s', 'modify', 'obsolete-blocker.txt', 'rescan', %f, 'blocked_conflict', 'before-state mismatch');
+VALUES ('refs/heads/main', %s, '%s', 'create', 'obsolete-blocker.txt', 'exact', %f, 'blocked_conflict', 'before-state mismatch');
+INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity)
+VALUES (last_insert_rowid(), 0, 'create', 'obsolete-blocker.txt', '%s', '100644', 'exact');
 `, gen, manualHead, now, manualOID, now+0.001, manualHead, gen,
 		gen, manualHead, now+0.002, revertedAfterOID, now+0.003, manualHead, gen,
-		gen, manualHead, now+0.004)
+		gen, manualHead, now+0.004, obsoleteAfterOID)
 	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
 		t.Fatalf("seed decision ledger: %v\n%s", err, out)
 	}
 	manualSeq := sqliteScalar(t, dbPath, "SELECT seq FROM capture_events WHERE path = 'manual.txt' ORDER BY seq DESC LIMIT 1")
+	var manualSeqNumber int64
+	if _, err := fmt.Sscan(manualSeq, &manualSeqNumber); err != nil {
+		t.Fatalf("parse manual event seq %q: %v", manualSeq, err)
+	}
 
 	events := runAcd(t, ctx, env, "events", "--repo", repo, "--json")
 	if events.ExitCode != 0 {
@@ -151,15 +158,18 @@ VALUES ('refs/heads/main', %s, '%s', 'modify', 'obsolete-blocker.txt', 'rescan',
 	var plan struct {
 		DryRun  bool `json:"dry_run"`
 		Actions []struct {
-			Kind string `json:"kind"`
-			Seq  int64  `json:"seq"`
+			Kind         string `json:"kind"`
+			Seq          int64  `json:"seq"`
+			PendingCount int    `json:"pending_count"`
 		} `json:"actions"`
 	}
 	if err := json.Unmarshal([]byte(fixDryRun.Stdout), &plan); err != nil {
 		t.Fatalf("decode fix dry-run: %v\n%s", err, fixDryRun.Stdout)
 	}
-	if !plan.DryRun || !hasIntegrationFixAction(plan.Actions, "mark_external_published") ||
-		!hasIntegrationFixAction(plan.Actions, "delete_obsolete_barrier") {
+	if !plan.DryRun || len(plan.Actions) != 1 ||
+		plan.Actions[0].Kind != "reconcile_unpublished_chain" ||
+		plan.Actions[0].Seq != manualSeqNumber ||
+		plan.Actions[0].PendingCount != 3 {
 		t.Fatalf("fix dry-run did not plan expected safe actions: %+v\n%s", plan, fixDryRun.Stdout)
 	}
 
@@ -167,13 +177,19 @@ VALUES ('refs/heads/main', %s, '%s', 'modify', 'obsolete-blocker.txt', 'rescan',
 	if fixApply.ExitCode != 0 {
 		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", fixApply.ExitCode, fixApply.Stdout, fixApply.Stderr)
 	}
-	if state := sqliteScalar(t, dbPath, fmt.Sprintf("SELECT state FROM capture_events WHERE seq = %s", manualSeq)); state != "published" {
-		t.Fatalf("manual external event state=%q want published\ndry-run=%s\napply=%s", state, fixDryRun.Stdout, fixApply.Stdout)
+	if states := sqliteScalar(t, dbPath, "SELECT group_concat(state, ',') FROM (SELECT state FROM capture_events ORDER BY seq)"); states != "recovered,recovered,recovered" {
+		t.Fatalf("whole-chain states=%q want all recovered\ndry-run=%s\napply=%s", states, fixDryRun.Stdout, fixApply.Stdout)
+	}
+	if members := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshot_events"); members != "3" {
+		t.Fatalf("recovery snapshot members=%q want 3\napply=%s", members, fixApply.Stdout)
 	}
 }
 
 func TestExplainableUX_DaemonRecordsHandledExternalDecision(t *testing.T) {
 	requireSQLite(t)
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available; slow subprocess provider requires bash")
+	}
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
@@ -185,22 +201,37 @@ func TestExplainableUX_DaemonRecordsHandledExternalDecision(t *testing.T) {
 	target := filepath.Join(repo, "external-handled.txt")
 	writeFile(t, target, "before\n")
 	baseHead := gitCommitAll(t, repo, "baseline handled external", "external-handled.txt")
+	providerStarted := filepath.Join(t.TempDir(), "provider-started")
+	plugDir := writePluginScript(t, "slow-handled", fmt.Sprintf(`#!/usr/bin/env bash
+while IFS= read -r line; do
+  printf 'started\n' > %q
+  sleep 2
+  printf '{"version":1,"subject":"slow handled race","body":"","error":""}\n'
+done
+`, providerStarted))
+	slowEnv := envWith(env,
+		"ACD_AI_PROVIDER=subprocess:slow-handled",
+		"ACD_AI_TIMEOUT=10s",
+		pathPrepended(plugDir),
+	)
 
-	startSession(t, ctx, env, repo, "ux-handled-daemon", "shell")
+	startSession(t, ctx, slowEnv, repo, "ux-handled-daemon", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	pauseReplay(t, ctx, env, repo, "handled external integration")
 	writeFile(t, target, "same change\n")
+	wakeSession(t, ctx, slowEnv, repo, "ux-handled-daemon")
+	waitFor(t, "provider entered after replay conflict probe", 8*time.Second, func() bool {
+		_, err := os.Stat(providerStarted)
+		return err == nil
+	})
 	externalHead := gitCommitAll(t, repo, "external handled commit", "external-handled.txt")
 	if externalHead == baseHead {
 		t.Fatalf("external commit did not advance HEAD")
 	}
 
-	resumeReplay(t, ctx, env, repo)
-	wakeSession(t, ctx, env, repo, "ux-handled-daemon")
-	waitForEventState(t, dbPath, "external-handled.txt", "published", 8*time.Second)
-	waitForDecision(t, dbPath, "external-handled.txt", "handled_external", "already_published_by_external_committer", 8*time.Second)
+	waitForEventState(t, dbPath, "external-handled.txt", "published", 15*time.Second)
+	waitForDecision(t, dbPath, "external-handled.txt", "handled_external", "already_published_after_cas_exhaustion", 15*time.Second)
 
 	if got := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'external-handled.txt' ORDER BY seq DESC LIMIT 1"); got != externalHead {
 		t.Fatalf("published commit_oid=%q want external HEAD %s", got, externalHead)
@@ -410,18 +441,6 @@ VALUES (%f, 'blocked', 'watch.txt', 'before-state mismatch', 'blocked_conflict',
 			t.Fatalf("events --watch did not stream appended decision")
 		}
 	}
-}
-
-func hasIntegrationFixAction(actions []struct {
-	Kind string `json:"kind"`
-	Seq  int64  `json:"seq"`
-}, kind string) bool {
-	for _, action := range actions {
-		if action.Kind == kind {
-			return true
-		}
-	}
-	return false
 }
 
 func waitForDecision(t *testing.T, dbPath, path, kind, reason string, timeout time.Duration) {

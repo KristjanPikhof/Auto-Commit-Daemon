@@ -1,13 +1,50 @@
-# acd adapter: shell (universal fallback)
+# acd adapter: shell
 
-For tools without a hook system: rely on the shell to register/deregister.
+Use the shell adapter when your coding tool does not have a native hook system.
+Choose either direnv for one repo or zsh for every repo you enter.
 
-## direnv
+## Install with direnv
 
-Append `direnv.envrc.snippet` to your repo's `.envrc`. `direnv allow` once.
+Run `acd setup shell`, copy the direnv snippet into the repository's `.envrc`,
+then approve it once:
 
-## zsh
+~~~bash
+direnv allow
+~~~
 
-Append `zshrc.snippet.sh` to `~/.zshrc`. The `chpwd` hook registers acd whenever you `cd` into a git repo.
+The snippet registers the current shell when direnv loads the repo and
+deregisters it when direnv unloads the environment.
 
-Either approach uses `--harness shell`. PID-based liveness keeps the daemon alive only while a registered shell is running.
+## Install with zsh
+
+Run `acd setup shell` and append the zsh snippet to `~/.zshrc`. Load the change
+in the current terminal:
+
+~~~bash
+source ~/.zshrc
+~~~
+
+The `chpwd` hook registers ACD whenever you enter a Git worktree. The shell PID
+keeps the session alive, so ACD removes the client after that shell exits.
+
+## Verify
+
+Enter a Git repository and run:
+
+~~~bash
+acd status
+~~~
+
+The client list should contain `harness=shell`. Run `acd doctor` if the daemon
+does not start or the client is missing.
+
+## Uninstall
+
+Remove the ACD block from `.envrc` or `~/.zshrc`, depending on which form you
+installed. Restart the shell, or stop the current repo immediately:
+
+~~~bash
+acd stop
+~~~
+
+Stopping the daemon does not delete `.git/acd` state.

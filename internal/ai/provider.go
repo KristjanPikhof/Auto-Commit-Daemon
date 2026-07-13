@@ -139,6 +139,7 @@ func recordPromptFallback(ctx context.Context, strategy, primary, fallback, reas
 	if meta.Strategy == "" {
 		meta.Strategy = strategy
 	}
+	reason = SanitizePlannerError(reason)
 	logger.Record(prompttrace.Record{
 		Stage:        "fallback",
 		Strategy:     meta.Strategy,
@@ -289,7 +290,7 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 			slog.Int("max_retries", maxRetries),
 			slog.Int("code", int(typed.Code)),
 			slog.Int64("seq", typed.Seq),
-			slog.String("error", typed.Message),
+			slog.String("error", SanitizePlannerError(typed.Message)),
 		)
 		currentReq = req
 		currentReq.RetryCorrection = typed.Message

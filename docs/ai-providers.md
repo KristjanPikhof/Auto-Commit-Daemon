@@ -77,8 +77,6 @@ Before sending, it redacts common secret shapes and truncates:
 Redaction is a backstop, not a guarantee. Do not enable diff egress for a
 private repo unless the endpoint or plugin is trusted.
 
-`ACD_AI_SEND_DIFF` is removed. Use `ACD_AI_DIFF_EGRESS=1`.
-
 ## Environment reference
 
 | Variable | Default | Notes |
@@ -92,20 +90,21 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local prompt diagnostics under `<gitDir>/acd/prompt-trace/`. |
 | `ACD_COMMIT_STRATEGY` | `event` | Set `intent` to ask the planner to group captures. |
-| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
+| `ACD_COMMIT_FORMAT` | `imperative` | `imperative` uses verb-led subjects; `conventional` uses scope-less Conventional Commit subjects. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending count before planning. |
 | `ACD_INTENT_SETTLE_WINDOW` | `10s` | Burst settle delay after the count gate. `0` disables it. |
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age trigger for sparse queues. |
 | `ACD_INTENT_RECENT_COMMITS` | `5` | Recent commits sent as compact context. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before forced one-capture planning. |
-| `ACD_INTENT_PATH_COALESCE` | off | Truthy restores legacy folding of consecutive same-path captures into one planner offer. |
+| `ACD_INTENT_PATH_COALESCE` | off | Truthy folds consecutive same-path captures into one planner offer. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after typed planner validation errors. `0` or false-like values disable retries. |
 | `ACD_INTENT_REJECTS_RAW` | off | Truthy stores raw rejected planner responses. Sensitive. |
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |
 
-Restart the daemon after changing provider, format, or intent environment.
+Provider, format, and intent environment settings are read when the daemon
+starts.
 
 `ACD_COMMIT_FORMAT=conventional` accepts only `feat`, `fix`, `docs`,
 `refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`
@@ -218,8 +217,8 @@ For windows that contain several independent intents, return ordered
 }
 ~~~
 
-The top-level `selected_seqs`, `subject`, `body`, and `grouping_reason` remain
-required for legacy compatibility. When `commit_groups` is present,
+The top-level `selected_seqs`, `subject`, `body`, and `grouping_reason` are
+required. When `commit_groups` is present,
 `selected_seqs` must be the union of all group selections; the top-level
 message can mirror the first group or summarize the selected window.
 
@@ -237,7 +236,7 @@ Rules:
 | `deferred_reasons` may mention only deferred seqs | Reasons stay aligned with the plan. |
 | `subject` must match `commit_format` | Wrong-format output gets rejected, corrected, or falls back deterministically. |
 | Non-empty `error` is a soft error | ACD keeps the plugin alive and falls back for that request. |
-| Timeout, EOF, crash, or I/O error is a hard error | ACD kills the plugin and respawns it on the next request. |
+| Timeout, EOF, crash, or I/O error is a hard error | ACD kills the plugin. Event mode restarts it on the next request; intent mode waits until the circuit allows a provider probe. |
 
 Minimal smoke test:
 
@@ -265,9 +264,48 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 | Provider unset | Deterministic provider. |
 | `openai-compat` succeeds | Provider result is used. |
 | Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
-| `openai-compat` fails, times out, or has no key | Deterministic fallback. |
+| Intent planner transport failure | Open the persisted circuit immediately and use deterministic fallback. |
+| Three consecutive intent validation failures | Open the persisted circuit after configured correction retries are exhausted. |
+| Intent circuit open | Skip the remote planner and use deterministic fallback without repeated planner-error decisions. |
+| Intent circuit half-open | Allow one provider probe; other windows use deterministic fallback. |
+| `openai-compat` has no key | Deterministic provider. |
 | Subprocess response has `error` | Deterministic fallback, plugin stays alive. |
-| Subprocess crashes or times out | Deterministic fallback, plugin restarts next time. |
+| Subprocess crashes or times out | Deterministic fallback; the plugin restarts on the next allowed provider probe. |
 
 The deterministic provider is the final backstop and should always return a
 message.
+
+### Inspect the intent planner circuit
+
+Use either read-only command:
+
+~~~bash
+acd status --repo . --json
+acd diagnose --repo . --json
+~~~
+
+Both expose `intent_strategy.planner_health`. The useful fields are:
+
+| Field | Meaning |
+|---|---|
+| `state` | `closed`, `open`, or `half_open`. |
+| `consecutive_failures` | Failures counted toward the current open state. |
+| `backoff_level` | Cooldown step: 30 seconds, 2 minutes, then 10 minutes. |
+| `next_probe_ts` | Unix timestamp when one half-open probe may run. |
+| `opened_ts` | Unix timestamp when the current circuit-open period began. |
+| `last_failure_ts` | Unix timestamp of the most recent counted failure. |
+| `last_failure_class` | `transport` or `validation`. |
+| `last_error` | Bounded, redacted diagnostic text. |
+| `bypass_count` | Cumulative windows served by fallback while the circuit denied a provider call. |
+| `provider_fingerprint` | Hash of provider, model, sanitized endpoint, and provider mode. |
+| `updated_ts` | Unix timestamp of the latest persisted health update. |
+
+If the persisted record is empty, malformed, unsafe to expose, or uses an
+unsupported version, `status` and `diagnose` omit `planner_health` and return
+`planner_health_warning`. The read path never repairs or deletes the meta row.
+
+The circuit record persists across daemon restarts. A successful half-open
+probe closes it. A failed probe advances cooldown from 30 seconds to 2 minutes,
+then caps at 10 minutes. API keys are never part of the provider fingerprint;
+endpoint credentials, query strings, authorization values, and common token
+shapes are removed from stored errors.

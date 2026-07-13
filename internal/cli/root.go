@@ -7,7 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// ErrNoCommand is returned when acd is invoked with no subcommand.
+// ErrNoCommand is retained for source compatibility. Bare acd now renders a
+// read-only health summary and no longer returns this error.
 var ErrNoCommand = errors.New("no command provided")
 
 // Execute builds the root command tree and runs it.
@@ -31,9 +32,9 @@ func newRootCmd() *cobra.Command {
 		Short:         "Atomic Commit Daemon — per-repo, multi-harness",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(c *cobra.Command, args []string) error {
-			_ = c.Help()
-			return ErrNoCommand
+			return runControlStatus(c.Context(), c.OutOrStdout(), repoPath, jsonOut)
 		},
 	}
 	cmd.CompletionOptions.HiddenDefaultCmd = true
@@ -46,6 +47,8 @@ func newRootCmd() *cobra.Command {
 	pf.StringVar(&logLevel, "log-level", "info", "debug|info|warn|error")
 
 	cmd.AddCommand(
+		newOnCmd(),
+		newOffCmd(),
 		newVersionCmd(),
 		newStartCmd(),
 		newStopCmd(),

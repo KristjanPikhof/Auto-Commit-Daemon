@@ -280,6 +280,11 @@ type recoveryBlockerCounts struct {
 	// blocked_conflict rows that have later pending rows on the same
 	// (branch_ref, branch_generation). This is the force-fix barrier count.
 	ActiveBlockedBarriersWithSuccessors int
+	// ActiveTerminalEvents is every blocked_conflict or failed row for the
+	// daemon's current (branch_ref, branch_generation), including a terminal
+	// row at the tail with no pending successor. Bare health uses this to avoid
+	// reporting a stuck active pair as healthy.
+	ActiveTerminalEvents int
 	// FailedBarriersWithSuccessors is every failed terminal row that has later
 	// pending rows on the same (branch_ref, branch_generation).
 	FailedBarriersWithSuccessors int
@@ -305,6 +310,17 @@ func loadRecoveryBlockerCounts(ctx context.Context, conn *sql.DB, activeBranchRe
 			return c, fmt.Errorf("active blocked barriers with successors: %w", err)
 		}
 		c.ActiveBlockedBarriersWithSuccessors = n
+		if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state IN (?, ?)`,
+			activeBranchRef, activeGeneration,
+			state.EventStateBlockedConflict, state.EventStateFailed,
+		).Scan(&c.ActiveTerminalEvents); err != nil {
+			return c, fmt.Errorf("active terminal events: %w", err)
+		}
 	}
 	failed, err := countTerminalBarriersWithSuccessors(ctx, conn, state.EventStateFailed, "", 0)
 	if err != nil {

@@ -92,7 +92,7 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 		BranchGeneration:    1,
 		Source:              sqlNullStr("deterministic"),
 		CommitFormat:        sqlNullStr("imperative"),
-		ValidationFailure:   sqlNullStr("planner validation failed"),
+		ValidationFailure:   sqlNullStr(`planner validation failed {"api_key":"legacy-window-secret"}`),
 		OfferedSeqs:         []int64{4, 5},
 		VisibleOriginalSeqs: []int64{4, 5, 6},
 		HiddenSeqs:          []int64{6},
@@ -118,7 +118,8 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	}
 	if len(win.OfferedSeqs) != 2 || win.OfferedSeqs[0] != 4 ||
 		len(win.HiddenSeqs) != 1 || win.HiddenSeqs[0] != 6 ||
-		win.ValidationFailure != "planner validation failed" {
+		strings.Contains(win.ValidationFailure, "legacy-window-secret") ||
+		!strings.Contains(win.ValidationFailure, "[REDACTED]") {
 		t.Fatalf("last planner window seq/failure fields = %+v", win)
 	}
 

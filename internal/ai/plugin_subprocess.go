@@ -321,6 +321,15 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		p.markCrashed(session)
 	}
 	if err != nil {
+		var decodeErr *subprocessResponseDecodeError
+		if errors.As(err, &decodeErr) {
+			validationErr := intentPlanShapeValidationError(
+				fmt.Sprintf("subprocess:%s: %v", p.name, decodeErr),
+				decodeErr,
+			)
+			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: validationErr.Error()})
+			return IntentPlan{}, validationErr
+		}
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
 		return IntentPlan{}, err
 	}
@@ -341,7 +350,8 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		Source:          p.Name(),
 	}
 	if strings.TrimSpace(plan.Subject) == "" {
-		err := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+		cause := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+		err := intentPlanShapeValidationError(cause.Error(), cause)
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
@@ -447,6 +457,14 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 		p.markCrashed(session)
 	}
 	if err != nil {
+		var decodeErr *subprocessResponseDecodeError
+		if errors.As(err, &decodeErr) {
+			validationErr := &IntentMessageRewriteValidationError{
+				Err: fmt.Errorf("subprocess:%s: %w", p.name, decodeErr),
+			}
+			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
+			return Result{}, validationErr
+		}
 		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
 		return Result{}, err
 	}
@@ -454,6 +472,13 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
 		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
 		return Result{}, err
+	}
+	if intentMessageRewriteSubjectEmpty(resp.Subject) {
+		validationErr := &IntentMessageRewriteValidationError{
+			Err: fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name),
+		}
+		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
+		return Result{}, validationErr
 	}
 
 	cleaned := SanitizeMessage(resp.Subject + "\n\n" + resp.Body)
@@ -463,9 +488,11 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 		result.Body = parts[1]
 	}
 	if strings.TrimSpace(result.Subject) == "" {
-		err := fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name)
-		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: err.Error()})
-		return Result{}, err
+		validationErr := &IntentMessageRewriteValidationError{
+			Err: fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name),
+		}
+		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
+		return Result{}, validationErr
 	}
 	p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Subject: result.Subject, Body: result.Body})
 	return result, nil
@@ -608,6 +635,8 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 	if meta.Strategy == "" {
 		meta.Strategy = strategy
 	}
+	response.Error = SanitizePlannerError(response.Error)
+	response.ValidationError = SanitizePlannerError(response.ValidationError)
 	meta = promptTraceMetadata(meta, p.Name(), "")
 	logger.Record(prompttrace.Record{
 		Stage:        "response",
@@ -675,6 +704,22 @@ type pluginRequest struct {
 type pluginReply struct {
 	resp subprocessResponse
 	err  error
+}
+
+type subprocessResponseDecodeError struct{ err error }
+
+func (e *subprocessResponseDecodeError) Error() string {
+	if e == nil || e.err == nil {
+		return "decode response"
+	}
+	return "decode response: " + e.err.Error()
+}
+
+func (e *subprocessResponseDecodeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 // pluginSession owns a single child process plus the goroutine that
@@ -822,8 +867,8 @@ func (s *pluginSession) run() {
 		}
 		var resp subprocessResponse
 		if err := json.Unmarshal(line, &resp); err != nil {
-			req.reply <- pluginReply{err: fmt.Errorf("decode response: %w", err)}
-			s.logger.Debug("plugin response decode failed", slog.Any("err", err), slog.String("line", string(line)))
+			req.reply <- pluginReply{err: &subprocessResponseDecodeError{err: err}}
+			s.logger.Debug("plugin response decode failed", slog.Any("err", err), slog.Int("response_bytes", len(line)))
 			return
 		}
 		req.reply <- pluginReply{resp: resp}

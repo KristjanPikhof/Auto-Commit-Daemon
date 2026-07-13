@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,14 +24,10 @@ import (
 )
 
 const (
-	fixActionClearExpiredManualPause     = "clear_expired_manual_pause"
-	fixActionClearDrainedBackpressure    = "clear_drained_backpressure"
-	fixActionDeleteObsoleteBarrier       = "delete_obsolete_barrier"
-	fixActionMarkExternalPublished       = "mark_external_published"
-	fixActionDropGeneratedPending        = "drop_generated_pending"
-	fixActionResolveAlreadyLandedBarrier = "resolve_already_landed_barrier"
-	fixActionRetargetStaleAnchor         = "retarget_stale_anchor"
-	fixActionPurgeBarrierWithSuccessors  = "purge_barrier_with_successors"
+	fixActionClearExpiredManualPause   = "clear_expired_manual_pause"
+	fixActionClearDrainedBackpressure  = "clear_drained_backpressure"
+	fixActionDropGeneratedPending      = "drop_generated_pending"
+	fixActionReconcileUnpublishedChain = "reconcile_unpublished_chain"
 )
 
 type fixPlan struct {
@@ -53,14 +51,14 @@ type fixPlan struct {
 	RemainingBlockers  *fixBlockerVerification `json:"remaining_blockers,omitempty"`
 	ManualPauseRemoved bool                    `json:"manual_pause_removed,omitempty"`
 	ManualPausePath    string                  `json:"manual_pause_path,omitempty"`
-	// Retarget bookkeeping (mirrors recoverPlan fields so JSON callers can
-	// follow ported acd recover semantics without losing data).
-	ManualMarkerRemoved     bool   `json:"manual_marker_removed,omitempty"`
-	ManualMarkerPreserved   bool   `json:"manual_marker_preserved,omitempty"`
-	ManualMarkerRemoveError string `json:"manual_marker_remove_error,omitempty"`
-	LiveIndexCandidates     int    `json:"live_index_candidates,omitempty"`
-	LiveIndexApplied        int    `json:"live_index_applied,omitempty"`
-	LiveIndexSkipped        int    `json:"live_index_skipped,omitempty"`
+
+	// Apply-only proof and hooks. These never cross the JSON plan boundary.
+	plannedPauseMarker   *pausepkg.Marker
+	plannedPauseInfo     os.FileInfo
+	afterBackup          func()
+	beforePauseRemove    func()
+	afterPauseQuarantine func(string)
+	commitTransaction    func(*sql.Tx) error
 }
 
 type fixBlockerVerification struct {
@@ -96,6 +94,9 @@ type fixAction struct {
 	SetAt             string  `json:"set_at,omitempty"`
 	RequiresForce     bool    `json:"requires_force,omitempty"`
 	State             string  `json:"state,omitempty"`
+	ArchiveOnly       bool    `json:"archive_only,omitempty"`
+	InvalidateShadow  bool    `json:"invalidate_shadow,omitempty"`
+	RecoveryRef       string  `json:"recovery_ref,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
@@ -105,13 +106,13 @@ func newFixCmd() *cobra.Command {
 		Long: `Plan or apply guided remediation for common stuck ACD states.
 
 ` + "`acd fix`" + ` is the single recovery entrypoint. Without --yes and
-without --force it prints a dry-run plan only. --yes applies the safe,
-auto-resolvable actions (resolve already-landed barriers, retarget stale
-anchors, clear obsolete barriers, mark externally-published rows, clear
-expired manual pauses, clear drained backpressure). --force opts into the
-destructive purge of replay barriers that still have pending successors;
---force without --yes is still dry-run. All actions refuse while a live
-daemon owns the state DB, and state.db is backed up before any mutation.`,
+without --force it prints a dry-run plan only. --yes applies safe recovery:
+each stuck unpublished branch/generation pair is either proven present at a
+stable HEAD or preserved at a hidden recovery ref before its queue state
+changes. --force selects archive-only recovery for otherwise unresolved pairs;
+it never deletes captured work. --force without --yes is still dry-run. All
+actions refuse while a live daemon owns the state DB, and state.db is backed
+up before any mutation.`,
 		Example: `  acd fix --dry-run
   acd fix --yes
   acd fix --force --dry-run
@@ -130,8 +131,8 @@ daemon owns the state DB, and state.db is backed up before any mutation.`,
 	}
 	cmd.Flags().Bool("dry-run", false, "Show the guided remediation plan without mutating state")
 	cmd.Flags().Bool("yes", false, "Apply safe remediation actions (auto/safe set)")
-	cmd.Flags().Bool("force", false, "Include destructive purge of replay barriers with pending successors in the plan; combine with --yes to apply")
-	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker when retargeting a stale anchor")
+	cmd.Flags().Bool("force", false, "Use archive-only recovery for unresolved unpublished pairs; captured work is protected before state changes")
+	cmd.Flags().Bool("clear-pause", false, "Also remove the manual pause marker after safe recovery")
 	return cmd
 }
 
@@ -139,12 +140,10 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Resolve effective dry-run vs apply mode. The rules per SPEC LOCK:
-	//   neither --yes nor --force: dry-run default (same as --dry-run).
-	//   --yes alone: apply auto/safe actions (no purge).
-	//   --force without --yes: dry-run that INCLUDES purge plan.
-	//   --yes --force: apply auto + purge.
-	// An explicit --dry-run always wins (operator inspection).
+	// Resolve effective dry-run vs apply mode. Neither --yes nor --force
+	// mutates by itself: --yes authorizes apply, while --force only changes
+	// planned pair reconciliation to archive-only recovery. An explicit
+	// --dry-run always wins.
 	if !yes {
 		dryRun = true
 	}
@@ -168,6 +167,7 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	}
 	if len(plan.Actions) > 0 {
 		if err := applyFixPlan(ctx, rec.StateDB, &plan); err != nil {
+			markFixIncomplete(&plan, err)
 			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
 				return rerr
 			}
@@ -189,6 +189,14 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 	return renderFix(out, plan, jsonOut)
 }
 
+func markFixIncomplete(plan *fixPlan, err error) {
+	if plan.Incomplete {
+		return
+	}
+	plan.Incomplete = true
+	plan.VerifyErrors = append(plan.VerifyErrors, err.Error())
+}
+
 func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clearPause bool) (fixPlan, error) {
 	gitDir, err := resolveGitDir(ctx, repo)
 	if err != nil {
@@ -199,8 +207,11 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD branch: %w", err)
 	}
 	head, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
+	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
 		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD: %w", err)
+	}
+	if errors.Is(err, git.ErrRefNotFound) {
+		head = ""
 	}
 
 	conn, err := openStateDBReadOnly(ctx, stateDB)
@@ -237,6 +248,13 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if branchRef == "" {
 		plan.Unsafe = append(plan.Unsafe, "detached HEAD is not safe for guided state mutation")
 		plan.Suggestions = append(plan.Suggestions, "Checkout an attached branch before applying fixes.")
+	} else if head == "" && !force {
+		plan.Unsafe = append(plan.Unsafe, "attached HEAD has no commit; archive-only recovery must be explicitly requested")
+		plan.Suggestions = append(plan.Suggestions, "Rerun with `acd fix --force --yes` to preserve complete unpublished pairs at hidden recovery refs.")
+	}
+	if name, active := daemon.GitOperationInProgress(gitDir); active {
+		plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("Git operation %s is in progress", name))
+		plan.Suggestions = append(plan.Suggestions, "Finish or abort the Git operation before applying `acd fix --yes`.")
 	}
 
 	if err := planManualPauseFix(ctx, gitDir, &plan); err != nil {
@@ -249,61 +267,122 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if err != nil {
 		return fixPlan{}, fmt.Errorf("acd fix: check decision ledger: %w", err)
 	}
-	if hasDecisionRecords {
-		if err := planExternalDecisionFix(ctx, conn, repo, head, &plan); err != nil {
-			return fixPlan{}, err
-		}
-	}
 	if err := planGeneratedPendingCleanup(ctx, conn, repo, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	// resolve_already_landed_barrier must precede delete_obsolete_barrier:
-	// a blocked row whose captured after-state matches HEAD is BOTH "obsolete"
-	// (no pending successors) AND "already landed externally". The promote
-	// path preserves the decision_records audit trail, so we want that
-	// outcome instead of a silent delete. Build a skip-set keyed by seq so
-	// planObsoleteBarrierFix never plans a delete for the same row.
-	resolveSeqs := map[int64]struct{}{}
-	if branchRef != "" {
-		if err := planResolveAlreadyLandedBarrier(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
-			return fixPlan{}, err
-		}
-		for _, a := range plan.Actions {
-			if a.Kind == fixActionResolveAlreadyLandedBarrier {
-				resolveSeqs[a.Seq] = struct{}{}
-			}
-		}
-	}
-	if err := planObsoleteBarrierFix(ctx, conn, hasDecisionRecords, &plan, resolveSeqs); err != nil {
+	if err := planUnpublishedChainReconciliation(ctx, conn, branchRef, plan.Generation, head, force, hasDecisionRecords, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	if branchRef != "" {
-		if force {
-			// Destructive purges must be applied before retarget_stale_anchor can
-			// reset blocked_conflict rows back to pending. Keep this order in the
-			// action list so --force --yes is order-safe.
-			if err := planPurgeBarrierWithSuccessors(ctx, conn, branchRef, plan.Generation, &plan); err != nil {
-				return fixPlan{}, err
-			}
-		} else {
-			// Without --force we never plan the purge, but we still nudge the
-			// operator when a stuck barrier exists so they can opt in.
-			counts, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, plan.Generation)
-			if err != nil {
-				return fixPlan{}, err
-			}
-			n := counts.ActiveBlockedBarriersWithSuccessors + counts.FailedBarriersWithSuccessors
-			if n > 0 {
-				plan.ForceRequired = true
-				plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-					"%d replay barrier row(s) still have pending successors; run `acd fix --repo %s --force --yes` to purge them.", n, plan.Repo))
-			}
-		}
-		if err := planRetargetStaleAnchor(ctx, conn, repo, head, branchRef, plan.Generation, &plan); err != nil {
-			return fixPlan{}, err
-		}
-	}
 	return plan, nil
+}
+
+type unpublishedFixPair struct {
+	branchRef   string
+	generation  int64
+	firstSeq    int64
+	lastSeq     int64
+	eventCount  int
+	hasTerminal bool
+	decisionLed bool
+}
+
+// planUnpublishedChainReconciliation emits one action per exact provenance
+// pair. It never rewrites a row onto the live branch and never peels one root
+// barrier away from its successors. The daemon reconciler owns the eventual
+// all-or-none proof/archive transition.
+func planUnpublishedChainReconciliation(
+	ctx context.Context,
+	conn *sql.DB,
+	currentBranch string,
+	currentGeneration int64,
+	currentHead string,
+	force bool,
+	hasDecisionRecords bool,
+	plan *fixPlan,
+) error {
+	decisionExpr := "0"
+	if hasDecisionRecords {
+		decisionExpr = `EXISTS (
+    SELECT 1
+    FROM decision_records d
+    WHERE d.event_seq = e.seq
+      AND d.kind IN ('handled_external', 'handled_external_after_block', 'superseded_external')
+)`
+	}
+	rows, err := conn.QueryContext(ctx, `
+SELECT e.seq, e.branch_ref, e.branch_generation, e.state, `+decisionExpr+`
+FROM capture_events e
+WHERE e.state IN (?, ?, ?)
+ORDER BY e.branch_ref, e.branch_generation, e.seq`,
+		state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed)
+	if err != nil {
+		return fmt.Errorf("acd fix: scan unpublished recovery pairs: %w", err)
+	}
+	defer rows.Close()
+
+	pairs := make(map[string]*unpublishedFixPair)
+	var order []string
+	for rows.Next() {
+		var seq, generation int64
+		var branchRef, eventState string
+		var decisionLed bool
+		if err := rows.Scan(&seq, &branchRef, &generation, &eventState, &decisionLed); err != nil {
+			return fmt.Errorf("acd fix: scan unpublished recovery row: %w", err)
+		}
+		key := fmt.Sprintf("%s\x00%d", branchRef, generation)
+		pair := pairs[key]
+		if pair == nil {
+			pair = &unpublishedFixPair{
+				branchRef: branchRef, generation: generation,
+				firstSeq: seq, lastSeq: seq,
+			}
+			pairs[key] = pair
+			order = append(order, key)
+		}
+		pair.lastSeq = seq
+		pair.eventCount++
+		pair.hasTerminal = pair.hasTerminal || eventState == state.EventStateBlockedConflict || eventState == state.EventStateFailed
+		pair.decisionLed = pair.decisionLed || decisionLed
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("acd fix: iterate unpublished recovery rows: %w", err)
+	}
+
+	for _, key := range order {
+		pair := pairs[key]
+		activePair := pair.branchRef == currentBranch && pair.generation == currentGeneration
+		stalePair := !activePair
+		if !pair.hasTerminal && !stalePair && !pair.decisionLed {
+			continue
+		}
+		archiveOnly := force || currentHead == ""
+		reasonParts := make([]string, 0, 3)
+		if pair.hasTerminal {
+			reasonParts = append(reasonParts, "terminal replay barrier")
+		}
+		if stalePair {
+			reasonParts = append(reasonParts, "non-active provenance pair")
+		}
+		if pair.decisionLed {
+			reasonParts = append(reasonParts, "external decision evidence")
+		}
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:               fmt.Sprintf("%s:%s:%d:%d", fixActionReconcileUnpublishedChain, pair.branchRef, pair.generation, pair.firstSeq),
+			Kind:             fixActionReconcileUnpublishedChain,
+			Description:      "prove or preserve the exact unpublished branch/generation chain",
+			Reason:           strings.Join(reasonParts, "; "),
+			Seq:              pair.firstSeq,
+			BranchRef:        pair.branchRef,
+			BranchGeneration: pair.generation,
+			OldestSeq:        pair.firstSeq,
+			NewestSeq:        pair.lastSeq,
+			PendingCount:     pair.eventCount,
+			ArchiveOnly:      archiveOnly,
+			InvalidateShadow: activePair,
+			RequiresForce:    force,
+		})
+	}
+	return nil
 }
 
 func daemonAliveSQL(ctx context.Context, conn *sql.DB) (bool, string, error) {
@@ -318,21 +397,11 @@ func daemonAliveSQL(ctx context.Context, conn *sql.DB) (bool, string, error) {
 	}
 	switch mode {
 	case "running", "starting", "draining":
-		if pid > 0 && identityAlive(ctx, pid) {
+		if pid > 0 && identity.AliveContext(ctx, pid) {
 			return true, fmt.Sprintf("daemon pid %d is alive in mode %s", pid, mode), nil
 		}
 	}
 	return false, "", nil
-}
-
-func identityAlive(ctx context.Context, pid int) bool {
-	return pid > 0 && identityAliveContext(ctx, pid)
-}
-
-var identityAliveContext = identityAliveContextDefault
-
-func identityAliveContextDefault(ctx context.Context, pid int) bool {
-	return identity.AliveContext(ctx, pid)
 }
 
 func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error {
@@ -344,7 +413,26 @@ func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error
 	if !ok {
 		return nil
 	}
+	markerInfo, err := os.Lstat(markerPath)
+	if err != nil {
+		return fmt.Errorf("acd fix: stat planned manual pause marker: %w", err)
+	}
+	if !markerInfo.Mode().IsRegular() {
+		return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", markerPath)
+	}
 	plan.ManualPausePath = markerPath
+	plan.plannedPauseMarker = &marker
+	plan.plannedPauseInfo = markerInfo
+	if plan.ClearPause {
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:          fixActionClearExpiredManualPause,
+			Kind:        fixActionClearExpiredManualPause,
+			Description: "remove manual pause marker after safe recovery",
+			Reason:      "operator explicitly requested --clear-pause",
+			SetAt:       marker.SetAt,
+		})
+		return nil
+	}
 	if marker.ExpiresAt == nil || strings.TrimSpace(*marker.ExpiresAt) == "" {
 		plan.Suggestions = append(plan.Suggestions, "Manual pause marker is active; run `acd resume --yes` when the pause is intentional to lift.")
 		return nil
@@ -394,191 +482,6 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 		Reason:      "backpressure marker is set but no pending events remain",
 		SetAt:       setAt,
 	})
-	return nil
-}
-
-func planObsoleteBarrierFix(ctx context.Context, conn *sql.DB, hasDecisionRecords bool, plan *fixPlan, skipSeqs map[int64]struct{}) error {
-	decisionFilter := ""
-	if hasDecisionRecords {
-		decisionFilter = `
-  AND NOT EXISTS (
-      SELECT 1
-      FROM decision_records d
-      WHERE d.event_seq = e.seq
-        AND d.kind IN (?, ?)
-        AND d.commit_oid IS NOT NULL
-        AND d.commit_oid <> ''
-  )`
-	}
-	q := `
-SELECT seq, path, state
-FROM capture_events e
-WHERE state IN (?, ?)
-` + decisionFilter + `
-  AND NOT EXISTS (
-      SELECT 1
-      FROM capture_events pending
-      WHERE pending.branch_ref = e.branch_ref
-        AND pending.branch_generation = e.branch_generation
-        AND pending.seq > e.seq
-        AND pending.state = ?
-  )
-ORDER BY seq ASC`
-	args := []any{state.EventStateBlockedConflict, state.EventStateFailed}
-	if hasDecisionRecords {
-		args = append(args, state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal)
-	}
-	args = append(args, state.EventStatePending)
-	rows, err := conn.QueryContext(ctx, q, args...)
-	if err != nil {
-		return fmt.Errorf("acd fix: query obsolete barriers: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var seq int64
-		var path, st string
-		if err := rows.Scan(&seq, &path, &st); err != nil {
-			return fmt.Errorf("acd fix: scan obsolete barrier: %w", err)
-		}
-		if _, skip := skipSeqs[seq]; skip {
-			// resolve_already_landed_barrier already owns this seq; skip the
-			// delete so the promote path can run and keep the audit trail.
-			continue
-		}
-		plan.Actions = append(plan.Actions, fixAction{
-			ID:          fmt.Sprintf("%s:%d", fixActionDeleteObsoleteBarrier, seq),
-			Kind:        fixActionDeleteObsoleteBarrier,
-			Description: "delete obsolete terminal replay barrier with no pending successors",
-			Reason:      st,
-			Seq:         seq,
-			Path:        path,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("acd fix: iterate obsolete barriers: %w", err)
-	}
-
-	var blocking int
-	blockingDecisionFilter := ""
-	if hasDecisionRecords {
-		blockingDecisionFilter = `
-  AND NOT EXISTS (
-      SELECT 1
-      FROM decision_records d
-      WHERE d.event_seq = e.seq
-        AND d.kind IN (?, ?)
-        AND d.commit_oid IS NOT NULL
-        AND d.commit_oid <> ''
-  )`
-	}
-	blockingQ := `
-SELECT COUNT(*)
-FROM capture_events e
-WHERE state IN (?, ?)
-` + blockingDecisionFilter + `
-  AND EXISTS (
-      SELECT 1
-      FROM capture_events pending
-      WHERE pending.branch_ref = e.branch_ref
-        AND pending.branch_generation = e.branch_generation
-        AND pending.seq > e.seq
-        AND pending.state = ?
-  )`
-	blockingArgs := []any{state.EventStateBlockedConflict, state.EventStateFailed}
-	if hasDecisionRecords {
-		blockingArgs = append(blockingArgs, state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal)
-	}
-	blockingArgs = append(blockingArgs, state.EventStatePending)
-	if err := conn.QueryRowContext(ctx, blockingQ, blockingArgs...).Scan(&blocking); err != nil {
-		return fmt.Errorf("acd fix: count active barriers: %w", err)
-	}
-	if blocking > 0 {
-		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf("%d terminal barrier rows still have pending successors; inspect with `acd diagnose` before purging.", blocking))
-	}
-	return nil
-}
-
-type externalDecisionCandidate struct {
-	seq        int64
-	path       string
-	branchRef  string
-	generation int64
-	decisionID int64
-	kind       string
-	reason     string
-	commitOID  string
-}
-
-func planExternalDecisionFix(ctx context.Context, conn *sql.DB, repo, head string, plan *fixPlan) error {
-	rows, err := conn.QueryContext(ctx, `
-SELECT e.seq, e.path, e.branch_ref, e.branch_generation,
-       d.id, d.kind, COALESCE(d.reason, ''), COALESCE(d.commit_oid, '')
-FROM capture_events e
-JOIN decision_records d ON d.event_seq = e.seq
-WHERE e.state IN (?, ?)
-  AND d.kind IN (?, ?)
-  AND d.commit_oid IS NOT NULL
-  AND d.commit_oid <> ''
-  AND (d.branch_ref IS NULL OR d.branch_ref = e.branch_ref)
-  AND (d.branch_generation IS NULL OR d.branch_generation = e.branch_generation)
-ORDER BY e.seq ASC, d.id DESC`,
-		state.EventStatePending, state.EventStateBlockedConflict,
-		state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal)
-	if err != nil {
-		return fmt.Errorf("acd fix: query external decisions: %w", err)
-	}
-	defer rows.Close()
-
-	seen := map[int64]bool{}
-	for rows.Next() {
-		var c externalDecisionCandidate
-		if err := rows.Scan(&c.seq, &c.path, &c.branchRef, &c.generation, &c.decisionID, &c.kind, &c.reason, &c.commitOID); err != nil {
-			return fmt.Errorf("acd fix: scan external decision: %w", err)
-		}
-		if seen[c.seq] {
-			continue
-		}
-		seen[c.seq] = true
-		ops, err := loadFixCaptureOps(ctx, conn, c.seq)
-		if err != nil {
-			return err
-		}
-		if len(ops) == 0 {
-			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d has no capture ops to verify", c.decisionID, c.seq))
-			continue
-		}
-		ok, err := git.IsAncestor(ctx, repo, c.commitOID, head)
-		if err != nil {
-			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d references unresolved commit %s", c.decisionID, c.seq, c.commitOID))
-			continue
-		}
-		if !ok {
-			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d references commit %s outside current HEAD history", c.decisionID, c.seq, shortOID(c.commitOID, 12)))
-			continue
-		}
-		matches, err := currentHeadMatchesFixDecision(ctx, repo, head, c.kind, ops)
-		if err != nil {
-			return err
-		}
-		if !matches {
-			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf("decision %d for event %d no longer matches current HEAD tree", c.decisionID, c.seq))
-			continue
-		}
-		plan.Actions = append(plan.Actions, fixAction{
-			ID:          fmt.Sprintf("%s:%d", fixActionMarkExternalPublished, c.seq),
-			Kind:        fixActionMarkExternalPublished,
-			Description: "mark externally handled queued event as published",
-			Reason:      c.kind + ":" + c.reason,
-			Seq:         c.seq,
-			Path:        c.path,
-			DecisionID:  c.decisionID,
-			CommitOID:   c.commitOID,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("acd fix: iterate external decisions: %w", err)
-	}
 	return nil
 }
 
@@ -650,114 +553,67 @@ ORDER BY ord ASC`, seq)
 	return ops, nil
 }
 
-func currentHeadMatchesFixDecision(ctx context.Context, repo, head, kind string, ops []state.CaptureOp) (bool, error) {
-	for _, op := range ops {
-		var ok bool
-		var err error
-		switch kind {
-		case state.DecisionKindHandledExternal:
-			ok, err = treeMatchesCapturedAfter(ctx, repo, head, op)
-		case state.DecisionKindSupersededExternal:
-			ok, err = treeMatchesCapturedBeforeForFix(ctx, repo, head, op)
-		default:
-			ok = false
-		}
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func treeMatchesCapturedAfter(ctx context.Context, repo, ref string, op state.CaptureOp) (bool, error) {
-	if op.Op == "delete" {
-		return treePathAbsent(ctx, repo, ref, op.Path)
-	}
-	if !op.AfterOID.Valid || op.AfterOID.String == "" {
-		return false, nil
-	}
-	if ok, err := treeBlobMatches(ctx, repo, ref, op.Path, op.AfterOID.String, op.AfterMode); err != nil || !ok {
-		return ok, err
-	}
-	if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
-		return treePathAbsent(ctx, repo, ref, op.OldPath.String)
-	}
-	return true, nil
-}
-
-func treeMatchesCapturedBeforeForFix(ctx context.Context, repo, ref string, op state.CaptureOp) (bool, error) {
-	switch op.Op {
-	case "create":
-		return treePathAbsent(ctx, repo, ref, op.Path)
-	case "delete", "modify":
-		if !op.BeforeOID.Valid || op.BeforeOID.String == "" {
-			return false, nil
-		}
-		return treeBlobMatches(ctx, repo, ref, op.Path, op.BeforeOID.String, op.BeforeMode)
-	default:
-		return false, nil
-	}
-}
-
-func treeBlobMatches(ctx context.Context, repo, ref, path, oid string, mode sql.NullString) (bool, error) {
-	entries, err := git.LsTree(ctx, repo, ref, false, path)
-	if err != nil {
-		return false, fmt.Errorf("acd fix: ls-tree %s %s: %w", ref, path, err)
-	}
-	for _, entry := range entries {
-		if entry.Path != path || entry.Type != "blob" {
-			continue
-		}
-		if entry.OID != oid {
-			return false, nil
-		}
-		if mode.Valid && mode.String != "" && entry.Mode != mode.String {
-			return false, nil
-		}
-		return true, nil
-	}
-	return false, nil
-}
-
-func treePathAbsent(ctx context.Context, repo, ref, path string) (bool, error) {
-	entries, err := git.LsTree(ctx, repo, ref, false, path)
-	if err != nil {
-		return false, fmt.Errorf("acd fix: ls-tree %s %s: %w", ref, path, err)
-	}
-	for _, entry := range entries {
-		if entry.Path == path {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	if plan.CurrentBranchRef == "" {
 		return fmt.Errorf("acd fix: refusing to mutate state while HEAD is detached")
 	}
-	// Defense-in-depth: refuse to apply any RequiresForce action unless the
-	// plan's Force flag was set at build time. Planner gating already prevents
-	// these actions from appearing without --force, so this guard catches
-	// future refactors (re-hydrated plans, alternate callers) before they can
-	// silently apply a destructive purge.
+	// Defense-in-depth: refuse archive-only recovery actions unless the plan's
+	// Force flag was set at build time. Planner gating already prevents these
+	// actions from appearing without --force, so this catches re-hydrated plans
+	// or alternate callers that try to bypass the explicit opt-in.
 	for _, action := range plan.Actions {
 		if action.RequiresForce && !plan.Force {
 			return fmt.Errorf("acd fix: refusing to apply %s without --force (planner gating bypassed)", action.Kind)
 		}
 	}
+	daemonLock, err := daemon.AcquireDaemonLock(plan.GitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return fmt.Errorf("acd fix: refusing while the per-repo daemon owns daemon.lock: %w", err)
+		}
+		return fmt.Errorf("acd fix: acquire daemon.lock: %w", err)
+	}
+	defer func() { _ = daemonLock.Release() }()
+
+	if err := revalidateFixApplySafety(ctx, plan); err != nil {
+		return err
+	}
 	if err := preflightFixFS(plan); err != nil {
 		return err
 	}
-	backup, err := backupStateDB(stateDB)
+	// Preserve the original WAL-consistent database through a raw connection.
+	// state.Open may apply schema DDL, so it must not run until this verified
+	// pre-migration backup exists.
+	backupConn, err := openFixBackupDB(ctx, stateDB)
 	if err != nil {
+		return err
+	}
+	if err := refuseRecoverWhenDaemonAliveSQL(ctx, backupConn); err != nil {
+		_ = backupConn.Close()
+		return err
+	}
+	if err := revalidateFixApplySafety(ctx, plan); err != nil {
+		_ = backupConn.Close()
+		return err
+	}
+	backup, err := backupStateDB(ctx, backupConn, stateDB)
+	if err != nil {
+		_ = backupConn.Close()
 		return fmt.Errorf("acd fix: backup state.db: %w", err)
 	}
 	plan.BackupPath = backup
+	if err := backupConn.Close(); err != nil {
+		return fmt.Errorf("acd fix: close pre-migration backup connection: %w", err)
+	}
+	if plan.afterBackup != nil {
+		plan.afterBackup()
+	}
 
+	// daemon.lock excludes daemon startup, but external Git surgery does not use
+	// it. Repeat every apply-safety check after the potentially long backup.
+	if err := revalidateFixApplySafety(ctx, plan); err != nil {
+		return err
+	}
 	db, err := state.Open(ctx, stateDB)
 	if err != nil {
 		return fmt.Errorf("acd fix: open state.db: %w", err)
@@ -766,60 +622,117 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	if err := refuseRecoverWhenDaemonAlive(ctx, db); err != nil {
 		return err
 	}
-	branchRef, err := git.RunBranchRef(ctx, plan.Repo)
-	if err != nil {
-		return fmt.Errorf("acd fix: recheck HEAD branch: %w", err)
-	}
-	head, err := git.RevParse(ctx, plan.Repo, "HEAD")
-	if err != nil {
-		return fmt.Errorf("acd fix: recheck HEAD: %w", err)
-	}
-	if branchRef != plan.CurrentBranchRef || head != plan.CurrentHead {
-		return fmt.Errorf("acd fix: refusing to mutate state because HEAD changed during planning")
-	}
-
-	tx, err := db.SQL().BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("acd fix: begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	nowSec := float64(time.Now().UTC().UnixNano()) / 1e9
-	for i := range plan.Actions {
-		n, err := applyFixAction(ctx, tx, plan.Actions[i], plan, nowSec)
-		if err != nil {
-			return err
-		}
-		plan.Actions[i].RowsChanged = n
-		plan.Actions[i].Applied = true
-		plan.RowsChanged += n
-	}
-	if err := clearPublishBarrierIfSafe(ctx, tx, nowSec); err != nil {
+	if err := revalidateFixApplySafety(ctx, plan); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("acd fix: commit transaction: %w", err)
+
+	// Git-backed reconciliation owns its own ref-first/SQLite transaction. Run
+	// it before housekeeping so generated-row cleanup or breadcrumb changes can
+	// never remove captured work before the hidden proof/recovery ref exists.
+	for i := range plan.Actions {
+		action := &plan.Actions[i]
+		if action.Kind != fixActionReconcileUnpublishedChain {
+			continue
+		}
+		if err := revalidateFixApplySafety(ctx, plan); err != nil {
+			return err
+		}
+		result, err := daemon.ReconcileUnpublishedChain(ctx, plan.Repo, db, daemon.RecoveryReconcileOptions{
+			GitDir:           plan.GitDir,
+			BranchRef:        action.BranchRef,
+			BranchGeneration: action.BranchGeneration,
+			FirstSeq:         action.Seq,
+			Trigger:          "cli_fix",
+			ArchiveOnly:      action.ArchiveOnly,
+			InvalidateShadow: action.InvalidateShadow,
+		})
+		if err != nil {
+			return fmt.Errorf("acd fix: reconcile %s generation %d from seq %d: %w",
+				action.BranchRef, action.BranchGeneration, action.Seq, err)
+		}
+		action.Applied = true
+		if result.Handled {
+			action.RowsChanged = int64(result.EventCount)
+			action.CommitOID = result.CommitOID
+			action.RecoveryRef = result.RecoveryRef
+			action.State = result.Outcome
+			plan.RowsChanged += int64(result.EventCount)
+		}
+	}
+
+	transactional := false
+	for _, action := range plan.Actions {
+		if action.Kind != fixActionReconcileUnpublishedChain && action.Kind != fixActionClearExpiredManualPause {
+			transactional = true
+			break
+		}
+	}
+	if transactional {
+		if err := revalidateFixApplySafety(ctx, plan); err != nil {
+			return err
+		}
+		tx, err := db.SQL().BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("acd fix: begin transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		type pendingActionResult struct {
+			index int
+			rows  int64
+		}
+		var pendingResults []pendingActionResult
+		nowSec := float64(time.Now().UTC().UnixNano()) / 1e9
+		for i := range plan.Actions {
+			if plan.Actions[i].Kind == fixActionReconcileUnpublishedChain || plan.Actions[i].Kind == fixActionClearExpiredManualPause {
+				continue
+			}
+			n, err := applyFixAction(ctx, tx, plan.Actions[i], nowSec)
+			if err != nil {
+				return err
+			}
+			pendingResults = append(pendingResults, pendingActionResult{index: i, rows: n})
+		}
+		if err := clearPublishBarrierIfSafe(ctx, tx, nowSec); err != nil {
+			return err
+		}
+		commit := tx.Commit
+		if plan.commitTransaction != nil {
+			commit = func() error { return plan.commitTransaction(tx) }
+		}
+		if err := revalidateFixApplySafety(ctx, plan); err != nil {
+			return err
+		}
+		if err := commit(); err != nil {
+			return fmt.Errorf("acd fix: commit transaction: %w", err)
+		}
+		for _, result := range pendingResults {
+			plan.Actions[result.index].RowsChanged = result.rows
+			plan.Actions[result.index].Applied = true
+			plan.RowsChanged += result.rows
+		}
 	}
 
 	for _, action := range plan.Actions {
 		if action.Kind != fixActionClearExpiredManualPause {
 			continue
 		}
-		if err := os.Remove(plan.ManualPausePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd fix: remove manual pause marker: %w", err)
-		}
-		stampManualPauseResume(ctx, plan.GitDir)
-		plan.ManualPauseRemoved = true
-	}
-
-	// Retarget post-commit phase: when retarget_stale_anchor was applied,
-	// run the live-index repair pass and reconcile the manual pause marker
-	// the same way acd recover did. These steps must run AFTER tx.Commit so
-	// the slow git ops never hold the SQLite write lock.
-	if planHasAction(plan, fixActionRetargetStaleAnchor) {
-		if err := finalizeRetargetPostCommit(ctx, db, plan); err != nil {
+		if err := revalidateFixApplySafety(ctx, plan); err != nil {
 			return err
 		}
+		if plan.beforePauseRemove != nil {
+			plan.beforePauseRemove()
+		}
+		if err := removePlannedPauseMarker(plan); err != nil {
+			return err
+		}
+		stampManualPauseResume(ctx, plan.GitDir)
+		for i := range plan.Actions {
+			if plan.Actions[i].Kind == fixActionClearExpiredManualPause {
+				plan.Actions[i].Applied = true
+			}
+		}
+		plan.ManualPauseRemoved = true
 	}
 	if err := verifyFixPostApply(ctx, db.SQL(), plan); err != nil {
 		return err
@@ -827,22 +740,77 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	return nil
 }
 
-func planHasAction(plan *fixPlan, kind string) bool {
-	for _, action := range plan.Actions {
-		if action.Kind == kind {
-			return true
-		}
+func openFixBackupDB(ctx context.Context, stateDB string) (*sql.DB, error) {
+	q := url.Values{}
+	q.Add("mode", "rw")
+	q.Add("_pragma", "busy_timeout(5000)")
+	conn, err := sql.Open("sqlite", "file:"+stateDB+"?"+q.Encode())
+	if err != nil {
+		return nil, fmt.Errorf("acd fix: open state.db for pre-migration backup: %w", err)
 	}
-	return false
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("acd fix: ping state.db for pre-migration backup: %w", err)
+	}
+	return conn, nil
+}
+
+func revalidateFixApplySafety(ctx context.Context, plan *fixPlan) error {
+	branchRef, err := git.RunBranchRef(ctx, plan.Repo)
+	if err != nil {
+		return fmt.Errorf("acd fix: recheck HEAD branch: %w", err)
+	}
+	head, err := git.RevParse(ctx, plan.Repo, "HEAD")
+	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
+		return fmt.Errorf("acd fix: recheck HEAD: %w", err)
+	}
+	if errors.Is(err, git.ErrRefNotFound) {
+		head = ""
+	}
+	if branchRef != plan.CurrentBranchRef || head != plan.CurrentHead {
+		return fmt.Errorf("acd fix: refusing to mutate state because HEAD changed during planning")
+	}
+	if name, active := daemon.GitOperationInProgress(plan.GitDir); active {
+		return fmt.Errorf("acd fix: refusing to mutate state while Git operation %s is in progress", name)
+	}
+	if err := revalidateFixPauseState(plan); err != nil {
+		return err
+	}
+	return nil
+}
+
+func revalidateFixPauseState(plan *fixPlan) error {
+	marker, ok, err := pausepkg.Read(plan.GitDir)
+	if err != nil {
+		return fmt.Errorf("acd fix: re-read manual pause marker: %w", err)
+	}
+	if plan.plannedPauseMarker == nil {
+		if ok {
+			return fmt.Errorf("acd fix: manual pause marker appeared since planning; preserving current marker")
+		}
+		return nil
+	}
+	if !ok {
+		return fmt.Errorf("acd fix: manual pause marker disappeared since planning")
+	}
+	info, err := os.Lstat(plan.ManualPausePath)
+	if err != nil {
+		return fmt.Errorf("acd fix: stat manual pause marker: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", plan.ManualPausePath)
+	}
+	if plan.plannedPauseInfo == nil || !os.SameFile(plan.plannedPauseInfo, info) ||
+		!samePauseMarker(*plan.plannedPauseMarker, marker) {
+		return fmt.Errorf("acd fix: manual pause marker changed since planning; preserving current marker")
+	}
+	return nil
 }
 
 func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
 	var errs []string
-	for _, action := range plan.Actions {
-		if action.Kind == fixActionPurgeBarrierWithSuccessors && action.RowsChanged == 0 {
-			errs = append(errs, fmt.Sprintf("planned purge seq=%d changed zero rows", action.Seq))
-		}
-	}
 	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
 	if err != nil {
 		return fmt.Errorf("acd fix: verify post-apply blockers: %w", err)
@@ -874,43 +842,111 @@ func preflightFixFS(plan *fixPlan) error {
 		if action.Kind != fixActionClearExpiredManualPause {
 			continue
 		}
-		info, err := os.Lstat(plan.ManualPausePath)
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd fix: manual pause marker disappeared before apply")
-		}
-		if err != nil {
-			return fmt.Errorf("acd fix: stat manual pause marker: %w", err)
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", plan.ManualPausePath)
+		if err := verifyPlannedPauseMarker(plan); err != nil {
+			return err
 		}
 		if err := checkParentDirWritable(plan.ManualPausePath); err != nil {
 			return fmt.Errorf("acd fix: manual pause marker parent not writable: %w", err)
 		}
 	}
-	// Retarget with --clear-pause also wants to remove the manual pause
-	// marker; perform the same FS preflight BEFORE opening the SQLite
-	// write tx so a slow stat on a network mount cannot hold the write
-	// lock. The retarget path uses plan.ManualMarkerPath (computed by
-	// planRetargetStaleAnchor) which may equal plan.ManualPausePath; the
-	// stat is cheap and idempotent so duplication is fine.
-	if plan.ClearPause && planHasAction(plan, fixActionRetargetStaleAnchor) {
-		markerPath := plan.ManualPausePath
-		if info, err := os.Lstat(markerPath); err == nil {
-			if !info.Mode().IsRegular() {
-				return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", markerPath)
-			}
-			if err := checkParentDirWritable(markerPath); err != nil {
-				return fmt.Errorf("acd fix: manual pause marker parent not writable: %w", err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd fix: stat manual pause marker %s: %w", markerPath, err)
-		}
+	return nil
+}
+
+func verifyPlannedPauseMarker(plan *fixPlan) error {
+	if plan.plannedPauseMarker == nil || plan.plannedPauseInfo == nil {
+		return fmt.Errorf("acd fix: manual pause marker proof missing from plan")
+	}
+	return revalidateFixPauseState(plan)
+}
+
+func samePauseMarker(a, b pausepkg.Marker) bool {
+	if a.Reason != b.Reason || a.SetAt != b.SetAt || a.SetBy != b.SetBy || a.Version != b.Version {
+		return false
+	}
+	if a.ExpiresAt == nil || b.ExpiresAt == nil {
+		return a.ExpiresAt == nil && b.ExpiresAt == nil
+	}
+	return *a.ExpiresAt == *b.ExpiresAt
+}
+
+func removePlannedPauseMarker(plan *fixPlan) error {
+	if plan.plannedPauseMarker == nil || plan.plannedPauseInfo == nil {
+		return fmt.Errorf("acd fix: manual pause marker proof missing from plan")
+	}
+	quarantineDir, err := os.MkdirTemp(filepath.Dir(plan.ManualPausePath), ".paused-fix-quarantine-")
+	if err != nil {
+		return fmt.Errorf("acd fix: create pause marker quarantine: %w", err)
+	}
+	quarantinePath := filepath.Join(quarantineDir, "paused")
+	if err := os.Rename(plan.ManualPausePath, quarantinePath); err != nil {
+		_ = os.Remove(quarantineDir)
+		return fmt.Errorf("acd fix: quarantine manual pause marker: %w", err)
+	}
+	if plan.afterPauseQuarantine != nil {
+		plan.afterPauseQuarantine(quarantinePath)
+	}
+
+	marker, info, err := readQuarantinedPauseMarker(quarantinePath)
+	if err != nil {
+		return preserveQuarantinedPauseMarker(plan.ManualPausePath, quarantinePath, err)
+	}
+	if !os.SameFile(plan.plannedPauseInfo, info) || !samePauseMarker(*plan.plannedPauseMarker, marker) {
+		return preserveQuarantinedPauseMarker(plan.ManualPausePath, quarantinePath,
+			fmt.Errorf("manual pause marker changed since planning"))
+	}
+	if err := os.Remove(quarantinePath); err != nil {
+		return fmt.Errorf("acd fix: remove quarantined planned pause marker at %s: %w", quarantinePath, err)
+	}
+	_ = os.Remove(quarantineDir)
+	if _, err := os.Lstat(plan.ManualPausePath); err == nil {
+		return fmt.Errorf("acd fix: planned pause marker removed, but a new marker was created and preserved at %s", plan.ManualPausePath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("acd fix: check for replacement pause marker after removal: %w", err)
 	}
 	return nil
 }
 
-func applyFixAction(ctx context.Context, tx *sql.Tx, action fixAction, plan *fixPlan, nowSec float64) (int64, error) {
+func readQuarantinedPauseMarker(path string) (pausepkg.Marker, os.FileInfo, error) {
+	var marker pausepkg.Marker
+	info, err := os.Lstat(path)
+	if err != nil {
+		return marker, nil, fmt.Errorf("stat quarantined marker: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return marker, info, fmt.Errorf("quarantined marker is not a regular file")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return marker, info, fmt.Errorf("read quarantined marker: %w", err)
+	}
+	if err := json.Unmarshal(body, &marker); err != nil {
+		return marker, info, fmt.Errorf("decode quarantined marker: %w", err)
+	}
+	return marker, info, nil
+}
+
+func preserveQuarantinedPauseMarker(originalPath, quarantinePath string, cause error) error {
+	if _, err := os.Lstat(originalPath); errors.Is(err, os.ErrNotExist) {
+		if linkErr := os.Link(quarantinePath, originalPath); linkErr == nil {
+			if removeErr := os.Remove(quarantinePath); removeErr != nil {
+				return fmt.Errorf("acd fix: %v; marker restored at %s but quarantine cleanup failed at %s: %w",
+					cause, originalPath, quarantinePath, removeErr)
+			}
+			_ = os.Remove(filepath.Dir(quarantinePath))
+			return fmt.Errorf("acd fix: %v; current marker restored without removal at %s", cause, originalPath)
+		} else if !errors.Is(linkErr, os.ErrExist) {
+			return fmt.Errorf("acd fix: %v; marker preserved at %s after restore failed: %w",
+				cause, quarantinePath, linkErr)
+		}
+	} else if err != nil {
+		return fmt.Errorf("acd fix: %v; marker preserved at %s after original-path probe failed: %w",
+			cause, quarantinePath, err)
+	}
+	return fmt.Errorf("acd fix: %v; marker preserved at quarantine path %s because a marker exists at %s",
+		cause, quarantinePath, originalPath)
+}
+
+func applyFixAction(ctx context.Context, tx *sql.Tx, action fixAction, nowSec float64) (int64, error) {
 	switch action.Kind {
 	case fixActionClearExpiredManualPause:
 		return 0, nil
@@ -934,137 +970,8 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.upd
 			changed += n
 		}
 		return changed, nil
-	case fixActionDeleteObsoleteBarrier:
-		res, err := tx.ExecContext(ctx, `
-DELETE FROM capture_events
-WHERE seq = ?
-  AND state IN (?, ?)
-  AND NOT EXISTS (
-      SELECT 1
-      FROM capture_events pending
-      WHERE pending.branch_ref = capture_events.branch_ref
-        AND pending.branch_generation = capture_events.branch_generation
-        AND pending.seq > capture_events.seq
-        AND pending.state = ?
-  )`,
-			action.Seq, state.EventStateBlockedConflict, state.EventStateFailed, state.EventStatePending)
-		if err != nil {
-			return 0, fmt.Errorf("acd fix: delete obsolete barrier seq %d: %w", action.Seq, err)
-		}
-		n, _ := res.RowsAffected()
-		return n, nil
-	case fixActionMarkExternalPublished:
-		res, err := tx.ExecContext(ctx, `
-UPDATE capture_events
-SET state = ?, commit_oid = ?, error = NULL, published_ts = ?
-WHERE seq = ? AND state IN (?, ?)`,
-			state.EventStatePublished, action.CommitOID, nowSec, action.Seq,
-			state.EventStatePending, state.EventStateBlockedConflict)
-		if err != nil {
-			return 0, fmt.Errorf("acd fix: mark event %d published: %w", action.Seq, err)
-		}
-		n, _ := res.RowsAffected()
-		if n > 0 {
-			if _, err := tx.ExecContext(ctx, `
-INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid, status, error, updated_ts)
-VALUES (1, ?, ?, ?, ?, ?, 'published', NULL, ?)
-ON CONFLICT(id) DO UPDATE SET
-    event_seq = excluded.event_seq,
-    branch_ref = excluded.branch_ref,
-    branch_generation = excluded.branch_generation,
-    source_head = excluded.source_head,
-    target_commit_oid = excluded.target_commit_oid,
-    status = excluded.status,
-    error = excluded.error,
-    updated_ts = excluded.updated_ts`,
-				action.Seq, plan.CurrentBranchRef, plan.Generation, plan.CurrentHead, action.CommitOID, nowSec); err != nil {
-				return 0, fmt.Errorf("acd fix: update publish_state for event %d: %w", action.Seq, err)
-			}
-		}
-		return n, nil
-	case fixActionResolveAlreadyLandedBarrier:
-		// Promote the blocked_conflict row to published(commit_oid=HEAD)
-		// and record decision handled_external_after_block. Race-safe: the
-		// UPDATE includes the state predicate so a concurrent transition
-		// out of blocked_conflict cannot be overwritten.
-		res, err := tx.ExecContext(ctx, `
-UPDATE capture_events
-SET state = ?, commit_oid = ?, error = NULL, published_ts = ?
-WHERE seq = ? AND state = ?`,
-			state.EventStatePublished, action.CommitOID, nowSec, action.Seq,
-			state.EventStateBlockedConflict)
-		if err != nil {
-			return 0, fmt.Errorf("acd fix: promote blocked seq %d: %w", action.Seq, err)
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			// Row already moved out of blocked_conflict (race with another
-			// recovery action or replay pass). Treat as a no-op — the row
-			// is no longer ours to settle here.
-			return 0, nil
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO publish_state(id, event_seq, branch_ref, branch_generation, source_head, target_commit_oid, status, error, updated_ts)
-VALUES (1, ?, ?, ?, ?, ?, 'published', NULL, ?)
-ON CONFLICT(id) DO UPDATE SET
-    event_seq = excluded.event_seq,
-    branch_ref = excluded.branch_ref,
-    branch_generation = excluded.branch_generation,
-    source_head = excluded.source_head,
-    target_commit_oid = excluded.target_commit_oid,
-    status = excluded.status,
-    error = excluded.error,
-    updated_ts = excluded.updated_ts`,
-			action.Seq, action.BranchRef, action.BranchGeneration, action.BaseHead, action.CommitOID, nowSec); err != nil {
-			return 0, fmt.Errorf("acd fix: upsert publish_state for self-heal seq %d: %w", action.Seq, err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO decision_records(
-    decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
-    branch_ref, branch_generation, action_taken, user_message
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			nowSec, state.DecisionKindHandledExternalAfterBlock,
-			nullableString(action.Path),
-			nullableString("already_published_by_external_committer"),
-			sql.NullInt64{Int64: action.Seq, Valid: true},
-			nullableString(action.BaseHead),
-			nullableString(action.CommitOID),
-			nullableString(action.BranchRef),
-			sql.NullInt64{Int64: action.BranchGeneration, Valid: true},
-			nullableString("handled externally after block"),
-			nullableString(fmt.Sprintf("External commit cleared blocked replay for %s.", action.Path)),
-		); err != nil {
-			return 0, fmt.Errorf("acd fix: append decision for self-heal seq %d: %w", action.Seq, err)
-		}
-		return n, nil
 	case fixActionDropGeneratedPending:
 		return applyDropGeneratedPending(ctx, tx, action)
-	case fixActionRetargetStaleAnchor:
-		return applyRetargetStaleAnchorTx(ctx, tx, plan, nowSec)
-	case fixActionPurgeBarrierWithSuccessors:
-		// Delete one specific terminal replay barrier by seq (planner enumerates
-		// rows with pending successors). Tightly scoped to seq + terminal states
-		// so concurrent transitions cannot accidentally clobber an unrelated row.
-		res, err := tx.ExecContext(ctx, `
-DELETE FROM capture_events
-WHERE seq = ? AND state IN (?, ?)`,
-			action.Seq, state.EventStateBlockedConflict, state.EventStateFailed)
-		if err != nil {
-			return 0, fmt.Errorf("acd fix: purge terminal barrier seq %d: %w", action.Seq, err)
-		}
-		n, _ := res.RowsAffected()
-		if n > 0 {
-			// Clear publish_state breadcrumb if it pointed at this seq.
-			if _, err := tx.ExecContext(ctx, `
-UPDATE publish_state
-SET status = 'ok', error = NULL, updated_ts = ?
-WHERE id = 1
-  AND status = 'blocked_conflict'
-  AND event_seq = ?`, nowSec, action.Seq); err != nil {
-				return 0, fmt.Errorf("acd fix: clear publish_state for purged seq %d: %w", action.Seq, err)
-			}
-		}
-		return n, nil
 	default:
 		return 0, fmt.Errorf("acd fix: unknown action kind %q", action.Kind)
 	}
@@ -1079,11 +986,21 @@ func applyDropGeneratedPending(ctx context.Context, tx *sql.Tx, action fixAction
 		placeholders := placeholders(len(chunk))
 		args := int64Args(chunk)
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM planner_state WHERE event_seq IN (`+placeholders+`)`, args...); err != nil {
+			`DELETE FROM planner_state
+WHERE event_seq IN (`+placeholders+`)
+  AND EXISTS (
+      SELECT 1 FROM capture_events e
+      WHERE e.seq = planner_state.event_seq AND e.state = 'pending' AND e.operation = 'delete'
+  )`, args...); err != nil {
 			return 0, fmt.Errorf("acd fix: delete generated planner state for %s: %w", action.GeneratedRoot, err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM capture_ops WHERE event_seq IN (`+placeholders+`)`, args...); err != nil {
+			`DELETE FROM capture_ops
+WHERE event_seq IN (`+placeholders+`)
+  AND EXISTS (
+      SELECT 1 FROM capture_events e
+      WHERE e.seq = capture_ops.event_seq AND e.state = 'pending' AND e.operation = 'delete'
+  )`, args...); err != nil {
 			return 0, fmt.Errorf("acd fix: delete generated capture ops for %s: %w", action.GeneratedRoot, err)
 		}
 		eventArgs := append(int64Args(chunk), state.EventStatePending, "delete")
@@ -1128,10 +1045,6 @@ func int64Args(values []int64) []any {
 	return args
 }
 
-func nullableString(s string) sql.NullString {
-	return sql.NullString{String: s, Valid: s != ""}
-}
-
 func clearPublishBarrierIfSafe(ctx context.Context, tx *sql.Tx, nowSec float64) error {
 	var blocked int
 	if err := tx.QueryRowContext(ctx,
@@ -1158,252 +1071,6 @@ WHERE id = 1`, nowSec); err != nil {
 	return nil
 }
 
-// planResolveAlreadyLandedBarrier appends resolve_already_landed_barrier
-// actions for every blocked_conflict row whose self-heal predicate currently
-// holds. Predicate parity with the daemon-side probe is enforced by
-// scanAutoResolvableBlockedRows (internal/cli/recovery_probe.go).
-func planResolveAlreadyLandedBarrier(ctx context.Context, conn *sql.DB, repo, head, branchRef string, generation int64, plan *fixPlan) error {
-	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repo, head, branchRef, generation)
-	if err != nil {
-		return fmt.Errorf("acd fix: scan auto-resolvable blocked rows: %w", err)
-	}
-	for _, c := range candidates {
-		afterOID := ""
-		if len(c.Ops) > 0 && c.Ops[0].AfterOID.Valid {
-			afterOID = c.Ops[0].AfterOID.String
-		}
-		blobOID := ""
-		if len(c.Ops) > 0 {
-			if oid, err := git.LsTreeBlobOID(ctx, repo, c.HeadOID, c.Ops[0].Path); err == nil {
-				blobOID = oid
-			}
-		}
-		plan.Actions = append(plan.Actions, fixAction{
-			ID:               fmt.Sprintf("%s:%d", fixActionResolveAlreadyLandedBarrier, c.Seq),
-			Kind:             fixActionResolveAlreadyLandedBarrier,
-			Description:      "promote already-landed blocked barrier to published",
-			Reason:           "captured after-state matches HEAD; external committer landed the change",
-			Seq:              c.Seq,
-			Path:             c.Path,
-			CommitOID:        c.HeadOID,
-			BlobOID:          shortOID(blobOID, 12),
-			CapturedAfterOID: shortOID(afterOID, 12),
-			BranchRef:        c.BranchRef,
-			BranchGeneration: c.Generation,
-			BaseHead:         c.BaseHead,
-		})
-	}
-	return nil
-}
-
-// planRetargetStaleAnchor decides whether a retarget_stale_anchor action is
-// warranted. We mirror acd recover's gating: refuse on detached HEAD (already
-// recorded as plan.Unsafe at the start of buildFixPlan); otherwise plan the
-// retarget if there are pending/blocked rows on a stale (branch_ref,
-// generation) that no longer matches the live anchor, OR replay-pause meta
-// keys remain that the daemon never cleared.
-func planRetargetStaleAnchor(ctx context.Context, conn *sql.DB, repo, head, branchRef string, generation int64, plan *fixPlan) error {
-	if branchRef == "" {
-		return nil
-	}
-	// Two trigger conditions for retarget (either alone is enough):
-	//   1. capture_events rows in (pending, blocked_conflict) reference a
-	//      (branch_ref, branch_generation, base_head) tuple that no longer
-	//      matches the current attached anchor;
-	//   2. daemon_meta still carries stale replay/pause breadcrumbs the
-	//      daemon should have cleared on resume.
-	var staleRows int
-	if err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM capture_events
-WHERE state IN (?, ?)
-  AND (branch_ref <> ? OR branch_generation <> ? OR base_head <> ?)`,
-		state.EventStatePending, state.EventStateBlockedConflict,
-		branchRef, generation, head).Scan(&staleRows); err != nil {
-		return fmt.Errorf("acd fix: count stale anchor rows: %w", err)
-	}
-	hasStaleMeta := false
-	for _, key := range []string{
-		"last_replay_conflict",
-		"last_replay_conflict_legacy",
-		"last_replay_error",
-		"detached_head_paused",
-		"operation_in_progress",
-		daemon.MetaKeyReplayPausedUntil,
-	} {
-		if _, ok, err := metaLookup(ctx, conn, key); err != nil {
-			return fmt.Errorf("acd fix: read meta %s: %w", key, err)
-		} else if ok {
-			hasStaleMeta = true
-			break
-		}
-	}
-	if staleRows == 0 && !hasStaleMeta {
-		return nil
-	}
-	description := "retarget stale capture/shadow rows to current branch/generation/head and clear stale replay/pause meta"
-	plan.Actions = append(plan.Actions, fixAction{
-		ID:               fixActionRetargetStaleAnchor,
-		Kind:             fixActionRetargetStaleAnchor,
-		Description:      description,
-		Reason:           fmt.Sprintf("stale_rows=%d stale_meta=%v", staleRows, hasStaleMeta),
-		BranchRef:        branchRef,
-		BranchGeneration: generation,
-		BaseHead:         head,
-	})
-	return nil
-}
-
-// planPurgeBarrierWithSuccessors enumerates terminal replay barriers whose
-// (branch_ref, generation) still has pending successors. blocked_conflict
-// rows are scoped to the active anchor; failed rows are global because
-// status/list/diagnose count failed barriers globally. Only invoked when
-// --force is set on the planner inputs.
-func planPurgeBarrierWithSuccessors(ctx context.Context, conn *sql.DB, branchRef string, generation int64, plan *fixPlan) error {
-	rows, err := scanTerminalBarrierRowsWithSuccessors(ctx, conn, branchRef, generation)
-	if err != nil {
-		return fmt.Errorf("acd fix: scan barrier-with-successors rows: %w", err)
-	}
-	for _, r := range rows {
-		plan.Actions = append(plan.Actions, fixAction{
-			ID:               fmt.Sprintf("%s:%d", fixActionPurgeBarrierWithSuccessors, r.Seq),
-			Kind:             fixActionPurgeBarrierWithSuccessors,
-			Description:      "purge replay barrier with pending successors (destructive)",
-			Reason:           fmt.Sprintf("%s row still has pending successors on same (branch_ref, generation)", r.State),
-			Seq:              r.Seq,
-			Path:             r.Path,
-			BranchRef:        r.BranchRef,
-			BranchGeneration: r.Generation,
-			RequiresForce:    true,
-			State:            r.State,
-		})
-	}
-	return nil
-}
-
-// applyRetargetStaleAnchorTx ports the in-tx half of applyRecoverPlan into
-// acd fix. The mutations are deliberately identical so existing recover_test
-// fixtures still describe the contract. Live-index repair and the manual
-// pause marker reconciliation run AFTER tx.Commit in finalizeRetargetPostCommit
-// so slow FS/git ops never hold the SQLite write lock.
-func applyRetargetStaleAnchorTx(ctx context.Context, tx *sql.Tx, plan *fixPlan, nowSec float64) (int64, error) {
-	var rowsChanged int64
-	execTracked := func(q string, args ...any) error {
-		res, err := tx.ExecContext(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-		if n, rerr := res.RowsAffected(); rerr == nil {
-			rowsChanged += n
-		}
-		return nil
-	}
-
-	if err := execTracked(`UPDATE capture_events
-SET branch_ref = ?, branch_generation = ?, base_head = ?
-WHERE state IN (?, ?)`,
-		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead,
-		state.EventStatePending, state.EventStateBlockedConflict); err != nil {
-		return 0, fmt.Errorf("acd fix: retarget capture_events: %w", err)
-	}
-	if err := execTracked(`UPDATE capture_events
-SET state = ?, published_ts = NULL, error = NULL
-WHERE state = ?`,
-		state.EventStatePending, state.EventStateBlockedConflict); err != nil {
-		return 0, fmt.Errorf("acd fix: reset blocked events: %w", err)
-	}
-	if err := execTracked(`DELETE FROM shadow_paths
-WHERE rowid NOT IN (
-    SELECT keep_rowid FROM (
-        SELECT MAX(rowid) AS keep_rowid
-        FROM shadow_paths
-        GROUP BY path
-    )
-)`); err != nil {
-		return 0, fmt.Errorf("acd fix: dedupe shadow_paths: %w", err)
-	}
-	if err := execTracked(`UPDATE shadow_paths
-SET branch_ref = ?, branch_generation = ?, base_head = ?`,
-		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead); err != nil {
-		return 0, fmt.Errorf("acd fix: retarget shadow_paths: %w", err)
-	}
-	if err := execTracked(`UPDATE publish_state
-SET branch_ref = ?, branch_generation = ?, source_head = ?, status = 'idle', error = NULL`,
-		plan.CurrentBranchRef, plan.Generation, plan.CurrentHead); err != nil {
-		return 0, fmt.Errorf("acd fix: retarget publish_state: %w", err)
-	}
-	if err := execTracked(`UPDATE daemon_state
-SET branch_ref = ?, branch_generation = ?, mode = 'stopped', note = NULL`,
-		plan.CurrentBranchRef, plan.Generation); err != nil {
-		return 0, fmt.Errorf("acd fix: retarget daemon_state: %w", err)
-	}
-	for _, key := range []string{
-		"last_replay_conflict",
-		"last_replay_conflict_legacy",
-		"last_replay_error",
-		"detached_head_paused",
-		"operation_in_progress",
-		daemon.MetaKeyReplayPausedUntil,
-	} {
-		if err := execTracked(`DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
-			return 0, fmt.Errorf("acd fix: clear %s: %w", key, err)
-		}
-	}
-	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch_token', ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
-		"rev:"+plan.CurrentHead+" "+plan.CurrentBranchRef, nowSec); err != nil {
-		return 0, fmt.Errorf("acd fix: set branch token: %w", err)
-	}
-	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.generation', ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
-		fmt.Sprintf("%d", plan.Generation), nowSec); err != nil {
-		return 0, fmt.Errorf("acd fix: set branch generation: %w", err)
-	}
-	if err := execTracked(`INSERT INTO daemon_meta(key, value, updated_ts) VALUES('branch.head', ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
-		plan.CurrentHead, nowSec); err != nil {
-		return 0, fmt.Errorf("acd fix: set branch head: %w", err)
-	}
-	return rowsChanged, nil
-}
-
-// finalizeRetargetPostCommit runs the live-index repair pass and reconciles
-// the manual pause marker after the retarget tx commits. Failures here are
-// reported but the DB transaction has already landed, so we never re-open it.
-func finalizeRetargetPostCommit(ctx context.Context, db *state.DB, plan *fixPlan) error {
-	repaired, err := daemon.RepairPublishedLiveIndex(ctx, plan.Repo, db, plan.CurrentHead, daemon.DefaultLiveIndexRepairLimit)
-	if err != nil {
-		return fmt.Errorf("acd fix: repair live index: %w", err)
-	}
-	plan.LiveIndexCandidates = repaired.Candidates
-	plan.LiveIndexApplied = repaired.Applied
-	plan.LiveIndexSkipped = len(repaired.Skipped)
-
-	if plan.ManualPausePath == "" {
-		return nil
-	}
-	if _, err := os.Lstat(plan.ManualPausePath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("acd fix: stat manual pause marker after commit: %w", err)
-	}
-	if !plan.ClearPause {
-		plan.ManualMarkerPreserved = true
-		return nil
-	}
-	if err := os.Remove(plan.ManualPausePath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		plan.ManualMarkerRemoveError = err.Error()
-		return nil
-	}
-	plan.ManualMarkerRemoved = true
-	stampManualPauseResume(ctx, plan.GitDir)
-	return nil
-}
-
 func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -1411,7 +1078,9 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		return enc.Encode(plan)
 	}
 	mode := "planned"
-	if !plan.DryRun {
+	if plan.Incomplete {
+		mode = "incomplete"
+	} else if !plan.DryRun {
 		mode = "applied"
 	}
 	fmt.Fprintf(out, "Fix %s for %s\n", mode, plan.Repo)
@@ -1431,6 +1100,12 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 			if action.Kind == fixActionDropGeneratedPending {
 				target = fmt.Sprintf(" root=%s pending=%d tracked=%d seq=%d..%d",
 					action.GeneratedRoot, action.PendingCount, action.TrackedCount, action.OldestSeq, action.NewestSeq)
+			} else if action.Kind == fixActionReconcileUnpublishedChain {
+				target = fmt.Sprintf(" pair=%s/g%d seq=%d..%d",
+					action.BranchRef, action.BranchGeneration, action.OldestSeq, action.NewestSeq)
+				if action.ArchiveOnly {
+					target += " archive-only"
+				}
 			} else if action.Seq > 0 {
 				target = fmt.Sprintf(" seq=%d", action.Seq)
 			}
@@ -1474,30 +1149,10 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		if plan.ManualPauseRemoved {
 			fmt.Fprintf(out, "Manual pause marker removed: %s\n", plan.ManualPausePath)
 		}
-		switch {
-		case plan.ManualMarkerRemoved:
-			fmt.Fprintf(out, "Manual pause marker (retarget) removed: %s\n", plan.ManualPausePath)
-		case plan.ManualMarkerPreserved:
-			fmt.Fprintf(out, "Manual pause marker (retarget) preserved: %s (use --clear-pause to remove)\n", plan.ManualPausePath)
-		}
-		if plan.ManualMarkerRemoveError != "" {
-			fmt.Fprintf(out, "WARNING: manual pause marker remove failed after commit: %s\n", plan.ManualMarkerRemoveError)
-		}
-		if plan.LiveIndexCandidates > 0 || plan.LiveIndexApplied > 0 || plan.LiveIndexSkipped > 0 {
-			fmt.Fprintf(out, "Live index repair: candidates=%d applied=%d skipped=%d\n",
-				plan.LiveIndexCandidates, plan.LiveIndexApplied, plan.LiveIndexSkipped)
-		}
 	} else {
 		hint := "pass --yes to apply safe actions"
 		if plan.Force {
-			hint = "pass --yes to apply safe actions; combine --yes --force to also apply destructive purge"
-		} else {
-			for _, action := range plan.Actions {
-				if action.RequiresForce {
-					hint = "pass --yes to apply safe actions; rerun with --force to plan purge_barrier_with_successors"
-					break
-				}
-			}
+			hint = "pass --yes to apply archive-only recovery; captured work will be protected first"
 		}
 		fmt.Fprintf(out, "(dry-run; %s)\n", hint)
 	}

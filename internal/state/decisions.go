@@ -30,6 +30,12 @@ const (
 	DecisionKindIntentPlannerError        = "intent_planner_error"
 	DecisionKindMessageQualityRewrite     = "message_quality_rewrite"
 	DecisionKindMessageQualityFallback    = "message_quality_fallback"
+	// DecisionKindRecoveryPublished records one member of an unpublished chain
+	// whose composed final state was proven at an external commit.
+	DecisionKindRecoveryPublished = "recovery_published"
+	// DecisionKindRecoveryArchived records one member of an unpublished chain
+	// made reachable through a hidden recovery ref before replay was unblocked.
+	DecisionKindRecoveryArchived = "recovery_archived"
 )
 
 const (
@@ -64,8 +70,23 @@ type DecisionCommitGroup struct {
 	Count     int
 }
 
+type decisionExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 // AppendDecision inserts a decision row and returns its monotonic cursor ID.
 func AppendDecision(ctx context.Context, d *DB, rec DecisionRecord) (int64, error) {
+	if d == nil {
+		return 0, fmt.Errorf("state: AppendDecision: nil db")
+	}
+	return appendDecision(ctx, d.conn, rec)
+}
+
+// appendDecision is the transaction-capable form used when a decision must
+// commit atomically with another state transition. Keeping the INSERT shape in
+// one helper prevents the normal replay path and recovery transactions from
+// drifting as decision_records evolves.
+func appendDecision(ctx context.Context, execer decisionExecer, rec DecisionRecord) (int64, error) {
 	if rec.Kind == "" {
 		return 0, fmt.Errorf("state: AppendDecision: empty kind")
 	}
@@ -77,7 +98,7 @@ INSERT INTO decision_records(
     decision_ts, kind, path, reason, event_seq, head_sha, commit_oid,
     branch_ref, branch_generation, action_taken, user_message
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	res, err := d.conn.ExecContext(ctx, q,
+	res, err := execer.ExecContext(ctx, q,
 		rec.DecisionTS, rec.Kind, rec.Path, rec.Reason, rec.EventSeq, rec.HeadSHA,
 		rec.CommitOID, rec.BranchRef, rec.BranchGeneration, rec.ActionTaken, rec.UserMessage,
 	)

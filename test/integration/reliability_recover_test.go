@@ -20,7 +20,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestRecoverReplaysIncidentFixture(t *testing.T) {
+func TestFixArchivesIncidentFixtureWithoutRetargeting(t *testing.T) {
 	buildAcdBinary(t)
 
 	repo := tempRepo(t)
@@ -90,39 +90,77 @@ VALUES (last_insert_rowid(), 0, 'create', 'recover.txt', '%s', '100644', 'exact'
 		t.Fatalf("inject incident fixture: %v\n%s", err, out)
 	}
 
-	dry := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--dry-run", "--json")
+	refsBefore := recoveryRefList(t, repo)
+	dry := runAcd(t, ctx, env, "fix", "--repo", repo, "--dry-run", "--json")
 	if dry.ExitCode != 0 {
-		t.Fatalf("acd recover dry-run exit=%d\nstdout=%s\nstderr=%s", dry.ExitCode, dry.Stdout, dry.Stderr)
+		t.Fatalf("acd fix dry-run exit=%d\nstdout=%s\nstderr=%s", dry.ExitCode, dry.Stdout, dry.Stderr)
 	}
 	if state := sqliteScalar(t, dbPath, "SELECT state FROM capture_events WHERE path = 'recover.txt'"); state != "blocked_conflict" {
 		t.Fatalf("dry-run mutated event state=%q", state)
 	}
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots"); got != "0" {
+		t.Fatalf("dry-run created recovery snapshots=%s", got)
+	}
+	if refsAfter := recoveryRefList(t, repo); refsAfter != refsBefore {
+		t.Fatalf("dry-run mutated recovery refs:\nbefore=%s\nafter=%s", refsBefore, refsAfter)
+	}
 
-	applied := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--yes", "--json")
+	applied := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
 	if applied.ExitCode != 0 {
-		t.Fatalf("acd recover apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
+		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}
-	var payload struct {
-		BackupPath string `json:"backup_path"`
-	}
+	var payload reliabilityFixPlan
 	if err := json.Unmarshal([]byte(applied.Stdout), &payload); err != nil {
-		t.Fatalf("decode recover output: %v\n%s", err, applied.Stdout)
+		t.Fatalf("decode fix output: %v\n%s", err, applied.Stdout)
 	}
 	if payload.BackupPath == "" {
-		t.Fatalf("recover output missing backup path: %s", applied.Stdout)
+		t.Fatalf("fix output missing backup path: %s", applied.Stdout)
 	}
 	if _, err := os.Stat(payload.BackupPath); err != nil {
 		t.Fatalf("backup missing: %v", err)
 	}
-	if got := sqliteScalar(t, dbPath, "SELECT branch_ref || '|' || state FROM capture_events WHERE path = 'recover.txt'"); got != "refs/heads/main|pending" {
-		t.Fatalf("event after recover=%q want refs/heads/main|pending", got)
+	if len(payload.Actions) != 1 {
+		t.Fatalf("fix actions=%d want 1\n%s", len(payload.Actions), applied.Stdout)
 	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM daemon_meta WHERE key = 'last_replay_conflict'"); got != "0" {
-		t.Fatalf("last_replay_conflict rows=%s want 0", got)
+	action := payload.Actions[0]
+	if action.Kind != "reconcile_unpublished_chain" || !action.Applied ||
+		action.State != "recovered" || action.RowsChanged != 1 ||
+		!strings.HasPrefix(action.RecoveryRef, "refs/acd/recovery/") ||
+		!strings.HasSuffix(action.RecoveryRef, "/archive") {
+		t.Fatalf("unexpected recovery action=%+v\n%s", action, applied.Stdout)
+	}
+	if got := sqliteScalar(t, dbPath, "SELECT branch_ref || '|' || branch_generation || '|' || state FROM capture_events WHERE path = 'recover.txt'"); got != "refs/heads/stale|3|recovered" {
+		t.Fatalf("event after fix=%q want refs/heads/stale|3|recovered", got)
+	}
+	seq := sqliteScalar(t, dbPath, "SELECT seq FROM capture_events WHERE path = 'recover.txt'")
+	snapshotID := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT snapshot_id FROM recovery_snapshot_events WHERE event_seq = %s", seq))
+	if snapshotID == "" {
+		t.Fatal("recovered event has no protected snapshot membership")
+	}
+	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
+SELECT outcome || '|' || event_count || '|' || first_event_seq || '|' || last_event_seq || '|' || recovery_ref
+FROM recovery_snapshots WHERE id = %s`, snapshotID)); got !=
+		fmt.Sprintf("recovered|1|%s|%s|%s", seq, seq, action.RecoveryRef) {
+		t.Fatalf("recovery snapshot=%q", got)
+	}
+	recoveryCommit := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT commit_oid FROM recovery_snapshots WHERE id = %s", snapshotID))
+	if got := strings.TrimSpace(runGitOK(t, repo, "show-ref", "--hash", "--verify", action.RecoveryRef)); got != recoveryCommit {
+		t.Fatalf("recovery ref resolves to %q want %q", got, recoveryCommit)
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", action.RecoveryRef+":recover.txt")); got != afterOID {
+		t.Fatalf("archived recover.txt oid=%s want %s", got, afterOID)
+	}
+	// The fixture intentionally has no matching publish_state breadcrumb. Exact
+	// recovery must not erase unrelated diagnostic metadata merely because its
+	// text mentions the recovered seq.
+	if got := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'last_replay_conflict'"); got != `{"seq":1,"error_class":"cas_fail"}` {
+		t.Fatalf("unrelated last_replay_conflict changed=%q", got)
 	}
 }
 
-func TestRecoverRepairsPublishedStaleLiveIndex(t *testing.T) {
+func TestFixLeavesPublishedStaleLiveIndexUntouched(t *testing.T) {
 	buildAcdBinary(t)
 
 	repo := tempRepo(t)
@@ -178,6 +216,7 @@ func TestRecoverRepairsPublishedStaleLiveIndex(t *testing.T) {
 	if !strings.Contains(status, "D  legacy.txt") || !strings.Contains(status, "?? legacy.txt") {
 		t.Fatalf("test did not create stale live-index shape:\n%s", status)
 	}
+	statusBefore := status
 
 	now := nowFloatSeconds()
 	inject := fmt.Sprintf(`
@@ -192,20 +231,38 @@ VALUES (last_insert_rowid(), 0, 'create', 'legacy.txt', '%s', '100644', 'exact')
 		t.Fatalf("inject published fixture: %v\n%s", err, out)
 	}
 
-	applied := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--yes", "--json")
+	applied := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
 	if applied.ExitCode != 0 {
-		t.Fatalf("acd recover apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
+		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}
-	var payload struct {
-		LiveIndexApplied int `json:"live_index_applied"`
-	}
+	var payload reliabilityFixPlan
 	if err := json.Unmarshal([]byte(applied.Stdout), &payload); err != nil {
-		t.Fatalf("decode recover output: %v\n%s", err, applied.Stdout)
+		t.Fatalf("decode fix output: %v\n%s", err, applied.Stdout)
 	}
-	if payload.LiveIndexApplied != 1 {
-		t.Fatalf("live_index_applied=%d want 1\n%s", payload.LiveIndexApplied, applied.Stdout)
+	if len(payload.Actions) != 0 || payload.RowsChanged != 0 || payload.BackupPath != "" {
+		t.Fatalf("published-only fixture should need no fix actions: %+v\n%s", payload, applied.Stdout)
 	}
-	if status := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); status != "" {
-		t.Fatalf("status after live-index repair not clean:\n%s", status)
+	if statusAfter := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); statusAfter != statusBefore {
+		t.Fatalf("fix mutated the user's stale live index:\nbefore:\n%s\nafter:\n%s", statusBefore, statusAfter)
 	}
+	if got := sqliteScalar(t, dbPath, "SELECT state || '|' || commit_oid FROM capture_events WHERE path = 'legacy.txt'"); got != "published|"+publishedHead {
+		t.Fatalf("published event changed=%q", got)
+	}
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots"); got != "0" {
+		t.Fatalf("published-only fixture created recovery snapshots=%s", got)
+	}
+}
+
+type reliabilityFixPlan struct {
+	BackupPath  string                 `json:"backup_path"`
+	RowsChanged int64                  `json:"rows_changed"`
+	Actions     []reliabilityFixAction `json:"actions"`
+}
+
+type reliabilityFixAction struct {
+	Kind        string `json:"kind"`
+	Applied     bool   `json:"applied"`
+	RowsChanged int64  `json:"rows_changed"`
+	State       string `json:"state"`
+	RecoveryRef string `json:"recovery_ref"`
 }

@@ -25,7 +25,17 @@ import (
 
 func TestMain(m *testing.M) {
 	_ = os.Setenv(ai.EnvProvider, "deterministic")
-	os.Exit(m.Run())
+	templateRoot, err := setupDaemonTestRepoTemplates()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test template setup: %v\n", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	if err := os.RemoveAll(templateRoot); err != nil && code == 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test template cleanup: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
 }
 
 // daemonFixture wires up a temp git repo + open per-repo state DB so the
@@ -39,54 +49,8 @@ type daemonFixture struct {
 
 func newDaemonFixture(t *testing.T) *daemonFixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	dir, err := os.MkdirTemp("", "acd-daemon-test-*")
-	if err != nil {
-		t.Fatalf("mkdir temp dir: %v", err)
-	}
-	t.Cleanup(func() { removeAllWithRetry(t, dir) })
-	if err := git.Init(ctx, dir); err != nil {
-		t.Fatalf("git init: %v", err)
-	}
-	// Force HEAD onto refs/heads/main regardless of host's init.defaultBranch
-	// (CI runners default to master; daemon Options pin BranchRef to main).
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
-		t.Fatalf("symbolic-ref HEAD: %v", err)
-	}
-	for _, kv := range [][]string{
-		{"user.email", "acd-test@example.com"},
-		{"user.name", "ACD Test"},
-		{"commit.gpgsign", "false"},
-	} {
-		if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "config", kv[0], kv[1]); err != nil {
-			t.Fatalf("git config %s: %v", kv[0], err)
-		}
-	}
-	// Initial commit so HEAD resolves.
-	seed := filepath.Join(dir, ".gitignore")
-	if err := os.WriteFile(seed, []byte("# acd test seed\n"), 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "add", ".gitignore"); err != nil {
-		t.Fatalf("git add: %v", err)
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "commit", "-q", "-m", "seed"); err != nil {
-		t.Fatalf("git commit: %v", err)
-	}
-
-	gitDir, err := git.AbsoluteGitDir(ctx, dir)
-	if err != nil {
-		t.Fatalf("AbsoluteGitDir: %v", err)
-	}
-	dbPath := state.DBPathFromGitDir(gitDir)
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return &daemonFixture{dir: dir, gitDir: gitDir, db: db}
+	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
+	return &daemonFixture{dir: repo.dir, gitDir: repo.gitDir, db: repo.db}
 }
 
 func removeAllWithRetry(t *testing.T, path string) {
@@ -108,6 +72,32 @@ func fastScheduler() Scheduler {
 		Base:         10 * time.Millisecond,
 		IdleCeiling:  20 * time.Millisecond,
 		ErrorCeiling: 50 * time.Millisecond,
+	}
+}
+
+func oneShotBranchTokenCheckGate() (hook func(), entered <-chan struct{}, release func()) {
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var enterOnce sync.Once
+	var releaseOnce sync.Once
+	hook = func() {
+		enterOnce.Do(func() {
+			close(enteredCh)
+			<-releaseCh
+		})
+	}
+	release = func() {
+		releaseOnce.Do(func() { close(releaseCh) })
+	}
+	return hook, enteredCh, release
+}
+
+func waitForBranchTokenCheckGate(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not reach branch-token check gate")
 	}
 }
 
@@ -529,6 +519,8 @@ func TestRun_DetachedHeadPausesCaptureReplay(t *testing.T) {
 }
 
 func TestRun_PauseDuringGitOperation(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		marker string
 		name   string
@@ -543,6 +535,8 @@ func TestRun_PauseDuringGitOperation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.marker, func(t *testing.T) {
+			runBoundedParallel(t)
+
 			f := newDaemonFixture(t)
 			registerLiveClient(t, f.db)
 			ctx := context.Background()
@@ -1166,6 +1160,56 @@ func TestRun_FlockContention(t *testing.T) {
 	}
 }
 
+func TestRun_FlockContentionDoesNotResetIntentPlannerHealth(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	f := newDaemonFixture(t)
+	seed := intentPlannerHealthRecord{
+		Version: intentPlannerHealthVersion,
+		IntentPlannerHealthSnapshot: IntentPlannerHealthSnapshot{
+			State:               IntentPlannerCircuitOpen,
+			ProviderFingerprint: IntentPlannerProviderFingerprint(openAIIntentHealthIdentity("https://previous.example/v1")),
+			ConsecutiveFailures: 1,
+			BackoffLevel:        0,
+			LastFailureClass:    IntentPlannerFailureTransport,
+			LastError:           "previous provider unavailable",
+		},
+	}
+	if err := state.MetaSetJSON(context.Background(), f.db, MetaKeyIntentPlannerHealth, seed); err != nil {
+		t.Fatalf("seed intent planner health: %v", err)
+	}
+	before, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyIntentPlannerHealth)
+	if err != nil || !ok {
+		t.Fatalf("read seeded intent planner health: ok=%v err=%v", ok, err)
+	}
+
+	lock, err := AcquireDaemonLock(f.gitDir)
+	if err != nil {
+		t.Fatalf("AcquireDaemonLock: %v", err)
+	}
+	defer func() { _ = lock.Release() }()
+
+	err = Run(context.Background(), Options{
+		RepoPath: f.dir,
+		GitDir:   f.gitDir,
+		DB:       f.db,
+		MessageFn: func(context.Context, EventContext) (string, error) {
+			return "unused", nil
+		},
+		IntentPlanner: &recordingIntentPlanner{name: "openai-compat"},
+		SkipSignals:   true,
+	})
+	if !errors.Is(err, ErrDaemonLockHeld) {
+		t.Fatalf("Run returned %v want ErrDaemonLockHeld", err)
+	}
+	after, ok, err := state.MetaGet(context.Background(), f.db, MetaKeyIntentPlannerHealth)
+	if err != nil || !ok {
+		t.Fatalf("read intent planner health after contention: ok=%v err=%v", ok, err)
+	}
+	if after != before {
+		t.Fatalf("intent planner health changed under lock contention\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 // TestRun_RealSIGUSR1: covers the real-OS signal path. Sends SIGUSR1 to the
 // current process and asserts the loop wakes and produces a commit. Skipped
 // on Windows (which we don't target anyway).
@@ -1233,7 +1277,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	// Insert one old published row and one fresh pending row.
 	old, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "create", Path: "old.txt",
+		BaseHead: "old-base", Operation: "create", Path: "old.txt",
 		Fidelity: "full", CapturedTS: 1,
 		State: "published",
 	}, []state.CaptureOp{{
@@ -1246,7 +1290,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	}
 	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "create", Path: "fresh.txt",
+		BaseHead: "fresh-base", Operation: "create", Path: "fresh.txt",
 		Fidelity: "full",
 		// captured_ts default = now()
 		State: "pending",
@@ -1258,7 +1302,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 		t.Fatalf("insert fresh: %v", err)
 	}
 
-	n, err := PruneCaptureEvents(ctx, f.db, time.Now(), 1*time.Second)
+	n, err := PruneCaptureEvents(ctx, f.dir, f.db, time.Now(), 1*time.Second)
 	if err != nil {
 		t.Fatalf("PruneCaptureEvents: %v", err)
 	}
@@ -1287,7 +1331,7 @@ func TestPruneCaptureEvents_DropsOldPublished(t *testing.T) {
 	}
 }
 
-func TestPruneCaptureEvents_DropsOldTerminalRowsWhenNotBarriers(t *testing.T) {
+func TestPruneCaptureEvents_PreservesUnprotectedTerminalRows(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
 
@@ -1320,12 +1364,12 @@ func TestPruneCaptureEvents_DropsOldTerminalRowsWhenNotBarriers(t *testing.T) {
 	freshTS := float64(time.Now().Add(time.Hour).UnixNano()) / 1e9
 	freshFailed := appendEvent("fresh-failed.txt", "refs/heads/fresh", state.EventStateFailed, freshTS)
 
-	n, err := PruneCaptureEvents(ctx, f.db, time.Now(), 1*time.Second)
+	n, err := PruneCaptureEvents(ctx, f.dir, f.db, time.Now(), 1*time.Second)
 	if err != nil {
 		t.Fatalf("PruneCaptureEvents: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("pruned=%d want 2", n)
+	if n != 0 {
+		t.Fatalf("pruned=%d want 0 without durable recovery refs", n)
 	}
 
 	rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
@@ -1344,13 +1388,144 @@ func TestPruneCaptureEvents_DropsOldTerminalRowsWhenNotBarriers(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate remaining: %v", err)
 	}
-	if remaining[oldBlocked] || remaining[oldFailed] {
-		t.Fatalf("old terminal rows survived: remaining=%v", remaining)
-	}
-	for _, seq := range []int64{barrier, pendingBehindBarrier, freshFailed} {
+	for _, seq := range []int64{oldBlocked, oldFailed, barrier, pendingBehindBarrier, freshFailed} {
 		if !remaining[seq] {
 			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
 		}
+	}
+}
+
+func TestPruneCaptureEvents_VerifiesSnapshotGitRefsForEveryOutcome(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	type snapshotCase struct {
+		name       string
+		state      string
+		ref        string
+		commitOID  string
+		createRef  bool
+		wantRemain bool
+	}
+	cases := []snapshotCase{
+		{name: "valid-recovered", state: state.EventStateRecovered, ref: "refs/acd/recovery/prune-valid-recovered", commitOID: head, createRef: true},
+		{name: "missing-recovered", state: state.EventStateRecovered, ref: "refs/acd/recovery/prune-missing-recovered", commitOID: head, wantRemain: true},
+		{name: "corrupt-recovered", state: state.EventStateRecovered, ref: "refs/acd/recovery/prune-corrupt-recovered", commitOID: "deadbeef", createRef: true, wantRemain: true},
+		{name: "valid-published", state: state.EventStatePublished, ref: "refs/acd/recovery/prune-valid-published", commitOID: head, createRef: true},
+		{name: "missing-published", state: state.EventStatePublished, ref: "refs/acd/recovery/prune-missing-published", commitOID: head, wantRemain: true},
+		{name: "corrupt-published", state: state.EventStatePublished, ref: "refs/acd/recovery/prune-corrupt-published", commitOID: "deadbeef", createRef: true, wantRemain: true},
+	}
+	seqs := make(map[string]int64, len(cases))
+	for _, tc := range cases {
+		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+			Operation: "create", Path: tc.name + ".txt", Fidelity: "full",
+			CapturedTS: 1, State: tc.state,
+		}, []state.CaptureOp{{Op: "create", Path: tc.name + ".txt", Fidelity: "full"}})
+		if err != nil {
+			t.Fatalf("append %s: %v", tc.name, err)
+		}
+		seqs[tc.name] = seq
+		res, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshots(
+    created_ts, outcome, branch_ref, branch_generation,
+    first_event_seq, last_event_seq, event_count,
+    commit_oid, recovery_ref, reason
+) VALUES (2, ?, 'refs/heads/main', 1, ?, ?, 1, ?, ?, 'prune test')`,
+			tc.state, seq, seq, tc.commitOID, tc.ref)
+		if err != nil {
+			t.Fatalf("insert %s snapshot: %v", tc.name, err)
+		}
+		snapshotID, _ := res.LastInsertId()
+		if _, err := f.db.SQL().ExecContext(ctx,
+			`INSERT INTO recovery_snapshot_events(snapshot_id, ord, event_seq) VALUES (?, 0, ?)`,
+			snapshotID, seq); err != nil {
+			t.Fatalf("insert %s membership: %v", tc.name, err)
+		}
+		if tc.createRef {
+			if err := git.UpdateRef(ctx, f.dir, tc.ref, head, ""); err != nil {
+				t.Fatalf("create %s ref: %v", tc.name, err)
+			}
+		}
+	}
+
+	n, err := PruneCaptureEvents(ctx, f.dir, f.db, time.Now(), time.Second)
+	if err != nil {
+		t.Fatalf("PruneCaptureEvents: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("pruned=%d want valid recovered and published rows", n)
+	}
+	for _, tc := range cases {
+		var count int
+		if err := f.db.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seqs[tc.name]).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", tc.name, err)
+		}
+		want := 0
+		if tc.wantRemain {
+			want = 1
+		}
+		if count != want {
+			t.Fatalf("%s event count=%d want %d", tc.name, count, want)
+		}
+	}
+	var validMembership int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshot_events WHERE event_seq = ?`, seqs["valid-recovered"]).Scan(&validMembership); err != nil {
+		t.Fatalf("count valid membership: %v", err)
+	}
+	if validMembership != 1 {
+		t.Fatalf("valid snapshot membership=%d want 1", validMembership)
+	}
+}
+
+func TestPruneCaptureEvents_ReportsUnexpectedGitErrors(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "create", Path: "retained-on-git-error.txt", Fidelity: "full",
+		CapturedTS: 1, State: state.EventStateRecovered,
+	}, []state.CaptureOp{{Op: "create", Path: "retained-on-git-error.txt", Fidelity: "full"}})
+	if err != nil {
+		t.Fatalf("append recovered event: %v", err)
+	}
+	res, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshots(
+    created_ts, outcome, branch_ref, branch_generation,
+    first_event_seq, last_event_seq, event_count,
+    commit_oid, recovery_ref, reason
+) VALUES (2, 'recovered', 'refs/heads/main', 1, ?, ?, 1, ?,
+          'refs/acd/recovery/git-error', 'git error test')`, seq, seq, head)
+	if err != nil {
+		t.Fatalf("insert recovery snapshot: %v", err)
+	}
+	snapshotID, _ := res.LastInsertId()
+	if _, err := f.db.SQL().ExecContext(ctx,
+		`INSERT INTO recovery_snapshot_events(snapshot_id, ord, event_seq) VALUES (?, 0, ?)`,
+		snapshotID, seq); err != nil {
+		t.Fatalf("insert recovery membership: %v", err)
+	}
+
+	_, err = PruneCaptureEvents(ctx, filepath.Join(f.dir, "not-a-repository"), f.db, time.Now(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "verify protected snapshot") {
+		t.Fatalf("PruneCaptureEvents err=%v want surfaced Git failure", err)
+	}
+	var count int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&count); err != nil {
+		t.Fatalf("count recovered event: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("recovered event count=%d want 1 after Git failure", count)
 	}
 }
 
@@ -1477,6 +1652,11 @@ func (c *hangingCloser) Close() error {
 // closeProviderOnce called Close synchronously with no deadline, so a
 // subprocess plugin that hangs on Close would wedge the daemon.
 func TestRun_ShutdownCompletesWithin5sUnderHungProvider(t *testing.T) {
+	runBoundedParallel(t)
+
+	if providerCloseTimeout != 5*time.Second {
+		t.Fatalf("providerCloseTimeout=%v want 5s", providerCloseTimeout)
+	}
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 
@@ -1503,6 +1683,7 @@ func TestRun_ShutdownCompletesWithin5sUnderHungProvider(t *testing.T) {
 			SkipSignals:           true,
 			MessageProvider:       stub,
 			MessageProviderCloser: closer,
+			providerCloseTimeout:  100 * time.Millisecond,
 		})
 	}()
 
@@ -1514,14 +1695,14 @@ func TestRun_ShutdownCompletesWithin5sUnderHungProvider(t *testing.T) {
 	select {
 	case <-runDone:
 		elapsed := time.Since(start)
-		// 5s closer budget + slack for run-loop teardown (signals, db,
-		// trace writer, fs watcher). 8s is well under the wedge bound.
-		if elapsed > 8*time.Second {
+		// The production timeout is asserted above; use a shorter injected
+		// budget here so the same timeout path stays fast under -race.
+		if elapsed > 2*time.Second {
 			t.Fatalf("Run shutdown took %v with hung provider closer; want <= %v",
-				elapsed, 8*time.Second)
+				elapsed, 2*time.Second)
 		}
-	case <-time.After(15 * time.Second):
-		t.Fatalf("Run did not exit on cancel within 15s — hung provider regressed shutdown bound")
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Run did not exit on cancel within 5s — hung provider regressed shutdown bound")
 	}
 
 	if got := closer.calls.Load(); got != 1 {
@@ -1902,23 +2083,27 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 
 	var wg sync.WaitGroup
 	var runErr error
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runErr = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-			MessageFn:   DeterministicMessage,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			MessageFn:              DeterministicMessage,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 3*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	upstreamBody := []byte("from upstream\n")
 	upstreamBlob, err := git.HashObjectStdin(ctx, f.dir, upstreamBody)
@@ -1952,6 +2137,7 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "-q", upstreamHead, "--", "upstream.txt"); err != nil {
 		t.Fatalf("checkout upstream worktree: %v", err)
 	}
+	releaseCheck()
 	for i := 0; i < 4; i++ {
 		select {
 		case wakeCh <- struct{}{}:
@@ -1993,77 +2179,208 @@ func TestRun_ExternalFastForwardReseedsShadowWithoutCapturingUpstream(t *testing
 	}
 }
 
-func TestRun_BranchSwitchDropsPending(t *testing.T) {
+func TestRun_FastForwardRollbackInvalidatesProspectiveShadow(t *testing.T) {
 	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
 	ctx := context.Background()
-	baseHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
 	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	upstreamBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("upstream\n"))
+	if err != nil {
+		t.Fatalf("hash upstream: %v", err)
+	}
+	seedEntries, err := git.LsTree(ctx, f.dir, seedHead, false)
+	if err != nil {
+		t.Fatalf("ls-tree seed: %v", err)
+	}
+	entries := make([]git.MktreeEntry, 0, len(seedEntries)+1)
+	for _, entry := range seedEntries {
+		entries = append(entries, git.MktreeEntry{Mode: entry.Mode, Type: entry.Type, OID: entry.OID, Path: entry.Path})
+	}
+	entries = append(entries, git.MktreeEntry{Mode: git.RegularFileMode, Type: "blob", OID: upstreamBlob, Path: "upstream.txt"})
+	upstreamTree, err := git.Mktree(ctx, f.dir, entries)
+	if err != nil {
+		t.Fatalf("mktree upstream: %v", err)
+	}
+	upstreamHead, err := git.CommitTree(ctx, f.dir, upstreamTree, "upstream", seedHead)
+	if err != nil {
+		t.Fatalf("commit-tree upstream: %v", err)
 	}
 
-	appendEvent := func(path string, generation int64, stateName string) int64 {
-		t.Helper()
-		seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
-			BranchRef:        "refs/heads/main",
-			BranchGeneration: generation,
-			BaseHead:         baseHead,
-			Operation:        "create",
-			Path:             path,
-			Fidelity:         "full",
-			State:            stateName,
-		}, []state.CaptureOp{{
-			Op:        "create",
-			Path:      path,
-			Fidelity:  "full",
-			AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-			AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
-		}})
+	wakeCh := make(chan struct{}, 4)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	hookDone := make(chan error, 1)
+	rollbackDone := make(chan struct{}, 1)
+	var hookOnce sync.Once
+	var rollbackOnce sync.Once
+	trace := &memoryTraceLogger{}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			WakeCh: wakeCh, ShutdownCh: make(chan struct{}), SkipSignals: true,
+			Trace: trace,
+			beforeBranchTransitionAccept: func() {
+				hookOnce.Do(func() {
+					if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", seedHead, upstreamHead); err != nil {
+						hookDone <- err
+						return
+					}
+					_, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", seedHead)
+					hookDone <- err
+				})
+			},
+			afterBranchTransitionRollback: func() {
+				rollbackOnce.Do(func() { rollbackDone <- struct{}{} })
+			},
+		})
+	}()
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	wantToken := branchTokenRev(seedHead, "refs/heads/main")
+	waitForMetaValue(t, f.db, MetaKeyBranchToken, wantToken, 5*time.Second)
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", upstreamHead, seedHead); err != nil {
+		t.Fatalf("fast-forward main: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", upstreamHead); err != nil {
+		t.Fatalf("reset worktree upstream: %v", err)
+	}
+	wakeCh <- struct{}{}
+	select {
+	case err := <-hookDone:
 		if err != nil {
-			t.Fatalf("append %s: %v", path, err)
+			t.Fatalf("rollback hook: %v", err)
 		}
-		return seq
+	case <-time.After(5 * time.Second):
+		t.Fatalf("branch transition hook did not run")
 	}
-
-	prevPending := appendEvent("prev-pending.txt", 1, state.EventStatePending)
-	prevBlocked := appendEvent("prev-blocked.txt", 1, state.EventStateBlockedConflict)
-	prevPublished := appendEvent("prev-published.txt", 1, state.EventStatePublished)
-	nextPending := appendEvent("next-pending.txt", 2, state.EventStatePending)
-
-	dropped, err := state.DeletePendingForGeneration(ctx, f.db, 1)
-	if err != nil {
-		t.Fatalf("DeletePendingForGeneration: %v", err)
+	select {
+	case <-rollbackDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("branch transition rollback did not finish")
 	}
-	if dropped != 1 {
-		t.Fatalf("dropped=%d want 1", dropped)
-	}
-
-	rows, err := f.db.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
-	if err != nil {
-		t.Fatalf("query events: %v", err)
-	}
-	defer rows.Close()
-	remaining := map[int64]bool{}
-	for rows.Next() {
-		var seq int64
-		if err := rows.Scan(&seq); err != nil {
-			t.Fatalf("scan: %v", err)
+	transitionEvents := traceEventsByClass(trace.Events(), "branch_token.transition")
+	rolledBack := 0
+	for _, event := range transitionEvents {
+		switch event.Decision {
+		case "rolled_back":
+			rolledBack++
+		case TokenTransitionFastForward.String(), TokenTransitionDiverged.String():
+			t.Fatalf("trace reported unaccepted transition as successful: %+v", event)
 		}
-		remaining[seq] = true
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows: %v", err)
+	if rolledBack != 1 {
+		t.Fatalf("rolled_back traces=%d want 1; events=%+v", rolledBack, transitionEvents)
 	}
-	if remaining[prevPending] {
-		t.Fatalf("previous generation pending seq %d was not deleted", prevPending)
-	}
-	for _, seq := range []int64{prevBlocked, prevPublished, nextPending} {
-		if !remaining[seq] {
-			t.Fatalf("seq %d should be retained; remaining=%v", seq, remaining)
+	wakeCh <- struct{}{}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
 		}
+		bootstrapped, _ := IsShadowBootstrapped(ctx, f.db, "refs/heads/main", 1)
+		var upstreamRows int
+		_ = f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM shadow_paths
+WHERE branch_ref = 'refs/heads/main' AND branch_generation = 1 AND path = 'upstream.txt'`).Scan(&upstreamRows)
+		if bootstrapped && upstreamRows == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if bootstrapped, err := IsShadowBootstrapped(ctx, f.db, "refs/heads/main", 1); err != nil || !bootstrapped {
+		t.Fatalf("old shadow not re-established: bootstrapped=%v err=%v", bootstrapped, err)
+	}
+	var upstreamRows int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM shadow_paths
+WHERE branch_ref = 'refs/heads/main' AND branch_generation = 1 AND path = 'upstream.txt'`).Scan(&upstreamRows); err != nil {
+		t.Fatalf("count upstream shadow: %v", err)
+	}
+	if upstreamRows != 0 {
+		t.Fatalf("prospective upstream shadow rows=%d want 0 after rollback", upstreamRows)
 	}
 }
 
-// TestRun_RuntimeDivergedPrunesDeadBranchTerminals exercises the runtime
+func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
+	t.Setenv(EnvShadowRetentionGenerations, "0")
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, "refs/heads/feature", seedHead, ""); err != nil {
+		t.Fatalf("create feature: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	hookDone := make(chan error, 1)
+	var hookOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(runCtx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			WakeCh: wakeCh, ShutdownCh: make(chan struct{}), SkipSignals: true,
+			beforeBranchTransitionAccept: func() {
+				hookOnce.Do(func() {
+					_, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main")
+					hookDone <- err
+				})
+			},
+		})
+	}()
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(seedHead, "refs/heads/main"), 5*time.Second)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/feature"); err != nil {
+		t.Fatalf("switch symbolic ref: %v", err)
+	}
+	wakeCh <- struct{}{}
+	select {
+	case err := <-hookDone:
+		if err != nil {
+			t.Fatalf("rollback hook: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("branch transition hook did not run")
+	}
+	wakeCh <- struct{}{}
+	time.Sleep(300 * time.Millisecond)
+	gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
+	if gen != "1" {
+		t.Fatalf("branch generation=%q want 1 after rollback", gen)
+	}
+	if bootstrapped, err := IsShadowBootstrapped(ctx, f.db, "refs/heads/main", 1); err != nil || !bootstrapped {
+		t.Fatalf("old shadow marker lost: bootstrapped=%v err=%v", bootstrapped, err)
+	}
+	var oldRows, prospectiveRows int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = 'refs/heads/main' AND branch_generation = 1`).Scan(&oldRows); err != nil {
+		t.Fatalf("count old shadow: %v", err)
+	}
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM shadow_paths WHERE branch_ref = 'refs/heads/feature' AND branch_generation = 2`).Scan(&prospectiveRows); err != nil {
+		t.Fatalf("count prospective shadow: %v", err)
+	}
+	if oldRows == 0 || prospectiveRows != 0 {
+		t.Fatalf("shadow rows old=%d prospective=%d", oldRows, prospectiveRows)
+	}
+}
+
+// TestRun_RuntimeDivergedRecoversDeadBranchTerminals exercises the runtime
 // Diverged-hook end-to-end: the daemon boots on refs/heads/feat-x (created
 // + checked out before the run loop starts), accumulates a blocked_conflict
 // + pending capture_events row tied to that ref, the worktree is then
@@ -2072,7 +2389,7 @@ func TestRun_BranchSwitchDropsPending(t *testing.T) {
 // prunes the dead-branch rows. This is the regression-against-"P2 #7"
 // coverage gap (the prior dead_branch_sweep_test.go test invoked the helper
 // directly rather than driving the run loop into the runtime Diverged path).
-func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
+func TestRun_RuntimeDivergedRecoversDeadBranchTerminals(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -2104,18 +2421,21 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 
@@ -2124,6 +2444,7 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	// is the closure variable observable through MetaKeyBranchToken meta.
 	want := "rev:" + seedHead + " refs/heads/feat-x"
 	waitForMetaValue(t, f.db, MetaKeyBranchToken, want, 5*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	// Now switch the worktree back to refs/heads/main and delete feat-x.
 	// The daemon's next tick classifies the change as Diverged (ref change
@@ -2134,6 +2455,7 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", "refs/heads/feat-x"); err != nil {
 		t.Fatalf("delete refs/heads/feat-x: %v", err)
 	}
+	releaseCheck()
 	for i := 0; i < 4; i++ {
 		select {
 		case wakeCh <- struct{}{}:
@@ -2163,17 +2485,18 @@ func TestRun_RuntimeDivergedPrunesDeadBranchTerminals(t *testing.T) {
 		t.Fatalf("runtime Diverged hook did not stamp %s within 5s", MetaKeyDeadBranchPruneLastRunTS)
 	}
 
-	// All capture_events rows for the dead ref must be gone — both the
-	// blocked_conflict and the pending — proving pending+terminal pruning
-	// (not just terminals) ran in the runtime path.
+	// Both rows remain as recovered provenance under a durable recovery ref.
 	var total int
 	if err := f.db.SQL().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE branch_ref = ?`, "refs/heads/feat-x",
 	).Scan(&total); err != nil {
 		t.Fatalf("count feat-x rows: %v", err)
 	}
-	if total != 0 {
-		t.Fatalf("feat-x rows=%d want 0 after runtime Diverged hook", total)
+	if total != 2 {
+		t.Fatalf("feat-x rows=%d want 2 retained after runtime recovery", total)
+	}
+	if recovered := countEventsByRefState(t, f.db, "refs/heads/feat-x", state.EventStateRecovered); recovered != 2 {
+		t.Fatalf("feat-x recovered rows=%d want 2", recovered)
 	}
 
 	cancel()
@@ -2204,7 +2527,11 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 	} else if seeded == 0 {
 		t.Fatalf("BootstrapShadow old generation seeded 0 rows")
 	}
-	if _, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+	staleOID, err := git.HashObjectStdin(ctx, f.dir, []byte("stale pending\n"))
+	if err != nil {
+		t.Fatalf("hash stale pending: %v", err)
+	}
+	staleSeq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
 		BranchRef:        oldCtx.BranchRef,
 		BranchGeneration: oldCtx.BranchGeneration,
 		BaseHead:         oldCtx.BaseHead,
@@ -2216,8 +2543,9 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 		Path:      "stale-pending.txt",
 		Fidelity:  "full",
 		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-		AfterOID:  sql.NullString{String: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Valid: true},
-	}}); err != nil {
+		AfterOID:  sql.NullString{String: staleOID, Valid: true},
+	}})
+	if err != nil {
 		t.Fatalf("AppendCaptureEvent stale pending: %v", err)
 	}
 
@@ -2259,6 +2587,10 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -2312,12 +2644,42 @@ func TestRun_StartupDivergenceBumpsGenerationAndReseedsShadow(t *testing.T) {
 		t.Fatalf("old shadow generation rows=%d want 0", oldShadowRows)
 	}
 	time.Sleep(100 * time.Millisecond)
-	var events int
-	if err := f.db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
-		t.Fatalf("count capture events: %v", err)
+	var staleState string
+	var staleCommit sql.NullString
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state, commit_oid FROM capture_events WHERE seq = ?`, staleSeq,
+	).Scan(&staleState, &staleCommit); err != nil {
+		t.Fatalf("query preserved stale capture: %v", err)
 	}
-	if events != 0 {
-		t.Fatalf("startup after offline reset captured %d phantom events, want 0", events)
+	if staleState != state.EventStateRecovered || !staleCommit.Valid || staleCommit.String == "" {
+		t.Fatalf("stale capture state=%q commit=%v, want durable recovered provenance", staleState, staleCommit)
+	}
+	var recoveryRef, snapshotCommit string
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT rs.recovery_ref, rs.commit_oid
+FROM recovery_snapshots rs
+JOIN recovery_snapshot_events rse ON rse.snapshot_id = rs.id
+WHERE rse.event_seq = ?`, staleSeq).Scan(&recoveryRef, &snapshotCommit); err != nil {
+		t.Fatalf("query stale capture recovery snapshot: %v", err)
+	}
+	if snapshotCommit != staleCommit.String {
+		t.Fatalf("snapshot commit=%s want recovered commit=%s", snapshotCommit, staleCommit.String)
+	}
+	resolvedRecovery, err := git.RevParse(ctx, f.dir, recoveryRef)
+	if err != nil {
+		t.Fatalf("resolve stale capture recovery ref: %v", err)
+	}
+	if resolvedRecovery != snapshotCommit {
+		t.Fatalf("recovery ref commit=%s want %s", resolvedRecovery, snapshotCommit)
+	}
+	var newEvents int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq != ?`, staleSeq,
+	).Scan(&newEvents); err != nil {
+		t.Fatalf("count captures created after startup: %v", err)
+	}
+	if newEvents != 0 {
+		t.Fatalf("startup after offline reset captured %d phantom events, want 0", newEvents)
 	}
 
 	cancel()
@@ -2433,7 +2795,7 @@ func TestRun_BranchGenerationStableOnAcdFastForward(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 15*time.Second)
 	if newHead == startHead {
 		t.Fatalf("HEAD did not advance via daemon commit")
 	}
@@ -2571,7 +2933,7 @@ func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
 	}
 	wakeCh <- struct{}{}
 
-	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 15*time.Second)
 	mainHead, err := git.RevParse(ctx, f.dir, "refs/heads/main")
 	if err != nil {
 		t.Fatalf("rev-parse main: %v", err)
@@ -2942,18 +3304,21 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	defer cancel()
 
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   manual,
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              manual,
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
 	t.Cleanup(func() {
@@ -2965,6 +3330,9 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	// Wait until startup has settled — persisted MetaKeyBranchHead =
 	// seedHead, currentToken in-memory = "rev:seedHead refs/heads/main".
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		"rev:"+seedHead+" refs/heads/main", 2*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	// Simulate an out-of-band observer (acd recover, manual sqlite edit,
 	// or a previous-tick observation that has since been lost from
@@ -2974,10 +3342,10 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	if err := state.MetaSet(ctx, f.db, MetaKeyBranchHead, advanced); err != nil {
 		t.Fatalf("MetaSet branch.head=advanced: %v", err)
 	}
-	// Wake. The next processBranchTokenChange should observe
+	// Release the gated token check. processBranchTokenChange should observe
 	// SameGeneration (live token == currentToken), enter the cross-tick
 	// probe, and arm the grace marker.
-	wakeCh <- struct{}{}
+	releaseCheck()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

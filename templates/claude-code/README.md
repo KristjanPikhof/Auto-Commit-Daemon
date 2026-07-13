@@ -13,12 +13,9 @@
 
 4. Restart Claude Code
 
-If you previously installed a snippet that predates the v2026-05-08 release,
-re-run `acd setup claude-code` and replace the `hooks` block in
-`~/.claude/settings.json` so the new self-heal hooks take effect. Run
-`acd doctor` to check whether your installed snippet is current; it warns when
-active hooks are missing `acd start` or `acd wake` and shows the remediation
-command.
+Run `acd doctor` after setup. It compares the installed hook with the current
+template and tells you when to regenerate the ACD block with
+`acd setup claude-code`.
 
 ## Verify
 
@@ -33,8 +30,8 @@ with `acd stop --session-id`.
 
 `acd wake` refreshes the heartbeat and nudges capture/replay, but it does not
 bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. The `Stop`
-hook uses `acd flush --logical` for the prompt-end commit boundary; re-run
-`acd setup claude-code` if your installed snippet predates that hook.
+hook uses `acd flush --logical` for the prompt-end commit boundary. `acd doctor`
+reports template drift when that wiring is missing.
 
 Repo autodiscovery is enabled by default. If you disable it with
 `repo_lifecycle.autodiscovery` in `~/.config/acd/config.json` or with

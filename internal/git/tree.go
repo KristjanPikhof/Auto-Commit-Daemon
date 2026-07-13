@@ -131,16 +131,38 @@ func HashSymlinkBlob(ctx context.Context, repoDir, target string) (oid, mode str
 
 // CommitTree runs `git commit-tree <tree> -p <parent> ... -F -` (message
 // supplied on stdin) and returns the new commit OID. Pass an empty parent
-// slice for an initial commit.
+// slice for an initial commit. Git resolves the author and committer from the
+// repository or user configuration.
 func CommitTree(ctx context.Context, repoDir, treeOID, message string, parents ...string) (string, error) {
+	return commitTree(ctx, repoDir, treeOID, message, nil, parents...)
+}
+
+// CommitTreeWithIdentity creates a commit with an explicit author and
+// committer identity. It is intended for ACD-owned hidden provenance commits
+// that must remain writable even when the repository has no configured user.
+func CommitTreeWithIdentity(ctx context.Context, repoDir, treeOID, message, name, email string, parents ...string) (string, error) {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(email) == "" {
+		return "", fmt.Errorf("git: commit identity name and email are required")
+	}
+	identityEnv := map[string]string{
+		"GIT_AUTHOR_NAME":     name,
+		"GIT_AUTHOR_EMAIL":    email,
+		"GIT_COMMITTER_NAME":  name,
+		"GIT_COMMITTER_EMAIL": email,
+	}
+	return commitTree(ctx, repoDir, treeOID, message, identityEnv, parents...)
+}
+
+func commitTree(ctx context.Context, repoDir, treeOID, message string, extraEnv map[string]string, parents ...string) (string, error) {
 	args := []string{"commit-tree", treeOID}
 	for _, p := range parents {
 		args = append(args, "-p", p)
 	}
 	args = append(args, "-F", "-")
 	out, err := Run(ctx, RunOpts{
-		Dir:   repoDir,
-		Stdin: strings.NewReader(message),
+		Dir:      repoDir,
+		Stdin:    strings.NewReader(message),
+		ExtraEnv: extraEnv,
 	}, args...)
 	if err != nil {
 		return "", err

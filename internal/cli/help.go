@@ -3,50 +3,37 @@ package cli
 const rootHelpTemplate = `{{if eq .CommandPath "acd"}}{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
 
 {{end}}Usage:
+  acd [flags]
   acd <command> [flags]
 
-Common workflow:
-  acd start                         Register this session and ensure the repo daemon is running
-  acd status                        Show daemon, branch, and client state for the current repo
-  acd events                        Show recent product decisions for the current repo
-  acd events --watch                Stream appended product decisions
-  acd prompt --last                 Inspect the last recorded AI prompt request
-  acd explain --path FILE           Explain why ACD did or did not commit a path
-  acd fix --dry-run                 Preview safe remediation for a stuck repo (use --force dry-run for barrier purge plans)
-  acd repo init                     Explicitly initialize ACD state for this repo
-  acd repo disable                  Stop and disable a registered repo while preserving state
-  acd repo enable                   Re-enable a registered repo without starting its daemon
-  acd repo manage                   Interactive lifecycle manager for enabling and disabling repos
-  acd repo list                     List all registry rows for lifecycle management
-  acd repo remove --dry-run          Preview registry removal and state preservation
-  acd list                          Compact dashboard on TTY (Ctrl-C to exit)
-  acd list --once                   One-shot compact table (scripts)
-  acd list --verbose                Wide table with CLIENTS and status notes
-  acd list --json                   All repos as JSON (one-shot on TTY)
-  acd logs --lines 200              Tail the current repo daemon log as raw JSONL
-  acd logs --follow                 Stream appended raw JSONL daemon log lines
-  acd wake                          Refresh heartbeat and nudge replay
-  acd commit-all                    One-shot: commit every uncommitted file (daemon must be off)
-  acd rewrite-commits --from-nr 5 --plan-only  Generate an AI-gated linear rewrite plan without prompts
-  acd rewrite-commits --range-nr 5-12 --review  Review/edit proposed messages before applying
-  acd rewrite-commits --edit <plan-id> --plan-only  Edit a saved plan revision without AI calls
-  acd rewrite-commits --apply <plan-id> --dry-run  Validate a saved plan before apply
-  acd stop                          Stop the repo daemon or deregister a session
+Primary controls:
+  acd              Show one read-only health classification and next action
+  acd on           Enable this repo and ensure its daemon is running
+  acd off          Durably disable this repo while preserving state
+  acd status       Show the detailed current-repo snapshot
+  acd setup        Print the one-time harness install snippet
 
-Diagnostics and recovery:
-  acd diagnose     Inspect replay blockers, waiting queues, and branch anchors
-  acd doctor       Run diagnostics and optionally bundle a support zip
-  acd pause        Pause capture and replay
-  acd resume       Resume capture and replay
+Observe:
+  acd list         Show all active repos
+  acd events       Follow capture, grouping, publish, and block decisions
+  acd explain      Explain one path or commit decision
 
-Setup:
-  acd setup        Print harness install snippets
-  acd version      Print version and build info
+Support and recovery:
+  acd diagnose     Inspect replay blockers and branch anchors read-only
+  acd doctor       Inspect installation/runtime health or create a support bundle
+  acd fix          Preview or apply advanced recovery actions
 
 Advanced:
-  acd stats        Show aggregate commits, events, and bytes
-  acd gc           Prune dead or missing repo registry entries
-  acd touch        Refresh heartbeat without waking replay
+  acd repo         Manage explicit registration and lifecycle details
+  acd logs         Read raw daemon logs
+  acd pause        Pause capture and replay for repository surgery
+  acd resume       Resume a manually paused repo
+  acd commit-all   Capture a dirty worktree while the daemon is off
+  acd rewrite-commits  Plan or apply an explicit local history rewrite
+  acd stats / gc / prompt  Inspect aggregate or internal state
+
+Hook protocol (normally managed by acd setup):
+  acd start / stop / wake / touch / flush
 
 Flags:
 {{.Flags.FlagUsages | trimTrailingWhitespaces}}

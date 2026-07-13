@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,48 @@ import (
 // no" from "ran successfully with nothing to do".
 var errCommitAllAborted = errors.New("acd commit-all: aborted by user")
 
+// commitAllIncompleteError reports that commit-all stopped safely but did not
+// drain every unpublished event. The rendered result carries the detailed
+// counts; the typed error gives scripts a reliable non-zero outcome.
+type commitAllIncompleteError struct {
+	PendingAfter int
+	Conflicts    int
+	Failed       int
+}
+
+type commitAllReplayError struct {
+	Cause        error
+	PendingAfter int
+}
+
+func (e *commitAllReplayError) Error() string {
+	return fmt.Sprintf("acd commit-all: replay stopped with %d unpublished event(s): %v", e.PendingAfter, e.Cause)
+}
+
+func (e *commitAllReplayError) Unwrap() error { return e.Cause }
+
+// commitAllRecoveryError reports a failure while preserving pre-existing
+// provenance pairs. Earlier pairs may already be protected and transitioned,
+// so callers must receive the rendered partial result as well as a non-zero
+// error.
+type commitAllRecoveryError struct {
+	Cause        error
+	PendingAfter int
+}
+
+func (e *commitAllRecoveryError) Error() string {
+	return fmt.Sprintf("acd commit-all: pre-existing recovery stopped with %d unpublished event(s): %v", e.PendingAfter, e.Cause)
+}
+
+func (e *commitAllRecoveryError) Unwrap() error { return e.Cause }
+
+func (e *commitAllIncompleteError) Error() string {
+	return fmt.Sprintf(
+		"acd commit-all: incomplete (pending=%d conflicts=%d failed=%d)",
+		e.PendingAfter, e.Conflicts, e.Failed,
+	)
+}
+
 // commitAllResult is the JSON payload returned by `acd commit-all --json`.
 type commitAllResult struct {
 	OK                  bool     `json:"ok"`
@@ -47,9 +90,13 @@ type commitAllResult struct {
 	Drained             int      `json:"drained"`
 	Conflicts           int      `json:"conflicts,omitempty"`
 	Failed              int      `json:"failed,omitempty"`
+	Incomplete          bool     `json:"incomplete,omitempty"`
+	Error               string   `json:"error,omitempty"`
 	DryRun              bool     `json:"dry_run,omitempty"`
 	Confirmed           bool     `json:"confirmed,omitempty"`
 	DroppedStalePending int      `json:"dropped_stale_pending,omitempty"`
+	PreservedPending    int      `json:"preserved_pending,omitempty"`
+	RecoveryRefs        []string `json:"recovery_refs,omitempty"`
 	DurationMillis      int64    `json:"duration_ms"`
 	Notes               []string `json:"notes,omitempty"`
 }
@@ -65,9 +112,11 @@ The active commit strategy is read from existing config (daemon meta first,
 then ACD_COMMIT_STRATEGY env, then the canonical default). There is no
 --strategy override: commit-all matches what the daemon would do on its own.
 
-Refuses to run on detached HEAD, while a git operation is in progress
-(rebase/merge/cherry-pick/bisect), while a manual pause marker is present,
-or while the per-repo daemon is alive.`,
+Detached HEAD, an in-progress git operation
+(rebase/merge/cherry-pick/bisect), and a manual pause marker are refused for
+both previews and apply. If an authorized run reaches its mutation phase, it
+also refuses while the per-repo daemon is alive; dry-run, a declined prompt,
+and a clean no-op do not acquire daemon.lock.`,
 		Example: `  acd commit-all --dry-run
   acd commit-all --yes
   acd commit-all --repo /path/to/repo --yes --json`,
@@ -93,13 +142,69 @@ or while the per-repo daemon is alive.`,
 	return cmd
 }
 
-const commitAllZeroProgressLimit = 3
+const (
+	commitAllZeroProgressLimit = 3
+	commitAllRecaptureLimit    = 3
+)
+
+type commitAllMutationStage string
+
+const (
+	commitAllStagePostLock         commitAllMutationStage = "post_lock"
+	commitAllStageRecoveryPair     commitAllMutationStage = "recovery_pair"
+	commitAllStageReseed           commitAllMutationStage = "reseed"
+	commitAllStageCapture          commitAllMutationStage = "capture"
+	commitAllStageReplay           commitAllMutationStage = "replay"
+	commitAllStageRecaptureReseed  commitAllMutationStage = "recapture_reseed"
+	commitAllStageRecaptureCapture commitAllMutationStage = "recapture_capture"
+)
+
+// commitAllHooks is a per-invocation test seam. It deliberately lives on the
+// call stack instead of in package globals so parallel CLI tests cannot change
+// another invocation's mutation timing.
+type commitAllHooks struct {
+	BeforeMutationCheck func(context.Context, commitAllMutationStage) error
+}
+
+type commitAllMutationGuard struct {
+	repo           string
+	gitDir         string
+	expectedBranch string
+	hooks          commitAllHooks
+}
+
+func (g commitAllMutationGuard) check(
+	ctx context.Context,
+	stage commitAllMutationStage,
+	expectedHead string,
+) error {
+	if g.hooks.BeforeMutationCheck != nil {
+		if err := g.hooks.BeforeMutationCheck(ctx, stage); err != nil {
+			return fmt.Errorf("acd commit-all: %s pre-mutation hook: %w", stage, err)
+		}
+	}
+	return revalidateCommitAllMutationAnchor(ctx, g.repo, g.gitDir, g.expectedBranch, expectedHead)
+}
 
 func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag string, yes, dryRun, jsonOut bool) error {
+	return runCommitAllWithHooks(ctx, out, in, repoFlag, yes, dryRun, jsonOut, commitAllHooks{})
+}
+
+func runCommitAllWithHooks(
+	ctx context.Context,
+	out io.Writer,
+	in io.Reader,
+	repoFlag string,
+	yes, dryRun, jsonOut bool,
+	hooks commitAllHooks,
+) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	start := time.Now()
+	if jsonOut && !yes && !dryRun {
+		return errors.New("acd commit-all: --json requires --yes (no interactive prompt available)")
+	}
 
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
@@ -126,28 +231,6 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		return fmt.Errorf("acd commit-all: refusing while manual pause marker is present at %s; run `acd resume` first", pausepkg.Path(gitDir))
 	}
 
-	// daemon.lock acquire is the live-daemon refusal gate: if the daemon
-	// owns the lock our acquire fails with ErrDaemonLockHeld. We hold it
-	// across the entire run so a daemon that starts mid-flight cannot
-	// race the capture/replay loop. The previous control.lock
-	// acquire+release dance was no-op (released before any work) and has
-	// been dropped — daemon.lock already covers the only real exclusion.
-	dlock, err := daemon.AcquireDaemonLock(gitDir)
-	if err != nil {
-		if errors.Is(err, daemon.ErrDaemonLockHeld) {
-			return errors.New("acd commit-all: refusing while the per-repo daemon is alive (stop it first with `acd stop`)")
-		}
-		return fmt.Errorf("acd commit-all: acquire daemon.lock: %w", err)
-	}
-	defer func() { _ = dlock.Release() }()
-
-	dbPath := state.DBPathFromGitDir(gitDir)
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return fmt.Errorf("acd commit-all: open state.db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		if errors.Is(err, git.ErrRefNotFound) {
@@ -158,6 +241,97 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 	if strings.TrimSpace(head) == "" {
 		return errors.New("acd commit-all: no commits on branch yet; create the initial commit first")
 	}
+	guard := commitAllMutationGuard{
+		repo:           repo,
+		gitDir:         gitDir,
+		expectedBranch: branchRef,
+		hooks:          hooks,
+	}
+	dbPath := state.DBPathFromGitDir(gitDir)
+	preflight, err := inspectCommitAllPreflight(ctx, repo, dbPath, branchRef, head)
+	if err != nil {
+		return err
+	}
+	cfg := ai.LoadProviderConfigFromEnv()
+	cfg.CommitStrategy = preflight.Strategy
+	estimatedPending := preflight.ExistingCount + preflight.WorktreeChanges
+	res := commitAllResult{
+		OK:               true,
+		Repo:             repo,
+		BranchRef:        branchRef,
+		HeadBefore:       head,
+		Strategy:         string(preflight.Strategy),
+		Provider:         commitAllConfiguredProviderName(cfg),
+		IntentWindow:     cfg.IntentWindow,
+		IntentDeferLim:   cfg.IntentDeferLimit,
+		PendingBefore:    estimatedPending,
+		EstimatedPass:    commitAllEstimatePasses(preflight.Strategy, estimatedPending, cfg.IntentWindow),
+		DryRun:           dryRun,
+		PreservedPending: preflight.ExistingCount,
+	}
+	if preflight.ExistingCount > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf(
+			"%swould preserve %d pre-existing event(s) across %d exact pair(s) before reseeding shadow",
+			commitAllDryRunPrefix(dryRun), preflight.ExistingCount, len(preflight.ExistingPairs),
+		))
+	}
+	if preflight.WorktreeChanges > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf(
+			"%sread-only worktree estimate found %d changed path(s)",
+			commitAllDryRunPrefix(dryRun), preflight.WorktreeChanges,
+		))
+	}
+	if dryRun {
+		res.Notes = append(res.Notes, "dry-run: no capture, recovery ref, or replay state was written")
+		res.DurationMillis = time.Since(start).Milliseconds()
+		return renderCommitAll(out, res, jsonOut)
+	}
+	if estimatedPending == 0 {
+		res.Notes = append(res.Notes, "no pending events; worktree already clean")
+		res.HeadAfter = head
+		res.DurationMillis = time.Since(start).Milliseconds()
+		return renderCommitAll(out, res, jsonOut)
+	}
+	if !yes {
+		ok, err := promptCommitAllConfirm(out, in, res)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			res.Notes = append(res.Notes, "aborted by user; no state changes were made")
+			res.OK = false
+			res.DurationMillis = time.Since(start).Milliseconds()
+			if rerr := renderCommitAll(out, res, jsonOut); rerr != nil {
+				return rerr
+			}
+			return errCommitAllAborted
+		}
+	}
+	res.Confirmed = true
+
+	// Acquire the daemon lock only after the operator authorizes mutation. Hold
+	// it through the state reload and replay so a daemon cannot start between
+	// the post-prompt safety checks and capture.
+	dlock, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return errors.New("acd commit-all: refusing while the per-repo daemon is alive (stop it first with `acd stop`)")
+		}
+		return fmt.Errorf("acd commit-all: acquire daemon.lock: %w", err)
+	}
+	defer func() { _ = dlock.Release() }()
+	if err := guard.check(ctx, commitAllStagePostLock, head); err != nil {
+		return err
+	}
+
+	// Writable state is opened only after dry-run and confirmation paths have
+	// returned. Reload the state-derived values so the mutation phase acts on
+	// the exact queue and generation it is about to reconcile.
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: open state.db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
 	gen, err := loadCommitAllGeneration(ctx, db)
 	if err != nil {
 		return err
@@ -166,6 +340,48 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		BranchRef:        branchRef,
 		BranchGeneration: gen,
 		BaseHead:         head,
+	}
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, db.SQL())
+	if err != nil {
+		return fmt.Errorf("acd commit-all: resolve strategy: %w", err)
+	}
+	cfg.CommitStrategy = strategy
+	res.Strategy = string(strategy)
+	provider, providerCloser, err := ai.BuildProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: build provider: %w", err)
+	}
+	if providerCloser != nil {
+		defer func() { _ = providerCloser.Close() }()
+	}
+	res.Provider = ai.PrimaryProviderName(provider)
+	if err := guard.check(ctx, commitAllStagePostLock, head); err != nil {
+		return err
+	}
+	existingPairs, err := inspectCommitAllExistingPairs(ctx, db, cctx)
+	if err != nil {
+		return err
+	}
+	existingCount := commitAllExistingPairCount(existingPairs)
+	res.PreservedPending = existingCount
+	res.PendingBefore = existingCount
+
+	// Preserve every pre-existing exact-pair queue before reseeding shadow. The
+	// shared reconciler makes each pair reachable independently before active
+	// capture begins.
+	for _, pair := range existingPairs {
+		if err := guard.check(ctx, commitAllStageRecoveryPair, head); err != nil {
+			res.DurationMillis = time.Since(start).Milliseconds()
+			return finishCommitAllRecoveryError(ctx, out, repo, db, cctx, res, jsonOut, err)
+		}
+		result, err := reconcileCommitAllExistingPair(ctx, repo, gitDir, db, pair)
+		if err != nil {
+			res.DurationMillis = time.Since(start).Milliseconds()
+			return finishCommitAllRecoveryError(ctx, out, repo, db, cctx, res, jsonOut, err)
+		}
+		if result.Handled {
+			appendCommitAllRecoveryResult(&res, result)
+		}
 	}
 
 	// commit-all is the "cold start, dirty repo, daemon was off" entrypoint.
@@ -178,22 +394,12 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 	// leaving the next Capture to compare live worktree against a shadow
 	// that already mirrors live state and emit zero events. Force a reseed
 	// so the diff is always vs HEAD's tree.
+	if err := guard.check(ctx, commitAllStageReseed, head); err != nil {
+		return err
+	}
 	if _, err := daemon.ReseedShadowFromHead(ctx, repo, db, cctx); err != nil {
 		return fmt.Errorf("acd commit-all: reseed shadow from HEAD: %w", err)
 	}
-	// Stale pending rows from earlier daemon runs reference an outdated
-	// baseline. Per the replay model, blocked_conflict and failed are
-	// terminal seq barriers and PendingEvents hides later pending rows
-	// behind prior terminal rows for the same (branch_ref, generation). If
-	// these stale pending rows replay first as blocked/failed, they will
-	// stop our newly captured events from making progress. Drop them up
-	// front, scoped to the active branch+generation (not generation-only,
-	// which would also nuke rows on co-existing refs).
-	dropped, err := state.DeletePendingForBranchGeneration(ctx, db, branchRef, gen)
-	if err != nil {
-		return fmt.Errorf("acd commit-all: drop stale pending events: %w", err)
-	}
-
 	checker := git.NewIgnoreChecker(repo)
 	defer func() { _ = checker.Close() }()
 	sensitive := state.NewSensitiveMatcher()
@@ -204,6 +410,9 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 	// the mid-pass cap; using a typed CaptureOpts field keeps the daemon's
 	// process-wide invariant (DefaultMaxPendingEvents) untouched and
 	// avoids racing the env with concurrent goroutines.
+	if err := guard.check(ctx, commitAllStageCapture, head); err != nil {
+		return err
+	}
 	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
 		IgnoreChecker:     checker,
 		SensitiveMatcher:  sensitive,
@@ -215,47 +424,14 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		return fmt.Errorf("acd commit-all: capture: %w", err)
 	}
 
-	pending, err := state.PendingEvents(ctx, db, 0)
+	pendingCount, err := countCommitAllUnpublishedPair(ctx, db, cctx)
 	if err != nil {
 		return fmt.Errorf("acd commit-all: count pending: %w", err)
 	}
-	pendingCount := len(pending)
 
-	strategy, err := ResolveEffectiveCommitStrategy(ctx, db.SQL())
-	if err != nil {
-		return fmt.Errorf("acd commit-all: resolve strategy: %w", err)
-	}
-	cfg := ai.LoadProviderConfigFromEnv()
-	cfg.CommitStrategy = strategy
-	provider, providerCloser, err := ai.BuildProvider(cfg)
-	if err != nil {
-		return fmt.Errorf("acd commit-all: build provider: %w", err)
-	}
-	if providerCloser != nil {
-		defer func() { _ = providerCloser.Close() }()
-	}
-
-	estimated := commitAllEstimatePasses(strategy, pendingCount, cfg.IntentWindow)
-
-	res := commitAllResult{
-		OK:                  true,
-		Repo:                repo,
-		BranchRef:           branchRef,
-		HeadBefore:          head,
-		Strategy:            string(strategy),
-		Provider:            ai.PrimaryProviderName(provider),
-		IntentWindow:        cfg.IntentWindow,
-		IntentDeferLim:      cfg.IntentDeferLimit,
-		PendingBefore:       pendingCount,
-		EstimatedPass:       estimated,
-		DryRun:              dryRun,
-		DroppedStalePending: dropped,
-	}
-	if dropped > 0 {
-		res.Notes = append(res.Notes, fmt.Sprintf("shadow reseeded from HEAD; %d stale pending events dropped", dropped))
-	} else {
-		res.Notes = append(res.Notes, "shadow reseeded from HEAD")
-	}
+	res.PendingBefore = pendingCount
+	res.EstimatedPass = commitAllEstimatePasses(strategy, pendingCount, cfg.IntentWindow)
+	res.Notes = append(res.Notes, "shadow reseeded from HEAD")
 
 	if pendingCount == 0 {
 		res.Notes = append(res.Notes, "no pending events; worktree already clean")
@@ -263,56 +439,159 @@ func runCommitAll(ctx context.Context, out io.Writer, in io.Reader, repoFlag str
 		return renderCommitAll(out, res, jsonOut)
 	}
 
-	if dryRun {
-		previewIntentDryRun(ctx, repo, db, cctx, strategy, cfg, provider, &res)
-		res.DurationMillis = time.Since(start).Milliseconds()
-		return renderCommitAll(out, res, jsonOut)
-	}
-
-	if !yes {
-		if jsonOut {
-			return errors.New("acd commit-all: --json requires --yes (no interactive prompt available)")
-		}
-		ok, err := promptCommitAllConfirm(out, in, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			res.Notes = append(res.Notes, "aborted by user")
-			res.OK = false
-			res.DurationMillis = time.Since(start).Milliseconds()
-			if rerr := renderCommitAll(out, res, jsonOut); rerr != nil {
-				return rerr
-			}
-			// Return a sentinel error so cobra exits non-zero. Scripts
-			// can grep for "aborted by user" in JSON output and rely
-			// on the exit code matching the human signal.
-			return errCommitAllAborted
-		}
-	}
-	res.Confirmed = true
-
-	commits, drained, conflicts, failed, after, err := commitAllReplayLoop(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, pendingCount)
-	if err != nil {
-		return err
-	}
+	commits, drained, conflicts, failed, after, err := commitAllReplayLoop(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, pendingCount, &res.Notes, &guard)
 	res.Commits = commits
 	res.Drained = drained
 	res.Conflicts = conflicts
 	res.Failed = failed
 	res.PendingAfter = after
-	if newHead, herr := git.RevParse(ctx, repo, "HEAD"); herr == nil {
-		res.HeadAfter = newHead
-	} else {
-		slog.Default().Warn("acd commit-all: post-loop HEAD lookup failed", slog.String("err", herr.Error()))
-		res.Notes = append(res.Notes, fmt.Sprintf("post-loop HEAD lookup failed: %v", herr))
-	}
 	res.DurationMillis = time.Since(start).Milliseconds()
-	return renderCommitAll(out, res, jsonOut)
+	return finishCommitAllReplay(ctx, out, repo, db, cctx, res, jsonOut, err)
+}
+
+type commitAllPreflight struct {
+	Generation      int64
+	Strategy        ai.CommitStrategy
+	ExistingPairs   []commitAllExistingPair
+	ExistingCount   int
+	WorktreeChanges int
+}
+
+// inspectCommitAllPreflight gathers enough information to render a dry-run or
+// confirmation prompt without opening the writable state handle. A missing
+// state DB is a valid cold-start case and contributes no queued events.
+func inspectCommitAllPreflight(
+	ctx context.Context,
+	repo, stateDB, branchRef, head string,
+) (commitAllPreflight, error) {
+	preflight := commitAllPreflight{Generation: 1}
+	strategy, err := ResolveEffectiveCommitStrategy(ctx, nil)
+	if err != nil {
+		return commitAllPreflight{}, fmt.Errorf("acd commit-all: resolve strategy: %w", err)
+	}
+	preflight.Strategy = strategy
+
+	if _, statErr := os.Stat(stateDB); statErr == nil {
+		conn, openErr := openStateDBReadOnly(ctx, stateDB)
+		if openErr != nil {
+			return commitAllPreflight{}, fmt.Errorf("acd commit-all: open state.db read-only: %w", openErr)
+		}
+		defer func() { _ = conn.Close() }()
+
+		preflight.Generation, err = loadCommitAllGenerationSQL(ctx, conn)
+		if err != nil {
+			return commitAllPreflight{}, err
+		}
+		cctx := daemon.CaptureContext{
+			BranchRef:        branchRef,
+			BranchGeneration: preflight.Generation,
+			BaseHead:         head,
+		}
+		preflight.ExistingPairs, err = inspectCommitAllExistingPairsSQL(ctx, conn, cctx)
+		if err != nil {
+			return commitAllPreflight{}, err
+		}
+		preflight.ExistingCount = commitAllExistingPairCount(preflight.ExistingPairs)
+		preflight.Strategy, err = ResolveEffectiveCommitStrategy(ctx, conn)
+		if err != nil {
+			return commitAllPreflight{}, fmt.Errorf("acd commit-all: resolve strategy: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return commitAllPreflight{}, fmt.Errorf("acd commit-all: stat state.db: %w", statErr)
+	}
+
+	preflight.WorktreeChanges, err = estimateCommitAllWorktreeChanges(ctx, repo)
+	if err != nil {
+		return commitAllPreflight{}, err
+	}
+	return preflight, nil
+}
+
+// estimateCommitAllWorktreeChanges counts tracked worktree differences from
+// HEAD plus untracked, non-ignored paths. It reads Git only; capture remains the
+// authority for the exact event count after the operator authorizes mutation.
+func estimateCommitAllWorktreeChanges(ctx context.Context, repo string) (int, error) {
+	tracked, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"diff", "--no-ext-diff", "--name-only", "-z", "HEAD", "--")
+	if err != nil {
+		return 0, fmt.Errorf("acd commit-all: estimate tracked worktree changes: %w", err)
+	}
+	untracked, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"ls-files", "--others", "--exclude-standard", "-z", "--")
+	if err != nil {
+		return 0, fmt.Errorf("acd commit-all: estimate untracked worktree changes: %w", err)
+	}
+
+	sensitive := state.NewSensitiveMatcher()
+	safeIgnore := state.NewSafeIgnoreMatcher()
+	paths := make(map[string]struct{})
+	add := func(raw []byte) {
+		for _, rel := range strings.Split(string(raw), "\x00") {
+			if rel == "" || sensitive.Match(rel) || safeIgnore.MatchFile(rel) {
+				continue
+			}
+			paths[rel] = struct{}{}
+		}
+	}
+	add(tracked)
+	add(untracked)
+	return len(paths), nil
+}
+
+func commitAllDryRunPrefix(dryRun bool) string {
+	if dryRun {
+		return "dry-run: "
+	}
+	return ""
+}
+
+func commitAllConfiguredProviderName(cfg ai.ProviderConfig) string {
+	switch {
+	case cfg.Mode == "openai-compat" && cfg.APIKey != "":
+		return "openai-compat"
+	case strings.HasPrefix(cfg.Mode, "subprocess:") &&
+		strings.TrimSpace(strings.TrimPrefix(cfg.Mode, "subprocess:")) != "":
+		return cfg.Mode
+	default:
+		return "deterministic"
+	}
+}
+
+func revalidateCommitAllMutationAnchor(
+	ctx context.Context,
+	repo, gitDir, expectedBranch, expectedHead string,
+) error {
+	branchRef, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: recheck HEAD branch: %w", err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		return fmt.Errorf("acd commit-all: recheck HEAD: %w", err)
+	}
+	if branchRef != expectedBranch || head != expectedHead {
+		return fmt.Errorf(
+			"acd commit-all: refusing because HEAD changed after preflight (%s @ %s -> %s @ %s)",
+			expectedBranch, shortenSHA(expectedHead), branchRef, shortenSHA(head),
+		)
+	}
+	if name, active := daemon.GitOperationInProgress(gitDir); active {
+		return fmt.Errorf("acd commit-all: refusing while git operation %q is in progress", name)
+	}
+	if _, present, err := pausepkg.Read(gitDir); err != nil {
+		return fmt.Errorf("acd commit-all: recheck pause marker: %w", err)
+	} else if present {
+		return fmt.Errorf("acd commit-all: refusing while manual pause marker is present at %s; run `acd resume` first", pausepkg.Path(gitDir))
+	}
+	return nil
 }
 
 func loadCommitAllGeneration(ctx context.Context, db *state.DB) (int64, error) {
-	v, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyBranchGeneration)
+	return loadCommitAllGenerationSQL(ctx, db.ReadSQL())
+}
+
+func loadCommitAllGenerationSQL(ctx context.Context, conn *sql.DB) (int64, error) {
+	v, ok, err := metaLookup(ctx, conn, daemon.MetaKeyBranchGeneration)
 	if err != nil {
 		return 0, fmt.Errorf("acd commit-all: load branch generation: %w", err)
 	}
@@ -332,6 +611,97 @@ func loadCommitAllGeneration(ctx context.Context, db *state.DB) (int64, error) {
 		return 0, fmt.Errorf("acd commit-all: branch generation meta %q is non-positive; run `acd fix --clear-pause` to repair state", v)
 	}
 	return parsed, nil
+}
+
+type commitAllExistingPair struct {
+	BranchRef  string
+	Generation int64
+	FirstSeq   int64
+	EventCount int
+	Active     bool
+}
+
+func inspectCommitAllExistingPairs(
+	ctx context.Context,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+) ([]commitAllExistingPair, error) {
+	return inspectCommitAllExistingPairsSQL(ctx, db.ReadSQL(), cctx)
+}
+
+func inspectCommitAllExistingPairsSQL(
+	ctx context.Context,
+	conn *sql.DB,
+	cctx daemon.CaptureContext,
+) ([]commitAllExistingPair, error) {
+	rows, err := conn.QueryContext(ctx, `
+SELECT branch_ref, branch_generation, MIN(seq), COUNT(*)
+FROM capture_events
+WHERE state IN (?, ?, ?)
+GROUP BY branch_ref, branch_generation
+ORDER BY MIN(seq) ASC`,
+		state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("acd commit-all: inspect pre-existing unpublished pairs: %w", err)
+	}
+	defer rows.Close()
+	var pairs []commitAllExistingPair
+	for rows.Next() {
+		var pair commitAllExistingPair
+		if err := rows.Scan(&pair.BranchRef, &pair.Generation, &pair.FirstSeq, &pair.EventCount); err != nil {
+			return nil, fmt.Errorf("acd commit-all: scan pre-existing unpublished pair: %w", err)
+		}
+		pair.Active = pair.BranchRef == cctx.BranchRef && pair.Generation == cctx.BranchGeneration
+		pairs = append(pairs, pair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("acd commit-all: iterate pre-existing unpublished pairs: %w", err)
+	}
+	return pairs, nil
+}
+
+func commitAllExistingPairCount(pairs []commitAllExistingPair) int {
+	total := 0
+	for _, pair := range pairs {
+		total += pair.EventCount
+	}
+	return total
+}
+
+func reconcileCommitAllExistingPair(
+	ctx context.Context,
+	repo, gitDir string,
+	db *state.DB,
+	pair commitAllExistingPair,
+) (daemon.RecoveryChainResult, error) {
+	result, err := daemon.ReconcileUnpublishedChain(ctx, repo, db, daemon.RecoveryReconcileOptions{
+		GitDir:           gitDir,
+		BranchRef:        pair.BranchRef,
+		BranchGeneration: pair.Generation,
+		FirstSeq:         pair.FirstSeq,
+		Trigger:          "commit_all_preflight",
+		InvalidateShadow: pair.Active,
+	})
+	if err != nil {
+		return daemon.RecoveryChainResult{}, fmt.Errorf("acd commit-all: preserve pre-existing unpublished pair %s generation %d: %w", pair.BranchRef, pair.Generation, err)
+	}
+	return result, nil
+}
+
+func countCommitAllUnpublishedPair(ctx context.Context, db *state.DB, cctx daemon.CaptureContext) (int, error) {
+	var count int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state IN (?, ?, ?)`, cctx.BranchRef, cctx.BranchGeneration,
+		state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed,
+	).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func commitAllEstimatePasses(strategy ai.CommitStrategy, pending, window int) int {
@@ -387,8 +757,10 @@ func commitAllReplayLoop(
 	cfg ai.ProviderConfig,
 	provider ai.Provider,
 	startingPending int,
+	noteSink *[]string,
+	guard *commitAllMutationGuard,
 ) (commits, drained, conflicts, failed, after int, err error) {
-	return commitAllReplayLoopWith(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, startingPending, commitAllRunReplayDefault, nil)
+	return commitAllReplayLoopWithSafety(ctx, repo, gitDir, db, cctx, strategy, cfg, provider, startingPending, commitAllRunReplayDefault, noteSink, guard)
 }
 
 // commitAllReplayLoopWith is the testable form of commitAllReplayLoop;
@@ -408,7 +780,27 @@ func commitAllReplayLoopWith(
 	replayFn commitAllReplayer,
 	noteSink *[]string,
 ) (commits, drained, conflicts, failed, after int, err error) {
+	return commitAllReplayLoopWithSafety(
+		ctx, repo, gitDir, db, cctx, strategy, cfg, provider,
+		startingPending, replayFn, noteSink, nil,
+	)
+}
+
+func commitAllReplayLoopWithSafety(
+	ctx context.Context,
+	repo, gitDir string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	strategy ai.CommitStrategy,
+	cfg ai.ProviderConfig,
+	provider ai.Provider,
+	startingPending int,
+	replayFn commitAllReplayer,
+	noteSink *[]string,
+	guard *commitAllMutationGuard,
+) (commits, drained, conflicts, failed, after int, err error) {
 	zeroProgress := 0
+	recapturePasses := 0
 	prevHead := cctx.BaseHead
 
 	// Provider-driven message fn matches what the daemon's run loop
@@ -420,20 +812,53 @@ func commitAllReplayLoopWith(
 		msgFn = daemon.ProviderMessageFn(provider, repo)
 	}
 
-	var planner ai.IntentPlanner
+	var (
+		planner         ai.IntentPlanner
+		intentHealth    *daemon.IntentPlannerHealth
+		plannerProvider string
+		plannerModel    string
+	)
 	if strategy == ai.CommitStrategyIntent {
 		if p, ok := provider.(ai.IntentPlanner); ok {
 			planner = p
+		} else {
+			planner = ai.DeterministicProvider{CommitFormat: cfg.CommitFormat}
+		}
+		plannerProvider = ai.PrimaryProviderName(planner)
+		if plannerProvider == "openai-compat" {
+			plannerModel = cfg.Model
 		}
 	}
 
 	for {
+		if guard != nil {
+			if safetyErr := guard.check(ctx, commitAllStageReplay, cctx.BaseHead); safetyErr != nil {
+				err = safetyErr
+				return
+			}
+		}
+		// Construct one circuit for this commit-all process after the first
+		// pass safety check succeeds. Reusing it in every ReplayOpts prevents a
+		// failing remote planner from being retried on each bounded pass.
+		if strategy == ai.CommitStrategyIntent && intentHealth == nil {
+			intentHealth = daemon.NewIntentPlannerHealth(ctx, db, daemon.IntentPlannerHealthOptions{
+				Provider: daemon.IntentPlannerProviderIdentity{
+					Provider:      plannerProvider,
+					Model:         plannerModel,
+					Endpoint:      cfg.BaseURL,
+					Deterministic: plannerProvider == (ai.DeterministicProvider{}).Name(),
+				},
+			})
+		}
 		opts := daemon.ReplayOpts{
 			GitDir:                gitDir,
 			Limit:                 daemon.DefaultReplayLimit,
 			MessageFn:             msgFn,
 			CommitStrategy:        strategy,
 			IntentPlanner:         planner,
+			IntentHealth:          intentHealth,
+			IntentPlannerProvider: plannerProvider,
+			IntentPlannerModel:    plannerModel,
 			IntentWindow:          cfg.IntentWindow,
 			IntentMinPending:      cfg.IntentMinPending,
 			IntentMaxPendingAge:   cfg.IntentMaxPendingAge,
@@ -442,13 +867,13 @@ func commitAllReplayLoopWith(
 			IntentBypassBatchWait: true,
 		}
 		sum, rerr := replayFn(ctx, repo, db, cctx, opts)
+		commits += sum.Published
+		conflicts += sum.Conflicts
+		failed += sum.Failed
 		if rerr != nil {
 			err = fmt.Errorf("acd commit-all: replay: %w", rerr)
 			return
 		}
-		commits += sum.Published
-		conflicts += sum.Conflicts
-		failed += sum.Failed
 		// Refresh BaseHead so the next pass sees the just-committed HEAD.
 		// A failure here is fatal: a stale BaseHead would target the
 		// wrong CAS base and produce spurious supersede / conflict
@@ -459,15 +884,34 @@ func commitAllReplayLoopWith(
 			return
 		}
 		cctx.BaseHead = newHead
+		if sum.RecaptureRequired {
+			recapturePasses++
+			if recapturePasses > commitAllRecaptureLimit {
+				err = fmt.Errorf("acd commit-all: recovery recapture did not converge after %d passes; captured work remains protected in recovery refs", commitAllRecaptureLimit)
+				return
+			}
+			captureSummary, captureErr := recaptureCommitAllWorktreeWithSafety(ctx, repo, gitDir, db, cctx, guard)
+			if captureErr != nil {
+				err = captureErr
+				return
+			}
+			if noteSink != nil {
+				*noteSink = append(*noteSink, fmt.Sprintf(
+					"recovery invalidated shadow; recaptured %d event(s) before continuing",
+					captureSummary.EventsAppended))
+			}
+		}
 
-		remaining, perr := state.PendingEvents(ctx, db, 0)
+		remaining, perr := countCommitAllUnpublishedPair(ctx, db, cctx)
 		if perr != nil {
 			err = fmt.Errorf("acd commit-all: count pending after pass: %w", perr)
 			return
 		}
-		after = len(remaining)
+		after = remaining
 
-		if sum.Published == 0 && cctx.BaseHead == prevHead {
+		if sum.RecaptureRequired {
+			zeroProgress = 0
+		} else if sum.Published == 0 && cctx.BaseHead == prevHead {
 			zeroProgress++
 		} else {
 			zeroProgress = 0
@@ -483,7 +927,7 @@ func commitAllReplayLoopWith(
 			}
 			break
 		}
-		if sum.Conflicts > 0 || sum.Failed > 0 {
+		if !sum.RecaptureRequired && (sum.Conflicts > 0 || sum.Failed > 0) {
 			break
 		}
 	}
@@ -496,69 +940,146 @@ func commitAllReplayLoopWith(
 	return
 }
 
-func previewIntentDryRun(
+func recaptureCommitAllWorktreeWithSafety(
 	ctx context.Context,
+	repo, gitDir string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	guard *commitAllMutationGuard,
+) (daemon.CaptureSummary, error) {
+	if guard != nil {
+		if err := guard.check(ctx, commitAllStageRecaptureReseed, cctx.BaseHead); err != nil {
+			return daemon.CaptureSummary{}, err
+		}
+	}
+	if _, err := daemon.ReseedShadowFromHead(ctx, repo, db, cctx); err != nil {
+		return daemon.CaptureSummary{}, fmt.Errorf("acd commit-all: reseed shadow after recovery: %w", err)
+	}
+	checker := git.NewIgnoreChecker(repo)
+	defer func() { _ = checker.Close() }()
+	if guard != nil {
+		if err := guard.check(ctx, commitAllStageRecaptureCapture, cctx.BaseHead); err != nil {
+			return daemon.CaptureSummary{}, err
+		}
+	}
+	summary, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{
+		IgnoreChecker:     checker,
+		SensitiveMatcher:  state.NewSensitiveMatcher(),
+		SafeIgnoreMatcher: state.NewSafeIgnoreMatcher(),
+		GitDir:            gitDir,
+		SortByPath:        true,
+		DisablePendingCap: true,
+	})
+	if err != nil {
+		return daemon.CaptureSummary{}, fmt.Errorf("acd commit-all: recapture after recovery: %w", err)
+	}
+	return summary, nil
+}
+
+func finishCommitAll(out io.Writer, res commitAllResult, jsonOut bool) error {
+	if res.PendingAfter == 0 {
+		return renderCommitAll(out, res, jsonOut)
+	}
+
+	res.OK = false
+	res.Incomplete = true
+	res.Notes = append(res.Notes, fmt.Sprintf(
+		"commit-all stopped incomplete with pending=%d conflicts=%d failed=%d; captured work remains protected",
+		res.PendingAfter, res.Conflicts, res.Failed,
+	))
+	if err := renderCommitAll(out, res, jsonOut); err != nil {
+		return err
+	}
+	return &commitAllIncompleteError{
+		PendingAfter: res.PendingAfter,
+		Conflicts:    res.Conflicts,
+		Failed:       res.Failed,
+	}
+}
+
+func appendCommitAllRecoveryResult(res *commitAllResult, result daemon.RecoveryChainResult) {
+	if res == nil {
+		return
+	}
+	res.RecoveryRefs = append(res.RecoveryRefs, result.RecoveryRef)
+	res.Notes = append(res.Notes, fmt.Sprintf(
+		"preserved %d pre-existing event(s) as %s at %s",
+		result.EventCount, result.Outcome, result.RecoveryRef))
+}
+
+func finishCommitAllRecoveryError(
+	ctx context.Context,
+	out io.Writer,
 	repo string,
 	db *state.DB,
 	cctx daemon.CaptureContext,
-	strategy ai.CommitStrategy,
-	cfg ai.ProviderConfig,
-	provider ai.Provider,
-	res *commitAllResult,
-) {
-	res.Notes = append(res.Notes, fmt.Sprintf("dry-run: %d events would be processed", res.PendingBefore))
-	if strategy != ai.CommitStrategyIntent {
-		return
+	res commitAllResult,
+	jsonOut bool,
+	recoveryErr error,
+) error {
+	pairs, err := inspectCommitAllExistingPairs(ctx, db, cctx)
+	if err != nil {
+		res.Notes = append(res.Notes, fmt.Sprintf("post-error unpublished recount failed: %v", err))
+	} else {
+		res.PendingAfter = commitAllExistingPairCount(pairs)
+		if res.PendingBefore >= res.PendingAfter {
+			res.Drained = res.PendingBefore - res.PendingAfter
+		}
 	}
-	planner, ok := provider.(ai.IntentPlanner)
-	if !ok {
-		res.Notes = append(res.Notes, "dry-run: provider does not implement intent planning; would fall back to deterministic single-event grouping")
-		return
+	if newHead, err := git.RevParse(ctx, repo, "HEAD"); err == nil {
+		res.HeadAfter = newHead
+	} else {
+		res.Notes = append(res.Notes, fmt.Sprintf("post-error HEAD lookup failed: %v", err))
 	}
-	// Refuse to call a network provider during dry-run. Users reasonably
-	// expect --dry-run to be airgapped; the planner request still leaks
-	// captured paths/ops to the configured AI endpoint even though no
-	// diff egress is involved. Skip the planner peek when the provider
-	// declares NeedsDiff (network-bound) or is anything other than the
-	// always-local deterministic provider.
-	mode := strings.TrimSpace(strings.ToLower(cfg.Mode))
-	if ai.ProviderNeedsDiff(provider) || (mode != "" && mode != "deterministic") {
-		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner peek skipped (network provider %q; would call out otherwise)", ai.PrimaryProviderName(provider)))
-		return
+	res.OK = false
+	res.Incomplete = true
+	res.Error = recoveryErr.Error()
+	res.Notes = append(res.Notes,
+		"pre-existing chain recovery stopped with an error; completed recovery refs remain valid and remaining captures are unchanged")
+	if err := renderCommitAll(out, res, jsonOut); err != nil {
+		return err
 	}
-	pending, err := state.PendingEvents(ctx, db, cfg.IntentWindow)
-	if err != nil || len(pending) == 0 {
-		return
+	return &commitAllRecoveryError{Cause: recoveryErr, PendingAfter: res.PendingAfter}
+}
+
+func finishCommitAllReplay(
+	ctx context.Context,
+	out io.Writer,
+	repo string,
+	db *state.DB,
+	cctx daemon.CaptureContext,
+	res commitAllResult,
+	jsonOut bool,
+	replayErr error,
+) error {
+	if replayErr != nil {
+		pending, err := countCommitAllUnpublishedPair(ctx, db, cctx)
+		if err != nil {
+			res.Notes = append(res.Notes, fmt.Sprintf("post-error pending recount failed: %v", err))
+		} else {
+			res.PendingAfter = pending
+			if res.PendingBefore >= pending {
+				res.Drained = res.PendingBefore - pending
+			}
+		}
+		res.OK = false
+		res.Incomplete = true
+		res.Error = replayErr.Error()
+		res.Notes = append(res.Notes, "replay stopped with an error; captured work remains protected")
 	}
-	offered := make([]ai.OfferedCapture, 0, len(pending))
-	for _, ev := range pending {
-		offered = append(offered, ai.OfferedCapture{
-			Seq:       ev.Seq,
-			Path:      ev.Path,
-			Op:        ev.Operation,
-			Timestamp: time.Unix(0, int64(ev.CapturedTS*1e9)),
-			Fidelity:  ev.Fidelity,
-		})
+	if newHead, err := git.RevParse(ctx, repo, "HEAD"); err == nil {
+		res.HeadAfter = newHead
+	} else {
+		slog.Default().Warn("acd commit-all: post-loop HEAD lookup failed", slog.String("err", err.Error()))
+		res.Notes = append(res.Notes, fmt.Sprintf("post-loop HEAD lookup failed: %v", err))
 	}
-	req, rerr := ai.NewIntentPlanRequest(ai.IntentPlanRequestOptions{OfferedCaptures: offered})
-	if rerr != nil {
-		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: build planner request: %v", rerr))
-		return
+	if replayErr == nil {
+		return finishCommitAll(out, res, jsonOut)
 	}
-	plan, perr := planner.PlanIntent(ctx, req)
-	if perr != nil {
-		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner preview failed: %v", perr))
-		return
+	if err := renderCommitAll(out, res, jsonOut); err != nil {
+		return err
 	}
-	if len(plan.SelectedSeqs) > 0 {
-		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner would select %d capture(s) for the next commit", len(plan.SelectedSeqs)))
-	}
-	if len(plan.DeferredSeqs) > 0 {
-		res.Notes = append(res.Notes, fmt.Sprintf("dry-run: planner would defer %d capture(s)", len(plan.DeferredSeqs)))
-	}
-	if subj := strings.TrimSpace(plan.Subject); subj != "" {
-		res.Notes = append(res.Notes, "dry-run: planner subject preview: "+subj)
-	}
+	return &commitAllReplayError{Cause: replayErr, PendingAfter: res.PendingAfter}
 }
 
 func renderCommitAll(out io.Writer, res commitAllResult, jsonOut bool) error {
@@ -569,6 +1090,10 @@ func renderCommitAll(out io.Writer, res commitAllResult, jsonOut bool) error {
 	}
 	if res.DryRun {
 		fmt.Fprintf(out, "commit-all DRY RUN for %s (%s @ %s)\n", res.Repo, res.BranchRef, shortenSHA(res.HeadBefore))
+	} else if res.Incomplete {
+		fmt.Fprintf(out, "commit-all incomplete for %s (%s)\n", res.Repo, res.BranchRef)
+	} else if !res.OK {
+		fmt.Fprintf(out, "commit-all stopped for %s (%s)\n", res.Repo, res.BranchRef)
 	} else {
 		fmt.Fprintf(out, "commit-all complete for %s (%s)\n", res.Repo, res.BranchRef)
 	}

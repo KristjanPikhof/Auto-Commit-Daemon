@@ -159,6 +159,8 @@ func TestReplay_ReconcilesLiveIndexAfterPublishedCreate(t *testing.T) {
 }
 
 func TestReplay_ReconcilesLiveIndexForTrackedChanges(t *testing.T) {
+	runBoundedParallel(t)
+
 	for _, tc := range []struct {
 		name string
 		edit func(t *testing.T, f *captureFixture)
@@ -632,6 +634,8 @@ func TestReplay_NonRegularMarkerFailOpen(t *testing.T) {
 // 1k-event queue at 64 events per pass would otherwise stall behind the
 // ~1s poll interval.
 func TestReplay_BoundedBatchYields(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2244,6 +2248,8 @@ func TestReplay_BatchHaltsOnBlockedConflict(t *testing.T) {
 // isolated GIT_INDEX_FILE from BaseHead and advances it per event, so each
 // event's before-state matches the prior event's after-state.
 func TestReplay_ModifyChain_OrderedReplay(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2404,6 +2410,8 @@ func TestReplay_EventStrategyIgnoresIntentPlanner(t *testing.T) {
 }
 
 func TestReplay_IntentStrategyWaitsBelowMinPendingBeforeMaxAge(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2447,6 +2455,8 @@ func TestReplay_IntentStrategyWaitsBelowMinPendingBeforeMaxAge(t *testing.T) {
 }
 
 func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2491,6 +2501,8 @@ func TestReplay_IntentStrategyPlansWhenMinPendingReached(t *testing.T) {
 }
 
 func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2575,6 +2587,8 @@ func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
 }
 
 func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2623,6 +2637,8 @@ func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
 }
 
 func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2678,6 +2694,8 @@ func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *te
 }
 
 func TestReplay_IntentStrategyPlansWhenOldestPendingReachesMaxAge(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -2722,6 +2740,8 @@ func TestReplay_IntentStrategyPlansWhenOldestPendingReachesMaxAge(t *testing.T) 
 }
 
 func TestReplay_IntentStrategyFlushBypassesBatchWait(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3081,6 +3101,8 @@ func TestReplay_IntentStrategyBatchWaitSeesOnlyBarrierVisiblePending(t *testing.
 }
 
 func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3160,6 +3182,8 @@ func TestReplay_IntentStrategyPublishesSelectedCapturesAsOneCommit(t *testing.T)
 }
 
 func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3228,6 +3252,8 @@ func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T)
 }
 
 func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3290,6 +3316,8 @@ func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) 
 }
 
 func TestReplay_IntentStrategyRecordsDeferralsAndForcesAgingWindow(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5383,6 +5411,8 @@ func captureSamePathEdit(t *testing.T, ctx context.Context, f *captureFixture, p
 // one row per original seq joined by commit_oid (so the CLI's grouped_seqs
 // derivation reports len 4).
 func TestReplay_IntentSamePathCapturesRemainPlannerVisible(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5505,6 +5535,8 @@ func TestReplay_IntentSamePathCapturesRemainPlannerVisible(t *testing.T) {
 }
 
 func TestReplay_IntentSameFileIndependentFunctionsRemainPlannerVisible(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5554,6 +5586,8 @@ func TestReplay_IntentSameFileIndependentFunctionsRemainPlannerVisible(t *testin
 // TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce: a same-path capture
 // surrounded by an other-path capture stays as 3 separate offers.
 func TestReplay_IntentPathCoalesce_PQPDoesNotCoalesce(t *testing.T) {
+	runBoundedParallel(t)
+
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -5657,9 +5691,8 @@ func TestReplay_IntentPathCoalesce_DisabledViaEnv(t *testing.T) {
 }
 
 // TestReplay_IntentPathCoalesce_BarrierStopsCoalesce: a blocked_conflict
-// barrier between two same-path captures keeps the suffix invisible to the
-// planner (state.PendingEvents already filters past the barrier), so coalesce
-// cannot fold across it.
+// anywhere in the pair bypasses planning and atomically protects the entire
+// unpublished chain, including earlier pending and later hidden rows.
 func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -5679,8 +5712,8 @@ func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 		state.EventStateBlockedConflict, "synthetic barrier for test", seq2); err != nil {
 		t.Fatalf("force blocked seq=%d: %v", seq2, err)
 	}
-	captureSamePathEdit(t, ctx, f, "barrier.txt", "v3\n")
-	captureSamePathEdit(t, ctx, f, "barrier.txt", "v4\n")
+	seq3 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v3\n")
+	seq4 := captureSamePathEdit(t, ctx, f, "barrier.txt", "v4\n")
 
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil {
@@ -5710,13 +5743,31 @@ func TestReplay_IntentPathCoalesce_BarrierStopsCoalesce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if sum.Published != 1 || sum.Conflicts != 0 || sum.Failed != 0 {
-		t.Fatalf("summary=%+v want 1 published (barrier hides rest)", sum)
+	if sum.Published != 0 || sum.Conflicts != 0 || sum.Failed != 0 || !sum.RecaptureRequired {
+		t.Fatalf("summary=%+v want one protected chain awaiting recapture", sum)
 	}
 	if planner.calls != 0 {
-		t.Fatalf("planner calls=%d want 0 (visible pre-barrier singleton uses fast path)", planner.calls)
+		t.Fatalf("planner calls=%d want 0 (recovery bypasses planning)", planner.calls)
 	}
-	assertReplayDecision(t, ctx, f.db, seq1, state.DecisionKindCommitted, "intent_group: singleton fast path")
+	var snapshotCommit, recoveryRef string
+	var eventCount int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT commit_oid, recovery_ref, event_count
+FROM recovery_snapshots`).Scan(&snapshotCommit, &recoveryRef, &eventCount); err != nil {
+		t.Fatalf("query recovery snapshot: %v", err)
+	}
+	if eventCount != 4 || recoveryRef == "" {
+		t.Fatalf("snapshot event_count=%d ref=%q want 4 protected events", eventCount, recoveryRef)
+	}
+	for _, seq := range []int64{seq1, seq2, seq3, seq4} {
+		gotState, oid := readEventState(t, ctx, f.db, seq)
+		if gotState != state.EventStateRecovered || !oid.Valid || oid.String != snapshotCommit {
+			t.Fatalf("seq=%d state=%q oid=%v want recovered at %s", seq, gotState, oid, snapshotCommit)
+		}
+	}
+	if bootstrapped, err := IsShadowBootstrapped(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration); err != nil || bootstrapped {
+		t.Fatalf("shadow marker after recovery=%v err=%v want invalidated", bootstrapped, err)
+	}
 }
 
 // TestReplay_PathQuiescenceGateDefersOfferUntilWindowElapses runs the

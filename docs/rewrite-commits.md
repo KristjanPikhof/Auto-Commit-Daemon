@@ -46,7 +46,7 @@ export ACD_AI_API_KEY=...
 fine for showing or applying an existing saved plan.
 
 Rewrite plans use the active `ACD_COMMIT_FORMAT` when they are generated. The
-default is `imperative`, so existing rewrite behavior stays unchanged. Set
+default is `imperative`. Set
 `ACD_COMMIT_FORMAT=conventional` to request scope-less Conventional Commit
 subjects such as `fix: preserve rewrite plan format`. Accepted conventional
 types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`,
@@ -62,10 +62,6 @@ bullets keep the same `- ` prefix and wrapping rules in both modes.
 | `--range-nr <start-end>` | Rewrite a 1-based contiguous range. Newer commits are recreated unchanged when needed. |
 | `--range-sha <base>..<head>` | Rewrite a simple git range. Base is exclusive, head is inclusive. |
 | `--last <n>` | Rewrite the newest `n` commits. |
-| `--from <sha|position>` | Compatibility selector; prefer `--from-sha` or `--from-nr`. |
-| `--range <start-end>` | Compatibility selector; prefer `--range-nr`. |
-| `--git-range <base>..<head>` | Advanced compatibility revset. |
-| `--base <base> --head <head>` | Deprecated alias for the explicit git range. |
 
 Examples:
 
@@ -75,8 +71,10 @@ acd rewrite-commits --from-nr 5 --plan-only
 acd rewrite-commits --range-nr 5-12 --review --format text
 acd rewrite-commits --range-sha main~12..main~4 --format json
 acd rewrite-commits --last 4 --no-review --yes
-acd rewrite-commits --git-range main~12..main~4 --format json
 ~~~
+
+The CLI also accepts compatibility selectors. Use `acd rewrite-commits --help`
+when you need to open a plan created with one of those forms.
 
 ## Progress output
 
@@ -122,16 +120,16 @@ without accidentally applying malformed subjects.
 `--progress auto|plain|json|off` is accepted by generate, edit, and apply modes
 that run through the rewrite command.
 
+For fresh plan generation, `--json` prints the resolved selection and exits
+before calling the provider. Use normal text output to generate and save a new
+plan.
+
 ~~~text
 acd rewrite-commits --from-sha <sha> [--plan-out FILE] [--review|--no-review] [--format text|json] [--progress auto|plain|json|off] [--plan-only|--yes]
 acd rewrite-commits --from-nr <position> [--plan-out FILE] [--review|--no-review] [--format text|json] [--progress auto|plain|json|off] [--plan-only|--yes]
 acd rewrite-commits --range-nr <start-end> [--plan-out FILE] [--review|--no-review] [--format text|json] [--progress auto|plain|json|off] [--plan-only|--yes]
 acd rewrite-commits --range-sha <base>..<head> [--plan-out FILE] [--review|--no-review] [--format text|json] [--progress auto|plain|json|off] [--plan-only|--yes]
 acd rewrite-commits --last <n> [--plan-out FILE] [--review|--no-review] [--format text|json] [--plan-only|--yes]
-acd rewrite-commits --git-range <base>..<head> [--plan-out FILE] [--review|--no-review] [--format text|json] [--plan-only|--yes]
-acd rewrite-commits --from <sha|position> [compatibility]
-acd rewrite-commits --range <start-end> [compatibility]
-acd rewrite-commits --base <base> [--head <head>] [--plan-out FILE] [--review|--no-review] [--format text|json] [--plan-only|--yes]
 acd rewrite-commits --show-plan FILE
 acd rewrite-commits --edit <plan-id-or-file> [--format text|json] [--plan-only|--yes|--dry-run]
 acd rewrite-commits --apply-plan FILE (--yes | --dry-run)

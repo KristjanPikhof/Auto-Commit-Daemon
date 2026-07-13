@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,14 +35,21 @@ var (
 	acdBinary     string
 	acdBinaryDir  string
 	acdBinaryErr  error
+
+	repoTemplateOnce sync.Once
+	repoTemplateDir  string
+	repoTemplateErr  error
 )
 
-// TestMain owns process-wide setup/teardown — currently just removing the
-// build cache directory after the suite completes so /tmp stays clean.
+// TestMain removes package-scoped binary and repository fixtures after the
+// suite completes so /tmp stays clean.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if acdBinaryDir != "" {
 		_ = os.RemoveAll(acdBinaryDir)
+	}
+	if repoTemplateDir != "" {
+		_ = os.RemoveAll(repoTemplateDir)
 	}
 	os.Exit(code)
 }
@@ -102,23 +110,95 @@ func buildAcdBinary(t *testing.T) string {
 // cleanup beyond t.TempDir's automatic teardown.
 func tempRepo(t *testing.T) string {
 	t.Helper()
+	repoTemplateOnce.Do(initRepoTemplate)
+	if repoTemplateErr != nil {
+		t.Fatalf("initialize integration repo template: %v", repoTemplateErr)
+	}
+
 	dir := t.TempDir()
-	gitInit(t, dir)
-	// Configure a user so commits succeed without global config.
-	for _, kv := range [][]string{
-		{"user.email", "acd-integration@example.com"},
-		{"user.name", "ACD Integration"},
-		{"commit.gpgsign", "false"},
-	} {
-		runGitOK(t, dir, "config", kv[0], kv[1])
+	if err := copyRepoTemplate(repoTemplateDir, dir); err != nil {
+		t.Fatalf("materialize integration repo template: %v", err)
 	}
-	// Seed commit so HEAD exists.
-	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("# acd integration seed\n"), 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	runGitOK(t, dir, "add", ".gitignore")
-	runGitOK(t, dir, "commit", "-q", "-m", "seed")
 	return dir
+}
+
+func initRepoTemplate() {
+	dir, err := os.MkdirTemp("", "acd-integration-repo-template-*")
+	if err != nil {
+		repoTemplateErr = err
+		return
+	}
+	repoTemplateDir = dir
+
+	if out, err := exec.Command("git", "init", "-q", dir).CombinedOutput(); err != nil {
+		repoTemplateErr = fmt.Errorf("git init: %w\n%s", err, out)
+		return
+	}
+	for _, args := range [][]string{
+		{"symbolic-ref", "HEAD", "refs/heads/main"},
+		{"config", "user.email", "acd-integration@example.com"},
+		{"config", "user.name", "ACD Integration"},
+		{"config", "commit.gpgsign", "false"},
+	} {
+		if out, err := runGit(dir, args...); err != nil {
+			repoTemplateErr = fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
+			return
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("# acd integration seed\n"), 0o644); err != nil {
+		repoTemplateErr = fmt.Errorf("write seed: %w", err)
+		return
+	}
+	for _, args := range [][]string{{"add", ".gitignore"}, {"commit", "-q", "-m", "seed"}} {
+		if out, err := runGit(dir, args...); err != nil {
+			repoTemplateErr = fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
+			return
+		}
+	}
+}
+
+func copyRepoTemplate(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, target)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("unsupported fixture entry %s with mode %s", rel, info.Mode())
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+		if err != nil {
+			_ = in.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		return errors.Join(copyErr, out.Close(), in.Close())
+	})
 }
 
 // gitInit runs `git init -q dir`.

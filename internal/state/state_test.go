@@ -84,8 +84,8 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 		"daemon_state", "daemon_clients", "shadow_paths",
 		"capture_events", "capture_ops", "planner_state", "intent_planner_windows",
 		"intent_planner_window_events", "rewrite_plans", "rewrite_plan_commits",
-		"flush_requests", "decision_records", "publish_state", "daemon_meta",
-		"daily_rollups",
+		"flush_requests", "decision_records", "recovery_snapshots",
+		"recovery_snapshot_events", "publish_state", "daemon_meta", "daily_rollups",
 	}
 	for _, table := range tables {
 		var name string
@@ -848,162 +848,6 @@ func TestPendingEventsStopsAfterTerminalPredecessor(t *testing.T) {
 	}
 }
 
-func TestDeleteStaleUnpublishedForBranchGeneration(t *testing.T) {
-	t.Parallel()
-	d, _ := openTestDB(t)
-	ctx := context.Background()
-
-	appendEvent := func(branch string, generation int64, baseHead, stateName, path string) int64 {
-		t.Helper()
-		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
-			BranchRef:        branch,
-			BranchGeneration: generation,
-			BaseHead:         baseHead,
-			Operation:        "modify",
-			Path:             path,
-			Fidelity:         "exact",
-			State:            stateName,
-		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
-		if err != nil {
-			t.Fatalf("append %s: %v", path, err)
-		}
-		return seq
-	}
-
-	stalePending := appendEvent("refs/heads/main", 7, "old", EventStatePending, "stale-pending.txt")
-	staleBlocked := appendEvent("refs/heads/main", 7, "old", EventStateBlockedConflict, "stale-blocked.txt")
-	currentPending := appendEvent("refs/heads/main", 7, "new", EventStatePending, "current-pending.txt")
-	stalePublished := appendEvent("refs/heads/main", 7, "old", EventStatePublished, "stale-published.txt")
-	otherBranch := appendEvent("refs/heads/feature", 7, "old", EventStatePending, "other-branch.txt")
-	otherGeneration := appendEvent("refs/heads/main", 8, "old", EventStatePending, "other-generation.txt")
-
-	n, err := DeleteStaleUnpublishedForBranchGeneration(ctx, d, "refs/heads/main", 7, "new")
-	if err != nil {
-		t.Fatalf("DeleteStaleUnpublishedForBranchGeneration: %v", err)
-	}
-	if n != 2 {
-		t.Fatalf("deleted=%d want 2", n)
-	}
-
-	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
-	if err != nil {
-		t.Fatalf("query remaining: %v", err)
-	}
-	defer rows.Close()
-	remaining := map[int64]bool{}
-	for rows.Next() {
-		var seq int64
-		if err := rows.Scan(&seq); err != nil {
-			t.Fatalf("scan remaining: %v", err)
-		}
-		remaining[seq] = true
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate remaining: %v", err)
-	}
-	for _, seq := range []int64{stalePending, staleBlocked} {
-		if remaining[seq] {
-			t.Fatalf("stale unpublished seq %d survived; remaining=%v", seq, remaining)
-		}
-	}
-	for _, seq := range []int64{currentPending, stalePublished, otherBranch, otherGeneration} {
-		if !remaining[seq] {
-			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
-		}
-	}
-}
-
-// TestDeletePendingForBranchGeneration pins the branch-scoped pending wipe
-// used by `acd commit-all` to clear stale rows before forcing a shadow reseed.
-// Must scope by (branch_ref, branch_generation) AND must never delete terminal
-// rows (published, failed, blocked_conflict).
-func TestDeletePendingForBranchGeneration(t *testing.T) {
-	t.Parallel()
-	d, _ := openTestDB(t)
-	ctx := context.Background()
-
-	appendEvent := func(branch string, generation int64, stateName, path string) int64 {
-		t.Helper()
-		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
-			BranchRef:        branch,
-			BranchGeneration: generation,
-			BaseHead:         "deadbeef",
-			Operation:        "modify",
-			Path:             path,
-			Fidelity:         "exact",
-			State:            stateName,
-		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
-		if err != nil {
-			t.Fatalf("append %s: %v", path, err)
-		}
-		return seq
-	}
-
-	// Target rows (branch=main, gen=1, state=pending) — must be deleted.
-	targetA := appendEvent("refs/heads/main", 1, EventStatePending, "target-a.txt")
-	targetB := appendEvent("refs/heads/main", 1, EventStatePending, "target-b.txt")
-
-	// Same branch+gen but terminal — must survive.
-	keepPublished := appendEvent("refs/heads/main", 1, EventStatePublished, "keep-published.txt")
-	keepFailed := appendEvent("refs/heads/main", 1, EventStateFailed, "keep-failed.txt")
-	keepBlocked := appendEvent("refs/heads/main", 1, EventStateBlockedConflict, "keep-blocked.txt")
-
-	// Different branch (same gen number) — must survive.
-	otherBranch := appendEvent("refs/heads/feature", 1, EventStatePending, "other-branch.txt")
-	// Different gen (same branch) — must survive.
-	otherGen := appendEvent("refs/heads/main", 2, EventStatePending, "other-gen.txt")
-
-	n, err := DeletePendingForBranchGeneration(ctx, d, "refs/heads/main", 1)
-	if err != nil {
-		t.Fatalf("DeletePendingForBranchGeneration: %v", err)
-	}
-	if n != 2 {
-		t.Fatalf("deleted=%d want 2 (only the two target pending rows)", n)
-	}
-
-	// Verify the survivors and casualties.
-	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
-	if err != nil {
-		t.Fatalf("query remaining: %v", err)
-	}
-	defer rows.Close()
-	remaining := map[int64]bool{}
-	for rows.Next() {
-		var seq int64
-		if err := rows.Scan(&seq); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		remaining[seq] = true
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iter: %v", err)
-	}
-	for _, seq := range []int64{targetA, targetB} {
-		if remaining[seq] {
-			t.Fatalf("target seq %d survived; remaining=%v", seq, remaining)
-		}
-	}
-	for _, seq := range []int64{keepPublished, keepFailed, keepBlocked, otherBranch, otherGen} {
-		if !remaining[seq] {
-			t.Fatalf("seq %d wrongly deleted; remaining=%v", seq, remaining)
-		}
-	}
-
-	// Empty branch_ref must error rather than nuking everything.
-	if _, err := DeletePendingForBranchGeneration(ctx, d, "", 1); err == nil {
-		t.Fatalf("empty branch_ref must error")
-	}
-
-	// Idempotent: a second call deletes zero.
-	n2, err := DeletePendingForBranchGeneration(ctx, d, "refs/heads/main", 1)
-	if err != nil {
-		t.Fatalf("second call: %v", err)
-	}
-	if n2 != 0 {
-		t.Fatalf("second call deleted=%d want 0", n2)
-	}
-}
-
 func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -1029,16 +873,16 @@ func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 
 	prunedBlocked := appendEvent("refs/heads/main", 1, "old-blocked.txt", 10, EventStateBlockedConflict)
 	prunedFailed := appendEvent("refs/heads/failed", 1, "old-failed.txt", 11, EventStateFailed)
+	unprotected := appendEvent("refs/heads/unprotected", 1, "old-unprotected.txt", 11, EventStateFailed)
 	barrier := appendEvent("refs/heads/barrier", 1, "barrier.txt", 12, EventStateBlockedConflict)
 	pendingBehindBarrier := appendEvent("refs/heads/barrier", 1, "pending.txt", 13, EventStatePending)
 	freshFailed := appendEvent("refs/heads/fresh", 1, "fresh-failed.txt", 200, EventStateFailed)
-
 	n, err := PruneTerminalEventsBefore(ctx, d, 100)
 	if err != nil {
 		t.Fatalf("PruneTerminalEventsBefore: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("pruned=%d want 2", n)
+	if n != 0 {
+		t.Fatalf("pruned=%d want 0; unresolved terminal rows are never pruned", n)
 	}
 
 	rows, err := d.SQL().QueryContext(ctx, `SELECT seq FROM capture_events ORDER BY seq ASC`)
@@ -1057,10 +901,7 @@ func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate remaining: %v", err)
 	}
-	if remaining[prunedBlocked] || remaining[prunedFailed] {
-		t.Fatalf("stale terminal rows survived: remaining=%v", remaining)
-	}
-	for _, seq := range []int64{barrier, pendingBehindBarrier, freshFailed} {
+	for _, seq := range []int64{prunedBlocked, prunedFailed, unprotected, barrier, pendingBehindBarrier, freshFailed} {
 		if !remaining[seq] {
 			t.Fatalf("seq %d should remain; remaining=%v", seq, remaining)
 		}
@@ -1072,8 +913,138 @@ func TestPruneTerminalEventsBeforePreservesActiveBarriers(t *testing.T) {
 		prunedBlocked, prunedFailed).Scan(&opCount); err != nil {
 		t.Fatalf("count pruned ops: %v", err)
 	}
-	if opCount != 0 {
-		t.Fatalf("capture_ops for pruned rows=%d want 0", opCount)
+	if opCount != 2 {
+		t.Fatalf("capture_ops for terminal rows=%d want 2", opCount)
+	}
+}
+
+func TestPrunePublishedEventsPreservesSnapshotMembers(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	appendPublished := func(path string) int64 {
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: "deadbeef", Operation: "create", Path: path,
+			Fidelity: "full", CapturedTS: 10, State: EventStatePublished,
+		}, []CaptureOp{{Op: "create", Path: path, Fidelity: "full"}})
+		if err != nil {
+			t.Fatalf("append published %s: %v", path, err)
+		}
+		return seq
+	}
+	protected := appendPublished("protected-published.txt")
+	unprotected := appendPublished("unprotected-published.txt")
+	res, err := d.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshots(
+    created_ts, outcome, branch_ref, branch_generation,
+    first_event_seq, last_event_seq, event_count,
+    commit_oid, recovery_ref, reason
+) VALUES (20, ?, 'refs/heads/main', 1, ?, ?, 1, 'commit',
+          'refs/acd/recovery/prune-published', 'retention test')`,
+		EventStatePublished, protected, protected)
+	if err != nil {
+		t.Fatalf("insert published snapshot: %v", err)
+	}
+	snapshotID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("snapshot id: %v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx,
+		`INSERT INTO recovery_snapshot_events(snapshot_id, ord, event_seq) VALUES (?, 0, ?)`,
+		snapshotID, protected); err != nil {
+		t.Fatalf("insert published member: %v", err)
+	}
+
+	n, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("ordinary published pruned=%d want 1", n)
+	}
+	var protectedCount, unprotectedCount int
+	if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE seq = ?`, protected).Scan(&protectedCount); err != nil {
+		t.Fatalf("count protected published: %v", err)
+	}
+	if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE seq = ?`, unprotected).Scan(&unprotectedCount); err != nil {
+		t.Fatalf("count ordinary published: %v", err)
+	}
+	if protectedCount != 1 || unprotectedCount != 0 {
+		t.Fatalf("counts protected=%d ordinary=%d", protectedCount, unprotectedCount)
+	}
+
+	n, err = PruneRecoverySnapshotEventsBefore(ctx, d, snapshotID, 100)
+	if err != nil {
+		t.Fatalf("PruneRecoverySnapshotEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("protected published pruned=%d want 1", n)
+	}
+}
+
+func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T) {
+	for _, unpublishedState := range []string{
+		EventStatePending,
+		EventStateBlockedConflict,
+		EventStateFailed,
+	} {
+		t.Run(unpublishedState, func(t *testing.T) {
+			t.Parallel()
+			d, _ := openTestDB(t)
+			ctx := context.Background()
+			appendEvent := func(baseHead, path, eventState string) int64 {
+				t.Helper()
+				seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+					BranchRef: "refs/heads/main", BranchGeneration: 7,
+					BaseHead: baseHead, Operation: "modify", Path: path,
+					Fidelity: "exact", CapturedTS: 10, State: eventState,
+				}, []CaptureOp{{
+					Op: "modify", Path: path,
+					BeforeOID: sqlNullStr("before-" + path), BeforeMode: sqlNullStr("100644"),
+					AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+					Fidelity: "exact",
+				}})
+				if err != nil {
+					t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+				}
+				return seq
+			}
+
+			prefix := appendEvent("shared-base", "prefix.txt", EventStatePublished)
+			ordinary := appendEvent("other-base", "ordinary.txt", EventStatePublished)
+			suffix := appendEvent("shared-base", "suffix.txt", unpublishedState)
+
+			n, err := PrunePublishedEventsBefore(ctx, d, 100)
+			if err != nil {
+				t.Fatalf("PrunePublishedEventsBefore: %v", err)
+			}
+			if n != 1 {
+				t.Fatalf("pruned=%d want only ordinary published row", n)
+			}
+			for _, seq := range []int64{prefix, suffix} {
+				var eventCount, opCount int
+				if err := d.SQL().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&eventCount); err != nil {
+					t.Fatalf("count event seq=%d: %v", seq, err)
+				}
+				if err := d.SQL().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM capture_ops WHERE event_seq = ?`, seq).Scan(&opCount); err != nil {
+					t.Fatalf("count ops seq=%d: %v", seq, err)
+				}
+				if eventCount != 1 || opCount != 1 {
+					t.Fatalf("recovery context seq=%d event=%d ops=%d want 1,1", seq, eventCount, opCount)
+				}
+			}
+			var ordinaryCount int
+			if err := d.SQL().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+				t.Fatalf("count ordinary published: %v", err)
+			}
+			if ordinaryCount != 0 {
+				t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
+			}
+		})
 	}
 }
 
@@ -1519,6 +1490,90 @@ WHERE type = 'index' AND name = 'idx_capture_events_barrier' AND tbl_name = 'cap
 	}
 	if !strings.Contains(planText.String(), "idx_capture_events_barrier") {
 		t.Fatalf("query plan did not select idx_capture_events_barrier:\n%s", planText.String())
+	}
+}
+
+func TestState_RecoveryPrefixPruneIndexMigratesFromV12(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+
+	fresh, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatalf("close fresh: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+DROP INDEX idx_capture_events_recovery_prefix;
+PRAGMA user_version = 12;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v12 schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v12: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("user_version=%d want %d", uv, SchemaVersion)
+	}
+
+	var name string
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master
+WHERE type = 'index'
+  AND name = 'idx_capture_events_recovery_prefix'
+  AND tbl_name = 'capture_events'`).Scan(&name); err != nil {
+		t.Fatalf("idx_capture_events_recovery_prefix missing after v12 migration: %v", err)
+	}
+
+	rows, err := d.SQL().QueryContext(ctx, `
+EXPLAIN QUERY PLAN
+SELECT 1
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND base_head = ?
+  AND seq > ?
+  AND state IN (?, ?, ?)`,
+		"refs/heads/main", 1, "base", 1,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+	)
+	if err != nil {
+		t.Fatalf("explain recovery-prefix lookup: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan recovery-prefix plan: %v", err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate recovery-prefix plan: %v", err)
+	}
+	if !strings.Contains(plan.String(), "idx_capture_events_recovery_prefix") {
+		t.Fatalf("query plan did not select recovery-prefix index:\n%s", plan.String())
 	}
 }
 

@@ -242,6 +242,51 @@ done
 	}
 }
 
+func TestSubprocess_RewriteIntentMessageValidationErrorsAreTyped(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+	}{
+		{name: "malformed response", response: "{"},
+		{name: "empty subject", response: `{"version":1,"subject":"","body":"","error":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			skipIfWindows(t)
+			dir := t.TempDir()
+			script := fmt.Sprintf(`
+while IFS= read -r line; do
+  printf '%%s\n' '%s'
+done
+`, tc.response)
+			bin := writePluginScript(t, dir, "test", script)
+			p := NewSubprocessProvider("test", SubprocessOptions{
+				LookPath: fixedLookPath("acd-provider-test", bin),
+				Timeout:  5 * time.Second,
+				Stderr:   io.Discard,
+			})
+			t.Cleanup(func() { _ = p.Close() })
+
+			req := sampleIntentPlanRequest(t)
+			plan := IntentPlan{
+				SelectedSeqs:   []int64{101},
+				DeferredSeqs:   []int64{102},
+				Subject:        "Update parsed",
+				GroupingReason: "checkout service change is focused",
+				DeferredReasons: []DeferredReason{{
+					Seq:    102,
+					Reason: "docs change is independent",
+				}},
+			}
+			rewriteReq := NewIntentMessageRewriteRequest(req, plan, EvaluateIntentPlanMessageQuality(req, plan))
+			_, err := p.RewriteIntentMessage(context.Background(), rewriteReq)
+			var validationErr *IntentMessageRewriteValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("error=%T %v want IntentMessageRewriteValidationError", err, err)
+			}
+		})
+	}
+}
+
 func TestSubprocess_RewriteIntentMessagePromptTraceUsesRewriteStrategy(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -533,9 +578,9 @@ done
 
 // TestSubprocess_Timeout makes the plugin sleep longer than the timeout.
 // The runner must kill the plugin on timeout and respawn on the next
-// Generate. We point the second invocation at a *different* script (via
-// a fresh provider sharing the same temp dir prefix) to keep the test
-// straightforward.
+// Generate. We point the same provider at a different script before the
+// second invocation so the killed shell cannot race an in-place rewrite of
+// its executable.
 func TestSubprocess_Timeout(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -565,14 +610,18 @@ done
 		t.Errorf("timeout fired far too late: %v", elapsed)
 	}
 
-	// After timeout the provider should be ready to respawn. Swap the
-	// plugin to a fast one and retry — the new process is a fresh pid.
-	fastBin := writePluginScript(t, dir, "slow", `
+	// After timeout the provider should be ready to respawn. Point it at a
+	// distinct fast plugin and retry — the new process is a fresh pid.
+	fastBin := writePluginScript(t, dir, "fast", `
 while IFS= read -r line; do
   printf '{"version":1,"subject":"fast","body":"","error":""}\n'
 done
 `)
-	_ = fastBin // same path as slowBin, overwritten in place
+	p.binary = fastBin
+	// The timeout behavior was proved above. Give process startup a wider
+	// budget for the respawn assertion because package-level race tests run in
+	// parallel and can delay a healthy child under load.
+	p.timeout = 10 * time.Second
 	r, err := p.Generate(context.Background(), CommitContext{Path: "a", Op: "modify"})
 	if err != nil {
 		t.Fatalf("respawn Generate: %v", err)
