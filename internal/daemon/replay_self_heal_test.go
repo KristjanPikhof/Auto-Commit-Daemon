@@ -496,6 +496,76 @@ func TestReplay_ArchivesWhenAncestryFails(t *testing.T) {
 	assertRecoverySnapshot(t, ctx, f, seq, commitOID.String, base, afterBlob)
 }
 
+func TestReconcile_PublishesPathspecMagicFilenameLiterally(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	const capturedPath = ":(top)colon.txt"
+	before, _ := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	after, _ := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	distractor, _ := git.HashObjectStdin(ctx, f.dir, []byte("distractor\n"))
+
+	baseTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: before, Path: capturedPath},
+		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: "colon.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Mktree base: %v", err)
+	}
+	base, err := git.CommitTree(ctx, f.dir, baseTree, "base with pathspec-magic filename", f.cctx.BaseHead)
+	if err != nil {
+		t.Fatalf("CommitTree base: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update base: %v", err)
+	}
+	f.cctx.BaseHead = base
+
+	seq := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: capturedPath,
+		BeforeOID: sql.NullString{String: before, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: after, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	markRecoveryBarrier(t, ctx, f, seq, base, "modify before-state mismatch for "+capturedPath)
+
+	externalTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
+		{Mode: git.RegularFileMode, Type: "blob", OID: after, Path: capturedPath},
+		{Mode: git.RegularFileMode, Type: "blob", OID: distractor, Path: "colon.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Mktree external: %v", err)
+	}
+	external, err := git.CommitTree(ctx, f.dir, externalTree, "publish pathspec-magic filename", base)
+	if err != nil {
+		t.Fatalf("CommitTree external: %v", err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, external, base); err != nil {
+		t.Fatalf("update external: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         seq,
+		Trigger:          "test_literal_pathspec_recovery",
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStatePublished || result.CommitOID != external {
+		t.Fatalf("result=%+v want published at %s", result, external)
+	}
+	gotState, commitOID := readEventState(t, ctx, f.db, seq)
+	if gotState != state.EventStatePublished || !commitOID.Valid || commitOID.String != external {
+		t.Fatalf("event state=%q commit=%v want published at %s", gotState, commitOID, external)
+	}
+	if resolved, err := git.RevParse(ctx, f.dir, result.RecoveryRef); err != nil || resolved != external {
+		t.Fatalf("proof ref=%s err=%v want %s", resolved, err, external)
+	}
+}
+
 func TestReplay_ReconcilesWholeSquashedChain(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
