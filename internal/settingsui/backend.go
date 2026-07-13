@@ -17,17 +17,17 @@ type Backend interface {
 }
 
 type Snapshot struct {
-	Fields              []FieldValue
-	ActiveRevision      int64
-	DesiredRevision     int64
-	AppliedRevision     int64
-	LastKnownGood       int64
-	PendingSince        time.Time
-	PendingError        string
-	DaemonRunning       bool
-	Experiment          Experiment
-	SavedGeneration     uint64
-	Profile             string
+	Fields          []FieldValue
+	ActiveRevision  int64
+	DesiredRevision int64
+	AppliedRevision int64
+	LastKnownGood   int64
+	PendingSince    time.Time
+	PendingError    string
+	DaemonRunning   bool
+	Experiment      Experiment
+	SavedGeneration uint64
+	Profile         string
 }
 
 type FieldValue struct {
