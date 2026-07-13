@@ -10,24 +10,31 @@
    hooks = true
    ~~~
    Do not set `hooks = false`; that disables Codex lifecycle hooks.
-3. Write the snippet straight to disk: `acd setup codex --raw > ~/.codex/hooks.json`. The raw output is strict Codex-compatible JSON with only `hooks` at the top level. Codex reads this file before inline hook configuration. `acd setup codex` without `--raw` prints the same JSON with comment-prefixed instructions, so copy only the JSON block when you use that form. JSON does not allow comments.
+3. Write the snippet straight to disk:
+
+   ~~~bash
+   acd setup codex --raw > ~/.codex/hooks.json
+   ~~~
+
+   Raw output is strict Codex-compatible JSON with only `hooks` at the top
+   level. Codex reads this file before inline hook configuration.
+   `acd setup codex` without `--raw` prints the same JSON with comment-prefixed
+   instructions, so copy only the JSON block when you use that form. JSON does
+   not allow comments.
 
    **Overwrite warning:** the shell redirect above replaces the entire file. If
    you have custom non-acd hooks in `~/.codex/hooks.json`, back up that file
    first and then merge the acd JSON block in manually rather than using `>`.
 
 4. Restart Codex.
-5. **Approve the hooks.** Codex flags every newly-added hook entry as "review required" and refuses to run them until you approve. On first launch you will see `5 hooks need review before they can run. Open /hooks to review them.` Run `/hooks` inside Codex and approve all five (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`). Until you approve, the daemon never starts and `acd status` will show no Codex client.
+5. Approve the hooks. Codex marks new hook entries as "review required" and
+   refuses to run them until you approve. Run `/hooks` inside Codex and approve
+   `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
+   Until then, `acd status` will show no Codex client.
 
-   **Re-approval on update:** Codex re-flags every hook entry as review-required
-   whenever `hooks.json` content changes, even if only the ACD block was
-   re-written. After any `acd setup codex --raw > ~/.codex/hooks.json` re-run
-   (including migrations), open Codex and run `/hooks` again to approve the
-   updated entries. Until you do, the daemon will not start for new sessions.
-
-   Run `acd doctor` to check whether your installed snippet is current; it warns
-   when active hooks are missing `acd start` or `acd wake` and shows the
-   remediation command.
+Codex asks for approval again whenever `hooks.json` changes. After regenerating
+the file, run `/hooks` and approve the updated entries before opening a new
+session.
 
 Run `acd doctor` after setup. If it reports ACD hooks in both `hooks.json` and
 an inline `config.toml` block, remove the ACD-managed inline block. Codex loads
