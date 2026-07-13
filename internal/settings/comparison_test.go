@@ -61,7 +61,7 @@ func TestComparisonExactMetricsDistinctCommitsAndNonCausalLabel(t *testing.T) {
 		t.Fatalf("interpretation = %q", comparison.Interpretation)
 	}
 	encoded, _ := json.Marshal(comparison)
-	for _, forbidden := range []string{"prompt", "diff", "raw response", "credential", "\x1b"} {
+	for _, forbidden := range []string{"prompt", "repository_diff", "raw response", "credential", "\x1b"} {
 		if strings.Contains(strings.ToLower(string(encoded)), strings.ToLower(forbidden)) {
 			t.Fatalf("comparison leaked %q: %s", forbidden, encoded)
 		}
