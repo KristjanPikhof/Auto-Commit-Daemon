@@ -98,7 +98,7 @@ func TestSettingsRuntimeRailStaleDraftAndRejectionDoNotApply(t *testing.T) {
 		t.Fatalf("stale err=%v calls=%d", err, svc.applyCalls)
 	}
 	svc.err = errors.New("rejected\x1b[2J\x00secret-free")
-	if _, err := b.Test(context.Background(), map[string]string{}); err == nil || err.Error() != "rejectedsecret-free" {
+	if _, err := b.Test(context.Background(), map[string]string{}); err == nil || err.Error() != "rejected secret-free" {
 		t.Fatalf("sanitized err=%q", err)
 	}
 }
@@ -156,7 +156,7 @@ func TestSettingsProfileExperimentStartProgressCancel(t *testing.T) {
 	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository})
 	_, _ = b.Snapshot(context.Background())
 	_, _ = b.Test(context.Background(), map[string]string{config.FieldModel: "candidate"})
-	got, err := b.StartExperiment(context.Background(), map[string]string{config.FieldModel: "candidate"}, 10)
+	got, err := b.StartExperiment(context.Background(), map[string]string{config.FieldModel: "candidate"}, ExperimentOptions{WindowBudget: 10})
 	if err != nil || got.ID != 4 || svc.startedWindows != 10 {
 		t.Fatalf("start=%+v err=%v", got, err)
 	}
@@ -164,7 +164,7 @@ func TestSettingsProfileExperimentStartProgressCancel(t *testing.T) {
 	if err != nil || !cancel.Queued || svc.cancelledExperiment != 4 {
 		t.Fatalf("cancel=%+v err=%v", cancel, err)
 	}
-	if _, err := b.StartExperiment(context.Background(), nil, 0); err == nil {
+	if _, err := b.StartExperiment(context.Background(), nil, ExperimentOptions{}); err == nil {
 		t.Fatal("unbounded experiment accepted")
 	}
 }

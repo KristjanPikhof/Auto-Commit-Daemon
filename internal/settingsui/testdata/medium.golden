@@ -5,15 +5,18 @@ FIELDS                                     | DETAILS
   Model: new-model *                       | Provider used for synthetic tests and futu
   Base URL: https://example.invalid/v1     | Source: environment
   Timeout: inherit                         | Changed: no
-  API key: [set]                           | Apply: next safe boundary
-  Diff egress: inherit                     | Active: deterministic
-  Commit strategy: intent                  | Draft: openai-compat
-  Commit format: inherit                   |
-  Sensitive globs: defaults                | REVISION
-  Filesystem notifications: inherit        | DRAFT [yes] > TESTED [yes]
-                                           | QUEUED r8 > ACTIVE r7
-                                           | Desired: r8
-                                           | Applied: r7
-                                           | Experiment: 3/10 windows (descriptive)
-                                           | QUEUED: applies at next safe boundary
-[j/k] nav [enter] edit [/] find [t] test [a] apply [r] revert [x] experiment [q] quit
+  CA file: inherit                         | Apply: next safe boundary
+  API key: [set]                           | Active: deterministic
+  Diff egress: inherit                     | Draft: openai-compat
+  Commit strategy: intent                  |
+  Commit format: inherit                   | REVISION
+  Intent window: inherit                   | DRAFT [yes] > TESTED [yes]
+  Minimum pending: inherit                 | QUEUED r8 > ACTIVE r7
+  Settle window: inherit                   | Desired: r8
+  Maximum pending age: inherit             | Applied: r7
+  Recent commits: inherit                  | Experiment setup: 10 windows, expiry none,
+  Defer limit: inherit                     | Experiment: 3/10 windows (descriptive)
+  Invalid retries: inherit                 | QUEUED: applies at next safe boundary
+  Path coalescing: inherit                 |
+  Maximum file bytes: inherit              |
+[q] quit [j/k] nav [enter] edit [/] find [s] save [t] test [a] apply [r] revert [p...

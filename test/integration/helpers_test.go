@@ -321,7 +321,12 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	}
 	time.Sleep(inputDelay)
 	if input != "" {
-		_, _ = io.WriteString(stdin, input)
+		for i, chunk := range strings.Split(input, "\x00") {
+			if i > 0 {
+				time.Sleep(700 * time.Millisecond)
+			}
+			_, _ = io.WriteString(stdin, chunk)
+		}
 	}
 	_ = stdin.Close()
 	err = cmd.Wait()

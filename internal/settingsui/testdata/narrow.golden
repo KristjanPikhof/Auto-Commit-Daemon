@@ -1,6 +1,6 @@
 ACD SETTINGS  QUEUED  profile: daily
 ------------------------------------------------------------
-FIELD 1/10
+FIELD 1/29
 > Provider: openai-compat
 Source: environment
 Changed: no
@@ -12,4 +12,4 @@ DRAFT [yes] > TESTED [yes]
 QUEUED r8 > ACTIVE r7
 Experiment: 3/10 windows (descriptive)
 QUEUED: applies at next safe boundary
-[j/k] nav [e] edit [/] find [t] test [a] apply [q] quit
+[q] quit [j/k] nav [e] edit [s] save [t] test [a] appl...

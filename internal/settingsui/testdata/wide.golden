@@ -5,10 +5,26 @@ FIELDS                                 | DETAILS                                
   Model: new-model *                   | Provider used for synthetic tests and  | QUEUED r8 > ACTIVE r7
   Base URL: https://example.invalid/v1 | Source: environment                    | Desired: r8
   Timeout: inherit                     | Changed: no                            | Applied: r7
-  API key: [set]                       | Apply: next safe boundary              | Experiment: 3/10 windows (descriptive)
-  Diff egress: inherit                 | Active: deterministic                  | QUEUED: applies at next safe boundary
-  Commit strategy: intent              | Draft: openai-compat                   |
+  CA file: inherit                     | Apply: next safe boundary              | Experiment setup: 10 windows, expiry n
+  API key: [set]                       | Active: deterministic                  | Experiment: 3/10 windows (descriptive)
+  Diff egress: inherit                 | Draft: openai-compat                   | QUEUED: applies at next safe boundary
+  Commit strategy: intent              |                                        |
   Commit format: inherit               |                                        |
+  Intent window: inherit               |                                        |
+  Minimum pending: inherit             |                                        |
+  Settle window: inherit               |                                        |
+  Maximum pending age: inherit         |                                        |
+  Recent commits: inherit              |                                        |
+  Defer limit: inherit                 |                                        |
+  Invalid retries: inherit             |                                        |
+  Path coalescing: inherit             |                                        |
+  Maximum file bytes: inherit          |                                        |
+  Maximum pending events: inherit      |                                        |
   Sensitive globs: defaults            |                                        |
+  Safe ignore: inherit                 |                                        |
+  Extra safe ignores: inherit          |                                        |
   Filesystem notifications: inherit    |                                        |
-[up/down] navigate  [enter] edit  [/] search  [t] test  [a] apply  [r] revert  [x] experiment  [q] quit
+  Trace: inherit                       |                                        |
+  Prompt trace: [unset]                |                                        |
+  Event retention days: inherit        |                                        |
+[q] quit [up/down] navigate [enter] edit [/] search [s] save [t] test [a] apply [r] revert [p] profile [x/X] start...

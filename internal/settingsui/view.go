@@ -25,9 +25,17 @@ func (m Model) Render() string {
 	draftRail := fmt.Sprintf("DRAFT %s > TESTED %s", mark(m.IsDirty()), mark(m.Test.OK && m.TestFingerprint == m.Fingerprint()))
 	applyRail := fmt.Sprintf("QUEUED r%d > ACTIVE r%d", m.PendingRevision, m.AppliedRevision)
 	left := []string{"FIELDS"}
-	for i, f := range fields {
+	displayFields := fields
+	if m.Width >= 70 {
+		limit := max(1, m.Height-10)
+		if len(displayFields) > limit {
+			start := max(0, min(m.Focus-limit/2, len(displayFields)-limit))
+			displayFields = displayFields[start : start+limit]
+		}
+	}
+	for _, f := range displayFields {
 		prefix := "  "
-		if i == m.Focus {
+		if f.Key == m.ActiveField().Key {
 			prefix = "> "
 		}
 		value := m.Draft[f.Key]
@@ -39,7 +47,7 @@ func (m Model) Render() string {
 			dirty = " *"
 		}
 		line := fmt.Sprintf("%s%s: %s%s", prefix, f.Label, fallback(value, "inherit"), dirty)
-		if i == m.Focus {
+		if f.Key == m.ActiveField().Key {
 			line = t.render(t.Focus, line)
 		}
 		left = append(left, line)
@@ -54,6 +62,8 @@ func (m Model) Render() string {
 		}
 	}
 	state := []string{"REVISION", draftRail, applyRail, fmt.Sprintf("Desired: r%d", m.PendingRevision), fmt.Sprintf("Applied: r%d", m.AppliedRevision)}
+	expiry := []string{"none", "15m", "1h"}[m.ExperimentExpiry]
+	state = append(state, fmt.Sprintf("Experiment setup: %d windows, expiry %s, policy %s", m.ExperimentBudget, expiry, m.ExperimentPolicy))
 	if m.Snapshot.PendingError != "" {
 		state = append(state, "Failure: "+m.Snapshot.PendingError)
 	}
@@ -103,11 +113,11 @@ func (m Model) Render() string {
 		}
 		body = strings.Join(compact, "\n")
 	}
-	footer := "[up/down] navigate  [enter] edit  [/] search  [t] test  [a] apply  [r] revert  [x] experiment  [q] quit"
+	footer := "[q] quit [up/down] navigate [enter] edit [/] search [s] save [t] test [a] apply [r] revert [p] profile [x/X] start/cancel experiment [b/z/f] budget/expiry/policy"
 	if m.Width < 70 {
-		footer = "[j/k] nav [e] edit [/] find [t] test [a] apply [q] quit"
+		footer = "[q] quit [j/k] nav [e] edit [s] save [t] test [a] apply [x/X] experiment"
 	} else if m.Width < 100 {
-		footer = "[j/k] nav [enter] edit [/] find [t] test [a] apply [r] revert [x] experiment [q] quit"
+		footer = "[q] quit [j/k] nav [enter] edit [/] find [s] save [t] test [a] apply [r] revert [p] profile [x/X] experiment"
 	}
 	if m.Mode == ModeConfirmQuit {
 		footer = "Unsaved DRAFT. [d/y] discard and quit  [esc] continue editing"
@@ -169,10 +179,13 @@ func normalizeRender(s string, width, height int, ascii bool) string {
 	return strings.Join(out, "\n")
 }
 func lifecycle(m Model) string {
+	if m.Snapshot.PendingStatus == "rejected" || m.Snapshot.PendingError != "" {
+		return "REJECTED"
+	}
 	if m.Err != "" || strings.HasPrefix(m.Status, "FAILED") {
 		return "FAILED"
 	}
-	if m.PendingRevision > m.AppliedRevision {
+	if m.PendingRevision > 0 && m.PendingRevision != m.AppliedRevision {
 		return "QUEUED"
 	}
 	if m.Test.OK && m.TestFingerprint == m.Fingerprint() {
@@ -181,7 +194,10 @@ func lifecycle(m Model) string {
 	if m.IsDirty() {
 		return "DRAFT"
 	}
-	return "ACTIVE"
+	if m.AppliedRevision > 0 && m.PendingRevision == m.AppliedRevision {
+		return "ACTIVE"
+	}
+	return "DRAFT"
 }
 func mark(v bool) string {
 	if v {

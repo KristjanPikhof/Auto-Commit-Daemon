@@ -3,7 +3,9 @@ package settingsui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
@@ -171,6 +173,8 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case key.Matches(msg, m.keys.Test):
 		return m, m.start("test", func(ctx context.Context) (any, error) { return m.backend.Test(ctx, sanitizedDraft(m.Draft)) })
+	case key.Matches(msg, m.keys.Save):
+		return m, m.start("save", func(ctx context.Context) (any, error) { return m.backend.Save(ctx, sanitizedDraft(m.Draft)) })
 	case key.Matches(msg, m.keys.Apply):
 		if !m.IsDirty() {
 			m.Status = "DRAFT: no changes"
@@ -183,7 +187,52 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.start("revert", func(ctx context.Context) (any, error) { return m.backend.Revert(ctx, m.Snapshot.LastKnownGood) })
 	case key.Matches(msg, m.keys.Experiment):
 		return m, m.start("experiment", func(ctx context.Context) (any, error) {
-			return m.backend.StartExperiment(ctx, sanitizedDraft(m.Draft), 10)
+			expiry := time.Duration(0)
+			if m.ExperimentExpiry == 1 {
+				expiry = 15 * time.Minute
+			} else if m.ExperimentExpiry == 2 {
+				expiry = time.Hour
+			}
+			return m.backend.StartExperiment(ctx, sanitizedDraft(m.Draft), ExperimentOptions{
+				WindowBudget: m.ExperimentBudget, ExpiresAfter: expiry, FailurePolicy: m.ExperimentPolicy})
+		})
+	case key.Matches(msg, m.keys.CancelExperiment):
+		if !m.Experiment.Active {
+			m.Status = "EXPERIMENT: no active experiment"
+			return m, nil
+		}
+		return m, m.start("cancel experiment", func(ctx context.Context) (any, error) {
+			return m.backend.CancelExperiment(ctx, m.Experiment.ID)
+		})
+	case key.Matches(msg, m.keys.Budget):
+		switch m.ExperimentBudget {
+		case 10:
+			m.ExperimentBudget = 50
+		case 50:
+			m.ExperimentBudget = 100
+		default:
+			m.ExperimentBudget = 10
+		}
+		m.Status = fmt.Sprintf("EXPERIMENT: budget %d windows", m.ExperimentBudget)
+	case key.Matches(msg, m.keys.Expiry):
+		m.ExperimentExpiry = (m.ExperimentExpiry + 1) % 3
+		m.Status = "EXPERIMENT: expiry " + []string{"none", "15m", "1h"}[m.ExperimentExpiry]
+	case key.Matches(msg, m.keys.Policy):
+		if m.ExperimentPolicy == "continue" {
+			m.ExperimentPolicy = "revert"
+		} else {
+			m.ExperimentPolicy = "continue"
+		}
+		m.Status = "EXPERIMENT: failure policy " + m.ExperimentPolicy
+	case key.Matches(msg, m.keys.Profile):
+		if len(m.Snapshot.Profiles) == 0 {
+			m.Status = "PROFILE: no named profiles available"
+			return m, nil
+		}
+		profile := m.Snapshot.Profiles[m.ProfileIndex%len(m.Snapshot.Profiles)]
+		m.ProfileIndex++
+		return m, m.start("select profile", func(ctx context.Context) (any, error) {
+			return m.backend.SelectProfile(ctx, profile)
 		})
 	}
 	return m, nil
@@ -206,7 +255,11 @@ func (m *Model) start(name string, fn func(context.Context) (any, error)) tea.Cm
 
 func sanitizeSnapshot(s Snapshot) Snapshot {
 	s.PendingError = safeText(s.PendingError)
+	s.PendingStatus = safeText(s.PendingStatus)
 	s.Profile = safeText(s.Profile)
+	for i := range s.Profiles {
+		s.Profiles[i] = safeText(s.Profiles[i])
+	}
 	for i := range s.Fields {
 		s.Fields[i].Key = safeText(s.Fields[i].Key)
 		s.Fields[i].Source = safeText(s.Fields[i].Source)

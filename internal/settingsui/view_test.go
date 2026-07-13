@@ -33,6 +33,11 @@ func TestResponsiveGoldenViews(t *testing.T) {
 			m := viewModel(tc.w, tc.h)
 			got := m.Render()
 			path := filepath.Join("testdata", tc.name+".golden")
+			if os.Getenv("UPDATE_GOLDEN") == "1" {
+				if err := os.WriteFile(path, []byte(got+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			want, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatalf("%v\n--- got ---\n%s", err, got)

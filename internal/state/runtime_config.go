@@ -353,6 +353,92 @@ WHERE EXISTS (SELECT 1 FROM config_revisions WHERE id=?)
 	return ConfigExperimentByID(ctx, d, id)
 }
 
+// RequestConfigExperimentActivation makes the experiment visible before its
+// candidate can become desired. A daemon can therefore never lease the
+// candidate without the durable experiment ID used to count and revert it.
+func RequestConfigExperimentActivation(ctx context.Context, d *DB, in ConfigExperimentInput, expectedDesired sql.NullInt64) (ConfigExperiment, ConfigActivationRequest, bool, error) {
+	if d == nil || in.BaselineRevisionID <= 0 || in.CandidateRevisionID <= 0 ||
+		in.BaselineRevisionID == in.CandidateRevisionID || in.WindowBudget <= 0 {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: RequestConfigExperimentActivation: invalid input")
+	}
+	policy := strings.TrimSpace(in.FailurePolicy)
+	if policy == "" {
+		policy = "continue"
+	}
+	if _, err := safeConfigLabel("failure policy", policy); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: begin experiment activation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := ensureRuntimeConfigState(ctx, tx); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
+	}
+	var current sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT desired_revision_id FROM runtime_config_state WHERE id=1`).Scan(&current); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: read desired revision: %w", err)
+	}
+	if !equalNullInt64(current, expectedDesired) || !current.Valid || current.Int64 != in.BaselineRevisionID {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, nil
+	}
+	var exists, active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM config_revisions WHERE id IN (?,?)`, in.BaselineRevisionID, in.CandidateRevisionID).Scan(&exists); err != nil || exists != 2 {
+		if err == nil {
+			err = sql.ErrNoRows
+		}
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment revisions: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM config_experiments WHERE status='active')`).Scan(&active); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: read active experiment: %w", err)
+	}
+	if active != 0 {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: active config experiment already exists")
+	}
+	now := nowSeconds()
+	expRes, err := tx.ExecContext(ctx, `
+INSERT INTO config_experiments(
+    baseline_revision_id, candidate_revision_id, window_budget,
+    expires_ts, failure_policy, status, created_ts, updated_ts
+) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`, in.BaselineRevisionID,
+		in.CandidateRevisionID, in.WindowBudget, in.ExpiresTS, policy, now, now)
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: create config experiment activation: %w", err)
+	}
+	experimentID, err := expRes.LastInsertId()
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment activation id: %w", err)
+	}
+	reqRes, err := tx.ExecContext(ctx, `
+INSERT INTO config_activation_requests(
+    revision_id, prior_desired_revision_id, status, requested_ts
+) VALUES (?, ?, 'pending', ?)`, in.CandidateRevisionID, current, now)
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: insert experiment activation request: %w", err)
+	}
+	requestID, err := reqRes.LastInsertId()
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment activation request id: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_config_state
+SET desired_revision_id=?, desired_request_id=?, desired_ts=?, last_error=NULL, updated_ts=?
+WHERE id=1`, in.CandidateRevisionID, requestID, now, now); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: set experiment desired revision: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: commit experiment activation: %w", err)
+	}
+	experiment, err := ConfigExperimentByID(ctx, d, experimentID)
+	if err != nil {
+		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
+	}
+	request := ConfigActivationRequest{ID: requestID, RevisionID: in.CandidateRevisionID,
+		PriorDesiredRevisionID: current, Status: ActivationPending, RequestedTS: now}
+	return experiment, request, true, nil
+}
+
 func ConfigExperimentByID(ctx context.Context, d *DB, id int64) (ConfigExperiment, error) {
 	var out ConfigExperiment
 	err := d.readSQL().QueryRowContext(ctx, `
@@ -512,7 +598,7 @@ func hasUnsafeConfigString(value any) bool {
 	switch typed := value.(type) {
 	case string:
 		return strings.IndexFunc(typed, func(r rune) bool {
-			return r == '\x1b' || (!unicode.IsPrint(r) && !unicode.IsSpace(r))
+			return !unicode.IsPrint(r) || r == '\u007f'
 		}) >= 0
 	case map[string]any:
 		for key, child := range typed {
@@ -541,12 +627,13 @@ func safeConfigLabel(name, value string) (string, error) {
 }
 
 func nullableSanitizedText(value string) sql.NullString {
-	value = strings.TrimSpace(strings.Map(func(r rune) rune {
-		if r == '\x1b' || (!unicode.IsPrint(r) && !unicode.IsSpace(r)) {
-			return -1
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) && r != '\u007f' {
+			return r
 		}
-		return r
-	}, value))
+		return ' '
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
 	if len(value) > 1024 {
 		value = value[:1024]
 	}

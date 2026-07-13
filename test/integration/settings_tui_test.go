@@ -98,12 +98,45 @@ func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 	accessible := runPTYCommand(t, ctx, baseEnv, 72, 28, 0, 0, "\x03", bin, "settings", "--repo", repo, "--accessible")
 	cancel()
+	if accessible.ExitCode == 0 {
+		t.Fatalf("cancelled accessible action unexpectedly succeeded\n%s", accessible.Stdout)
+	}
 	if !strings.Contains(accessible.Stdout, "ACD SETTINGS - accessible mode") || !strings.Contains(accessible.Stdout, "set/unset only; value never displayed") {
 		t.Fatalf("accessible transcript missing\n%s", accessible.Stdout)
 	}
 	if strings.Contains(accessible.Stdout, "\x1b[?1049h") {
 		t.Fatalf("accessible mode entered alternate screen\n%q", accessible.Stdout)
 	}
+}
+
+func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// Edit provider, save, wait for the real config write, then quit.
+	saved := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
+		"\r\x15openai-compat\rs\x00q", bin, "settings", "--repo", repo)
+	cancel()
+	if saved.ExitCode != 0 || !strings.Contains(saved.Stdout, "draft saved") {
+		t.Fatalf("save action exit=%d\n%s", saved.ExitCode, saved.Stdout)
+	}
+	assertAltScreenRestored(t, saved.Stdout)
+	if body := readOptionalFile(t, settingsConfigPath(env)); !strings.Contains(body, `"ai.provider": "openai-compat"`) {
+		t.Fatalf("save action did not persist scoped provider: %s", body)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+	// Make the provider invalid, exercise the asynchronous strict-test error,
+	// wait for it to render, then use the dirty-discard path to exit.
+	failed := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
+		"\r\x15invalid-provider\rt\x00qd", bin, "settings", "--repo", repo)
+	cancel()
+	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "FAILED:") {
+		t.Fatalf("failed action exit=%d\n%s", failed.ExitCode, failed.Stdout)
+	}
+	assertAltScreenRestored(t, failed.Stdout)
 }
 
 func TestSettingsTUIProductionBinaryIsCGODisabled(t *testing.T) {
