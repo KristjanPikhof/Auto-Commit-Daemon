@@ -262,8 +262,8 @@ commands most useful while reading the capture and replay internals:
 | Stream new decisions | `acd events --watch` |
 | Explain one path | `acd explain --path FILE` |
 | Explain one commit | `acd explain --commit HEAD` |
-| All registered repos | `acd list` |
-| Wide repo table | `acd list --verbose` |
+| Enabled repo dashboard | `acd list` |
+| One wide repo snapshot | `acd list --once --verbose` |
 | Machine-readable repo table | `acd list --json` |
 | Interactive repo lifecycle manager | `acd list --interactive` |
 | Raw daemon log | `acd logs --follow` |
