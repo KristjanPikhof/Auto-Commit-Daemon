@@ -2,6 +2,7 @@ package settingsui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -21,7 +22,8 @@ func (m Model) Render() string {
 		m.Focus = len(fields) - 1
 	}
 	header := t.render(t.Title, "ACD SETTINGS") + "  " + lifecycle(m) + fmt.Sprintf("  profile: %s", fallback(m.Snapshot.Profile, "default"))
-	rail := fmt.Sprintf("DRAFT %s > TESTED %s > QUEUED r%d > ACTIVE r%d", mark(m.IsDirty()), mark(m.Test.OK && m.TestFingerprint == m.Fingerprint()), m.PendingRevision, m.AppliedRevision)
+	draftRail := fmt.Sprintf("DRAFT %s > TESTED %s", mark(m.IsDirty()), mark(m.Test.OK && m.TestFingerprint == m.Fingerprint()))
+	applyRail := fmt.Sprintf("QUEUED r%d > ACTIVE r%d", m.PendingRevision, m.AppliedRevision)
 	left := []string{"FIELDS"}
 	for i, f := range fields {
 		prefix := "  "
@@ -50,7 +52,7 @@ func (m Model) Render() string {
 			detail = append(detail, "Value: [set/unset only; never displayed]")
 		}
 	}
-	state := []string{"REVISION", rail, fmt.Sprintf("Desired: r%d", m.PendingRevision), fmt.Sprintf("Applied: r%d", m.AppliedRevision)}
+	state := []string{"REVISION", draftRail, applyRail, fmt.Sprintf("Desired: r%d", m.PendingRevision), fmt.Sprintf("Applied: r%d", m.AppliedRevision)}
 	if m.Snapshot.PendingError != "" {
 		state = append(state, "Failure: "+m.Snapshot.PendingError)
 	}
@@ -68,12 +70,36 @@ func (m Model) Render() string {
 		combined := append(append(detail, ""), state...)
 		body = columns(m.Width, strings.Join(left, "\n"), strings.Join(combined, "\n"))
 	default:
-		combined := append(append(left, ""), detail...)
-		combined = append(combined, "")
-		combined = append(combined, state...)
-		body = strings.Join(combined, "\n")
+		fieldLine := "No matching fields"
+		if active.Key != "" {
+			value := m.Draft[active.Key]
+			if active.Sensitive {
+				value = secretState(m.Snapshot.Fields, active.Key)
+			}
+			fieldLine = "> " + active.Label + ": " + fallback(value, "inherit")
+		}
+		compact := []string{
+			"FIELD " + fmt.Sprintf("%d/%d", min(m.Focus+1, len(fields)), len(fields)),
+			fieldLine,
+			"Source: " + fieldSource(m.Snapshot.Fields, active.Key),
+			"Changed: " + changed(m, active.Key),
+			"Apply: " + fallback(active.Apply, "next safe boundary"),
+			"REVISION", draftRail, applyRail,
+		}
+		if m.Experiment.Active {
+			compact = append(compact, fmt.Sprintf("Experiment: %d/%d windows (descriptive)", m.Experiment.CompletedWindows, m.Experiment.TotalWindows))
+		}
+		if m.Status != "" {
+			compact = append(compact, m.Status)
+		}
+		body = strings.Join(compact, "\n")
 	}
 	footer := "[up/down] navigate  [enter] edit  [/] search  [t] test  [a] apply  [r] revert  [x] experiment  [q] quit"
+	if m.Width < 70 {
+		footer = "[j/k] nav [e] edit [/] find [t] test [a] apply [q] quit"
+	} else if m.Width < 100 {
+		footer = "[j/k] nav [enter] edit [/] find [t] test [a] apply [r] revert [x] experiment [q] quit"
+	}
 	if m.Mode == ModeConfirmQuit {
 		footer = "Unsaved DRAFT. [d/y] discard and quit  [esc] continue editing"
 	}
@@ -87,7 +113,7 @@ func (m Model) Render() string {
 		footer = "Search: " + m.input.View() + "  [enter] filter  [esc] cancel"
 	}
 	out := header + "\n" + strings.Repeat("-", max(1, min(m.Width, 120))) + "\n" + body + "\n" + footer
-	return normalizeRender(out, m.Width, m.Height)
+	return normalizeRender(out, m.Width, m.Height, m.noColor || m.accessible || strings.ToLower(os.Getenv("TERM")) == "dumb")
 }
 
 func columns(width int, parts ...string) string {
@@ -115,12 +141,16 @@ func columns(width int, parts ...string) string {
 	}
 	return strings.Join(out, "\n")
 }
-func normalizeRender(s string, width, height int) string {
+func normalizeRender(s string, width, height int, ascii bool) string {
 	var out []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimRight(line, " ")
 		if ansi.StringWidth(line) > width {
-			line = ansi.Truncate(line, width-1, "…")
+			suffix := "…"
+			if ascii {
+				suffix = "..."
+			}
+			line = ansi.Truncate(line, width-len(suffix), suffix)
 		}
 		out = append(out, line)
 		if height > 0 && len(out) >= height {

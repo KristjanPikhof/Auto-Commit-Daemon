@@ -9,6 +9,7 @@ import (
 
 func viewModel(width, height int) Model {
 	m := New(nil)
+	m.noColor = true
 	m.Width = width
 	m.Height = height
 	m.Snapshot = baseSnapshot()
@@ -34,12 +35,12 @@ func TestResponsiveGoldenViews(t *testing.T) {
 			path := filepath.Join("testdata", tc.name+".golden")
 			want, err := os.ReadFile(path)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("%v\n--- got ---\n%s", err, got)
 			}
 			if got != strings.TrimSuffix(string(want), "\n") {
 				t.Fatalf("golden mismatch %s\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, want)
 			}
-			for _, text := range []string{"Source:", "Changed:", "Apply:", "DRAFT", "> TESTED", "> QUEUED", "> ACTIVE", "Experiment:", "descriptive", "[q] quit"} {
+			for _, text := range []string{"Source:", "Changed:", "Apply:", "DRAFT", "TESTED", "QUEUED", "ACTIVE", "Experiment:", "descriptive", "[q] quit"} {
 				if !strings.Contains(got, text) {
 					t.Errorf("missing %q", text)
 				}
@@ -77,6 +78,28 @@ func TestThemeNoColorAndDumb(t *testing.T) {
 				t.Fatal("status relied on color")
 			}
 		})
+	}
+}
+
+func TestThemeColorEnabled(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "xterm-256color")
+	if !NewTheme(false).Enabled {
+		t.Fatal("color-capable terminal unexpectedly disabled")
+	}
+	if !NewThemeForBackground(false, false).Enabled || !NewThemeForBackground(false, true).Enabled {
+		t.Fatal("light/dark themes must both retain styled rendering")
+	}
+}
+
+func TestThemeDumbRenderingIsASCII(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	m := viewModel(40, 20)
+	m.noColor = false
+	for _, r := range m.Render() {
+		if r > 127 {
+			t.Fatalf("non-ASCII rune %q in dumb terminal", r)
+		}
 	}
 }
 
