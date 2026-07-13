@@ -1493,6 +1493,90 @@ WHERE type = 'index' AND name = 'idx_capture_events_barrier' AND tbl_name = 'cap
 	}
 }
 
+func TestState_RecoveryPrefixPruneIndexMigratesFromV12(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	dbPath := DBPathFromGitDir(gitDir)
+
+	fresh, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatalf("close fresh: %v", err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open raw: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+DROP INDEX idx_capture_events_recovery_prefix;
+PRAGMA user_version = 12;`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed v12 schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open migrated v12: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	uv, err := d.UserVersion(ctx)
+	if err != nil {
+		t.Fatalf("UserVersion: %v", err)
+	}
+	if uv != SchemaVersion {
+		t.Fatalf("user_version=%d want %d", uv, SchemaVersion)
+	}
+
+	var name string
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master
+WHERE type = 'index'
+  AND name = 'idx_capture_events_recovery_prefix'
+  AND tbl_name = 'capture_events'`).Scan(&name); err != nil {
+		t.Fatalf("idx_capture_events_recovery_prefix missing after v12 migration: %v", err)
+	}
+
+	rows, err := d.SQL().QueryContext(ctx, `
+EXPLAIN QUERY PLAN
+SELECT 1
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND base_head = ?
+  AND seq > ?
+  AND state IN (?, ?, ?)`,
+		"refs/heads/main", 1, "base", 1,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+	)
+	if err != nil {
+		t.Fatalf("explain recovery-prefix lookup: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan recovery-prefix plan: %v", err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate recovery-prefix plan: %v", err)
+	}
+	if !strings.Contains(plan.String(), "idx_capture_events_recovery_prefix") {
+		t.Fatalf("query plan did not select recovery-prefix index:\n%s", plan.String())
+	}
+}
+
 // BenchmarkPendingEvents seeds 10k pending rows + a couple of terminal
 // barriers in older generations and measures PendingEvents throughput. The
 // benchmark protects against future regressions where someone drops the
