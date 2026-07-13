@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-07-13
+
 ### Added
 
 - Bare `acd` now gives a read-only health summary and one recommended next
@@ -24,8 +26,9 @@
   terminal barriers or retargets captures to a different branch generation.
 - `acd status` and `acd diagnose` now show planner circuit state, failures,
   deterministic bypasses, and the next automatic provider probe.
-- Updated pinned GitHub Actions dependency `actions/setup-go` from `v6.4.0` to
-  `v6.5.0`.
+- Updated pinned GitHub Actions dependencies: `actions/setup-go` from `v6.4.0`
+  to `v6.5.0`, and `goreleaser/goreleaser-action` from `v7.2.2` to `v7.2.3`.
+- Updated `golang.org/x/sys` from `v0.46.0` to `v0.47.0`.
 - Raised the minimum Go toolchain to 1.26.5 to include the standard-library
   fix for GO-2026-5856.
 
