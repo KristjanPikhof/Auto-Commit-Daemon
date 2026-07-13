@@ -2,7 +2,14 @@ package ai
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -96,5 +103,72 @@ func TestProviderProbeRedactsProviderResponseErrors(t *testing.T) {
 	}
 	if !strings.Contains(result.Error, "[REDACTED]") {
 		t.Fatalf("result error=%q", result.Error)
+	}
+}
+
+func TestStrictProviderReturnsPrimaryResponseFailure(t *testing.T) {
+	secret := "sk-primary-response-secret"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream rejected "+secret, http.StatusBadGateway)
+	}))
+	defer server.Close()
+	certPath := filepath.Join(t.TempDir(), "ca.pem")
+	certificate, err := x509.ParseCertificate(server.Certificate().Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider, closer, err := BuildStrictProvider(ProviderConfig{
+		Mode: "openai-compat", BaseURL: server.URL, APIKey: secret,
+		Model: "test-model", CAFile: certPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer != nil {
+		t.Fatal("unexpected HTTP closer")
+	}
+	_, err = provider.Generate(context.Background(), CommitContext{Path: "synthetic.txt", Op: "modify"})
+	if err == nil {
+		t.Fatal("strict provider unexpectedly fell back")
+	}
+	if strings.Contains(provider.Name(), "deterministic") {
+		t.Fatalf("strict provider composed fallback: %q", provider.Name())
+	}
+	// Raw provider errors are sanitized at the probe boundary used by the UI.
+	result, probeErr := ProbeProvider(context.Background(), provider, time.Second, CommitFormatImperative)
+	if probeErr == nil || result.Success || strings.Contains(result.Error, secret) {
+		t.Fatalf("result=%+v err=%v", result, probeErr)
+	}
+}
+
+func TestProviderProbeConfigClosesOwnedSubprocess(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "closed")
+	script := filepath.Join(dir, "acd-provider-probe")
+	contents := "#!/bin/sh\n" +
+		"IFS= read -r request || exit 1\n" +
+		"printf '%s\\n' '{\"version\":1,\"subject\":\"Probe provider\",\"body\":\"\"}'\n" +
+		"IFS= read -r ignored || printf closed > '" + marker + "'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ProbeProviderConfig(context.Background(), ProviderConfig{
+		Mode: "subprocess:probe",
+		subprocessLookPath: func(name string) (string, error) {
+			if name != "acd-provider-probe" {
+				return "", errors.New("unexpected binary")
+			}
+			return script, nil
+		},
+		subprocessStderr: io.Discard,
+	})
+	if err != nil || !result.Success {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("subprocess close marker: %v", err)
 	}
 }
