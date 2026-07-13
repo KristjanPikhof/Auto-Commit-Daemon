@@ -6,6 +6,15 @@ import (
 	"fmt"
 )
 
+const runtimeConfigV14IndexesDDL = `
+CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_revision_id
+    ON intent_planner_windows(config_revision_id, id);
+CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_experiment_id
+    ON intent_planner_windows(experiment_id, id);
+CREATE INDEX IF NOT EXISTS idx_decision_records_config_revision_id
+    ON decision_records(config_revision_id, id);
+`
+
 const decisionRecordsV6MigrationDDL = `
 DROP TABLE IF EXISTS decision_records_v6;
 
@@ -56,8 +65,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // intent_planner_windows and intent_planner_window_events for lossless,
 // privacy-safe planner-window observability. v12 adds recovery_snapshots and
 // recovery_snapshot_events. v13 adds idx_capture_events_recovery_prefix for
-// bounded published-prefix pruning. Both are pure DDL applied through
-// schemaDDL.
+// bounded published-prefix pruning. v14 adds the runtime settings ledger and
+// additive planner/decision metadata. New tables are pure DDL; columns on
+// existing tables are added explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -105,6 +115,30 @@ func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 	if cur < 10 {
 		if err := addColumnIfMissing(ctx, tx, "rewrite_plans", "commit_format", "TEXT NOT NULL DEFAULT 'imperative'"); err != nil {
 			return err
+		}
+	}
+	if cur < 14 {
+		columns := []struct {
+			table, column, typ string
+		}{
+			{"intent_planner_windows", "config_revision_id", "INTEGER"},
+			{"intent_planner_windows", "config_profile", "TEXT"},
+			{"intent_planner_windows", "duration_ms", "INTEGER"},
+			{"intent_planner_windows", "retry_count", "INTEGER NOT NULL DEFAULT 0"},
+			{"intent_planner_windows", "fallback_used", "INTEGER NOT NULL DEFAULT 0"},
+			{"intent_planner_windows", "outcome", "TEXT"},
+			{"intent_planner_windows", "experiment_id", "INTEGER"},
+			{"intent_planner_windows", "experiment_consumed", "INTEGER NOT NULL DEFAULT 0"},
+			{"decision_records", "config_revision_id", "INTEGER"},
+			{"decision_records", "config_profile", "TEXT"},
+		}
+		for _, col := range columns {
+			if err := addColumnIfMissing(ctx, tx, col.table, col.column, col.typ); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, runtimeConfigV14IndexesDDL); err != nil {
+			return fmt.Errorf("state: add v14 runtime config indexes: %w", err)
 		}
 	}
 	return nil

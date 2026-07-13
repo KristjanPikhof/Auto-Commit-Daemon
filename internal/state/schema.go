@@ -24,8 +24,10 @@ package state
 // intent planner-window summaries for captured-vs-offered observability; v12
 // adds immutable recovery snapshots with ordered, exact event membership; v13
 // adds an index for published-prefix retention while unresolved same-base
-// recovery chains remain in the ledger.
-const SchemaVersion = 13
+// recovery chains remain in the ledger; v14 adds immutable runtime
+// configuration revisions, activation and experiment ledgers, and revision
+// metadata on planner windows and decisions.
+const SchemaVersion = 14
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -156,7 +158,15 @@ CREATE TABLE IF NOT EXISTS intent_planner_windows(
     hidden_seqs           TEXT NOT NULL,
     selected_groups       TEXT NOT NULL,
     deferred_seqs         TEXT NOT NULL,
-    deferred_reasons      TEXT NOT NULL
+    deferred_reasons      TEXT NOT NULL,
+    config_revision_id    INTEGER,
+    config_profile        TEXT,
+    duration_ms           INTEGER,
+    retry_count           INTEGER NOT NULL DEFAULT 0,
+    fallback_used         INTEGER NOT NULL DEFAULT 0,
+    outcome               TEXT,
+    experiment_id         INTEGER,
+    experiment_consumed   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_ts_id
@@ -243,7 +253,9 @@ CREATE TABLE IF NOT EXISTS decision_records(
     branch_ref          TEXT,
     branch_generation   INTEGER,
     action_taken        TEXT,
-    user_message        TEXT
+    user_message        TEXT,
+    config_revision_id  INTEGER,
+    config_profile      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_decision_records_ts_id
@@ -257,6 +269,97 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_event_seq_id
 
 CREATE INDEX IF NOT EXISTS idx_decision_records_commit_oid_id
     ON decision_records(commit_oid, id);
+
+-- v14 runtime settings ledger. Snapshots contain only canonical, sanitized
+-- JSON. Triggers make the append-only contract explicit even for callers that
+-- bypass package helpers.
+CREATE TABLE IF NOT EXISTS config_revisions(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_ts          REAL NOT NULL,
+    profile             TEXT NOT NULL,
+    scope               TEXT NOT NULL,
+    snapshot_json       TEXT NOT NULL,
+    snapshot_hash       TEXT NOT NULL,
+    source_generation   INTEGER NOT NULL CHECK (source_generation >= 0),
+    reason              TEXT,
+    UNIQUE(snapshot_hash, profile, scope, source_generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_revisions_scope_created
+    ON config_revisions(scope, created_ts, id);
+
+CREATE TRIGGER IF NOT EXISTS config_revisions_no_update
+BEFORE UPDATE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS config_revisions_no_delete
+BEFORE DELETE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS runtime_config_state(
+    id                       INTEGER PRIMARY KEY CHECK (id = 1),
+    desired_revision_id      INTEGER,
+    applied_revision_id      INTEGER,
+    last_known_good_revision_id INTEGER,
+    desired_request_id       INTEGER,
+    desired_ts               REAL,
+    applied_ts               REAL,
+    last_error               TEXT,
+    updated_ts               REAL NOT NULL,
+    FOREIGN KEY (desired_revision_id) REFERENCES config_revisions(id),
+    FOREIGN KEY (applied_revision_id) REFERENCES config_revisions(id),
+    FOREIGN KEY (last_known_good_revision_id) REFERENCES config_revisions(id)
+);
+
+CREATE TABLE IF NOT EXISTS config_activation_requests(
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id          INTEGER NOT NULL,
+    prior_desired_revision_id INTEGER,
+    status               TEXT NOT NULL CHECK (status IN
+                           ('pending','acknowledged','applied','rejected','cancelled')),
+    requested_ts         REAL NOT NULL,
+    acknowledged_ts      REAL,
+    completed_ts         REAL,
+    error                TEXT,
+    FOREIGN KEY (revision_id) REFERENCES config_revisions(id),
+    FOREIGN KEY (prior_desired_revision_id) REFERENCES config_revisions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_activation_requests_status_id
+    ON config_activation_requests(status, id);
+
+CREATE INDEX IF NOT EXISTS idx_config_activation_requests_revision_id
+    ON config_activation_requests(revision_id, id);
+
+CREATE TABLE IF NOT EXISTS config_experiments(
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_revision_id INTEGER NOT NULL,
+    candidate_revision_id INTEGER NOT NULL,
+    window_budget        INTEGER NOT NULL CHECK (window_budget > 0),
+    completed_windows    INTEGER NOT NULL DEFAULT 0 CHECK (completed_windows >= 0),
+    expires_ts           REAL,
+    failure_policy       TEXT NOT NULL,
+    status               TEXT NOT NULL CHECK (status IN
+                           ('active','completed','expired','failed','cancelled')),
+    created_ts           REAL NOT NULL,
+    updated_ts           REAL NOT NULL,
+    completed_ts         REAL,
+    terminal_reason      TEXT,
+    FOREIGN KEY (baseline_revision_id) REFERENCES config_revisions(id),
+    FOREIGN KEY (candidate_revision_id) REFERENCES config_revisions(id),
+    CHECK (baseline_revision_id <> candidate_revision_id),
+    CHECK (completed_windows <= window_budget)
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_experiments_status_expiry
+    ON config_experiments(status, expires_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_config_experiments_candidate_status
+    ON config_experiments(candidate_revision_id, status, id);
 
 -- v12: one durable record for an all-or-none unpublished-chain transition.
 -- capture event provenance remains on capture_events; this table records the
