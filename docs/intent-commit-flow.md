@@ -9,6 +9,11 @@ history should read like review-ready changes.
 
 ## Setup
 
+Use `acd settings` to configure intent mode without maintaining shell exports.
+It saves explicit provider and tuning values, tests the exact draft, and
+activates one complete config revision at the next safe work boundary. API keys
+remain environment only. See [the settings guide](settings.md).
+
 Sparse repo:
 
 ~~~bash
@@ -198,6 +203,13 @@ not an API key or raw endpoint. Stored errors are bounded and redacted before
 they reach status or diagnose output.
 
 ## Observability
+
+`acd status` and `acd diagnose` include additive runtime settings state: saved
+generation, desired/applied/last-known-good config revision, profile, pending or
+rejected state, safe boundary, and bounded experiment progress. Planner windows
+and decisions carry the applied revision/profile, so descriptive comparisons
+can join outcomes without storing prompts, diffs, credentials, or raw provider
+responses.
 
 | Question | Command |
 |---|---|

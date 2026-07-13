@@ -26,6 +26,11 @@ appear, or how to recover a stuck queue.
 `acd events --watch` starts at the current ledger tail unless you pass
 `--since <cursor>`.
 
+Use `acd settings` when you need to change providers, models, commit strategy,
+or intent tuning. Saved explicit values do not require shell sourcing. See the
+[settings guide](settings.md) for profiles, source precedence, safe activation,
+and rejected-revision recovery.
+
 See [commands.md](commands.md) for the complete public command reference,
 including repo administration, maintenance, and the hook protocol.
 
@@ -328,7 +333,9 @@ acd doctor
 | `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated-tree patterns. |
 | `ACD_SENSITIVE_GLOBS=...` | Replace the protected path globs. Unset or empty uses the defaults. |
 
-Restart the daemon after changing these settings.
+These fields are labeled `restart required` in `acd settings`. Save the change,
+then restart the daemon explicitly with `acd off` followed by `acd on`. The
+settings command never starts a stopped daemon.
 
 ## Generated cache flood recovery
 
