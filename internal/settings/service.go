@@ -405,17 +405,18 @@ func fingerprintNudge(_ context.Context, st state.DaemonState) error {
 }
 
 func cleanText(value string) string {
-	return strings.TrimSpace(strings.Map(func(r rune) rune {
-		if r == '\x1b' || (!unicode.IsPrint(r) && !unicode.IsSpace(r)) {
-			return -1
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) && r != '\u007f' {
+			return r
 		}
-		return r
-	}, value))
+		return ' '
+	}, value)
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func hasUnsafeText(value string) bool {
 	return strings.IndexFunc(value, func(r rune) bool {
-		return r == '\x1b' || (!unicode.IsPrint(r) && !unicode.IsSpace(r))
+		return !unicode.IsPrint(r) || r == '\u007f'
 	}) >= 0
 }
 
