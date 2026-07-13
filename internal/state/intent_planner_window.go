@@ -58,6 +58,14 @@ type IntentPlannerWindow struct {
 	DeferredSeqs        []int64
 	DeferredReasons     []IntentPlannerWindowDeferredReason
 	Events              []IntentPlannerWindowEvent
+	ConfigRevisionID    sql.NullInt64
+	ConfigProfile       sql.NullString
+	DurationMS          sql.NullInt64
+	RetryCount          int
+	FallbackUsed        bool
+	Outcome             sql.NullString
+	ExperimentID        sql.NullInt64
+	ExperimentConsumed  bool
 }
 
 // AppendIntentPlannerWindow records one planner-visible window plus a compact
@@ -105,13 +113,15 @@ INSERT INTO intent_planner_windows(
     planned_ts, provider, model, branch_ref, branch_generation, source,
     commit_format, forced, forced_reason, validation_failure, offered_seqs,
     visible_original_seqs, hidden_seqs, selected_groups, deferred_seqs,
-    deferred_reasons
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    deferred_reasons, config_revision_id, config_profile, duration_ms,
+    retry_count, fallback_used, outcome, experiment_id, experiment_consumed
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
 	res, err := tx.ExecContext(ctx, insWindow,
 		win.PlannedTS, win.Provider, win.Model, win.BranchRef, win.BranchGeneration,
 		win.Source, win.CommitFormat, boolInt(win.Forced), win.ForcedReason,
 		win.ValidationFailure, offered, visible, hidden, groups, deferred,
-		deferredReasons,
+		deferredReasons, win.ConfigRevisionID, win.ConfigProfile, win.DurationMS,
+		win.RetryCount, boolInt(win.FallbackUsed), win.Outcome, win.ExperimentID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("state: insert intent planner window: %w", err)
@@ -142,6 +152,16 @@ INSERT INTO intent_planner_window_events(
 			}
 		}
 	}
+	consumed, err := consumeExperimentWindow(ctx, tx, id, win)
+	if err != nil {
+		return 0, err
+	}
+	if consumed {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE intent_planner_windows SET experiment_consumed=1 WHERE id=?`, id); err != nil {
+			return 0, fmt.Errorf("state: mark planner window experiment consumption: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("state: commit intent planner window tx: %w", err)
 	}
@@ -158,7 +178,8 @@ func RecentIntentPlannerWindows(ctx context.Context, d *DB, limit int) ([]Intent
 SELECT id, planned_ts, provider, model, branch_ref, branch_generation, source,
        commit_format, forced, forced_reason, validation_failure, offered_seqs,
        visible_original_seqs, hidden_seqs, selected_groups, deferred_seqs,
-       deferred_reasons
+       deferred_reasons, config_revision_id, config_profile, duration_ms,
+       retry_count, fallback_used, outcome, experiment_id, experiment_consumed
 FROM intent_planner_windows
 ORDER BY id DESC
 LIMIT ?`, limit)
@@ -190,7 +211,9 @@ func IntentPlannerWindowForEvent(ctx context.Context, d *DB, eventSeq int64) (In
 SELECT w.id, w.planned_ts, w.provider, w.model, w.branch_ref, w.branch_generation,
        w.source, w.commit_format, w.forced, w.forced_reason, w.validation_failure,
        w.offered_seqs, w.visible_original_seqs, w.hidden_seqs, w.selected_groups,
-       w.deferred_seqs, w.deferred_reasons
+       w.deferred_seqs, w.deferred_reasons, w.config_revision_id,
+       w.config_profile, w.duration_ms, w.retry_count, w.fallback_used,
+       w.outcome, w.experiment_id, w.experiment_consumed
 FROM intent_planner_windows w
 JOIN intent_planner_window_events e ON e.window_id = w.id
 WHERE e.event_seq = ?
@@ -248,18 +271,22 @@ func scanIntentPlannerWindows(rows *sql.Rows) ([]IntentPlannerWindow, error) {
 	var out []IntentPlannerWindow
 	for rows.Next() {
 		var win IntentPlannerWindow
-		var forced int
+		var forced, fallback, consumed int
 		var offered, visible, hidden, groups, deferred, deferredReasons string
 		if err := rows.Scan(
 			&win.ID, &win.PlannedTS, &win.Provider, &win.Model,
 			&win.BranchRef, &win.BranchGeneration, &win.Source,
 			&win.CommitFormat, &forced, &win.ForcedReason,
 			&win.ValidationFailure, &offered, &visible, &hidden, &groups,
-			&deferred, &deferredReasons,
+			&deferred, &deferredReasons, &win.ConfigRevisionID,
+			&win.ConfigProfile, &win.DurationMS, &win.RetryCount, &fallback,
+			&win.Outcome, &win.ExperimentID, &consumed,
 		); err != nil {
 			return nil, fmt.Errorf("state: scan intent planner window: %w", err)
 		}
 		win.Forced = forced != 0
+		win.FallbackUsed = fallback != 0
+		win.ExperimentConsumed = consumed != 0
 		if err := unmarshalArray(offered, &win.OfferedSeqs); err != nil {
 			return nil, fmt.Errorf("state: unmarshal offered seqs: %w", err)
 		}
@@ -284,6 +311,76 @@ func scanIntentPlannerWindows(rows *sql.Rows) ([]IntentPlannerWindow, error) {
 		return nil, fmt.Errorf("state: iter intent planner windows: %w", err)
 	}
 	return out, nil
+}
+
+// consumeExperimentWindow increments at most one active experiment in the
+// same transaction that appends the completed planner outcome. This makes
+// retries idempotent at the durable window boundary: a committed window and
+// its progress can never be observed separately.
+func consumeExperimentWindow(ctx context.Context, tx *sql.Tx, windowID int64, win IntentPlannerWindow) (bool, error) {
+	if !win.ExperimentID.Valid {
+		return false, nil
+	}
+	if !win.ConfigRevisionID.Valid {
+		return false, fmt.Errorf("state: experiment planner window requires config revision")
+	}
+	var exp ConfigExperiment
+	err := tx.QueryRowContext(ctx, `
+SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
+       completed_windows, expires_ts, failure_policy, status, created_ts,
+       updated_ts, completed_ts, terminal_reason
+FROM config_experiments WHERE id=?`, win.ExperimentID.Int64).Scan(
+		&exp.ID, &exp.BaselineRevisionID, &exp.CandidateRevisionID,
+		&exp.WindowBudget, &exp.CompletedWindows, &exp.ExpiresTS,
+		&exp.FailurePolicy, &exp.Status, &exp.CreatedTS, &exp.UpdatedTS,
+		&exp.CompletedTS, &exp.TerminalReason)
+	if err != nil {
+		return false, fmt.Errorf("state: load planner-window experiment: %w", err)
+	}
+	if exp.Status != ExperimentActive {
+		return false, nil
+	}
+	if exp.CandidateRevisionID != win.ConfigRevisionID.Int64 {
+		return false, fmt.Errorf("state: planner window revision does not match experiment candidate")
+	}
+	when := win.PlannedTS
+	if exp.ExpiresTS.Valid && when >= exp.ExpiresTS.Float64 {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE config_experiments SET status='expired', updated_ts=?, completed_ts=?,
+    terminal_reason='expiry reached before completed window'
+WHERE id=? AND status='active'`, when, when, exp.ID); err != nil {
+			return false, fmt.Errorf("state: expire config experiment: %w", err)
+		}
+		return false, nil
+	}
+	next := exp.CompletedWindows + 1
+	status := ExperimentActive
+	reason := sql.NullString{}
+	outcome := strings.ToLower(strings.TrimSpace(win.Outcome.String))
+	if (outcome == "failed" || outcome == "error") && exp.FailurePolicy != "continue" {
+		status = ExperimentFailed
+		reason = sql.NullString{String: "planner window failure policy", Valid: true}
+	} else if next >= exp.WindowBudget {
+		status = ExperimentCompleted
+		reason = sql.NullString{String: "window budget consumed", Valid: true}
+	}
+	var completed any
+	if status != ExperimentActive {
+		completed = when
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE config_experiments
+SET completed_windows=?, status=?, updated_ts=?, completed_ts=?, terminal_reason=?
+WHERE id=? AND status='active' AND completed_windows=?`,
+		next, status, when, completed, reason, exp.ID, exp.CompletedWindows)
+	if err != nil {
+		return false, fmt.Errorf("state: consume experiment planner window %d: %w", windowID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("state: count consumed experiment window: %w", err)
+	}
+	return n == 1, nil
 }
 
 func marshalArray(v any) (string, error) {
