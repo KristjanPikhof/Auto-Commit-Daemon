@@ -1,14 +1,18 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"golang.org/x/sys/unix"
 )
 
 // Store safely reads and updates the XDG operator configuration.
@@ -23,10 +27,7 @@ func NewStore(roots paths.Roots) *Store { return &Store{Roots: roots} }
 // Load reads config.json without creating it.
 func (s *Store) Load() (*Document, error) {
 	path := s.Roots.ConfigPath()
-	if err := validateRegularTarget(path); err != nil {
-		return nil, err
-	}
-	body, err := os.ReadFile(path)
+	body, err := readRegularNoFollow(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return NewDocument(), nil
 	}
@@ -61,6 +62,9 @@ func (s *Store) update(expected *uint64, fn func(*Document) error) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("acd config: mkdir: %w", err)
 	}
+	if info, err := os.Lstat(dir); err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("acd config: config directory is not a real directory: %s", dir)
+	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return fmt.Errorf("acd config: chmod directory: %w", err)
 	}
@@ -91,16 +95,26 @@ func (s *Store) update(expected *uint64, fn func(*Document) error) error {
 }
 
 func openLock(path string) (*os.File, error) {
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("acd config: lock target is not a regular file: %s", path)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("acd config: inspect lock: %w", err)
+	dir, err := openParentNoFollow(path)
+	if err != nil {
+		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	defer dir.Close()
+	fd, err := unix.Openat(int(dir.Fd()), filepath.Base(path), unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	// Darwin can transiently report ENOENT when concurrent creators race on the
+	// same O_CREAT|O_NOFOLLOW directory entry. Retrying against the same anchored
+	// directory descriptor preserves the no-follow guarantee.
+	if errors.Is(err, unix.ENOENT) {
+		fd, err = unix.Openat(int(dir.Fd()), filepath.Base(path), unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("acd config: open lock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("acd config: lock target is not a regular file: %s", path)
 	}
 	if err := f.Chmod(0o600); err != nil {
 		f.Close()
@@ -109,36 +123,31 @@ func openLock(path string) (*os.File, error) {
 	return f, nil
 }
 
-func validateRegularTarget(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("acd config: inspect %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("acd config: target is not a regular file: %s", path)
-	}
-	return nil
-}
-
 func writeDocument(path string, doc *Document) error {
-	if err := validateRegularTarget(path); err != nil {
-		return err
-	}
 	body, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("acd config: marshal: %w", err)
 	}
 	body = append(body, '\n')
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	dir, err := openParentNoFollow(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := validateRegularAt(dir, filepath.Base(path), path); err != nil {
+		return err
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("acd config: temp name: %w", err)
+	}
+	tmpName := ".config-" + hex.EncodeToString(nonce[:]) + ".tmp"
+	fd, err := unix.Openat(int(dir.Fd()), tmpName, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("acd config: create temp: %w", err)
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	tmp := os.NewFile(uintptr(fd), tmpName)
+	defer unix.Unlinkat(int(dir.Fd()), tmpName, 0) //nolint:errcheck
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
 		return fmt.Errorf("acd config: chmod temp: %w", err)
@@ -154,18 +163,68 @@ func writeDocument(path string, doc *Document) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("acd config: close temp: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := unix.Renameat(int(dir.Fd()), tmpName, int(dir.Fd()), filepath.Base(path)); err != nil {
 		return fmt.Errorf("acd config: rename: %w", err)
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("acd config: open parent: %w", err)
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := dir.Sync(); err != nil {
 		return fmt.Errorf("acd config: fsync parent: %w", err)
 	}
 	return nil
+}
+
+func openParentNoFollow(path string) (*os.File, error) {
+	dirPath := filepath.Dir(path)
+	fd, err := unix.Open(dirPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("acd config: open parent: %w", err)
+	}
+	return os.NewFile(uintptr(fd), dirPath), nil
+}
+
+func validateRegularAt(dir *os.File, name, display string) error {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("acd config: target is not a regular file: %s", display)
+	}
+	f := os.NewFile(uintptr(fd), display)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("acd config: target is not a regular file: %s", display)
+	}
+	return nil
+}
+
+func readRegularNoFollow(path string) ([]byte, error) {
+	dir, err := openParentNoFollow(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	defer dir.Close()
+	fd, err := unix.Openat(int(dir.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, fmt.Errorf("acd config: target is not a regular file: %s", path)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("acd config: target is not a regular file: %s", path)
+	}
+	body, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("acd config: read %s: %w", path, err)
+	}
+	return body, nil
 }
 
 func flock(fd int, how int) error {

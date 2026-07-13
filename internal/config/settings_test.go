@@ -120,6 +120,30 @@ func TestConfigStoreRejectsSymlinkAndNonRegularTargets(t *testing.T) {
 			t.Fatal("Update accepted symlink lock")
 		}
 	})
+	t.Run("config directory symlink", func(t *testing.T) {
+		base := t.TempDir()
+		target := filepath.Join(base, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		roots := testConfigRoots(t)
+		if err := os.MkdirAll(filepath.Dir(roots.Config), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, roots.Config); err != nil {
+			t.Fatal(err)
+		}
+		store := NewStore(roots)
+		if _, err := store.Load(); err == nil {
+			t.Fatal("Load accepted symlink config directory")
+		}
+		if err := store.Update(func(*Document) error { return nil }); err == nil {
+			t.Fatal("Update accepted symlink config directory")
+		}
+		if _, err := os.Stat(filepath.Join(target, "config.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("symlink target mutated: %v", err)
+		}
+	})
 }
 
 func TestConfigStoreCallbackErrorLeavesDiskUnchanged(t *testing.T) {
