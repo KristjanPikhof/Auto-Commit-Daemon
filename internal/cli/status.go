@@ -497,7 +497,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	if r.BlockedConflicts > 0 {
 		fmt.Fprintf(out, "Blocked conflicts: %d (inspect with `acd diagnose`; preview safe cleanup with `acd fix --dry-run`)\n", r.BlockedConflicts)
 		if r.ActiveBarriers > 0 {
-			fmt.Fprintf(out, "Blocked barriers with pending replay: %d (force purge preview: `acd fix --force --dry-run`)\n", r.ActiveBarriers)
+			fmt.Fprintf(out, "Blocked barriers with pending replay: %d (archive-only recovery preview: `acd fix --force --dry-run`)\n", r.ActiveBarriers)
 		}
 	}
 	if r.FailedEvents > 0 {
