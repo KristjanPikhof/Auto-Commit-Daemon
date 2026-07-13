@@ -732,7 +732,7 @@ func materializeRecoveryTree(
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	entries, err := git.LsFilesIndex(ctx, repoRoot, indexFile, paths...)
+	entries, err := git.LsFilesIndex(ctx, repoRoot, indexFile, git.LiteralPathspecs(paths)...)
 	if err != nil {
 		return "", nil, fmt.Errorf("daemon: reconcile recovery chain: read final index: %w", err)
 	}
@@ -879,7 +879,7 @@ func recoveryStatesMatchTree(
 	for _, state := range states {
 		paths = append(paths, state.Path)
 	}
-	entries, err := git.LsTree(ctx, repoRoot, rev, false, paths...)
+	entries, err := git.LsTree(ctx, repoRoot, rev, false, git.LiteralPathspecs(paths)...)
 	if err != nil {
 		return false, err
 	}
