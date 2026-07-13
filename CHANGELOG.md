@@ -41,6 +41,13 @@
   provider outage falls back once instead of repeating the remote timeout.
 - Recovery now proves grouped same-path commit prefixes cumulatively and keeps
   each hidden evidence ref locked through its SQLite lifecycle transition.
+- Published-event retention now preserves same-base recovery prefixes. Schema
+  v13 adds a covering index so the safety check remains bounded at ledger cap.
+- Recovery now treats captured filenames as literal Git pathspecs without
+  trimming legal whitespace or interpreting pathspec-magic characters.
+- Planner circuit state now initializes only after daemon-lock ownership,
+  caller cancellation wins provider-error races, and persisted errors redact
+  URL paths that may contain credentials.
 - Daemon shutdown now cancels and joins the asynchronous startup recovery sweep
   before releasing the daemon lock or returning database ownership.
 

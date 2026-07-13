@@ -50,7 +50,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands, health/control, recovery, setup, start cache |
 | `internal/daemon` | Run loop, capture/replay, exact-chain reconciliation, intent circuit, shadow, fsnotify |
-| `internal/state` | SQLite v12: events/ops, planner state/windows, recovery snapshots, meta/clients/flush |
+| `internal/state` | SQLite v13: events/ops, planner state/windows, recovery snapshots, meta/clients/flush |
 | `internal/git` | Bounded Git/ref/tree/diff/blob/index/history/ignore helpers |
 | `internal/ai` | Deterministic, OpenAI-compatible, subprocess providers; prompts and planner |
 | `internal/{central,config,identity,logger,paths,pause,prompttrace,trace}` | Registry/config, XDG/logging, pause and diagnostics |
@@ -84,7 +84,7 @@ Commit messages:
 
 ## State, branches and capture
 
-- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. `SchemaVersion=12` adds immutable `recovery_snapshots` and ordered `recovery_snapshot_events`; see `internal/state/migrate.go`.
+- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. v12 adds immutable `recovery_snapshots` and ordered `recovery_snapshot_events`; `SchemaVersion=13` adds the same-base recovery-prefix retention index; see `internal/state/migrate.go`.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2, atomic temp+rename. `acd stop` removes matching/all caches.
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Reset/rebase/switch/same-SHA ref switch bumps generation; ordinary FF keeps it, except FF during rewind grace bumps, reseeds, and clears grace. Legacy bare rev upgrades as Diverged.
 - Every non-unchanged token transition reconciles the prior exact pair before acceptance; dead-ref sweeps alone skip live refs.
