@@ -33,6 +33,10 @@ type ApplyResult struct {
 // Apply records one immutable resolved hot snapshot and atomically requests
 // it as desired. It never saves XDG config or enqueues a normal wake request.
 func (s *Service) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, error) {
+	return s.apply(ctx, req, true)
+}
+
+func (s *Service) apply(ctx context.Context, req ApplyRequest, signal bool) (ApplyResult, error) {
 	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
 	if err != nil {
 		return ApplyResult{}, err
@@ -89,7 +93,7 @@ func (s *Service) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, err
 	}
 	result := ApplyResult{RevisionID: revision.ID, RequestID: activation.ID,
 		Queued: true, DaemonMode: cleanText(daemonState.Mode), SnapshotHash: revision.SnapshotHash}
-	if daemonState.PID > 0 && daemonState.Mode != "stopped" {
+	if signal && daemonState.PID > 0 && daemonState.Mode != "stopped" {
 		if err := s.nudge(ctx, daemonState); err != nil {
 			return result, sanitizeError(err)
 		}
