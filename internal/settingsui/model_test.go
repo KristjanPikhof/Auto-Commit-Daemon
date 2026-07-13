@@ -17,6 +17,10 @@ type fakeBackend struct {
 }
 
 func (f *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return f.snapshot, nil }
+func (f *fakeBackend) Save(_ context.Context, v map[string]string) (ApplyResult, error) {
+	f.applied = v
+	return ApplyResult{Summary: "draft saved"}, nil
+}
 func (f *fakeBackend) Test(ctx context.Context, v map[string]string) (TestResult, error) {
 	f.tested = v
 	if f.blocked != nil {
@@ -43,7 +47,7 @@ func (f *fakeBackend) CancelExperiment(context.Context, int64) (ApplyResult, err
 }
 
 func baseSnapshot() Snapshot {
-	return Snapshot{ActiveRevision: 7, DesiredRevision: 7, AppliedRevision: 7, LastKnownGood: 6, DaemonRunning: true, Profile: "daily", Fields: []FieldValue{{Key: "ai.provider", Value: "openai-compat", Source: "environment"}, {Key: "ai.model", Value: "old-model", Source: "profile", Shadowed: "environment: env-model"}, {Key: "ai.api_key", Value: "top-secret", Source: "environment", SensitiveSet: true}}}
+	return Snapshot{ActiveRevision: 7, DesiredRevision: 7, AppliedRevision: 7, LastKnownGood: 6, DaemonRunning: true, Profile: "daily", Fields: []FieldValue{{Key: "ai.provider", Value: "openai-compat", ActiveValue: "deterministic", Source: "environment"}, {Key: "ai.model", Value: "old-model", ActiveValue: "active-model", Source: "profile", Shadowed: "environment: env-model"}, {Key: "ai.api_key", Value: "top-secret", Source: "environment", SensitiveSet: true}}}
 }
 
 func keyMsg(s string) tea.KeyPressMsg {

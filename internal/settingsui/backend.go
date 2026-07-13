@@ -9,6 +9,7 @@ import (
 // leaking config, state, provider, or daemon types into the state machine.
 type Backend interface {
 	Snapshot(context.Context) (Snapshot, error)
+	Save(context.Context, map[string]string) (ApplyResult, error)
 	Test(context.Context, map[string]string) (TestResult, error)
 	Apply(context.Context, map[string]string, string) (ApplyResult, error)
 	Revert(context.Context, int64) (ApplyResult, error)
@@ -28,11 +29,13 @@ type Snapshot struct {
 	Experiment      Experiment
 	SavedGeneration uint64
 	Profile         string
+	Comparison      string
 }
 
 type FieldValue struct {
 	Key          string
 	Value        string
+	ActiveValue  string
 	Source       string
 	Shadowed     string
 	Restart      bool

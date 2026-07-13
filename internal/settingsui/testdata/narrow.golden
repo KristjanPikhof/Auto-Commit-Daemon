@@ -5,6 +5,8 @@ FIELD 1/10
 Source: environment
 Changed: no
 Apply: next safe boundary
+Active: deterministic
+Draft: openai-compat
 REVISION
 DRAFT [yes] > TESTED [yes]
 QUEUED r8 > ACTIVE r7

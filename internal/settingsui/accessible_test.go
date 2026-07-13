@@ -3,6 +3,7 @@ package settingsui
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -49,4 +50,31 @@ func TestAccessibleCancelledContext(t *testing.T) {
 	if err == nil {
 		t.Fatal("cancelled form succeeded")
 	}
+}
+
+func TestAccessibleDispatchSaveTestAndApply(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot()}
+	for _, action := range []string{"save", "test", "apply"} {
+		var out bytes.Buffer
+		if err := dispatchAccessible(context.Background(), b, AccessibleValues{Action: action, Values: map[string]string{"ai.model": "safe"}}, &out); err != nil {
+			t.Fatalf("%s: %v", action, err)
+		}
+		if action == "apply" && !strings.Contains(out.String(), "QUEUED:") {
+			t.Fatalf("apply output=%q", out.String())
+		}
+	}
+}
+
+func TestAccessibleDispatchSanitizesBackendError(t *testing.T) {
+	b := &errorBackend{fakeBackend: fakeBackend{snapshot: baseSnapshot()}}
+	err := dispatchAccessible(context.Background(), b, AccessibleValues{Action: "test"}, &bytes.Buffer{})
+	if err == nil || strings.Contains(err.Error(), "\x1b") || strings.Contains(err.Error(), "\x00") {
+		t.Fatalf("error=%q", err)
+	}
+}
+
+type errorBackend struct{ fakeBackend }
+
+func (b *errorBackend) Test(context.Context, map[string]string) (TestResult, error) {
+	return TestResult{}, fmt.Errorf("rejected\x1b[2J\x00")
 }

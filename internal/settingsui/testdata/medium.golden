@@ -6,11 +6,13 @@ FIELDS                                     | DETAILS
   Base URL: https://example.invalid/v1     | Source: environment
   Timeout: inherit                         | Changed: no
   API key: [set]                           | Apply: next safe boundary
-  Diff egress: inherit                     |
-  Commit strategy: intent                  | REVISION
-  Commit format: inherit                   | DRAFT [yes] > TESTED [yes]
-  Sensitive globs: defaults                | QUEUED r8 > ACTIVE r7
-  Filesystem notifications: inherit        | Desired: r8
+  Diff egress: inherit                     | Active: deterministic
+  Commit strategy: intent                  | Draft: openai-compat
+  Commit format: inherit                   |
+  Sensitive globs: defaults                | REVISION
+  Filesystem notifications: inherit        | DRAFT [yes] > TESTED [yes]
+                                           | QUEUED r8 > ACTIVE r7
+                                           | Desired: r8
                                            | Applied: r7
                                            | Experiment: 3/10 windows (descriptive)
                                            | QUEUED: applies at next safe boundary
