@@ -3,6 +3,7 @@ package settingsui
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,10 +11,13 @@ import (
 )
 
 type fakeBackend struct {
-	snapshot Snapshot
-	tested   map[string]string
-	applied  map[string]string
-	blocked  chan struct{}
+	snapshot  Snapshot
+	tested    map[string]string
+	applied   map[string]string
+	blocked   chan struct{}
+	missing   []ConfirmationRequirement
+	confirmed []ConfirmationRequirement
+	testCalls int
 }
 
 func (f *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return f.snapshot, nil }
@@ -22,7 +26,11 @@ func (f *fakeBackend) Save(_ context.Context, v map[string]string) (ApplyResult,
 	return ApplyResult{Summary: "draft saved"}, nil
 }
 func (f *fakeBackend) Test(ctx context.Context, v map[string]string) (TestResult, error) {
+	f.testCalls++
 	f.tested = v
+	if len(f.missing) > 0 {
+		return TestResult{}, &ConfirmationRequiredError{Missing: append([]ConfirmationRequirement(nil), f.missing...)}
+	}
 	if f.blocked != nil {
 		select {
 		case <-f.blocked:
@@ -31,6 +39,10 @@ func (f *fakeBackend) Test(ctx context.Context, v map[string]string) (TestResult
 		}
 	}
 	return TestResult{OK: true, Summary: "synthetic request passed"}, nil
+}
+func (f *fakeBackend) Confirm(requirements []ConfirmationRequirement) {
+	f.confirmed = append(f.confirmed, requirements...)
+	f.missing = nil
 }
 func (f *fakeBackend) Apply(_ context.Context, v map[string]string, _ string) (ApplyResult, error) {
 	f.applied = v
@@ -206,6 +218,47 @@ func TestModelOperationErrorSanitized(t *testing.T) {
 	m, _ = updated(t, m, operationMsg{id: 1, err: errors.New("oops\x1b[2J\x00")})
 	if m.Err != "oops" {
 		t.Fatalf("error=%q", m.Err)
+	}
+}
+
+func TestModelConfirmationRetriesOnceAndClearsFailure(t *testing.T) {
+	requirement := ConfirmationRequirement{ID: "endpoint_credentials", Label: "send credentials to a non-default endpoint"}
+	b := &fakeBackend{snapshot: baseSnapshot(), missing: []ConfirmationRequirement{requirement}}
+	m := New(b)
+	m, _ = updated(t, m, snapshotMsg{Snapshot: b.snapshot})
+	m.Err = "old failure"
+	m.Status = "FAILED: old failure"
+
+	m, cmd := updated(t, m, keyMsg("T"))
+	if m.Err != "" || m.Operation == nil {
+		t.Fatalf("operation did not clear stale error: %+v", m)
+	}
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if m.Mode != ModeConfirmRisk || m.Confirmation == nil || b.testCalls != 1 || m.Err != "" {
+		t.Fatalf("confirmation state=%+v calls=%d", m, b.testCalls)
+	}
+	if got := m.Render(); !strings.Contains(got, requirement.Label) || strings.Contains(got, "old failure") {
+		t.Fatalf("confirmation render=%q", got)
+	}
+	m, cmd = updated(t, m, keyMsg("y"))
+	if cmd == nil || len(b.confirmed) != 1 {
+		t.Fatalf("confirmation not recorded: %+v", b.confirmed)
+	}
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if b.testCalls != 2 || !m.Test.OK || m.Err != "" || m.Mode != ModeBrowse || lifecycle(m) != "TESTED" {
+		t.Fatalf("retry state=%+v calls=%d", m, b.testCalls)
+	}
+}
+
+func TestModelConfirmationCancelDoesNotRetry(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot(), missing: []ConfirmationRequirement{{ID: "subprocess", Label: "execute provider subprocess"}}}
+	m := New(b)
+	m, _ = updated(t, m, snapshotMsg{Snapshot: b.snapshot})
+	m, cmd := updated(t, m, keyMsg("t"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	m, cmd = updated(t, m, keyMsg("esc"))
+	if cmd != nil || b.testCalls != 1 || len(b.confirmed) != 0 || m.Mode != ModeBrowse || m.Status != "CANCELLED: risk confirmation" {
+		t.Fatalf("cancel state=%+v calls=%d confirmed=%v", m, b.testCalls, b.confirmed)
 	}
 }
 

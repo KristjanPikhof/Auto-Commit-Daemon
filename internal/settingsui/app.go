@@ -2,10 +2,12 @@ package settingsui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -17,6 +19,12 @@ type Options struct {
 	Accessible bool
 	NoColor    bool
 }
+
+const (
+	declinedBeforeRequest = "required risk confirmation declined; no request or change was made"
+	declinedAfterTest     = "required risk confirmation declined; the synthetic test completed, but no apply or activation change was made"
+	declinedExperiment    = "required risk confirmation declined; the synthetic test completed, but no experiment or activation change was made"
+)
 
 func Run(backend Backend, opts Options) error {
 	if opts.Accessible {
@@ -56,7 +64,7 @@ func runAccessibleBackend(ctx context.Context, backend Backend, opts Options) er
 			draft[field.Key] = field.Value
 		}
 	}
-	if _, err := fmt.Fprintln(out, AccessibleTranscript(draft)); err != nil {
+	if _, err := fmt.Fprintln(out, AccessibleStartTranscript(draft)); err != nil {
 		return err
 	}
 	if snapshot.Experiment.Active {
@@ -70,14 +78,48 @@ func runAccessibleBackend(ctx context.Context, backend Backend, opts Options) er
 			return err
 		}
 	}
-	values, err := RunAccessible(ctx, draft, in, out)
+	action, err := RunAccessibleAction(ctx, in, out)
 	if err != nil {
 		return fmt.Errorf("settings accessible: %s", safeText(err.Error()))
 	}
-	return dispatchAccessible(ctx, backend, values, out)
+	values := finalizeAccessibleValues(newAccessibleValues(draft))
+	values.Action = action
+	switch action {
+	case "quick":
+		values, err = RunAccessibleQuick(ctx, draft, in, out)
+		if err == nil {
+			values.Confirm, err = ConfirmAccessibleAction(ctx, values.Action, in, out)
+		}
+	case "advanced":
+		if _, printErr := fmt.Fprintln(out, "Advanced settings: every non-sensitive field follows."); printErr != nil {
+			return printErr
+		}
+		values, err = RunAccessible(ctx, draft, in, out)
+	case "profile":
+		values.Profile, err = RunAccessibleProfile(ctx, in, out)
+	case "experiment":
+		values.ExperimentBudget, values.ExperimentExpiry, values.ExperimentPolicy, err = RunAccessibleExperimentOptions(ctx, in, out)
+	}
+	if err != nil {
+		return fmt.Errorf("settings accessible: %s", safeText(err.Error()))
+	}
+	if action != "quick" && action != "advanced" {
+		values.Confirm, err = ConfirmAccessibleAction(ctx, action, in, out)
+	}
+	if err != nil {
+		return fmt.Errorf("settings accessible: %s", safeText(err.Error()))
+	}
+	if !values.Confirm {
+		return errors.New("settings accessible: action not confirmed; no request or change was made")
+	}
+	return dispatchAccessibleWithInput(ctx, backend, values, in, out)
 }
 
 func dispatchAccessible(ctx context.Context, backend Backend, values AccessibleValues, out io.Writer) error {
+	return dispatchAccessibleWithInput(ctx, backend, values, strings.NewReader(""), out)
+}
+
+func dispatchAccessibleWithInput(ctx context.Context, backend Backend, values AccessibleValues, in io.Reader, out io.Writer) error {
 	switch values.Action {
 	case "save":
 		result, err := backend.Save(ctx, values.Values)
@@ -87,20 +129,29 @@ func dispatchAccessible(ctx context.Context, backend Backend, values AccessibleV
 		_, err = fmt.Fprintln(out, "SAVED:", safeText(result.Summary))
 		return err
 	case "test":
-		result, err := backend.Test(ctx, values.Values)
+		result, err := accessibleWithConfirmations(ctx, backend, in, out,
+			declinedBeforeRequest, func() (TestResult, error) {
+				return backend.Test(ctx, values.Values)
+			})
 		if err != nil {
-			return fmt.Errorf("settings test: %s", safeText(err.Error()))
+			return fmt.Errorf("settings test: %s", actionableSettingsError(err))
 		}
 		_, err = fmt.Fprintln(out, "TESTED:", safeText(result.Summary))
 		return err
 	case "apply":
-		tested, err := backend.Test(ctx, values.Values)
+		tested, err := accessibleWithConfirmations(ctx, backend, in, out,
+			declinedBeforeRequest, func() (TestResult, error) {
+				return backend.Test(ctx, values.Values)
+			})
 		if err != nil {
-			return fmt.Errorf("settings test: %s", safeText(err.Error()))
+			return fmt.Errorf("settings test: %s", actionableSettingsError(err))
 		}
-		result, err := backend.Apply(ctx, values.Values, tested.Fingerprint)
+		result, err := accessibleWithConfirmations(ctx, backend, in, out,
+			declinedAfterTest, func() (ApplyResult, error) {
+				return backend.Apply(ctx, values.Values, tested.Fingerprint)
+			})
 		if err != nil {
-			return fmt.Errorf("settings apply: %s", safeText(err.Error()))
+			return fmt.Errorf("settings apply: %s", actionableSettingsError(err))
 		}
 		label := "ACTIVE:"
 		if result.Queued {
@@ -137,9 +188,18 @@ func dispatchAccessible(ctx context.Context, backend Backend, values AccessibleV
 		default:
 			return fmt.Errorf("settings experiment: invalid expiry")
 		}
-		result, err := backend.StartExperiment(ctx, values.Values, ExperimentOptions{WindowBudget: budget, ExpiresAfter: expiry, FailurePolicy: values.ExperimentPolicy})
+		if _, err := accessibleWithConfirmations(ctx, backend, in, out,
+			declinedBeforeRequest, func() (TestResult, error) {
+				return backend.Test(ctx, values.Values)
+			}); err != nil {
+			return fmt.Errorf("settings test: %s", actionableSettingsError(err))
+		}
+		result, err := accessibleWithConfirmations(ctx, backend, in, out,
+			declinedExperiment, func() (Experiment, error) {
+				return backend.StartExperiment(ctx, values.Values, ExperimentOptions{WindowBudget: budget, ExpiresAfter: expiry, FailurePolicy: values.ExperimentPolicy})
+			})
 		if err != nil {
-			return fmt.Errorf("settings experiment: %s", safeText(err.Error()))
+			return fmt.Errorf("settings experiment: %s", actionableSettingsError(err))
 		}
 		_, err = fmt.Fprintf(out, "QUEUED: experiment %d, 0/%d windows, policy %s\n", result.ID, result.TotalWindows, safeText(result.FailurePolicy))
 		return err
@@ -160,4 +220,33 @@ func dispatchAccessible(ctx context.Context, backend Backend, values AccessibleV
 	default:
 		return fmt.Errorf("settings accessible: unsupported action")
 	}
+}
+
+func accessibleWithConfirmations[T any](ctx context.Context, backend Backend, in io.Reader, out io.Writer, declined string, operation func() (T, error)) (T, error) {
+	result, err := operation()
+	if err == nil {
+		return result, nil
+	}
+	var confirmationErr *ConfirmationRequiredError
+	confirmer, ok := backend.(ConfirmationBackend)
+	if !errors.As(err, &confirmationErr) || !ok || len(confirmationErr.Missing) == 0 {
+		return result, err
+	}
+	confirmed, promptErr := ConfirmAccessibleRisks(ctx, confirmationErr.Missing, in, out)
+	if promptErr != nil {
+		return result, promptErr
+	}
+	if !confirmed {
+		return result, errors.New(declined)
+	}
+	confirmer.Confirm(confirmationErr.Missing)
+	return operation()
+}
+
+func actionableSettingsError(err error) string {
+	clean := safeText(err.Error())
+	if strings.Contains(strings.ToLower(clean), "missing api key") {
+		return "API key is not set; set ACD_AI_API_KEY in the environment, then rerun acd settings (the value is never stored)"
+	}
+	return clean
 }

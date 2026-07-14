@@ -2,6 +2,8 @@ package settingsui
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -16,6 +18,27 @@ type Backend interface {
 	StartExperiment(context.Context, map[string]string, ExperimentOptions) (Experiment, error)
 	CancelExperiment(context.Context, int64) (ApplyResult, error)
 	SelectProfile(context.Context, string) (ApplyResult, error)
+}
+
+type ConfirmationRequirement struct {
+	ID    string
+	Label string
+}
+
+type ConfirmationRequiredError struct {
+	Missing []ConfirmationRequirement
+}
+
+func (e *ConfirmationRequiredError) Error() string {
+	labels := make([]string, 0, len(e.Missing))
+	for _, requirement := range e.Missing {
+		labels = append(labels, safeText(requirement.Label))
+	}
+	return fmt.Sprintf("explicit confirmation required: %s", strings.Join(labels, "; "))
+}
+
+type ConfirmationBackend interface {
+	Confirm([]ConfirmationRequirement)
 }
 
 type ExperimentOptions struct {

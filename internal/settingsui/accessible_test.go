@@ -3,6 +3,7 @@ package settingsui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -62,7 +63,7 @@ func TestAccessibleFormShowsRetainedValueForEveryPrompt(t *testing.T) {
 		"Experiment expiry (none, 15m, or 1h) [current: none; Enter keeps current]",
 		"Experiment failure policy [current: continue; Enter keeps current]",
 		"Next action [current: save draft only; Enter keeps current]",
-		"Enter keeps no",
+		"Save this draft without testing or applying it?",
 	} {
 		if !strings.Contains(view, title) {
 			t.Errorf("missing accessible default guidance %q", title)
@@ -102,6 +103,52 @@ func TestAccessibleFormLabelsTestAndApplyRisk(t *testing.T) {
 	}
 }
 
+func TestAccessibleActionDefaultsToTestCurrentSettings(t *testing.T) {
+	var out bytes.Buffer
+	action, err := RunAccessibleAction(context.Background(), &bytewiseReader{r: strings.NewReader("\n")}, &out)
+	if err != nil || action != "test" {
+		t.Fatalf("action=%q err=%v\n%s", action, err, out.String())
+	}
+	if !strings.Contains(out.String(), "Test current settings (recommended)") {
+		t.Fatalf("action-first prompt missing\n%s", out.String())
+	}
+}
+
+func TestAccessibleQuickSetupOnlyPromptsProviderEssentials(t *testing.T) {
+	draft := map[string]string{"ai.provider": "deterministic", "ai.model": "model", "intent.min_pending": "2"}
+	var out bytes.Buffer
+	values, err := RunAccessibleQuick(context.Background(), draft,
+		&bytewiseReader{r: strings.NewReader(strings.Repeat("\n", len(quickProviderFields)+1))}, &out)
+	if err != nil || values.Action != "test" || values.Values["intent.min_pending"] != "2" {
+		t.Fatalf("values=%+v err=%v\n%s", values, err, out.String())
+	}
+	view := out.String()
+	for _, want := range []string{"Provider", "Model", "Base URL", "Timeout", "CA file", "After quick setup"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("quick setup missing %q", want)
+		}
+	}
+	if strings.Contains(view, "Minimum pending") || strings.Contains(view, "Experiment window budget") {
+		t.Fatalf("quick setup exposed advanced fields\n%s", view)
+	}
+}
+
+func TestAccessibleTestCurrentSkipsAdvancedCatalog(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot()}
+	var out bytes.Buffer
+	input := &bytewiseReader{r: strings.NewReader("\ny\n")}
+	if err := runAccessibleBackend(context.Background(), b, Options{Input: input, Output: &out, Accessible: true}); err != nil {
+		t.Fatal(err)
+	}
+	view := out.String()
+	if !strings.Contains(view, "TESTED:") || !strings.Contains(view, "What do you want to do?") {
+		t.Fatalf("test-current output missing\n%s", view)
+	}
+	if strings.Contains(view, "Minimum pending (next safe boundary) [current:") {
+		t.Fatalf("test-current traversed advanced fields\n%s", view)
+	}
+}
+
 func TestAccessibleCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -136,4 +183,86 @@ type errorBackend struct{ fakeBackend }
 
 func (b *errorBackend) Test(context.Context, map[string]string) (TestResult, error) {
 	return TestResult{}, fmt.Errorf("rejected\x1b[2J\x00")
+}
+
+type accessibleRiskBackend struct {
+	fakeBackend
+	confirmed  map[string]bool
+	testCalls  int
+	applyCalls int
+}
+
+func (b *accessibleRiskBackend) Confirm(requirements []ConfirmationRequirement) {
+	if b.confirmed == nil {
+		b.confirmed = map[string]bool{}
+	}
+	for _, requirement := range requirements {
+		b.confirmed[requirement.ID] = true
+	}
+}
+
+func (b *accessibleRiskBackend) Test(context.Context, map[string]string) (TestResult, error) {
+	b.testCalls++
+	if !b.confirmed["endpoint_credentials"] {
+		return TestResult{}, &ConfirmationRequiredError{Missing: []ConfirmationRequirement{{
+			ID: "endpoint_credentials", Label: "send credentials to a non-default endpoint",
+		}}}
+	}
+	return TestResult{OK: true, Fingerprint: "tested", Summary: "synthetic request passed"}, nil
+}
+
+func (b *accessibleRiskBackend) Apply(context.Context, map[string]string, string) (ApplyResult, error) {
+	b.applyCalls++
+	if !b.confirmed["diff_egress"] {
+		return ApplyResult{}, &ConfirmationRequiredError{Missing: []ConfirmationRequirement{{
+			ID: "diff_egress", Label: "allow redacted repository diff egress",
+		}}}
+	}
+	return ApplyResult{DesiredRevision: 2, AppliedRevision: 1, Queued: true, Summary: "next safe boundary"}, nil
+}
+
+func TestAccessibleApplyConfirmsEndpointThenDiffWithoutRetesting(t *testing.T) {
+	b := &accessibleRiskBackend{fakeBackend: fakeBackend{snapshot: baseSnapshot()}}
+	values := AccessibleValues{Action: "apply", Values: map[string]string{"ai.model": "model"}, Confirm: true}
+	var out bytes.Buffer
+	input := &bytewiseReader{r: strings.NewReader("y\ny\n")}
+	if err := dispatchAccessibleWithInput(context.Background(), b, values, input, &out); err != nil {
+		t.Fatal(err)
+	}
+	if b.testCalls != 2 || b.applyCalls != 2 {
+		t.Fatalf("calls test=%d apply=%d", b.testCalls, b.applyCalls)
+	}
+	view := out.String()
+	if !strings.Contains(view, "send credentials to a non-default endpoint") || !strings.Contains(view, "allow redacted repository diff egress") || !strings.Contains(view, "QUEUED:") {
+		t.Fatalf("risk flow output=%q", view)
+	}
+}
+
+func TestAccessibleApplyDeclineReportsCompletedTest(t *testing.T) {
+	b := &accessibleRiskBackend{fakeBackend: fakeBackend{snapshot: baseSnapshot()},
+		confirmed: map[string]bool{"endpoint_credentials": true}}
+	values := AccessibleValues{Action: "apply", Values: map[string]string{"ai.model": "model"}, Confirm: true}
+	var out bytes.Buffer
+	err := dispatchAccessibleWithInput(context.Background(), b, values,
+		&bytewiseReader{r: strings.NewReader("n\n")}, &out)
+	if err == nil || !strings.Contains(err.Error(), "synthetic test completed") ||
+		strings.Contains(err.Error(), "no request or change") {
+		t.Fatalf("decline error=%v\n%s", err, out.String())
+	}
+	if b.testCalls != 1 || b.applyCalls != 1 {
+		t.Fatalf("testCalls=%d applyCalls=%d", b.testCalls, b.applyCalls)
+	}
+}
+
+type missingKeyBackend struct{ fakeBackend }
+
+func (b *missingKeyBackend) Test(context.Context, map[string]string) (TestResult, error) {
+	return TestResult{}, errors.New("openai-compat: missing API key")
+}
+
+func TestAccessibleMissingAPIKeyIsActionable(t *testing.T) {
+	err := dispatchAccessibleWithInput(context.Background(), &missingKeyBackend{}, AccessibleValues{Action: "test"}, strings.NewReader(""), &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "set ACD_AI_API_KEY") || !strings.Contains(err.Error(), "never stored") {
+		t.Fatalf("error=%v", err)
+	}
 }

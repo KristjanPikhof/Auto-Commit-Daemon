@@ -47,6 +47,9 @@ type ServiceBackend struct {
 	opts    BackendAdapterOptions
 
 	mu                  sync.Mutex
+	interactiveConfirms []ai.ConfirmationRequirement
+	confirmationDraft   string
+	pendingConfirmDraft string
 	last                settings.Snapshot
 	testedFingerprint   string
 	testedDraftIdentity string
@@ -54,6 +57,59 @@ type ServiceBackend struct {
 
 func NewServiceBackend(service SettingsService, opts BackendAdapterOptions) *ServiceBackend {
 	return &ServiceBackend{service: service, opts: opts}
+}
+
+func (b *ServiceBackend) Confirm(requirements []ConfirmationRequirement) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pendingConfirmDraft == "" {
+		return
+	}
+	if b.confirmationDraft != b.pendingConfirmDraft {
+		b.interactiveConfirms = nil
+		b.confirmationDraft = b.pendingConfirmDraft
+	}
+	seen := make(map[ai.ConfirmationRequirement]struct{}, len(b.interactiveConfirms)+len(requirements))
+	for _, confirmation := range b.interactiveConfirms {
+		seen[confirmation] = struct{}{}
+	}
+	for _, requirement := range requirements {
+		confirmation, ok := aiConfirmation(requirement.ID)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[confirmation]; exists {
+			continue
+		}
+		b.interactiveConfirms = append(b.interactiveConfirms, confirmation)
+		seen[confirmation] = struct{}{}
+	}
+	b.pendingConfirmDraft = ""
+}
+
+func (b *ServiceBackend) currentConfirmations(clean map[string]string) []ai.ConfirmationRequirement {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	confirmations := append([]ai.ConfirmationRequirement(nil), b.opts.Confirmations...)
+	if b.confirmationDraft == draftIdentity(clean) {
+		confirmations = append(confirmations, b.interactiveConfirms...)
+	}
+	return confirmations
+}
+
+func (b *ServiceBackend) confirmationError(values []ai.ConfirmationRequirement, clean map[string]string) error {
+	b.mu.Lock()
+	b.pendingConfirmDraft = draftIdentity(clean)
+	b.mu.Unlock()
+	return newConfirmationRequiredError(values)
+}
+
+func (b *ServiceBackend) projectConfirmationError(err error, clean map[string]string) error {
+	var confirmationErr *settings.ConfirmationRequiredError
+	if errors.As(err, &confirmationErr) {
+		return b.confirmationError(confirmationErr.Missing, clean)
+	}
+	return sanitizeAdapterError(err)
 }
 
 func (b *ServiceBackend) Snapshot(ctx context.Context) (Snapshot, error) {
@@ -82,16 +138,9 @@ func (b *ServiceBackend) Snapshot(ctx context.Context) (Snapshot, error) {
 
 func (b *ServiceBackend) Test(ctx context.Context, draft map[string]string) (TestResult, error) {
 	clean := sanitizedDraft(draft)
-	validation, err := b.service.Validate(ctx, clean, b.opts.Confirmations)
+	result, err := b.service.TestProvider(ctx, clean, b.currentConfirmations(clean))
 	if err != nil {
-		return TestResult{}, sanitizeAdapterError(err)
-	}
-	if len(validation.Missing) > 0 {
-		return TestResult{}, fmt.Errorf("explicit confirmation required: %s", confirmationLabels(validation.Missing))
-	}
-	result, err := b.service.TestProvider(ctx, clean, b.opts.Confirmations)
-	if err != nil {
-		return TestResult{}, sanitizeAdapterError(err)
+		return TestResult{}, b.projectConfirmationError(err, clean)
 	}
 	b.mu.Lock()
 	b.testedFingerprint = result.Fingerprint
@@ -132,12 +181,12 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 		return ApplyResult{}, errors.New("tested settings are stale; test the current draft again")
 	}
 	changes := changedValues(last, clean)
-	saved, err := b.service.Save(ctx, settings.SaveRequest{Scope: b.opts.Scope, Profile: b.opts.Profile,
-		Values: changes, ExpectedGeneration: last.SavedGeneration})
-	if err != nil {
-		return ApplyResult{}, sanitizeAdapterError(err)
-	}
 	if b.opts.Scope != settings.ScopeRepository {
+		_, err := b.service.Save(ctx, settings.SaveRequest{Scope: b.opts.Scope, Profile: b.opts.Profile,
+			Values: changes, ExpectedGeneration: last.SavedGeneration})
+		if err != nil {
+			return ApplyResult{}, sanitizeAdapterError(err)
+		}
 		summary := "profile saved; select it for a repository to activate"
 		if b.opts.Scope == settings.ScopeGlobal {
 			summary = "global defaults saved; running repositories were not changed"
@@ -145,8 +194,21 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 		return ApplyResult{DesiredRevision: last.DesiredRevisionID,
 			AppliedRevision: last.AppliedRevisionID, Summary: summary}, nil
 	}
+	confirmations := b.currentConfirmations(clean)
+	validation, err := b.service.Validate(ctx, clean, confirmations)
+	if err != nil {
+		return ApplyResult{}, sanitizeAdapterError(err)
+	}
+	if len(validation.Missing) > 0 {
+		return ApplyResult{}, b.confirmationError(validation.Missing, clean)
+	}
+	saved, err := b.service.Save(ctx, settings.SaveRequest{Scope: b.opts.Scope, Profile: b.opts.Profile,
+		Values: changes, ExpectedGeneration: last.SavedGeneration})
+	if err != nil {
+		return ApplyResult{}, sanitizeAdapterError(err)
+	}
 	result, err := b.service.Apply(ctx, settings.ApplyRequest{Values: clean,
-		TestedFingerprint: testedFingerprint, Confirmations: b.opts.Confirmations,
+		TestedFingerprint: testedFingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: last.DesiredRevisionID})
 	if err != nil {
 		return ApplyResult{}, sanitizeAdapterError(err)
@@ -200,6 +262,14 @@ func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]s
 	if testedFingerprint == "" || testedDraft != draftIdentity(clean) {
 		return Experiment{}, errors.New("tested settings are stale; test the current draft again")
 	}
+	confirmations := b.currentConfirmations(clean)
+	validation, err := b.service.Validate(ctx, clean, confirmations)
+	if err != nil {
+		return Experiment{}, sanitizeAdapterError(err)
+	}
+	if len(validation.Missing) > 0 {
+		return Experiment{}, b.confirmationError(validation.Missing, clean)
+	}
 	saved, err := b.service.Save(ctx, settings.SaveRequest{Scope: settings.ScopeRepository,
 		Values: changedValues(last, clean), ExpectedGeneration: last.SavedGeneration})
 	if err != nil {
@@ -214,7 +284,7 @@ func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]s
 		expires = time.Now().Add(options.ExpiresAfter)
 	}
 	result, err := experiments.StartExperiment(ctx, settings.ExperimentRequest{Values: clean,
-		TestedFingerprint: testedFingerprint, Confirmations: b.opts.Confirmations,
+		TestedFingerprint: testedFingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: last.DesiredRevisionID,
 		WindowBudget: windows, ExpiresAt: expires, FailurePolicy: policy})
 	if err != nil {
@@ -342,19 +412,35 @@ func draftIdentity(draft map[string]string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func confirmationLabels(values []ai.ConfirmationRequirement) string {
-	labels := make([]string, 0, len(values))
+func newConfirmationRequiredError(values []ai.ConfirmationRequirement) *ConfirmationRequiredError {
+	missing := make([]ConfirmationRequirement, 0, len(values))
 	for _, value := range values {
-		switch value {
-		case ai.ConfirmationEndpointCredentials:
-			labels = append(labels, "send credentials to a non-default endpoint")
-		case ai.ConfirmationSubprocessExecution:
-			labels = append(labels, "execute the configured provider subprocess")
-		case ai.ConfirmationDiffEgress:
-			labels = append(labels, "allow redacted repository diff egress")
-		}
+		missing = append(missing, ConfirmationRequirement{ID: string(value), Label: confirmationLabel(value)})
 	}
-	return strings.Join(labels, "; ")
+	return &ConfirmationRequiredError{Missing: missing}
+}
+
+func confirmationLabel(value ai.ConfirmationRequirement) string {
+	switch value {
+	case ai.ConfirmationEndpointCredentials:
+		return "send credentials to a non-default endpoint"
+	case ai.ConfirmationSubprocessExecution:
+		return "execute the configured provider subprocess"
+	case ai.ConfirmationDiffEgress:
+		return "allow redacted repository diff egress"
+	default:
+		return "approve an unknown provider risk"
+	}
+}
+
+func aiConfirmation(id string) (ai.ConfirmationRequirement, bool) {
+	value := ai.ConfirmationRequirement(safeText(id))
+	switch value {
+	case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress:
+		return value, true
+	default:
+		return "", false
+	}
 }
 
 func sanitizeAdapterError(err error) error {
