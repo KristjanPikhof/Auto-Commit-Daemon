@@ -9,6 +9,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type adapterService struct {
@@ -16,6 +17,7 @@ type adapterService struct {
 	saved               settings.SaveRequest
 	applied             settings.ApplyRequest
 	applyCalls          int
+	revertCalls         int
 	validate            settings.Validation
 	test                settings.ProviderTestResult
 	err                 error
@@ -73,6 +75,7 @@ func (a *adapterService) Apply(_ context.Context, r settings.ApplyRequest) (sett
 	return settings.ApplyResult{RevisionID: 8, Queued: true}, a.err
 }
 func (a *adapterService) Revert(context.Context, settings.RevertRequest) (settings.ApplyResult, error) {
+	a.revertCalls++
 	return settings.ApplyResult{RevisionID: 9, Queued: true}, a.err
 }
 func (a *adapterService) StartExperiment(_ context.Context, req settings.ExperimentRequest) (settings.ExperimentResult, error) {
@@ -269,5 +272,20 @@ func TestSettingsProfileExperimentStartProgressCancel(t *testing.T) {
 	}
 	if _, err := b.StartExperiment(context.Background(), nil, ExperimentOptions{}); err == nil {
 		t.Fatal("unbounded experiment accepted")
+	}
+}
+
+func TestSettingsTerminalExperimentDoesNotHijackKnownGoodRevert(t *testing.T) {
+	svc := adapterFixture()
+	svc.snapshot.Experiment = &settings.ExperimentSnapshot{ID: 4, Status: state.ExperimentCompleted}
+	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository})
+	_, _ = b.Snapshot(context.Background())
+
+	result, err := b.Revert(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.revertCalls != 1 || svc.cancelledExperiment != 0 || result.DesiredRevision != 9 {
+		t.Fatalf("revert=%+v normalCalls=%d experimentID=%d", result, svc.revertCalls, svc.cancelledExperiment)
 	}
 }

@@ -26,7 +26,7 @@ func TestSettingsExperimentLifecycleIsBoundedAndIdempotent(t *testing.T) {
 	}
 	_, _ = state.AcknowledgeConfigActivation(ctx, svc.db, request.ID, baseline.ID)
 	_, _ = state.ApplyConfigActivation(ctx, svc.db, request.ID, baseline.ID)
-	draft := map[string]string{config.FieldModel: "candidate"}
+	draft := map[string]string{config.FieldModel: "candidate", config.FieldCommitStrategy: string(ai.CommitStrategyIntent)}
 	validation, tested := testedDraft(t, svc, draft, nil)
 	started, err := svc.StartExperiment(ctx, ExperimentRequest{Values: draft,
 		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration,
@@ -72,6 +72,34 @@ WHERE s.desired_revision_id=? AND NOT EXISTS (
 	}
 	if revisions != 3 {
 		t.Fatalf("immutable revision count=%d, want baseline+candidate+revert", revisions)
+	}
+}
+
+func TestSettingsExperimentRejectsEventModeWithoutCreatingState(t *testing.T) {
+	svc, _ := testService(t, nil, nil, nil)
+	ctx := context.Background()
+	baseline := insertRevision(t, svc, "baseline", 0)
+	request, ok, err := state.RequestConfigActivation(ctx, svc.db, baseline.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("baseline request: ok=%v err=%v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(ctx, svc.db, request.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(ctx, svc.db, request.ID, baseline.ID)
+	draft := map[string]string{config.FieldModel: "candidate"}
+	validation, tested := testedDraft(t, svc, draft, nil)
+
+	_, err = svc.StartExperiment(ctx, ExperimentRequest{Values: draft,
+		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration,
+		ExpectedDesiredRevision: baseline.ID, WindowBudget: 10})
+	if err == nil || !strings.Contains(err.Error(), "intent") {
+		t.Fatalf("event-mode experiment error=%v", err)
+	}
+	var experiments int
+	if err := svc.db.ReadSQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM config_experiments`).Scan(&experiments); err != nil {
+		t.Fatal(err)
+	}
+	if experiments != 0 {
+		t.Fatalf("event-mode experiment created %d rows", experiments)
 	}
 }
 

@@ -146,8 +146,9 @@ response content.
 Press `x` after applying a baseline revision to start a ten-window experiment.
 The underlying service accepts a positive budget up to 1000 completed planner
 windows, an optional future expiry, and either `continue` or `revert` for the
-provider-error policy. Only completed windows consume the budget, and only one
-experiment can be active for a repository.
+provider-error policy. The candidate must use `commit.strategy=intent` because
+event mode does not produce planner windows. Only completed windows consume the
+budget, and only one experiment can be active for a repository.
 
 Completion, cancellation, expiry, or the configured failure policy can queue a
 new immutable revision copied from the baseline. Existing commits are never

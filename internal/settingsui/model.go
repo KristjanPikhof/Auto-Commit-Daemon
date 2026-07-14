@@ -92,6 +92,18 @@ func (m Model) ActiveField() FieldDescriptor {
 
 func (m Model) IsDirty() bool { return len(m.Dirty) > 0 }
 
+func (m Model) hasHotDraftChanges() bool {
+	for _, field := range m.Snapshot.Fields {
+		if field.Restart || field.SensitiveSet || descriptor(field.Key).Sensitive {
+			continue
+		}
+		if value, ok := m.Draft[field.Key]; ok && value != field.ActiveValue {
+			return true
+		}
+	}
+	return false
+}
+
 func (m Model) Fingerprint() string {
 	keys := make([]string, 0, len(m.Draft))
 	for key := range m.Draft {

@@ -84,6 +84,7 @@ type ApplyResult struct {
 	DesiredRevision int64
 	AppliedRevision int64
 	Queued          bool
+	SavedOnly       bool
 	Summary         string
 }
 

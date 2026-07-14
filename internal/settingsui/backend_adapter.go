@@ -169,7 +169,8 @@ func (b *ServiceBackend) Save(ctx context.Context, draft map[string]string) (App
 	} else if b.opts.Scope == settings.ScopeProfile {
 		summary = "profile saved; select it for a repository to activate"
 	}
-	return ApplyResult{DesiredRevision: last.DesiredRevisionID, AppliedRevision: last.AppliedRevisionID, Summary: summary}, nil
+	return ApplyResult{DesiredRevision: last.DesiredRevisionID, AppliedRevision: last.AppliedRevisionID,
+		SavedOnly: true, Summary: summary}, nil
 }
 
 func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ string) (ApplyResult, error) {
@@ -192,7 +193,7 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 			summary = "global defaults saved; running repositories were not changed"
 		}
 		return ApplyResult{DesiredRevision: last.DesiredRevisionID,
-			AppliedRevision: last.AppliedRevisionID, Summary: summary}, nil
+			AppliedRevision: last.AppliedRevisionID, SavedOnly: true, Summary: summary}, nil
 	}
 	confirmations := b.currentConfirmations(clean)
 	validation, err := b.service.Validate(ctx, clean, confirmations)
@@ -225,7 +226,7 @@ func (b *ServiceBackend) Revert(ctx context.Context, _ int64) (ApplyResult, erro
 	b.mu.Lock()
 	last := b.last
 	b.mu.Unlock()
-	if last.Experiment != nil && last.Experiment.ID > 0 {
+	if last.Experiment != nil && last.Experiment.ID > 0 && last.Experiment.Status == "active" {
 		if experiments, ok := b.service.(experimentService); ok {
 			result, err := experiments.RevertExperiment(ctx, last.Experiment.ID)
 			if err != nil {
@@ -322,7 +323,7 @@ func (b *ServiceBackend) SelectProfile(ctx context.Context, profile string) (App
 		return ApplyResult{}, sanitizeAdapterError(err)
 	}
 	return ApplyResult{DesiredRevision: last.DesiredRevisionID, AppliedRevision: last.AppliedRevisionID,
-		Summary: "repository profile selected; test and apply explicitly"}, nil
+		SavedOnly: true, Summary: "repository profile selected; test and apply explicitly"}, nil
 }
 
 func projectSnapshot(s settings.Snapshot) Snapshot {

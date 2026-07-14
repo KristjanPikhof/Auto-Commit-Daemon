@@ -549,12 +549,8 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 		} else if projection.LastKnownGoodRevisionID.Valid {
 			revisionID = projection.LastKnownGoodRevisionID.Int64
 		}
-		if revisionID == 0 || (m.Current() != nil && m.Current().RevisionID == revisionID) {
+		if revisionID == 0 {
 			return nil
-		}
-		revision, err := state.ConfigRevisionByID(ctx, m.db, revisionID)
-		if err != nil {
-			return err
 		}
 		var request state.ConfigActivationRequest
 		hasRequest := projection.DesiredRequestID.Valid && projection.DesiredRevisionID.Valid && projection.DesiredRevisionID.Int64 == revisionID
@@ -567,7 +563,35 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 				return nil
 			}
 		}
-		candidate, buildErr := m.builder.BuildRevision(ctx, revision, m.Current())
+		current := m.Current()
+		currentMatches := current != nil && current.RevisionID == revisionID
+		if currentMatches {
+			if !hasRequest || request.Status == state.ActivationApplied {
+				return nil
+			}
+			if request.Status == state.ActivationPending {
+				ok, err := state.AcknowledgeConfigActivation(ctx, m.db, request.ID, revisionID)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					continue
+				}
+			}
+			ok, err := state.ApplyConfigActivation(ctx, m.db, request.ID, revisionID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			continue
+		}
+		revision, err := state.ConfigRevisionByID(ctx, m.db, revisionID)
+		if err != nil {
+			return err
+		}
+		candidate, buildErr := m.builder.BuildRevision(ctx, revision, current)
 		if buildErr != nil {
 			if hasRequest {
 				_, _ = state.RejectConfigActivation(ctx, m.db, request.ID, revisionID, ai.SanitizePlannerError(buildErr.Error()))

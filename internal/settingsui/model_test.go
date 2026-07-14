@@ -23,7 +23,7 @@ type fakeBackend struct {
 func (f *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return f.snapshot, nil }
 func (f *fakeBackend) Save(_ context.Context, v map[string]string) (ApplyResult, error) {
 	f.applied = v
-	return ApplyResult{Summary: "draft saved"}, nil
+	return ApplyResult{SavedOnly: true, Summary: "draft saved"}, nil
 }
 func (f *fakeBackend) Test(ctx context.Context, v map[string]string) (TestResult, error) {
 	f.testCalls++
@@ -133,6 +133,26 @@ func TestModelUpdateLifecycle(t *testing.T) {
 	}
 	if _, ok := b.applied["ai.api_key"]; ok {
 		t.Fatal("sensitive value reached backend")
+	}
+}
+
+func TestModelSavedDraftRemainsAvailableForActivation(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot()}
+	m := New(b)
+	m, _ = updated(t, m, snapshotMsg{Snapshot: b.snapshot})
+	m.Dirty["ai.model"] = true
+
+	m, cmd := updated(t, m, keyMsg("s"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if m.IsDirty() || !strings.HasPrefix(m.Status, "SAVED:") {
+		t.Fatalf("saved state=%+v", m)
+	}
+
+	m, cmd = updated(t, m, keyMsg("t"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	m, _ = updated(t, m, keyMsg("a"))
+	if m.Mode != ModeConfirmApply {
+		t.Fatalf("saved draft cannot be activated: mode=%v status=%q", m.Mode, m.Status)
 	}
 }
 

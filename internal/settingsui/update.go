@@ -81,11 +81,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ApplyResult:
 			m.PendingRevision = result.DesiredRevision
 			m.AppliedRevision = result.AppliedRevision
-			if result.Queued {
+			m.Dirty = map[string]bool{}
+			if result.SavedOnly {
+				m.Status = "SAVED: " + safeText(result.Summary)
+			} else if result.Queued {
 				m.Status = "QUEUED: " + safeText(result.Summary)
 			} else {
 				m.Status = "ACTIVE: " + safeText(result.Summary)
-				m.Dirty = map[string]bool{}
 			}
 		case Experiment:
 			m.Experiment = result
@@ -204,7 +206,9 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Save):
 		return m, m.start("save", func(ctx context.Context) (any, error) { return m.backend.Save(ctx, sanitizedDraft(m.Draft)) })
 	case key.Matches(msg, m.keys.Apply):
-		if !m.IsDirty() {
+		if m.PendingRevision != m.AppliedRevision && !m.IsDirty() {
+			m.Status = "QUEUED: activation already pending"
+		} else if !m.IsDirty() && !m.hasHotDraftChanges() {
 			m.Status = "DRAFT: no changes"
 		} else if !m.Test.OK || m.TestFingerprint != m.Fingerprint() {
 			m.Status = "DRAFT: test current changes before apply"
