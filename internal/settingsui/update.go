@@ -50,12 +50,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.Operation == nil || msg.id != m.Operation.ID {
 			return m, nil
 		}
+		operation := m.Operation
 		m.Operation = nil
 		if msg.err != nil {
+			var confirmationErr *ConfirmationRequiredError
+			_, canConfirm := m.backend.(ConfirmationBackend)
+			if errors.As(msg.err, &confirmationErr) && canConfirm && len(confirmationErr.Missing) > 0 {
+				m.Err = ""
+				m.Mode = ModeConfirmRisk
+				m.Confirmation = &ConfirmationPrompt{Operation: operation.Name,
+					Requirements: sanitizeConfirmationRequirements(confirmationErr.Missing), Retry: operation.Run}
+				m.Status = "CONFIRM: " + confirmationRequirementLabels(m.Confirmation.Requirements)
+				return m, nil
+			}
 			m.Err = safeText(msg.err.Error())
 			m.Status = "FAILED: " + m.Err
 			return m, nil
 		}
+		m.Err = ""
+		m.Confirmation = nil
 		switch result := msg.result.(type) {
 		case TestResult:
 			m.Test = sanitizeTest(result)
@@ -130,6 +143,21 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.Cancel) {
 			m.Mode = ModeBrowse
+		}
+		return m, nil
+	}
+	if m.Mode == ModeConfirmRisk {
+		if key.Matches(msg, m.keys.Confirm) && m.Confirmation != nil {
+			confirmation := m.Confirmation
+			m.Mode = ModeBrowse
+			m.Confirmation = nil
+			m.backend.(ConfirmationBackend).Confirm(confirmation.Requirements)
+			return m, m.start(confirmation.Operation, confirmation.Retry)
+		}
+		if key.Matches(msg, m.keys.Cancel) {
+			m.Mode = ModeBrowse
+			m.Confirmation = nil
+			m.Status = "CANCELLED: risk confirmation"
 		}
 		return m, nil
 	}
@@ -245,12 +273,29 @@ func (m *Model) start(name string, fn func(context.Context) (any, error)) tea.Cm
 	m.nextOperation++
 	id := m.nextOperation
 	ctx, cancel := context.WithCancel(context.Background())
-	m.Operation = &Operation{ID: id, Name: name, Cancel: cancel}
+	m.Operation = &Operation{ID: id, Name: name, Cancel: cancel, Run: fn}
+	m.Err = ""
 	m.Status = "WORKING: " + strings.ToUpper(name)
 	return func() tea.Msg {
 		result, err := fn(ctx)
 		return operationMsg{id: id, name: name, result: result, err: err}
 	}
+}
+
+func sanitizeConfirmationRequirements(requirements []ConfirmationRequirement) []ConfirmationRequirement {
+	out := make([]ConfirmationRequirement, 0, len(requirements))
+	for _, requirement := range requirements {
+		out = append(out, ConfirmationRequirement{ID: safeText(requirement.ID), Label: safeText(requirement.Label)})
+	}
+	return out
+}
+
+func confirmationRequirementLabels(requirements []ConfirmationRequirement) string {
+	labels := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		labels = append(labels, safeText(requirement.Label))
+	}
+	return strings.Join(labels, "; ")
 }
 
 func sanitizeSnapshot(s Snapshot) Snapshot {

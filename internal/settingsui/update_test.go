@@ -3,6 +3,7 @@ package settingsui
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -20,6 +21,10 @@ type adapterService struct {
 	err                 error
 	startedWindows      int
 	cancelledExperiment int64
+	required            []ai.ConfirmationRequirement
+	testRequired        []ai.ConfirmationRequirement
+	validatedWith       []ai.ConfirmationRequirement
+	testedWith          []ai.ConfirmationRequirement
 }
 
 func (a *adapterService) Snapshot(context.Context, settings.Scope, string) (settings.Snapshot, error) {
@@ -29,10 +34,37 @@ func (a *adapterService) Save(_ context.Context, r settings.SaveRequest) (settin
 	a.saved = r
 	return settings.SaveResult{Generation: r.ExpectedGeneration + 1, Scope: r.Scope}, a.err
 }
-func (a *adapterService) Validate(context.Context, map[string]string, []ai.ConfirmationRequirement) (settings.Validation, error) {
-	return a.validate, a.err
+func (a *adapterService) Validate(_ context.Context, _ map[string]string, confirmed []ai.ConfirmationRequirement) (settings.Validation, error) {
+	a.validatedWith = append([]ai.ConfirmationRequirement(nil), confirmed...)
+	validation := a.validate
+	confirmedSet := map[ai.ConfirmationRequirement]bool{}
+	for _, value := range confirmed {
+		confirmedSet[value] = true
+	}
+	validation.Missing = nil
+	for _, value := range a.required {
+		if !confirmedSet[value] {
+			validation.Missing = append(validation.Missing, value)
+		}
+	}
+	return validation, a.err
 }
-func (a *adapterService) TestProvider(context.Context, map[string]string, []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
+
+func (a *adapterService) TestProvider(_ context.Context, _ map[string]string, confirmed []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
+	a.testedWith = append([]ai.ConfirmationRequirement(nil), confirmed...)
+	confirmedSet := map[ai.ConfirmationRequirement]bool{}
+	for _, value := range confirmed {
+		confirmedSet[value] = true
+	}
+	var missing []ai.ConfirmationRequirement
+	for _, value := range a.testRequired {
+		if !confirmedSet[value] {
+			missing = append(missing, value)
+		}
+	}
+	if len(missing) > 0 {
+		return settings.ProviderTestResult{}, &settings.ConfirmationRequiredError{Missing: missing}
+	}
 	return a.test, a.err
 }
 func (a *adapterService) Apply(_ context.Context, r settings.ApplyRequest) (settings.ApplyResult, error) {
@@ -103,6 +135,73 @@ func TestSettingsRuntimeRailStaleDraftAndRejectionDoNotApply(t *testing.T) {
 	}
 }
 
+func TestSettingsConfirmationDiffBeforeAnyApplyMutation(t *testing.T) {
+	svc := adapterFixture()
+	svc.required = []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}
+	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository})
+	_, _ = b.Snapshot(context.Background())
+	draft := map[string]string{config.FieldModel: "candidate"}
+	if _, err := b.Test(context.Background(), draft); err != nil {
+		t.Fatal(err)
+	}
+	_, err := b.Apply(context.Background(), draft, "")
+	var confirmationErr *ConfirmationRequiredError
+	if !errors.As(err, &confirmationErr) || len(confirmationErr.Missing) != 1 || confirmationErr.Missing[0].ID != string(ai.ConfirmationDiffEgress) {
+		t.Fatalf("confirmation error=%v", err)
+	}
+	if svc.saved.Values != nil || svc.applyCalls != 0 {
+		t.Fatalf("pre-confirmation mutation: save=%+v applyCalls=%d", svc.saved, svc.applyCalls)
+	}
+	b.Confirm(confirmationErr.Missing)
+	if _, err := b.Apply(context.Background(), draft, ""); err != nil {
+		t.Fatal(err)
+	}
+	if svc.applyCalls != 1 || !reflect.DeepEqual(svc.applied.Confirmations, []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}) {
+		t.Fatalf("apply calls=%d confirmations=%v", svc.applyCalls, svc.applied.Confirmations)
+	}
+}
+
+func TestSettingsInteractiveConfirmationIsBoundToDraft(t *testing.T) {
+	svc := adapterFixture()
+	svc.testRequired = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}
+	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository})
+	draftA := map[string]string{config.FieldBaseURL: "https://a.example/v1"}
+	draftB := map[string]string{config.FieldBaseURL: "https://b.example/v1"}
+
+	_, err := b.Test(context.Background(), draftA)
+	var confirmationErr *ConfirmationRequiredError
+	if !errors.As(err, &confirmationErr) {
+		t.Fatalf("draft A confirmation error=%v", err)
+	}
+	b.Confirm(confirmationErr.Missing)
+	if _, err := b.Test(context.Background(), draftA); err != nil {
+		t.Fatalf("confirmed draft A: %v", err)
+	}
+	if !reflect.DeepEqual(svc.testedWith, []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}) {
+		t.Fatalf("draft A confirmations=%v", svc.testedWith)
+	}
+
+	_, err = b.Test(context.Background(), draftB)
+	if !errors.As(err, &confirmationErr) {
+		t.Fatalf("changed draft reused confirmation: %v", err)
+	}
+	if len(svc.testedWith) != 0 {
+		t.Fatalf("changed draft confirmations=%v", svc.testedWith)
+	}
+}
+
+func TestSettingsLaunchConfirmationRemainsDraftIndependent(t *testing.T) {
+	svc := adapterFixture()
+	svc.testRequired = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}
+	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository,
+		Confirmations: []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}})
+	for _, endpoint := range []string{"https://a.example/v1", "https://b.example/v1"} {
+		if _, err := b.Test(context.Background(), map[string]string{config.FieldBaseURL: endpoint}); err != nil {
+			t.Fatalf("pre-authorized %s: %v", endpoint, err)
+		}
+	}
+}
+
 func TestSettingsSourceShadowClearSecretAndRestartProjection(t *testing.T) {
 	svc := adapterFixture()
 	b := NewServiceBackend(svc, BackendAdapterOptions{Scope: settings.ScopeRepository})
@@ -133,6 +232,7 @@ func TestSettingsProfileAndGlobalSaveNeverQueueActivation(t *testing.T) {
 	for _, scope := range []settings.Scope{settings.ScopeProfile, settings.ScopeGlobal} {
 		t.Run(string(scope), func(t *testing.T) {
 			svc := adapterFixture()
+			svc.required = []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}
 			b := NewServiceBackend(svc, BackendAdapterOptions{Scope: scope, Profile: "fast"})
 			_, _ = b.Snapshot(context.Background())
 			draft := map[string]string{config.FieldModel: "new"}
@@ -143,6 +243,9 @@ func TestSettingsProfileAndGlobalSaveNeverQueueActivation(t *testing.T) {
 			}
 			if got.Queued || svc.applyCalls != 0 {
 				t.Fatalf("fanout result=%+v calls=%d", got, svc.applyCalls)
+			}
+			if len(svc.validatedWith) != 0 {
+				t.Fatalf("non-repository save checked activation confirmations: %v", svc.validatedWith)
 			}
 			if scope == settings.ScopeGlobal && got.Summary != "global defaults saved; running repositories were not changed" {
 				t.Fatalf("summary=%q", got.Summary)
