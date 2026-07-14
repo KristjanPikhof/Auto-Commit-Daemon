@@ -15,6 +15,11 @@
 
 ### Changed
 
+- The settings lab now starts accessible sessions with **Test current
+  settings**, offers a short **Quick provider setup** before **Advanced
+  settings**, accepts both `t` and `T`, and resolves provider-risk confirmations
+  inside the current keyboard-only session. Synthetic tests no longer require
+  activation-only diff egress consent.
 - `acd status` and `acd diagnose` now add saved generation, desired/applied/
   last-known-good revision, profile, activation failure, boundary, and
   experiment progress without changing existing fields or pre-v14 read-only

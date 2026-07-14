@@ -8,6 +8,10 @@ the draft came from, and when a change can take effect.
 acd settings
 ~~~
 
+Start with **Test current settings**. It runs the strict synthetic provider
+test without making you edit every field first. If the provider is not ready,
+the failure tells you which environment value or provider setting to correct.
+
 Saved explicit values do not need to be exported or sourced by your shell.
 Environment variables still work and remain the compatibility path for
 existing installations. `ACD_AI_API_KEY` is the exception: it is environment
@@ -52,10 +56,12 @@ The revision rail makes the lifecycle explicit:
 | `QUEUED` | An immutable desired config revision is stored and waiting for activation. |
 | `ACTIVE` | The daemon acknowledged the complete revision at a safe work boundary. |
 
-Use the keyboard to edit a value, then press `t` to test and `a` to apply. An
-apply never changes a provider in the middle of a capture or replay pass. Work
-already in flight finishes with the old revision, and the next pass leases the
-new revision as one complete runtime bundle.
+Use the keyboard to edit a value, then press `t` or `T` to test and `a` to
+apply. A required provider-risk confirmation opens inside the current session,
+then retries that operation once. An apply never changes a provider in the
+middle of a capture or replay pass. Work already in flight finishes with the
+old revision, and the next pass leases the new revision as one complete runtime
+bundle.
 
 Saving and applying are separate operations. A saved profile or global value
 does not activate running repositories. A repository apply creates an
@@ -94,16 +100,20 @@ API keys stay in `ACD_AI_API_KEY`. The lab displays only `set` or `unset`, and
 errors, fingerprints, saved settings, and runtime revisions never contain the
 key.
 
-Some configurations need separate, explicit confirmations:
+Some configurations need separate, explicit confirmations. The lab asks for
+the relevant confirmation inside the current session. The flags below are
+optional pre-authorization for scripts or repeat sessions.
 
-| Risk | Flag | Why it is separate |
+| Risk | When it is required | Optional flag |
 |---|---|---|
-| Credentials sent to a non-default endpoint | `--confirm-endpoint-credentials` | Confirms the selected endpoint may receive the bearer credential. |
-| Provider subprocess execution | `--confirm-subprocess` | Confirms an unsandboxed local executable may run with daemon privileges. |
-| Repository diff egress | `--confirm-diff-egress` | Confirms redacted captured diffs may leave the process. |
+| Credentials sent to a non-default endpoint | Strict synthetic test, apply, or experiment | `--confirm-endpoint-credentials` |
+| Provider subprocess execution | Strict synthetic test, apply, or experiment | `--confirm-subprocess` |
+| Repository diff egress | Apply or experiment when diff egress is enabled | `--confirm-diff-egress` |
 
-The confirmations apply to testing and activation. One confirmation never
-implies either of the other risks.
+The synthetic test never includes a repository diff, so diff egress consent
+does not block testing. Apply and experiment activation still require it when
+the chosen provider can receive redacted diffs. One confirmation never implies
+either of the other risks.
 
 ## Run an accessible session
 
@@ -118,6 +128,18 @@ NO_COLOR=1 acd settings --accessible
 interactive stdin and stdout. Both modes are keyboard-only, use text labels in
 addition to color, hide sensitive values, and ask before discarding a dirty
 draft.
+
+Accessible mode asks for the next action first. Press Enter on **Test current
+settings** to test the existing provider without walking the field catalog.
+Choose **Quick provider setup** to edit only provider, model, base URL, timeout,
+and CA file. Choose **Advanced settings** for every non-sensitive setting and
+its current value. Revert, profile, and experiment actions remain available in
+the first menu.
+
+Do not paste an API key into the settings lab. Set `ACD_AI_API_KEY` in the
+environment and run `acd settings` again. Missing-key and provider-test errors
+return one sanitized next action without printing credentials or provider
+response content.
 
 ## Run a bounded experiment
 

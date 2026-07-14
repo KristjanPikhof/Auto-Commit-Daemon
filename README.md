@@ -114,11 +114,18 @@ requires a restart.
 acd settings
 ~~~
 
-Use it to choose the provider, model, commit strategy, message format, and
-intent tuning. Once an explicit value is saved, you do not need to export it or
-source it from your shell. Existing environment variables remain compatible,
-and API keys remain environment only. See the [settings guide](docs/settings.md)
-for scopes, profiles, testing, activation, experiments, and recovery.
+Choose **Test current settings** first. It validates the current provider with
+one synthetic request and does not send repository content. Use **Quick
+provider setup** for provider essentials or **Advanced settings** for the full
+non-sensitive catalog. The terminal UI is keyboard-only, and required risk
+confirmations happen inside the session.
+
+Once an explicit value is saved, you do not need to export it or source it from
+your shell. Existing environment variables remain compatible, and API keys
+remain environment only. Diff egress is confirmed separately when applying a
+configuration; it does not block the synthetic test. See the [settings
+guide](docs/settings.md) for scopes, profiles, testing, activation,
+experiments, and recovery.
 
 | Strategy | What happens | Best for |
 |---|---|---|

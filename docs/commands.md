@@ -35,7 +35,8 @@ environment only. See [Configure ACD with the settings lab](settings.md).
 
 `acd settings` opens the rich terminal settings lab for the current repository.
 It shows `DRAFT`, `TESTED`, `QUEUED`, and `ACTIVE` state, including each value's
-source, shadowed environment value, and apply boundary.
+source, shadowed environment value, and apply boundary. Start with **Test
+current settings** to validate the current provider before editing anything.
 
 ~~~bash
 acd settings
@@ -49,10 +50,17 @@ not fan out to running repositories. Accessible mode uses linear prompts, and
 `TERM=dumb` selects it automatically. Rich mode requires interactive stdin and
 stdout; `--json` is not supported for the interactive command.
 
+Accessible mode is action-first and keyboard-only. **Quick provider setup**
+asks for provider essentials; **Advanced settings** opens the full
+non-sensitive catalog. Keep the API key in `ACD_AI_API_KEY`, never in a prompt.
+
 Provider tests use one fixed synthetic request and may incur one provider
-charge. Use distinct flags to confirm non-default endpoint credentials,
-subprocess execution, or diff egress. See the [settings guide](settings.md) for
-the full save, test, apply, revert, restart, and experiment contract.
+charge. Endpoint credentials and subprocess execution require confirmation for
+the test. Repository diff egress is not part of the synthetic request, so that
+confirmation is required only for apply or experiment activation. The UI can
+ask inside the session; the `--confirm-endpoint-credentials`,
+`--confirm-subprocess`, and `--confirm-diff-egress` flags pre-authorize their
+specific risks. See the [settings guide](settings.md) for the full contract.
 
 Bare `acd` reports one of these states:
 

@@ -225,7 +225,7 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 			missing = append(missing, item)
 		}
 	}
-	fingerprint, err := settingsFingerprint(resolved, confirmed)
+	fingerprint, err := settingsFingerprint(resolved)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -247,17 +247,43 @@ func (s *Service) TestProvider(ctx context.Context, draft map[string]string, con
 	if err != nil {
 		return ProviderTestResult{}, err
 	}
-	if len(validation.Missing) > 0 {
-		return ProviderTestResult{}, &ConfirmationRequiredError{Missing: validation.Missing}
+	testConfirmations := providerTestConfirmations(validation.Confirmations)
+	missing := missingConfirmations(testConfirmations, confirmed)
+	if len(missing) > 0 {
+		return ProviderTestResult{}, &ConfirmationRequiredError{Missing: missing}
 	}
 	result, err := s.probe(ctx, validation.ProviderConfig)
 	out := ProviderTestResult{Fingerprint: validation.Fingerprint,
 		Provider: cleanText(result.Provider), Latency: result.Latency,
-		Success: result.Success, Confirmations: append([]ai.ConfirmationRequirement(nil), validation.Confirmations...)}
+		Success: result.Success, Confirmations: testConfirmations}
 	if err != nil {
 		return out, sanitizeErrorWithSecrets(err, validation.ProviderConfig.APIKey)
 	}
 	return out, nil
+}
+
+func providerTestConfirmations(confirmations []ai.ConfirmationRequirement) []ai.ConfirmationRequirement {
+	out := make([]ai.ConfirmationRequirement, 0, len(confirmations))
+	for _, confirmation := range confirmations {
+		if confirmation != ai.ConfirmationDiffEgress {
+			out = append(out, confirmation)
+		}
+	}
+	return out
+}
+
+func missingConfirmations(required, confirmed []ai.ConfirmationRequirement) []ai.ConfirmationRequirement {
+	confirmedSet := make(map[ai.ConfirmationRequirement]struct{}, len(confirmed))
+	for _, confirmation := range confirmed {
+		confirmedSet[confirmation] = struct{}{}
+	}
+	missing := make([]ai.ConfirmationRequirement, 0, len(required))
+	for _, confirmation := range required {
+		if _, ok := confirmedSet[confirmation]; !ok {
+			missing = append(missing, confirmation)
+		}
+	}
+	return missing
 }
 
 func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, error) {
@@ -351,17 +377,11 @@ func hotValues(values map[string]string) map[string]string {
 	return out
 }
 
-func settingsFingerprint(values map[string]string, confirmations []ai.ConfirmationRequirement) (string, error) {
+func settingsFingerprint(values map[string]string) (string, error) {
 	payload := map[string]any{}
 	for key, value := range hotValues(values) {
 		payload[key] = value
 	}
-	consents := make([]string, len(confirmations))
-	for i := range confirmations {
-		consents[i] = string(confirmations[i])
-	}
-	sort.Strings(consents)
-	payload["confirmations"] = consents
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("acd settings: fingerprint: %w", err)
