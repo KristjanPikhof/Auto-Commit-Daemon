@@ -34,9 +34,9 @@ type pauseResult struct {
 }
 
 // resumeResult is the JSON envelope returned by `acd resume`. Status takes
-// the values "resumed", "not-paused", "requires-yes",
-// "backpressure-cleared", or "no-backpressure" so machine readers can
-// switch on a single field across all outcomes.
+// the values "resumed", "not-paused", "rewind-grace", "requires-yes",
+// "backpressure-cleared", or "no-backpressure" so machine readers can switch
+// on a single field across all outcomes.
 type resumeResult struct {
 	OK                  bool        `json:"ok"`
 	Status              string      `json:"status"`
@@ -48,6 +48,7 @@ type resumeResult struct {
 	BackpressureCleared bool        `json:"backpressure_cleared,omitempty"`
 	BackpressureWasSet  bool        `json:"backpressure_was_set,omitempty"`
 	BackpressureSetAt   string      `json:"backpressure_set_at,omitempty"`
+	Pause               *pauseInfo  `json:"pause,omitempty"`
 }
 
 func newPauseCmd() *cobra.Command {
@@ -215,6 +216,20 @@ func runResume(ctx context.Context, out io.Writer, repoFlag string, yes, jsonOut
 				BackpressureCleared: bpCleared,
 				BackpressureWasSet:  bpWasSet,
 				BackpressureSetAt:   bpSetAt,
+			}, jsonOut)
+		}
+		info, pauseErr := rewindGracePauseInfoForStateDB(ctx, state.DBPathFromGitDir(gitDir), time.Now())
+		if pauseErr != nil {
+			return fmt.Errorf("acd resume: inspect rewind grace: %w", pauseErr)
+		}
+		if info != nil {
+			return renderResume(out, resumeResult{
+				OK:         true,
+				Status:     "rewind-grace",
+				Repo:       repo,
+				MarkerPath: markerPath,
+				Removed:    false,
+				Pause:      info,
 			}, jsonOut)
 		}
 		return renderResume(out, resumeResult{
@@ -404,6 +419,16 @@ func renderResume(out io.Writer, res resumeResult, jsonOut bool) error {
 		return nil
 	case "not-paused":
 		fmt.Fprintf(out, "Repo is not paused: %s\n", res.Repo)
+		return nil
+	case "rewind-grace":
+		fmt.Fprintf(out, "Rewind safety grace is active for %s\n", res.Repo)
+		if res.Pause != nil && res.Pause.ExpiresAt != "" {
+			fmt.Fprintf(out, "Capture and replay resume automatically at %s (%s remaining).\n",
+				res.Pause.ExpiresAt,
+				formatDurationCompact(time.Duration(res.Pause.RemainingSeconds)*time.Second))
+		} else {
+			fmt.Fprintln(out, "Capture and replay resume automatically when the safety window expires.")
+		}
 		return nil
 	case "no-backpressure":
 		fmt.Fprintf(out, "No durable capture backpressure was active for %s\n", res.Repo)

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -270,6 +271,49 @@ func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusRewindGraceIsWaiting(t *testing.T) {
+	status := statusReport{
+		Daemon: "running",
+		PID:    os.Getpid(),
+		Paused: true,
+		Pause: &pauseInfo{
+			Source:           "rewind_grace",
+			Reason:           "rewind grace",
+			ExpiresAt:        time.Now().UTC().Add(45 * time.Second).Format(time.RFC3339),
+			RemainingSeconds: 45,
+		},
+	}
+	res := controlResult{OK: true}
+
+	applyControlStatus(&res, status)
+
+	if !res.OK || res.Health != controlHealthWaiting {
+		t.Fatalf("rewind grace should be a healthy wait: %+v", res)
+	}
+	if !strings.Contains(res.Summary, "45s") || !strings.Contains(res.NextAction, "resume automatically") {
+		t.Fatalf("rewind grace guidance is not actionable: %+v", res)
+	}
+}
+
+func TestApplyControlStatusManualPauseStillNeedsAttention(t *testing.T) {
+	status := statusReport{
+		Daemon: "running",
+		PID:    os.Getpid(),
+		Paused: true,
+		Pause: &pauseInfo{
+			Source: "manual",
+			Reason: "repo surgery",
+		},
+	}
+	res := controlResult{OK: true}
+
+	applyControlStatus(&res, status)
+
+	if res.OK || res.Health != controlHealthNeedsAttention {
+		t.Fatalf("manual pause should still need attention: %+v", res)
+	}
+}
+
 func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T) {
 	health := &daemon.IntentPlannerHealthSnapshot{State: daemon.IntentPlannerCircuitOpen}
 	for _, tc := range []struct {
@@ -343,6 +387,46 @@ func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
 	}
 	if secondOut.String() != thirdOut.String() {
 		t.Fatalf("idempotent JSON changed\nsecond=%s\nthird=%s", secondOut.String(), thirdOut.String())
+	}
+}
+
+func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeStartRepo(t)
+	_, restoreSpawn := installFakeSpawn(t, os.Getpid())
+	t.Cleanup(restoreSpawn)
+
+	if err := runControlOn(context.Background(), io.Discard, repo, true); err != nil {
+		t.Fatalf("seed runControlOn: %v", err)
+	}
+	reg, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
+	if !ok {
+		t.Fatal("registered repo missing")
+	}
+	db, err := state.Open(context.Background(), rec.StateDB)
+	if err != nil {
+		t.Fatalf("open state DB: %v", err)
+	}
+	until := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(context.Background(), db, replayPausedUntilMetaKey, until); err != nil {
+		db.Close()
+		t.Fatalf("seed rewind grace: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close state DB: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runControlOn(context.Background(), &out, repo, true); err != nil {
+		t.Fatalf("runControlOn during rewind grace: %v\n%s", err, out.String())
+	}
+	got := decodeControlResult(t, out.Bytes())
+	if !got.OK || got.Health != controlHealthWaiting || got.Changed {
+		t.Fatalf("unexpected rewind-grace control result: %+v", got)
 	}
 }
 

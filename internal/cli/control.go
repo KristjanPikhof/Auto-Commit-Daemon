@@ -350,6 +350,14 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD is enabled, but its daemon process is not running."
 		res.NextAction = "Run `acd on` to start it."
+	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD rewind safety grace is active."
+		if status.Pause.RemainingSeconds > 0 {
+			res.Summary = fmt.Sprintf("ACD rewind safety grace is active (%s remaining).",
+				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
+		}
+		res.NextAction = "No action needed; capture and replay resume automatically."
 	case status.Paused:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention

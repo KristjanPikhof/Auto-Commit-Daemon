@@ -47,6 +47,10 @@ func pauseInfoForRepo(ctx context.Context, conn *sql.DB, stateDBPath string, now
 		}
 	}
 
+	return rewindGracePauseInfo(ctx, conn, now)
+}
+
+func rewindGracePauseInfo(ctx context.Context, conn *sql.DB, now time.Time) (*pauseInfo, error) {
 	raw, ok, err := metaLookup(ctx, conn, replayPausedUntilMetaKey)
 	if err != nil || !ok || strings.TrimSpace(raw) == "" {
 		return nil, err
@@ -61,6 +65,18 @@ func pauseInfoForRepo(ctx context.Context, conn *sql.DB, stateDBPath string, now
 		ExpiresAt:        until.UTC().Format(time.RFC3339),
 		RemainingSeconds: int64(until.Sub(now.UTC()).Seconds()),
 	}, nil
+}
+
+func rewindGracePauseInfoForStateDB(ctx context.Context, stateDBPath string, now time.Time) (*pauseInfo, error) {
+	if !fileExists(stateDBPath) {
+		return nil, nil
+	}
+	conn, err := openStateDBReadOnly(ctx, stateDBPath)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return rewindGracePauseInfo(ctx, conn, now)
 }
 
 // pauseInfoFromMarker projects a manual pause marker into pauseInfo. An

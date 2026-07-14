@@ -183,6 +183,55 @@ func TestResume_NoMarkerIsNoop(t *testing.T) {
 	}
 }
 
+func TestResume_RewindGraceReportsAutomaticResume(t *testing.T) {
+	ctx := context.Background()
+	repo, _, db := makeRepoStateDB(t)
+	until := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, replayPausedUntilMetaKey, until); err != nil {
+		t.Fatalf("seed rewind grace: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close state DB: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runResume(ctx, &out, repo, true, true, false); err != nil {
+		t.Fatalf("runResume: %v", err)
+	}
+	var got resumeResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, out.String())
+	}
+	if !got.OK || got.Removed || got.Status != "rewind-grace" {
+		t.Fatalf("unexpected rewind-grace result: %+v", got)
+	}
+	if got.Pause == nil || got.Pause.Source != "rewind_grace" || got.Pause.ExpiresAt != until {
+		t.Fatalf("missing rewind-grace details: %+v", got)
+	}
+}
+
+func TestResume_RewindGraceHumanGuidance(t *testing.T) {
+	ctx := context.Background()
+	repo, _, db := makeRepoStateDB(t)
+	until := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+	if err := state.MetaSet(ctx, db, replayPausedUntilMetaKey, until); err != nil {
+		t.Fatalf("seed rewind grace: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close state DB: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runResume(ctx, &out, repo, true, false, false); err != nil {
+		t.Fatalf("runResume: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Rewind safety grace is active") ||
+		!strings.Contains(got, "resume automatically") {
+		t.Fatalf("missing automatic-resume guidance:\n%s", got)
+	}
+}
+
 func TestResume_RequiresYes_JSONEnvelope(t *testing.T) {
 	ctx := context.Background()
 	repo := makeStartRepo(t)
