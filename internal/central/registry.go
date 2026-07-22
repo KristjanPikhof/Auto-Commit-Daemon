@@ -30,11 +30,9 @@ package central
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -721,25 +719,11 @@ func canonicalStateDB(path string) string {
 }
 
 func readDaemonStateReadOnly(ctx context.Context, dbPath string) (pid int, mode string, known bool, err error) {
-	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
-	q.Add("mode", "ro")
-	conn, err := sql.Open("sqlite", "file:"+dbPath+"?"+q.Encode())
+	st, known, err := state.LoadDaemonStateReadOnly(ctx, dbPath)
 	if err != nil {
-		return 0, "", false, fmt.Errorf("open state.db read-only: %w", err)
+		return 0, "", false, err
 	}
-	defer func() { _ = conn.Close() }()
-	if err := conn.PingContext(ctx); err != nil {
-		return 0, "", false, fmt.Errorf("ping state.db read-only: %w", err)
-	}
-	const query = `SELECT pid, mode FROM daemon_state WHERE id = 1`
-	row := conn.QueryRowContext(ctx, query)
-	if err := row.Scan(&pid, &mode); errors.Is(err, sql.ErrNoRows) {
-		return 0, "stopped", false, nil
-	} else if err != nil {
-		return 0, "", false, fmt.Errorf("load daemon_state read-only: %w", err)
-	}
-	return pid, mode, true, nil
+	return st.PID, st.Mode, known, nil
 }
 
 func fileExists(path string) bool {

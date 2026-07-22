@@ -223,6 +223,21 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	defer func() { _ = clock.Release() }()
 
 	dbPath := state.DBPathFromGitDir(gitDir)
+	if sessionID == "" {
+		st, _, err := state.LoadDaemonStateReadOnly(ctx, dbPath)
+		if err != nil {
+			return res, fmt.Errorf("acd stop: load daemon state read-only: %w", err)
+		}
+		res.DaemonPID = st.PID
+		load := func(ctx context.Context) (state.DaemonState, bool, error) {
+			return state.LoadDaemonStateReadOnly(ctx, dbPath)
+		}
+		res = stopDaemonProcess(ctx, res, st, force, load)
+		return res, nil
+	}
+
+	// Explicit-session stops update daemon_clients, so they must use the
+	// schema-aware writable path and refuse databases newer than this binary.
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
 		return res, fmt.Errorf("acd stop: open state.db: %w", err)
@@ -234,77 +249,90 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 		return res, fmt.Errorf("acd stop: load daemon state: %w", err)
 	}
 	res.DaemonPID = st.PID
+	load := func(ctx context.Context) (state.DaemonState, bool, error) {
+		return state.LoadDaemonState(ctx, db)
+	}
 
 	// Refcount-aware explicit-session path: drop the caller's row first,
 	// then inspect remaining peers.
 	if !force {
-		if sessionID != "" {
-			existed, err := state.DeregisterClient(ctx, db, sessionID)
-			if err != nil {
-				return res, fmt.Errorf("acd stop: deregister: %w", err)
-			}
-			if !existed {
-				res.UnknownSession = true
-			}
-			// Count remaining clients.
-			remaining, err := state.CountClients(ctx, db)
-			if err != nil {
-				return res, fmt.Errorf("acd stop: count clients: %w", err)
-			}
-			if remaining > 0 {
-				res.Deferred = true
-				res.Peers = remaining
-				res.Reason = fmt.Sprintf("%d peer(s) remain", remaining)
-				return res, nil
-			}
+		existed, err := state.DeregisterClient(ctx, db, sessionID)
+		if err != nil {
+			return res, fmt.Errorf("acd stop: deregister: %w", err)
 		}
-		// No session was supplied, or the explicit session was the last
-		// client. SIGTERM the daemon without escalating; if it does not
-		// transition to mode=stopped within stopWaitTimeout, report
-		// deferred so the caller can see that shutdown is still pending.
-		if st.PID > 0 && identity.Alive(st.PID) {
-			_ = signalProcess(st.PID, syscall.SIGTERM, daemonFingerprintToken(st))
-			if waitForStopped(ctx, db, stopWaitTimeout) {
-				res.Stopped = true
-				return res, nil
-			}
+		if !existed {
+			res.UnknownSession = true
+		}
+		remaining, err := state.CountClients(ctx, db)
+		if err != nil {
+			return res, fmt.Errorf("acd stop: count clients: %w", err)
+		}
+		if remaining > 0 {
 			res.Deferred = true
-			res.Reason = "daemon still running after SIGTERM"
+			res.Peers = remaining
+			res.Reason = fmt.Sprintf("%d peer(s) remain", remaining)
 			return res, nil
 		}
-		// No live daemon — already stopped.
-		res.Stopped = true
+		res = stopDaemonProcess(ctx, res, st, false, load)
 		return res, nil
 	}
 
 	// --force path: optionally deregister the named session, then SIGTERM
 	// the daemon, escalate to SIGKILL after stopWaitTimeout.
-	if sessionID != "" {
-		_, _ = state.DeregisterClient(ctx, db, sessionID)
+	_, _ = state.DeregisterClient(ctx, db, sessionID)
+	res = stopDaemonProcess(ctx, res, st, true, load)
+	return res, nil
+}
+
+type daemonStateLoader func(context.Context) (state.DaemonState, bool, error)
+
+func stopDaemonProcess(
+	ctx context.Context,
+	res stopRepoResult,
+	st state.DaemonState,
+	force bool,
+	load daemonStateLoader,
+) stopRepoResult {
+	if !force {
+		// SIGTERM without escalating. If the daemon does not transition to
+		// mode=stopped within stopWaitTimeout, report shutdown as pending.
+		if st.PID > 0 && identity.Alive(st.PID) {
+			_ = signalProcess(st.PID, syscall.SIGTERM, daemonFingerprintToken(st))
+			if waitForStopped(ctx, load, stopWaitTimeout) {
+				res.Stopped = true
+				return res
+			}
+			res.Deferred = true
+			res.Reason = "daemon still running after SIGTERM"
+			return res
+		}
+		res.Stopped = true
+		return res
 	}
+
 	if st.PID <= 0 || !identity.Alive(st.PID) {
 		res.Stopped = true
 		res.Reason = "daemon not running"
-		return res, nil
+		return res
 	}
 	expectedFingerprint := daemonFingerprintToken(st)
 	if err := signalProcess(st.PID, syscall.SIGTERM, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGTERM failed: %v", err)
 	}
-	if waitForStopped(ctx, db, stopWaitTimeout) {
+	if waitForStopped(ctx, load, stopWaitTimeout) {
 		res.Stopped = true
-		return res, nil
+		return res
 	}
 	// Escalate: SIGKILL to the PID. Verify identity via fingerprint
 	// before the kill if possible — protects against PID reuse.
 	res.Escalated = true
 	if !identity.Alive(st.PID) {
 		res.Stopped = true
-		return res, nil
+		return res
 	}
 	if err := signalProcess(st.PID, syscall.SIGKILL, expectedFingerprint); err != nil {
 		res.Reason = fmt.Sprintf("SIGKILL failed: %v", err)
-		return res, nil
+		return res
 	}
 	// SIGKILL is synchronous from the kernel's perspective but the
 	// daemon's own state.db rows won't be updated. Treat the kill as
@@ -313,20 +341,20 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	for time.Now().Before(deadline) {
 		if !identity.Alive(st.PID) {
 			res.Stopped = true
-			return res, nil
+			return res
 		}
 		time.Sleep(stopPollInterval)
 	}
 	res.Reason = "daemon survived SIGKILL"
-	return res, nil
+	return res
 }
 
 // waitForStopped polls daemon_state.mode for "stopped" inside the timeout.
 // Returns true once the transition is observed.
-func waitForStopped(ctx context.Context, db *state.DB, timeout time.Duration) bool {
+func waitForStopped(ctx context.Context, load daemonStateLoader, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		st, _, err := state.LoadDaemonState(ctx, db)
+		st, _, err := load(ctx)
 		if err == nil && st.Mode == "stopped" {
 			return true
 		}

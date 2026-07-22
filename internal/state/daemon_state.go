@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"time"
 )
 
@@ -29,13 +31,45 @@ type DaemonState struct {
 // shape an UPSERT would produce — and ok=false so callers can distinguish
 // "never written" from "explicitly stopped".
 func LoadDaemonState(ctx context.Context, d *DB) (DaemonState, bool, error) {
-	const q = `
+	return loadDaemonStateRow(d.readSQL().QueryRowContext(ctx, daemonStateQuery))
+}
+
+// LoadDaemonStateReadOnly reads the stable daemon control row without opening
+// the database through the migration path. It lets an older controller stop a
+// newer daemon while preserving the newer schema unchanged.
+func LoadDaemonStateReadOnly(ctx context.Context, dbPath string) (DaemonState, bool, error) {
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return DaemonState{Mode: "stopped"}, false, nil
+	} else if err != nil {
+		return DaemonState{}, false, fmt.Errorf("state: stat state.db: %w", err)
+	}
+
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("mode", "ro")
+	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return DaemonState{}, false, fmt.Errorf("state: open state.db read-only: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	conn.SetMaxOpenConns(1)
+	if err := conn.PingContext(ctx); err != nil {
+		return DaemonState{}, false, fmt.Errorf("state: ping state.db read-only: %w", err)
+	}
+	return loadDaemonStateRow(conn.QueryRowContext(ctx, daemonStateQuery))
+}
+
+const daemonStateQuery = `
 SELECT pid, mode, heartbeat_ts, branch_ref, branch_generation,
        note, daemon_token, daemon_fingerprint, updated_ts
 FROM daemon_state WHERE id = 1`
 
+type daemonStateRow interface {
+	Scan(dest ...any) error
+}
+
+func loadDaemonStateRow(row daemonStateRow) (DaemonState, bool, error) {
 	var s DaemonState
-	row := d.readSQL().QueryRowContext(ctx, q)
 	err := row.Scan(&s.PID, &s.Mode, &s.HeartbeatTS, &s.BranchRef, &s.BranchGeneration,
 		&s.Note, &s.DaemonToken, &s.DaemonFingerprint, &s.UpdatedTS)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -215,6 +215,57 @@ func TestDaemonStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadDaemonStateReadOnlyAllowsFutureSchema(t *testing.T) {
+	t.Parallel()
+	d, dbPath := openTestDB(t)
+	ctx := context.Background()
+	want := DaemonState{
+		PID:               4242,
+		Mode:              "running",
+		HeartbeatTS:       12.5,
+		BranchRef:         sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration:  sql.NullInt64{Int64: 9, Valid: true},
+		Note:              sql.NullString{String: "ready", Valid: true},
+		DaemonToken:       sql.NullString{String: "token", Valid: true},
+		DaemonFingerprint: sql.NullString{String: "fingerprint", Valid: true},
+		UpdatedTS:         13.5,
+	}
+	if err := SaveDaemonState(ctx, d, want); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	futureVersion := SchemaVersion + 1
+	if _, err := d.SQL().ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", futureVersion)); err != nil {
+		t.Fatalf("set future schema version: %v", err)
+	}
+
+	got, ok, err := LoadDaemonStateReadOnly(ctx, dbPath)
+	if err != nil || !ok {
+		t.Fatalf("load read-only: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Fatalf("read-only daemon state = %+v, want %+v", got, want)
+	}
+	var version int
+	if err := d.SQL().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != futureVersion {
+		t.Fatalf("user_version = %d, want %d", version, futureVersion)
+	}
+}
+
+func TestLoadDaemonStateReadOnlyMissingDatabase(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "missing", DBFileName)
+	got, ok, err := LoadDaemonStateReadOnly(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("load missing database: %v", err)
+	}
+	if ok || got.Mode != "stopped" {
+		t.Fatalf("missing database = (%+v, %v), want stopped and false", got, ok)
+	}
+}
+
 // TestTouchClient_RefreshesLastSeenWithoutClobberingMetadata pins the
 // hot-path contract used by start.go's short-circuit branch: Touch must
 // bump last_seen_ts only and never disturb harness / watch_pid / watch_fp

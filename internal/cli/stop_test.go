@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -130,6 +132,83 @@ func TestStop_NoSessionStopsDaemonWithoutDeregisteringClients(t *testing.T) {
 	}
 	if clients != 2 {
 		t.Fatalf("clients after no-session stop = %d, want 2", clients)
+	}
+}
+
+func TestStop_NoSessionStopsDaemonWithNewerSchema(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir, _, db := makeRepoStateDB(t)
+	pid := os.Getpid()
+	fingerprint := "test-process-fingerprint"
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:               pid,
+		Mode:              "running",
+		HeartbeatTS:       nowFloat(),
+		DaemonFingerprint: sql.NullString{String: fingerprint, Valid: true},
+		UpdatedTS:         nowFloat(),
+	}); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	futureVersion := state.SchemaVersion + 1
+	if _, err := db.SQL().ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", futureVersion)); err != nil {
+		t.Fatalf("set future schema version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close state db: %v", err)
+	}
+
+	dbPath := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
+	prevSignal := signalProcess
+	var signals atomic.Int32
+	signalProcess = func(gotPID int, sig syscall.Signal, expectedFingerprint string) error {
+		signals.Add(1)
+		if gotPID != pid || sig != syscall.SIGTERM {
+			return fmt.Errorf("unexpected signal pid=%d signal=%v", gotPID, sig)
+		}
+		if expectedFingerprint != fingerprint {
+			return fmt.Errorf("fingerprint = %q, want %q", expectedFingerprint, fingerprint)
+		}
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			return err
+		}
+		defer raw.Close()
+		_, err = raw.ExecContext(ctx, `UPDATE daemon_state SET mode = 'stopped' WHERE id = 1`)
+		return err
+	}
+	defer func() { signalProcess = prevSignal }()
+
+	prevTimeout := stopWaitTimeout
+	stopWaitTimeout = time.Second
+	defer func() { stopWaitTimeout = prevTimeout }()
+
+	var out bytes.Buffer
+	if err := runStop(ctx, &out, repoDir, "", false, false, true); err != nil {
+		t.Fatalf("runStop with newer schema: %v", err)
+	}
+	if signals.Load() != 1 {
+		t.Fatalf("signals = %d, want 1", signals.Load())
+	}
+	var got stopRepoResult
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Stopped || got.Deferred {
+		t.Fatalf("expected stopped result, got %+v", got)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open state db: %v", err)
+	}
+	defer raw.Close()
+	var version int
+	if err := raw.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != futureVersion {
+		t.Fatalf("user_version = %d, want %d", version, futureVersion)
 	}
 }
 
