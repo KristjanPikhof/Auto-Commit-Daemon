@@ -143,6 +143,43 @@ func TestRecoveryChainLoadScopedOrdered(t *testing.T) {
 	}
 }
 
+func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"other-base", "unrelated-prefix.txt", EventStatePublished)
+	prefix := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"first-base", "prefix.txt", EventStatePublished)
+	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"first-base", "first.txt", EventStatePending)
+	interleaved := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"second-base", "interleaved.txt", EventStatePublished)
+	last := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"second-base", "last.txt", EventStateFailed)
+	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"second-base", "after-suffix.txt", EventStatePublished)
+	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 5,
+		"first-base", "wrong-generation.txt", EventStatePublished)
+
+	recoveryContext, err := LoadPublishedRecoveryContext(
+		ctx, d, "refs/heads/main", 4, "first-base", first, last,
+	)
+	if err != nil {
+		t.Fatalf("LoadPublishedRecoveryContext: %v", err)
+	}
+	if len(recoveryContext) != 2 || recoveryContext[0].Event.Seq != prefix ||
+		recoveryContext[1].Event.Seq != interleaved {
+		t.Fatalf("recovery context=%+v want ordered seqs [%d %d]", recoveryContext, prefix, interleaved)
+	}
+	for _, member := range recoveryContext {
+		if len(member.Ops) != 1 || member.Ops[0].EventSeq != member.Event.Seq {
+			t.Fatalf("ops not loaded exactly for seq %d: %+v", member.Event.Seq, member.Ops)
+		}
+	}
+}
+
 func TestRecoveryChainTransitionPublishedAtomic(t *testing.T) {
 	t.Parallel()
 	d, chain := seedRecoveryTestChain(t)

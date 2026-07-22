@@ -1050,6 +1050,60 @@ func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T
 	}
 }
 
+func TestPrunePublishedEventsPreservesInterleavedRecoveryContext(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	appendEvent := func(baseHead, path, eventState string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			BaseHead: baseHead, Operation: "modify", Path: path,
+			Fidelity: "exact", CapturedTS: 10, State: eventState,
+		}, []CaptureOp{{
+			Op: "modify", Path: path,
+			BeforeOID: sqlNullStr("before-" + path), BeforeMode: sqlNullStr("100644"),
+			AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+			Fidelity: "exact",
+		}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+		}
+		return seq
+	}
+
+	first := appendEvent("base-one", "first.txt", EventStatePending)
+	contextSeq := appendEvent("base-one", "context.txt", EventStatePublished)
+	last := appendEvent("base-two", "last.txt", EventStatePending)
+	ordinary := appendEvent("base-two", "ordinary.txt", EventStatePublished)
+
+	n, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned=%d want only non-context published row", n)
+	}
+	for _, seq := range []int64{first, contextSeq, last} {
+		var count int
+		if err := d.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&count); err != nil {
+			t.Fatalf("count event seq=%d: %v", seq, err)
+		}
+		if count != 1 {
+			t.Fatalf("recovery context seq=%d count=%d want 1", seq, count)
+		}
+	}
+	var ordinaryCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+		t.Fatalf("count ordinary event: %v", err)
+	}
+	if ordinaryCount != 0 {
+		t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
+	}
+}
+
 func TestRollupsAppendOnly(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)

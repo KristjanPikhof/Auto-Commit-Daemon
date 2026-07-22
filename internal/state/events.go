@@ -676,10 +676,11 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 }
 
 // PrunePublishedEventsBefore deletes old published rows that do not belong to
-// a recovery snapshot and are not materialization context for a later
-// unpublished same-base chain. Snapshot members require repo-aware Git-ref
-// locking and are pruned separately by the daemon, regardless of whether
-// reconciliation classified them as published or recovered.
+// a recovery snapshot and are not materialization context for an unresolved
+// chain. Context includes same-base prefixes and published events interleaved
+// between unresolved rows. Snapshot members require repo-aware Git-ref locking
+// and are pruned separately by the daemon, regardless of whether reconciliation
+// classified them as published or recovered.
 func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
 	res, err := d.conn.ExecContext(ctx, `
 DELETE FROM capture_events
@@ -698,7 +699,26 @@ WHERE state = 'published'
         AND unpublished.base_head = capture_events.base_head
         AND unpublished.seq > capture_events.seq
         AND unpublished.state IN (?, ?, ?)
-  )`, cutoff, EventStatePending, EventStateBlockedConflict, EventStateFailed)
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM capture_events earlier
+      WHERE earlier.branch_ref = capture_events.branch_ref
+        AND earlier.branch_generation = capture_events.branch_generation
+        AND earlier.seq < capture_events.seq
+        AND earlier.state IN (?, ?, ?)
+        AND EXISTS (
+            SELECT 1
+            FROM capture_events later
+            WHERE later.branch_ref = capture_events.branch_ref
+              AND later.branch_generation = capture_events.branch_generation
+              AND later.seq > capture_events.seq
+              AND later.state IN (?, ?, ?)
+        )
+  )`, cutoff,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune published events: %w", err)
 	}

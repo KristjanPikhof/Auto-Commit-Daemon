@@ -87,24 +87,25 @@ func LoadUnpublishedRecoveryChain(ctx context.Context, d *DB, branchRef string, 
 	return loadUnpublishedRecoveryChain(ctx, d.readSQL(), branchRef, branchGeneration, firstSeq)
 }
 
-// LoadPublishedRecoveryPrefix returns earlier published events captured from
-// the same immutable base as an unpublished suffix. The prefix is
-// materialization context only: it lets recovery rebuild a later event whose
-// before-state was produced by an event already published in a prior pass.
-// TransitionRecoveryChain never changes these rows.
-func LoadPublishedRecoveryPrefix(
+// LoadPublishedRecoveryContext returns published events needed to materialize
+// an unpublished suffix. Context includes same-base events before the suffix
+// and published events interleaved through it; both can produce a later
+// unpublished event's before-state. TransitionRecoveryChain never changes
+// these rows.
+func LoadPublishedRecoveryContext(
 	ctx context.Context,
 	d *DB,
 	branchRef string,
 	branchGeneration int64,
 	baseHead string,
-	beforeSeq int64,
+	firstSeq int64,
+	lastSeq int64,
 ) ([]RecoveryChainEvent, error) {
 	if d == nil {
-		return nil, fmt.Errorf("state: LoadPublishedRecoveryPrefix: nil db")
+		return nil, fmt.Errorf("state: LoadPublishedRecoveryContext: nil db")
 	}
-	if branchRef == "" || branchGeneration < 1 || baseHead == "" || beforeSeq < 1 {
-		return nil, fmt.Errorf("state: LoadPublishedRecoveryPrefix: invalid selector")
+	if branchRef == "" || branchGeneration < 1 || baseHead == "" || firstSeq < 1 || lastSeq < firstSeq {
+		return nil, fmt.Errorf("state: LoadPublishedRecoveryContext: invalid selector")
 	}
 	rows, err := d.readSQL().QueryContext(ctx, `
 SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
@@ -112,39 +113,39 @@ SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
 FROM capture_events
 WHERE branch_ref = ?
   AND branch_generation = ?
-  AND base_head = ?
-  AND seq < ?
   AND state = ?
-ORDER BY seq ASC`, branchRef, branchGeneration, baseHead, beforeSeq, EventStatePublished)
+  AND ((base_head = ? AND seq < ?) OR (seq > ? AND seq < ?))
+ORDER BY seq ASC`, branchRef, branchGeneration, EventStatePublished,
+		baseHead, firstSeq, firstSeq, lastSeq)
 	if err != nil {
-		return nil, fmt.Errorf("state: load published recovery prefix: %w", err)
+		return nil, fmt.Errorf("state: load published recovery context: %w", err)
 	}
 	defer rows.Close()
-	var prefix []RecoveryChainEvent
+	var recoveryContext []RecoveryChainEvent
 	for rows.Next() {
 		var ev CaptureEvent
 		if err := rows.Scan(&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead,
 			&ev.Operation, &ev.Path, &ev.OldPath, &ev.Fidelity,
 			&ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID,
 			&ev.Error, &ev.Message); err != nil {
-			return nil, fmt.Errorf("state: scan published recovery prefix: %w", err)
+			return nil, fmt.Errorf("state: scan published recovery context: %w", err)
 		}
-		prefix = append(prefix, RecoveryChainEvent{Event: ev})
+		recoveryContext = append(recoveryContext, RecoveryChainEvent{Event: ev})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("state: iterate published recovery prefix: %w", err)
+		return nil, fmt.Errorf("state: iterate published recovery context: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("state: close published recovery prefix: %w", err)
+		return nil, fmt.Errorf("state: close published recovery context: %w", err)
 	}
-	for i := range prefix {
-		ops, err := loadCaptureOpsWith(ctx, d.readSQL(), prefix[i].Event.Seq)
+	for i := range recoveryContext {
+		ops, err := loadCaptureOpsWith(ctx, d.readSQL(), recoveryContext[i].Event.Seq)
 		if err != nil {
 			return nil, err
 		}
-		prefix[i].Ops = ops
+		recoveryContext[i].Ops = ops
 	}
-	return prefix, nil
+	return recoveryContext, nil
 }
 
 func loadUnpublishedRecoveryChain(ctx context.Context, q recoveryQueryer, branchRef string, branchGeneration, firstSeq int64) ([]RecoveryChainEvent, error) {
