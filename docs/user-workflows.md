@@ -335,7 +335,8 @@ acd doctor
 
 These fields are labeled `restart required` in `acd settings`. Save the change,
 then restart the daemon explicitly with `acd off` followed by `acd on`. The
-settings command never starts a stopped daemon.
+new daemon resolves the saved repository, selected-profile, and global values
+before capture starts. The settings command never starts a stopped daemon.
 
 ## Generated cache flood recovery
 

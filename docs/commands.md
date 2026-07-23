@@ -67,7 +67,7 @@ Bare `acd` reports one of these states:
 | State | Meaning |
 |---|---|
 | `healthy` | The daemon is running and no action is needed. |
-| `waiting` | Intent mode is waiting for its configured batch boundary. |
+| `waiting` | Intent mode is waiting for its batch boundary, or replay is inside the automatic rewind grace period. |
 | `degraded` | ACD is still running, usually with deterministic planner fallback. |
 | `needs_attention` | The daemon, pause state, or replay queue needs inspection. |
 | `off` | This repo is disabled. |
