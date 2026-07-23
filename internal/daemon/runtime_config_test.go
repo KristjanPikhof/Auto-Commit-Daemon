@@ -211,6 +211,38 @@ func TestRuntimeConfigRestartRecoversAcknowledgedDesired(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigFinalizesRequestWhenBundleAlreadyMatches(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	revision := runtimeRevision(t, db, "current", 1, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "event",
+	})
+	request, ok, err := state.RequestConfigActivation(context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request=%+v ok=%v err=%v", request, ok, err)
+	}
+	if ok, err := state.AcknowledgeConfigActivation(context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("ack=%v err=%v", ok, err)
+	}
+	manager := NewRuntimeBundleManager(&RuntimeBundle{
+		RevisionID: revision.ID, Provider: &runtimeTestProvider{name: "deterministic"}, MessageFn: DeterministicMessage,
+	}, runtimeBuilder(db, closers), time.Second)
+	defer manager.Close()
+
+	if err := manager.ActivateDesired(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := state.RuntimeConfigActivationState(context.Background(), db)
+	if err != nil || projection.AppliedRevisionID.Int64 != revision.ID {
+		t.Fatalf("projection=%+v err=%v", projection, err)
+	}
+	got, err := state.ActivationRequestByID(context.Background(), db, request.ID)
+	if err != nil || got.Status != state.ActivationApplied {
+		t.Fatalf("request=%+v err=%v", got, err)
+	}
+}
+
 func TestRuntimeConfigRequiresPrivacyConfirmations(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "test-only-key")
 	db := openTestDB(t)

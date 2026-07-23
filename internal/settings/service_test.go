@@ -230,6 +230,45 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 	}
 }
 
+func TestSettingsActionProviderTestDoesNotRequireDiffEgressConfirmation(t *testing.T) {
+	var probes atomic.Int32
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden-key", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		probes.Add(1)
+		if !cfg.DiffEgress {
+			t.Fatal("test config lost the activation diff-egress setting")
+		}
+		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
+	}, nil)
+	draft := map[string]string{
+		config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1",
+		config.FieldModel: "model-a", config.FieldDiffEgress: "true",
+	}
+	confirmed := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}
+	result, err := svc.TestProvider(context.Background(), draft, confirmed)
+	if err != nil || !result.Success || probes.Load() != 1 {
+		t.Fatalf("TestProvider = %+v err=%v probes=%d", result, err, probes.Load())
+	}
+	if !reflect.DeepEqual(result.Confirmations, confirmed) {
+		t.Fatalf("test confirmations=%v want=%v", result.Confirmations, confirmed)
+	}
+	validation, err := svc.Validate(context.Background(), draft, confirmed)
+	if err != nil || !reflect.DeepEqual(validation.Missing, []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}) {
+		t.Fatalf("activation validation=%+v err=%v", validation, err)
+	}
+	withDiff, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{
+		ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress,
+	})
+	if err != nil || validation.Fingerprint != withDiff.Fingerprint {
+		t.Fatalf("consent changed fingerprint: without=%s with=%s err=%v", validation.Fingerprint, withDiff.Fingerprint, err)
+	}
+}
+
 func TestSettingsActionProviderTestRedactsProbeError(t *testing.T) {
 	lookup := func(name string) (string, bool) {
 		if name == ai.EnvAPIKey {

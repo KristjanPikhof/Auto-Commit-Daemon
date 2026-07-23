@@ -31,7 +31,8 @@ func (f *fakeCLISettingsService) Validate(_ context.Context, _ map[string]string
 	f.confirmations = append([]ai.ConfirmationRequirement(nil), c...)
 	return settings.Validation{Fingerprint: "fp"}, nil
 }
-func (f *fakeCLISettingsService) TestProvider(context.Context, map[string]string, []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
+func (f *fakeCLISettingsService) TestProvider(_ context.Context, _ map[string]string, c []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
+	f.confirmations = append([]ai.ConfirmationRequirement(nil), c...)
 	return settings.ProviderTestResult{Fingerprint: "fp", Provider: "deterministic", Success: true}, nil
 }
 func (f *fakeCLISettingsService) Apply(context.Context, settings.ApplyRequest) (settings.ApplyResult, error) {

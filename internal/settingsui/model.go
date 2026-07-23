@@ -18,12 +18,20 @@ const (
 	ModeSearch
 	ModeConfirmQuit
 	ModeConfirmApply
+	ModeConfirmRisk
 )
 
 type Operation struct {
 	ID     uint64
 	Name   string
 	Cancel context.CancelFunc
+	Run    func(context.Context) (any, error)
+}
+
+type ConfirmationPrompt struct {
+	Operation    string
+	Requirements []ConfirmationRequirement
+	Retry        func(context.Context) (any, error)
 }
 
 type Model struct {
@@ -38,6 +46,7 @@ type Model struct {
 	PendingRevision  int64
 	AppliedRevision  int64
 	Operation        *Operation
+	Confirmation     *ConfirmationPrompt
 	Experiment       Experiment
 	Focus            int
 	Mode             Mode
@@ -82,6 +91,18 @@ func (m Model) ActiveField() FieldDescriptor {
 }
 
 func (m Model) IsDirty() bool { return len(m.Dirty) > 0 }
+
+func (m Model) hasHotDraftChanges() bool {
+	for _, field := range m.Snapshot.Fields {
+		if field.Restart || field.SensitiveSet || descriptor(field.Key).Sensitive {
+			continue
+		}
+		if value, ok := m.Draft[field.Key]; ok && value != field.ActiveValue {
+			return true
+		}
+	}
+	return false
+}
 
 func (m Model) Fingerprint() string {
 	keys := make([]string, 0, len(m.Draft))

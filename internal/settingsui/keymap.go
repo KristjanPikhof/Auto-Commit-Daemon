@@ -14,7 +14,7 @@ func DefaultKeyMap() KeyMap {
 		Edit:             key.NewBinding(key.WithKeys("enter", "e"), key.WithHelp("enter/e", "edit")),
 		Search:           key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
 		Save:             key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "save")),
-		Test:             key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "test")),
+		Test:             key.NewBinding(key.WithKeys("t", "T"), key.WithHelp("t/T", "test")),
 		Apply:            key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "apply")),
 		Revert:           key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "revert")),
 		Experiment:       key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "experiment")),

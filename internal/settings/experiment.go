@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -69,6 +70,13 @@ func (s *Service) StartExperiment(ctx context.Context, req ExperimentRequest) (E
 	if !runtimeState.DesiredRevisionID.Valid || runtimeState.DesiredRevisionID.Int64 != baselineID ||
 		req.ExpectedDesiredRevision != baselineID {
 		return ExperimentResult{}, errors.New("acd settings: desired revision changed; refresh before starting experiment")
+	}
+	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
+	if err != nil {
+		return ExperimentResult{}, err
+	}
+	if validation.ResolvedHot[config.FieldCommitStrategy] != string(ai.CommitStrategyIntent) {
+		return ExperimentResult{}, errors.New("acd settings: experiments require commit.strategy=intent because budgets count planner windows")
 	}
 	applyReq := ApplyRequest{
 		Values: req.Values, TestedFingerprint: req.TestedFingerprint,

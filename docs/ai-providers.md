@@ -260,9 +260,11 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 
 The strict test in `acd settings` sends exactly one fixed synthetic request and
 may incur one provider charge. It sends no repository path, diff, captured
-metadata, prompt trace, commit, or experiment sample. Non-default endpoints,
-subprocess execution, and diff egress each require a separate confirmation;
-see [Test a provider safely](settings.md#test-a-provider-safely).
+metadata, prompt trace, commit, or experiment sample. Non-default endpoint and
+subprocess risks require confirmation before the test. Diff egress is an
+activation-only confirmation because the synthetic test contains no diff. The
+lab asks inside the current session, while CLI flags can pre-authorize each
+specific risk. See [Test a provider safely](settings.md#test-a-provider-safely).
 
 | Risk | What to do |
 |---|---|

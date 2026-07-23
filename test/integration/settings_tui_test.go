@@ -5,11 +5,13 @@ package integration_test
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,11 +106,156 @@ func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	if !strings.Contains(accessible.Stdout, "ACD SETTINGS - accessible mode") || !strings.Contains(accessible.Stdout, "set/unset only; value never displayed") {
 		t.Fatalf("accessible transcript missing\n%s", accessible.Stdout)
 	}
-	if !strings.Contains(accessible.Stdout, "Provider (next safe boundary) [current: deterministic; Enter keeps current]") {
-		t.Fatalf("accessible prompt omitted retained value\n%s", accessible.Stdout)
+	if !strings.Contains(accessible.Stdout, "What do you want to do?") ||
+		!strings.Contains(accessible.Stdout, "Test current settings (recommended)") {
+		t.Fatalf("accessible prompt omitted action-first onboarding\n%s", accessible.Stdout)
+	}
+	if strings.Contains(accessible.Stdout, "Minimum pending (next safe boundary) [current:") {
+		t.Fatalf("accessible start unexpectedly opened the advanced catalog\n%s", accessible.Stdout)
 	}
 	if strings.Contains(accessible.Stdout, "\x1b[?1049h") {
 		t.Fatalf("accessible mode entered alternate screen\n%q", accessible.Stdout)
+	}
+}
+
+func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
+	repo := tempRepo(t)
+	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	tested := runPTYCommand(t, ctx, baseEnv, 72, 28, 0, 0,
+		"\n\x00y\n\x00", bin, "settings", "--repo", repo, "--accessible")
+	cancel()
+	if tested.ExitCode != 0 || !strings.Contains(tested.Stdout, "TESTED:") {
+		t.Fatalf("action-first deterministic test exit=%d\n%s", tested.ExitCode, tested.Stdout)
+	}
+	if !strings.Contains(tested.Stdout, "Test current settings (recommended)") {
+		t.Fatalf("action-first default was not rendered\n%s", tested.Stdout)
+	}
+	if strings.Contains(tested.Stdout, "Minimum pending (next safe boundary) [current:") {
+		t.Fatalf("current-settings test visited the advanced catalog\n%s", tested.Stdout)
+	}
+	if strings.Contains(tested.Stdout, "\x1b[?1049h") {
+		t.Fatalf("accessible test entered alternate screen\n%q", tested.Stdout)
+	}
+
+	riskEnv := envWith(baseEnv,
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_MODEL=synthetic-test-model",
+		"ACD_AI_BASE_URL=https://example.invalid/v1",
+		"ACD_AI_API_KEY=integration-placeholder",
+	)
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+	declined := runPTYCommand(t, ctx, riskEnv, 72, 28, 0, 0,
+		"\n\x00y\n\x00n\n\x00", bin, "settings", "--repo", repo, "--accessible")
+	cancel()
+	if declined.ExitCode == 0 {
+		t.Fatalf("declined endpoint risk unexpectedly succeeded\n%s", declined.Stdout)
+	}
+	if !strings.Contains(declined.Stdout, "send credentials to a non-default endpoint") ||
+		!strings.Contains(declined.Stdout, "no request or change was made") {
+		t.Fatalf("endpoint risk decline was not explicit\n%s", declined.Stdout)
+	}
+	if strings.Contains(declined.Stdout, "integration-placeholder") {
+		t.Fatalf("accessible transcript exposed the test credential\n%s", declined.Stdout)
+	}
+	if strings.Contains(declined.Stdout, "\x1b[?1049h") {
+		t.Fatalf("accessible risk prompt entered alternate screen\n%q", declined.Stdout)
+	}
+}
+
+func TestSettingsTUIRealPTYConfirmationRetryAndApplyDecline(t *testing.T) {
+	repo := tempRepo(t)
+	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+	const response = `{
+  "id": "chatcmpl-settings-probe",
+  "object": "chat.completion",
+  "model": "synthetic-test-model",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "call_settings_probe",
+        "type": "function",
+        "function": {
+          "name": "commit_message",
+          "arguments": "{\"subject\":\"Probe provider\",\"body\":\"\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}`
+	var hits atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(response))
+	}))
+	defer server.Close()
+	providerEnv := envWith(baseEnv,
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_MODEL=synthetic-test-model",
+		"ACD_AI_BASE_URL="+server.URL,
+		"ACD_AI_API_KEY=integration-placeholder",
+		trustEnv,
+	)
+
+	for _, key := range []string{"t", "T"} {
+		t.Run("rich_"+key, func(t *testing.T) {
+			before := hits.Load()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			result := runPTYCommand(t, ctx, providerEnv, 100, 32, 0, 0,
+				key+"\x00y\x00\x00q\x00", bin, "settings", "--repo", repo)
+			cancel()
+			if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Confirm send credentials to a non-default endpoint?") ||
+				!strings.Contains(result.Stdout, "TESTED") || !strings.Contains(result.Stdout, "[t/T] test") {
+				t.Fatalf("rich %q confirmation/retry exit=%d\n%s", key, result.ExitCode, result.Stdout)
+			}
+			if got := hits.Load() - before; got != 1 {
+				t.Fatalf("rich %q provider requests=%d want 1", key, got)
+			}
+			assertAltScreenRestored(t, result.Stdout)
+		})
+	}
+
+	applyEnv := envWith(providerEnv, "ACD_AI_DIFF_EGRESS=true")
+	beforeConfig := readOptionalFile(t, settingsConfigPath(applyEnv))
+	beforeHits := hits.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	declined := runPTYCommand(t, ctx, applyEnv, 72, 28, 0, 0,
+		"2\n\x00y\n\x00y\n\x00n\n\x00", bin, "settings", "--repo", repo, "--accessible")
+	cancel()
+	if declined.ExitCode == 0 {
+		t.Fatalf("declined diff egress unexpectedly applied\n%s", declined.Stdout)
+	}
+	if !strings.Contains(declined.Stdout, "allow redacted repository diff egress") ||
+		!strings.Contains(declined.Stdout, "synthetic test completed, but no apply or activation change was made") {
+		t.Fatalf("accessible apply decline was inaccurate\n%s", declined.Stdout)
+	}
+	if got := hits.Load() - beforeHits; got != 1 {
+		t.Fatalf("accessible apply provider requests=%d want 1", got)
+	}
+	if strings.Contains(declined.Stdout, "integration-placeholder") {
+		t.Fatalf("accessible apply exposed the test credential\n%s", declined.Stdout)
+	}
+	if got := readOptionalFile(t, settingsConfigPath(applyEnv)); got != beforeConfig {
+		t.Fatalf("declined apply changed config: before=%q after=%q", beforeConfig, got)
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions"); got != "0" {
+		t.Fatalf("declined apply created runtime revisions: %s", got)
+	}
+	if strings.Contains(declined.Stdout, "\x1b[?1049h") {
+		t.Fatalf("accessible apply entered alternate screen\n%q", declined.Stdout)
 	}
 }
 
@@ -120,7 +267,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	// Edit provider, save, wait for the real config write, then quit.
 	saved := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x15openai-compat\rs\x00q", bin, "settings", "--repo", repo)
+		"\r\x00\x15\x00openai-compat\x00\r\x00s\x00q", bin, "settings", "--repo", repo)
 	cancel()
 	if saved.ExitCode != 0 || !strings.Contains(saved.Stdout, "draft saved") {
 		t.Fatalf("save action exit=%d\n%s", saved.ExitCode, saved.Stdout)
@@ -134,7 +281,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	// Make the provider invalid, exercise the asynchronous strict-test error,
 	// wait for it to render, then use the dirty-discard path to exit.
 	failed := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x15invalid-provider\rt\x00qd", bin, "settings", "--repo", repo)
+		"\r\x00\x15\x00invalid-provider\x00\r\x00t\x00qd", bin, "settings", "--repo", repo)
 	cancel()
 	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "FAILED:") {
 		t.Fatalf("failed action exit=%d\n%s", failed.ExitCode, failed.Stdout)

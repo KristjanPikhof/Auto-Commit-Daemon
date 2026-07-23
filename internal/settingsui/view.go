@@ -113,17 +113,20 @@ func (m Model) Render() string {
 		}
 		body = strings.Join(compact, "\n")
 	}
-	footer := "[q] quit [up/down] navigate [enter] edit [/] search [s] save [t] test [a] apply [r] revert [p] profile [x/X] start/cancel experiment [b/z/f] budget/expiry/policy"
+	footer := "[q] quit [up/down] navigate [enter] edit [/] search [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] start/cancel experiment [b/z/f] budget/expiry/policy"
 	if m.Width < 70 {
-		footer = "[q] quit [j/k] nav [e] edit [s] save [t] test [a] apply [x/X] experiment"
+		footer = "[q] quit [j/k] nav [e] edit [s] save [t/T] test [a] apply [x/X] experiment"
 	} else if m.Width < 100 {
-		footer = "[q] quit [j/k] nav [enter] edit [/] find [s] save [t] test [a] apply [r] revert [p] profile [x/X] experiment"
+		footer = "[q] quit [j/k] nav [enter] edit [/] find [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] experiment"
 	}
 	if m.Mode == ModeConfirmQuit {
 		footer = "Unsaved DRAFT. [d/y] discard and quit  [esc] continue editing"
 	}
 	if m.Mode == ModeConfirmApply {
 		footer = "Apply TESTED draft at the next safe boundary? [y] confirm  [esc] cancel"
+	}
+	if m.Mode == ModeConfirmRisk && m.Confirmation != nil {
+		footer = "Confirm " + confirmationRequirementLabels(m.Confirmation.Requirements) + "? [y] confirm and retry  [esc] cancel"
 	}
 	if m.Mode == ModeEdit {
 		footer = "Edit " + active.Label + ": " + m.input.View() + "  [enter] accept  [esc] cancel"

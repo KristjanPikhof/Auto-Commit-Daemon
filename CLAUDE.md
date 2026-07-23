@@ -102,7 +102,7 @@ Commit messages:
 
 - `acd settings` is the Go-native configuration lab. It uses Bubble Tea v2.0.8, Bubbles v2.1.1, Lip Gloss v2.0.5, and Huh v2.0.3. Preserve static CGO-disabled builds, responsive/accessible/no-color behavior, and `DRAFT > TESTED > QUEUED > ACTIVE` text labels.
 - Settings precedence is experiment > repository > profile > global > environment > default. API keys remain environment only. Hot revisions activate between daemon passes; restart-required fields never enter a hot revision. Global saves do not fan out and stopped-daemon apply never starts it.
-- Strict provider tests send one synthetic request without source data. Endpoint credentials, subprocess execution, and diff egress require distinct confirmations. Experiment comparisons are descriptive, not causal.
+- Strict provider tests send one synthetic request without source data. Endpoint credentials and subprocess execution require operation-specific confirmation; diff egress is activation-only because the test never sends a diff. Rich and accessible modes resolve missing confirmations inside the current session. Accessible onboarding is action-first: Test current settings by default, Quick provider setup for provider essentials, and Advanced settings for the full non-sensitive catalog. Keep all interaction keyboard-only. Experiment comparisons are descriptive, not causal.
 
 - Default `ACD_COMMIT_STRATEGY=event` publishes one capture per commit and never calls the planner. `intent` selects one capture or a non-empty subset; capture durability is unchanged.
 - Every offered seq must be selected or deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to a deterministic singleton.

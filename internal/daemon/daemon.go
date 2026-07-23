@@ -1054,11 +1054,10 @@ func Run(ctx context.Context, opts Options) error {
 	// start-latency budget. The goroutine reads ctx — when the daemon
 	// stops the sweep is short-circuited.
 	//
-	// Honor the manual-pause marker first: an operator paused mid-surgery
-	// expects no background mutation to capture_events while they
-	// investigate. A read failure on the pause state is logged and the
-	// sweep is skipped (fail closed — same posture as the run-loop pause
-	// gate).
+	// Honor the shared pause state first: an operator pause or rewind grace
+	// expects no background mutation to capture_events. A read failure on the
+	// pause state is logged and the sweep is skipped (fail closed — same posture
+	// as the run-loop pause gate).
 	startupSweepCctx := cctx
 	startupSweepWG.Add(1)
 	go func(sweepCctx CaptureContext) {
@@ -1073,7 +1072,7 @@ func Run(ctx context.Context, opts Options) error {
 				"err", perr.Error())
 			return
 		} else if pauseStatus.Active {
-			logger.Info("startup dead-branch sweep skipped (manual pause)",
+			logger.Info("startup dead-branch sweep skipped while paused",
 				"source", pauseStatus.Source,
 				"reason", pauseStatus.Reason)
 			return
