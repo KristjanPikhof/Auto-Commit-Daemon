@@ -171,6 +171,55 @@ func TestUpdatePollingPreservesFocusAndDirtyDraft(t *testing.T) {
 	}
 }
 
+func TestModelInitSchedulesSnapshotAndRecurringPoll(t *testing.T) {
+	cmd := New(&fakeBackend{}).Init()
+	msg := runCmd(t, cmd)
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("init message=%T %#v", msg, msg)
+	}
+}
+
+func TestUpdatePreservesDirtyDraftForUnrelatedOperations(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot()}
+	m := New(b)
+	m, _ = updated(t, m, snapshotMsg{Snapshot: b.snapshot})
+	m.Draft["ai.model"] = "unsaved"
+	m.Dirty["ai.model"] = true
+
+	m, cmd := updated(t, m, keyMsg("r"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if !m.Dirty["ai.model"] || m.Draft["ai.model"] != "unsaved" {
+		t.Fatalf("revert discarded dirty draft: %+v", m)
+	}
+
+	m.Experiment = Experiment{ID: 3, Active: true}
+	m, cmd = updated(t, m, keyMsg("X"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if !m.Dirty["ai.model"] || m.Draft["ai.model"] != "unsaved" {
+		t.Fatalf("experiment cancellation discarded dirty draft: %+v", m)
+	}
+
+	m.Snapshot.Profiles = []string{"other"}
+	m, cmd = updated(t, m, keyMsg("p"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if !m.Dirty["ai.model"] || m.Draft["ai.model"] != "unsaved" {
+		t.Fatalf("profile selection discarded dirty draft: %+v", m)
+	}
+}
+
+func TestUpdateExperimentStartMarksSavedDraftClean(t *testing.T) {
+	b := &fakeBackend{snapshot: baseSnapshot()}
+	m := New(b)
+	m, _ = updated(t, m, snapshotMsg{Snapshot: b.snapshot})
+	m.Dirty["ai.model"] = true
+	m, cmd := updated(t, m, keyMsg("x"))
+	m, _ = updated(t, m, runCmd(t, cmd))
+	if m.IsDirty() || !m.Experiment.Active {
+		t.Fatalf("experiment start state=%+v", m)
+	}
+}
+
 func TestUpdateRejectRevertExperimentAndCancellation(t *testing.T) {
 	b := &fakeBackend{snapshot: baseSnapshot()}
 	m := New(b)

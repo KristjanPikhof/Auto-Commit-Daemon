@@ -50,7 +50,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands, health/control, recovery, setup, start cache |
 | `internal/daemon` | Run loop, capture/replay, exact-chain reconciliation, intent circuit, shadow, fsnotify |
-| `internal/state` | SQLite v13: events/ops, planner state/windows, recovery snapshots, meta/clients/flush |
+| `internal/state` | SQLite v14: events/ops, planner/runtime settings state, recovery snapshots, meta/clients/flush |
 | `internal/git` | Bounded Git/ref/tree/diff/blob/index/history/ignore helpers |
 | `internal/ai` | Deterministic, OpenAI-compatible, subprocess providers; prompts and planner |
 | `internal/{central,config,identity,logger,paths,pause,prompttrace,trace}` | Registry/config, XDG/logging, pause and diagnostics |
@@ -101,7 +101,7 @@ Commit messages:
 ## Replay and intent
 
 - `acd settings` is the Go-native configuration lab. It uses Bubble Tea v2.0.8, Bubbles v2.1.1, Lip Gloss v2.0.5, and Huh v2.0.3. Preserve static CGO-disabled builds, responsive/accessible/no-color behavior, and `DRAFT > TESTED > QUEUED > ACTIVE` text labels.
-- Settings precedence is experiment > repository > profile > global > environment > default. API keys remain environment only. Hot revisions activate between daemon passes; restart-required fields never enter a hot revision. Global saves do not fan out and stopped-daemon apply never starts it.
+- Settings authoring precedence is repository > profile > global > environment > default. Active experiments are immutable runtime candidates outside those authoring layers. API keys remain environment only. Hot revisions activate between daemon passes; saved restart-required fields resolve when the next daemon starts and never enter a hot revision. Global saves do not fan out and stopped-daemon apply never starts it.
 - Strict provider tests send one synthetic request without source data. Endpoint credentials and subprocess execution require operation-specific confirmation; diff egress is activation-only because the test never sends a diff. Rich and accessible modes resolve missing confirmations inside the current session. Accessible onboarding is action-first: Test current settings by default, Quick provider setup for provider essentials, and Advanced settings for the full non-sensitive catalog. Keep all interaction keyboard-only. Experiment comparisons are descriptive, not causal.
 
 - Default `ACD_COMMIT_STRATEGY=event` publishes one capture per commit and never calls the planner. `intent` selects one capture or a non-empty subset; capture durability is unchanged.
@@ -125,7 +125,7 @@ acd fix --force --dry-run
 acd fix --force --yes
 ~~~
 
-- Reconcile from the earliest unpublished seq of one exact `(branch_ref,generation)` chain. A represented published prefix is materialization context only and is never transitioned.
+- Reconcile from the earliest unpublished seq of one exact `(branch_ref,generation)` chain. Represented published context can include same-base prefixes and relevant interleaved events; it is materialization context only and is never transitioned.
 - HEAD+ancestry+final-state proof marks the complete unpublished chain `published` under a `/published` ref; otherwise archive reconstructs immutable provenance under `/archive` and marks it `recovered`. Missing objects, partial proof, collisions or races mean no DB transition.
 - Recovery refs include a 96-bit SHA-256 target digest: archive hashes `baseHead + NUL + treeOID`; published hashes `commitOID`. This prevents selector reuse across linked worktrees/reset DBs.
 - Dead-ref recovery locks/verifies the proof ref and expected-absent branch in one `git update-ref --stdin` transaction held through the SQLite transition. The dead-branch sweep proves or archives; legacy `dead_branch_prune.*` records only the last non-empty recovery.

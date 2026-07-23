@@ -279,6 +279,9 @@ func TestResolveClearToInheritAndSecretExclusion(t *testing.T) {
 	if resolved.Value != "set" || resolved.Source != SourceEnvironment {
 		t.Fatalf("secret resolution exposed or lost state: %#v", resolved)
 	}
+	if resolved.EffectiveValue() != "super-secret" {
+		t.Fatal("secret resolution lost its internal effective value")
+	}
 }
 
 func TestFieldCatalogClassifiesHotRestartAndValidates(t *testing.T) {
@@ -293,6 +296,40 @@ func TestFieldCatalogClassifiesHotRestartAndValidates(t *testing.T) {
 	strategy, _ := LookupField(FieldCommitStrategy)
 	if _, err := normalizeValue(strategy, "random"); err == nil {
 		t.Fatal("invalid strategy accepted")
+	}
+	timeout, _ := LookupField(FieldTimeout)
+	for _, value := range []string{"1e20", "Inf", "NaN"} {
+		if _, err := normalizeValue(timeout, value); err == nil {
+			t.Fatalf("overflowing timeout %q accepted", value)
+		}
+	}
+}
+
+func TestResolveRestartEnvironmentUsesSavedPrecedenceAndRawSensitiveValues(t *testing.T) {
+	doc := NewDocument()
+	doc.Settings.Global["capture.max_file_bytes"] = rawString("2048")
+	doc.Settings.Profiles["large"] = Profile{Fields: Overrides{
+		"capture.max_file_bytes":  rawString("4096"),
+		"capture.sensitive_globs": rawString("private/**"),
+	}}
+	doc.Settings.Repositories["repo-hash"] = RepositorySettings{
+		Profile: "large",
+		Fields:  Overrides{"capture.max_file_bytes": rawString("8192")},
+	}
+	values, err := ResolveRestartEnvironment(doc, "repo-hash", func(name string) (string, bool) {
+		if name == "ACD_MAX_FILE_BYTES" {
+			return "1024", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values["ACD_MAX_FILE_BYTES"] != "8192" {
+		t.Fatalf("max file bytes=%q", values["ACD_MAX_FILE_BYTES"])
+	}
+	if values["ACD_SENSITIVE_GLOBS"] != "private/**" {
+		t.Fatalf("sensitive globs=%q", values["ACD_SENSITIVE_GLOBS"])
 	}
 }
 

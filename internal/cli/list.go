@@ -192,7 +192,6 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 	}
 
 	now := time.Now()
-	ttl := clientTTL()
 	entries := make([]listEntry, 0, len(reg.Repos))
 
 	for _, rec := range reg.Repos {
@@ -226,7 +225,7 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 			continue
 		}
 
-		summary, err := summarizeRepo(ctx, rec.StateDB, now, ttl)
+		summary, err := summarizeRepo(ctx, rec.StateDB, now, clientTTLForRepo(rec.Path))
 		if err != nil {
 			fmt.Fprintf(errOut, "acd list: skip %s: %v\n", rec.Path, err)
 			e.Status = "unreadable"

@@ -30,9 +30,24 @@
 
 ### Fixed
 
-- `acd stop` now reads daemon control state without opening the migration path,
-  so an older binary can safely stop a newer daemon without altering its
-  repository database.
+- No-session `acd stop` now reads daemon control state without opening the
+  migration path, so an older binary can safely stop a newer daemon without
+  altering its repository database. Session-aware stops remain schema-aware
+  because they update client rows.
+- Saved restart-required settings now resolve repository, profile, global, and
+  environment precedence when the daemon starts, including raw sensitive path
+  filters and repository-specific client TTL.
+- Rejected runtime revisions now restore the last-known-good bundle after a
+  daemon restart. Active experiments block unrelated apply/revert requests and
+  fail atomically before queuing their baseline cleanup.
+- The settings UI now tests cleared overrides with their inherited value,
+  preserves unrelated dirty drafts, refreshes runtime state on a timer, and
+  clears dirty state after a successful experiment start.
+- Provider setup now falls back before loading a custom CA when the API key is
+  missing, closes custom transports, and sanitizes wrapped cancellation and
+  deadline errors without breaking `errors.Is`.
+- Bare health keeps backpressure and terminal replay barriers visible during
+  rewind grace; `waiting` now covers both intent batching and rewind grace.
 - Recovery now limits published context to suffix paths and groups
   noncontiguous members by commit, preventing false provenance mismatches
   after intent-mode deferrals and branch rewinds.

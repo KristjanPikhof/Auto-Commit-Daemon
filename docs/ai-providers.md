@@ -112,7 +112,8 @@ Environment settings remain compatible. Saved settings can shadow them, and
 `acd settings` shows both the active source and any shadowed environment value.
 Hot provider and intent values activate as one immutable config revision at the
 next safe work boundary. Fields labeled `restart required` still need an
-explicit daemon restart.
+explicit daemon restart; the new process resolves their saved scope precedence
+before initializing capture and observability.
 
 `ACD_COMMIT_FORMAT=conventional` accepts only `feat`, `fix`, `docs`,
 `refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`

@@ -295,6 +295,48 @@ func TestApplyControlStatusRewindGraceIsWaiting(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusRewindGraceDoesNotHideRecoveryBlockers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*statusReport)
+		want   string
+	}{
+		{
+			name: "backpressure",
+			mutate: func(status *statusReport) {
+				status.BackpressurePaused = true
+			},
+			want: "backpressure",
+		},
+		{
+			name: "terminal barrier",
+			mutate: func(status *statusReport) {
+				status.ActiveBarriers = 1
+			},
+			want: "terminal replay",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := statusReport{
+				Daemon: "running",
+				PID:    os.Getpid(),
+				Paused: true,
+				Pause: &pauseInfo{
+					Source:           "rewind_grace",
+					RemainingSeconds: 45,
+				},
+			}
+			tc.mutate(&status)
+			result := controlResult{OK: true}
+			applyControlStatus(&result, status)
+			if result.OK || result.Health != controlHealthNeedsAttention ||
+				!strings.Contains(result.Summary, tc.want) {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
 func TestApplyControlStatusManualPauseStillNeedsAttention(t *testing.T) {
 	status := statusReport{
 		Daemon: "running",

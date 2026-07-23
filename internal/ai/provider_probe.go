@@ -72,8 +72,10 @@ func ProbeProvider(ctx context.Context, provider Provider, timeout time.Duration
 func failedProviderProbe(provider string, latency time.Duration, err error) (ProviderProbeResult, error) {
 	clean := SanitizePlannerError(err.Error())
 	cleanErr := error(errors.New(clean))
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		cleanErr = err
+	if errors.Is(err, context.Canceled) {
+		cleanErr = providerProbeContextError{message: clean, cause: context.Canceled}
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		cleanErr = providerProbeContextError{message: clean, cause: context.DeadlineExceeded}
 	}
 	return ProviderProbeResult{
 		Provider: sanitizeProviderLabel(provider),
@@ -81,3 +83,11 @@ func failedProviderProbe(provider string, latency time.Duration, err error) (Pro
 		Error:    clean,
 	}, cleanErr
 }
+
+type providerProbeContextError struct {
+	message string
+	cause   error
+}
+
+func (e providerProbeContextError) Error() string { return e.message }
+func (e providerProbeContextError) Unwrap() error { return e.cause }

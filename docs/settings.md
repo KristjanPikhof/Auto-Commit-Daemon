@@ -33,17 +33,18 @@ combined with `--repo` or `--profile`.
 
 The effective value is resolved in this order:
 
-1. Active experiment
-2. Repository override
-3. Selected profile
-4. Global override
-5. Environment variable
-6. Built-in default
+1. Repository override
+2. Selected profile
+3. Global override
+4. Environment variable
+5. Built-in default
 
 `Source` names the winning layer. When a saved value wins over a set
 environment variable, the lab also labels that environment value as shadowed.
 Remove an explicit value in the editor to inherit from the next layer. JSON
-`null` is not a stored inherit marker.
+`null` is not a stored inherit marker. An active experiment is an immutable
+runtime candidate, not an authoring layer, so it appears on the runtime rail
+without changing the draft's `Source`.
 
 ## Save, test, and apply a change
 
@@ -80,7 +81,9 @@ next safe work boundary. The lab labels these fields `next safe boundary`.
 
 Capture limits and filters, filesystem notifications, tracing, retention,
 rewind and shadow retention, and client TTL are labeled `restart required`.
-Save these changes, then restart the daemon explicitly:
+Save these changes, then restart the daemon explicitly. The next daemon process
+resolves the saved repository, selected-profile, and global values before
+initializing its runtime:
 
 ~~~bash
 acd off
@@ -156,6 +159,8 @@ rewritten or removed. Experiment comparisons report exact revision/profile
 window counts, primary and fallback outcomes, retries, median latency,
 deferrals, forced singletons, and distinct commit OIDs. The results are
 descriptive observations from sequential workloads, not causal A/B evidence.
+Normal apply and revert operations are rejected while an experiment is active,
+so its candidate cannot be superseded before cleanup returns to the baseline.
 
 ## Inspect activation state
 

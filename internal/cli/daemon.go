@@ -55,6 +55,11 @@ func runDaemon(ctx context.Context, out, errOut io.Writer, repoFlag, gitDirFlag 
 	if err != nil {
 		return err
 	}
+	restoreRestartEnvironment, err := applyRestartEnvironment(repo)
+	if err != nil {
+		return fmt.Errorf("acd daemon run: load saved restart settings: %w", err)
+	}
+	defer restoreRestartEnvironment()
 
 	// Wire SIGTERM/SIGINT to ctx cancel. The daemon package installs its
 	// own handlers but the top-level CLI ctx is the canonical "stop now"

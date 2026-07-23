@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
@@ -74,7 +75,9 @@ func New(backend Backend) Model {
 		ExperimentBudget: 10, ExperimentPolicy: "continue"}
 }
 
-func (m Model) Init() tea.Cmd { return m.snapshotCmd() }
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(m.snapshotCmd(), m.pollTickCmd())
+}
 
 func (m Model) ActiveField() FieldDescriptor {
 	fields := visibleFields(m.Search)
@@ -91,6 +94,12 @@ func (m Model) ActiveField() FieldDescriptor {
 }
 
 func (m Model) IsDirty() bool { return len(m.Dirty) > 0 }
+
+func (m Model) pollTickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return scheduledPollMsg{}
+	})
+}
 
 func (m Model) hasHotDraftChanges() bool {
 	for _, field := range m.Snapshot.Fields {

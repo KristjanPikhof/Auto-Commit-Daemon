@@ -50,6 +50,33 @@ WHERE s.desired_revision_id=? AND NOT EXISTS (
 		started.Experiment.WindowBudget != 10 || started.Experiment.Status != state.ExperimentActive {
 		t.Fatalf("started experiment = %+v", started)
 	}
+	var revisionsBeforeBlockedApply int
+	if err := svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM config_revisions`).Scan(&revisionsBeforeBlockedApply); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.Apply(ctx, ApplyRequest{
+		Values: draft, TestedFingerprint: tested.Fingerprint,
+		ExpectedGeneration:      validation.SourceGeneration,
+		ExpectedDesiredRevision: started.Candidate.RevisionID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "active experiment") {
+		t.Fatalf("normal apply during experiment error=%v", err)
+	}
+	_, err = svc.Revert(ctx, RevertRequest{
+		ExpectedGeneration:      validation.SourceGeneration,
+		ExpectedDesiredRevision: started.Candidate.RevisionID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "active experiment") {
+		t.Fatalf("normal revert during experiment error=%v", err)
+	}
+	var revisionsAfterBlockedApply int
+	if err := svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM config_revisions`).Scan(&revisionsAfterBlockedApply); err != nil {
+		t.Fatal(err)
+	}
+	if revisionsAfterBlockedApply != revisionsBeforeBlockedApply {
+		t.Fatalf("blocked operations created revisions: before=%d after=%d",
+			revisionsBeforeBlockedApply, revisionsAfterBlockedApply)
+	}
 	progress, err := svc.ExperimentProgress(ctx, started.Experiment.ID)
 	if err != nil || progress.CompletedWindows != 0 || progress.FailurePolicy != ExperimentPolicyRevert {
 		t.Fatalf("progress=%+v err=%v", progress, err)

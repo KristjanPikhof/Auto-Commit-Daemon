@@ -184,6 +184,172 @@ func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T
 	if gotRequest.Status != state.ActivationRejected {
 		t.Fatalf("request=%+v", gotRequest)
 	}
+
+	restarted := NewRuntimeBundleManager(
+		&RuntimeBundle{Provider: &runtimeTestProvider{name: "deterministic"}, MessageFn: DeterministicMessage},
+		builder,
+		time.Second,
+	)
+	defer restarted.Close()
+	if err := restarted.ActivateDesired(context.Background()); err != nil {
+		t.Fatalf("restart after rejected desired: %v", err)
+	}
+	if got := restarted.Current(); got.RevisionID != latest.ID || got.Model != "model-c" {
+		t.Fatalf("restart bundle=%+v want last-known-good revision %d", got, latest.ID)
+	}
+}
+
+func TestRuntimeConfigRejectsFailedExperimentAndQueuesBaseline(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	builder := runtimeBuilder(db, closers)
+	baseline := runtimeRevision(t, db, "baseline", 1, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "intent",
+	})
+	baselineRequest, ok, err := state.RequestConfigActivation(
+		context.Background(), db, baseline.ID, sql.NullInt64{},
+	)
+	if err != nil || !ok {
+		t.Fatalf("baseline request: ok=%v err=%v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(context.Background(), db, baselineRequest.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(context.Background(), db, baselineRequest.ID, baseline.ID)
+	baselineBundle, err := builder.BuildRevision(context.Background(), baseline, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := runtimeRevision(t, db, "candidate", 2, map[string]any{
+		"capture.max_file_bytes": 1234,
+	})
+	experiment, request, ok, err := state.RequestConfigExperimentActivation(
+		context.Background(),
+		db,
+		state.ConfigExperimentInput{
+			BaselineRevisionID:  baseline.ID,
+			CandidateRevisionID: candidate.ID,
+			WindowBudget:        10,
+			FailurePolicy:       "revert",
+		},
+		sql.NullInt64{Int64: baseline.ID, Valid: true},
+	)
+	if err != nil || !ok {
+		t.Fatalf("experiment request: ok=%v err=%v", ok, err)
+	}
+	manager := NewRuntimeBundleManager(baselineBundle, builder, time.Second)
+	defer manager.Close()
+	if err := manager.ActivateDesired(context.Background()); err == nil {
+		t.Fatal("invalid experiment candidate activated")
+	}
+	gotExperiment, err := state.ConfigExperimentByID(context.Background(), db, experiment.ID)
+	if err != nil || gotExperiment.Status != state.ExperimentFailed {
+		t.Fatalf("experiment=%+v err=%v", gotExperiment, err)
+	}
+	gotRequest, err := state.ActivationRequestByID(context.Background(), db, request.ID)
+	if err != nil || gotRequest.Status != state.ActivationRejected {
+		t.Fatalf("request=%+v err=%v", gotRequest, err)
+	}
+	projection, err := state.RuntimeConfigActivationState(context.Background(), db)
+	if err != nil || !projection.DesiredRevisionID.Valid ||
+		projection.DesiredRevisionID.Int64 == candidate.ID {
+		t.Fatalf("baseline revert was not queued: projection=%+v err=%v", projection, err)
+	}
+	if err := manager.ActivateDesired(context.Background()); err != nil {
+		t.Fatalf("activate queued baseline revert: %v", err)
+	}
+	if manager.Current().RevisionID != projection.DesiredRevisionID.Int64 {
+		t.Fatalf("bundle=%+v projection=%+v", manager.Current(), projection)
+	}
+}
+
+func TestRuntimeConfigExpiresExperimentWithoutCurrentCandidateBundle(t *testing.T) {
+	db := openTestDB(t)
+	baseline := runtimeRevision(t, db, "baseline", 1, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "intent",
+	})
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, baseline.ID, sql.NullInt64{},
+	)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(context.Background(), db, request.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(context.Background(), db, request.ID, baseline.ID)
+	candidate := runtimeRevision(t, db, "candidate", 2, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "intent",
+	})
+	_, _, ok, err = state.RequestConfigExperimentActivation(
+		context.Background(),
+		db,
+		state.ConfigExperimentInput{
+			BaselineRevisionID:  baseline.ID,
+			CandidateRevisionID: candidate.ID,
+			WindowBudget:        10,
+			ExpiresTS:           sql.NullFloat64{Float64: 10, Valid: true},
+		},
+		sql.NullInt64{Int64: baseline.ID, Valid: true},
+	)
+	if err != nil || !ok {
+		t.Fatalf("experiment request: ok=%v err=%v", ok, err)
+	}
+	manager := NewRuntimeBundleManager(
+		&RuntimeBundle{RevisionID: baseline.ID, Provider: &runtimeTestProvider{name: "deterministic"}},
+		runtimeBuilder(db, map[string]*runtimeTestCloser{}),
+		time.Second,
+	)
+	defer manager.Close()
+	queued, err := manager.QueueExperimentRevert(context.Background(), time.Unix(20, 0))
+	if err != nil || !queued {
+		t.Fatalf("queued=%v err=%v", queued, err)
+	}
+}
+
+func TestRuntimeConfigQueuesFailedExperimentWithoutCurrentCandidateBundle(t *testing.T) {
+	db := openTestDB(t)
+	baseline := runtimeRevision(t, db, "baseline", 1, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "intent",
+	})
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, baseline.ID, sql.NullInt64{},
+	)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(context.Background(), db, request.ID, baseline.ID)
+	_, _ = state.ApplyConfigActivation(context.Background(), db, request.ID, baseline.ID)
+	candidate := runtimeRevision(t, db, "candidate", 2, map[string]any{
+		"ai.provider": "deterministic", "commit.strategy": "intent",
+	})
+	experiment, _, ok, err := state.RequestConfigExperimentActivation(
+		context.Background(),
+		db,
+		state.ConfigExperimentInput{
+			BaselineRevisionID:  baseline.ID,
+			CandidateRevisionID: candidate.ID,
+			WindowBudget:        10,
+		},
+		sql.NullInt64{Int64: baseline.ID, Valid: true},
+	)
+	if err != nil || !ok {
+		t.Fatalf("experiment request: ok=%v err=%v", ok, err)
+	}
+	if updated, err := state.FinishConfigExperiment(
+		context.Background(), db, experiment.ID, state.ExperimentFailed, "provider failed",
+	); err != nil || !updated {
+		t.Fatalf("finish experiment: updated=%v err=%v", updated, err)
+	}
+	manager := NewRuntimeBundleManager(
+		&RuntimeBundle{RevisionID: baseline.ID, Provider: &runtimeTestProvider{name: "deterministic"}},
+		runtimeBuilder(db, map[string]*runtimeTestCloser{}),
+		time.Second,
+	)
+	defer manager.Close()
+	queued, err := manager.QueueExperimentRevert(context.Background(), time.Unix(20, 0))
+	if err != nil || !queued {
+		t.Fatalf("queued=%v err=%v", queued, err)
+	}
 }
 
 func TestRuntimeConfigRestartRecoversAcknowledgedDesired(t *testing.T) {

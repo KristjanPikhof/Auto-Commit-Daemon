@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -131,7 +132,13 @@ type ResolvedField struct {
 	Value               string
 	Source              Source
 	ShadowedEnvironment *ShadowedEnvironment
+	effectiveValue      string
 }
+
+// EffectiveValue returns the normalized value used by runtime consumers.
+// Value remains presentation-safe and may contain only "set"/"unset" for
+// sensitive fields, so callers must never render EffectiveValue directly.
+func (r ResolvedField) EffectiveValue() string { return r.effectiveValue }
 
 func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 	field, ok := LookupField(name)
@@ -156,7 +163,10 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 			if err != nil {
 				return ResolvedField{}, err
 			}
-			result := ResolvedField{Definition: field, Value: displayValue(field, value), Source: layer.source}
+			result := ResolvedField{
+				Definition: field, Value: displayValue(field, value),
+				Source: layer.source, effectiveValue: value,
+			}
 			if envSet {
 				result.ShadowedEnvironment = &ShadowedEnvironment{Set: true, Value: displayValue(field, envValue)}
 			}
@@ -166,14 +176,53 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 	if envSet {
 		value, err := normalizeValue(field, envValue)
 		if err == nil {
-			return ResolvedField{Definition: field, Value: displayValue(field, value), Source: SourceEnvironment}, nil
+			return ResolvedField{
+				Definition: field, Value: displayValue(field, value),
+				Source: SourceEnvironment, effectiveValue: value,
+			}, nil
 		}
 	}
 	value, err := normalizeValue(field, field.Default)
 	if err != nil {
 		return ResolvedField{}, err
 	}
-	return ResolvedField{Definition: field, Value: displayValue(field, value), Source: SourceDefault}, nil
+	return ResolvedField{
+		Definition: field, Value: displayValue(field, value),
+		Source: SourceDefault, effectiveValue: value,
+	}, nil
+}
+
+// ResolveRestartEnvironment resolves the restart-bound catalog for one
+// repository using the same precedence as the settings lab. Returned keys are
+// environment variable names because the existing daemon consumers parse
+// their established environment contracts at process startup.
+func ResolveRestartEnvironment(
+	doc *Document,
+	repoHash string,
+	lookupEnv func(string) (string, bool),
+) (map[string]string, error) {
+	if doc == nil {
+		return nil, errors.New("acd config: nil document")
+	}
+	repo := doc.Settings.Repositories[repoHash]
+	profile := doc.Settings.Profiles[repo.Profile]
+	out := make(map[string]string)
+	for _, field := range fieldCatalog {
+		if field.Boundary != ApplyRestart {
+			continue
+		}
+		resolved, err := ResolveField(field.Name, ResolveInput{
+			Repository: repo.Fields,
+			Profile:    profile.Fields,
+			Global:     doc.Settings.Global,
+			LookupEnv:  lookupEnv,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out[field.Environment] = resolved.EffectiveValue()
+	}
+	return out, nil
 }
 
 func ValidateDocument(doc *Document) error {
@@ -287,8 +336,13 @@ func normalizeValue(field FieldDefinition, raw string) (string, error) {
 		return strconv.FormatInt(n, 10), nil
 	case KindDuration:
 		if field.PlainSeconds {
-			if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
-				return time.Duration(seconds * float64(time.Second)).String(), nil
+			if seconds, err := strconv.ParseFloat(value, 64); err == nil &&
+				!math.IsNaN(seconds) && !math.IsInf(seconds, 0) && seconds > 0 &&
+				seconds <= float64(math.MaxInt64)/float64(time.Second) {
+				duration := time.Duration(seconds * float64(time.Second))
+				if duration > 0 {
+					return duration.String(), nil
+				}
 			}
 		}
 		if field.AllowZero && value == "0" {

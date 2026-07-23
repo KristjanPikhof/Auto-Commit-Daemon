@@ -22,6 +22,7 @@ type operationMsg struct {
 	err    error
 }
 type PollMsg struct{}
+type scheduledPollMsg struct{}
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -46,6 +47,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case PollMsg:
 		return m, m.snapshotCmd()
+	case scheduledPollMsg:
+		return m, tea.Batch(m.snapshotCmd(), m.pollTickCmd())
 	case operationMsg:
 		if m.Operation == nil || msg.id != m.Operation.ID {
 			return m, nil
@@ -81,7 +84,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ApplyResult:
 			m.PendingRevision = result.DesiredRevision
 			m.AppliedRevision = result.AppliedRevision
-			m.Dirty = map[string]bool{}
+			if operation.Name == "save" || operation.Name == "apply" {
+				m.Dirty = map[string]bool{}
+			}
 			if result.SavedOnly {
 				m.Status = "SAVED: " + safeText(result.Summary)
 			} else if result.Queued {
@@ -91,6 +96,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case Experiment:
 			m.Experiment = result
+			m.Dirty = map[string]bool{}
 			m.Status = "EXPERIMENT: bounded run started"
 		}
 		return m, m.snapshotCmd()

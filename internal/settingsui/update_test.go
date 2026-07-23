@@ -27,6 +27,8 @@ type adapterService struct {
 	testRequired        []ai.ConfirmationRequirement
 	validatedWith       []ai.ConfirmationRequirement
 	testedWith          []ai.ConfirmationRequirement
+	validatedValues     map[string]string
+	testedValues        map[string]string
 }
 
 func (a *adapterService) Snapshot(context.Context, settings.Scope, string) (settings.Snapshot, error) {
@@ -36,8 +38,9 @@ func (a *adapterService) Save(_ context.Context, r settings.SaveRequest) (settin
 	a.saved = r
 	return settings.SaveResult{Generation: r.ExpectedGeneration + 1, Scope: r.Scope}, a.err
 }
-func (a *adapterService) Validate(_ context.Context, _ map[string]string, confirmed []ai.ConfirmationRequirement) (settings.Validation, error) {
+func (a *adapterService) Validate(_ context.Context, values map[string]string, confirmed []ai.ConfirmationRequirement) (settings.Validation, error) {
 	a.validatedWith = append([]ai.ConfirmationRequirement(nil), confirmed...)
+	a.validatedValues = values
 	validation := a.validate
 	confirmedSet := map[ai.ConfirmationRequirement]bool{}
 	for _, value := range confirmed {
@@ -52,8 +55,9 @@ func (a *adapterService) Validate(_ context.Context, _ map[string]string, confir
 	return validation, a.err
 }
 
-func (a *adapterService) TestProvider(_ context.Context, _ map[string]string, confirmed []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
+func (a *adapterService) TestProvider(_ context.Context, values map[string]string, confirmed []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
 	a.testedWith = append([]ai.ConfirmationRequirement(nil), confirmed...)
+	a.testedValues = values
 	confirmedSet := map[ai.ConfirmationRequirement]bool{}
 	for _, value := range confirmed {
 		confirmedSet[value] = true
@@ -97,7 +101,7 @@ func (a *adapterService) Compare(context.Context, ...int64) (settings.Comparison
 }
 
 func adapterFixture() *adapterService {
-	return &adapterService{snapshot: settings.Snapshot{Scope: settings.ScopeRepository, Profile: "fast", SavedGeneration: 2, DesiredRevisionID: 7, AppliedRevisionID: 7, LastKnownGoodRevisionID: 6, DaemonRunning: true, Fields: []settings.FieldSnapshot{{Name: config.FieldModel, DraftValue: "old", ActiveValue: "active", Source: config.SourceProfile, ShadowedEnvironment: "env-model", EnvironmentSet: true, Persistable: true, Boundary: config.ApplyHot}, {Name: config.FieldAPIKey, DraftValue: "set", Sensitive: true, EnvironmentSet: true}, {Name: "capture.max_file_bytes", DraftValue: "10", ActiveValue: "10", Source: config.SourceDefault, Persistable: true, Boundary: config.ApplyRestart}}}, validate: settings.Validation{Fingerprint: "service-fp"}, test: settings.ProviderTestResult{Fingerprint: "service-fp", Provider: "openai-compat", Success: true}}
+	return &adapterService{snapshot: settings.Snapshot{Scope: settings.ScopeRepository, Profile: "fast", SavedGeneration: 2, DesiredRevisionID: 7, AppliedRevisionID: 7, LastKnownGoodRevisionID: 6, DaemonRunning: true, Fields: []settings.FieldSnapshot{{Name: config.FieldModel, DraftValue: "old", InheritedValue: "global-model", ActiveValue: "active", Source: config.SourceProfile, ShadowedEnvironment: "env-model", EnvironmentSet: true, Persistable: true, Boundary: config.ApplyHot}, {Name: config.FieldAPIKey, DraftValue: "set", Sensitive: true, EnvironmentSet: true}, {Name: "capture.max_file_bytes", DraftValue: "10", InheritedValue: "10", ActiveValue: "10", Source: config.SourceDefault, Persistable: true, Boundary: config.ApplyRestart}}}, validate: settings.Validation{Fingerprint: "service-fp"}, test: settings.ProviderTestResult{Fingerprint: "service-fp", Provider: "openai-compat", Success: true}}
 }
 
 func TestSettingsRuntimeRailUsesRealTestAndApplyAcknowledgements(t *testing.T) {
@@ -228,6 +232,12 @@ func TestSettingsSourceShadowClearSecretAndRestartProjection(t *testing.T) {
 	}
 	if value, ok := svc.saved.Values[config.FieldModel]; !ok || value != nil {
 		t.Fatalf("clear=%v present=%v", value, ok)
+	}
+	if svc.testedValues[config.FieldModel] != "global-model" ||
+		svc.validatedValues[config.FieldModel] != "global-model" ||
+		svc.applied.Values[config.FieldModel] != "global-model" {
+		t.Fatalf("clear did not activate inherited value: tested=%v validated=%v applied=%v",
+			svc.testedValues, svc.validatedValues, svc.applied.Values)
 	}
 }
 

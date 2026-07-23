@@ -640,7 +640,6 @@ func collectRepoManagementEntries(ctx context.Context, repos []central.RepoRecor
 		ctx = context.Background()
 	}
 	now := time.Now()
-	ttl := clientTTL()
 	entries := make([]repoListEntry, 0, len(repos))
 	for _, rec := range repos {
 		safety := central.ProbeRepoRemovalSafety(ctx, rec)
@@ -655,7 +654,7 @@ func collectRepoManagementEntries(ctx context.Context, repos []central.RepoRecor
 			entry.PID = safety.DaemonPID
 		}
 		if safety.StateDBExists && safety.DaemonStateError == "" {
-			if summary, err := summarizeRepo(ctx, rec.StateDB, now, ttl); err == nil {
+			if summary, err := summarizeRepo(ctx, rec.StateDB, now, clientTTLForRepo(rec.Path)); err == nil {
 				entry.Daemon = summary.daemon
 				entry.PID = summary.pid
 				entry.Clients = summary.clients

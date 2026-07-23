@@ -298,7 +298,7 @@ func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (m
 		if err != nil {
 			return nil, nil, sanitizeError(err)
 		}
-		resolved[field.Name] = value.Value
+		resolved[field.Name] = value.EffectiveValue()
 	}
 	var restartChanged []string
 	for name, raw := range draft {
@@ -335,7 +335,7 @@ func normalizeDraftValue(field config.FieldDefinition, value string) (string, er
 	if err != nil {
 		return "", sanitizeError(err)
 	}
-	return resolved.Value, nil
+	return resolved.EffectiveValue(), nil
 }
 
 func (s *Service) providerConfig(values map[string]string) (ai.ProviderConfig, error) {
