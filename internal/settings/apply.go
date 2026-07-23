@@ -162,7 +162,7 @@ func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, e
 }
 
 func revisionSnapshotJSON(values map[string]string, confirmations []ai.ConfirmationRequirement) ([]byte, error) {
-	payload := make(map[string]any, len(values)+1)
+	payload := make(map[string]any, len(values))
 	for key, value := range values {
 		payload[key] = value
 	}
