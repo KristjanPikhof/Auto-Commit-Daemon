@@ -66,6 +66,7 @@ type statusReport struct {
 	RecentDecisions       []eventEntry         `json:"recent_decisions,omitempty"`
 	DecisionCursor        int64                `json:"decision_cursor,omitempty"`
 	IntentStrategy        intentStrategyReport `json:"intent_strategy"`
+	RuntimeConfig         runtimeConfigReport  `json:"runtime_config"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -336,6 +337,11 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
 		return report, err
 	}
+	if runtimeConfig, err := loadRuntimeConfigReport(ctx, conn, rec.RepoHash, now); err != nil {
+		return report, fmt.Errorf("runtime settings: %w", err)
+	} else {
+		report.RuntimeConfig = runtimeConfig
+	}
 
 	return report, nil
 }
@@ -482,6 +488,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 			formatDurationCompact(time.Duration(r.UptimeSeconds)*time.Second)))
 	}
 	fmt.Fprintf(out, "Daemon: %s\n", joinParens(parts))
+	renderRuntimeConfigHuman(out, r.RuntimeConfig)
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))
 	for _, c := range r.Clients {

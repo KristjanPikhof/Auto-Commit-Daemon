@@ -45,6 +45,7 @@ const (
 	EnvModel                = "ACD_AI_MODEL"
 	EnvTimeout              = "ACD_AI_TIMEOUT"
 	EnvCAFile               = "ACD_AI_CA_FILE"
+	EnvDiffEgress           = "ACD_AI_DIFF_EGRESS"
 	EnvCommitStrategy       = "ACD_COMMIT_STRATEGY"
 	EnvCommitFormat         = "ACD_COMMIT_FORMAT"
 	EnvIntentWindow         = "ACD_INTENT_WINDOW"
@@ -133,6 +134,11 @@ type ProviderConfig struct {
 	// OpenAI-compatible HTTPS gateway.
 	CAFile string
 
+	// DiffEgress records whether repository diffs may be sent to a provider.
+	// Provider construction does not consume it; validation surfaces a
+	// separate confirmation requirement when it is enabled.
+	DiffEgress bool
+
 	// CommitStrategy chooses the replay planner. The default is event,
 	// preserving one capture event per commit until intent planning is
 	// explicitly enabled.
@@ -169,6 +175,28 @@ type ProviderConfig struct {
 	// Logger receives warning logs from BuildProvider's degraded paths.
 	// Nil falls back to slog.Default().
 	Logger *slog.Logger
+
+	// subprocessLookPath and subprocessStderr are test seams kept private so
+	// runtime callers cannot accidentally replace subprocess security policy.
+	subprocessLookPath LookPathFunc
+	subprocessStderr   io.Writer
+}
+
+// ConfirmationRequirement identifies an effect that needs its own explicit
+// operator consent before a provider can be tested or applied.
+type ConfirmationRequirement string
+
+const (
+	ConfirmationEndpointCredentials ConfirmationRequirement = "endpoint_credentials"
+	ConfirmationSubprocessExecution ConfirmationRequirement = "subprocess_execution"
+	ConfirmationDiffEgress          ConfirmationRequirement = "diff_egress"
+)
+
+// ProviderValidation is the non-secret result of validating provider
+// settings. Confirmations are stable identifiers suitable for a UI; they
+// never contain endpoint paths, credentials, or provider response text.
+type ProviderValidation struct {
+	Confirmations []ConfirmationRequirement
 }
 
 // LoadProviderConfigFromEnv reads ACD_AI_* env vars and returns a
@@ -183,6 +211,7 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		APIKey:              strings.TrimSpace(os.Getenv(EnvAPIKey)),
 		Model:               strings.TrimSpace(os.Getenv(EnvModel)),
 		CAFile:              strings.TrimSpace(os.Getenv(EnvCAFile)),
+		DiffEgress:          envTruthy(os.Getenv(EnvDiffEgress)),
 		CommitStrategy:      normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
 		CommitFormat:        normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
 		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
@@ -209,6 +238,15 @@ func LoadProviderConfigFromEnv() ProviderConfig {
 		cfg.Timeout = DefaultProviderTimeout
 	}
 	return cfg
+}
+
+func envTruthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on", "enabled":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeCommitFormat(raw string) CommitFormat {
@@ -321,7 +359,7 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return det, nil, nil
 
 	case mode == "openai-compat":
-		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		primary, closer, err := buildPrimaryProvider(cfg)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -330,18 +368,7 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 				slog.String("provider", "openai-compat"))
 			return det, nil, nil
 		}
-		httpClient, err := openAIHTTPClient(cfg.Timeout, cfg.CAFile)
-		if err != nil {
-			return nil, nil, err
-		}
-		primary := &OpenAIProvider{
-			BaseURL: baseURL,
-			APIKey:  cfg.APIKey,
-			Model:   cfg.Model,
-			HTTP:    httpClient,
-			Format:  cfg.CommitFormat,
-		}
-		return Compose(primary, det), nil, nil
+		return Compose(primary, det), closer, nil
 
 	case strings.HasPrefix(mode, "subprocess:"):
 		name := strings.TrimPrefix(mode, "subprocess:")
@@ -350,18 +377,143 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 				slog.String("mode", mode))
 			return det, nil, nil
 		}
-		sp := NewSubprocessProvider(name, SubprocessOptions{
-			Timeout:      cfg.Timeout,
-			Logger:       logger,
-			CommitFormat: cfg.CommitFormat,
-		})
-		return Compose(sp, det), sp, nil
+		primary, closer, err := buildPrimaryProvider(cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		return Compose(primary, det), closer, nil
 
 	default:
 		logger.Warn("ai: unrecognized ACD_AI_PROVIDER; falling back to deterministic",
 			slog.String("mode", mode))
 		return det, nil, nil
 	}
+}
+
+// BuildStrictProvider constructs the selected provider without a deterministic
+// fallback. Unlike BuildProvider it rejects degraded configuration and an
+// unavailable subprocess immediately, so a settings test cannot report a
+// synthetic fallback as provider success. Callers own and must close closer.
+func BuildStrictProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
+	mode := normalizeMode(cfg.Mode)
+	if mode == "" {
+		mode = "deterministic"
+	}
+	cfg.Mode = mode
+	if _, err := ValidateProviderConfig(cfg); err != nil {
+		return nil, nil, err
+	}
+	primary, closer, err := buildPrimaryProvider(cfg)
+	if err != nil {
+		return nil, nil, sanitizeProviderError(err)
+	}
+	if sp, ok := primary.(*SubprocessProvider); ok && sp.resolveErr != nil {
+		_ = sp.Close()
+		return nil, nil, sanitizeProviderError(sp.resolveErr)
+	}
+	return primary, closer, nil
+}
+
+// ValidateProviderConfig validates provider construction inputs and returns
+// effects requiring separate explicit confirmation. It performs no network
+// request and does not start a subprocess.
+func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
+	mode := normalizeMode(cfg.Mode)
+	if mode == "" {
+		mode = "deterministic"
+	}
+	validation := ProviderValidation{}
+	switch {
+	case mode == "deterministic":
+	case mode == "openai-compat":
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		if err != nil {
+			return ProviderValidation{}, sanitizeProviderError(err)
+		}
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return ProviderValidation{}, errors.New("openai-compat: missing API key")
+		}
+		if err := validateProviderModel(cfg.Model); err != nil {
+			return ProviderValidation{}, err
+		}
+		if _, err := openAIHTTPClient(cfg.Timeout, cfg.CAFile); err != nil {
+			return ProviderValidation{}, sanitizeProviderError(err)
+		}
+		defaultURL, _ := normalizeOpenAIBaseURL(DefaultOpenAIBaseURL, true)
+		if baseURL != defaultURL {
+			validation.Confirmations = append(validation.Confirmations, ConfirmationEndpointCredentials)
+		}
+	case strings.HasPrefix(mode, "subprocess:"):
+		if strings.TrimSpace(strings.TrimPrefix(mode, "subprocess:")) == "" {
+			return ProviderValidation{}, errors.New("subprocess: plugin name is empty")
+		}
+		validation.Confirmations = append(validation.Confirmations, ConfirmationSubprocessExecution)
+	default:
+		return ProviderValidation{}, fmt.Errorf("ai: unknown provider mode %q", sanitizeProviderLabel(mode))
+	}
+	if cfg.DiffEgress {
+		validation.Confirmations = append(validation.Confirmations, ConfirmationDiffEgress)
+	}
+	return validation, nil
+}
+
+func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
+	mode := normalizeMode(cfg.Mode)
+	if mode == "" || mode == "deterministic" {
+		return DeterministicProvider{CommitFormat: cfg.CommitFormat}, nil, nil
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if mode == "openai-compat" {
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		httpClient, err := openAIHTTPClient(cfg.Timeout, cfg.CAFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		primary := &OpenAIProvider{BaseURL: baseURL, APIKey: cfg.APIKey,
+			Model: cfg.Model, HTTP: httpClient, Format: cfg.CommitFormat}
+		return primary, nil, nil
+	}
+	if strings.HasPrefix(mode, "subprocess:") {
+		name := strings.TrimPrefix(mode, "subprocess:")
+		sp := NewSubprocessProvider(name, SubprocessOptions{
+			Timeout: cfg.Timeout, Logger: logger, CommitFormat: cfg.CommitFormat,
+			LookPath: cfg.subprocessLookPath, Stderr: cfg.subprocessStderr,
+		})
+		return sp, sp, nil
+	}
+	return nil, nil, fmt.Errorf("ai: unknown provider mode %q", sanitizeProviderLabel(mode))
+}
+
+func validateProviderModel(model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return errors.New("openai-compat: model is required")
+	}
+	if len(model) > 256 || strings.ContainsAny(model, "\r\n\t") {
+		return errors.New("openai-compat: model is invalid")
+	}
+	return nil
+}
+
+func sanitizeProviderLabel(label string) string {
+	clean := SanitizePlannerError(label)
+	if clean == "" {
+		return "[invalid]"
+	}
+	return clean
+}
+
+func sanitizeProviderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(SanitizePlannerError(err.Error()))
 }
 
 // errProviderUnused is reserved so future BuildProvider expansion (e.g. a

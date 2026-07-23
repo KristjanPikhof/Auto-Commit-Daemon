@@ -10,6 +10,7 @@ Primary controls:
   acd              Show one read-only health classification and next action
   acd on           Enable this repo and ensure its daemon is running
   acd off          Durably disable this repo while preserving state
+  acd settings     Inspect, test, and safely activate configuration
   acd status       Show the detailed current-repo snapshot
   acd setup        Print the one-time harness install snippet
 

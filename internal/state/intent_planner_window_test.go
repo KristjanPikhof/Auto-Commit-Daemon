@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,94 @@ func TestIntentPlannerWindowRoundTrip(t *testing.T) {
 	}
 	if !ok || forEvent.ID != id || len(forEvent.Events) != 3 {
 		t.Fatalf("window for event = %+v ok=%v", forEvent, ok)
+	}
+}
+
+func TestExperimentTerminalBaselineRevertIsAtomicAndIdempotent(t *testing.T) {
+	for _, terminal := range []string{"completed", "expired", "cancelled", "provider_error"} {
+		t.Run(terminal, func(t *testing.T) {
+			d, _ := openTestDB(t)
+			ctx := context.Background()
+			baseline := testConfigRevision(t, d, "baseline", 1)
+			candidate := testConfigRevision(t, d, "candidate", 2)
+			request, ok, err := RequestConfigActivation(ctx, d, candidate.ID, sql.NullInt64{})
+			if err != nil || !ok {
+				t.Fatalf("request=%+v ok=%v err=%v", request, ok, err)
+			}
+			if ok, err := AcknowledgeConfigActivation(ctx, d, request.ID, candidate.ID); err != nil || !ok {
+				t.Fatal(err)
+			}
+			if ok, err := ApplyConfigActivation(ctx, d, request.ID, candidate.ID); err != nil || !ok {
+				t.Fatal(err)
+			}
+			expires := sql.NullFloat64{}
+			if terminal == "expired" {
+				expires = sql.NullFloat64{Float64: 50, Valid: true}
+			}
+			experiment, err := CreateConfigExperiment(ctx, d, ConfigExperimentInput{
+				BaselineRevisionID: baseline.ID, CandidateRevisionID: candidate.ID,
+				WindowBudget: 1, ExpiresTS: expires, FailurePolicy: "revert",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if terminal == "cancelled" {
+				if ok, err := FinishConfigExperiment(ctx, d, experiment.ID, ExperimentCancelled, "operator cancelled"); err != nil || !ok {
+					t.Fatal(err)
+				}
+			} else if terminal != "expired" {
+				win := IntentPlannerWindow{
+					PlannedTS: 40, BranchRef: "refs/heads/main", BranchGeneration: 1,
+					ConfigRevisionID: sql.NullInt64{Int64: candidate.ID, Valid: true},
+					ConfigProfile:    sql.NullString{String: "candidate", Valid: true},
+					ExperimentID:     sql.NullInt64{Int64: experiment.ID, Valid: true},
+					Outcome:          sql.NullString{String: "selected", Valid: true},
+				}
+				if terminal == "provider_error" {
+					win.FallbackUsed = true
+					win.ValidationFailure = sql.NullString{String: "sanitized provider failure", Valid: true}
+				}
+				if _, err := AppendIntentPlannerWindow(ctx, d, win); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = AppendDecision(ctx, d, DecisionRecord{Kind: DecisionKindCommitted, CommitOID: sql.NullString{String: "deadbeef", Valid: true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := float64(41)
+			if terminal == "expired" {
+				now = 51
+			}
+			revert, revertRequest, queued, err := QueueExperimentBaselineRevert(ctx, d, experiment.ID, now)
+			if err != nil || !queued {
+				t.Fatalf("revert=%+v request=%+v queued=%v err=%v", revert, revertRequest, queued, err)
+			}
+			if revert.SnapshotHash != baseline.SnapshotHash || revert.ID == baseline.ID || revertRequest.RevisionID != revert.ID {
+				t.Fatalf("revert=%+v request=%+v", revert, revertRequest)
+			}
+			projection, _ := RuntimeConfigActivationState(ctx, d)
+			if projection.DesiredRevisionID.Int64 != revert.ID || projection.AppliedRevisionID.Int64 != candidate.ID {
+				t.Fatalf("projection=%+v", projection)
+			}
+			if _, _, queued, err := QueueExperimentBaselineRevert(ctx, d, experiment.ID, now+1); err != nil || queued {
+				t.Fatalf("second queued=%v err=%v", queued, err)
+			}
+			var revisionCount int
+			if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM config_revisions`).Scan(&revisionCount); err != nil || revisionCount != 3 {
+				t.Fatalf("revision count=%d err=%v", revisionCount, err)
+			}
+			decisions, err := RecentDecisions(ctx, d, 1)
+			if err != nil || len(decisions) != 1 || decisions[0].CommitOID.String != "deadbeef" {
+				t.Fatalf("commit decision changed: %+v err=%v", decisions, err)
+			}
+			gotExperiment, _ := ConfigExperimentByID(ctx, d, experiment.ID)
+			if terminal == "provider_error" && gotExperiment.Status != ExperimentFailed {
+				t.Fatalf("provider failure status=%s", gotExperiment.Status)
+			}
+			if terminal == "expired" && (gotExperiment.Status != ExperimentExpired || !strings.Contains(gotExperiment.TerminalReason.String, "expiry")) {
+				t.Fatalf("expiry=%+v", gotExperiment)
+			}
+		})
 	}
 }

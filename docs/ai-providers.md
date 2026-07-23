@@ -16,6 +16,11 @@ model, and does not need a key.
 
 ## Quick setup
 
+Prefer `acd settings` for provider and model selection. Saved explicit values
+do not need shell sourcing. Keep `ACD_AI_API_KEY` in the environment because
+the settings file and config revision ledger never store credentials. The full
+workflow and confirmation flags are in [the settings guide](settings.md).
+
 Offline default:
 
 ~~~bash
@@ -103,8 +108,11 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |
 
-Provider, format, and intent environment settings are read when the daemon
-starts.
+Environment settings remain compatible. Saved settings can shadow them, and
+`acd settings` shows both the active source and any shadowed environment value.
+Hot provider and intent values activate as one immutable config revision at the
+next safe work boundary. Fields labeled `restart required` still need an
+explicit daemon restart.
 
 `ACD_COMMIT_FORMAT=conventional` accepts only `feat`, `fix`, `docs`,
 `refactor`, `test`, `build`, `ci`, `chore`, `perf`, `style`, and `revert`
@@ -249,6 +257,12 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 `error`.
 
 ## Security notes
+
+The strict test in `acd settings` sends exactly one fixed synthetic request and
+may incur one provider charge. It sends no repository path, diff, captured
+metadata, prompt trace, commit, or experiment sample. Non-default endpoints,
+subprocess execution, and diff egress each require a separate confirmation;
+see [Test a provider safely](settings.md#test-a-provider-safely).
 
 | Risk | What to do |
 |---|---|

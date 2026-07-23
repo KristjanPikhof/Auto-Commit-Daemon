@@ -104,7 +104,21 @@ acd doctor
 
 `doctor` checks that the installed snippet still matches the current template.
 
-## Choose commit behavior
+## Configure commit behavior
+
+Start with the Go-native settings lab. It shows active and draft values, their
+source, and whether each change activates at the next safe work boundary or
+requires a restart.
+
+~~~bash
+acd settings
+~~~
+
+Use it to choose the provider, model, commit strategy, message format, and
+intent tuning. Once an explicit value is saved, you do not need to export it or
+source it from your shell. Existing environment variables remain compatible,
+and API keys remain environment only. See the [settings guide](docs/settings.md)
+for scopes, profiles, testing, activation, experiments, and recovery.
 
 | Strategy | What happens | Best for |
 |---|---|---|

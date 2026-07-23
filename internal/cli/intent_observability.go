@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -168,6 +172,181 @@ const IntentRecentCommitWindow = 100
 // out of 5 decisions = 0.05 = threshold), which is a noise signal, not
 // an operator-actionable regression.
 const IntentPlannerErrorRateWarnThreshold = 0.05
+
+type runtimeExperimentReport struct {
+	ID                  int64  `json:"id"`
+	BaselineRevisionID  int64  `json:"baseline_revision"`
+	CandidateRevisionID int64  `json:"candidate_revision"`
+	WindowBudget        int    `json:"window_budget"`
+	CompletedWindows    int    `json:"completed_windows"`
+	ExpiresTS           int64  `json:"expires_ts,omitempty"`
+	FailurePolicy       string `json:"failure_policy"`
+	Status              string `json:"status"`
+}
+
+type runtimeConfigReport struct {
+	SavedGeneration         uint64                   `json:"saved_generation"`
+	DesiredRevisionID       int64                    `json:"desired_revision"`
+	AppliedRevisionID       int64                    `json:"applied_revision"`
+	LastKnownGoodRevisionID int64                    `json:"last_known_good_revision"`
+	Profile                 string                   `json:"profile,omitempty"`
+	ApplyState              string                   `json:"apply_state"`
+	PendingAgeSeconds       int64                    `json:"pending_age_seconds,omitempty"`
+	Failure                 string                   `json:"failure,omitempty"`
+	ApplyBoundary           string                   `json:"apply_boundary"`
+	Experiment              *runtimeExperimentReport `json:"experiment,omitempty"`
+}
+
+func loadRuntimeConfigReport(ctx context.Context, conn *sql.DB, repoHash string, now time.Time) (runtimeConfigReport, error) {
+	report := runtimeConfigReport{ApplyState: "unset", ApplyBoundary: string(config.ApplyHot)}
+	if roots, err := paths.Resolve(); err == nil {
+		if doc, err := config.NewStore(roots).Load(); err == nil {
+			report.SavedGeneration = doc.Generation
+			if repo := doc.Settings.Repositories[repoHash]; repo.Profile != "" {
+				report.Profile = sanitizeObservabilityText(repo.Profile)
+			}
+		}
+	}
+	if conn == nil {
+		return report, nil
+	}
+	hasState, err := sqliteTableExists(ctx, conn, "runtime_config_state")
+	if err != nil {
+		return report, errors.New("runtime settings table check failed")
+	}
+	if !hasState {
+		return report, nil
+	}
+	var desired, applied, knownGood sql.NullInt64
+	var desiredTS sql.NullFloat64
+	var failure sql.NullString
+	err = conn.QueryRowContext(ctx, `
+SELECT desired_revision_id, applied_revision_id, last_known_good_revision_id,
+       desired_ts, last_error
+FROM runtime_config_state WHERE id=1`).Scan(&desired, &applied, &knownGood, &desiredTS, &failure)
+	if errors.Is(err, sql.ErrNoRows) {
+		return report, nil
+	}
+	if err != nil {
+		return report, errors.New("read runtime settings state failed")
+	}
+	if desired.Valid {
+		report.DesiredRevisionID = desired.Int64
+	}
+	if applied.Valid {
+		report.AppliedRevisionID = applied.Int64
+	}
+	if knownGood.Valid {
+		report.LastKnownGoodRevisionID = knownGood.Int64
+	}
+	report.Failure = sanitizeObservabilityText(failure.String)
+	switch {
+	case desired.Valid && applied.Valid && desired.Int64 == applied.Int64 && report.Failure == "":
+		report.ApplyState = "active"
+	case report.Failure != "":
+		report.ApplyState = "rejected"
+	case desired.Valid:
+		report.ApplyState = "pending"
+	case applied.Valid:
+		report.ApplyState = "active"
+	}
+	if desiredTS.Valid && report.ApplyState != "active" {
+		pending := time.Unix(0, int64(desiredTS.Float64*float64(time.Second)))
+		report.PendingAgeSeconds = int64(now.Sub(pending).Seconds())
+		if report.PendingAgeSeconds < 0 {
+			report.PendingAgeSeconds = 0
+		}
+	}
+	if ok, _ := sqliteTableExists(ctx, conn, "config_revisions"); ok {
+		revision := report.DesiredRevisionID
+		if revision == 0 {
+			revision = report.AppliedRevisionID
+		}
+		if revision > 0 {
+			var profile sql.NullString
+			if err := conn.QueryRowContext(ctx, `SELECT profile FROM config_revisions WHERE id=?`, revision).Scan(&profile); err == nil && profile.Valid {
+				report.Profile = sanitizeObservabilityText(profile.String)
+			}
+		}
+	}
+	if ok, _ := sqliteTableExists(ctx, conn, "config_experiments"); ok {
+		var exp runtimeExperimentReport
+		var expires sql.NullFloat64
+		err := conn.QueryRowContext(ctx, `
+SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
+       completed_windows, expires_ts, failure_policy, status
+FROM config_experiments ORDER BY id DESC LIMIT 1`).Scan(
+			&exp.ID, &exp.BaselineRevisionID, &exp.CandidateRevisionID,
+			&exp.WindowBudget, &exp.CompletedWindows, &expires,
+			&exp.FailurePolicy, &exp.Status)
+		if err == nil {
+			if expires.Valid {
+				exp.ExpiresTS = int64(expires.Float64)
+			}
+			exp.FailurePolicy = sanitizeObservabilityText(exp.FailurePolicy)
+			exp.Status = sanitizeObservabilityText(exp.Status)
+			report.Experiment = &exp
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return report, errors.New("read runtime experiment state failed")
+		}
+	}
+	return report, nil
+}
+
+var (
+	observabilityANSI     = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
+	observabilityUserInfo = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@`)
+	observabilitySecret   = regexp.MustCompile(`(?i)\b(api[_ -]?key|access[_ -]?token|token|password|credential)\s*[:=]\s*[^\s,;]+`)
+	observabilityPayload  = regexp.MustCompile(`(?i)\b(prompt|repository[_ -]?diff|raw[_ -]?response|provider[_ -]?response)\s*[:=]\s*[^\n]+`)
+)
+
+func sanitizeObservabilityText(value string) string {
+	value = observabilityANSI.ReplaceAllString(value, "")
+	value = observabilityUserInfo.ReplaceAllString(value, `${1}[redacted]@`)
+	value = observabilitySecret.ReplaceAllString(value, `[redacted secret]`)
+	value = observabilityPayload.ReplaceAllString(value, `[redacted payload]`)
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) && r != '\u007f' {
+			return r
+		}
+		return -1
+	}, value)
+	if len(value) > 1024 {
+		value = value[:1024]
+	}
+	return strings.TrimSpace(value)
+}
+
+func renderRuntimeConfigHuman(out io.Writer, report runtimeConfigReport) {
+	fmt.Fprintf(out, "Runtime settings: %s desired=%s applied=%s known_good=%s profile=%s boundary=%s saved_generation=%d",
+		valueOrUnset(report.ApplyState), revisionOrUnset(report.DesiredRevisionID),
+		revisionOrUnset(report.AppliedRevisionID), revisionOrUnset(report.LastKnownGoodRevisionID),
+		valueOrUnset(report.Profile), valueOrUnset(report.ApplyBoundary), report.SavedGeneration)
+	if report.PendingAgeSeconds > 0 {
+		fmt.Fprintf(out, " pending_age=%s", formatDurationCompact(time.Duration(report.PendingAgeSeconds)*time.Second))
+	}
+	fmt.Fprintln(out)
+	if report.Failure != "" {
+		fmt.Fprintf(out, "  Activation failure: %s\n", report.Failure)
+	}
+	if report.Experiment != nil {
+		exp := report.Experiment
+		fmt.Fprintf(out, "  Experiment #%d: %s windows=%d/%d baseline=%d candidate=%d policy=%s",
+			exp.ID, valueOrUnset(exp.Status), exp.CompletedWindows, exp.WindowBudget,
+			exp.BaselineRevisionID, exp.CandidateRevisionID, valueOrUnset(exp.FailurePolicy))
+		if exp.ExpiresTS > 0 {
+			fmt.Fprintf(out, " expires=%s", time.Unix(exp.ExpiresTS, 0).UTC().Format(time.RFC3339))
+		}
+		fmt.Fprintln(out)
+	}
+}
+
+func revisionOrUnset(value int64) string {
+	if value <= 0 {
+		return "unset"
+	}
+	return strconv.FormatInt(value, 10)
+}
 
 func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 	status := "event"

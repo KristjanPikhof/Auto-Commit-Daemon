@@ -1013,7 +1013,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 			return
 		}
 	}
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+	record := state.DecisionRecord{
 		Kind:             kind,
 		Path:             sql.NullString{String: path, Valid: true},
 		Reason:           sql.NullString{String: reason, Valid: reason != ""},
@@ -1022,7 +1022,9 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		ActionTaken:      sql.NullString{String: "no_delete_generated", Valid: true},
 		UserMessage:      sql.NullString{String: fmt.Sprintf("Skipped protected path %s without generating a delete.", path), Valid: true},
-	}); err != nil {
+	}
+	stampDecisionRuntime(ctx, &record)
+	if _, err := state.AppendDecision(ctx, db, record); err != nil {
 		slog.Default().Warn("append capture protected decision", "path", path, "reason", reason, "err", err.Error())
 	}
 }
@@ -1042,7 +1044,7 @@ func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureConte
 	}
 	action := "queued"
 	message := fmt.Sprintf("Captured %s for %s and queued it for replay.", op.Op, op.Path)
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+	record := state.DecisionRecord{
 		Kind:             state.DecisionKindCaptured,
 		Path:             sql.NullString{String: op.Path, Valid: true},
 		Reason:           sql.NullString{String: op.Fidelity, Valid: op.Fidelity != ""},
@@ -1052,7 +1054,9 @@ func recordCapturedDecision(ctx context.Context, db *state.DB, cctx CaptureConte
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		ActionTaken:      sql.NullString{String: action, Valid: true},
 		UserMessage:      sql.NullString{String: message, Valid: true},
-	}); err != nil {
+	}
+	stampDecisionRuntime(ctx, &record)
+	if _, err := state.AppendDecision(ctx, db, record); err != nil {
 		slog.Default().Warn("append capture decision", "path", op.Path, "seq", seq, "err", err.Error())
 	}
 }

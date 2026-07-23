@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -276,6 +277,77 @@ func runAcd(t *testing.T, ctx context.Context, env []string, args ...string) Exe
 		Stderr:   stderr.String(),
 		ExitCode: exit,
 	}
+}
+
+// runPTYCommand executes a command behind the host's script(1) PTY. The
+// wrapper sets a real kernel window size before exec and can resize it during
+// the session, which exercises Bubble Tea's SIGWINCH path rather than merely
+// setting COLUMNS/LINES. Inputs are written after startup so full-screen
+// initialization is observable before keyboard-only interaction begins.
+func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows int, resizeCols, resizeRows int, input string, args ...string) ExecResult {
+	t.Helper()
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("PTY integration is supported on macOS and Linux")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) PTY utility required")
+	}
+	body := "stty cols " + strconv.Itoa(cols) + " rows " + strconv.Itoa(rows)
+	inputDelay := 850 * time.Millisecond
+	if resizeCols > 0 && resizeRows > 0 {
+		body += "; (sleep 0.9; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) & exec \"$@\""
+		inputDelay = 1400 * time.Millisecond
+	} else {
+		body += "; exec \"$@\""
+	}
+	commandArgs := append([]string{"/bin/sh", "-c", body, "sh"}, args...)
+	var scriptArgs []string
+	if runtime.GOOS == "darwin" {
+		scriptArgs = append([]string{"-q", "/dev/null"}, commandArgs...)
+	} else {
+		scriptArgs = []string{"-q", "-c", shellJoin(commandArgs), "/dev/null"}
+	}
+	cmd := exec.CommandContext(ctx, "script", scriptArgs...)
+	cmd.Env = env
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("PTY stdin: %v", err)
+	}
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start PTY command: %v", err)
+	}
+	time.Sleep(inputDelay)
+	if input != "" {
+		for i, chunk := range strings.Split(input, "\x00") {
+			if i > 0 {
+				time.Sleep(700 * time.Millisecond)
+			}
+			_, _ = io.WriteString(stdin, chunk)
+		}
+	}
+	_ = stdin.Close()
+	err = cmd.Wait()
+	exit := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			exit = ee.ExitCode()
+		} else {
+			exit = -1
+		}
+	}
+	return ExecResult{Stdout: output.String(), ExitCode: exit}
+}
+
+func shellJoin(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+	}
+	return strings.Join(quoted, " ")
 }
 
 // waitFor polls pred at ~50ms intervals until it returns true or the

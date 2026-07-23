@@ -119,6 +119,9 @@ func TestRoots_RepoStateDirAndLog(t *testing.T) {
 	if roots.ConfigPath() != "/tmp/config/acd/config.json" {
 		t.Errorf("ConfigPath = %q", roots.ConfigPath())
 	}
+	if roots.ConfigLockPath() != "/tmp/config/acd/config.lock" {
+		t.Errorf("ConfigLockPath = %q", roots.ConfigLockPath())
+	}
 }
 
 func TestRepoHash_Deterministic(t *testing.T) {

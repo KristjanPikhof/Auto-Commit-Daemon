@@ -27,6 +27,33 @@ acd on
 acd off
 ~~~
 
+Use `acd settings` for provider, model, commit strategy, and intent tuning. It
+replaces shell exports for saved explicit values, except API keys, which remain
+environment only. See [Configure ACD with the settings lab](settings.md).
+
+## Configure ACD
+
+`acd settings` opens the rich terminal settings lab for the current repository.
+It shows `DRAFT`, `TESTED`, `QUEUED`, and `ACTIVE` state, including each value's
+source, shadowed environment value, and apply boundary.
+
+~~~bash
+acd settings
+acd settings --profile fast
+acd settings --global
+acd settings --accessible
+~~~
+
+Repository scope is the default. Profile edits are reusable. Global saves do
+not fan out to running repositories. Accessible mode uses linear prompts, and
+`TERM=dumb` selects it automatically. Rich mode requires interactive stdin and
+stdout; `--json` is not supported for the interactive command.
+
+Provider tests use one fixed synthetic request and may incur one provider
+charge. Use distinct flags to confirm non-default endpoint credentials,
+subprocess execution, or diff egress. See the [settings guide](settings.md) for
+the full save, test, apply, revert, restart, and experiment contract.
+
 Bare `acd` reports one of these states:
 
 | State | Meaning |

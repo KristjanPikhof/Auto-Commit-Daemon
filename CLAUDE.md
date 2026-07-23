@@ -66,6 +66,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 - After test `git.Init`/`git init`, run `git symbolic-ref HEAD refs/heads/main`. HEAD-transition tests use `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
 - Focused stability: `-count=10`. Ordering hazards: `GOMAXPROCS=1 -count=50`.
 - Broad-run-sensitive coverage includes fsnotify wake, lifecycle, wake coalescing, real SIGUSR1, repeated edits, external FF reseed, FF-in-rewind-grace, and `TestSquashBacklogRecovery_PreservesSixtyCapturesAndControls`.
+- Settings integration coverage: `go test ./test/integration/... -tags=integration -run 'Settings|RuntimeConfig|ConfigExperiment|SettingsTUI' -race -count=1 -timeout 5m`. Preserve isolated HOME/XDG roots, local HTTPS fixtures, real PTYs at wide/medium/narrow sizes, resize, keyboard-only, NO_COLOR, accessible, dirty-quit, terminal-restoration, and static-build checks.
 - CLI changes need Cobra help/examples. Template changes need `internal/cli/setup_test.go` and AdapterE2E coverage.
 - ACD self-hosts this repo. Pause only for branch/history surgery, recovery/DB mutation, or tests that deliberately run capture/replay against this checkout; resume with `acd resume --repo . --yes`.
 - Source edits do not change the running daemon. For daemon/provider tests, build and install/use `bin/acd`, then restart or invoke it directly.
@@ -84,7 +85,7 @@ Commit messages:
 
 ## State, branches and capture
 
-- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. v12 adds immutable `recovery_snapshots` and ordered `recovery_snapshot_events`; `SchemaVersion=13` adds the same-base recovery-prefix retention index; see `internal/state/migrate.go`.
+- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. v12 adds immutable recovery snapshots, v13 adds same-base recovery-prefix retention, and `SchemaVersion=14` adds immutable runtime config revisions, activation requests, experiments, and planner/decision revision metadata; see `internal/state/migrate.go`.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2, atomic temp+rename. `acd stop` removes matching/all caches.
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Reset/rebase/switch/same-SHA ref switch bumps generation; ordinary FF keeps it, except FF during rewind grace bumps, reseeds, and clears grace. Legacy bare rev upgrades as Diverged.
 - Every non-unchanged token transition reconciles the prior exact pair before acceptance; dead-ref sweeps alone skip live refs.
@@ -98,6 +99,10 @@ Commit messages:
 - `IgnoreChecker` keeps `git check-ignore --stdin -z --non-matching --verbose` alive. Stream writes while reading stdout; one large write can deadlock on macOS 16 KiB pipes. Close is cancel+kill with a 2s wait.
 
 ## Replay and intent
+
+- `acd settings` is the Go-native configuration lab. It uses Bubble Tea v2.0.8, Bubbles v2.1.1, Lip Gloss v2.0.5, and Huh v2.0.3. Preserve static CGO-disabled builds, responsive/accessible/no-color behavior, and `DRAFT > TESTED > QUEUED > ACTIVE` text labels.
+- Settings precedence is experiment > repository > profile > global > environment > default. API keys remain environment only. Hot revisions activate between daemon passes; restart-required fields never enter a hot revision. Global saves do not fan out and stopped-daemon apply never starts it.
+- Strict provider tests send one synthetic request without source data. Endpoint credentials, subprocess execution, and diff egress require distinct confirmations. Experiment comparisons are descriptive, not causal.
 
 - Default `ACD_COMMIT_STRATEGY=event` publishes one capture per commit and never calls the planner. `intent` selects one capture or a non-empty subset; capture durability is unchanged.
 - Every offered seq must be selected or deferred. Invalid/missing/unsafe output records `intent_planner_error` and falls back to a deterministic singleton.
@@ -138,7 +143,7 @@ acd fix --force --yes
 - fsnotify is opt-in; poll is the safety net. Dispatch never blocks: rewalk/diagnostics use replaceable worker channels, debounce tail is 500ms, and budget exhaustion falls back to poll.
 - Bare `acd` is read-only health. Active-tail terminal events mean `needs_attention`; inactive historical terminals do not. `acd on` is idempotent but renders diagnostics and returns nonzero if still unhealthy. `acd off` idempotently disables/stops and preserves state.
 - `events`, `explain` and `doctor` read paths must use read-only SQLite and never migrate/create tables. Missing decision tables yield empty valid output.
-- `status --json`/`diagnose --json` expose intent windows, circuit and recovery. Open-circuit guidance is fallback plus automatic probe, not restart.
+- `status --json`/`diagnose --json` expose intent windows, circuit, recovery, and additive runtime settings revision/experiment state. Pre-v14 read paths return an empty settings projection without migration. Open-circuit guidance is fallback plus automatic probe, not restart.
 - Logs: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log` with rotation/compression; hooks use `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log`. `acd logs --follow` continues from the EOF reached by initial tail.
 - `events --watch` starts at ledger tail unless `--since` is supplied. Rewrite progress uses stderr; see `docs/rewrite-commits.md`.
 - Start cache plus central registry may bypass control lock, DB migration and registry rewrite. Manual start uses `human:<repoHash>`; harness starts require `--session-id`.
@@ -169,7 +174,10 @@ acd fix --force --yes
 
 ## Environment
 
-Runtime environment is resolved at daemon start; restart after changes.
+Environment variables remain compatible. `acd settings` can persist explicit
+non-secret values and shows when they shadow environment values. Hot settings
+activate at the next safe work boundary; fields labeled `restart required`
+need an explicit daemon restart. API keys remain environment only.
 
 | Group | Variables and defaults |
 |---|---|
@@ -181,4 +189,4 @@ Runtime environment is resolved at daemon start; restart after changes.
 | Intent | `ACD_COMMIT_STRATEGY`: `event` or `intent`; `ACD_INTENT_WINDOW=10`; `ACD_INTENT_MIN_PENDING=10`; `ACD_INTENT_SETTLE_WINDOW=10s`; `ACD_INTENT_MAX_PENDING_AGE=5m`; `ACD_INTENT_RECENT_COMMITS=5`; `ACD_INTENT_DEFER_LIMIT=1`; `ACD_INTENT_RETRY_ON_INVALID=2`; `ACD_INTENT_PATH_COALESCE=off`; `ACD_RECENT_COMMIT_AFFINITY_SECONDS=0` |
 | Watch/client | `ACD_FSNOTIFY_ENABLED=off`; `ACD_DISABLE_FSNOTIFY` forces poll; `ACD_MAX_INOTIFY_WATCHES`; `ACD_CLIENT_TTL_SECONDS=1800` |
 
-Canonical details: `docs/overview.md`, `docs/capture-replay.md`, `docs/intent-commit-flow.md`, `docs/ai-providers.md`, `docs/user-workflows.md` and `docs/rewrite-commits.md`.
+Canonical details: `docs/overview.md`, `docs/capture-replay.md`, `docs/settings.md`, `docs/intent-commit-flow.md`, `docs/ai-providers.md`, `docs/user-workflows.md` and `docs/rewrite-commits.md`.

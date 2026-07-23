@@ -19,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
@@ -230,7 +231,7 @@ func logIntentPlanNormalization(provider string, dropped, synthesized, overlapRe
 // exhausted, any error is returned to the composed caller, which records the
 // intent_planner_error decision and falls back to deterministic.
 func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanner, req IntentPlanRequest) (IntentPlan, error) {
-	maxRetries := intentRetryOnInvalidLimit()
+	maxRetries := intentRetryOnInvalidLimit(ctx)
 	maxAttempts := 1 + maxRetries
 	currentReq := req
 	var (
@@ -240,6 +241,7 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 		overlapRemoved []int64
 	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		recordIntentAttempt(ctx)
 		plan, err := primary.PlanIntent(ctx, currentReq)
 		if err == nil {
 			plan = NormalizeIntentPlanReasons(plan)
@@ -386,7 +388,64 @@ func withPromptTraceStrategy(ctx context.Context, strategy string, offeredSeqs [
 // planner may make after typed validation errors. The initial planner call is
 // not counted. Empty or invalid values use DefaultIntentRetryOnInvalid.
 // False-like values disable retries for cost-sensitive environments.
-func intentRetryOnInvalidLimit() int {
+type intentRetryLimitContextKey struct{}
+type intentAttemptCounterContextKey struct{}
+
+// IntentAttemptCounter observes composed planner attempts without changing
+// request payloads, prompts, logs, or provider output. RetryCount excludes the
+// initial attempt.
+type IntentAttemptCounter struct{ attempts atomic.Int64 }
+
+func WithIntentAttemptCounter(ctx context.Context) (context.Context, *IntentAttemptCounter) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	counter := &IntentAttemptCounter{}
+	return context.WithValue(ctx, intentAttemptCounterContextKey{}, counter), counter
+}
+
+func (c *IntentAttemptCounter) RetryCount() int {
+	if c == nil {
+		return 0
+	}
+	attempts := c.attempts.Load()
+	if attempts <= 1 {
+		return 0
+	}
+	return int(attempts - 1)
+}
+
+func recordIntentAttempt(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	if counter, ok := ctx.Value(intentAttemptCounterContextKey{}).(*IntentAttemptCounter); ok && counter != nil {
+		counter.attempts.Add(1)
+	}
+}
+
+// WithIntentRetryLimit pins correction retries to one immutable runtime
+// bundle for the lifetime of ctx. Negative limits are clamped to zero. When
+// absent, the established environment/default behavior is unchanged.
+func WithIntentRetryLimit(ctx context.Context, limit int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return context.WithValue(ctx, intentRetryLimitContextKey{}, limit)
+}
+
+func intentRetryOnInvalidLimit(ctx context.Context) int {
+	if ctx != nil {
+		if limit, ok := ctx.Value(intentRetryLimitContextKey{}).(int); ok {
+			if limit < 0 {
+				return 0
+			}
+			return limit
+		}
+	}
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv(EnvIntentRetryOnInvalid)))
 	switch raw {
 	case "":

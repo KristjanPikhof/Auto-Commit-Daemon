@@ -1,0 +1,334 @@
+package daemon
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+)
+
+type runtimeTestProvider struct{ name string }
+
+func (p *runtimeTestProvider) Name() string { return p.name }
+func (p *runtimeTestProvider) Generate(context.Context, ai.CommitContext) (ai.Result, error) {
+	return ai.Result{Subject: "Test runtime bundle"}, nil
+}
+func (p *runtimeTestProvider) PlanIntent(_ context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	if len(req.OfferedCaptures) == 0 {
+		return ai.IntentPlan{}, errors.New("no captures")
+	}
+	return ai.IntentPlan{SelectedSeqs: []int64{req.OfferedCaptures[0].Seq}, Subject: "Test runtime bundle", GroupingReason: "synthetic", Source: p.name}, nil
+}
+
+type runtimeTestCloser struct {
+	calls atomic.Int32
+	block <-chan struct{}
+}
+
+func (c *runtimeTestCloser) Close() error {
+	c.calls.Add(1)
+	if c.block != nil {
+		<-c.block
+	}
+	return nil
+}
+
+func runtimeRevision(t *testing.T, db *state.DB, profile string, generation int64, values map[string]any) state.ConfigRevision {
+	t.Helper()
+	body, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(context.Background(), db, state.ConfigRevisionInput{Snapshot: body, Profile: profile, Scope: "repo", SourceGeneration: generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}
+
+func runtimeBuilder(db *state.DB, closers map[string]*runtimeTestCloser) RuntimeBundleBuilder {
+	return RuntimeBundleBuilder{DB: db, BuildProvider: func(cfg ai.ProviderConfig) (ai.Provider, io.Closer, error) {
+		name := cfg.Mode
+		if name == "openai-compat" {
+			name = "openai-compat"
+		}
+		closer := &runtimeTestCloser{}
+		closers[cfg.Model] = closer
+		return &runtimeTestProvider{name: name}, closer, nil
+	}}
+}
+
+func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	a := runtimeRevision(t, db, "work", 1, map[string]any{
+		"ai.provider": "openai-compat", "ai.model": "model-a",
+		"commit.strategy": "intent", "commit.format": "imperative",
+		"intent.window": 3, "intent.min_pending": 2,
+	})
+	b := runtimeRevision(t, db, "work", 2, map[string]any{
+		"ai.provider": "openai-compat", "ai.model": "model-a",
+		"commit.strategy": "intent", "commit.format": "conventional",
+		"intent.window": 9, "intent.min_pending": 4,
+		"intent.retry_on_invalid": 1,
+	})
+	c := runtimeRevision(t, db, "work", 3, map[string]any{
+		"ai.provider": "openai-compat", "ai.model": "model-c",
+		"commit.strategy": "intent", "intent.window": 11,
+	})
+	builder := runtimeBuilder(db, closers)
+	bundleA, err := builder.BuildRevision(context.Background(), a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleB, err := builder.BuildRevision(context.Background(), b, bundleA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundleA.IntentHealth != bundleB.IntentHealth {
+		t.Fatal("intent-only/format tuning reset circuit health")
+	}
+	if bundleB.IntentRetryLimit != 1 {
+		t.Fatalf("retry limit=%d", bundleB.IntentRetryLimit)
+	}
+	bundleC, err := builder.BuildRevision(context.Background(), c, bundleB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundleC.IntentHealth == bundleB.IntentHealth || bundleC.HealthFingerprint == bundleB.HealthFingerprint {
+		t.Fatal("provider identity change preserved circuit health")
+	}
+	withOtherTrust := bundleC.HealthIdentity
+	withOtherTrust.TrustFingerprint = "sha256:other"
+	if IntentPlannerProviderFingerprint(withOtherTrust) == bundleC.HealthFingerprint {
+		t.Fatal("CA trust change preserved circuit identity")
+	}
+
+	manager := NewRuntimeBundleManager(bundleA, builder, time.Second)
+	closerA := bundleA.ProviderCloser.(*runtimeTestCloser)
+	lease := manager.Lease()
+	manager.swap(bundleB)
+	if closerA.calls.Load() != 0 {
+		t.Fatal("retired leased provider closed during pass")
+	}
+	leased := lease.Bundle()
+	if leased.RevisionID != a.ID || leased.CommitFormat != ai.CommitFormatImperative || leased.IntentWindow != 3 || leased.IntentMinPending != 2 {
+		t.Fatalf("mixed leased bundle: %+v", leased)
+	}
+	lease.Release()
+	if closerA.calls.Load() != 1 {
+		t.Fatalf("old close count=%d", closerA.calls.Load())
+	}
+	manager.Close()
+}
+
+func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	builder := runtimeBuilder(db, closers)
+	initialCloser := &runtimeTestCloser{}
+	initial := &RuntimeBundle{Provider: &runtimeTestProvider{name: "deterministic"}, ProviderCloser: initialCloser, MessageFn: DeterministicMessage}
+	manager := NewRuntimeBundleManager(initial, builder, time.Second)
+	defer manager.Close()
+	var expected sql.NullInt64
+	var latest state.ConfigRevision
+	for i, model := range []string{"model-a", "model-b", "model-c"} {
+		revision := runtimeRevision(t, db, "work", int64(i+1), map[string]any{"ai.provider": "openai-compat", "ai.model": model, "commit.strategy": "intent", "intent.window": i + 3})
+		request, ok, err := state.RequestConfigActivation(context.Background(), db, revision.ID, expected)
+		if err != nil || !ok {
+			t.Fatalf("request %s: %+v %v", model, request, err)
+		}
+		expected = sql.NullInt64{Int64: revision.ID, Valid: true}
+		latest = revision
+	}
+	if err := manager.ActivateDesired(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Current(); got.RevisionID != latest.ID || got.Model != "model-c" || got.IntentWindow != 5 {
+		t.Fatalf("active=%+v", got)
+	}
+	projection, err := state.RuntimeConfigActivationState(context.Background(), db)
+	if err != nil || projection.AppliedRevisionID.Int64 != latest.ID || projection.LastKnownGoodRevisionID.Int64 != latest.ID {
+		t.Fatalf("projection=%+v err=%v", projection, err)
+	}
+	if initialCloser.calls.Load() != 1 {
+		t.Fatalf("initial close count=%d", initialCloser.calls.Load())
+	}
+
+	bad := runtimeRevision(t, db, "work", 4, map[string]any{"capture.max_file_bytes": 1234})
+	request, ok, err := state.RequestConfigActivation(context.Background(), db, bad.ID, expected)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if err := manager.ActivateDesired(context.Background()); err == nil {
+		t.Fatal("restart-only candidate applied")
+	}
+	projection, _ = state.RuntimeConfigActivationState(context.Background(), db)
+	if projection.AppliedRevisionID.Int64 != latest.ID || projection.LastKnownGoodRevisionID.Int64 != latest.ID {
+		t.Fatalf("known-good changed: %+v", projection)
+	}
+	gotRequest, _ := state.ActivationRequestByID(context.Background(), db, request.ID)
+	if gotRequest.Status != state.ActivationRejected {
+		t.Fatalf("request=%+v", gotRequest)
+	}
+}
+
+func TestRuntimeConfigRestartRecoversAcknowledgedDesired(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	revision := runtimeRevision(t, db, "restart", 1, map[string]any{"ai.provider": "openai-compat", "ai.model": "restart-model", "commit.strategy": "intent"})
+	request, ok, err := state.RequestConfigActivation(context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	if ok, err := state.AcknowledgeConfigActivation(context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("ack=%v err=%v", ok, err)
+	}
+	manager := NewRuntimeBundleManager(&RuntimeBundle{Provider: &runtimeTestProvider{name: "deterministic"}, MessageFn: DeterministicMessage}, runtimeBuilder(db, closers), time.Second)
+	defer manager.Close()
+	if err := manager.ActivateDesired(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	projection, _ := state.RuntimeConfigActivationState(context.Background(), db)
+	if manager.Current().RevisionID != revision.ID || projection.AppliedRevisionID.Int64 != revision.ID {
+		t.Fatalf("bundle=%+v projection=%+v", manager.Current(), projection)
+	}
+}
+
+func TestRuntimeConfigRequiresPrivacyConfirmations(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	db := openTestDB(t)
+	closers := map[string]*runtimeTestCloser{}
+	revision := runtimeRevision(t, db, "privacy", 1, map[string]any{"ai.provider": "openai-compat", "ai.base_url": "https://gateway.example/v1", "ai.model": "model", "ai.diff_egress": true})
+	_, err := runtimeBuilder(db, closers).BuildRevision(context.Background(), revision, nil)
+	if err == nil {
+		t.Fatal("unconfirmed privacy effects accepted")
+	}
+	confirmed := runtimeRevision(t, db, "privacy", 2, map[string]any{"ai.provider": "openai-compat", "ai.base_url": "https://gateway.example/v1", "ai.model": "model", "ai.diff_egress": true, "confirmations": []string{"endpoint_credentials", "diff_egress"}})
+	if _, err := runtimeBuilder(db, closers).BuildRevision(context.Background(), confirmed, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeBundleRetiredProviderCloseIsBounded(t *testing.T) {
+	block := make(chan struct{})
+	closer := &runtimeTestCloser{block: block}
+	manager := NewRuntimeBundleManager(&RuntimeBundle{Provider: &runtimeTestProvider{name: "a"}, ProviderCloser: closer}, RuntimeBundleBuilder{}, 20*time.Millisecond)
+	started := time.Now()
+	manager.swap(&RuntimeBundle{Provider: &runtimeTestProvider{name: "b"}})
+	if time.Since(started) > time.Second {
+		t.Fatalf("bounded close took %v", time.Since(started))
+	}
+	if closer.calls.Load() != 1 {
+		t.Fatalf("close count=%d", closer.calls.Load())
+	}
+	close(block)
+	manager.Close()
+}
+
+func TestConfigRevisionStampsDecisionsAndPlannerWindows(t *testing.T) {
+	db := openTestDB(t)
+	revision := runtimeRevision(t, db, "candidate", 1, map[string]any{"ai.provider": "deterministic"})
+	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{
+		RevisionID: revision.ID,
+		Profile:    revision.Profile,
+	})
+	cctx := CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 3, BaseHead: "abc123"}
+	ev := state.CaptureEvent{
+		BranchRef:        cctx.BranchRef,
+		BranchGeneration: cctx.BranchGeneration,
+		BaseHead:         cctx.BaseHead,
+		Operation:        "modify",
+		Path:             "src/app.go",
+		Fidelity:         "exact",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, ev, []state.CaptureOp{{Op: "modify", Path: ev.Path, Fidelity: ev.Fidelity}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev.Seq = seq
+	recordCapturedDecision(ctx, db, cctx, seq, ClassifiedOp{Op: ev.Operation, Path: ev.Path, Fidelity: ev.Fidelity})
+	recordReplayDecision(ctx, db, ev, cctx, float64(time.Now().UnixNano())/float64(time.Second), state.DecisionKindCommitted, "event", "deadbeef")
+
+	decisions, err := state.DecisionsForEvent(ctx, db, seq, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 2 {
+		t.Fatalf("decisions=%+v", decisions)
+	}
+	for _, decision := range decisions {
+		if !decision.ConfigRevisionID.Valid || decision.ConfigRevisionID.Int64 != revision.ID ||
+			!decision.ConfigProfile.Valid || decision.ConfigProfile.String != "candidate" {
+			t.Fatalf("unstamped decision: %+v", decision)
+		}
+	}
+
+	req := ai.IntentPlanRequest{
+		OfferedCaptures: []ai.OfferedCapture{{Seq: seq, Path: ev.Path, Op: ev.Operation, Fidelity: ev.Fidelity}},
+		CommitFormat:    ai.CommitFormatImperative,
+	}
+	plan := ai.IntentPlan{SelectedSeqs: []int64{seq}, Subject: "Update app behavior", GroupingReason: "one change", Source: "openai-compat"}
+	cfg := intentReplayConfig{plannerProvider: "openai-compat", plannerModel: "synthetic", retryCount: 2}
+	if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, []intentReplayItem{{event: ev}}, cctx,
+		float64(time.Now().Add(-5*time.Millisecond).UnixNano())/float64(time.Second), false, ""); err != nil {
+		t.Fatal(err)
+	}
+	windows, err := state.RecentIntentPlannerWindows(ctx, db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("windows=%+v", windows)
+	}
+	window := windows[0]
+	if !window.ConfigRevisionID.Valid || window.ConfigRevisionID.Int64 != revision.ID ||
+		!window.ConfigProfile.Valid || window.ConfigProfile.String != "candidate" ||
+		!window.DurationMS.Valid || window.DurationMS.Int64 < 0 || window.RetryCount != 2 ||
+		window.FallbackUsed || !window.Outcome.Valid || window.Outcome.String != "selected" {
+		t.Fatalf("planner telemetry=%+v", window)
+	}
+}
+
+func TestConfigRevisionPlannerFallbackTelemetryIsDescriptive(t *testing.T) {
+	db := openTestDB(t)
+	revision := runtimeRevision(t, db, "fallback", 1, map[string]any{"ai.provider": "deterministic"})
+	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{RevisionID: revision.ID, Profile: revision.Profile})
+	cctx := CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1}
+	ev := state.CaptureEvent{Seq: 41, BranchRef: cctx.BranchRef, BranchGeneration: 1, Operation: "modify", Path: "safe.txt", Fidelity: "exact"}
+	req := ai.IntentPlanRequest{OfferedCaptures: []ai.OfferedCapture{{Seq: ev.Seq, Path: ev.Path, Op: ev.Operation}}, CommitFormat: ai.CommitFormatImperative}
+	plan := ai.IntentPlan{SelectedSeqs: []int64{ev.Seq}, Subject: "Update safe behavior", GroupingReason: "fallback", Source: "deterministic"}
+	cfg := intentReplayConfig{plannerProvider: "openai-compat", plannerModel: "synthetic", retryCount: 3}
+	if err := recordIntentPlannerWindow(ctx, db, cfg, req, plan, []intentReplayItem{{event: ev}}, cctx,
+		float64(time.Now().UnixNano())/float64(time.Second), false, "provider validation failed"); err != nil {
+		t.Fatal(err)
+	}
+	windows, err := state.RecentIntentPlannerWindows(ctx, db, 1)
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("windows=%+v err=%v", windows, err)
+	}
+	window := windows[0]
+	if !window.FallbackUsed || window.RetryCount != 3 || !window.ValidationFailure.Valid ||
+		window.Outcome.String != "provider_error_fallback_selected" {
+		t.Fatalf("fallback telemetry=%+v", window)
+	}
+	if window.ValidationFailure.String == "" || window.ConfigRevisionID.Int64 != revision.ID {
+		t.Fatalf("missing safe fallback provenance: %+v", window)
+	}
+}

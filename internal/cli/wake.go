@@ -227,6 +227,23 @@ func daemonFingerprintToken(st state.DaemonState) string {
 	return st.DaemonFingerprint.String
 }
 
+// signalSettingsActivation is the no-queue nudge used after a settings
+// revision becomes desired. Unlike runWake it does not touch clients or
+// enqueue flush/capture work. Process identity is checked by signalProcess
+// before SIGUSR1 is delivered.
+func signalSettingsActivation(st state.DaemonState) (bool, error) {
+	if st.PID <= 0 || st.Mode == "stopped" || !identity.Alive(st.PID) {
+		return false, nil
+	}
+	if !st.DaemonFingerprint.Valid || st.DaemonFingerprint.String == "" {
+		return false, errors.New("acd settings: daemon fingerprint unavailable")
+	}
+	if err := signalProcess(st.PID, syscall.SIGUSR1, daemonFingerprintToken(st)); err != nil {
+		return false, fmt.Errorf("acd settings: nudge daemon: %w", err)
+	}
+	return true, nil
+}
+
 func nowSecondsFloat() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }

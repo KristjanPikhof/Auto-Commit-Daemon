@@ -221,6 +221,14 @@ type ReplayOpts struct {
 	// use a negative value in tests to force zero.
 	IntentDeferLimit int
 
+	// IntentRetryLimit pins composed-planner correction retries for this pass.
+	// Nil preserves the provider's environment/default behavior.
+	IntentRetryLimit *int
+
+	// IntentPathCoalescing pins the legacy same-path coalescing decision for
+	// this pass. Nil preserves environment resolution for direct callers.
+	IntentPathCoalescing *bool
+
 	// IntentIncludeDiffs permits captured diffs in planner requests. Production
 	// callers should leave this false unless diff egress is explicitly enabled.
 	IntentIncludeDiffs bool
@@ -834,6 +842,9 @@ type intentReplayConfig struct {
 	maxPendingAge   time.Duration
 	recent          int
 	deferLimit      int
+	retryLimit      *int
+	retryCount      int
+	pathCoalescing  bool
 	includeDiffs    bool
 	bypassBatchWait bool
 	// pathQuiescence is the per-path silence window read from
@@ -875,6 +886,8 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		maxPendingAge:        cfg.IntentMaxPendingAge,
 		recent:               cfg.IntentRecentCommits,
 		deferLimit:           cfg.IntentDeferLimit,
+		retryLimit:           opts.IntentRetryLimit,
+		pathCoalescing:       pathCoalesceEnabled(),
 		includeDiffs:         opts.IntentIncludeDiffs,
 		bypassBatchWait:      opts.IntentBypassBatchWait,
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
@@ -908,6 +921,9 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		out.deferLimit = opts.IntentDeferLimit
 	} else if opts.IntentDeferLimit < 0 {
 		out.deferLimit = 0
+	}
+	if opts.IntentPathCoalescing != nil {
+		out.pathCoalescing = *opts.IntentPathCoalescing
 	}
 	if out.window <= 0 {
 		out.window = ai.DefaultIntentWindow
@@ -1194,10 +1210,15 @@ func replayIntentBatch(
 			DiffCap: ai.IntentStageDiffCap,
 		})
 	}
+	if cfg.retryLimit != nil {
+		plannerCtx = ai.WithIntentRetryLimit(plannerCtx, *cfg.retryLimit)
+	}
+	plannerCtx, attemptCounter := ai.WithIntentAttemptCounter(plannerCtx)
 	plan, validationFailure, err := planIntentWithFallback(plannerCtx, repoRoot, db, cfg.planner, cfg.health, req, items, activeCtx, nowSec)
 	if err != nil {
 		return sum, err
 	}
+	cfg.retryCount = attemptCounter.RetryCount()
 	if validationFailure != "" {
 		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx, items, validationFailure)
 	}
@@ -1544,7 +1565,7 @@ func buildIntentPlanRequest(
 	// Legacy same-path coalesce can run ahead of the planner offer, but it
 	// defaults off so every durable capture remains planner-visible. Operators
 	// can opt in via ACD_INTENT_PATH_COALESCE=1|true|yes|on (restart to apply).
-	offers, err := coalesceIntentWindow(ctx, db, events, pathCoalesceEnabled(), state.LoadCaptureOps)
+	offers, err := coalesceIntentWindow(ctx, db, events, cfg.pathCoalescing, state.LoadCaptureOps)
 	if err != nil {
 		return nil, ai.IntentPlanRequest{}, err
 	}
@@ -2359,6 +2380,20 @@ func recordIntentPlannerWindow(
 	if forced {
 		forcedReason = "defer_limit"
 	}
+	telemetry := runtimeTelemetryFromContext(ctx)
+	fallbackUsed := validationFailure != ""
+	if !fallbackUsed && provider != "" && provider != (ai.DeterministicProvider{}).Name() && strings.TrimSpace(plan.Source) == (ai.DeterministicProvider{}).Name() {
+		fallbackUsed = true
+	}
+	outcome := "selected"
+	if len(plan.SelectedSeqs) == 0 && len(plan.DeferredSeqs) > 0 {
+		outcome = "deferred"
+	} else if len(plan.SelectedSeqs) > 0 && len(plan.DeferredSeqs) > 0 {
+		outcome = "mixed"
+	}
+	if validationFailure != "" {
+		outcome = "provider_error_fallback_" + outcome
+	}
 	_, err = state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
 		PlannedTS:           ts,
 		Provider:            nullString(provider),
@@ -2377,8 +2412,24 @@ func recordIntentPlannerWindow(
 		DeferredSeqs:        append([]int64(nil), plan.DeferredSeqs...),
 		DeferredReasons:     deferredReasons,
 		Events:              rows,
+		ConfigRevisionID:    sql.NullInt64{Int64: telemetry.revisionID, Valid: telemetry.revisionID > 0},
+		ConfigProfile:       sql.NullString{String: telemetry.profile, Valid: telemetry.profile != ""},
+		DurationMS:          sql.NullInt64{Int64: plannerWindowDurationMS(ts), Valid: true},
+		RetryCount:          cfg.retryCount,
+		FallbackUsed:        fallbackUsed,
+		Outcome:             sql.NullString{String: outcome, Valid: true},
+		ExperimentID:        sql.NullInt64{Int64: telemetry.experimentID, Valid: telemetry.experimentID > 0},
 	})
 	return err
+}
+
+func plannerWindowDurationMS(startedTS float64) int64 {
+	started := time.Unix(0, int64(startedTS*float64(time.Second)))
+	duration := time.Since(started)
+	if duration < 0 {
+		return 0
+	}
+	return duration.Milliseconds()
 }
 
 func appendUniqueSeq(seqs []int64, seq int64) []int64 {
@@ -2429,7 +2480,7 @@ func recordIntentForcedDecision(ctx context.Context, db *state.DB, items []inten
 }
 
 func appendIntentPlannerDecision(ctx context.Context, db *state.DB, ev state.CaptureEvent, cctx CaptureContext, ts float64, kind, reason, action, message string) error {
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+	record := state.DecisionRecord{
 		DecisionTS:       ts,
 		Kind:             kind,
 		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
@@ -2440,7 +2491,9 @@ func appendIntentPlannerDecision(ctx context.Context, db *state.DB, ev state.Cap
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		ActionTaken:      sql.NullString{String: action, Valid: action != ""},
 		UserMessage:      sql.NullString{String: message, Valid: message != ""},
-	}); err != nil {
+	}
+	stampDecisionRuntime(ctx, &record)
+	if _, err := state.AppendDecision(ctx, db, record); err != nil {
 		return fmt.Errorf("daemon: append intent planner decision seq=%d kind=%s: %w", ev.Seq, kind, err)
 	}
 	return nil
@@ -4050,7 +4103,7 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 	if kind == state.DecisionKindCommitted && strings.HasPrefix(reason, "intent_group:") && message != "" {
 		message = strings.TrimSuffix(message, ".") + " in an intent group."
 	}
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+	record := state.DecisionRecord{
 		DecisionTS:       ts,
 		Kind:             kind,
 		Path:             sql.NullString{String: ev.Path, Valid: ev.Path != ""},
@@ -4062,7 +4115,9 @@ func recordReplayDecision(ctx context.Context, db *state.DB, ev state.CaptureEve
 		BranchGeneration: sql.NullInt64{Int64: cctx.BranchGeneration, Valid: true},
 		ActionTaken:      sql.NullString{String: action, Valid: true},
 		UserMessage:      sql.NullString{String: message, Valid: message != ""},
-	}); err != nil {
+	}
+	stampDecisionRuntime(ctx, &record)
+	if _, err := state.AppendDecision(ctx, db, record); err != nil {
 		slog.Default().Warn("append replay decision",
 			"seq", ev.Seq, "kind", kind, "commit", commitOID, "err", err.Error())
 	}

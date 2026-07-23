@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- Added the Go-native `acd settings` configuration lab with rich and accessible
+  terminal modes, repository/global/profile scopes, source and shadow labels,
+  strict synthetic provider testing, and explicit risk confirmations. The TUI
+  pins Bubble Tea 2.0.8, Bubbles 2.1.1, Lip Gloss 2.0.5, and Huh 2.0.3 while
+  preserving static CGO-disabled builds.
+- Added immutable desired/applied config revisions, safe-boundary activation,
+  last-known-good revert, bounded experiments, and descriptive revision/profile
+  comparisons. The runtime settings ledger uses SQLite `SchemaVersion=14`.
+
+### Changed
+
+- `acd status` and `acd diagnose` now add saved generation, desired/applied/
+  last-known-good revision, profile, activation failure, boundary, and
+  experiment progress without changing existing fields or pre-v14 read-only
+  behavior.
+- Provider, model, commit, and intent settings can now be saved without shell
+  sourcing. Existing environment variables remain compatible, and API keys
+  remain environment only.
+
 ## v2026-07-13
 
 ### Added
