@@ -138,13 +138,17 @@ func (b *ServiceBackend) Snapshot(ctx context.Context) (Snapshot, error) {
 
 func (b *ServiceBackend) Test(ctx context.Context, draft map[string]string) (TestResult, error) {
 	clean := sanitizedDraft(draft)
-	result, err := b.service.TestProvider(ctx, clean, b.currentConfirmations(clean))
+	b.mu.Lock()
+	last := b.last
+	b.mu.Unlock()
+	effective := effectiveDraft(last, clean)
+	result, err := b.service.TestProvider(ctx, effective, b.currentConfirmations(effective))
 	if err != nil {
-		return TestResult{}, b.projectConfirmationError(err, clean)
+		return TestResult{}, b.projectConfirmationError(err, effective)
 	}
 	b.mu.Lock()
 	b.testedFingerprint = result.Fingerprint
-	b.testedDraftIdentity = draftIdentity(clean)
+	b.testedDraftIdentity = draftIdentity(effective)
 	b.mu.Unlock()
 	return TestResult{Fingerprint: result.Fingerprint, OK: result.Success,
 		Summary: fmt.Sprintf("strict synthetic %s test passed", fallback(result.Provider, "provider"))}, nil
@@ -178,7 +182,8 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 	b.mu.Lock()
 	last, testedFingerprint, testedDraft := b.last, b.testedFingerprint, b.testedDraftIdentity
 	b.mu.Unlock()
-	if testedFingerprint == "" || testedDraft != draftIdentity(clean) {
+	effective := effectiveDraft(last, clean)
+	if testedFingerprint == "" || testedDraft != draftIdentity(effective) {
 		return ApplyResult{}, errors.New("tested settings are stale; test the current draft again")
 	}
 	changes := changedValues(last, clean)
@@ -195,20 +200,20 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 		return ApplyResult{DesiredRevision: last.DesiredRevisionID,
 			AppliedRevision: last.AppliedRevisionID, SavedOnly: true, Summary: summary}, nil
 	}
-	confirmations := b.currentConfirmations(clean)
-	validation, err := b.service.Validate(ctx, clean, confirmations)
+	confirmations := b.currentConfirmations(effective)
+	validation, err := b.service.Validate(ctx, effective, confirmations)
 	if err != nil {
 		return ApplyResult{}, sanitizeAdapterError(err)
 	}
 	if len(validation.Missing) > 0 {
-		return ApplyResult{}, b.confirmationError(validation.Missing, clean)
+		return ApplyResult{}, b.confirmationError(validation.Missing, effective)
 	}
 	saved, err := b.service.Save(ctx, settings.SaveRequest{Scope: b.opts.Scope, Profile: b.opts.Profile,
 		Values: changes, ExpectedGeneration: last.SavedGeneration})
 	if err != nil {
 		return ApplyResult{}, sanitizeAdapterError(err)
 	}
-	result, err := b.service.Apply(ctx, settings.ApplyRequest{Values: clean,
+	result, err := b.service.Apply(ctx, settings.ApplyRequest{Values: effective,
 		TestedFingerprint: testedFingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: last.DesiredRevisionID})
 	if err != nil {
@@ -260,16 +265,17 @@ func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]s
 	if b.opts.Scope != settings.ScopeRepository {
 		return Experiment{}, errors.New("experiments require repository scope")
 	}
-	if testedFingerprint == "" || testedDraft != draftIdentity(clean) {
+	effective := effectiveDraft(last, clean)
+	if testedFingerprint == "" || testedDraft != draftIdentity(effective) {
 		return Experiment{}, errors.New("tested settings are stale; test the current draft again")
 	}
-	confirmations := b.currentConfirmations(clean)
-	validation, err := b.service.Validate(ctx, clean, confirmations)
+	confirmations := b.currentConfirmations(effective)
+	validation, err := b.service.Validate(ctx, effective, confirmations)
 	if err != nil {
 		return Experiment{}, sanitizeAdapterError(err)
 	}
 	if len(validation.Missing) > 0 {
-		return Experiment{}, b.confirmationError(validation.Missing, clean)
+		return Experiment{}, b.confirmationError(validation.Missing, effective)
 	}
 	saved, err := b.service.Save(ctx, settings.SaveRequest{Scope: settings.ScopeRepository,
 		Values: changedValues(last, clean), ExpectedGeneration: last.SavedGeneration})
@@ -284,7 +290,7 @@ func (b *ServiceBackend) StartExperiment(ctx context.Context, draft map[string]s
 	if options.ExpiresAfter > 0 {
 		expires = time.Now().Add(options.ExpiresAfter)
 	}
-	result, err := experiments.StartExperiment(ctx, settings.ExperimentRequest{Values: clean,
+	result, err := experiments.StartExperiment(ctx, settings.ExperimentRequest{Values: effective,
 		TestedFingerprint: testedFingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: last.DesiredRevisionID,
 		WindowBudget: windows, ExpiresAt: expires, FailurePolicy: policy})
@@ -396,6 +402,19 @@ func changedValues(last settings.Snapshot, draft map[string]string) map[string]*
 		}
 		copyValue := value
 		out[key] = &copyValue
+	}
+	return out
+}
+
+func effectiveDraft(last settings.Snapshot, draft map[string]string) map[string]string {
+	out := make(map[string]string, len(draft))
+	for key, value := range draft {
+		out[key] = value
+	}
+	for _, field := range last.Fields {
+		if !field.Sensitive && strings.TrimSpace(out[field.Name]) == "" {
+			out[field.Name] = field.InheritedValue
+		}
 	}
 	return out
 }

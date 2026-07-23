@@ -24,6 +24,7 @@ type FieldSnapshot struct {
 	Boundary            config.ApplyBoundary
 	Sensitive           bool
 	Persistable         bool
+	InheritedValue      string
 }
 
 type ExperimentSnapshot struct {
@@ -116,15 +117,33 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		if err != nil {
 			return Snapshot{}, sanitizeError(err)
 		}
+		inheritedInput := config.ResolveInput{
+			Repository: repositoryFields, Profile: profileFields,
+			Global: doc.Settings.Global, LookupEnv: s.lookupEnv,
+		}
+		switch scope {
+		case ScopeRepository:
+			inheritedInput.Repository = nil
+		case ScopeProfile:
+			inheritedInput.Profile = nil
+		case ScopeGlobal:
+			inheritedInput.Global = nil
+		}
+		inherited, err := config.ResolveField(field.Name, inheritedInput)
+		if err != nil {
+			return Snapshot{}, sanitizeError(err)
+		}
 		item := FieldSnapshot{Name: field.Name, DraftValue: cleanText(resolved.Value),
 			ActiveValue: cleanText(activeValues[field.Name]), Source: resolved.Source,
-			Boundary: field.Boundary, Sensitive: field.Sensitive, Persistable: field.Persistable}
+			Boundary: field.Boundary, Sensitive: field.Sensitive, Persistable: field.Persistable,
+			InheritedValue: inherited.EffectiveValue()}
 		if resolved.ShadowedEnvironment != nil {
 			item.EnvironmentSet = resolved.ShadowedEnvironment.Set
 			item.ShadowedEnvironment = cleanText(resolved.ShadowedEnvironment.Value)
 		}
 		if field.Sensitive {
 			item.ActiveValue = ""
+			item.InheritedValue = ""
 			if item.DraftValue != "set" {
 				item.DraftValue = "unset"
 			}
