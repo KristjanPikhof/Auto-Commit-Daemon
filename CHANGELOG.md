@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-07-24
+
 ### Added
 
 - Added the Go-native `acd settings` configuration lab with rich and accessible
