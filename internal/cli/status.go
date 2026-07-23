@@ -169,6 +169,7 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	if !fileExists(rec.StateDB) {
 		return report, fmt.Errorf("state.db missing for repo %s", rec.Path)
 	}
+	ttl := clientTTLForRepo(rec.Path)
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
@@ -199,7 +200,7 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		if heartbeatTS > 0 {
 			age := now.Sub(time.Unix(int64(heartbeatTS), 0))
 			report.HeartbeatAgeSeconds = int64(age.Seconds())
-			if age > clientTTL() {
+			if age > ttl {
 				report.Stale = true
 			}
 		}
@@ -228,7 +229,7 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	if err != nil {
 		return report, fmt.Errorf("clients: %w", err)
 	}
-	ttlSecs := int64(clientTTL().Seconds())
+	ttlSecs := int64(ttl.Seconds())
 	for rows.Next() {
 		var sc statusClient
 		var watchPID sql.NullInt64

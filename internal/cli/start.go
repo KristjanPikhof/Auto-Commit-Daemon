@@ -149,6 +149,11 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	if err != nil {
 		return fmt.Errorf("acd start: repo hash: %w", err)
 	}
+	restoreRestartEnvironment, err := applyRestartEnvironment(repo)
+	if err != nil {
+		return fmt.Errorf("acd start: load saved restart settings: %w", err)
+	}
+	defer restoreRestartEnvironment()
 	if sessionID == "" {
 		sessionID = humanStartSessionID(repoHash)
 	}

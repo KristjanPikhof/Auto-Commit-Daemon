@@ -560,7 +560,12 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 				return err
 			}
 			if request.Status == state.ActivationRejected || request.Status == state.ActivationCancelled {
-				return nil
+				hasRequest = false
+				if projection.LastKnownGoodRevisionID.Valid {
+					revisionID = projection.LastKnownGoodRevisionID.Int64
+				} else {
+					return nil
+				}
 			}
 		}
 		current := m.Current()
@@ -594,7 +599,21 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 		candidate, buildErr := m.builder.BuildRevision(ctx, revision, current)
 		if buildErr != nil {
 			if hasRequest {
-				_, _ = state.RejectConfigActivation(ctx, m.db, request.ID, revisionID, ai.SanitizePlannerError(buildErr.Error()))
+				experimentID, _, rejectErr := state.RejectConfigActivationAndExperiment(
+					ctx, m.db, request.ID, revisionID,
+					ai.SanitizePlannerError(buildErr.Error()),
+				)
+				if rejectErr != nil {
+					return errors.Join(buildErr, rejectErr)
+				}
+				if experimentID > 0 {
+					if _, _, _, revertErr := state.QueueExperimentBaselineRevert(
+						ctx, m.db, experimentID,
+						float64(time.Now().UnixNano())/1e9,
+					); revertErr != nil {
+						return errors.Join(buildErr, revertErr)
+					}
+				}
 			}
 			return buildErr
 		}
@@ -630,11 +649,16 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 // and baseline-derived revision/request creation atomically, making repeated
 // restart recovery calls idempotent.
 func (m *RuntimeBundleManager) QueueExperimentRevert(ctx context.Context, now time.Time) (bool, error) {
-	bundle := m.Current()
-	if bundle == nil || bundle.ExperimentID <= 0 {
+	experiment, pending, err := state.ConfigExperimentPendingRevert(ctx, m.db)
+	if err != nil {
+		return false, err
+	}
+	if !pending {
 		return false, nil
 	}
-	_, _, queued, err := state.QueueExperimentBaselineRevert(ctx, m.db, bundle.ExperimentID, float64(now.UnixNano())/1e9)
+	_, _, queued, err := state.QueueExperimentBaselineRevert(
+		ctx, m.db, experiment.ID, float64(now.UnixNano())/1e9,
+	)
 	return queued, err
 }
 

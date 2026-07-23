@@ -32,7 +32,7 @@ type Roots struct {
 	// live here.
 	Share string
 	// Config is the per-tool config directory. Reserved for operator
-	// preferences (no v1 consumer yet).
+	// preferences and saved settings.
 	Config string
 }
 

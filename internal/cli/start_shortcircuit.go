@@ -363,7 +363,7 @@ func tryShortCircuitStart(
 		}
 	}
 	d := evaluateShortCircuit(cache, repoHash, sessionID, harness, rec,
-		shortCircuitNow(), clientTTL(), identity.Alive, captureDaemonFingerprint)
+		shortCircuitNow(), clientTTLForRepo(repo), identity.Alive, captureDaemonFingerprint)
 	if !d.OK {
 		return false, 0, 0, d.Reason
 	}
@@ -431,7 +431,7 @@ func tryRegistryBackedShortCircuitStart(
 	}
 	cache := readStartCache(startCachePath(gitDir, sessionID))
 	d := evaluateShortCircuit(cache, rec.RepoHash, sessionID, harness, rec,
-		shortCircuitNow(), clientTTL(), identity.Alive, captureDaemonFingerprint)
+		shortCircuitNow(), clientTTLForRepo(rec.Path), identity.Alive, captureDaemonFingerprint)
 	if !d.OK {
 		return registryBackedStartResult{}, false
 	}

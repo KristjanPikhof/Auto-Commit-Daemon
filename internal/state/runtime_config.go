@@ -203,6 +203,15 @@ func RequestConfigActivation(ctx context.Context, d *DB, revisionID int64, expec
 	if !equalNullInt64(current, expectedDesired) {
 		return ConfigActivationRequest{}, false, nil
 	}
+	var activeExperiment int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM config_experiments WHERE status='active')`,
+	).Scan(&activeExperiment); err != nil {
+		return ConfigActivationRequest{}, false, fmt.Errorf("state: read active config experiment: %w", err)
+	}
+	if activeExperiment != 0 {
+		return ConfigActivationRequest{}, false, errors.New("state: active config experiment blocks normal activation")
+	}
 	var exists int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM config_revisions WHERE id=?`, revisionID).Scan(&exists); err != nil || exists != 1 {
 		if err == nil {
@@ -454,6 +463,124 @@ FROM config_experiments WHERE id=?`, id).Scan(
 		return ConfigExperiment{}, fmt.Errorf("state: get config experiment: %w", err)
 	}
 	return out, nil
+}
+
+func ActiveConfigExperiment(ctx context.Context, d *DB) (ConfigExperiment, bool, error) {
+	if d == nil {
+		return ConfigExperiment{}, false, fmt.Errorf("state: ActiveConfigExperiment: nil db")
+	}
+	var out ConfigExperiment
+	err := d.readSQL().QueryRowContext(ctx, `
+SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
+       completed_windows, expires_ts, failure_policy, status, created_ts,
+       updated_ts, completed_ts, terminal_reason
+FROM config_experiments WHERE status='active' ORDER BY id DESC LIMIT 1`).Scan(
+		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
+		&out.WindowBudget, &out.CompletedWindows, &out.ExpiresTS,
+		&out.FailurePolicy, &out.Status, &out.CreatedTS, &out.UpdatedTS,
+		&out.CompletedTS, &out.TerminalReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ConfigExperiment{}, false, nil
+	}
+	if err != nil {
+		return ConfigExperiment{}, false, fmt.Errorf("state: read active config experiment: %w", err)
+	}
+	return out, true, nil
+}
+
+// ConfigExperimentPendingRevert returns the experiment whose candidate is
+// still the desired revision. It includes active experiments so expiry can be
+// evaluated and terminal experiments so interrupted cleanup can be retried.
+func ConfigExperimentPendingRevert(ctx context.Context, d *DB) (ConfigExperiment, bool, error) {
+	if d == nil {
+		return ConfigExperiment{}, false, fmt.Errorf("state: ConfigExperimentPendingRevert: nil db")
+	}
+	var out ConfigExperiment
+	err := d.readSQL().QueryRowContext(ctx, `
+SELECT e.id, e.baseline_revision_id, e.candidate_revision_id, e.window_budget,
+       e.completed_windows, e.expires_ts, e.failure_policy, e.status,
+       e.created_ts, e.updated_ts, e.completed_ts, e.terminal_reason
+FROM config_experiments e
+JOIN runtime_config_state s ON s.desired_revision_id=e.candidate_revision_id
+WHERE e.status IN ('active','completed','expired','failed','cancelled')
+ORDER BY e.id DESC LIMIT 1`).Scan(
+		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
+		&out.WindowBudget, &out.CompletedWindows, &out.ExpiresTS,
+		&out.FailurePolicy, &out.Status, &out.CreatedTS, &out.UpdatedTS,
+		&out.CompletedTS, &out.TerminalReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ConfigExperiment{}, false, nil
+	}
+	if err != nil {
+		return ConfigExperiment{}, false, fmt.Errorf("state: read config experiment pending revert: %w", err)
+	}
+	return out, true, nil
+}
+
+// RejectConfigActivationAndExperiment atomically rejects one desired
+// activation and fails an active experiment targeting the same candidate.
+// The rejected desired pointer remains intact for audit/diagnostic projection;
+// callers may queue the experiment's immutable baseline revert afterward.
+func RejectConfigActivationAndExperiment(
+	ctx context.Context,
+	d *DB,
+	requestID int64,
+	revisionID int64,
+	reason string,
+) (int64, bool, error) {
+	if d == nil || requestID <= 0 || revisionID <= 0 {
+		return 0, false, fmt.Errorf("state: RejectConfigActivationAndExperiment: invalid input")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("state: begin rejected experiment activation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := nowSeconds()
+	cleanReason := nullableSanitizedText(reason)
+	res, err := tx.ExecContext(ctx, `
+UPDATE config_activation_requests
+SET status='rejected', completed_ts=?, error=?
+WHERE id=? AND revision_id=? AND status IN ('pending','acknowledged')
+  AND EXISTS (SELECT 1 FROM runtime_config_state
+              WHERE id=1 AND desired_request_id=? AND desired_revision_id=?)`,
+		now, cleanReason, requestID, revisionID, requestID, revisionID)
+	if err != nil {
+		return 0, false, fmt.Errorf("state: reject config activation: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("state: count rejected config activation: %w", err)
+	}
+	if changed == 0 {
+		return 0, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE runtime_config_state SET last_error=?, updated_ts=?
+WHERE id=1 AND desired_request_id=? AND desired_revision_id=?`,
+		cleanReason, now, requestID, revisionID); err != nil {
+		return 0, false, fmt.Errorf("state: update rejected desired state: %w", err)
+	}
+	var experimentID int64
+	err = tx.QueryRowContext(ctx, `
+SELECT id FROM config_experiments
+WHERE candidate_revision_id=? AND status='active'
+ORDER BY id DESC LIMIT 1`, revisionID).Scan(&experimentID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("state: read rejected config experiment: %w", err)
+	}
+	if err == nil {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE config_experiments
+SET status='failed', updated_ts=?, completed_ts=?, terminal_reason=?
+WHERE id=? AND status='active'`, now, now, cleanReason, experimentID); err != nil {
+			return 0, false, fmt.Errorf("state: fail rejected config experiment: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("state: commit rejected experiment activation: %w", err)
+	}
+	return experimentID, true, nil
 }
 
 func FinishConfigExperiment(ctx context.Context, d *DB, id int64, status, reason string) (bool, error) {

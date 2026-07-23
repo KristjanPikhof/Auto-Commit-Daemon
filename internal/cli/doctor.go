@@ -1158,6 +1158,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 		return false
 	}
 	defer conn.Close()
+	ttl := clientTTLForRepo(repoPath)
 
 	var pid int
 	var mode string
@@ -1174,7 +1175,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 			rr.HeartbeatTS = int64(heartbeatTS.Float64)
 			age := time.Since(time.Unix(int64(heartbeatTS.Float64), 0))
 			rr.HeartbeatAgeS = int64(age.Seconds())
-			if age > clientTTL() {
+			if age > ttl {
 				rr.HeartbeatStale = true
 			}
 		}
