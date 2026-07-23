@@ -243,6 +243,29 @@ type ExecResult struct {
 	ExitCode int
 }
 
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *synchronizedBuffer) contains(value string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return bytes.Contains(b.buf.Bytes(), []byte(value))
+}
+
 // runAcd execs the integration-built binary with `args` and returns its
 // stdout/stderr/exit-code. Inherits HOME from the test process; callers that
 // need an isolated XDG layout should set ACD_TEST_HOME via env when
@@ -293,10 +316,10 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 		t.Skip("script(1) PTY utility required")
 	}
 	body := "stty cols " + strconv.Itoa(cols) + " rows " + strconv.Itoa(rows)
-	inputDelay := 850 * time.Millisecond
+	minInputDelay := 850 * time.Millisecond
 	if resizeCols > 0 && resizeRows > 0 {
 		body += "; (sleep 0.9; stty cols " + strconv.Itoa(resizeCols) + " rows " + strconv.Itoa(resizeRows) + " < /dev/tty; kill -WINCH $$) & exec \"$@\""
-		inputDelay = 1400 * time.Millisecond
+		minInputDelay = 1400 * time.Millisecond
 	} else {
 		body += "; exec \"$@\""
 	}
@@ -313,13 +336,30 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	if err != nil {
 		t.Fatalf("PTY stdin: %v", err)
 	}
-	var output bytes.Buffer
+	var output synchronizedBuffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
+	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start PTY command: %v", err)
 	}
-	time.Sleep(inputDelay)
+	readyDeadline := time.Now().Add(5 * time.Second)
+	for !output.contains("ACD SETTINGS") && time.Now().Before(readyDeadline) && ctx.Err() == nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if remaining := minInputDelay - time.Since(startedAt); remaining > 0 {
+		timer := time.NewTimer(remaining)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+	}
 	if input != "" {
 		for i, chunk := range strings.Split(input, "\x00") {
 			if i > 0 {

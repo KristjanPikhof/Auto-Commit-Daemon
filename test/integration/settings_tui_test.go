@@ -267,7 +267,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	// Edit provider, save, wait for the real config write, then quit.
 	saved := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x15openai-compat\rs\x00q", bin, "settings", "--repo", repo)
+		"\r\x00\x15\x00openai-compat\x00\r\x00s\x00q", bin, "settings", "--repo", repo)
 	cancel()
 	if saved.ExitCode != 0 || !strings.Contains(saved.Stdout, "draft saved") {
 		t.Fatalf("save action exit=%d\n%s", saved.ExitCode, saved.Stdout)
@@ -281,7 +281,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	// Make the provider invalid, exercise the asynchronous strict-test error,
 	// wait for it to render, then use the dirty-discard path to exit.
 	failed := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x15invalid-provider\rt\x00qd", bin, "settings", "--repo", repo)
+		"\r\x00\x15\x00invalid-provider\x00\r\x00t\x00qd", bin, "settings", "--repo", repo)
 	cancel()
 	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "FAILED:") {
 		t.Fatalf("failed action exit=%d\n%s", failed.ExitCode, failed.Stdout)
