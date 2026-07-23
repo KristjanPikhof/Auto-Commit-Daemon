@@ -350,15 +350,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD is enabled, but its daemon process is not running."
 		res.NextAction = "Run `acd on` to start it."
-	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD rewind safety grace is active."
-		if status.Pause.RemainingSeconds > 0 {
-			res.Summary = fmt.Sprintf("ACD rewind safety grace is active (%s remaining).",
-				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
-		}
-		res.NextAction = "No action needed; capture and replay resume automatically."
-	case status.Paused:
+	case status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace"):
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD capture and replay are paused."
@@ -373,6 +365,14 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A terminal replay event needs recovery on the active branch."
 		res.NextAction = "Run `acd diagnose` to inspect the blocker."
+	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD rewind safety grace is active."
+		if status.Pause.RemainingSeconds > 0 {
+			res.Summary = fmt.Sprintf("ACD rewind safety grace is active (%s remaining).",
+				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
+		}
+		res.NextAction = "No action needed; capture and replay resume automatically."
 	case status.IntentStrategy.PlannerHealth != nil &&
 		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
