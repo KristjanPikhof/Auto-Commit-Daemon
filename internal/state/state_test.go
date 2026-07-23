@@ -215,6 +215,57 @@ func TestDaemonStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadDaemonStateReadOnlyAllowsFutureSchema(t *testing.T) {
+	t.Parallel()
+	d, dbPath := openTestDB(t)
+	ctx := context.Background()
+	want := DaemonState{
+		PID:               4242,
+		Mode:              "running",
+		HeartbeatTS:       12.5,
+		BranchRef:         sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration:  sql.NullInt64{Int64: 9, Valid: true},
+		Note:              sql.NullString{String: "ready", Valid: true},
+		DaemonToken:       sql.NullString{String: "token", Valid: true},
+		DaemonFingerprint: sql.NullString{String: "fingerprint", Valid: true},
+		UpdatedTS:         13.5,
+	}
+	if err := SaveDaemonState(ctx, d, want); err != nil {
+		t.Fatalf("save daemon state: %v", err)
+	}
+	futureVersion := SchemaVersion + 1
+	if _, err := d.SQL().ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", futureVersion)); err != nil {
+		t.Fatalf("set future schema version: %v", err)
+	}
+
+	got, ok, err := LoadDaemonStateReadOnly(ctx, dbPath)
+	if err != nil || !ok {
+		t.Fatalf("load read-only: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Fatalf("read-only daemon state = %+v, want %+v", got, want)
+	}
+	var version int
+	if err := d.SQL().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != futureVersion {
+		t.Fatalf("user_version = %d, want %d", version, futureVersion)
+	}
+}
+
+func TestLoadDaemonStateReadOnlyMissingDatabase(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "missing", DBFileName)
+	got, ok, err := LoadDaemonStateReadOnly(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("load missing database: %v", err)
+	}
+	if ok || got.Mode != "stopped" {
+		t.Fatalf("missing database = (%+v, %v), want stopped and false", got, ok)
+	}
+}
+
 // TestTouchClient_RefreshesLastSeenWithoutClobberingMetadata pins the
 // hot-path contract used by start.go's short-circuit branch: Touch must
 // bump last_seen_ts only and never disturb harness / watch_pid / watch_fp
@@ -1047,6 +1098,60 @@ func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T
 				t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
 			}
 		})
+	}
+}
+
+func TestPrunePublishedEventsPreservesInterleavedRecoveryContext(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	appendEvent := func(baseHead, path, eventState string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			BaseHead: baseHead, Operation: "modify", Path: path,
+			Fidelity: "exact", CapturedTS: 10, State: eventState,
+		}, []CaptureOp{{
+			Op: "modify", Path: path,
+			BeforeOID: sqlNullStr("before-" + path), BeforeMode: sqlNullStr("100644"),
+			AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+			Fidelity: "exact",
+		}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+		}
+		return seq
+	}
+
+	first := appendEvent("base-one", "first.txt", EventStatePending)
+	contextSeq := appendEvent("base-one", "context.txt", EventStatePublished)
+	last := appendEvent("base-two", "last.txt", EventStatePending)
+	ordinary := appendEvent("base-two", "ordinary.txt", EventStatePublished)
+
+	n, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned=%d want only non-context published row", n)
+	}
+	for _, seq := range []int64{first, contextSeq, last} {
+		var count int
+		if err := d.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&count); err != nil {
+			t.Fatalf("count event seq=%d: %v", seq, err)
+		}
+		if count != 1 {
+			t.Fatalf("recovery context seq=%d count=%d want 1", seq, count)
+		}
+	}
+	var ordinaryCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+		t.Fatalf("count ordinary event: %v", err)
+	}
+	if ordinaryCount != 0 {
+		t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
 	}
 }
 

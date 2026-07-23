@@ -120,14 +120,17 @@ func ReconcileUnpublishedChain(
 	if len(chain) == 0 || chain[0].Event.Seq != opts.FirstSeq {
 		return result, nil
 	}
-	prefix, err := state.LoadPublishedRecoveryPrefix(
+	first := chain[0].Event
+	last := chain[len(chain)-1].Event
+	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration,
-		chain[0].Event.BaseHead, opts.FirstSeq,
+		first.BaseHead, first.Seq, last.Seq,
 	)
 	if err != nil {
-		return result, fmt.Errorf("daemon: reconcile recovery chain: load published prefix: %w", err)
+		return result, fmt.Errorf("daemon: reconcile recovery chain: load published context: %w", err)
 	}
-	prefix, err = representedPublishedPrefix(ctx, repoRoot, db, prefix)
+	recoveryContext = relevantPublishedContext(recoveryContext, chain)
+	recoveryContext, err = representedPublishedContext(ctx, repoRoot, db, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -153,13 +156,13 @@ func ReconcileUnpublishedChain(
 	}
 
 	baseHead := chain[0].Event.BaseHead
-	materialization := make([]state.RecoveryChainEvent, 0, len(prefix)+len(chain))
-	materialization = append(materialization, prefix...)
+	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
+	materialization = append(materialization, recoveryContext...)
 	materialization = append(materialization, chain...)
 	if err := validateRecoveryObjects(ctx, repoRoot, materialization); err != nil {
 		return result, err
 	}
-	treeOID, finalState, err := materializeRecoveryTree(ctx, repoRoot, gitDir, baseHead, prefix, chain)
+	treeOID, finalState, err := materializeRecoveryTree(ctx, repoRoot, gitDir, baseHead, recoveryContext, chain)
 	if err != nil {
 		return result, err
 	}
@@ -182,8 +185,6 @@ func ReconcileUnpublishedChain(
 	if trigger == "" {
 		trigger = "automatic_chain_reconciliation"
 	}
-	first := chain[0].Event
-	last := chain[len(chain)-1].Event
 	transition := state.RecoveryChainTransition{
 		Expected: chain,
 		Reason:   trigger,
@@ -452,39 +453,36 @@ LIMIT 1`, branchRef, branchGeneration,
 	return seq, eventState, true, nil
 }
 
-func representedPublishedPrefix(
+func representedPublishedContext(
 	ctx context.Context,
 	repoRoot string,
 	db *state.DB,
-	prefix []state.RecoveryChainEvent,
+	recoveryContext []state.RecoveryChainEvent,
 ) ([]state.RecoveryChainEvent, error) {
-	represented := make([]state.RecoveryChainEvent, 0, len(prefix))
-	for start := 0; start < len(prefix); {
+	groups := make(map[string][]state.RecoveryChainEvent)
+	commitOrder := make([]string, 0)
+	for _, item := range recoveryContext {
+		if !item.Event.CommitOID.Valid || item.Event.CommitOID.String == "" {
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: published context seq=%d has no commit", item.Event.Seq)
+		}
+		commitOID := item.Event.CommitOID.String
+		if _, exists := groups[commitOID]; !exists {
+			commitOrder = append(commitOrder, commitOID)
+		}
+		groups[commitOID] = append(groups[commitOID], item)
+	}
+
+	represented := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
+	for _, commitOID := range commitOrder {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		first := prefix[start]
-		if !first.Event.CommitOID.Valid || first.Event.CommitOID.String == "" {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: published prefix seq=%d has no commit", first.Event.Seq)
-		}
-		commitOID := first.Event.CommitOID.String
-		end := start + 1
-		for end < len(prefix) {
-			item := prefix[end]
-			if !item.Event.CommitOID.Valid || item.Event.CommitOID.String == "" {
-				return nil, fmt.Errorf("daemon: reconcile recovery chain: published prefix seq=%d has no commit", item.Event.Seq)
-			}
-			if item.Event.CommitOID.String != commitOID {
-				break
-			}
-			end++
-		}
-
-		group := make([]state.RecoveryChainEvent, 0, end-start)
-		for _, item := range prefix[start:end] {
+		candidates := groups[commitOID]
+		group := make([]state.RecoveryChainEvent, 0, len(candidates))
+		for _, item := range candidates {
 			decisions, err := state.DecisionsForEvent(ctx, db, item.Event.Seq, 1000)
 			if err != nil {
-				return nil, fmt.Errorf("daemon: reconcile recovery chain: load published prefix decision seq=%d: %w", item.Event.Seq, err)
+				return nil, fmt.Errorf("daemon: reconcile recovery chain: load published context decision seq=%d: %w", item.Event.Seq, err)
 			}
 			superseded := false
 			for _, decision := range decisions {
@@ -497,7 +495,6 @@ func representedPublishedPrefix(
 				group = append(group, item)
 			}
 		}
-		start = end
 		if len(group) == 0 {
 			continue
 		}
@@ -507,7 +504,7 @@ func representedPublishedPrefix(
 			ctx, repoRoot, commitOID, cumulativeState,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published prefix group %d-%d cumulative after-state: %w",
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d cumulative after-state: %w",
 				group[0].Event.Seq, group[len(group)-1].Event.Seq, err)
 		}
 		if afterMatch {
@@ -518,18 +515,43 @@ func representedPublishedPrefix(
 			ctx, repoRoot, commitOID, initialState,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published prefix group %d-%d initial before-state: %w",
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d initial before-state: %w",
 				group[0].Event.Seq, group[len(group)-1].Event.Seq, err)
 		}
 		if !beforeMatch {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: published prefix group %d-%d commit represents neither initial before nor cumulative after state",
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: published context group %d-%d commit represents neither initial before nor cumulative after state",
 				group[0].Event.Seq, group[len(group)-1].Event.Seq)
 		}
 		// The commit still contains the group's initial before-state, so an
 		// external change superseded every non-explicitly-superseded member.
 		// Skipping the group prevents recovery from resurrecting that work.
 	}
+	sort.Slice(represented, func(i, j int) bool {
+		return represented[i].Event.Seq < represented[j].Event.Seq
+	})
 	return represented, nil
+}
+
+func relevantPublishedContext(
+	recoveryContext []state.RecoveryChainEvent,
+	chain []state.RecoveryChainEvent,
+) []state.RecoveryChainEvent {
+	chainPaths := make(map[string]struct{})
+	for _, item := range chain {
+		for _, path := range touchedPaths(item.Ops) {
+			chainPaths[path] = struct{}{}
+		}
+	}
+	relevant := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
+	for _, item := range recoveryContext {
+		for _, path := range touchedPaths(item.Ops) {
+			if _, needed := chainPaths[path]; needed {
+				relevant = append(relevant, item)
+				break
+			}
+		}
+	}
+	return relevant
 }
 
 func recoveryGroupBoundaryStates(group []state.RecoveryChainEvent) ([]recoveryPathState, []recoveryPathState) {
@@ -696,7 +718,7 @@ func materializeRecoveryTree(
 	repoRoot string,
 	gitDir string,
 	baseHead string,
-	prefix []state.RecoveryChainEvent,
+	recoveryContext []state.RecoveryChainEvent,
 	chain []state.RecoveryChainEvent,
 ) (string, []recoveryPathState, error) {
 	indexParent := filepath.Join(gitDir, "acd")
@@ -716,15 +738,22 @@ func materializeRecoveryTree(
 		return "", nil, fmt.Errorf("daemon: reconcile recovery chain: seed base tree %s: %w", baseHead, err)
 	}
 
-	ordered := make([]state.RecoveryChainEvent, 0, len(prefix)+len(chain))
-	ordered = append(ordered, prefix...)
+	ordered := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
+	ordered = append(ordered, recoveryContext...)
 	ordered = append(ordered, chain...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Event.Seq < ordered[j].Event.Seq
+	})
+	chainSeqs := make(map[int64]struct{}, len(chain))
+	for _, item := range chain {
+		chainSeqs[item.Event.Seq] = struct{}{}
+	}
 	allTouched := make(map[string]struct{})
 	chainTouched := make(map[string]struct{})
-	for i, item := range ordered {
+	for _, item := range ordered {
 		for _, path := range touchedPaths(item.Ops) {
 			allTouched[path] = struct{}{}
-			if i >= len(prefix) {
+			if _, unpublished := chainSeqs[item.Event.Seq]; unpublished {
 				chainTouched[path] = struct{}{}
 			}
 		}

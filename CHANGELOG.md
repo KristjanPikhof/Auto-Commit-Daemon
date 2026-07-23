@@ -28,6 +28,15 @@
   sourcing. Existing environment variables remain compatible, and API keys
   remain environment only.
 
+### Fixed
+
+- `acd stop` now reads daemon control state without opening the migration path,
+  so an older binary can safely stop a newer daemon without altering its
+  repository database.
+- Recovery now limits published context to suffix paths and groups
+  noncontiguous members by commit, preventing false provenance mismatches
+  after intent-mode deferrals and branch rewinds.
+
 ## v2026-07-13
 
 ### Added
