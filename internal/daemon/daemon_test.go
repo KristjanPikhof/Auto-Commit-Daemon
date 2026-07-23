@@ -96,7 +96,7 @@ func waitForBranchTokenCheckGate(t *testing.T, entered <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-entered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("daemon did not reach branch-token check gate")
 	}
 }
@@ -2218,6 +2218,8 @@ func TestRun_FastForwardRollbackInvalidatesProspectiveShadow(t *testing.T) {
 	var rollbackOnce sync.Once
 	trace := &memoryTraceLogger{}
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2225,7 +2227,8 @@ func TestRun_FastForwardRollbackInvalidatesProspectiveShadow(t *testing.T) {
 			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
 			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
 			WakeCh: wakeCh, ShutdownCh: make(chan struct{}), SkipSignals: true,
-			Trace: trace,
+			Trace:                  trace,
+			beforeBranchTokenCheck: checkHook,
 			beforeBranchTransitionAccept: func() {
 				hookOnce.Do(func() {
 					if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", seedHead, upstreamHead); err != nil {
@@ -2244,12 +2247,14 @@ func TestRun_FastForwardRollbackInvalidatesProspectiveShadow(t *testing.T) {
 	t.Cleanup(func() { cancel(); wg.Wait() })
 	wantToken := branchTokenRev(seedHead, "refs/heads/main")
 	waitForMetaValue(t, f.db, MetaKeyBranchToken, wantToken, 5*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", upstreamHead, seedHead); err != nil {
 		t.Fatalf("fast-forward main: %v", err)
 	}
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", upstreamHead); err != nil {
 		t.Fatalf("reset worktree upstream: %v", err)
 	}
+	releaseCheck()
 	wakeCh <- struct{}{}
 	select {
 	case err := <-hookDone:
@@ -2327,6 +2332,8 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	hookDone := make(chan error, 1)
 	var hookOnce sync.Once
 	var wg sync.WaitGroup
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -2334,6 +2341,7 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
 			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
 			WakeCh: wakeCh, ShutdownCh: make(chan struct{}), SkipSignals: true,
+			beforeBranchTokenCheck: checkHook,
 			beforeBranchTransitionAccept: func() {
 				hookOnce.Do(func() {
 					_, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main")
@@ -2345,9 +2353,11 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	t.Cleanup(func() { cancel(); wg.Wait() })
 	waitForMetaValue(t, f.db, MetaKeyBranchToken,
 		branchTokenRev(seedHead, "refs/heads/main"), 5*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/feature"); err != nil {
 		t.Fatalf("switch symbolic ref: %v", err)
 	}
+	releaseCheck()
 	wakeCh <- struct{}{}
 	select {
 	case err := <-hookDone:
