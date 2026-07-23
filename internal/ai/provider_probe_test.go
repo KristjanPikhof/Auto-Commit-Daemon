@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,22 @@ func TestProviderProbeRedactsProviderResponseErrors(t *testing.T) {
 	}
 }
 
+func TestProviderProbeSanitizesWrappedDeadlineAndPreservesClassification(t *testing.T) {
+	provider := &probeCaptureProvider{err: fmt.Errorf(
+		"request https://user:pass@example.test/private?token=x: %w",
+		context.DeadlineExceeded,
+	)}
+	result, err := ProbeProvider(context.Background(), provider, time.Second, CommitFormatImperative)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v", err)
+	}
+	for _, exposed := range []string{"user:pass", "/private", "token=x"} {
+		if strings.Contains(err.Error(), exposed) || strings.Contains(result.Error, exposed) {
+			t.Fatalf("wrapped timeout exposed %q: result=%+v err=%v", exposed, result, err)
+		}
+	}
+}
+
 func TestStrictProviderReturnsPrimaryResponseFailure(t *testing.T) {
 	secret := "sk-primary-response-secret"
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -127,9 +144,10 @@ func TestStrictProviderReturnsPrimaryResponseFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if closer != nil {
-		t.Fatal("unexpected HTTP closer")
+	if closer == nil {
+		t.Fatal("custom CA provider did not return its owned transport closer")
 	}
+	defer closer.Close()
 	_, err = provider.Generate(context.Background(), CommitContext{Path: "synthetic.txt", Op: "modify"})
 	if err == nil {
 		t.Fatal("strict provider unexpectedly fell back")

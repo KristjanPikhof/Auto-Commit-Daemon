@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -387,6 +388,24 @@ func TestBuildProvider_OpenAICompatNoKeyDegrades(t *testing.T) {
 	}
 	if _, found := h.findWarn("ACD_AI_API_KEY empty"); !found {
 		t.Fatalf("warning about empty API key not fired; records=%v", h.records)
+	}
+}
+
+func TestBuildProvider_OpenAICompatNoKeyIgnoresInvalidCA(t *testing.T) {
+	h := &captureHandler{}
+	provider, closer, err := BuildProvider(ProviderConfig{
+		Mode: "openai-compat", APIKey: " ",
+		CAFile: filepath.Join(t.TempDir(), "missing.pem"),
+		Logger: slog.New(h),
+	})
+	if err != nil {
+		t.Fatalf("BuildProvider: %v", err)
+	}
+	if closer != nil || provider.Name() != "deterministic" {
+		t.Fatalf("provider=%v closer=%v", provider, closer)
+	}
+	if _, found := h.findWarn("ACD_AI_API_KEY empty"); !found {
+		t.Fatalf("missing-key warning not emitted: %v", h.records)
 	}
 }
 

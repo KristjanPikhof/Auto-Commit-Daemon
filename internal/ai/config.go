@@ -359,14 +359,14 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return det, nil, nil
 
 	case mode == "openai-compat":
-		primary, closer, err := buildPrimaryProvider(cfg)
-		if err != nil {
-			return nil, nil, err
-		}
-		if cfg.APIKey == "" {
+		if strings.TrimSpace(cfg.APIKey) == "" {
 			logger.Warn("ai: ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY empty; falling back to deterministic",
 				slog.String("provider", "openai-compat"))
 			return det, nil, nil
+		}
+		primary, closer, err := buildPrimaryProvider(cfg)
+		if err != nil {
+			return nil, nil, err
 		}
 		return Compose(primary, det), closer, nil
 
@@ -477,6 +477,9 @@ func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		}
 		primary := &OpenAIProvider{BaseURL: baseURL, APIKey: cfg.APIKey,
 			Model: cfg.Model, HTTP: httpClient, Format: cfg.CommitFormat}
+		if strings.TrimSpace(cfg.CAFile) != "" {
+			return primary, httpIdleConnectionCloser{client: httpClient}, nil
+		}
 		return primary, nil, nil
 	}
 	if strings.HasPrefix(mode, "subprocess:") {
@@ -488,6 +491,15 @@ func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return sp, sp, nil
 	}
 	return nil, nil, fmt.Errorf("ai: unknown provider mode %q", sanitizeProviderLabel(mode))
+}
+
+type httpIdleConnectionCloser struct{ client *http.Client }
+
+func (c httpIdleConnectionCloser) Close() error {
+	if c.client != nil {
+		c.client.CloseIdleConnections()
+	}
+	return nil
 }
 
 func validateProviderModel(model string) error {
