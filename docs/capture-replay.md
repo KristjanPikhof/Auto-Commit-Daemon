@@ -246,6 +246,18 @@ chain without trying the publish proof, preview and apply
 ref before marking rows recovered. Neither path purges, retargets, or discards
 captures.
 
+Reconstruction merges only published events that touch the unpublished
+suffix. That context can include same-base prefixes, interleaved events, and
+earlier captures published after the suffix base advanced. Rename dependencies
+are followed transitively, so a later `b -> c` context keeps the earlier
+`a -> b` step needed to materialize it. Published operations are split into
+connected path components for commit proof, while the operation prefix already
+present in the recovery seed is stripped before those proofs begin. Recovery
+fails safely instead of starting unbounded work when context exceeds 4096
+events, ancestry proof traverses more than 4096 commits, or more than 64
+remaining commits require tree proof. Retention keeps an oversized exact pair
+and continues pruning unrelated pairs.
+
 ## Operator commands
 
 See [commands.md](commands.md) for the full command reference. These are the

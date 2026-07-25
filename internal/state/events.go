@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 // Capture event lifecycle state values stored in capture_events.state.
@@ -677,12 +678,161 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 
 // PrunePublishedEventsBefore deletes old published rows that do not belong to
 // a recovery snapshot and are not materialization context for an unresolved
-// chain. Context includes same-base prefixes and published events interleaved
-// between unresolved rows. Snapshot members require repo-aware Git-ref locking
-// and are pruned separately by the daemon, regardless of whether reconciliation
-// classified them as published or recovered.
+// chain. Context includes same-base prefixes, earlier rows that touch a later
+// unresolved path, and published events interleaved between unresolved rows.
+// Snapshot members require repo-aware Git-ref locking and are pruned separately
+// by the daemon, regardless of whether reconciliation classified them as
+// published or recovered.
 func PrunePublishedEventsBefore(ctx context.Context, d *DB, cutoff float64) (int, error) {
-	res, err := d.conn.ExecContext(ctx, `
+	if d == nil {
+		return 0, fmt.Errorf("state: PrunePublishedEventsBefore: nil db")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("state: begin published prune: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TEMP TABLE IF NOT EXISTS acd_prune_recovery_context(
+    event_seq INTEGER PRIMARY KEY
+) WITHOUT ROWID`); err != nil {
+		return 0, fmt.Errorf("state: create published prune context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_recovery_context`); err != nil {
+		return 0, fmt.Errorf("state: clear published prune context: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT branch_ref, branch_generation, MIN(seq), MAX(seq)
+FROM capture_events
+WHERE state IN (?, ?, ?)
+GROUP BY branch_ref, branch_generation`,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed)
+	if err != nil {
+		return 0, fmt.Errorf("state: list unresolved recovery pairs for prune: %w", err)
+	}
+	type unresolvedPair struct {
+		branchRef  string
+		generation int64
+		firstSeq   int64
+		lastSeq    int64
+	}
+	var pairs []unresolvedPair
+	for rows.Next() {
+		var pair unresolvedPair
+		if err := rows.Scan(&pair.branchRef, &pair.generation, &pair.firstSeq, &pair.lastSeq); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("state: scan unresolved recovery pair for prune: %w", err)
+		}
+		pairs = append(pairs, pair)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("state: iterate unresolved recovery pairs for prune: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("state: close unresolved recovery pairs for prune: %w", err)
+	}
+
+	insertContext, err := tx.PrepareContext(ctx,
+		`INSERT OR IGNORE INTO acd_prune_recovery_context(event_seq) VALUES (?)`)
+	if err != nil {
+		return 0, fmt.Errorf("state: prepare published prune context insert: %w", err)
+	}
+	for _, pair := range pairs {
+		selected, err := loadPublishedRecoveryContextSeqs(
+			ctx, tx, pair.branchRef, pair.generation, pair.firstSeq, pair.lastSeq,
+		)
+		if errors.Is(err, errPublishedRecoveryContextLimit) {
+			if _, retainErr := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO acd_prune_recovery_context(event_seq)
+SELECT seq
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND state = ?`,
+				pair.branchRef, pair.generation, EventStatePublished); retainErr != nil {
+				_ = insertContext.Close()
+				return 0, fmt.Errorf("state: retain oversized published prune context for %s generation %d: %w",
+					pair.branchRef, pair.generation, retainErr)
+			}
+			slog.Default().Warn("published recovery context exceeds prune bound; retaining exact pair",
+				"branch_ref", pair.branchRef,
+				"branch_generation", pair.generation,
+				"max_events", maxPublishedRecoveryContextEvents)
+			continue
+		}
+		if err != nil {
+			_ = insertContext.Close()
+			return 0, fmt.Errorf("state: load published prune context for %s generation %d: %w",
+				pair.branchRef, pair.generation, err)
+		}
+		for seq := range selected {
+			if _, err := insertContext.ExecContext(ctx, seq); err != nil {
+				_ = insertContext.Close()
+				return 0, fmt.Errorf("state: insert published prune context seq=%d: %w", seq, err)
+			}
+		}
+	}
+	if err := insertContext.Close(); err != nil {
+		return 0, fmt.Errorf("state: close published prune context insert: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO acd_prune_recovery_context(event_seq)
+SELECT published.seq
+FROM capture_events published
+WHERE published.state = 'published'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM acd_prune_recovery_context context
+      WHERE context.event_seq = published.seq
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM capture_events unpublished
+      WHERE unpublished.branch_ref = published.branch_ref
+        AND unpublished.branch_generation = published.branch_generation
+        AND unpublished.base_head = published.base_head
+        AND unpublished.seq > published.seq
+        AND unpublished.state IN (?, ?, ?)
+  )`,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed); err != nil {
+		return 0, fmt.Errorf("state: retain same-base published prune context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO acd_prune_recovery_context(event_seq)
+SELECT published.seq
+FROM capture_events published
+WHERE published.state = 'published'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM acd_prune_recovery_context context
+      WHERE context.event_seq = published.seq
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM capture_events earlier
+      WHERE earlier.branch_ref = published.branch_ref
+        AND earlier.branch_generation = published.branch_generation
+        AND earlier.seq < published.seq
+        AND earlier.state IN (?, ?, ?)
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM capture_events later
+      WHERE later.branch_ref = published.branch_ref
+        AND later.branch_generation = published.branch_generation
+        AND later.seq > published.seq
+        AND later.state IN (?, ?, ?)
+  )`,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed); err != nil {
+		return 0, fmt.Errorf("state: retain interleaved published prune context: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
 DELETE FROM capture_events
 WHERE state = 'published'
   AND captured_ts < ?
@@ -693,38 +843,21 @@ WHERE state = 'published'
   )
   AND NOT EXISTS (
       SELECT 1
-      FROM capture_events unpublished
-      WHERE unpublished.branch_ref = capture_events.branch_ref
-        AND unpublished.branch_generation = capture_events.branch_generation
-        AND unpublished.base_head = capture_events.base_head
-        AND unpublished.seq > capture_events.seq
-        AND unpublished.state IN (?, ?, ?)
-  )
-  AND NOT EXISTS (
-      SELECT 1
-      FROM capture_events earlier
-      WHERE earlier.branch_ref = capture_events.branch_ref
-        AND earlier.branch_generation = capture_events.branch_generation
-        AND earlier.seq < capture_events.seq
-        AND earlier.state IN (?, ?, ?)
-        AND EXISTS (
-            SELECT 1
-            FROM capture_events later
-            WHERE later.branch_ref = capture_events.branch_ref
-              AND later.branch_generation = capture_events.branch_generation
-              AND later.seq > capture_events.seq
-              AND later.state IN (?, ?, ?)
-        )
-  )`, cutoff,
-		EventStatePending, EventStateBlockedConflict, EventStateFailed,
-		EventStatePending, EventStateBlockedConflict, EventStateFailed,
-		EventStatePending, EventStateBlockedConflict, EventStateFailed)
+      FROM acd_prune_recovery_context context
+      WHERE context.event_seq = capture_events.seq
+  )`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune published events: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("state: prune events rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_recovery_context`); err != nil {
+		return 0, fmt.Errorf("state: clear completed published prune context: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: commit published prune: %w", err)
 	}
 	return int(n), nil
 }

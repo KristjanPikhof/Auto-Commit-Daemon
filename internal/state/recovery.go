@@ -72,9 +72,13 @@ type RecoveryChainTransition struct {
 // committed when this error is returned.
 var ErrRecoveryChainChanged = errors.New("state: recovery chain changed")
 
+var errPublishedRecoveryContextLimit = errors.New("state: published recovery context limit exceeded")
+
 type recoveryQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
+
+const maxPublishedRecoveryContextEvents = 4096
 
 // LoadUnpublishedRecoveryChain returns the complete unpublished suffix for one
 // (branch_ref, branch_generation), starting at firstSeq and ordered by seq.
@@ -87,26 +91,37 @@ func LoadUnpublishedRecoveryChain(ctx context.Context, d *DB, branchRef string, 
 	return loadUnpublishedRecoveryChain(ctx, d.readSQL(), branchRef, branchGeneration, firstSeq)
 }
 
-// LoadPublishedRecoveryContext returns published events needed to materialize
-// an unpublished suffix. Context includes same-base events before the suffix
-// and published events interleaved through it; both can produce a later
-// unpublished event's before-state. TransitionRecoveryChain never changes
-// these rows.
+// LoadPublishedRecoveryContext returns published candidates that may be needed
+// to materialize an unpublished suffix. It includes earlier rows in the exact
+// branch/generation pair that touch a path in the selected unpublished suffix
+// because a previously captured event can be published after HEAD advances
+// beyond the suffix's first base. The daemon narrows candidates by seed state
+// and commit ancestry before materialization. TransitionRecoveryChain never
+// changes these rows.
 func LoadPublishedRecoveryContext(
 	ctx context.Context,
 	d *DB,
 	branchRef string,
 	branchGeneration int64,
-	baseHead string,
 	firstSeq int64,
 	lastSeq int64,
 ) ([]RecoveryChainEvent, error) {
 	if d == nil {
 		return nil, fmt.Errorf("state: LoadPublishedRecoveryContext: nil db")
 	}
-	if branchRef == "" || branchGeneration < 1 || baseHead == "" || firstSeq < 1 || lastSeq < firstSeq {
+	if branchRef == "" || branchGeneration < 1 || firstSeq < 1 || lastSeq < firstSeq {
 		return nil, fmt.Errorf("state: LoadPublishedRecoveryContext: invalid selector")
 	}
+	selected, err := loadPublishedRecoveryContextSeqs(
+		ctx, d.readSQL(), branchRef, branchGeneration, firstSeq, lastSeq,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+
 	rows, err := d.readSQL().QueryContext(ctx, `
 SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
        fidelity, captured_ts, published_ts, state, commit_oid, error, message
@@ -114,9 +129,8 @@ FROM capture_events
 WHERE branch_ref = ?
   AND branch_generation = ?
   AND state = ?
-  AND ((base_head = ? AND seq < ?) OR (seq > ? AND seq < ?))
-ORDER BY seq ASC`, branchRef, branchGeneration, EventStatePublished,
-		baseHead, firstSeq, firstSeq, lastSeq)
+  AND seq < ?
+ORDER BY seq ASC`, branchRef, branchGeneration, EventStatePublished, lastSeq)
 	if err != nil {
 		return nil, fmt.Errorf("state: load published recovery context: %w", err)
 	}
@@ -130,7 +144,9 @@ ORDER BY seq ASC`, branchRef, branchGeneration, EventStatePublished,
 			&ev.Error, &ev.Message); err != nil {
 			return nil, fmt.Errorf("state: scan published recovery context: %w", err)
 		}
-		recoveryContext = append(recoveryContext, RecoveryChainEvent{Event: ev})
+		if _, needed := selected[ev.Seq]; needed {
+			recoveryContext = append(recoveryContext, RecoveryChainEvent{Event: ev})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("state: iterate published recovery context: %w", err)
@@ -138,14 +154,162 @@ ORDER BY seq ASC`, branchRef, branchGeneration, EventStatePublished,
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("state: close published recovery context: %w", err)
 	}
+	bySeq := make(map[int64]int, len(recoveryContext))
 	for i := range recoveryContext {
-		ops, err := loadCaptureOpsWith(ctx, d.readSQL(), recoveryContext[i].Event.Seq)
-		if err != nil {
-			return nil, err
+		bySeq[recoveryContext[i].Event.Seq] = i
+	}
+	opRows, err := d.readSQL().QueryContext(ctx, `
+SELECT op.event_seq, op.ord, op.op, op.path, op.old_path,
+       op.before_oid, op.before_mode, op.after_oid, op.after_mode, op.fidelity
+FROM capture_ops op
+JOIN capture_events event ON event.seq = op.event_seq
+WHERE event.branch_ref = ?
+  AND event.branch_generation = ?
+  AND event.state = ?
+  AND event.seq < ?
+ORDER BY op.event_seq ASC, op.ord ASC`,
+		branchRef, branchGeneration, EventStatePublished, lastSeq)
+	if err != nil {
+		return nil, fmt.Errorf("state: load published recovery context ops: %w", err)
+	}
+	defer opRows.Close()
+	for opRows.Next() {
+		var op CaptureOp
+		if err := opRows.Scan(&op.EventSeq, &op.Ord, &op.Op, &op.Path, &op.OldPath,
+			&op.BeforeOID, &op.BeforeMode, &op.AfterOID, &op.AfterMode,
+			&op.Fidelity); err != nil {
+			return nil, fmt.Errorf("state: scan published recovery context op: %w", err)
 		}
-		recoveryContext[i].Ops = ops
+		if i, needed := bySeq[op.EventSeq]; needed {
+			recoveryContext[i].Ops = append(recoveryContext[i].Ops, op)
+		}
+	}
+	if err := opRows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate published recovery context ops: %w", err)
 	}
 	return recoveryContext, nil
+}
+
+type recoveryPathCandidate struct {
+	seq   int64
+	paths []string
+}
+
+func loadPublishedRecoveryContextSeqs(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	lastSeq int64,
+) (map[int64]struct{}, error) {
+	required := make(map[string]struct{})
+	rows, err := q.QueryContext(ctx, `
+SELECT op.path, op.old_path
+FROM capture_ops op
+JOIN capture_events event ON event.seq = op.event_seq
+WHERE event.branch_ref = ?
+  AND event.branch_generation = ?
+  AND event.seq >= ?
+  AND event.seq <= ?
+  AND event.state IN (?, ?, ?)`,
+		branchRef, branchGeneration, firstSeq, lastSeq,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed)
+	if err != nil {
+		return nil, fmt.Errorf("state: load unpublished recovery paths: %w", err)
+	}
+	for rows.Next() {
+		var path string
+		var oldPath sql.NullString
+		if err := rows.Scan(&path, &oldPath); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("state: scan unpublished recovery path: %w", err)
+		}
+		addRecoveryRequiredPath(required, path)
+		if oldPath.Valid {
+			addRecoveryRequiredPath(required, oldPath.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("state: iterate unpublished recovery paths: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("state: close unpublished recovery paths: %w", err)
+	}
+	if len(required) == 0 {
+		return nil, nil
+	}
+
+	rows, err = q.QueryContext(ctx, `
+SELECT event.seq, op.path, op.old_path
+FROM capture_events event
+JOIN capture_ops op ON op.event_seq = event.seq
+WHERE event.branch_ref = ?
+  AND event.branch_generation = ?
+  AND event.state = ?
+  AND event.seq < ?
+ORDER BY event.seq DESC, op.ord ASC`,
+		branchRef, branchGeneration, EventStatePublished, lastSeq)
+	if err != nil {
+		return nil, fmt.Errorf("state: load published recovery path candidates: %w", err)
+	}
+	var candidates []recoveryPathCandidate
+	for rows.Next() {
+		var seq int64
+		var path string
+		var oldPath sql.NullString
+		if err := rows.Scan(&seq, &path, &oldPath); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("state: scan published recovery path candidate: %w", err)
+		}
+		if len(candidates) == 0 || candidates[len(candidates)-1].seq != seq {
+			candidates = append(candidates, recoveryPathCandidate{seq: seq})
+		}
+		candidate := &candidates[len(candidates)-1]
+		candidate.paths = append(candidate.paths, path)
+		if oldPath.Valid && oldPath.String != "" {
+			candidate.paths = append(candidate.paths, oldPath.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("state: iterate published recovery path candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("state: close published recovery path candidates: %w", err)
+	}
+
+	selected := make(map[int64]struct{})
+	for _, candidate := range candidates {
+		if !recoveryPathsIntersect(candidate.paths, required) {
+			continue
+		}
+		selected[candidate.seq] = struct{}{}
+		if len(selected) > maxPublishedRecoveryContextEvents {
+			return nil, fmt.Errorf("%w: bounded limit is %d events",
+				errPublishedRecoveryContextLimit, maxPublishedRecoveryContextEvents)
+		}
+		for _, path := range candidate.paths {
+			addRecoveryRequiredPath(required, path)
+		}
+	}
+	return selected, nil
+}
+
+func addRecoveryRequiredPath(required map[string]struct{}, path string) {
+	if path != "" {
+		required[path] = struct{}{}
+	}
+}
+
+func recoveryPathsIntersect(paths []string, required map[string]struct{}) bool {
+	for _, path := range paths {
+		if _, ok := required[path]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func loadUnpublishedRecoveryChain(ctx context.Context, q recoveryQueryer, branchRef string, branchGeneration, firstSeq int64) ([]RecoveryChainEvent, error) {
