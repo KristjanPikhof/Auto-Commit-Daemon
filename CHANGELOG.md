@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- Updated pinned `actions/setup-go` from `v6.5.0` to `v7.0.0` across CI,
+  CodeQL, and release workflows.
+- Updated maintenance dependencies: `modernc.org/sqlite` from `v1.53.0` to
+  `v1.54.0` (SQLite 3.53.3), and `github.com/mattn/go-isatty` from `v0.0.22`
+  to `v0.0.24`.
+
 ## v2026-07-24
 
 ### Added
