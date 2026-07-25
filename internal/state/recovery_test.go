@@ -153,9 +153,9 @@ func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
 	prefix := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
 		"first-base", "prefix.txt", EventStatePublished)
 	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
-		"first-base", "first.txt", EventStatePending)
+		"first-base", "prefix.txt", EventStatePending)
 	interleaved := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
-		"second-base", "interleaved.txt", EventStatePublished)
+		"second-base", "last.txt", EventStatePublished)
 	last := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
 		"second-base", "last.txt", EventStateFailed)
 	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
@@ -164,19 +164,67 @@ func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
 		"first-base", "wrong-generation.txt", EventStatePublished)
 
 	recoveryContext, err := LoadPublishedRecoveryContext(
-		ctx, d, "refs/heads/main", 4, "first-base", first, last,
+		ctx, d, "refs/heads/main", 4, first, last,
 	)
 	if err != nil {
 		t.Fatalf("LoadPublishedRecoveryContext: %v", err)
 	}
 	if len(recoveryContext) != 2 || recoveryContext[0].Event.Seq != prefix ||
 		recoveryContext[1].Event.Seq != interleaved {
-		t.Fatalf("recovery context=%+v want ordered seqs [%d %d]", recoveryContext, prefix, interleaved)
+		t.Fatalf("recovery context=%+v want path-scoped ordered seqs [%d %d]",
+			recoveryContext, prefix, interleaved)
 	}
 	for _, member := range recoveryContext {
 		if len(member.Ops) != 1 || member.Ops[0].EventSeq != member.Event.Seq {
 			t.Fatalf("ops not loaded exactly for seq %d: %+v", member.Event.Seq, member.Ops)
 		}
+	}
+}
+
+func TestPublishedRecoveryContextLoadIncludesRenameClosure(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	const branchRef = "refs/heads/main"
+	const generation = int64(4)
+
+	appendRename := func(oldPath, path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: branchRef, BranchGeneration: generation,
+			BaseHead: "base", Operation: "rename", Path: path,
+			OldPath: sqlNullStr(oldPath), Fidelity: "exact",
+			State: EventStatePublished,
+		}, []CaptureOp{{
+			Op: "rename", Path: path, OldPath: sqlNullStr(oldPath),
+			BeforeOID: sqlNullStr("before-" + oldPath), BeforeMode: sqlNullStr("100644"),
+			AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+			Fidelity: "exact",
+		}})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent rename %s -> %s: %v", oldPath, path, err)
+		}
+		return seq
+	}
+
+	firstRename := appendRename("a.txt", "b.txt")
+	secondRename := appendRename("b.txt", "c.txt")
+	first := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
+		"advanced-base", "anchor.txt", EventStateBlockedConflict)
+	last := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
+		"advanced-base", "c.txt", EventStatePending)
+
+	recoveryContext, err := LoadPublishedRecoveryContext(
+		ctx, d, branchRef, generation, first, last,
+	)
+	if err != nil {
+		t.Fatalf("LoadPublishedRecoveryContext: %v", err)
+	}
+	if len(recoveryContext) != 2 ||
+		recoveryContext[0].Event.Seq != firstRename ||
+		recoveryContext[1].Event.Seq != secondRename {
+		t.Fatalf("recovery context=%+v want transitive rename seqs [%d %d]",
+			recoveryContext, firstRename, secondRename)
 	}
 }
 

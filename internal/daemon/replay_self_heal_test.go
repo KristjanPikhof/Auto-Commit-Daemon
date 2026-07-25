@@ -776,6 +776,512 @@ func TestReconcile_UsesInterleavedPublishedContext(t *testing.T) {
 	}
 }
 
+func TestReconcile_UsesPublishedPrefixAcrossAdvancedBase(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	anchorBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor before\n"))
+	anchorAfter, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor after\n"))
+	z, _ := git.HashObjectStdin(ctx, f.dir, []byte("Z\n"))
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	unrelated, _ := git.HashObjectStdin(ctx, f.dir, []byte("unrelated\n"))
+	initialBase := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "initial base",
+		git.RegularFileMode+" "+anchorBefore+"\tanchor.txt",
+		git.RegularFileMode+" "+z+"\tdoc.md")
+	represented := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: z, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: a, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	oldBase := commitTreeWithIndexUpdates(t, ctx, f, initialBase, "old base",
+		git.RegularFileMode+" "+a+"\tdoc.md")
+	if err := state.MarkEventPublished(ctx, f.db, represented, state.EventStatePublished,
+		sql.NullString{String: oldBase, Valid: true}, sql.NullString{}, sql.NullString{}, 1); err != nil {
+		t.Fatalf("MarkEventPublished represented prefix: %v", err)
+	}
+	published := appendRecoveryEvent(t, ctx, f, oldBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: b, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	firstBase := commitTreeWithIndexUpdates(t, ctx, f, oldBase, "advance unrelated path",
+		git.RegularFileMode+" "+unrelated+"\tunrelated.txt")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, firstBase, ""); err != nil {
+		t.Fatalf("update first base: %v", err)
+	}
+	first := appendRecoveryEvent(t, ctx, f, firstBase, state.CaptureOp{
+		Op: "modify", Path: "anchor.txt",
+		BeforeOID: sql.NullString{String: anchorBefore, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: anchorAfter, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	commitB := commitTreeWithIndexUpdates(t, ctx, f, firstBase, "publish B",
+		git.RegularFileMode+" "+b+"\tdoc.md")
+	if err := state.MarkEventPublished(ctx, f.db, published, state.EventStatePublished,
+		sql.NullString{String: commitB, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+		t.Fatalf("MarkEventPublished advanced-base prefix: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+		DecisionTS: 2, Kind: state.DecisionKindCommitted,
+		EventSeq: sql.NullInt64{Int64: published, Valid: true},
+	}); err != nil {
+		t.Fatalf("AppendDecision advanced-base prefix: %v", err)
+	}
+	last := appendRecoveryEvent(t, ctx, f, commitB, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: b, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, commitB, firstBase); err != nil {
+		t.Fatalf("update HEAD to published prefix: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_advanced_base_published_prefix",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 2 ||
+		result.FirstSeq != first || result.LastSeq != last {
+		t.Fatalf("result=%+v want two-event recovered suffix", result)
+	}
+	for seq, wantOID := range map[int64]string{represented: oldBase, published: commitB} {
+		if gotState, oid := readEventState(t, ctx, f.db, seq); gotState != state.EventStatePublished ||
+			!oid.Valid || oid.String != wantOID {
+			t.Fatalf("published prefix seq=%d state=%q oid=%v want unchanged at %s",
+				seq, gotState, oid, wantOID)
+		}
+	}
+	for path, want := range map[string]string{"anchor.txt": anchorAfter, "doc.md": c} {
+		got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, path)
+		if err != nil || got != want {
+			t.Fatalf("recovery %s blob=%s err=%v want %s", path, got, err, want)
+		}
+	}
+}
+
+func TestReconcile_UsesTransitiveRenameContext(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	anchorBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor before\n"))
+	anchorAfter, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor after\n"))
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	d, _ := git.HashObjectStdin(ctx, f.dir, []byte("D\n"))
+	unrelated, _ := git.HashObjectStdin(ctx, f.dir, []byte("unrelated\n"))
+	initialBase := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "initial base",
+		git.RegularFileMode+" "+anchorBefore+"\tanchor.txt",
+		git.RegularFileMode+" "+a+"\ta.txt")
+	firstRename := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "rename", Path: "b.txt", OldPath: sql.NullString{String: "a.txt", Valid: true},
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: a, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	secondRename := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "rename", Path: "c.txt", OldPath: sql.NullString{String: "b.txt", Valid: true},
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: a, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	firstBase := commitTreeWithIndexUpdates(t, ctx, f, initialBase, "advance unrelated path",
+		git.RegularFileMode+" "+unrelated+"\tunrelated.txt")
+	first := appendRecoveryEvent(t, ctx, f, firstBase, state.CaptureOp{
+		Op: "modify", Path: "anchor.txt",
+		BeforeOID: sql.NullString{String: anchorBefore, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: anchorAfter, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	renameCommit := commitTreeWithIndexUpdates(t, ctx, f, firstBase, "publish rename chain",
+		"0 0000000000000000000000000000000000000000\ta.txt",
+		git.RegularFileMode+" "+a+"\tc.txt")
+	for _, seq := range []int64{firstRename, secondRename} {
+		if err := state.MarkEventPublished(ctx, f.db, seq, state.EventStatePublished,
+			sql.NullString{String: renameCommit, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+			t.Fatalf("MarkEventPublished rename context seq=%d: %v", seq, err)
+		}
+		if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+			DecisionTS: 2, Kind: state.DecisionKindCommitted,
+			EventSeq: sql.NullInt64{Int64: seq, Valid: true},
+		}); err != nil {
+			t.Fatalf("AppendDecision rename context seq=%d: %v", seq, err)
+		}
+	}
+	last := appendRecoveryEvent(t, ctx, f, renameCommit, state.CaptureOp{
+		Op: "modify", Path: "c.txt",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: d, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, renameCommit, ""); err != nil {
+		t.Fatalf("update HEAD to rename context: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_transitive_rename_context",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 2 ||
+		result.FirstSeq != first || result.LastSeq != last {
+		t.Fatalf("result=%+v want two-event recovered suffix", result)
+	}
+	if got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, "c.txt"); err != nil || got != d {
+		t.Fatalf("recovery c.txt blob=%s err=%v want %s", got, err, d)
+	}
+	for _, absent := range []string{"a.txt", "b.txt"} {
+		if got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, absent); err != nil || got != "" {
+			t.Fatalf("recovery %s blob=%s err=%v want absent", absent, got, err)
+		}
+	}
+}
+
+func TestReconcile_ExcludesAdvancedContextAlreadyInSeed(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	anchorBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor before\n"))
+	anchorAfter, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor after\n"))
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	unrelated, _ := git.HashObjectStdin(ctx, f.dir, []byte("unrelated\n"))
+	initialBase := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "initial base",
+		git.RegularFileMode+" "+anchorBefore+"\tanchor.txt",
+		git.RegularFileMode+" "+a+"\tdoc.md")
+	published := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: b, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	firstBase := commitTreeWithIndexUpdates(t, ctx, f, initialBase, "external B",
+		git.RegularFileMode+" "+b+"\tdoc.md")
+	first := appendRecoveryEvent(t, ctx, f, firstBase, state.CaptureOp{
+		Op: "modify", Path: "anchor.txt",
+		BeforeOID: sql.NullString{String: anchorBefore, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: anchorAfter, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	settledHead := commitTreeWithIndexUpdates(t, ctx, f, firstBase, "advance after external B",
+		git.RegularFileMode+" "+unrelated+"\tunrelated.txt")
+	if err := state.MarkEventPublished(ctx, f.db, published, state.EventStatePublished,
+		sql.NullString{String: settledHead, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+		t.Fatalf("MarkEventPublished handled-external prefix: %v", err)
+	}
+	if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+		DecisionTS: 2, Kind: state.DecisionKindHandledExternal,
+		EventSeq: sql.NullInt64{Int64: published, Valid: true},
+	}); err != nil {
+		t.Fatalf("AppendDecision handled-external prefix: %v", err)
+	}
+	last := appendRecoveryEvent(t, ctx, f, settledHead, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: b, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, settledHead, ""); err != nil {
+		t.Fatalf("update HEAD to settled context: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_advanced_context_already_in_seed",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 2 ||
+		result.FirstSeq != first || result.LastSeq != last {
+		t.Fatalf("result=%+v want two-event recovered suffix", result)
+	}
+	for path, want := range map[string]string{"anchor.txt": anchorAfter, "doc.md": c} {
+		got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, path)
+		if err != nil || got != want {
+			t.Fatalf("recovery %s blob=%s err=%v want %s", path, got, err, want)
+		}
+	}
+}
+
+func TestReconcile_ExcludesOnlySeedRepresentedCommitPaths(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	anchorBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor before\n"))
+	anchorAfter, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor after\n"))
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	x, _ := git.HashObjectStdin(ctx, f.dir, []byte("X\n"))
+	y, _ := git.HashObjectStdin(ctx, f.dir, []byte("Y\n"))
+	z, _ := git.HashObjectStdin(ctx, f.dir, []byte("Z\n"))
+	initialBase := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "initial base",
+		git.RegularFileMode+" "+anchorBefore+"\tanchor.txt",
+		git.RegularFileMode+" "+a+"\tdoc.md",
+		git.RegularFileMode+" "+x+"\tother.md")
+	docPublished := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: b, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	otherPublished := appendRecoveryEvent(t, ctx, f, initialBase, state.CaptureOp{
+		Op: "modify", Path: "other.md",
+		BeforeOID: sql.NullString{String: x, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: y, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	firstBase := commitTreeWithIndexUpdates(t, ctx, f, initialBase, "external doc B",
+		git.RegularFileMode+" "+b+"\tdoc.md")
+	first := appendRecoveryEvent(t, ctx, f, firstBase, state.CaptureOp{
+		Op: "modify", Path: "anchor.txt",
+		BeforeOID: sql.NullString{String: anchorBefore, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: anchorAfter, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	settledHead := commitTreeWithIndexUpdates(t, ctx, f, firstBase, "publish grouped paths",
+		git.RegularFileMode+" "+y+"\tother.md")
+	for _, seq := range []int64{docPublished, otherPublished} {
+		if err := state.MarkEventPublished(ctx, f.db, seq, state.EventStatePublished,
+			sql.NullString{String: settledHead, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+			t.Fatalf("MarkEventPublished grouped context seq=%d: %v", seq, err)
+		}
+		if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+			DecisionTS: 2, Kind: state.DecisionKindCommitted,
+			EventSeq: sql.NullInt64{Int64: seq, Valid: true},
+		}); err != nil {
+			t.Fatalf("AppendDecision grouped context seq=%d: %v", seq, err)
+		}
+	}
+	_ = appendRecoveryEvent(t, ctx, f, settledHead, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: b, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	last := appendRecoveryEvent(t, ctx, f, settledHead, state.CaptureOp{
+		Op: "modify", Path: "other.md",
+		BeforeOID: sql.NullString{String: y, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: z, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, settledHead, ""); err != nil {
+		t.Fatalf("update HEAD to grouped context: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_partial_seed_context",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 3 ||
+		result.FirstSeq != first || result.LastSeq != last {
+		t.Fatalf("result=%+v want three-event recovered suffix", result)
+	}
+	for path, want := range map[string]string{
+		"anchor.txt": anchorAfter,
+		"doc.md":     c,
+		"other.md":   z,
+	} {
+		got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, path)
+		if err != nil || got != want {
+			t.Fatalf("recovery %s blob=%s err=%v want %s", path, got, err, want)
+		}
+	}
+}
+
+func TestGroupPublishedContextRejectsTooManyCommits(t *testing.T) {
+	t.Parallel()
+	contextEvents := make([]state.RecoveryChainEvent, 0, maxPublishedRecoveryContextCommits+1)
+	for i := 0; i <= maxPublishedRecoveryContextCommits; i++ {
+		contextEvents = append(contextEvents, state.RecoveryChainEvent{
+			Event: state.CaptureEvent{
+				Seq:       int64(i + 1),
+				CommitOID: sql.NullString{String: fmt.Sprintf("%040x", i+1), Valid: true},
+			},
+		})
+	}
+	if _, err := groupPublishedContextByCommit(contextEvents); err == nil ||
+		!strings.Contains(err.Error(), "bounded limit") {
+		t.Fatalf("groupPublishedContextByCommit err=%v want bounded limit", err)
+	}
+}
+
+func TestDescendantPublishedContextAllowsInterveningCommits(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	blob, _ := git.HashObjectStdin(ctx, f.dir, []byte("same tree\n"))
+	base := commitSingleFileTree(t, ctx, f.dir, "doc.md", blob, "base")
+	firstContextCommit := commitSingleFileTree(t, ctx, f.dir, "doc.md", blob,
+		"first context", base)
+	interveningCommit := commitSingleFileTree(t, ctx, f.dir, "doc.md", blob,
+		"intervening side commit", base)
+	secondContextCommit := commitSingleFileTree(t, ctx, f.dir, "doc.md", blob,
+		"second context merge", firstContextCommit, interveningCommit)
+	contextEvents := []state.RecoveryChainEvent{
+		{Event: state.CaptureEvent{
+			Seq:       1,
+			CommitOID: sql.NullString{String: firstContextCommit, Valid: true},
+		}},
+		{Event: state.CaptureEvent{
+			Seq:       2,
+			CommitOID: sql.NullString{String: secondContextCommit, Valid: true},
+		}},
+	}
+
+	got, err := descendantPublishedContext(ctx, f.dir, base, contextEvents)
+	if err != nil {
+		t.Fatalf("descendantPublishedContext: %v", err)
+	}
+	if len(got) != len(contextEvents) {
+		t.Fatalf("descendantPublishedContext len=%d want %d", len(got), len(contextEvents))
+	}
+	for i := range got {
+		if got[i].Event.Seq != contextEvents[i].Event.Seq {
+			t.Fatalf("descendantPublishedContext[%d].Seq=%d want %d",
+				i, got[i].Event.Seq, contextEvents[i].Event.Seq)
+		}
+	}
+}
+
+func TestReconcile_DropsSeedRepresentedContextBeforeCommitLimit(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	currentBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte("version 0\n"))
+	head := commitSingleFileTree(t, ctx, f.dir, "doc.md", currentBlob, "base")
+	for i := 1; i <= maxPublishedRecoveryContextCommits+1; i++ {
+		nextBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte(fmt.Sprintf("version %d\n", i)))
+		seq := appendRecoveryEvent(t, ctx, f, head, state.CaptureOp{
+			Op: "modify", Path: "doc.md",
+			BeforeOID: sql.NullString{String: currentBlob, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID: sql.NullString{String: nextBlob, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		})
+		nextHead := commitSingleFileTree(t, ctx, f.dir, "doc.md", nextBlob,
+			fmt.Sprintf("publish version %d", i), head)
+		if err := state.MarkEventPublished(ctx, f.db, seq, state.EventStatePublished,
+			sql.NullString{String: nextHead, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+			t.Fatalf("MarkEventPublished seq=%d: %v", seq, err)
+		}
+		if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+			DecisionTS: 2, Kind: state.DecisionKindCommitted,
+			EventSeq: sql.NullInt64{Int64: seq, Valid: true},
+		}); err != nil {
+			t.Fatalf("AppendDecision seq=%d: %v", seq, err)
+		}
+		currentBlob = nextBlob
+		head = nextHead
+	}
+	finalBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte("unpublished final\n"))
+	first := appendRecoveryEvent(t, ctx, f, head, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: currentBlob, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: finalBlob, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, head, ""); err != nil {
+		t.Fatalf("update HEAD to represented context: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_seed_filter_before_commit_limit",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 1 {
+		t.Fatalf("result=%+v want one-event recovered suffix", result)
+	}
+	if got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, "doc.md"); err != nil || got != finalBlob {
+		t.Fatalf("recovery doc blob=%s err=%v want %s", got, err, finalBlob)
+	}
+}
+
+func TestReconcile_DropsAncestorContextBeforeCommitLimit(t *testing.T) {
+	runBoundedParallel(t)
+
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	currentBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte("version 0\n"))
+	head := commitSingleFileTree(t, ctx, f.dir, "doc.md", currentBlob, "base")
+	for i := 1; i <= maxPublishedRecoveryContextCommits+1; i++ {
+		nextBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte(fmt.Sprintf("version %d\n", i)))
+		seq := appendRecoveryEvent(t, ctx, f, head, state.CaptureOp{
+			Op: "modify", Path: "doc.md",
+			BeforeOID: sql.NullString{String: currentBlob, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID: sql.NullString{String: nextBlob, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		})
+		nextHead := commitSingleFileTree(t, ctx, f.dir, "doc.md", nextBlob,
+			fmt.Sprintf("publish version %d", i), head)
+		if err := state.MarkEventPublished(ctx, f.db, seq, state.EventStatePublished,
+			sql.NullString{String: nextHead, Valid: true}, sql.NullString{}, sql.NullString{}, 2); err != nil {
+			t.Fatalf("MarkEventPublished seq=%d: %v", seq, err)
+		}
+		if _, err := state.AppendDecision(ctx, f.db, state.DecisionRecord{
+			DecisionTS: 2, Kind: state.DecisionKindCommitted,
+			EventSeq: sql.NullInt64{Int64: seq, Valid: true},
+		}); err != nil {
+			t.Fatalf("AppendDecision seq=%d: %v", seq, err)
+		}
+		currentBlob = nextBlob
+		head = nextHead
+	}
+
+	externalBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte("external seed\n"))
+	externalHead := commitSingleFileTree(t, ctx, f.dir, "doc.md", externalBlob,
+		"external seed change", head)
+	finalBlob, _ := git.HashObjectStdin(ctx, f.dir, []byte("unpublished final\n"))
+	first := appendRecoveryEvent(t, ctx, f, externalHead, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: externalBlob, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: finalBlob, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, externalHead, ""); err != nil {
+		t.Fatalf("update HEAD to external seed: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		GitDir:           f.gitDir,
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         first,
+		Trigger:          "test_ancestor_filter_before_commit_limit",
+		ArchiveOnly:      true,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 1 {
+		t.Fatalf("result=%+v want one-event recovered suffix", result)
+	}
+	if got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, "doc.md"); err != nil || got != finalBlob {
+		t.Fatalf("recovery doc blob=%s err=%v want %s", got, err, finalBlob)
+	}
+}
+
 func TestReconcile_IgnoresUnrelatedPublishedContext(t *testing.T) {
 	runBoundedParallel(t)
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,8 +18,10 @@ import (
 )
 
 const (
-	recoveryCommitIdentityName  = "Auto Commit Daemon"
-	recoveryCommitIdentityEmail = "acd-recovery@localhost"
+	recoveryCommitIdentityName          = "Auto Commit Daemon"
+	recoveryCommitIdentityEmail         = "acd-recovery@localhost"
+	maxPublishedRecoveryContextCommits  = 64
+	maxPublishedRecoveryAncestryCommits = 4096
 )
 
 // RecoveryReconcileOptions identifies one immutable unpublished suffix. The
@@ -124,13 +127,26 @@ func ReconcileUnpublishedChain(
 	last := chain[len(chain)-1].Event
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration,
-		first.BaseHead, first.Seq, last.Seq,
+		first.Seq, last.Seq,
 	)
 	if err != nil {
 		return result, fmt.Errorf("daemon: reconcile recovery chain: load published context: %w", err)
 	}
-	recoveryContext = relevantPublishedContext(recoveryContext, chain)
-	recoveryContext, err = representedPublishedContext(ctx, repoRoot, db, recoveryContext)
+	recoveryContext, err = excludeSupersededPublishedContext(ctx, db, recoveryContext)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = excludeSeedRepresentedPublishedContext(
+		ctx, repoRoot, first.BaseHead, recoveryContext,
+	)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = representedPublishedContext(ctx, repoRoot, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -456,75 +472,65 @@ LIMIT 1`, branchRef, branchGeneration,
 func representedPublishedContext(
 	ctx context.Context,
 	repoRoot string,
-	db *state.DB,
 	recoveryContext []state.RecoveryChainEvent,
 ) ([]state.RecoveryChainEvent, error) {
-	groups := make(map[string][]state.RecoveryChainEvent)
-	commitOrder := make([]string, 0)
-	for _, item := range recoveryContext {
-		if !item.Event.CommitOID.Valid || item.Event.CommitOID.String == "" {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: published context seq=%d has no commit", item.Event.Seq)
-		}
-		commitOID := item.Event.CommitOID.String
-		if _, exists := groups[commitOID]; !exists {
-			commitOrder = append(commitOrder, commitOID)
-		}
-		groups[commitOID] = append(groups[commitOID], item)
+	groups, err := groupPublishedContextByCommit(recoveryContext)
+	if err != nil {
+		return nil, err
 	}
 
 	represented := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
-	for _, commitOID := range commitOrder {
+	for _, group := range groups {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		candidates := groups[commitOID]
-		group := make([]state.RecoveryChainEvent, 0, len(candidates))
-		for _, item := range candidates {
-			decisions, err := state.DecisionsForEvent(ctx, db, item.Event.Seq, 1000)
+		commitOID := group[0].Event.CommitOID.String
+		components := splitPublishedContextByConnectedPaths(group)
+		requiredPaths := make(map[string]struct{})
+		for _, component := range components {
+			initialState, cumulativeState := recoveryGroupBoundaryStates(component)
+			for _, pathState := range append(initialState, cumulativeState...) {
+				requiredPaths[pathState.Path] = struct{}{}
+			}
+		}
+		paths := make([]string, 0, len(requiredPaths))
+		for path := range requiredPaths {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		entries, err := git.LsTree(ctx, repoRoot, commitOID, false, git.LiteralPathspecs(paths)...)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: read published context commit %s: %w",
+				commitOID, err)
+		}
+		commitEntries := make(map[string]git.TreeEntry, len(entries))
+		for _, entry := range entries {
+			commitEntries[entry.Path] = entry
+		}
+		for _, component := range components {
+			initialState, cumulativeState := recoveryGroupBoundaryStates(component)
+			afterMatch, err := recoveryStatesMatchEntries(ctx, commitEntries, cumulativeState)
 			if err != nil {
-				return nil, fmt.Errorf("daemon: reconcile recovery chain: load published context decision seq=%d: %w", item.Event.Seq, err)
+				return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d cumulative after-state: %w",
+					component[0].Event.Seq, component[len(component)-1].Event.Seq, err)
 			}
-			superseded := false
-			for _, decision := range decisions {
-				if decision.Kind == state.DecisionKindSupersededExternal {
-					superseded = true
-					break
-				}
+			if afterMatch {
+				represented = append(represented, component...)
+				continue
 			}
-			if !superseded {
-				group = append(group, item)
+			beforeMatch, err := recoveryStatesMatchEntries(ctx, commitEntries, initialState)
+			if err != nil {
+				return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d initial before-state: %w",
+					component[0].Event.Seq, component[len(component)-1].Event.Seq, err)
 			}
+			if !beforeMatch {
+				return nil, fmt.Errorf("daemon: reconcile recovery chain: published context group %d-%d commit represents neither initial before nor cumulative after state",
+					component[0].Event.Seq, component[len(component)-1].Event.Seq)
+			}
+			// The commit still contains the component's initial before-state,
+			// so an external change superseded every member without an
+			// explicit superseded decision. Skip it to avoid resurrection.
 		}
-		if len(group) == 0 {
-			continue
-		}
-
-		initialState, cumulativeState := recoveryGroupBoundaryStates(group)
-		afterMatch, err := recoveryStatesMatchTree(
-			ctx, repoRoot, commitOID, cumulativeState,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d cumulative after-state: %w",
-				group[0].Event.Seq, group[len(group)-1].Event.Seq, err)
-		}
-		if afterMatch {
-			represented = append(represented, group...)
-			continue
-		}
-		beforeMatch, err := recoveryStatesMatchTree(
-			ctx, repoRoot, commitOID, initialState,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: prove published context group %d-%d initial before-state: %w",
-				group[0].Event.Seq, group[len(group)-1].Event.Seq, err)
-		}
-		if !beforeMatch {
-			return nil, fmt.Errorf("daemon: reconcile recovery chain: published context group %d-%d commit represents neither initial before nor cumulative after state",
-				group[0].Event.Seq, group[len(group)-1].Event.Seq)
-		}
-		// The commit still contains the group's initial before-state, so an
-		// external change superseded every non-explicitly-superseded member.
-		// Skipping the group prevents recovery from resurrecting that work.
 	}
 	sort.Slice(represented, func(i, j int) bool {
 		return represented[i].Event.Seq < represented[j].Event.Seq
@@ -532,26 +538,319 @@ func representedPublishedContext(
 	return represented, nil
 }
 
-func relevantPublishedContext(
+func excludeSupersededPublishedContext(
+	ctx context.Context,
+	db *state.DB,
 	recoveryContext []state.RecoveryChainEvent,
-	chain []state.RecoveryChainEvent,
-) []state.RecoveryChainEvent {
-	chainPaths := make(map[string]struct{})
-	for _, item := range chain {
-		for _, path := range touchedPaths(item.Ops) {
-			chainPaths[path] = struct{}{}
-		}
-	}
-	relevant := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
+) ([]state.RecoveryChainEvent, error) {
+	filtered := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
 	for _, item := range recoveryContext {
-		for _, path := range touchedPaths(item.Ops) {
-			if _, needed := chainPaths[path]; needed {
-				relevant = append(relevant, item)
+		decisions, err := state.DecisionsForEvent(ctx, db, item.Event.Seq, 1000)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: load published context decision seq=%d: %w", item.Event.Seq, err)
+		}
+		superseded := false
+		for _, decision := range decisions {
+			if decision.Kind == state.DecisionKindSupersededExternal {
+				superseded = true
 				break
 			}
 		}
+		if !superseded {
+			filtered = append(filtered, item)
+		}
 	}
-	return relevant
+	return filtered, nil
+}
+
+func groupPublishedContextByCommit(
+	recoveryContext []state.RecoveryChainEvent,
+) ([][]state.RecoveryChainEvent, error) {
+	groups, err := collectPublishedContextByCommit(recoveryContext)
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) > maxPublishedRecoveryContextCommits {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: published context exceeds bounded limit of %d commits",
+			maxPublishedRecoveryContextCommits)
+	}
+	return groups, nil
+}
+
+func collectPublishedContextByCommit(
+	recoveryContext []state.RecoveryChainEvent,
+) ([][]state.RecoveryChainEvent, error) {
+	byCommit := make(map[string][]state.RecoveryChainEvent)
+	commitOrder := make([]string, 0)
+	for _, item := range recoveryContext {
+		if !item.Event.CommitOID.Valid || item.Event.CommitOID.String == "" {
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: published context seq=%d has no commit", item.Event.Seq)
+		}
+		commitOID := item.Event.CommitOID.String
+		if _, exists := byCommit[commitOID]; !exists {
+			commitOrder = append(commitOrder, commitOID)
+		}
+		byCommit[commitOID] = append(byCommit[commitOID], item)
+	}
+	groups := make([][]state.RecoveryChainEvent, 0, len(commitOrder))
+	for _, commitOID := range commitOrder {
+		groups = append(groups, byCommit[commitOID])
+	}
+	return groups, nil
+}
+
+func excludeSeedRepresentedPublishedContext(
+	ctx context.Context,
+	repoRoot string,
+	baseHead string,
+	recoveryContext []state.RecoveryChainEvent,
+) ([]state.RecoveryChainEvent, error) {
+	requiredPaths := make(map[string]struct{})
+	for _, item := range recoveryContext {
+		for _, path := range touchedPaths(item.Ops) {
+			requiredPaths[path] = struct{}{}
+		}
+	}
+	if len(requiredPaths) == 0 {
+		return nil, nil
+	}
+	paths := make([]string, 0, len(requiredPaths))
+	for path := range requiredPaths {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, git.LiteralPathspecs(paths)...)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: read published context seed %s: %w",
+			baseHead, err)
+	}
+	seedEntries := make(map[string]git.IndexEntry, len(entries))
+	for _, entry := range entries {
+		seedEntries[entry.Path] = git.IndexEntry{
+			Mode: entry.Mode,
+			OID:  entry.OID,
+			Path: entry.Path,
+		}
+	}
+
+	keep := make([][]bool, len(recoveryContext))
+	for i := len(recoveryContext) - 1; i >= 0; i-- {
+		item := recoveryContext[i]
+		keep[i] = make([]bool, len(item.Ops))
+		for opIndex := len(item.Ops) - 1; opIndex >= 0; opIndex-- {
+			op := item.Ops[opIndex]
+			afterState := recoveryOpStates([]state.CaptureOp{op}, true)
+			if recoveryStatesMatchIndex(seedEntries, afterState) {
+				setRecoveryIndexStates(seedEntries, recoveryOpStates([]state.CaptureOp{op}, false))
+				continue
+			}
+			keep[i][opIndex] = true
+		}
+	}
+
+	filtered := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
+	for i, item := range recoveryContext {
+		ops := make([]state.CaptureOp, 0, len(item.Ops))
+		for opIndex, op := range item.Ops {
+			if keep[i][opIndex] {
+				ops = append(ops, op)
+			}
+		}
+		if len(ops) > 0 {
+			item.Ops = ops
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+func recoveryStatesMatchIndex(
+	entries map[string]git.IndexEntry,
+	states []recoveryPathState,
+) bool {
+	for _, want := range states {
+		entry, present := entries[want.Path]
+		if !want.Present {
+			if present {
+				return false
+			}
+			continue
+		}
+		if !present || entry.Mode != want.Mode || entry.OID != want.OID {
+			return false
+		}
+	}
+	return len(states) > 0
+}
+
+func setRecoveryIndexStates(
+	entries map[string]git.IndexEntry,
+	states []recoveryPathState,
+) {
+	for _, state := range states {
+		if !state.Present {
+			delete(entries, state.Path)
+			continue
+		}
+		entries[state.Path] = git.IndexEntry{
+			Mode: state.Mode,
+			OID:  state.OID,
+			Path: state.Path,
+		}
+	}
+}
+
+func splitPublishedContextByConnectedPaths(
+	group []state.RecoveryChainEvent,
+) [][]state.RecoveryChainEvent {
+	parent := make(map[string]string)
+	var find func(string) string
+	find = func(path string) string {
+		root, ok := parent[path]
+		if !ok {
+			parent[path] = path
+			return path
+		}
+		if root != path {
+			parent[path] = find(root)
+		}
+		return parent[path]
+	}
+	union := func(paths []string) {
+		if len(paths) == 0 {
+			return
+		}
+		root := find(paths[0])
+		for _, path := range paths[1:] {
+			other := find(path)
+			if other != root {
+				parent[other] = root
+			}
+		}
+	}
+	for _, item := range group {
+		for _, op := range item.Ops {
+			union(touchedPaths([]state.CaptureOp{op}))
+		}
+	}
+
+	componentOrder := make([]string, 0)
+	seenComponent := make(map[string]struct{})
+	byComponent := make(map[string][]state.RecoveryChainEvent)
+	for _, item := range group {
+		eventOps := make(map[string][]state.CaptureOp)
+		eventOrder := make([]string, 0)
+		for _, op := range item.Ops {
+			paths := touchedPaths([]state.CaptureOp{op})
+			if len(paths) == 0 {
+				continue
+			}
+			root := find(paths[0])
+			if _, seen := seenComponent[root]; !seen {
+				seenComponent[root] = struct{}{}
+				componentOrder = append(componentOrder, root)
+			}
+			if _, seen := eventOps[root]; !seen {
+				eventOrder = append(eventOrder, root)
+			}
+			eventOps[root] = append(eventOps[root], op)
+		}
+		for _, root := range eventOrder {
+			member := item
+			member.Ops = eventOps[root]
+			byComponent[root] = append(byComponent[root], member)
+		}
+	}
+	components := make([][]state.RecoveryChainEvent, 0, len(componentOrder))
+	for _, root := range componentOrder {
+		components = append(components, byComponent[root])
+	}
+	return components
+}
+
+func descendantPublishedContext(
+	ctx context.Context,
+	repoRoot string,
+	baseHead string,
+	recoveryContext []state.RecoveryChainEvent,
+) ([]state.RecoveryChainEvent, error) {
+	groups, err := collectPublishedContextByCommit(recoveryContext)
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) == 0 {
+		return nil, nil
+	}
+
+	// Ask one bounded rev-list process which retained commits actually descend
+	// from the recovery seed. Applying the proof cap before this filter would
+	// let a long, already-ancestral published history block recovery even
+	// though none of those commits needs materialization proof.
+	if !validRecoveryCommitOID(baseHead) {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: invalid base commit %q", baseHead)
+	}
+	args := []string{
+		"rev-list",
+		"--ancestry-path",
+		fmt.Sprintf("--max-count=%d", maxPublishedRecoveryAncestryCommits+1),
+	}
+	descendantCandidates := make(map[string]struct{}, len(groups))
+	for i, group := range groups {
+		commitOID := group[0].Event.CommitOID.String
+		if !validRecoveryCommitOID(commitOID) {
+			return nil, fmt.Errorf("daemon: reconcile recovery chain: invalid published context commit %q", commitOID)
+		}
+		descendantCandidates[commitOID] = struct{}{}
+		if i == 0 {
+			args = append(args, baseHead+".."+commitOID)
+		} else {
+			args = append(args, commitOID)
+		}
+	}
+	maxOutput := int64((maxPublishedRecoveryAncestryCommits + 1) * (64 + 1))
+	out, err := git.RunWithLimit(ctx, git.RunOpts{
+		Dir:     repoRoot,
+		Timeout: git.DefaultReadTimeout,
+	}, maxOutput, args...)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: batch-filter published context descendants of base %s: %w",
+			baseHead, err)
+	}
+	traversedCommits := strings.Fields(string(out))
+	if len(traversedCommits) > maxPublishedRecoveryAncestryCommits {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: published context ancestry exceeds bounded limit of %d commits",
+			maxPublishedRecoveryAncestryCommits)
+	}
+	descendantCommits := make(map[string]struct{}, len(groups))
+	for _, commitOID := range traversedCommits {
+		if _, expected := descendantCandidates[commitOID]; expected {
+			descendantCommits[commitOID] = struct{}{}
+		}
+	}
+	if len(descendantCommits) > maxPublishedRecoveryContextCommits {
+		return nil, fmt.Errorf("daemon: reconcile recovery chain: published context exceeds bounded limit of %d descendant commits",
+			maxPublishedRecoveryContextCommits)
+	}
+
+	filtered := make([]state.RecoveryChainEvent, 0, len(recoveryContext))
+	for _, group := range groups {
+		commitOID := group[0].Event.CommitOID.String
+		if _, descends := descendantCommits[commitOID]; descends {
+			filtered = append(filtered, group...)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Event.Seq < filtered[j].Event.Seq
+	})
+	return filtered, nil
+}
+
+func validRecoveryCommitOID(oid string) bool {
+	if len(oid) != 40 && len(oid) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(oid)
+	return err == nil
 }
 
 func recoveryGroupBoundaryStates(group []state.RecoveryChainEvent) ([]recoveryPathState, []recoveryPathState) {
@@ -920,6 +1219,17 @@ func recoveryStatesMatchTree(
 	byPath := make(map[string]git.TreeEntry, len(entries))
 	for _, entry := range entries {
 		byPath[entry.Path] = entry
+	}
+	return recoveryStatesMatchEntries(ctx, byPath, states)
+}
+
+func recoveryStatesMatchEntries(
+	ctx context.Context,
+	byPath map[string]git.TreeEntry,
+	states []recoveryPathState,
+) (bool, error) {
+	if len(states) == 0 {
+		return false, fmt.Errorf("empty recovery state proof")
 	}
 	matched := true
 	for _, want := range states {

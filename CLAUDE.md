@@ -125,7 +125,7 @@ acd fix --force --dry-run
 acd fix --force --yes
 ~~~
 
-- Reconcile from the earliest unpublished seq of one exact `(branch_ref,generation)` chain. Represented published context can include same-base prefixes and relevant interleaved events; it is materialization context only and is never transitioned.
+- Reconcile from the earliest unpublished seq of one exact `(branch_ref,generation)` chain. Represented published context can include same-base prefixes, relevant interleaved events, and earlier captures published by commits that strictly descend the first recovery base. Resolve transitive rename dependencies with a reverse path-closure scan, strip the seed-represented operation prefix before proof, and fail safely above 4096 context events, 4096 traversed ancestry commits, or 64 remaining proof commits. Context is materialization-only and is never transitioned.
 - HEAD+ancestry+final-state proof marks the complete unpublished chain `published` under a `/published` ref; otherwise archive reconstructs immutable provenance under `/archive` and marks it `recovered`. Missing objects, partial proof, collisions or races mean no DB transition.
 - Recovery refs include a 96-bit SHA-256 target digest: archive hashes `baseHead + NUL + treeOID`; published hashes `commitOID`. This prevents selector reuse across linked worktrees/reset DBs.
 - Dead-ref recovery locks/verifies the proof ref and expected-absent branch in one `git update-ref --stdin` transaction held through the SQLite transition. The dead-branch sweep proves or archives; legacy `dead_branch_prune.*` records only the last non-empty recovery.
@@ -134,7 +134,7 @@ acd fix --force --yes
 - `--force` selects archive-only exact-chain recovery; it does not purge captured work. Fix acquires `daemon.lock` after consent, rechecks daemon/HEAD/git-op/pause safety, refuses a live owner, then creates a WAL-consistent `VACUUM INTO` backup verified with `PRAGMA quick_check` before migration/mutation.
 - `commit-all` reconciles before reseed. Its dry-run, decline and JSON without `--yes` must not open writable state, lock, create refs, capture or build providers; incomplete recovery returns nonzero.
 - `acd recover` and `acd purge-events` are deprecated/hidden. Purge selectors `--blocked|--pending|--failed` fail closed; only explicit `--all` delegates archive-only whole-repo recovery.
-- Published-event pruning defaults to 7 days, never removes unresolved terminal rows, and prunes recovered members only while their recovery ref is verified and locked.
+- Published-event pruning defaults to 7 days, preserves the same rename-aware recovery-context closure as reconciliation, and retains an exact pair without blocking unrelated pruning when that closure exceeds the execution cap. It never removes unresolved terminal rows and prunes recovered members only while their recovery ref is verified and locked.
 - `acd resume --yes` lifts only manual pause. Restore/archive workflows are in `docs/user-workflows.md`.
 
 ## Run loop, CLI and observability

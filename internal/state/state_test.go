@@ -1066,6 +1066,7 @@ func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T
 
 			prefix := appendEvent("shared-base", "prefix.txt", EventStatePublished)
 			ordinary := appendEvent("other-base", "ordinary.txt", EventStatePublished)
+			advancedBasePrefix := appendEvent("older-base", "suffix.txt", EventStatePublished)
 			suffix := appendEvent("shared-base", "suffix.txt", unpublishedState)
 
 			n, err := PrunePublishedEventsBefore(ctx, d, 100)
@@ -1075,7 +1076,7 @@ func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T
 			if n != 1 {
 				t.Fatalf("pruned=%d want only ordinary published row", n)
 			}
-			for _, seq := range []int64{prefix, suffix} {
+			for _, seq := range []int64{prefix, advancedBasePrefix, suffix} {
 				var eventCount, opCount int
 				if err := d.SQL().QueryRowContext(ctx,
 					`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&eventCount); err != nil {
@@ -1098,6 +1099,185 @@ func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T
 				t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
 			}
 		})
+	}
+}
+
+func TestPrunePublishedEventsPreservesRenameClosure(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	const branchRef = "refs/heads/main"
+	const generation = int64(7)
+
+	appendOp := func(baseHead, eventState string, op CaptureOp) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: branchRef, BranchGeneration: generation,
+			BaseHead: baseHead, Operation: op.Op, Path: op.Path,
+			OldPath: op.OldPath, Fidelity: "exact",
+			CapturedTS: 10, State: eventState,
+		}, []CaptureOp{op})
+		if err != nil {
+			t.Fatalf("AppendCaptureEvent %s: %v", op.Path, err)
+		}
+		return seq
+	}
+	rename := func(baseHead, oldPath, path string) int64 {
+		return appendOp(baseHead, EventStatePublished, CaptureOp{
+			Op: "rename", Path: path, OldPath: sqlNullStr(oldPath),
+			BeforeOID: sqlNullStr("before-" + oldPath), BeforeMode: sqlNullStr("100644"),
+			AfterOID: sqlNullStr("after-" + path), AfterMode: sqlNullStr("100644"),
+			Fidelity: "exact",
+		})
+	}
+
+	firstRename := rename("base-a", "a.txt", "b.txt")
+	secondRename := rename("base-b", "b.txt", "c.txt")
+	ordinary := appendOp("base-ordinary", EventStatePublished, CaptureOp{
+		Op: "modify", Path: "ordinary.txt",
+		BeforeOID: sqlNullStr("ordinary-before"), BeforeMode: sqlNullStr("100644"),
+		AfterOID: sqlNullStr("ordinary-after"), AfterMode: sqlNullStr("100644"),
+		Fidelity: "exact",
+	})
+	suffix := appendOp("base-c", EventStateBlockedConflict, CaptureOp{
+		Op: "modify", Path: "c.txt",
+		BeforeOID: sqlNullStr("before-c"), BeforeMode: sqlNullStr("100644"),
+		AfterOID: sqlNullStr("after-c"), AfterMode: sqlNullStr("100644"),
+		Fidelity: "exact",
+	})
+
+	n, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned=%d want only unrelated published row", n)
+	}
+	for _, seq := range []int64{firstRename, secondRename, suffix} {
+		var count int
+		if err := d.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, seq).Scan(&count); err != nil {
+			t.Fatalf("count retained seq=%d: %v", seq, err)
+		}
+		if count != 1 {
+			t.Fatalf("rename recovery context seq=%d count=%d want 1", seq, count)
+		}
+	}
+	var ordinaryCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+		t.Fatalf("count ordinary seq=%d: %v", ordinary, err)
+	}
+	if ordinaryCount != 0 {
+		t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
+	}
+}
+
+func TestPrunePublishedEventsIsolatesOversizedRecoveryPair(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+
+	tx, err := d.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	insertEvent, err := tx.PrepareContext(ctx, `
+INSERT INTO capture_events(
+    branch_ref, branch_generation, base_head, operation, path,
+    fidelity, captured_ts, state
+) VALUES (?, ?, ?, 'modify', ?, 'exact', 10, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare event insert: %v", err)
+	}
+	insertOp, err := tx.PrepareContext(ctx, `
+INSERT INTO capture_ops(
+    event_seq, ord, op, path, before_oid, before_mode,
+    after_oid, after_mode, fidelity
+) VALUES (?, 0, 'modify', ?, 'before', '100644', 'after', '100644', 'exact')`)
+	if err != nil {
+		_ = insertEvent.Close()
+		_ = tx.Rollback()
+		t.Fatalf("prepare op insert: %v", err)
+	}
+	const oversizedBranch = "refs/heads/oversized"
+	for i := 0; i <= maxPublishedRecoveryContextEvents; i++ {
+		res, err := insertEvent.ExecContext(ctx,
+			oversizedBranch, 1, fmt.Sprintf("base-%d", i), "hot.txt", EventStatePublished)
+		if err != nil {
+			t.Fatalf("insert published event %d: %v", i, err)
+		}
+		seq, err := res.LastInsertId()
+		if err != nil {
+			t.Fatalf("published event seq %d: %v", i, err)
+		}
+		if _, err := insertOp.ExecContext(ctx, seq, "hot.txt"); err != nil {
+			t.Fatalf("insert published op %d: %v", i, err)
+		}
+	}
+	res, err := insertEvent.ExecContext(ctx,
+		oversizedBranch, 1, "unresolved-base", "hot.txt", EventStatePending)
+	if err != nil {
+		t.Fatalf("insert oversized pending event: %v", err)
+	}
+	pendingSeq, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("oversized pending seq: %v", err)
+	}
+	if _, err := insertOp.ExecContext(ctx, pendingSeq, "hot.txt"); err != nil {
+		t.Fatalf("insert oversized pending op: %v", err)
+	}
+	if err := insertOp.Close(); err != nil {
+		t.Fatalf("close op insert: %v", err)
+	}
+	if err := insertEvent.Close(); err != nil {
+		t.Fatalf("close event insert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit oversized fixture: %v", err)
+	}
+
+	ordinary, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		BranchRef: "refs/heads/ordinary", BranchGeneration: 1,
+		BaseHead: "ordinary-base", Operation: "modify", Path: "ordinary.txt",
+		Fidelity: "exact", CapturedTS: 10, State: EventStatePublished,
+	}, []CaptureOp{{
+		Op: "modify", Path: "ordinary.txt",
+		BeforeOID: sqlNullStr("ordinary-before"), BeforeMode: sqlNullStr("100644"),
+		AfterOID: sqlNullStr("ordinary-after"), AfterMode: sqlNullStr("100644"),
+		Fidelity: "exact",
+	}})
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent ordinary: %v", err)
+	}
+
+	n, err := PrunePublishedEventsBefore(ctx, d, 100)
+	if err != nil {
+		t.Fatalf("PrunePublishedEventsBefore: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned=%d want only ordinary row", n)
+	}
+	var oversizedCount int
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE branch_ref = ? AND state = ?`,
+		oversizedBranch, EventStatePublished).Scan(&oversizedCount); err != nil {
+		t.Fatalf("count oversized retained rows: %v", err)
+	}
+	if oversizedCount != maxPublishedRecoveryContextEvents+1 {
+		t.Fatalf("oversized retained=%d want %d",
+			oversizedCount, maxPublishedRecoveryContextEvents+1)
+	}
+	var ordinaryCount int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq = ?`, ordinary).Scan(&ordinaryCount); err != nil {
+		t.Fatalf("count ordinary row: %v", err)
+	}
+	if ordinaryCount != 0 {
+		t.Fatalf("ordinary published row retained: count=%d", ordinaryCount)
 	}
 }
 

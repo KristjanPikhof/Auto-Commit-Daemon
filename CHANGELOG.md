@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- Recovery now preserves relevant earlier captures published after the first
+  unresolved base advanced, follows transitive rename dependencies, and
+  strips the operation prefix already represented by the recovery seed.
+  Context discovery is a linear path-closure scan bounded to 4,096 events,
+  4,096 traversed ancestry commits, and 64 remaining tree proofs.
+  Published-event pruning preserves the same closure while isolating
+  oversized exact pairs. This prevents false before-state mismatches without
+  correlated ledger scans or unbounded Git proof fan-out.
+
 ### Changed
 
 - Updated pinned `actions/setup-go` from `v6.5.0` to `v7.0.0` across CI,
