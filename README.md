@@ -4,42 +4,49 @@
 keep working. It is built for AI coding tools such as Claude Code, Codex,
 Cursor, OpenCode, and Pi, but the daemon itself is just a static Go binary.
 
-The flow is: your AI tool tells `acd` that work happened, the daemon records a
-durable capture, then replay turns that capture into a normal Git commit.
+## How ACD turns AI edits into clean commits
+
+ACD saves each edit as it happens, then decides which changes belong in the
+same commit.
 
 ~~~mermaid
 flowchart TB
-  Hook["AI tool hook<br/>Claude Code, Codex, Cursor, OpenCode, Pi"]
+  Work(["Your coding agent<br/>edits files"])
+  Capture["ACD saves every edit as it happens<br/>Your work is safe before planning starts"]
+  Strategy{"How should these edits<br/>be committed?"}
 
-  subgraph Capture["1. Notice and capture edits"]
-    CLI["acd start / wake / flush<br/>refreshes the repo session"]
-    Daemon["acd daemon<br/>watches files and records events"]
-  end
+  Event["Event mode - default<br/>Each saved edit gets its own commit"]
+  Intent["Intent mode<br/>Related edits become logical commits<br/>10 saved edits might become 3 commits"]
 
-  subgraph State["2. Keep the work durable"]
-    DB[("state.db<br/>event ledger")]
-    Blobs[("git blobs<br/>captured file content")]
-  end
+  Replay["ACD builds each commit safely<br/>using a temporary Git index"]
+  Safe{"Is the branch still<br/>safe to update?"}
 
-  subgraph Replay["3. Publish a safe commit"]
-    Scratch["scratch index replay<br/>rebuilds the intended tree"]
-    Commit["git commit + update-ref<br/>moves the branch only after checks pass"]
-  end
+  History(["Your branch gets normal Git commits<br/>ready to review or undo"])
+  Heal["ACD checks all pending work<br/>It finds what landed and saves the rest"]
+  Preserve["ACD cannot verify the result<br/>It keeps the captured work and leaves your files alone"]
 
-  Hook --> CLI --> Daemon --> DB
-  Daemon --> Blobs
-  DB --> Scratch
-  Blobs --> Scratch
-  Scratch --> Commit
+  Work --> Capture --> Strategy
+  Strategy -->|Keep every edit separate| Event
+  Strategy -->|Group edits by task| Intent
+  Event --> Replay
+  Intent --> Replay
+  Replay --> Safe
+  Safe -->|Yes| History
+  Safe -->|No| Heal
+  Heal -.->|Continue when safe| Capture
+  Heal -->|Still uncertain| Preserve
 
-  classDef external fill:#233142,stroke:#7aa2f7,color:#e6edf3
-  classDef capture fill:#203a31,stroke:#9ece6a,color:#eaffdf
-  classDef durable fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
-  classDef publish fill:#332b46,stroke:#bb9af7,color:#f4edff
-  class Hook external
-  class CLI,Daemon capture
-  class DB,Blobs durable
-  class Scratch,Commit publish
+  classDef external fill:#1e3a5f,stroke:#60a5fa,color:#f8fafc,stroke-width:2px
+  classDef process fill:#164e3b,stroke:#34d399,color:#ecfdf5,stroke-width:2px
+  classDef decision fill:#78350f,stroke:#fbbf24,color:#fffbeb,stroke-width:2px
+  classDef intent fill:#4c1d95,stroke:#c084fc,color:#faf5ff,stroke-width:3px
+  classDef guard fill:#3f3f46,stroke:#a1a1aa,color:#fafafa,stroke-width:2px
+
+  class Work external
+  class Capture,Replay,History,Heal process
+  class Strategy,Safe decision
+  class Intent intent
+  class Event,Preserve guard
 ~~~
 
 ## Install
