@@ -85,8 +85,8 @@ acd setup shell
 | Claude Code | `~/.claude/settings.json` | Native hook support. |
 | Codex | `~/.codex/hooks.json` | Run `/hooks` after changing the file so Codex re-approves it. |
 | Cursor | `~/.cursor/hooks.json` | User-global hooks only. Approve in Settings -> Hooks. |
-| OpenCode | `~/.config/opencode/hook/hooks.yaml` | Uses the OpenCode-Hooks adapter. |
-| Pi | `~/.pi/agent/hook/hooks.yaml` | Uses the Pi-YAML-Hooks adapter. |
+| OpenCode | `~/.config/opencode/hook/hooks.yaml` | Uses the [OpenCode-Hooks](https://github.com/KristjanPikhof/OpenCode-Hooks) adapter. |
+| Pi | `~/.pi/agent/hook/hooks.yaml` | Uses the [Pi-YAML-Hooks](https://github.com/KristjanPikhof/Pi-YAML-Hooks) adapter. |
 | Shell | `.envrc` or shell rc | Fallback when no native harness exists. |
 
 Fresh Cursor install with no existing hooks:
