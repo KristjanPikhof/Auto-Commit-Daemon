@@ -1,28 +1,28 @@
 flowchart TB
-  Work(["AI tool makes many<br/>small file edits"])
-  Capture["1. Capture immediately<br/>Every edit is stored locally and durably"]
-  Strategy{"2. Form commit boundaries"}
+  Work(["Your coding agent<br/>edits files"])
+  Capture["ACD saves every edit as it happens<br/>Your work is safe before planning starts"]
+  Strategy{"How should these edits<br/>be committed?"}
 
-  Event["Event mode · default<br/>1 capture → 1 commit"]
-  Intent["Intent mode<br/>Group related captures by purpose<br/>Example: 10 captures → 3 logical commits"]
+  Event["Event mode - default<br/>Each saved edit gets its own commit"]
+  Intent["Intent mode<br/>Related edits become logical commits<br/>10 saved edits might become 3 commits"]
 
-  Replay["3. Replay safely<br/>Rebuild each commit in a scratch index"]
-  Safe{"Safe to update<br/>the Git branch?"}
+  Replay["ACD builds each commit safely<br/>using a temporary Git index"]
+  Safe{"Is the branch still<br/>safe to update?"}
 
-  History(["Normal local Git history<br/>Atomic · reviewable · traceable"])
-  Heal["Self-heal the complete chain<br/>Prove · archive · reseed · recapture"]
-  Preserve["Stop safely<br/>Preserve queue, HEAD, index, and worktree"]
+  History(["Your branch gets normal Git commits<br/>ready to review or undo"])
+  Heal["ACD checks all pending work<br/>It finds what landed and saves the rest"]
+  Preserve["ACD cannot verify the result<br/>It keeps the captured work and leaves your files alone"]
 
   Work --> Capture --> Strategy
-  Strategy -->|Strict traceability| Event
-  Strategy -->|Cleaner commit history| Intent
+  Strategy -->|Keep every edit separate| Event
+  Strategy -->|Group edits by task| Intent
   Event --> Replay
   Intent --> Replay
   Replay --> Safe
   Safe -->|Yes| History
   Safe -->|No| Heal
-  Heal -.->|Resume normal flow| Capture
-  Heal -->|Cannot prove safely| Preserve
+  Heal -.->|Continue when safe| Capture
+  Heal -->|Still uncertain| Preserve
 
   classDef external fill:#1e3a5f,stroke:#60a5fa,color:#f8fafc,stroke-width:2px
   classDef process fill:#164e3b,stroke:#34d399,color:#ecfdf5,stroke-width:2px
