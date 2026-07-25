@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v2026-07-26
+
+### Changed
+
+- Reworked the README workflow diagram to explain capture, event and intent
+  grouping, safe replay, and automatic recovery in one first-look flow. Added
+  a matching standalone Mermaid source for reuse.
+- Updated pinned `actions/setup-go` from `v6.5.0` to `v7.0.0` across CI,
+  CodeQL, and release workflows.
+- Updated maintenance dependencies: `modernc.org/sqlite` from `v1.53.0` to
+  `v1.54.0` (SQLite 3.53.3), and `github.com/mattn/go-isatty` from `v0.0.22`
+  to `v0.0.24`.
+
 ### Fixed
 
 - Recovery now preserves relevant earlier captures published after the first
@@ -12,14 +25,6 @@
   Published-event pruning preserves the same closure while isolating
   oversized exact pairs. This prevents false before-state mismatches without
   correlated ledger scans or unbounded Git proof fan-out.
-
-### Changed
-
-- Updated pinned `actions/setup-go` from `v6.5.0` to `v7.0.0` across CI,
-  CodeQL, and release workflows.
-- Updated maintenance dependencies: `modernc.org/sqlite` from `v1.53.0` to
-  `v1.54.0` (SQLite 3.53.3), and `github.com/mattn/go-isatty` from `v0.0.22`
-  to `v0.0.24`.
 
 ## v2026-07-24
 
