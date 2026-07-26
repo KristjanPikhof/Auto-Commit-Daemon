@@ -160,14 +160,14 @@ acd fix --force --yes
 | Harness | Start | Active | End |
 |---|---|---|---|
 | Claude Code | `SessionStart -> start` | `Pre/PostToolUse -> start && wake` | `Stop -> flush --logical`; `SessionEnd -> stop` |
-| Codex | `SessionStart -> start` | `UserPromptSubmit/PreToolUse/PostToolUse -> start && wake` | `Stop -> touch` |
+| Codex | `SessionStart -> start` | `UserPromptSubmit/PreToolUse/PostToolUse -> start && wake` | `Stop -> touch --soft-boundary` |
 | Cursor | `sessionStart -> start` | `postToolUse/afterFileEdit -> start && wake` | `stop -> flush`; `sessionEnd -> stop` |
 | OpenCode/Pi | `session.created -> start` | `tool.before/after.* -> start && wake` | `session.idle -> flush --logical`; `session.deleted -> stop` |
 
 - Templates are source of truth. Keep hook helper, setup tests and AdapterE2E synchronized. Active hooks use `start && wake`, log failures and return nonzero; never mask start failures.
 - TOML/YAML/shell use leading `# acd-managed: true`. JSON must be schema-clean and is detected by command signatures; top-level `_acd_managed` is legacy-only.
 - Codex uses `~/.codex/hooks.json` with only root `hooks`; legacy TOML duplicates events. Keep `[features].hooks=true` if pinned; `features.codex_hooks` is deprecated.
-- Codex Stop stays `acd touch` because it fires every turn. Changes require `/hooks` re-approval. `setup codex --raw > ~/.codex/hooks.json` replaces the file; merge custom hooks.
+- Codex Stop uses `acd touch --soft-boundary` because it fires every turn; the boundary triggers evaluation without bypassing safety gates. Changes require `/hooks` re-approval. `setup codex --raw > ~/.codex/hooks.json` replaces the file; merge custom hooks.
 - Codex extracts `session_id cwd?` from stdin; missing cwd falls back to `$PWD`. Missing `acd` stays fail-soft.
 - Cursor installs only to `~/.cursor/hooks.json`; `--raw` replaces it, so merge custom hooks and re-approve in Settings -> Hooks.
 - `flush --logical` refreshes heartbeat, enqueues `flush_logical` and signals SIGUSR1. Only a drained logical flush bypasses intent batch wait; it requires a registered active session and reports refusal without blocking the harness.

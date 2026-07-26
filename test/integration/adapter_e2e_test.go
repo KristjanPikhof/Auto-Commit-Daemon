@@ -580,6 +580,27 @@ func readClients(t *testing.T, repo string) []clientRow {
 	return rows
 }
 
+func assertLatestActivityBoundary(
+	t *testing.T,
+	repo string,
+	wantKind string,
+	wantSource string,
+) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	out, err := exec.Command("sqlite3", "-separator", "|", dbPath, `
+SELECT kind, source, branch_ref IS NULL, branch_generation IS NULL
+FROM intent_activity_boundaries ORDER BY epoch DESC LIMIT 1`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("sqlite3 intent_activity_boundaries: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	want := wantKind + "|" + wantSource + "|1|1"
+	if got != want {
+		t.Fatalf("latest activity boundary=%q want %q", got, want)
+	}
+}
+
 // assertClientRow polls daemon_clients for up to timeout, asserting a row
 // with the given session_id + harness. Fails the test on timeout.
 func assertClientRow(t *testing.T, repo, sessionID, harness string, timeout time.Duration) {
@@ -918,15 +939,25 @@ func runCodexE2E(t *testing.T, bin string) {
 			preRes.ExitCode, preRes.Stdout, preRes.Stderr)
 	}
 
-	// Stop -> acd touch. Daemon must remain alive (mirrors claude-code Stop)
-	// because PostToolUse replay can still be draining when Stop fires.
+	// Stop -> acd touch --soft-boundary. Daemon must remain alive because
+	// PostToolUse replay can still be draining when Stop fires. The soft epoch
+	// triggers candidate evaluation without the hard logical-flush bypass.
 	stopHook := pickHookByEvent(t, hooks, "Stop")
+	if !strings.Contains(stopHook.Command, "acd touch --soft-boundary") {
+		t.Fatalf("codex Stop hook must call acd touch --soft-boundary: %s",
+			stopHook.Command)
+	}
+	if strings.Contains(stopHook.Command, "acd flush --logical") {
+		t.Fatalf("codex Stop hook must not use hard logical flush: %s",
+			stopHook.Command)
+	}
 	if stopRes := runBash(t, ctx, env, stdin, stopHook.Command); stopRes.ExitCode != 0 {
 		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
+	assertLatestActivityBoundary(t, repo, "soft", "touch_soft_boundary")
 	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("codex daemon mode after Stop=%q, want running (Stop must touch, not stop)", mode)
+		t.Fatalf("codex daemon mode after Stop=%q, want running (Stop must record a soft boundary, not stop)", mode)
 	}
 
 	// Production cleanup relies on watch_pid death + refcount sweep; in the

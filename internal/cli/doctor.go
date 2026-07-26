@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -420,8 +421,8 @@ var driftRemediationCommands = map[string]string{
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
-// and returns a non-empty note when one or more active-hook command bodies
-// are missing the canonical `acd start` + `acd wake` pair. Active hooks are:
+// and returns a non-empty note when one or more lifecycle command bodies are
+// missing their canonical command. Active hooks are:
 //
 //   - claude-code, codex : PreToolUse + PostToolUse entries inside nested JSON
 //     "hooks" map (PascalCase event keys)
@@ -468,13 +469,13 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 		// Marker lives on a non-canonical (legacy) path. Recommend a merge
 		// into the matched file only — never an overwrite that could blow
 		// away a user's canonical config they have not migrated yet.
-		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake' at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
+		return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
 	}
 	cmd, ok := driftRemediationCommands[name]
 	if !ok {
-		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via acd setup %s --raw", stale, name)
+		return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command; reinstall via acd setup %s --raw", stale, name)
 	}
-	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
+	return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command; reinstall via %s", stale, cmd)
 }
 
 // cursorLifecycleSubcommands maps wired Cursor hook events to the acd command
@@ -517,7 +518,35 @@ func countJSONActiveHookDrift(name string, body []byte) int {
 			}
 		}
 	}
+	if name == "codex" {
+		cmds := byEvent["Stop"]
+		if len(cmds) == 0 {
+			stale++
+		}
+		for _, cmd := range cmds {
+			if !codexStopHasSoftBoundary(cmd) ||
+				strings.Contains(cmd, "acd flush --logical") {
+				stale++
+			}
+		}
+	}
 	return stale
+}
+
+var codexTouchInvocation = regexp.MustCompile(
+	`(?:^|[;&|({][[:space:]]*)acd[[:space:]]+touch(?:[[:space:]]+[^;&|\n]*)?`,
+)
+
+func codexStopHasSoftBoundary(command string) bool {
+	for _, invocation := range codexTouchInvocation.FindAllString(command, -1) {
+		for _, field := range strings.Fields(invocation) {
+			field = strings.Trim(field, `'"(){}[]`)
+			if field == "--soft-boundary" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func countCursorStaleLifecycleCommands(body []byte) int {

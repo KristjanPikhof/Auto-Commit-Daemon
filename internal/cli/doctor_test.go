@@ -1091,13 +1091,15 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 
 func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 	cases := []struct {
-		name string
-		path string
-		body string
+		name        string
+		path        string
+		body        string
+		wantMissing int
 	}{
 		{
-			name: "claude-code",
-			path: filepath.Join(".claude", "settings.json"),
+			name:        "claude-code",
+			path:        filepath.Join(".claude", "settings.json"),
+			wantMissing: 2,
 			body: `{
 				"hooks": {
 					"SessionStart": [
@@ -1109,8 +1111,9 @@ func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 			}`,
 		},
 		{
-			name: "codex",
-			path: filepath.Join(".codex", "hooks.json"),
+			name:        "codex",
+			path:        filepath.Join(".codex", "hooks.json"),
+			wantMissing: 3,
 			body: `{
 				"hooks": {
 					"SessionStart": [
@@ -1154,10 +1157,69 @@ func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 			if !strings.Contains(notes, "installed snippet drift") {
 				t.Fatalf("%s missing active hooks should report drift, got notes=%v", tc.name, h.Notes)
 			}
-			if !strings.Contains(notes, "2 active hook(s)") {
-				t.Fatalf("%s should count missing PreToolUse/PostToolUse hooks, got notes=%v", tc.name, h.Notes)
+			wantCount := fmt.Sprintf("%d lifecycle hook(s)", tc.wantMissing)
+			if !strings.Contains(notes, wantCount) {
+				t.Fatalf("%s should count missing lifecycle hooks as %q, got notes=%v",
+					tc.name, wantCount, h.Notes)
 			}
 		})
+	}
+}
+
+func TestDoctor_CodexStopRequiresSoftBoundary(t *testing.T) {
+	canonical := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", canonical); got != 0 {
+		t.Fatalf("canonical Codex lifecycle drift=%d want 0", got)
+	}
+
+	legacy := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", legacy); got != 1 {
+		t.Fatalf("legacy Codex Stop drift=%d want 1", got)
+	}
+
+	hard := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary; acd flush --logical"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", hard); got != 1 {
+		t.Fatalf("hard Codex Stop drift=%d want 1", got)
+	}
+
+	falseValue := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary=false"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", falseValue); got != 1 {
+		t.Fatalf("false-valued Codex Stop drift=%d want 1", got)
+	}
+
+	echoed := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "echo acd touch --soft-boundary"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", echoed); got != 1 {
+		t.Fatalf("echo-only Codex Stop drift=%d want 1", got)
 	}
 }
 
@@ -1643,7 +1705,7 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 	if note == "" {
 		t.Fatalf("empty cursor hooks should report drift")
 	}
-	if !strings.Contains(note, "5 active hook(s)") {
+	if !strings.Contains(note, "5 lifecycle hook(s)") {
 		t.Fatalf("empty cursor hooks should count five missing lifecycle hooks, got %q", note)
 	}
 }

@@ -48,11 +48,13 @@ both sources, so keeping duplicate ACD hooks makes every event run twice.
 - `UserPromptSubmit` -> idempotent `acd start`, then `acd wake` (timeout 15s)
 - `PreToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 15s)
 - `PostToolUse` -> idempotent `acd start`, then `acd wake` (matcher `apply_patch|Edit|Write|Bash`, timeout 15s)
-- `Stop` -> `acd touch` (timeout 5s)
+- `Stop` -> `acd touch --soft-boundary` (timeout 5s)
 
-`Stop` calls `acd touch` because Codex fires `Stop` at turn scope rather than
-only at true session idle. The refcount sweep on the `watch_pid` still cleans
-up once Codex exits.
+`Stop` records a soft semantic boundary because Codex fires it at turn scope
+rather than only at true session idle. It asks Intent v2 to evaluate ready
+candidates without bypassing atomicity, verification, pause, Git-operation,
+branch-generation, or conflict gates. The refcount sweep on the `watch_pid`
+still cleans up once Codex exits.
 
 The active wake hooks call `acd start` first so a later prompt or tool event can
 recover if you manually ran `acd stop` while the Codex session stayed open.
