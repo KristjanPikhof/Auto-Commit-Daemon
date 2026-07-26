@@ -17,10 +17,11 @@ model, and does not need a key.
 
 ## Quick setup
 
-Prefer `acd configure` for provider, credential, consent, and verification
-setup. Use `acd settings` for later advanced overrides. Saved non-secret values
-do not need shell sourcing. `ACD_AI_API_KEY` can stay in the environment or the
-key can be stored with `acd auth set`; the environment remains higher priority.
+Prefer bare `acd configure` for global provider, credential, and consent setup.
+Use `acd configure --repo .` only for repository overrides or Strict Review,
+and `acd settings` for later advanced overrides. Saved non-secret values do not
+need shell sourcing. `ACD_AI_API_KEY` can stay in the environment or the key
+can be stored with `acd auth set`; the environment remains higher priority.
 The settings file, runtime revision ledger, and repository database never store
 the secret.
 
@@ -338,7 +339,7 @@ pre-authorize each specific risk. See
 | `openai-compat` succeeds | Provider result is used. |
 | Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
 | Intent Fast planner failure | Publish the smallest valid hard-dependency component. |
-| Intent Balanced planner failure | Reuse a valid or deterministic dependency partition, then run fast verification. |
+| Intent Balanced planner failure | Reuse a valid or deterministic dependency partition, then run structural verification. |
 | Intent Quality planner failure | Keep candidates pending and report `needs_attention`. |
 | Three consecutive intent validation failures | Open the persisted circuit after configured correction retries are exhausted. |
 | Intent circuit open | Skip the remote planner and apply the preset policy without repeated planner-error decisions. |

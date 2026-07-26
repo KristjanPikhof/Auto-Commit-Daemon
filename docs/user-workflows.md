@@ -26,16 +26,18 @@ appear, or how to recover a stuck queue.
 `acd events --watch` starts at the current ledger tail unless you pass
 `--since <cursor>`.
 
-Use `acd configure` for initial setup or a normal strategy/preset change. Use
+Use bare `acd configure` for global provider and everyday defaults. Use
+`acd configure --repo .` for a repository override or Strict Review, and
 `acd settings` for advanced overrides, profiles, and experiments. Saved
 non-secret values do not require shell sourcing. See the
 [settings guide](settings.md) for source precedence, safe activation, and
 rejected-revision recovery.
 
-Normal Intent setup returns after provider testing and durable validation
-queueing. Capture stays active while commit publishing waits. Use
-`acd configure --wait` to follow the job, or close the terminal and inspect it
-later with `acd status`.
+Global Everyday setup runs no project test or validation job. Repository Strict
+Review returns after provider testing and durable validation queueing. Capture
+stays active while commit publishing waits. Use
+`acd configure --repo . --wait` to follow the strict job, or close the terminal
+and inspect it later with `acd status`.
 
 See [commands.md](commands.md) for the complete public command reference,
 including repo administration, maintenance, and the hook protocol.
@@ -274,21 +276,21 @@ Plain `acd wake` does not bypass intent batch gates.
 
 Planner failure behavior is preset-specific. Fast uses the smallest valid
 hard-dependency component. Balanced uses a valid or deterministic dependency
-partition and runs fast verification. Quality keeps candidates pending and
-reports `needs_attention`. During the 30-second, 2-minute, and 10-minute
+partition and runs structural verification. Quality keeps candidates pending
+and reports `needs_attention`. During the 30-second, 2-minute, and 10-minute
 cooldowns ACD applies that policy, then sends one automatic probe. Inspect
 `intent_strategy.planner_health` in status or diagnose JSON for the circuit
 state, failure class, bypass count, and next probe time.
 
-Missing Intent v2 prerequisites always block replay, not capture. Run
-`acd configure` when status reports missing provider testing, credential, diff
-consent, or verification approval. ACD does not fall back to v1 or
-metadata-only planning.
+Missing Intent v2 prerequisites always block replay, not capture. Run bare
+`acd configure` for missing inherited provider, credential, or diff consent.
+Run `acd configure --repo .` for repository-specific settings or Strict Review
+approval. ACD does not fall back to v1 or metadata-only planning.
 
 Configuration validation uses the same capture-only safety state. A queued or
 running job needs no action. A failed or timed-out job preserves the desired
-revision and last-known-good runtime. Re-run `acd configure` to retry the exact
-check or switch experience.
+revision and last-known-good runtime. Re-run `acd configure --repo .` to retry
+the exact strict check or switch experience.
 
 To check whether work was captured, planner-visible, and committed as intended:
 

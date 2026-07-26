@@ -12,26 +12,28 @@ land together even when unrelated edits occur between them.
 
 ## Configure Intent mode
 
-Start with the guided setup:
+Start with global guided setup:
 
 ~~~bash
 acd configure --strategy intent --preset balanced
 ~~~
 
 Everyday work is the regular default and maps to Intent Balanced. It requires
-a tested provider and redacted diff context. Configure uses a detected quick
-check when available, otherwise it uses built-in structural verification. The
-wizard shows the exact endpoint, check source, timeout, diff-egress policy, and
-repair limits before one approval.
+a tested provider and redacted diff context, then uses built-in structural and
+materialization verification. Global setup never detects or runs a project
+test. The wizard shows the exact endpoint, diff-egress policy, and repair
+limits before one approval.
 
-The provider test runs synchronously before any write. Candidate verification
-is queued as a durable background activation gate. Capture continues while
-replay and repair wait. Use `acd configure --wait` to follow the gate.
+The provider test runs synchronously before any write. Strict Review is
+available only through `acd configure --repo .`; it queues the repository's
+approved full command as a durable background activation gate. Capture
+continues while replay and repair wait. Use
+`acd configure --repo . --wait` to follow that gate.
 
 | Preset | Evaluation | Verification | Planner failure | Recent repair |
 |---|---|---|---|---|
 | Fast | 10 captures, 10-second quiet time, 90-second max wait | None | Smallest valid hard-dependency component | Off |
-| Balanced | 20 captures, 30-second quiet time, 3-minute max wait | Detected fast command or built-in structural gate | Last valid or deterministic dependency partition, then verification | Up to 3 commits or 10 minutes |
+| Balanced | 20 captures, 30-second quiet time, 3-minute max wait | Structural and materialization gates | Last valid or deterministic dependency partition, then structural verification | Up to 3 commits or 10 minutes |
 | Quality | 30 captures, 60-second quiet time, 10-minute max wait | Approved full command, 10-minute timeout | Keep pending and report `needs_attention` | Up to 5 commits or 30 minutes |
 
 All regular Intent presets need redacted diff context. Network providers also
@@ -177,7 +179,7 @@ preset fallback.
 | Preset | Circuit or provider failure |
 |---|---|
 | Fast | Materialize and publish the smallest hard-dependency component |
-| Balanced | Reuse the last valid partition or deterministic dependency components, then run fast verification |
+| Balanced | Reuse the last valid partition or deterministic dependency components, then run structural verification |
 | Quality | Keep candidates pending and report `needs_attention` |
 
 Circuit bypasses are observability events, not new planner errors. Caller
@@ -219,14 +221,16 @@ redacted unless the advanced sensitive override
 
 ## Recover from blocked v2 replay
 
-Existing Intent repositories migrate to `intent.balanced@2`. If the effective
-provider, diff consent, credential, or approved quick or structural gate is
+Existing Intent repositories migrate to the current `intent.balanced@3`.
+Previously materialized revisions carry their explicit overrides forward. If
+the effective provider, diff consent, credential, or structural gate is
 missing, capture continues and replay stops with `needs_attention`.
 
 Run:
 
 ~~~bash
 acd configure
+acd configure --repo .
 acd status
 ~~~
 

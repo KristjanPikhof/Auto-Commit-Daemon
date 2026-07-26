@@ -11,15 +11,15 @@
   numbered progress, exposes sanitized verification failure output, and avoids
   delayed terminal capability replies corrupting short-terminal shell prompts.
 - Removed the regular wizard's free-form verification command question.
-  Balanced and Quality now reuse or detect a command and ask only for exact
-  approval in the final preview.
+  Everyday runs no project command; repository Strict Review detects a full
+  command and asks only for exact approval in the final preview.
 
 ### Added
 
-- Added Everyday work, Maximum speed, and Strict review setup experiences with
-  adaptive provider reuse, first-time endpoint and model prompts, one
-  fingerprint-bound approval, separate quick and full check detection, and
-  `acd configure --wait`.
+- Added global Everyday work and Maximum speed setup experiences with adaptive
+  provider reuse, first-time endpoint and model prompts, and one
+  fingerprint-bound approval. Repository setup additionally offers Strict
+  Review and `--wait`.
 - Added durable background configuration validation. Capture remains active
   while replay and repair wait, and failed checks preserve the desired
   revision, last-known-good runtime, sanitized output, and retry state.
@@ -46,7 +46,14 @@
 
 ### Changed
 
-- Existing Intent repositories migrate to `intent.balanced@2`. Missing
+- Made bare `acd configure` a one-time global setup with Everyday and Maximum
+  Speed only. Everyday uses internal structural gates and never detects or
+  runs project tests; Strict Review and full command validation require an
+  explicit `--repo`.
+- Added fingerprint-bound global setup approvals so untouched repositories can
+  inherit reviewed provider, diff-egress, and repair permissions without
+  globally authorizing repository-controlled shell commands.
+- Existing Intent repositories migrate to `intent.balanced@3`. Missing
   provider, diff-context, credential, or approved verification prerequisites
   now stop replay with `needs_attention` while capture continues. ACD no longer
   silently resumes v1 or metadata-only Intent planning.

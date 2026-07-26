@@ -113,23 +113,34 @@ acd doctor
 
 ## Configure commit behavior
 
-Use the guided setup for a regular repository:
+Configure provider and commit defaults once for your user account:
 
 ~~~bash
 acd configure
 ~~~
 
-Choose Everyday work, Maximum speed, or Strict review. Everyday is the
-recommended default and maps to Intent Balanced. Existing provider, model,
-endpoint, timeout, and credential values are reused when valid. A fresh
-OpenAI-compatible setup asks for the endpoint, model, and masked API key, then
-shows those exact values in the final review.
+Global setup offers Everyday work and Maximum speed. Everyday is the
+recommended default and maps to Intent Balanced with ACD's internal structural
+and materialization checks. It never detects or runs project tests. Existing
+provider, model, endpoint, timeout, and credential values are reused when
+valid. A fresh OpenAI-compatible setup asks for the endpoint, model, and masked
+API key, then shows those exact values in the final review.
 
-One approval covers the displayed diff context, endpoint, verification, and
-repair permissions. The provider test runs before any write. Intent setup
-queues a durable background validation job, keeps capture active, and returns
-without waiting for the project check. Commit publishing starts only after the
-check passes.
+One approval covers the displayed endpoint, diff context, and repair
+permissions. The provider test runs before any write. Global setup saves no
+repository state, starts no daemon, and does not fan changes out to already
+running repositories.
+
+Strict Review is an explicit repository configuration because a repository
+controls the command it executes:
+
+~~~bash
+acd configure --repo .
+~~~
+
+Only Strict Review detects and approves a full project test command. A failed
+test keeps capture active and the candidate pending without changing the live
+worktree, index, or HEAD.
 
 Preview the default or preselect a mode without making calls or writes:
 
@@ -137,12 +148,13 @@ Preview the default or preselect a mode without making calls or writes:
 acd configure --dry-run
 acd configure --strategy intent --preset balanced
 acd configure --accessible
-acd configure --wait
+acd configure --repo . --strategy intent --preset quality --wait
 ~~~
 
-Use `--wait` when you want the terminal to follow the queued validation until
-it passes or needs attention. Re-running `acd configure` resumes or retries an
-unfinished setup without discarding the reviewed revision.
+Use `--wait` only with repository Strict Review when you want the terminal to
+follow its queued validation. Re-running the same repository configuration
+resumes or retries unfinished strict validation without discarding the
+reviewed revision.
 
 Use `acd settings` after onboarding for profiles, experiments, and advanced
 field overrides. See the [settings guide](docs/settings.md) for authoring
@@ -153,13 +165,13 @@ scopes, preset customization, testing, and activation.
 | `event` | One captured edit becomes one commit. New Event repositories use Fast unless another preset is selected. | Offline use, CI, shared branches, strict traceability. |
 | `intent` | Durable semantic candidates group related captures, validate atomicity, and publish in dependency order. | Local work where reviewable, reversible commits matter more than one-edit history. |
 
-Fast offline setup:
+Fast global setup:
 
 ~~~bash
 acd configure --strategy event --preset fast
 ~~~
 
-Everyday semantic commits:
+Everyday global semantic commits:
 
 ~~~bash
 acd configure --strategy intent --preset balanced
@@ -178,9 +190,10 @@ materialization, verification, and revertibility before publication.
 
 Fallback depends on the preset. Fast publishes the smallest materializable
 hard-dependency component. Balanced reuses a valid or deterministic dependency
-partition and runs the approved fast verification. Quality keeps the candidate
-pending and reports `needs_attention`. No preset bypasses hard dependencies,
-scratch materialization, or required verification.
+partition and applies structural gates. Quality keeps the candidate pending
+when its approved full verification fails and reports `needs_attention`. No
+preset bypasses hard dependencies, scratch materialization, or required
+verification.
 
 Balanced and Quality may repair a small, recent ACD-only commit chain when a
 late companion capture arrives. Repair runs only while the commits remain

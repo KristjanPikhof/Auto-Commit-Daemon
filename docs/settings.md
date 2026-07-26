@@ -1,23 +1,32 @@
 # Configure ACD
 
-Use `acd configure` for initial setup and everyday mode changes. It stages all
-choices in memory, shows one final preview, tests the selected provider, saves
-one runtime revision with a durable validation job, and enables capture.
+Use `acd configure` once for global provider and everyday commit defaults. It
+stages all choices in memory, shows one final preview, tests the selected
+provider, and saves global settings without opening repository state.
 
 ~~~bash
 acd configure
-acd configure --wait
 acd configure --strategy intent --preset balanced
 acd configure --accessible
 ~~~
 
-The regular wizard offers three experiences:
+The global wizard offers two experiences and never runs project tests:
 
-| Experience | Internal mode | Activation check |
+| Experience | Internal mode | Verification |
 |---|---|---|
-| Everyday work | Intent Balanced | Detected quick check or built-in structural check |
+| Everyday work | Intent Balanced | ACD structural and materialization gates |
 | Maximum speed | Event Fast | None |
-| Strict review | Intent Quality | Detected full suite, which may take several minutes |
+
+Strict Review is available only when targeting one repository:
+
+~~~bash
+acd configure --repo .
+acd configure --repo . --strategy intent --preset quality --wait
+~~~
+
+Repository Everyday and Maximum Speed still run no project tests. Strict
+Review detects a full suite, displays its exact command and provenance, and
+queues a durable background validation gate that may take several minutes.
 
 Existing valid provider, model, endpoint, timeout, and credential values are
 reused. A fresh or incomplete OpenAI-compatible setup asks for the endpoint
@@ -32,24 +41,23 @@ not call a provider, run a command, write a credential or setting, start the
 daemon, or change hooks.
 
 One final approval covers every displayed endpoint, diff-egress permission,
-verification command, and repair permission. Configure tests the provider
-before any write. Event Fast activates immediately. Intent setup saves the
-credential and settings, atomically creates one revision, activation request,
-and validation job, then returns while validation runs in the background.
-Capture remains active, but replay and repair stay blocked until validation
-passes.
+and repair permission. Repository Strict Review additionally includes its
+exact verification command. Configure tests the provider before any write.
+Global setup saves no runtime revision and starts no daemon. Repository
+Everyday and Maximum Speed activate immediately; Strict Review atomically
+creates one revision, activation request, and validation job, then returns
+while validation runs in the background.
 
-Regular setup never asks the user to invent a shell command. Balanced and
-Quality first reuse an approved repository command, then check a repository
-manifest, Make targets, and language defaults. Everyday falls back to built-in
-structural verification when no quick command exists. Strict review is
-unavailable when no full command can be detected; custom commands belong in
-`acd settings`.
+Regular setup never asks the user to invent a shell command. Everyday always
+uses built-in structural verification. Repository Strict Review first reuses
+an approved full command, then checks a repository manifest, Make targets, and
+language defaults. Strict Review is unavailable when no full command can be
+detected; custom commands belong in `acd settings`.
 
-Use `acd configure --wait` to stream the same durable job until it passes,
-fails, or times out. Re-running configure resumes a queued job or offers to
-retry the exact failed check, switch experience, open advanced settings, or
-leave capture-only state unchanged.
+Use `acd configure --repo . --wait` with Strict Review to stream the durable
+job until it passes, fails, or times out. Re-running repository configuration
+resumes a queued job or offers to retry the exact failed check, switch
+experience, open advanced settings, or leave capture-only state unchanged.
 
 Use `acd settings` for advanced overrides, profiles, experiments, and revision
 recovery. Its first action is **Change strategy or preset**, followed by
@@ -73,7 +81,7 @@ already activated revision.
 | Event | Balanced | Immediate commits with a tested provider, redacted diff context, five recent commits, and one locked message rewrite. |
 | Event | Quality | Immediate commits with ten recent commits, stricter message validation, and two rewrite attempts. |
 | Intent | Fast | Ten-capture evaluations, 10-second quiet time, 90-second maximum wait, structural gates, and no command verification or repair. |
-| Intent | Balanced | Twenty-capture evaluations, 30-second quiet time, three-minute maximum wait, fast verification, and repair of up to three commits within ten minutes. |
+| Intent | Balanced | Twenty-capture evaluations, 30-second quiet time, three-minute maximum wait, structural verification, and repair of up to three commits within ten minutes. |
 | Intent | Quality | Thirty-capture evaluations, 60-second quiet time, ten-minute maximum wait, full verification, and repair of up to five commits within thirty minutes. |
 
 Intent defaults to Balanced. Event defaults to Fast. Changing a preset-owned
@@ -234,23 +242,24 @@ content.
 
 ## Approve candidate verification
 
-Balanced uses a detected quick command when one exists. If it does not,
-Everyday uses the built-in structural and materialization gates. Quality
-requires an exact repository-scoped full command. Configure cannot activate a
-detected command until it shows the complete command and receives approval.
+Balanced uses the built-in structural and materialization gates and does not
+run a project command. Quality requires an exact repository-scoped full
+command. Configure cannot activate a detected command until it shows the
+complete command and receives approval.
 
 | Mode | Preset | Default timeout |
 |---|---|---:|
 | `none` | Intent Fast | No command |
-| `structural` | Intent Balanced fallback | No shell command |
-| `fast` | Intent Balanced | 2 minutes |
+| `structural` | Intent Balanced | No shell command |
+| `fast` | Advanced repository override | 2 minutes |
 | `full` | Intent Quality | 10 minutes |
 
 ACD runs the approved command on the exact candidate tree in an ephemeral
 detached worktree. Output is bounded, and only the final sanitized 64 KiB can be
-retained. Failure or timeout leaves the candidate pending and reports
-`needs_attention`; it never forces publication. Switch to Intent Fast through
-`acd configure` to remove command verification.
+retained. Under Strict Review, failure or timeout leaves the candidate pending
+and reports `needs_attention`; it never forces publication. Switch that
+repository to Everyday with `acd configure --repo .` to remove command
+verification.
 
 ## Run a bounded experiment
 

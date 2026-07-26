@@ -33,33 +33,33 @@ overrides. See [Configure ACD](settings.md).
 
 ## Configure ACD
 
-`acd configure` offers Everyday work, Maximum speed, and Strict review, then
-shows one final approval. It reuses valid provider details. A fresh or
-incomplete OpenAI-compatible setup asks for the endpoint and model, plus a
-masked API key when no credential exists. The final review includes the model,
-endpoint, verification source, exact command, and repair policy.
+Bare `acd configure` saves global defaults. It offers Everyday work and
+Maximum speed, then shows one final approval. It reuses valid provider details.
+A fresh or incomplete OpenAI-compatible setup asks for the endpoint and model,
+plus a masked API key when no credential exists. Global setup never detects or
+runs a project command.
 
 ~~~bash
 acd configure
-acd configure --wait
 acd configure --accessible
 acd configure --strategy intent --preset balanced
+acd configure --repo .
+acd configure --repo . --strategy intent --preset quality --wait
 acd configure --dry-run --json
 ~~~
 
 Dry-run performs no provider call, command execution, credential or settings
 write, daemon start, or hook change.
 
-After approval, configure tests the provider before any write. Event Fast
-activates immediately. Intent setup creates one immutable runtime revision and
-durable background validation job. Capture remains active while replay and
-repair wait for that job. The normal command returns after the job is queued;
-`--wait` follows it to a terminal result.
+After approval, global configure tests the provider before any write, saves
+global defaults, and does not open repository state or start a daemon. Running
+repositories keep their immutable active revision.
 
-The regular wizard does not request free-form shell input. It reuses an
-approved repository command or detects quick and full project checks
-separately. Everyday can use built-in structural verification. Strict review
-requires a detected full command. Custom commands remain an advanced
+An explicit `--repo` enables repository setup and adds Strict Review.
+Repository Everyday and Maximum Speed run no project tests. Strict Review
+reuses or detects an approved full command, queues a durable background
+validation job, and blocks publication while capture continues. `--wait`
+follows only that strict job. Custom commands remain an advanced
 `acd settings` action.
 
 `acd settings` opens the advanced terminal settings lab:

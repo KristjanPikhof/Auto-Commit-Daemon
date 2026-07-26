@@ -19,9 +19,9 @@ Read-only commands do not migrate the database.
 
 | Existing repository | Migrated mode |
 |---|---|
-| Event without an explicit preset | `event.fast@2` |
+| Event without an explicit preset | Current `event.fast@3` |
 | Event with explicit compatible settings | Event plus the inferred or selected preset |
-| Intent | `intent.balanced@2` |
+| Intent | Current `intent.balanced@3` |
 
 Existing provider, model, endpoint, timeout, commit format, and explicit v1
 intent tuning remain advanced overrides. A differing preset-owned override
@@ -29,8 +29,8 @@ marks the result `Balanced (customized)`.
 
 ## Resolve migration attention
 
-Intent v2 requires a tested provider, redacted diff context, and an approved
-fast verification command or built-in structural gate for Balanced. If any
+Intent v2 requires a tested provider, redacted diff context, and built-in
+structural verification for Balanced. If any
 prerequisite is missing, ACD
 continues capturing changes but stops replay:
 
@@ -45,9 +45,10 @@ Resolve the complete configuration in one guided transaction:
 acd configure
 ~~~
 
-The wizard shows the exact diff-egress policy and verification command before
-activation. It tests both, stores an optional protected credential, writes one
-immutable runtime revision, and enables the daemon.
+Global setup shows the exact diff-egress policy, tests the provider, and stores
+an optional protected credential without opening repository state. Use
+`acd configure --repo .` when a migrated repository needs an override or
+Strict Review command.
 
 Do not work around the gate by clearing diff consent or relying on v1
 environment-only grouping. Metadata-only Intent v2 is unsupported in regular
@@ -74,9 +75,9 @@ private-history, exact-HEAD, staging, Git-operation, atomicity, and verification
 checks documented in [Intent commit flow](intent-commit-flow.md).
 
 To disable automatic repair without weakening the other Balanced gates, use
-the advanced settings editor and customize `intent.repair.enabled`. To remove
-command verification, switch to Fast through `acd configure`; do not blank the
-Balanced verification command.
+the advanced settings editor and customize `intent.repair.enabled`. Balanced
+has no project command. Switch a Strict Review repository back to Everyday
+through `acd configure --repo .` to remove full command verification.
 
 ## Roll back safely
 
