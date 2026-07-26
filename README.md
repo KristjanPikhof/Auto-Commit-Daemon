@@ -111,50 +111,76 @@ acd doctor
 
 `doctor` checks that the installed snippet still matches the current template.
 
-## Configure commit behavior
+## Configure ACD
 
-Configure provider and commit defaults once for your user account:
+Start with global setup. Use repository setup when one project needs different
+behavior, already has an override, or should run Strict Review.
+
+| What you want | Command | Result |
+|---|---|---|
+| Set defaults for your account and future repositories | `acd configure` | Saves global provider and commit defaults. It does not open repository state, run project tests, or start a daemon. |
+| Configure the current repository | `acd configure --repo .` | Saves a repository override, creates its runtime revision, and enables ACD for that repository. |
+| Require the repository's full test suite | `acd configure --repo .` and select Strict Review | Detects and displays the exact command, then queues it as a background activation check. |
+
+Global settings do not overwrite existing repository overrides. If a
+repository still uses an old mode or verification command, run
+`acd configure --repo .` inside that repository and select the behavior you
+want.
+
+### Global setup
+
+Run this once, from any directory:
 
 ~~~bash
 acd configure
 ~~~
 
-Global setup offers Everyday work and Maximum speed. Everyday is the
-recommended default and maps to Intent Balanced with ACD's internal structural
-and materialization checks. It never detects or runs project tests. Existing
-provider, model, endpoint, timeout, and credential values are reused when
-valid. A fresh OpenAI-compatible setup asks for the endpoint, model, and masked
-API key, then shows those exact values in the final review.
+1. Choose Everyday work or Maximum speed. Everyday work is the recommended
+   default.
+2. Enter the provider, endpoint, model, or API key if ACD does not already have
+   valid values.
+3. Review the endpoint, diff context, and repair permissions.
+4. Approve the preview to save the global defaults.
 
-One approval covers the displayed endpoint, diff context, and repair
-permissions. The provider test runs before any write. Global setup saves no
-repository state, starts no daemon, and does not fan changes out to already
-running repositories.
+Everyday work uses Intent Balanced with ACD's structural and materialization
+checks. It does not detect or run project tests. Global setup tests the
+provider with synthetic content before it writes the credential or settings.
 
-Strict Review is an explicit repository configuration because a repository
-controls the command it executes:
+### Repository setup
+
+Run this from the repository you want to configure:
 
 ~~~bash
 acd configure --repo .
 ~~~
 
-Only Strict Review detects and approves a full project test command. A failed
-test keeps capture active and the candidate pending without changing the live
-worktree, index, or HEAD.
+Choose one of these options:
 
-Preview the default or preselect a mode without making calls or writes:
+| Experience | Behavior |
+|---|---|
+| Everyday work | Intent Balanced with internal structural checks. No project test command runs. |
+| Maximum speed | Event Fast with immediate commits and no project checks. |
+| Strict Review | Intent Quality. ACD displays the detected full test command and asks for approval before queueing it. |
+
+Strict Review keeps capture active while the test runs. A failed test leaves
+the candidate pending and does not change the live worktree, index, or HEAD.
+Use `--wait` if you want the terminal to follow the queued test:
 
 ~~~bash
-acd configure --dry-run
-acd configure --strategy intent --preset balanced
-acd configure --accessible
 acd configure --repo . --strategy intent --preset quality --wait
 ~~~
 
-Use `--wait` only with repository Strict Review when you want the terminal to
-follow its queued validation. Re-running the same repository configuration
-resumes or retries unfinished strict validation without discarding the
-reviewed revision.
+### Preview setup
+
+Preview the defaults or a selected mode without provider calls, commands, or
+writes:
+
+~~~bash
+acd configure --dry-run
+acd configure --strategy intent --preset balanced --dry-run
+acd configure --repo . --dry-run
+acd configure --repo . --strategy intent --preset quality --dry-run --json
+~~~
 
 Use `acd settings` after onboarding for profiles, experiments, and advanced
 field overrides. See the [settings guide](docs/settings.md) for authoring
