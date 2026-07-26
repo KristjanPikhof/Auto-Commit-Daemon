@@ -56,6 +56,9 @@ type Snapshot struct {
 	DaemonRunning           bool
 	Experiment              *ExperimentSnapshot
 	Profiles                []string
+	PresetID                string
+	PresetVersion           int
+	PresetCustomized        bool
 }
 
 // Snapshot projects authoring and runtime state without writing config or DB.
@@ -99,7 +102,8 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 			return Snapshot{}, errors.New("acd settings: applied revision is unreadable")
 		}
 		for name, value := range raw {
-			if name == "confirmations" {
+			if name == "confirmations" || name == "preset_id" ||
+				name == "preset_version" || name == "customized" {
 				continue
 			}
 			var text string
@@ -108,31 +112,40 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 			}
 		}
 	}
+	currentInput := config.ResolveInput{
+		Repository: repositoryFields, Profile: profileFields, Global: doc.Settings.Global,
+		LookupEnv: s.lookupEnv,
+	}
+	var selectedScope config.Overrides
+	switch scope {
+	case ScopeRepository:
+		selectedScope = repositoryFields
+	case ScopeProfile:
+		selectedScope = profileFields
+	case ScopeGlobal:
+		selectedScope = doc.Settings.Global
+	}
+	resolvedFields, preset, err := config.ResolveAll(currentInput, selectedScope)
+	if err != nil {
+		return Snapshot{}, sanitizeError(err)
+	}
+	inheritedInput := currentInput
+	switch scope {
+	case ScopeRepository:
+		inheritedInput.Repository = nil
+	case ScopeProfile:
+		inheritedInput.Profile = nil
+	case ScopeGlobal:
+		inheritedInput.Global = nil
+	}
+	inheritedFields, _, err := config.ResolveAll(inheritedInput, nil)
+	if err != nil {
+		return Snapshot{}, sanitizeError(err)
+	}
 	fields := make([]FieldSnapshot, 0, len(config.Catalog()))
 	for _, field := range config.Catalog() {
-		resolved, err := config.ResolveField(field.Name, config.ResolveInput{
-			Repository: repositoryFields, Profile: profileFields, Global: doc.Settings.Global,
-			LookupEnv: s.lookupEnv,
-		})
-		if err != nil {
-			return Snapshot{}, sanitizeError(err)
-		}
-		inheritedInput := config.ResolveInput{
-			Repository: repositoryFields, Profile: profileFields,
-			Global: doc.Settings.Global, LookupEnv: s.lookupEnv,
-		}
-		switch scope {
-		case ScopeRepository:
-			inheritedInput.Repository = nil
-		case ScopeProfile:
-			inheritedInput.Profile = nil
-		case ScopeGlobal:
-			inheritedInput.Global = nil
-		}
-		inherited, err := config.ResolveField(field.Name, inheritedInput)
-		if err != nil {
-			return Snapshot{}, sanitizeError(err)
-		}
+		resolved := resolvedFields[field.Name]
+		inherited := inheritedFields[field.Name]
 		item := FieldSnapshot{Name: field.Name, DraftValue: cleanText(resolved.Value),
 			ActiveValue: cleanText(activeValues[field.Name]), Source: resolved.Source,
 			Boundary: field.Boundary, Sensitive: field.Sensitive, Persistable: field.Persistable,
@@ -168,6 +181,7 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	}
 	sort.Strings(profiles)
 	out := Snapshot{Scope: scope, Profile: activeProfile, RepoHash: s.repoHash, Profiles: profiles,
+		PresetID: preset.ID(), PresetVersion: preset.Version(), PresetCustomized: preset.Customized,
 		SavedGeneration: doc.Generation, Fields: fields,
 		DesiredRevisionID:       nullableValue(runtimeState.DesiredRevisionID),
 		AppliedRevisionID:       nullableValue(runtimeState.AppliedRevisionID),

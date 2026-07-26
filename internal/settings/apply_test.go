@@ -182,6 +182,43 @@ func TestSettingsActionApplyRequiresTypedRiskConfirmations(t *testing.T) {
 	}
 }
 
+func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
+	}, nil)
+	draft := map[string]string{
+		config.FieldCommitStrategy:          "intent",
+		config.FieldCommitPreset:            "balanced",
+		config.FieldProvider:                "openai-compat",
+		config.FieldVerificationFastCommand: "go test ./...",
+	}
+	all := []ai.ConfirmationRequirement{
+		ai.ConfirmationDiffEgress,
+		ai.ConfirmationVerificationCommand,
+		ai.ConfirmationIntentRepair,
+	}
+	validation, tested := testedDraft(t, svc, draft, all)
+	_, err := svc.Apply(context.Background(), ApplyRequest{
+		Values: draft, TestedFingerprint: tested.Fingerprint,
+		ExpectedGeneration: validation.SourceGeneration,
+		Confirmations:      []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress},
+	})
+	var confirmationErr *ConfirmationRequiredError
+	if !errors.As(err, &confirmationErr) || !reflect.DeepEqual(confirmationErr.Missing,
+		[]ai.ConfirmationRequirement{
+			ai.ConfirmationVerificationCommand,
+			ai.ConfirmationIntentRepair,
+		}) {
+		t.Fatalf("Apply confirmation error = %v", err)
+	}
+}
+
 func TestSettingsActionRevertCreatesNewKnownGoodRevision(t *testing.T) {
 	svc, _ := testService(t, nil, nil, nil)
 	ctx := context.Background()

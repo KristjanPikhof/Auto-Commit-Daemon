@@ -15,8 +15,14 @@ import (
 
 func TestSettingsExperimentLifecycleIsBoundedAndIdempotent(t *testing.T) {
 	var nudges atomic.Int32
-	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 	}, func(context.Context, state.DaemonState) error { nudges.Add(1); return nil })
 	ctx := context.Background()
 	baseline := insertRevision(t, svc, "baseline", 0)
@@ -26,9 +32,17 @@ func TestSettingsExperimentLifecycleIsBoundedAndIdempotent(t *testing.T) {
 	}
 	_, _ = state.AcknowledgeConfigActivation(ctx, svc.db, request.ID, baseline.ID)
 	_, _ = state.ApplyConfigActivation(ctx, svc.db, request.ID, baseline.ID)
-	draft := map[string]string{config.FieldModel: "candidate", config.FieldCommitStrategy: string(ai.CommitStrategyIntent)}
-	validation, tested := testedDraft(t, svc, draft, nil)
+	draft := map[string]string{
+		config.FieldModel: "candidate", config.FieldCommitStrategy: string(ai.CommitStrategyIntent),
+		config.FieldProvider: "openai-compat", config.FieldVerificationFastCommand: "go test ./...",
+	}
+	confirmations := []ai.ConfirmationRequirement{
+		ai.ConfirmationDiffEgress, ai.ConfirmationVerificationCommand,
+		ai.ConfirmationIntentRepair,
+	}
+	validation, tested := testedDraft(t, svc, draft, confirmations)
 	started, err := svc.StartExperiment(ctx, ExperimentRequest{Values: draft,
+		Confirmations:     confirmations,
 		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration,
 		ExpectedDesiredRevision: baseline.ID, WindowBudget: 10,
 		ExpiresAt: time.Now().Add(time.Hour), FailurePolicy: ExperimentPolicyRevert})
@@ -56,6 +70,7 @@ WHERE s.desired_revision_id=? AND NOT EXISTS (
 	}
 	_, err = svc.Apply(ctx, ApplyRequest{
 		Values: draft, TestedFingerprint: tested.Fingerprint,
+		Confirmations:           confirmations,
 		ExpectedGeneration:      validation.SourceGeneration,
 		ExpectedDesiredRevision: started.Candidate.RevisionID,
 	})

@@ -16,6 +16,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -227,6 +228,87 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 	validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials})
 	if err != nil || validation.Fingerprint == result.Fingerprint {
 		t.Fatalf("provider edit did not invalidate fingerprint: %+v %v", validation, err)
+	}
+}
+
+func TestSettingsIntentPresetMaterializesRevisionMetadata(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, nil, nil)
+	draft := map[string]string{
+		config.FieldCommitStrategy:          "intent",
+		config.FieldCommitPreset:            "balanced",
+		config.FieldProvider:                "openai-compat",
+		config.FieldVerificationFastCommand: "go test ./...",
+	}
+	validation, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.Preset.Reference() != "intent.balanced@2" || validation.Preset.Customized {
+		t.Fatalf("preset = %+v", validation.Preset)
+	}
+	if validation.ResolvedHot[config.FieldIntentWindow] != "20" ||
+		validation.ResolvedHot[config.FieldIntentVerification] != "fast" ||
+		validation.ResolvedHot[config.FieldIntentRepairEnabled] != "true" ||
+		validation.ResolvedHot[config.FieldDiffEgress] != "true" {
+		t.Fatalf("balanced values = %#v", validation.ResolvedHot)
+	}
+	body, err := revisionSnapshotJSON(validation.ResolvedHot, nil, validation.Preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["preset_id"] != "intent.balanced" ||
+		payload["preset_version"] != float64(2) || payload["customized"] != false {
+		t.Fatalf("revision metadata = %#v", payload)
+	}
+
+	draft[config.FieldIntentWindow] = "21"
+	custom, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !custom.Preset.Customized || custom.Fingerprint == validation.Fingerprint {
+		t.Fatalf("custom preset = %+v fingerprints=%q/%q",
+			custom.Preset, validation.Fingerprint, custom.Fingerprint)
+	}
+}
+
+func TestSettingsProviderUsesProtectedCredentialBelowEnvironment(t *testing.T) {
+	var gotKeys []string
+	probe := func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		gotKeys = append(gotKeys, cfg.APIKey)
+		return ai.ProviderProbeResult{Provider: cfg.Mode, Success: true}, nil
+	}
+	environmentKey := ""
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey && environmentKey != "" {
+			return environmentKey, true
+		}
+		return "", false
+	}
+	svc, roots := testService(t, lookup, probe, nil)
+	if err := credentials.NewStore(roots).Set("sk-protected"); err != nil {
+		t.Fatal(err)
+	}
+	draft := map[string]string{config.FieldProvider: "openai-compat"}
+	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
+		t.Fatal(err)
+	}
+	environmentKey = "sk-environment"
+	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotKeys, []string{"sk-protected", "sk-environment"}) {
+		t.Fatalf("provider keys = %v", gotKeys)
 	}
 }
 

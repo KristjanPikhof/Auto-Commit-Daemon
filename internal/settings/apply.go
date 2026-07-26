@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -76,7 +77,7 @@ func (s *Service) prepareRevision(ctx context.Context, req ApplyRequest) (state.
 	if req.ExpectedGeneration > math.MaxInt64 {
 		return state.ConfigRevision{}, errors.New("acd settings: saved generation is out of range")
 	}
-	body, err := revisionSnapshotJSON(validation.ResolvedHot, req.Confirmations)
+	body, err := revisionSnapshotJSON(validation.ResolvedHot, req.Confirmations, validation.Preset)
 	if err != nil {
 		return state.ConfigRevision{}, err
 	}
@@ -176,7 +177,7 @@ func (s *Service) rejectWhileExperimentActive(ctx context.Context) error {
 	return nil
 }
 
-func revisionSnapshotJSON(values map[string]string, confirmations []ai.ConfirmationRequirement) ([]byte, error) {
+func revisionSnapshotJSON(values map[string]string, confirmations []ai.ConfirmationRequirement, presets ...config.PresetResolution) ([]byte, error) {
 	payload := make(map[string]any, len(values))
 	for key, value := range values {
 		payload[key] = value
@@ -187,6 +188,11 @@ func revisionSnapshotJSON(values map[string]string, confirmations []ai.Confirmat
 	}
 	sort.Strings(consents)
 	payload["confirmations"] = consents
+	if len(presets) > 0 {
+		payload["preset_id"] = presets[0].ID()
+		payload["preset_version"] = presets[0].Version()
+		payload["customized"] = presets[0].Customized
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("acd settings: encode runtime snapshot: %w", err)

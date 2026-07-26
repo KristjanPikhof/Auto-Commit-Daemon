@@ -28,23 +28,32 @@ const (
 )
 
 const (
-	FieldProvider             = "ai.provider"
-	FieldBaseURL              = "ai.base_url"
-	FieldAPIKey               = "ai.api_key"
-	FieldModel                = "ai.model"
-	FieldTimeout              = "ai.timeout"
-	FieldCAFile               = "ai.ca_file"
-	FieldDiffEgress           = "ai.diff_egress"
-	FieldCommitStrategy       = "commit.strategy"
-	FieldCommitFormat         = "commit.format"
-	FieldIntentWindow         = "intent.window"
-	FieldIntentMinPending     = "intent.min_pending"
-	FieldIntentSettleWindow   = "intent.settle_window"
-	FieldIntentMaxPendingAge  = "intent.max_pending_age"
-	FieldIntentRecentCommits  = "intent.recent_commits"
-	FieldIntentDeferLimit     = "intent.defer_limit"
-	FieldIntentRetryOnInvalid = "intent.retry_on_invalid"
-	FieldIntentPathCoalescing = "intent.path_coalescing"
+	FieldProvider                = "ai.provider"
+	FieldBaseURL                 = "ai.base_url"
+	FieldAPIKey                  = "ai.api_key"
+	FieldModel                   = "ai.model"
+	FieldTimeout                 = "ai.timeout"
+	FieldCAFile                  = "ai.ca_file"
+	FieldDiffEgress              = "ai.diff_egress"
+	FieldCommitStrategy          = "commit.strategy"
+	FieldCommitPreset            = "commit.preset"
+	FieldCommitFormat            = "commit.format"
+	FieldIntentWindow            = "intent.window"
+	FieldIntentMinPending        = "intent.min_pending"
+	FieldIntentSettleWindow      = "intent.settle_window"
+	FieldIntentMaxPendingAge     = "intent.max_pending_age"
+	FieldIntentRecentCommits     = "intent.recent_commits"
+	FieldIntentDeferLimit        = "intent.defer_limit"
+	FieldIntentRetryOnInvalid    = "intent.retry_on_invalid"
+	FieldIntentPathCoalescing    = "intent.path_coalescing"
+	FieldIntentRepairEnabled     = "intent.repair.enabled"
+	FieldIntentRepairHorizon     = "intent.repair.horizon"
+	FieldIntentRepairMaxCommits  = "intent.repair.max_commits"
+	FieldIntentVerification      = "intent.verification"
+	FieldVerificationFastCommand = "verification.fast.command"
+	FieldVerificationFastTimeout = "verification.fast.timeout"
+	FieldVerificationFullCommand = "verification.full.command"
+	FieldVerificationFullTimeout = "verification.full.timeout"
 )
 
 type FieldDefinition struct {
@@ -54,6 +63,7 @@ type FieldDefinition struct {
 	Kind         ValueKind
 	Choices      []string
 	Minimum      int64
+	Maximum      int64
 	AllowZero    bool
 	PlainSeconds bool
 	Boundary     ApplyBoundary
@@ -70,6 +80,7 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldCAFile, Environment: "ACD_AI_CA_FILE", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldDiffEgress, Environment: "ACD_AI_DIFF_EGRESS", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitStrategy, Environment: "ACD_COMMIT_STRATEGY", Default: "event", Kind: KindString, Choices: []string{"event", "intent"}, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldCommitPreset, Environment: "ACD_COMMIT_PRESET", Default: "fast", Kind: KindString, Choices: []string{"fast", "balanced", "quality"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitFormat, Environment: "ACD_COMMIT_FORMAT", Default: "imperative", Kind: KindString, Choices: []string{"imperative", "conventional"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentWindow, Environment: "ACD_INTENT_WINDOW", Default: "10", Kind: KindInteger, Minimum: 1, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentMinPending, Environment: "ACD_INTENT_MIN_PENDING", Default: "10", Kind: KindInteger, Minimum: 1, Boundary: ApplyHot, Persistable: true},
@@ -79,6 +90,14 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldIntentDeferLimit, Environment: "ACD_INTENT_DEFER_LIMIT", Default: "1", Kind: KindInteger, AllowZero: true, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentRetryOnInvalid, Environment: "ACD_INTENT_RETRY_ON_INVALID", Default: "2", Kind: KindInteger, AllowZero: true, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentPathCoalescing, Environment: "ACD_INTENT_PATH_COALESCE", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentRepairEnabled, Environment: "ACD_INTENT_REPAIR_ENABLED", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentRepairHorizon, Environment: "ACD_INTENT_REPAIR_HORIZON", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentRepairMaxCommits, Environment: "ACD_INTENT_REPAIR_MAX_COMMITS", Default: "3", Kind: KindInteger, Minimum: 1, Maximum: 5, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: "none", Kind: KindString, Choices: []string{"none", "fast", "full"}, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationFastCommand, Environment: "ACD_VERIFICATION_FAST_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationFastTimeout, Environment: "ACD_VERIFICATION_FAST_TIMEOUT", Default: "2m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationFullCommand, Environment: "ACD_VERIFICATION_FULL_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationFullTimeout, Environment: "ACD_VERIFICATION_FULL_TIMEOUT", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: "capture.max_file_bytes", Environment: "ACD_MAX_FILE_BYTES", Default: "5242880", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.max_pending_events", Environment: "ACD_MAX_PENDING_EVENTS", Default: "50000", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.sensitive_globs", Environment: "ACD_SENSITIVE_GLOBS", Kind: KindString, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
@@ -112,6 +131,7 @@ const (
 	SourceProfile     Source = "profile"
 	SourceGlobal      Source = "global"
 	SourceEnvironment Source = "environment"
+	SourcePreset      Source = "preset"
 	SourceDefault     Source = "default"
 )
 
@@ -120,6 +140,7 @@ type ResolveInput struct {
 	Repository Overrides
 	Profile    Overrides
 	Global     Overrides
+	Preset     Overrides
 	LookupEnv  func(string) (string, bool)
 }
 
@@ -181,6 +202,16 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 				Source: SourceEnvironment, effectiveValue: value,
 			}, nil
 		}
+	}
+	if raw, exists := input.Preset[name]; exists {
+		value, err := validateRaw(field, raw, true)
+		if err != nil {
+			return ResolvedField{}, err
+		}
+		return ResolvedField{
+			Definition: field, Value: displayValue(field, value),
+			Source: SourcePreset, effectiveValue: value,
+		}, nil
 	}
 	value, err := normalizeValue(field, field.Default)
 	if err != nil {
@@ -332,6 +363,9 @@ func normalizeValue(field FieldDefinition, raw string) (string, error) {
 		n, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || n < field.Minimum || (n == 0 && !field.AllowZero && field.Minimum == 0) {
 			return "", fmt.Errorf("field %q requires an integer >= %d", field.Name, field.Minimum)
+		}
+		if field.Maximum > 0 && n > field.Maximum {
+			return "", fmt.Errorf("field %q requires an integer <= %d", field.Name, field.Maximum)
 		}
 		return strconv.FormatInt(n, 10), nil
 	case KindDuration:

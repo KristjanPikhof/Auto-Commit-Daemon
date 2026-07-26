@@ -190,6 +190,8 @@ const (
 	ConfirmationEndpointCredentials ConfirmationRequirement = "endpoint_credentials"
 	ConfirmationSubprocessExecution ConfirmationRequirement = "subprocess_execution"
 	ConfirmationDiffEgress          ConfirmationRequirement = "diff_egress"
+	ConfirmationVerificationCommand ConfirmationRequirement = "verification_command"
+	ConfirmationIntentRepair        ConfirmationRequirement = "intent_repair"
 )
 
 // ProviderValidation is the non-secret result of validating provider
