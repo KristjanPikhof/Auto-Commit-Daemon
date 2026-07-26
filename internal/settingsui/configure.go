@@ -243,7 +243,7 @@ type ConfigurePreviewApprovalOptions struct {
 
 // ConfirmConfigurePreview binds consent to the exact effective command and
 // repair policy shown in the resolved final preview.
-func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
+func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, _ bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
 	approval := ConfigurePreviewApproval{}
 	fields := make([]huh.Field, 0, 3)
 	if opts.VerificationMode != "none" {
@@ -262,11 +262,15 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 	fields = append(fields, huh.NewConfirm().Key("apply").Title(
 		"Apply this reviewed configuration, create one runtime revision, and enable ACD?").
 		Value(&approval.Apply))
-	form := huh.NewForm(huh.NewGroup(fields...))
-	if accessible || os.Getenv("NO_COLOR") != "" {
-		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
-	}
-	if err := form.WithAccessible(accessible).WithInput(input).WithOutput(output).
+
+	// The preview is already printed inline and can consume nearly the whole
+	// terminal. Starting another rich renderer below it can leave the consent
+	// fields outside a short viewport. Security-critical approvals stay
+	// line-oriented so every exact prompt remains visible and scrolls normally.
+	form := huh.NewForm(huh.NewGroup(fields...)).
+		WithTheme(huh.ThemeFunc(huh.ThemeBase)).
+		WithAccessible(true)
+	if err := form.WithInput(input).WithOutput(output).
 		WithShowHelp(true).RunWithContext(ctx); err != nil {
 		return ConfigurePreviewApproval{}, err
 	}

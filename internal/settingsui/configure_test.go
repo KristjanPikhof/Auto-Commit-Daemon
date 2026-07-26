@@ -134,7 +134,7 @@ func TestAccessibleFastToQualityResetsOnlyPresetSources(t *testing.T) {
 func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 	var out bytes.Buffer
 	approval, err := ConfirmConfigurePreview(context.Background(),
-		&bytewiseReader{r: strings.NewReader("y\ny\ny\n")}, &out, true,
+		&bytewiseReader{r: strings.NewReader("y\ny\ny\n")}, &out, false,
 		ConfigurePreviewApprovalOptions{
 			VerificationMode: "full", VerificationCommand: "make test\nunsafe",
 			RepairEnabled: true, RepairHorizon: "30m", RepairMaxCommits: "5",
@@ -150,6 +150,9 @@ func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 	}
 	if strings.Contains(view, "make test\nunsafe") {
 		t.Fatalf("unsanitized command rendered: %q", view)
+	}
+	if strings.Contains(view, "\x1b[") {
+		t.Fatalf("final approval used rich terminal rendering: %q", view)
 	}
 }
 

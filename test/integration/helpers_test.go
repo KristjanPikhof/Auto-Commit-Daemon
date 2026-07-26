@@ -462,7 +462,9 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 		t.Fatalf("start PTY command: %v", err)
 	}
 	readyDeadline := time.Now().Add(5 * time.Second)
-	for !output.contains("ACD SETTINGS") && time.Now().Before(readyDeadline) && ctx.Err() == nil {
+	for !output.contains("ACD SETTINGS") &&
+		!output.contains("Commit strategy") &&
+		time.Now().Before(readyDeadline) && ctx.Err() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if remaining := minInputDelay - time.Since(startedAt); remaining > 0 {

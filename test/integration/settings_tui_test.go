@@ -116,6 +116,59 @@ func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 	}
 }
 
+func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
+	repo := tempRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
+		[]byte("test:\n\t@true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := envWith(withIsolatedHome(t),
+		"TERM=xterm-256color",
+		"ACD_AI_API_KEY=configure-test-key",
+		"ACD_AI_BASE_URL=https://provider.example.invalid/v1",
+	)
+	bin := buildAcdBinary(t)
+
+	// Advance through the rich wizard one form at a time, approve only the
+	// preview prerequisites, then cancel when the final approval is visible.
+	input := strings.Join([]string{
+		"\r", "\r", "\r", // strategy, preset, commit format
+		"\r",             // provider
+		"\r", "\r", "\r", // model, endpoint, timeout
+		"\r",     // verification command
+		"y", "y", // diff context and custom endpoint
+		"y\n", "y\n", // exact verification and automatic repair
+		"\x03", // cancel apply without provider calls, verification, or writes
+	}, "\x00")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, input,
+		bin, "configure", "--repo", repo,
+		"--strategy", "intent", "--preset", "quality")
+	if result.ExitCode == 0 {
+		t.Fatalf("cancelled configure unexpectedly succeeded\n%s", result.Stdout)
+	}
+	previewAt := strings.Index(result.Stdout, "ACD CONFIGURE PREVIEW")
+	if previewAt < 0 {
+		t.Fatalf("configure never reached final preview\n%s", result.Stdout)
+	}
+	final := result.Stdout[previewAt:]
+	for _, want := range []string{
+		"Approve exact full verification command: make test",
+		"Approve automatic repair of eligible ACD commits",
+		"Apply this reviewed configuration",
+	} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final approval missing %q\n%s", want, final)
+		}
+	}
+	for _, rawMode := range []string{"\x1b[?25l", "\x1b[?2004h", "\x1b[?1004h"} {
+		if strings.Contains(final, rawMode) {
+			t.Errorf("final approval entered rich raw mode %q\n%q", rawMode, final)
+		}
+	}
+}
+
 func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	repo := tempRepo(t)
 	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
