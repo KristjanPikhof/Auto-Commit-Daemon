@@ -15,6 +15,17 @@
 //	            "now":"2026-04-28T12:00:00Z"}
 //	response: {"version":1,"subject":"...","body":"...","error":""}
 //
+// Intent v2 capability negotiation is deliberately asymmetric so old plugins
+// never receive an unfamiliar request:
+//   - First request: the existing version=1/request_type=intent_plan envelope.
+//   - Native-capable response: capabilities includes "intent_plan_v2".
+//   - Native request: version=2/request_type=intent_plan_v2 with
+//     planner_protocol=v2 and planner_request_v2.
+//   - Native response: version=2/planner_protocol=v2 with intent_plan_v2.
+//
+// A plugin that omits the capability stays entirely on the v1 wire protocol;
+// its valid plan is adapted by the caller and labeled v1_compat.
+//
 // The legacy snapshot daemon never shipped a subprocess provider, so the
 // canonical wire shape lives in this file (and in the docstring above) as
 // the contract every harness must speak. Diff text is empty unless the daemon
@@ -51,6 +62,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,9 +76,22 @@ const DefaultSubprocessTimeout = 30 * time.Second
 // escalate from EOF-on-stdin to SIGKILL.
 const subprocessShutdownGrace = 5 * time.Second
 
+// subprocessResponseByteCap bounds one JSONL response before decoding. It
+// matches the OpenAI-compatible response cap and prevents a faulty local
+// plugin from growing daemon memory without bound.
+const subprocessResponseByteCap = 1 << 20
+
 // pluginProtocolVersion is the integer carried in every request and
 // response. Bump when the wire shape changes incompatibly.
 const pluginProtocolVersion = 1
+
+const subprocessIntentV2Capability = "intent_plan_v2"
+
+const (
+	intentV2CapabilityUnknown int32 = iota
+	intentV2CapabilityLegacy
+	intentV2CapabilityNative
+)
 
 // LookPathFunc matches exec.LookPath's signature so tests can inject a
 // fake binary lookup without touching the real $PATH.
@@ -97,6 +122,8 @@ type SubprocessProvider struct {
 	stderr  io.Writer
 	logger  *slog.Logger
 	format  CommitFormat
+
+	intentV2Capability atomic.Int32
 
 	mu     sync.Mutex // guards plugin/closed
 	plugin *pluginSession
@@ -404,6 +431,217 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 	return plan, nil
 }
 
+// PlanIntentV2 negotiates native candidate planning with a safe v1 probe.
+// Unknown plugins first receive the exact legacy intent_plan envelope. A
+// v2-aware plugin advertises intent_plan_v2 in response capabilities, after
+// which the provider sends the version-2 request_type. Plugins that do not
+// advertise remain on the unchanged v1 wire shape and their valid response is
+// returned to the outer adapter as planner_protocol=v1_compat.
+func (p *SubprocessProvider) PlanIntentV2(ctx context.Context, plannerReq IntentPlanRequestV2) (IntentPlanV2, error) {
+	if err := ctx.Err(); err != nil {
+		return IntentPlanV2{}, err
+	}
+	if p.resolveErr != nil {
+		return IntentPlanV2{}, p.resolveErr
+	}
+	if err := ValidateIntentPlanRequestV2(plannerReq); err != nil {
+		return IntentPlanV2{}, err
+	}
+	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
+	legacyReq := LegacyIntentPlanRequest(plannerReq)
+
+	if p.intentV2Capability.Load() != intentV2CapabilityNative {
+		legacyResp, err := p.exchangeIntentV2Envelope(ctx, plannerReq, subprocessRequest{
+			Version:        pluginProtocolVersion,
+			RequestType:    "intent_plan",
+			CommitFormat:   plannerReq.CommitFormat,
+			PlannerRequest: &legacyReq,
+		}, "intent_v2_probe")
+		if err != nil {
+			return IntentPlanV2{}, err
+		}
+		if !hasSubprocessCapability(legacyResp.Capabilities, subprocessIntentV2Capability) {
+			p.intentV2Capability.Store(intentV2CapabilityLegacy)
+			return p.unsupportedIntentV2FromLegacyResponse(ctx, legacyReq, legacyResp)
+		}
+		p.intentV2Capability.Store(intentV2CapabilityNative)
+	}
+
+	req := subprocessRequest{
+		Version:          2,
+		RequestVersion:   2,
+		RequestType:      "intent_plan_v2",
+		PlannerProtocol:  IntentPlannerProtocolV2,
+		CommitFormat:     plannerReq.CommitFormat,
+		PlannerRequestV2: &plannerReq,
+	}
+	resp, err := p.exchangeIntentV2Envelope(ctx, plannerReq, req, "intent_v2")
+	if err != nil {
+		return IntentPlanV2{}, err
+	}
+
+	rawResponse, _ := json.Marshal(resp)
+	if resp.PlannerProtocol == IntentPlannerProtocolV2 {
+		if resp.Version != 2 {
+			err := v2ValidationError("", IntentAtomicityDependency,
+				"response_version_invalid", "native v2 response must use version 2")
+			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
+			return IntentPlanV2{}, err
+		}
+		if len(resp.IntentPlanV2) == 0 {
+			err := v2ValidationError("", IntentAtomicityCohesion,
+				"response_plan_missing", "native v2 response omitted intent_plan_v2")
+			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
+			return IntentPlanV2{}, err
+		}
+		plan, decodeErr := DecodeIntentPlanV2(resp.IntentPlanV2, plannerReq)
+		if decodeErr != nil {
+			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: decodeErr.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), decodeErr)
+			return IntentPlanV2{}, decodeErr
+		}
+		if err := validateNativeIntentPlanV2(plannerReq, plan); err != nil {
+			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
+			return IntentPlanV2{}, err
+		}
+		for i := range plan.Candidates {
+			plan.Candidates[i].Subject, plan.Candidates[i].Body = sanitizeSubjectBody(
+				plan.Candidates[i].Subject,
+				plan.Candidates[i].Body,
+			)
+		}
+		if err := validateNativeIntentPlanV2(plannerReq, plan); err != nil {
+			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
+			return IntentPlanV2{}, err
+		}
+		p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{
+			SelectedSeqs: candidatePlanSeqs(plan),
+		})
+		p.intentV2Capability.Store(intentV2CapabilityNative)
+		return plan, nil
+	}
+
+	p.intentV2Capability.Store(intentV2CapabilityLegacy)
+	return p.unsupportedIntentV2FromLegacyResponse(ctx, legacyReq, resp)
+}
+
+func (p *SubprocessProvider) exchangeIntentV2Envelope(
+	ctx context.Context,
+	plannerReq IntentPlanRequestV2,
+	req subprocessRequest,
+	strategy string,
+) (subprocessResponse, error) {
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return subprocessResponse{}, err
+	}
+	p.recordSubprocessRequest(ctx, body, plannerReq.CapturedDiffTransform, prompttrace.Metadata{
+		Strategy:     strategy,
+		OfferedSeqs:  offeredSeqsV2(plannerReq),
+		DiffIncluded: intentDiffIncludedV2(plannerReq),
+		DiffCap:      IntentStageDiffCap,
+	})
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	var resp subprocessResponse
+	for attempt := 0; attempt < 2; attempt++ {
+		session, acquireErr := p.acquire()
+		if acquireErr != nil {
+			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: acquireErr.Error()})
+			return subprocessResponse{}, acquireErr
+		}
+		resp, err = session.exchangeBytes(reqCtx, body)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			p.markCrashed(session)
+			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
+			return subprocessResponse{}, err
+		}
+		p.markCrashed(session)
+	}
+	if err != nil {
+		var decodeErr *subprocessResponseDecodeError
+		if errors.As(err, &decodeErr) {
+			validationErr := v2ValidationError("", IntentAtomicityCohesion,
+				"response_decode_failed", fmt.Sprintf("subprocess:%s: %v", p.name, decodeErr))
+			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{ValidationError: validationErr.Error()})
+			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(decodeErr.raw), validationErr)
+			return subprocessResponse{}, validationErr
+		}
+		p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
+		return subprocessResponse{}, err
+	}
+	if strings.TrimSpace(resp.Error) != "" {
+		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+		p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
+		return subprocessResponse{}, err
+	}
+	return resp, nil
+}
+
+func (p *SubprocessProvider) unsupportedIntentV2FromLegacyResponse(
+	ctx context.Context,
+	legacyReq IntentPlanRequest,
+	resp subprocessResponse,
+) (IntentPlanV2, error) {
+	rawResponse, _ := json.Marshal(resp)
+	legacyPlan, legacyErr := p.legacyIntentPlanFromResponse(legacyReq, resp)
+	if legacyErr != nil {
+		p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: legacyErr.Error()})
+		LogRejectedIntentPlan(ctx, p.Name(), legacyReq, string(rawResponse), legacyErr)
+		return IntentPlanV2{}, legacyErr
+	}
+	p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{
+		Subject:        legacyPlan.Subject,
+		Body:           legacyPlan.Body,
+		SelectedSeqs:   legacyPlan.SelectedSeqs,
+		DeferredSeqs:   legacyPlan.DeferredSeqs,
+		GroupingReason: legacyPlan.GroupingReason,
+	})
+	return IntentPlanV2{}, &IntentPlannerV2UnsupportedError{LegacyPlan: legacyPlan}
+}
+
+func hasSubprocessCapability(capabilities []string, capability string) bool {
+	for _, candidate := range capabilities {
+		if candidate == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *SubprocessProvider) legacyIntentPlanFromResponse(req IntentPlanRequest, resp subprocessResponse) (IntentPlan, error) {
+	plan := IntentPlan{
+		SelectedSeqs:    resp.SelectedSeqs,
+		DeferredSeqs:    resp.DeferredSeqs,
+		Subject:         resp.Subject,
+		Body:            resp.Body,
+		GroupingReason:  resp.GroupingReason,
+		DeferredReasons: resp.DeferredReasons,
+		CommitGroups:    resp.CommitGroups,
+		Source:          p.Name(),
+	}
+	if strings.TrimSpace(plan.Subject) == "" {
+		cause := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
+		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
+	}
+	plan.Subject, plan.Body = sanitizeSubjectBody(plan.Subject, plan.Body)
+	plan = NormalizeIntentPlanReasons(plan)
+	var dropped, synthesized, overlapRemoved []int64
+	plan, dropped, synthesized, overlapRemoved = NormalizeIntentPlanDeferredReasons(plan)
+	logIntentPlanNormalization(p.Name(), dropped, synthesized, overlapRemoved)
+	if err := ValidateIntentPlan(req, plan); err != nil {
+		return IntentPlan{}, err
+	}
+	return plan, nil
+}
+
 // RewriteIntentMessage asks the plugin to rewrite only subject/body for a
 // locked intent plan. The request_type keeps this distinct from intent_plan so
 // plugins cannot accidentally change grouping fields.
@@ -591,6 +829,7 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 		p.plugin = nil
 	}
 	p.mu.Unlock()
+	p.intentV2Capability.Store(intentV2CapabilityUnknown)
 	// shutdown is safe to call multiple times.
 	_ = session.shutdown(0)
 }
@@ -658,7 +897,9 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 // renames.
 type subprocessRequest struct {
 	Version               int                          `json:"version"`
+	RequestVersion        int                          `json:"request_version,omitempty"`
 	RequestType           string                       `json:"request_type,omitempty"`
+	PlannerProtocol       string                       `json:"planner_protocol,omitempty"`
 	CommitFormat          CommitFormat                 `json:"commit_format,omitempty"`
 	Path                  string                       `json:"path,omitempty"`
 	Op                    string                       `json:"op,omitempty"`
@@ -669,6 +910,7 @@ type subprocessRequest struct {
 	MultiOp               []subprocessOp               `json:"multi_op,omitempty"`
 	Now                   string                       `json:"now,omitempty"`
 	PlannerRequest        *IntentPlanRequest           `json:"planner_request,omitempty"`
+	PlannerRequestV2      *IntentPlanRequestV2         `json:"planner_request_v2,omitempty"`
 	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
 	CommitRewriteRequest  *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
 }
@@ -684,6 +926,9 @@ type subprocessOp struct {
 // subprocessResponse is the JSONL response envelope.
 type subprocessResponse struct {
 	Version         int                 `json:"version"`
+	Capabilities    []string            `json:"capabilities,omitempty"`
+	PlannerProtocol string              `json:"planner_protocol,omitempty"`
+	IntentPlanV2    json.RawMessage     `json:"intent_plan_v2,omitempty"`
 	Subject         string              `json:"subject"`
 	Body            string              `json:"body"`
 	Error           string              `json:"error"`
@@ -706,7 +951,10 @@ type pluginReply struct {
 	err  error
 }
 
-type subprocessResponseDecodeError struct{ err error }
+type subprocessResponseDecodeError struct {
+	err error
+	raw []byte
+}
 
 func (e *subprocessResponseDecodeError) Error() string {
 	if e == nil || e.err == nil {
@@ -720,6 +968,14 @@ func (e *subprocessResponseDecodeError) Unwrap() error {
 		return nil
 	}
 	return e.err
+}
+
+type subprocessResponseTooLargeError struct {
+	Limit int
+}
+
+func (e *subprocessResponseTooLargeError) Error() string {
+	return fmt.Sprintf("response exceeds %d-byte limit", e.Limit)
 }
 
 // pluginSession owns a single child process plus the goroutine that
@@ -859,15 +1115,26 @@ func (s *pluginSession) run() {
 		}
 
 		// Read one response line.
-		line, err := readLine(reader)
+		line, err := readLine(reader, subprocessResponseByteCap)
 		if err != nil {
-			req.reply <- pluginReply{err: fmt.Errorf("stdout read: %w", err)}
+			var tooLarge *subprocessResponseTooLargeError
+			if errors.As(err, &tooLarge) {
+				req.reply <- pluginReply{err: &subprocessResponseDecodeError{
+					err: err,
+					raw: append([]byte(nil), line...),
+				}}
+			} else {
+				req.reply <- pluginReply{err: fmt.Errorf("stdout read: %w", err)}
+			}
 			s.logger.Debug("plugin stdout read failed", slog.Any("err", err))
 			return
 		}
 		var resp subprocessResponse
 		if err := json.Unmarshal(line, &resp); err != nil {
-			req.reply <- pluginReply{err: &subprocessResponseDecodeError{err: err}}
+			req.reply <- pluginReply{err: &subprocessResponseDecodeError{
+				err: err,
+				raw: append([]byte(nil), line...),
+			}}
 			s.logger.Debug("plugin response decode failed", slog.Any("err", err), slog.Int("response_bytes", len(line)))
 			return
 		}
@@ -879,22 +1146,29 @@ func (s *pluginSession) run() {
 // reader, returning the bytes without the trailing newline. EOF before any
 // newline is reported as io.ErrUnexpectedEOF when partial data was read,
 // or io.EOF when the stream was empty.
-func readLine(r *bufio.Reader) ([]byte, error) {
+func readLine(r *bufio.Reader, limit int) ([]byte, error) {
+	if limit <= 0 {
+		return nil, &subprocessResponseTooLargeError{Limit: limit}
+	}
 	var out []byte
 	for {
 		chunk, err := r.ReadSlice('\n')
-		if len(chunk) > 0 {
-			// ReadSlice's buffer is reused; copy before continuing.
-			cp := make([]byte, len(chunk))
-			copy(cp, chunk)
-			out = append(out, cp...)
-		}
-		if err == nil {
-			// Strip trailing \n (and \r if present).
-			out = out[:len(out)-1]
-			if n := len(out); n > 0 && out[n-1] == '\r' {
-				out = out[:n-1]
+		complete := err == nil
+		if complete {
+			chunk = chunk[:len(chunk)-1]
+			if n := len(chunk); n > 0 && chunk[n-1] == '\r' {
+				chunk = chunk[:n-1]
 			}
+		}
+		if len(chunk) > 0 {
+			remaining := limit - len(out)
+			if len(chunk) > remaining {
+				out = append(out, chunk[:remaining]...)
+				return out, &subprocessResponseTooLargeError{Limit: limit}
+			}
+			out = append(out, chunk...)
+		}
+		if complete {
 			return out, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {

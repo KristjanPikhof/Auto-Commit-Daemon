@@ -231,6 +231,18 @@ type IntentPlannerV2 interface {
 	PlanIntentV2(ctx context.Context, req IntentPlanRequestV2) (IntentPlanV2, error)
 }
 
+// IntentPlannerV2UnsupportedError lets a provider probe a backward-compatible
+// wire protocol without losing a valid legacy response. The outer adapter
+// performs the v1 -> v2 conversion so callers can reliably distinguish native
+// v2 planning from planner_protocol=v1_compat.
+type IntentPlannerV2UnsupportedError struct {
+	LegacyPlan IntentPlan
+}
+
+func (e *IntentPlannerV2UnsupportedError) Error() string {
+	return "intent planner v2: provider returned a legacy v1 response"
+}
+
 // IntentPlanV2ValidationError carries bounded structural and atomicity
 // findings for a correction retry.
 type IntentPlanV2ValidationError struct {
@@ -314,9 +326,13 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 	if native, ok := planner.(IntentPlannerV2); ok {
 		plan, err := native.PlanIntentV2(ctx, req)
 		if err != nil {
-			return IntentPlanV2{}, err
+			var unsupported *IntentPlannerV2UnsupportedError
+			if !errors.As(err, &unsupported) {
+				return IntentPlanV2{}, err
+			}
+			return AdaptIntentPlanV1(req, unsupported.LegacyPlan)
 		}
-		if err := ValidateIntentPlanV2(req, plan); err != nil {
+		if err := validateNativeIntentPlanV2(req, plan); err != nil {
 			return IntentPlanV2{}, err
 		}
 		return plan, nil
@@ -330,6 +346,14 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 		return IntentPlanV2{}, err
 	}
 	return AdaptIntentPlanV1(req, legacy)
+}
+
+func validateNativeIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
+	if plan.ProtocolVersion != IntentPlannerProtocolV2 {
+		return v2ValidationError("", IntentAtomicityDependency, "native_protocol_invalid",
+			fmt.Sprintf("native provider must return protocol_version %q", IntentPlannerProtocolV2))
+	}
+	return ValidateIntentPlanV2(req, plan)
 }
 
 // LegacyIntentPlanRequest projects common fields for v1 provider compatibility.

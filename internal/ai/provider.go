@@ -204,6 +204,56 @@ func (c *composed) PlanIntent(ctx context.Context, req IntentPlanRequest) (Inten
 	return plan, nil
 }
 
+// PlanIntentV2 keeps candidate fallback policy outside the provider layer. A
+// primary transport or validation failure is returned to the candidate engine;
+// it is never converted into a deterministic success here (notably for the
+// Quality preset). Legacy primary planners are adapted and explicitly labeled
+// v1_compat.
+func (c *composed) PlanIntentV2(ctx context.Context, req IntentPlanRequestV2) (IntentPlanV2, error) {
+	if err := ctx.Err(); err != nil {
+		return IntentPlanV2{}, err
+	}
+	if err := ValidateIntentPlanRequestV2(req); err != nil {
+		return IntentPlanV2{}, err
+	}
+	recordIntentAttempt(ctx)
+	plan, err := PlanIntentV2WithCompatibility(ctx, c.primary, req)
+	if err != nil {
+		return IntentPlanV2{}, err
+	}
+	if err := ValidateIntentPlanV2(req, plan); err != nil {
+		return IntentPlanV2{}, err
+	}
+	return applyIntentV2MessageQuality(ctx, c.primary, req, plan)
+}
+
+func applyIntentV2MessageQuality(ctx context.Context, provider Provider, req IntentPlanRequestV2, plan IntentPlanV2) (IntentPlanV2, error) {
+	legacyReq := LegacyIntentPlanRequest(req)
+	out := plan
+	for i, candidate := range plan.Candidates {
+		if candidate.Readiness != IntentCandidateReady {
+			continue
+		}
+		locked := IntentPlan{
+			SelectedSeqs:   append([]int64(nil), candidate.SelectedSeqs...),
+			Subject:        candidate.Subject,
+			Body:           candidate.Body,
+			GroupingReason: candidate.GroupingReason,
+			Source:         provider.Name(),
+		}
+		checked, err := applyIntentMessageQuality(ctx, provider, legacyReq, locked)
+		if err != nil {
+			return IntentPlanV2{}, err
+		}
+		out.Candidates[i].Subject = checked.Subject
+		out.Candidates[i].Body = checked.Body
+	}
+	if err := ValidateIntentPlanV2(req, out); err != nil {
+		return IntentPlanV2{}, err
+	}
+	return out, nil
+}
+
 // logIntentPlanNormalization emits a single deterministic slog.Warn naming
 // both dropped and synthesized seqs from a NormalizeIntentPlanDeferredReasons
 // call. No-op when both lists are empty so defense-in-depth re-normalization
