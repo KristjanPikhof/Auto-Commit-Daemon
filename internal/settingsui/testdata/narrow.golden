@@ -1,6 +1,6 @@
-ACD SETTINGS  QUEUED  profile: daily
+ACD SETTINGS  QUEUED  mode: Intent Balanced  profile: daily
 ------------------------------------------------------------
-FIELD 1/29
+FIELD 1/38
 > Provider: openai-compat
 Source: environment
 Changed: no
@@ -12,4 +12,4 @@ DRAFT [yes] > TESTED [yes]
 QUEUED r8 > ACTIVE r7
 Experiment: 3/10 windows (descriptive)
 QUEUED: applies at next safe boundary
-[q] quit [j/k] nav [e] edit [s] save [t/T] test [a] ap...
+[q] quit [j/k] nav [m] mode [e] edit [s] save [t/T] te...

@@ -21,7 +21,18 @@ func (m Model) Render() string {
 	if m.Focus >= len(fields) && len(fields) > 0 {
 		m.Focus = len(fields) - 1
 	}
-	header := t.render(t.Title, "ACD SETTINGS") + "  " + lifecycle(m) + fmt.Sprintf("  profile: %s", fallback(m.Snapshot.Profile, "default"))
+	draftPreset := strings.Trim(m.Draft["commit.strategy"]+"."+m.Draft["commit.preset"], ".")
+	presetID := m.Snapshot.PresetID
+	customized := m.Snapshot.PresetCustomized
+	if m.Dirty["commit.strategy"] || m.Dirty["commit.preset"] {
+		presetID, customized = draftPreset, false
+	}
+	presetLabel := presetDisplay(fallback(presetID, draftPreset))
+	if customized {
+		presetLabel += " (customized)"
+	}
+	header := t.render(t.Title, "ACD SETTINGS") + "  " + lifecycle(m) +
+		fmt.Sprintf("  mode: %s  profile: %s", presetLabel, fallback(m.Snapshot.Profile, "default"))
 	draftRail := fmt.Sprintf("DRAFT %s > TESTED %s", mark(m.IsDirty()), mark(m.Test.OK && m.TestFingerprint == m.Fingerprint()))
 	applyRail := fmt.Sprintf("QUEUED r%d > ACTIVE r%d", m.PendingRevision, m.AppliedRevision)
 	left := []string{"FIELDS"}
@@ -113,11 +124,11 @@ func (m Model) Render() string {
 		}
 		body = strings.Join(compact, "\n")
 	}
-	footer := "[q] quit [up/down] navigate [enter] edit [/] search [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] start/cancel experiment [b/z/f] budget/expiry/policy"
+	footer := "[q] quit [up/down] navigate [enter] edit [/] search [m] strategy/preset [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] experiment"
 	if m.Width < 70 {
-		footer = "[q] quit [j/k] nav [e] edit [s] save [t/T] test [a] apply [x/X] experiment"
+		footer = "[q] quit [j/k] nav [m] mode [e] edit [s] save [t/T] test [a] apply"
 	} else if m.Width < 100 {
-		footer = "[q] quit [j/k] nav [enter] edit [/] find [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] experiment"
+		footer = "[q] quit [j/k] nav [m] strategy/preset [enter] edit [/] find [s] save [t/T] test [a] apply"
 	}
 	if m.Mode == ModeConfirmQuit {
 		footer = "Unsaved DRAFT. [d/y] discard and quit  [esc] continue editing"
@@ -136,6 +147,14 @@ func (m Model) Render() string {
 	}
 	out := header + "\n" + strings.Repeat("-", max(1, min(m.Width, 120))) + "\n" + body + "\n" + footer
 	return normalizeRender(out, m.Width, m.Height, m.noColor || m.accessible || strings.ToLower(os.Getenv("TERM")) == "dumb")
+}
+
+func presetDisplay(value string) string {
+	parts := strings.SplitN(strings.TrimSpace(value), ".", 2)
+	if len(parts) != 2 {
+		return fallback(value, "not selected")
+	}
+	return titleSetting(parts[0]) + " " + titleSetting(parts[1])
 }
 
 func columns(width int, parts ...string) string {

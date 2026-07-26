@@ -1,4 +1,4 @@
-ACD SETTINGS  QUEUED  profile: daily
+ACD SETTINGS  QUEUED  mode: Intent Balanced  profile: daily
 ------------------------------------------------------------------------------------------------------------------------
 FIELDS                                 | DETAILS                                | REVISION
 > Provider: openai-compat              | Provider                               | DRAFT [yes] > TESTED [yes]
@@ -9,6 +9,7 @@ FIELDS                                 | DETAILS                                
   API key: [set]                       | Active: deterministic                  | Experiment: 3/10 windows (descriptive)
   Diff egress: inherit                 | Draft: openai-compat                   | QUEUED: applies at next safe boundary
   Commit strategy: intent              |                                        |
+  Commit preset: balanced              |                                        |
   Commit format: inherit               |                                        |
   Intent window: inherit               |                                        |
   Minimum pending: inherit             |                                        |
@@ -18,13 +19,12 @@ FIELDS                                 | DETAILS                                
   Defer limit: inherit                 |                                        |
   Invalid retries: inherit             |                                        |
   Path coalescing: inherit             |                                        |
-  Maximum file bytes: inherit          |                                        |
-  Maximum pending events: inherit      |                                        |
-  Sensitive globs: defaults            |                                        |
-  Safe ignore: inherit                 |                                        |
-  Extra safe ignores: inherit          |                                        |
-  Filesystem notifications: inherit    |                                        |
-  Trace: inherit                       |                                        |
-  Prompt trace: [unset]                |                                        |
-  Event retention days: inherit        |                                        |
-[q] quit [up/down] navigate [enter] edit [/] search [s] save [t/T] test [a] apply [r] revert [p] profile [x/X] sta...
+  Automatic repair: inherit            |                                        |
+  Repair horizon: inherit              |                                        |
+  Repair commit limit: inherit         |                                        |
+  Intent verification: inherit         |                                        |
+  Fast verification command: inherit   |                                        |
+  Fast verification timeout: inherit   |                                        |
+  Full verification command: inherit   |                                        |
+  Full verification timeout: inherit   |                                        |
+[q] quit [up/down] navigate [enter] edit [/] search [m] strategy/preset [s] save [t/T] test [a] apply [r] revert [...

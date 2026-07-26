@@ -223,6 +223,24 @@ func (m Model) updateKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case key.Matches(msg, m.keys.Revert):
 		return m, m.start("revert", func(ctx context.Context) (any, error) { return m.backend.Revert(ctx, m.Snapshot.LastKnownGood) })
+	case key.Matches(msg, m.keys.Mode):
+		cycle := [][2]string{
+			{"intent", "balanced"}, {"intent", "fast"}, {"intent", "quality"},
+			{"event", "fast"}, {"event", "balanced"}, {"event", "quality"},
+		}
+		currentStrategy, currentPreset := m.Draft["commit.strategy"], m.Draft["commit.preset"]
+		next := cycle[0]
+		for index, candidate := range cycle {
+			if candidate[0] == currentStrategy && candidate[1] == currentPreset {
+				next = cycle[(index+1)%len(cycle)]
+				break
+			}
+		}
+		for field := range applyPresetSwitch(m.Draft, m.Snapshot.Fields, next[0], next[1]) {
+			m.Dirty[field] = true
+		}
+		m.TestFingerprint, m.Test = "", TestResult{}
+		m.Status = "MODE: " + titleSetting(next[0]) + " " + titleSetting(next[1]) + " (test before apply)"
 	case key.Matches(msg, m.keys.Experiment):
 		return m, m.start("experiment", func(ctx context.Context) (any, error) {
 			expiry := time.Duration(0)
@@ -312,6 +330,7 @@ func sanitizeSnapshot(s Snapshot) Snapshot {
 	s.PendingError = safeText(s.PendingError)
 	s.PendingStatus = safeText(s.PendingStatus)
 	s.Profile = safeText(s.Profile)
+	s.PresetID = safeText(s.PresetID)
 	for i := range s.Profiles {
 		s.Profiles[i] = safeText(s.Profiles[i])
 	}
@@ -326,6 +345,13 @@ func sanitizeSnapshot(s Snapshot) Snapshot {
 		}
 	}
 	return s
+}
+
+func titleSetting(value string) string {
+	if value == "" {
+		return ""
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
 }
 func sanitizeTest(r TestResult) TestResult {
 	r.Fingerprint = safeText(r.Fingerprint)

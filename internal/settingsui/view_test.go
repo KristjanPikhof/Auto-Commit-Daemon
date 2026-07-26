@@ -15,7 +15,7 @@ func viewModel(width, height int) Model {
 	m.Snapshot = baseSnapshot()
 	m.PendingRevision = 8
 	m.AppliedRevision = 7
-	m.Draft = map[string]string{"ai.provider": "openai-compat", "ai.model": "new-model", "ai.base_url": "https://example.invalid/v1", "commit.strategy": "intent", "capture.sensitive_globs": "defaults"}
+	m.Draft = map[string]string{"ai.provider": "openai-compat", "ai.model": "new-model", "ai.base_url": "https://example.invalid/v1", "commit.strategy": "intent", "commit.preset": "balanced", "capture.sensitive_globs": "defaults"}
 	m.Dirty = map[string]bool{"ai.model": true}
 	m.Test = TestResult{OK: true, Summary: "synthetic request passed"}
 	m.TestFingerprint = m.Fingerprint()

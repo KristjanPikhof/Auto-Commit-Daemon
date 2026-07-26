@@ -49,7 +49,9 @@ func newRootCmd() *cobra.Command {
 	cmd.AddCommand(
 		newOnCmd(),
 		newOffCmd(),
+		newConfigureCmd(),
 		newSettingsCmd(),
+		newAuthCmd(),
 		newVersionCmd(),
 		newStartCmd(),
 		newStopCmd(),
