@@ -80,6 +80,7 @@ type diagnoseReport struct {
 	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
 	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
 	RuntimeConfig              runtimeConfigReport             `json:"runtime_config"`
+	IntentV2                   intentV2Report                  `json:"intent_v2"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
@@ -195,6 +196,11 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.RuntimeConfig = runtimeConfig
+	}
+	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.IntentV2 = intentV2
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
@@ -619,6 +625,11 @@ func classifyDiagnoseError(seq int64, message string, last replayConflictMeta) s
 
 func diagnoseRemediation(report diagnoseReport) []string {
 	var remediation []string
+	if report.IntentV2.NeedsAttention != "" {
+		remediation = append(remediation,
+			"Intent v2 replay is stopped while durable capture continues: "+
+				report.IntentV2.NeedsAttention)
+	}
 	if report.Anchor.Mismatch {
 		remediation = append(remediation,
 			"Current git HEAD branch differs from the daemon anchor; switch back to the daemon branch or restart acd on the current branch.")
@@ -785,6 +796,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	}
 	renderIntentStrategyHuman(out, r.IntentStrategy)
 	renderRuntimeConfigHuman(out, r.RuntimeConfig)
+	renderIntentV2Human(out, r.IntentV2)
 
 	if r.OperationInProgress != "" {
 		stale := ""

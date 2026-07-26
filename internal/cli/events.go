@@ -33,34 +33,41 @@ var eventsWatchPollInterval = defaultEventsWatchInterval
 var eventsWatchReadyHook func()
 
 type eventsReport struct {
-	Repo    string       `json:"repo"`
-	Cursor  int64        `json:"cursor"`
-	Events  []eventEntry `json:"events"`
-	Message string       `json:"message,omitempty"`
+	Repo     string         `json:"repo"`
+	Cursor   int64          `json:"cursor"`
+	Events   []eventEntry   `json:"events"`
+	Message  string         `json:"message,omitempty"`
+	IntentV2 intentV2Report `json:"intent_v2"`
 }
 
 type eventEntry struct {
-	ID               int64                       `json:"id"`
-	Timestamp        int64                       `json:"timestamp"`
-	Time             string                      `json:"time"`
-	Kind             string                      `json:"kind"`
-	Path             string                      `json:"path,omitempty"`
-	Reason           string                      `json:"reason,omitempty"`
-	EventSeq         int64                       `json:"event_seq,omitempty"`
-	HeadSHA          string                      `json:"head_sha,omitempty"`
-	CommitOID        string                      `json:"commit_oid,omitempty"`
-	BranchRef        string                      `json:"branch_ref,omitempty"`
-	BranchGeneration int64                       `json:"branch_generation,omitempty"`
-	ActionTaken      string                      `json:"action_taken,omitempty"`
-	UserMessage      string                      `json:"user_message,omitempty"`
-	DecisionTS       float64                     `json:"decision_ts"`
-	GroupedSeqs      []int64                     `json:"grouped_seqs,omitempty"`
-	GroupSize        int                         `json:"group_size,omitempty"`
-	IntentGroup      bool                        `json:"intent_group,omitempty"`
-	PlannerWindow    *intentPlannerWindowSummary `json:"planner_window,omitempty"`
-	Deferred         bool                        `json:"deferred,omitempty"`
-	ForcedAging      bool                        `json:"forced_aging,omitempty"`
-	PlannerError     bool                        `json:"planner_error,omitempty"`
+	ID                 int64                       `json:"id"`
+	Timestamp          int64                       `json:"timestamp"`
+	Time               string                      `json:"time"`
+	Kind               string                      `json:"kind"`
+	Path               string                      `json:"path,omitempty"`
+	Reason             string                      `json:"reason,omitempty"`
+	EventSeq           int64                       `json:"event_seq,omitempty"`
+	HeadSHA            string                      `json:"head_sha,omitempty"`
+	CommitOID          string                      `json:"commit_oid,omitempty"`
+	BranchRef          string                      `json:"branch_ref,omitempty"`
+	BranchGeneration   int64                       `json:"branch_generation,omitempty"`
+	ActionTaken        string                      `json:"action_taken,omitempty"`
+	UserMessage        string                      `json:"user_message,omitempty"`
+	DecisionTS         float64                     `json:"decision_ts"`
+	GroupedSeqs        []int64                     `json:"grouped_seqs,omitempty"`
+	GroupSize          int                         `json:"group_size,omitempty"`
+	IntentGroup        bool                        `json:"intent_group,omitempty"`
+	PlannerWindow      *intentPlannerWindowSummary `json:"planner_window,omitempty"`
+	Deferred           bool                        `json:"deferred,omitempty"`
+	ForcedAging        bool                        `json:"forced_aging,omitempty"`
+	PlannerError       bool                        `json:"planner_error,omitempty"`
+	CandidateID        string                      `json:"candidate_id,omitempty"`
+	CandidateStatus    string                      `json:"candidate_status,omitempty"`
+	PlannerProtocol    string                      `json:"planner_protocol,omitempty"`
+	AtomicityStatus    string                      `json:"atomicity_status,omitempty"`
+	VerificationStatus string                      `json:"verification_status,omitempty"`
+	RepairStatus       string                      `json:"repair_status,omitempty"`
 }
 
 func newEventsCmd() *cobra.Command {
@@ -312,8 +319,13 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		if includeEnvelope {
+			intentV2, err := loadIntentV2Report(ctx, db)
+			if err != nil {
+				return fmt.Errorf("acd events: Intent v2 summary: %w", err)
+			}
 			enc.SetIndent("", "  ")
-			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor, Events: entries, Message: message})
+			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor,
+				Events: entries, Message: message, IntentV2: intentV2})
 		}
 		for _, entry := range entries {
 			if err := enc.Encode(entry); err != nil {
@@ -325,6 +337,12 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 	if includeEnvelope {
 		fmt.Fprintf(out, "Repo: %s\n", repo)
 		fmt.Fprintf(out, "Cursor: %d\n\n", cursor)
+		if intentV2, err := loadIntentV2Report(ctx, db); err != nil {
+			return fmt.Errorf("acd events: Intent v2 summary: %w", err)
+		} else {
+			renderIntentV2Human(out, intentV2)
+			fmt.Fprintln(out)
+		}
 		if len(entries) == 0 {
 			if message == "" {
 				message = "No decisions recorded yet."
@@ -364,6 +382,12 @@ func renderEventsTable(out io.Writer, entries []eventEntry) error {
 			if len(entry.PlannerWindow.HiddenSeqs) > 0 {
 				message = fmt.Sprintf("%s hidden=%s", message, formatSeqs(entry.PlannerWindow.HiddenSeqs))
 			}
+		}
+		if entry.CandidateID != "" {
+			message = fmt.Sprintf("%s candidate=%s status=%s atomicity=%s verification=%s",
+				message, entry.CandidateID, valueOrUnset(entry.CandidateStatus),
+				valueOrUnset(entry.AtomicityStatus),
+				valueOrUnset(entry.VerificationStatus))
 		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
 			entry.ID, entry.Time, entry.Kind, path, action, message)
@@ -437,6 +461,29 @@ func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) e
 	if err != nil {
 		return fmt.Errorf("acd events: intent planner window table check: %w", err)
 	}
+	hasCandidates, err := sqliteTableExists(ctx, db, "intent_candidate_events")
+	if err != nil {
+		return fmt.Errorf("acd events: Intent v2 candidate table check: %w", err)
+	}
+	hasRepairs, err := sqliteTableExists(ctx, db, "intent_repair_commits")
+	if err != nil {
+		return fmt.Errorf("acd events: Intent v2 repair table check: %w", err)
+	}
+	candidateBySeq := map[int64]eventCandidateSummary{}
+	repairByCandidate := map[string]string{}
+	if hasCandidates {
+		candidateBySeq, err = loadEventCandidateSummaries(ctx, db, entries)
+		if err != nil {
+			return err
+		}
+		if hasRepairs {
+			repairByCandidate, err = loadEventRepairSummaries(
+				ctx, db, candidateBySeq)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	for i := range entries {
 		commit := entries[i].CommitOID
 		if commit != "" {
@@ -464,8 +511,148 @@ func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) e
 			}
 			entries[i].PlannerWindow = window
 		}
+		if summary, ok := candidateBySeq[entries[i].EventSeq]; ok {
+			entries[i].CandidateID = summary.ID
+			entries[i].CandidateStatus = summary.Status
+			entries[i].PlannerProtocol = summary.Protocol
+			entries[i].AtomicityStatus = summary.Atomicity
+			entries[i].VerificationStatus = summary.Verification
+			entries[i].RepairStatus = repairByCandidate[summary.ID]
+		}
 	}
 	return nil
+}
+
+type eventCandidateSummary struct {
+	ID           string
+	Status       string
+	Protocol     string
+	Atomicity    string
+	Verification string
+}
+
+func loadEventCandidateSummaries(
+	ctx context.Context,
+	db *sql.DB,
+	entries []eventEntry,
+) (map[int64]eventCandidateSummary, error) {
+	const chunkSize = 400
+	unique := make(map[int64]struct{})
+	var seqs []int64
+	for _, entry := range entries {
+		if entry.EventSeq > 0 {
+			if _, exists := unique[entry.EventSeq]; !exists {
+				unique[entry.EventSeq] = struct{}{}
+				seqs = append(seqs, entry.EventSeq)
+			}
+		}
+	}
+	out := make(map[int64]eventCandidateSummary)
+	for start := 0; start < len(seqs); start += chunkSize {
+		end := start + chunkSize
+		if end > len(seqs) {
+			end = len(seqs)
+		}
+		args := make([]any, 0, end-start)
+		marks := make([]string, 0, end-start)
+		for _, seq := range seqs[start:end] {
+			args = append(args, seq)
+			marks = append(marks, "?")
+		}
+		rows, err := db.QueryContext(ctx, `
+SELECT ce.event_seq, c.id, c.status, c.planner_protocol,
+       c.atomicity_status, c.verification_status
+FROM intent_candidate_events ce
+JOIN intent_candidates c ON c.id=ce.candidate_id
+WHERE ce.membership_state='active' AND ce.event_seq IN (`+
+			strings.Join(marks, ",")+`)
+ORDER BY ce.event_seq, c.updated_ts DESC, c.id DESC`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query Intent v2 candidates: %w", err)
+		}
+		for rows.Next() {
+			var seq int64
+			var id, status, protocol, atomicity, verification sql.NullString
+			if err := rows.Scan(&seq, &id, &status, &protocol, &atomicity,
+				&verification); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("acd events: scan Intent v2 candidate: %w", err)
+			}
+			if _, exists := out[seq]; exists {
+				continue
+			}
+			out[seq] = eventCandidateSummary{
+				ID:           sanitizeObservabilityText(id.String),
+				Status:       sanitizeObservabilityText(status.String),
+				Protocol:     sanitizeObservabilityText(protocol.String),
+				Atomicity:    sanitizeObservabilityText(atomicity.String),
+				Verification: sanitizeObservabilityText(verification.String),
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("acd events: iterate Intent v2 candidates: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+func loadEventRepairSummaries(
+	ctx context.Context,
+	db *sql.DB,
+	candidates map[int64]eventCandidateSummary,
+) (map[string]string, error) {
+	const chunkSize = 400
+	unique := make(map[string]struct{})
+	var ids []string
+	for _, candidate := range candidates {
+		if candidate.ID != "" {
+			if _, exists := unique[candidate.ID]; !exists {
+				unique[candidate.ID] = struct{}{}
+				ids = append(ids, candidate.ID)
+			}
+		}
+	}
+	out := make(map[string]string)
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		args := make([]any, 0, end-start)
+		marks := make([]string, 0, end-start)
+		for _, id := range ids[start:end] {
+			args = append(args, id)
+			marks = append(marks, "?")
+		}
+		rows, err := db.QueryContext(ctx, `
+SELECT rc.candidate_id, r.status
+FROM intent_repair_commits rc
+JOIN intent_repairs r ON r.id=rc.repair_id
+WHERE rc.candidate_id IN (`+strings.Join(marks, ",")+`)
+ORDER BY rc.candidate_id, r.updated_ts DESC, r.id DESC`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("acd events: query Intent v2 repairs: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			var status sql.NullString
+			if err := rows.Scan(&id, &status); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("acd events: scan Intent v2 repair: %w", err)
+			}
+			if _, exists := out[id]; !exists {
+				out[id] = sanitizeObservabilityText(status.String)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("acd events: iterate Intent v2 repairs: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
 }
 
 type decisionCommitSummary struct {

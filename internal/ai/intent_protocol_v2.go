@@ -3,6 +3,8 @@ package ai
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -692,9 +694,9 @@ func AdaptIntentPlanV1(req IntentPlanRequestV2, legacy IntentPlan) (IntentPlanV2
 		return IntentPlanV2{}, err
 	}
 	plan := IntentPlanV2{ProtocolVersion: IntentPlannerProtocolV1Compat}
-	for i, group := range groups {
+	for _, group := range groups {
 		plan.Candidates = append(plan.Candidates, IntentCandidateAssignment{
-			CandidateID:    fmt.Sprintf("v1-compat-ready-%d", i+1),
+			CandidateID:    legacyCompatCandidateID(group.SelectedSeqs),
 			SelectedSeqs:   append([]int64(nil), group.SelectedSeqs...),
 			Purpose:        NormalizeIntentReason(group.GroupingReason),
 			Readiness:      IntentCandidateReady,
@@ -726,6 +728,20 @@ func AdaptIntentPlanV1(req IntentPlanRequestV2, legacy IntentPlan) (IntentPlanV2
 		return IntentPlanV2{}, fmt.Errorf("intent planner v1 compatibility: %w", err)
 	}
 	return plan, nil
+}
+
+func legacyCompatCandidateID(seqs []int64) string {
+	ordered := append([]int64(nil), seqs...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	var input strings.Builder
+	for i, seq := range ordered {
+		if i > 0 {
+			input.WriteByte(',')
+		}
+		fmt.Fprintf(&input, "%d", seq)
+	}
+	sum := sha256.Sum256([]byte(input.String()))
+	return "v1-compat-ready-" + hex.EncodeToString(sum[:12])
 }
 
 func addCompatCandidateDependencies(req IntentPlanRequestV2, plan *IntentPlanV2) {

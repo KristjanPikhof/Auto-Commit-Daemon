@@ -401,6 +401,12 @@ CREATE INDEX IF NOT EXISTS idx_intent_candidates_pair_status_updated
 CREATE INDEX IF NOT EXISTS idx_intent_candidates_published_oid
     ON intent_candidates(published_commit_oid, id);
 
+CREATE INDEX IF NOT EXISTS idx_intent_candidates_status_updated
+    ON intent_candidates(status, updated_ts DESC, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidates_updated
+    ON intent_candidates(updated_ts DESC, id);
+
 CREATE TABLE IF NOT EXISTS intent_candidate_events(
     candidate_id       TEXT NOT NULL,
     ord                INTEGER NOT NULL CHECK (ord >= 0),
@@ -484,6 +490,12 @@ CREATE INDEX IF NOT EXISTS idx_intent_repairs_pair_status_updated
 
 CREATE INDEX IF NOT EXISTS idx_intent_repairs_backup_ref
     ON intent_repairs(backup_ref, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repairs_status_updated
+    ON intent_repairs(status, updated_ts DESC, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repairs_updated
+    ON intent_repairs(updated_ts DESC, id);
 
 CREATE TABLE IF NOT EXISTS intent_repair_commits(
     repair_id           TEXT NOT NULL,

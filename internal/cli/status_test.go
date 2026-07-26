@@ -157,6 +157,150 @@ func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 	}
 }
 
+func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	snapshot, err := json.Marshal(map[string]any{
+		"preset_id":                        "intent.balanced",
+		"preset_version":                   config.PresetCatalogVersion,
+		"customized":                       true,
+		config.FieldIntentVerification:     "fast",
+		config.FieldIntentRepairEnabled:    "true",
+		config.FieldIntentRepairHorizon:    "10m",
+		config.FieldIntentRepairMaxCommits: "3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(ctx, d,
+		state.ConfigRevisionInput{
+			Snapshot: snapshot, Profile: "intent-v2", Scope: "repository",
+			SourceGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, ok, err := state.RequestConfigActivation(ctx, d, revision.ID,
+		sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request activation: ok=%v err=%v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(ctx, d, request.ID, revision.ID)
+	_, _ = state.ApplyConfigActivation(ctx, d, request.ID, revision.ID)
+
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		BaseHead: "base", Operation: "modify", Path: "service.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+		ID: "candidate-observable", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Status: state.IntentCandidateBlocked,
+		Readiness: state.IntentReadinessWait, Purpose: "one purpose",
+		PlannerProtocol:  sql.NullString{String: "v2", Valid: true},
+		AtomicityStatus:  sql.NullString{String: "invalid", Valid: true},
+		AtomicitySummary: "api_key=sk-hidden disconnected components",
+		VerificationStatus: sql.NullString{
+			String: "needs_attention", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendIntentActivityBoundary(ctx, d,
+		state.IntentActivityBoundary{
+			Kind: state.IntentBoundaryHard, Source: "logical_flush",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentRepair(ctx, d, state.IntentRepair{
+		ID: "repair-observable", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Status: state.IntentRepairPrepared,
+		ExpectedHead: "old-head", Error: "prompt=private",
+		Commits: []state.IntentRepairCommit{{OldOID: "old-head"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"intent.v2.migration_state": "active",
+		"intent.v2.needs_attention": "run acd configure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	got := report.IntentV2
+	if !got.Available || got.SchemaVersion != 15 ||
+		got.ReplayState != "needs_attention" ||
+		got.PresetID != "intent.balanced" ||
+		got.PresetVersion != config.PresetCatalogVersion ||
+		!got.Customized || got.VerificationMode != "fast" ||
+		!got.RepairEnabled || got.RepairHorizon != "10m" ||
+		got.RepairMaxCommits != 3 || got.OpenCandidates != 1 ||
+		got.BlockedCandidates != 1 || got.VerificationAttention != 1 ||
+		got.RecoverableRepairs != 1 || got.LastBoundaryEpoch != 1 ||
+		got.LatestPlannerProtocol != "v2" ||
+		got.LatestAtomicityStatus != "invalid" ||
+		got.LatestVerificationStatus != "needs_attention" ||
+		got.LatestRepairStatus != state.IntentRepairPrepared {
+		t.Fatalf("Intent v2 projection=%+v", got)
+	}
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Intent v2: needs_attention", "intent.balanced@2 customized",
+		"verification=fast", "recoverable_repairs=1",
+		"Latest candidate: status=blocked protocol=v2",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human Intent v2 output missing %q:\n%s",
+				want, human.String())
+		}
+	}
+	combined := jsonOut.String() + human.String()
+	for _, forbidden := range []string{"sk-hidden", "prompt=private"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("Intent v2 observability leaked %q:\n%s",
+				forbidden, combined)
+		}
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"intent.v2.cutover_required": "true",
+		"intent.v2.migration_state":  "needs_attention",
+		"intent.v2.needs_attention":  "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonOut.Reset()
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.IntentV2.ReplayState != "needs_attention" ||
+		!strings.Contains(report.IntentV2.NeedsAttention, "cutover") {
+		t.Fatalf("required cutover reported healthy: %+v", report.IntentV2)
+	}
+}
+
 func TestStatusRuntimeConfigPreV14MissingTablesReadOnly(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -191,6 +335,9 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 	if report.RuntimeConfig.ApplyState != "unset" || report.RuntimeConfig.DesiredRevisionID != 0 {
 		t.Fatalf("old schema runtime projection = %+v", report.RuntimeConfig)
 	}
+	if report.IntentV2.Available || report.IntentV2.SchemaVersion != 13 {
+		t.Fatalf("old schema Intent v2 projection = %+v", report.IntentV2)
+	}
 	after, _ := fileSHA256(dbPath)
 	if before != after {
 		t.Fatalf("status mutated pre-v14 DB: %s -> %s", before, after)
@@ -205,6 +352,10 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 	}
 	if diagnose.RuntimeConfig.ApplyState != "unset" || diagnose.RuntimeConfig.DesiredRevisionID != 0 {
 		t.Fatalf("old schema diagnose projection = %+v", diagnose.RuntimeConfig)
+	}
+	if diagnose.IntentV2.Available || diagnose.IntentV2.SchemaVersion != 13 {
+		t.Fatalf("old schema diagnose Intent v2 projection = %+v",
+			diagnose.IntentV2)
 	}
 	afterDiagnose, _ := fileSHA256(dbPath)
 	if before != afterDiagnose {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -119,7 +120,13 @@ func TestIntentCandidateEnginePersistsNonContiguousCandidateAcrossWindows(t *tes
 		},
 	}}
 	passMaterialization := func(context.Context, []IntentCandidateCapture) error { return nil }
-	passVerification := func(context.Context, []IntentCandidateCapture) error { return nil }
+	passVerification := func(
+		context.Context,
+		ai.IntentCandidateAssignment,
+		[]IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		return IntentCandidateVerification{Status: "passed"}, nil
+	}
 	first, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{firstA, b, secondA},
@@ -203,7 +210,13 @@ func TestIntentCandidateEngineRetriesDisconnectedGroupingWithCorrection(t *testi
 		Captures: []IntentCandidateCapture{a, b}, Planner: planner,
 		Preset:      config.PresetBalanced,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
-		Verify:      func(context.Context, []IntentCandidateCapture) error { return nil },
+		Verify: func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			return IntentCandidateVerification{Status: "passed"}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
@@ -237,9 +250,13 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 		Captures: []IntentCandidateCapture{a, b}, Planner: planner,
 		Preset:      config.PresetBalanced,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
-		Verify: func(context.Context, []IntentCandidateCapture) error {
+		Verify: func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
 			verifyCalls++
-			return nil
+			return IntentCandidateVerification{Status: "passed"}, nil
 		},
 	})
 	if err != nil {
@@ -296,9 +313,13 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 				Planner:     &intentCandidatePlannerStub{err: errors.New("provider unavailable")},
 				Preset:      tc.preset,
 				Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
-				Verify: func(context.Context, []IntentCandidateCapture) error {
+				Verify: func(
+					context.Context,
+					ai.IntentCandidateAssignment,
+					[]IntentCandidateCapture,
+				) (IntentCandidateVerification, error) {
 					verifyCalls++
-					return nil
+					return IntentCandidateVerification{Status: "passed"}, nil
 				},
 			})
 			if err != nil {
@@ -337,8 +358,14 @@ func TestIntentCandidateEngineVerificationFailureStaysPending(t *testing.T) {
 		Captures: []IntentCandidateCapture{capture}, Planner: planner,
 		Preset:      config.PresetBalanced,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
-		Verify: func(context.Context, []IntentCandidateCapture) error {
-			return errors.New("fast check failed")
+		Verify: func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			return IntentCandidateVerification{
+				Status: "failed", Output: "bounded output", CheckedTS: 123,
+			}, errors.New("fast check failed")
 		},
 	})
 	if err != nil {
@@ -348,6 +375,74 @@ func TestIntentCandidateEngineVerificationFailureStaysPending(t *testing.T) {
 		result.Decisions[0].Candidate.Status != state.IntentCandidateWaiting ||
 		!result.NeedsAttention {
 		t.Fatalf("verification failure result=%+v", result)
+	}
+	candidate := result.Decisions[0].Candidate
+	if candidate.VerificationStatus.String != "failed" ||
+		candidate.VerificationOutput != "bounded output" ||
+		!candidate.VerificationTS.Valid ||
+		candidate.VerificationTS.Float64 != 123 {
+		t.Fatalf("verification evidence=%+v", candidate)
+	}
+}
+
+func TestIntentCandidateEngineDoesNotVerifyRejectedPredecessor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	bad := appendIntentCandidateCapture(
+		t, db, "bad.go", "create", "", "bad")
+	good := appendIntentCandidateCapture(
+		t, db, "good.go", "create", "", "good")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{
+				CandidateID:  "candidate-bad",
+				SelectedSeqs: []int64{bad.Event.Seq},
+				Purpose:      "bad candidate", Readiness: ai.IntentCandidateReady,
+				Subject: "Add bad candidate", GroupingReason: "one component",
+			},
+			{
+				CandidateID:  "candidate-good",
+				SelectedSeqs: []int64{good.Event.Seq},
+				Purpose:      "good candidate", Readiness: ai.IntentCandidateReady,
+				Subject: "Add good candidate", GroupingReason: "one component",
+			},
+		},
+	}}
+	var verified []string
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{bad, good}, Planner: planner,
+		Preset: config.PresetBalanced,
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if captures[0].Event.Path == "bad.go" {
+				return errors.New("scratch materialization failed")
+			}
+			return nil
+		},
+		Verify: func(
+			_ context.Context,
+			assignment ai.IntentCandidateAssignment,
+			_ []IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			verified = append(verified, assignment.CandidateID)
+			return IntentCandidateVerification{Status: "passed"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Decisions) != 2 ||
+		result.Decisions[0].Publishable ||
+		!result.Decisions[1].Publishable {
+		t.Fatalf("decisions=%+v", result.Decisions)
+	}
+	if !reflect.DeepEqual(verified, []string{"candidate-good"}) {
+		t.Fatalf("verified rejected predecessor: %v", verified)
 	}
 }
 

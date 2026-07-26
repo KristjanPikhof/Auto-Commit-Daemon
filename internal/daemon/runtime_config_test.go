@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -42,6 +43,31 @@ func (c *runtimeTestCloser) Close() error {
 
 func runtimeRevision(t *testing.T, db *state.DB, profile string, generation int64, values map[string]any) state.ConfigRevision {
 	t.Helper()
+	strategy, _ := values[config.FieldCommitStrategy].(string)
+	if strategy == "" {
+		strategy = string(ai.CommitStrategyEvent)
+		values[config.FieldCommitStrategy] = strategy
+	}
+	preset := config.PresetFast
+	presetID := "event.fast"
+	if strategy == string(ai.CommitStrategyIntent) {
+		presetID = "intent.fast"
+		values[config.FieldCommitPreset] = string(preset)
+		values[config.FieldDiffEgress] = true
+		provider, _ := values[config.FieldProvider].(string)
+		confirmations := []string{string(ai.ConfirmationDiffEgress)}
+		if provider == "" || provider == "deterministic" {
+			values[config.FieldProvider] = "subprocess:runtime-test"
+			confirmations = append(confirmations,
+				string(ai.ConfirmationSubprocessExecution))
+		}
+		if _, exists := values["confirmations"]; !exists {
+			values["confirmations"] = confirmations
+		}
+	}
+	values["preset_id"] = presetID
+	values["preset_version"] = config.PresetCatalogVersion
+	values["customized"] = true
 	body, err := json.Marshal(values)
 	if err != nil {
 		t.Fatal(err)
@@ -130,6 +156,44 @@ func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
 		t.Fatalf("old close count=%d", closerA.calls.Load())
 	}
 	manager.Close()
+}
+
+func TestRuntimeBundleAllowsApprovedLocalSubprocessDiffContext(t *testing.T) {
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	body, err := json.Marshal(map[string]any{
+		config.FieldProvider:       "subprocess:local-planner",
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitPreset:   "fast",
+		config.FieldDiffEgress:     false,
+		"preset_id":                "intent.fast",
+		"preset_version":           config.PresetCatalogVersion,
+		"customized":               true,
+		"confirmations": []string{
+			string(ai.ConfirmationSubprocessExecution),
+			string(ai.ConfirmationDiffEgress),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(context.Background(), db,
+		state.ConfigRevisionInput{
+			Snapshot: body, Profile: "local", Scope: "repo",
+			SourceGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := runtimeBuilder(db, map[string]*runtimeTestCloser{}).
+		BuildRevision(context.Background(), revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.ReplayBlockedReason != "" || !bundle.IntentIncludeDiffs ||
+		bundle.DiffEgress {
+		t.Fatalf("local subprocess diff policy=%+v", bundle)
+	}
 }
 
 func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T) {

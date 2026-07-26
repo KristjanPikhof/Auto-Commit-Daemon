@@ -931,14 +931,27 @@ WHERE type='table' AND name IN (
 	projection.Available = true
 	if err := conn.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM intent_candidates
-WHERE status IN ('open','waiting','ready','soft_published','blocked')`,
+WHERE status IN ('open','waiting','ready','soft_published','blocked')
+  AND EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`,
 	).Scan(&projection.OpenCandidates); err != nil {
 		return IntentV2ReadOnlyProjection{}, fmt.Errorf("state: project open intent candidates: %w", err)
 	}
 	if err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM intent_candidates
-WHERE status='blocked'
-   OR verification_status IN ('failed','timed_out','needs_attention')`,
+SELECT COUNT(*)
+FROM intent_candidates c
+WHERE (c.status='blocked'
+       OR c.verification_status IN ('failed','timed_out','needs_attention'))
+  AND EXISTS (
+      SELECT 1
+      FROM intent_candidate_events ce
+      JOIN capture_events e
+        ON e.seq=ce.event_seq AND e.state='pending'
+      WHERE ce.candidate_id=c.id AND ce.membership_state='active'
+  )`,
 	).Scan(&projection.VerificationAttention); err != nil {
 		return IntentV2ReadOnlyProjection{}, fmt.Errorf("state: project intent verification attention: %w", err)
 	}

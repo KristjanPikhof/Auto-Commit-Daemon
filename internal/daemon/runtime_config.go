@@ -18,8 +18,10 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	acdconfig "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 // RuntimeBundle is an immutable lease unit for one capture/replay pass. Every
@@ -29,69 +31,122 @@ type RuntimeBundle struct {
 	RevisionID int64
 	Profile    string
 
-	Provider             ai.Provider
-	ProviderCloser       io.Closer
-	MessageFn            MessageFn
-	IntentPlanner        ai.IntentPlanner
-	IntentHealth         *IntentPlannerHealth
-	HealthIdentity       IntentPlannerProviderIdentity
-	HealthFingerprint    string
-	Model                string
-	DiffEgress           bool
-	CommitStrategy       ai.CommitStrategy
-	CommitFormat         ai.CommitFormat
-	IntentRetryLimit     int
-	IntentWindow         int
-	IntentMinPending     int
-	IntentSettleWindow   time.Duration
-	IntentMaxPendingAge  time.Duration
-	IntentRecentCommits  int
-	IntentDeferLimit     int
-	IntentPathCoalescing bool
-	ExperimentID         int64
-	ExperimentBaselineID int64
-	ExperimentPolicy     string
+	Provider                  ai.Provider
+	ProviderCloser            io.Closer
+	MessageFn                 MessageFn
+	IntentPlanner             ai.IntentPlanner
+	IntentHealth              *IntentPlannerHealth
+	HealthIdentity            IntentPlannerProviderIdentity
+	HealthFingerprint         string
+	Model                     string
+	DiffEgress                bool
+	IntentIncludeDiffs        bool
+	CommitStrategy            ai.CommitStrategy
+	CommitFormat              ai.CommitFormat
+	PresetID                  string
+	PresetVersion             int
+	PresetCustomized          bool
+	IntentPreset              acdconfig.PresetName
+	IntentRetryLimit          int
+	IntentWindow              int
+	IntentMinPending          int
+	IntentSettleWindow        time.Duration
+	IntentMaxPendingAge       time.Duration
+	IntentRecentCommits       int
+	IntentDeferLimit          int
+	IntentPathCoalescing      bool
+	IntentVerificationMode    string
+	IntentVerificationCommand verification.ApprovedCommand
+	IntentVerificationReady   bool
+	IntentRepairEnabled       bool
+	IntentRepairHorizon       time.Duration
+	IntentRepairMaxCommits    int
+	ReplayBlockedReason       string
+	ExperimentID              int64
+	ExperimentBaselineID      int64
+	ExperimentPolicy          string
 }
 
 type runtimeBundleBuildFunc func(ai.ProviderConfig) (ai.Provider, io.Closer, error)
 
 type RuntimeBundleBuilder struct {
-	DB            *state.DB
-	RepoRoot      string
-	PromptTrace   prompttrace.Logger
-	Logger        *slog.Logger
-	Now           func() time.Time
-	BuildProvider runtimeBundleBuildFunc
+	DB              *state.DB
+	RepoRoot        string
+	PromptTrace     prompttrace.Logger
+	Logger          *slog.Logger
+	Now             func() time.Time
+	BuildProvider   runtimeBundleBuildFunc
+	CredentialStore *credentials.Store
+	LookupEnv       func(string) (string, bool)
 }
 
 // BuildRevision validates and constructs one complete candidate without
 // mutating the active bundle. Persisted snapshots never contain credentials;
 // the API key remains environment-only through LoadProviderConfigFromEnv.
 func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.ConfigRevision, previous *RuntimeBundle) (*RuntimeBundle, error) {
-	values, confirmations, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
+	values, confirmations, metadata, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
 	if err != nil {
 		return nil, err
 	}
 	cfg := ai.LoadProviderConfigFromEnv()
+	var credentialErr error
+	if b.CredentialStore != nil {
+		var key string
+		key, _, credentialErr = credentials.Resolve(*b.CredentialStore, b.LookupEnv)
+		if credentialErr == nil {
+			cfg.APIKey = key
+		}
+	}
 	if err := applyRuntimeValues(&cfg, values); err != nil {
 		return nil, err
 	}
+	preset, presetErr := runtimePreset(metadata, cfg.CommitStrategy, values)
+	if presetErr != nil {
+		return nil, presetErr
+	}
+	blockedReason := runtimeIntentPrerequisiteBlock(cfg, values, confirmations,
+		preset, metadata)
+	if credentialErr != nil {
+		if cfg.CommitStrategy == ai.CommitStrategyIntent {
+			blockedReason = runtimeConfigureReason(
+				"the protected provider credential is unavailable")
+		} else {
+			return nil, aiError(credentialErr)
+		}
+	}
 	validation, err := ai.ValidateProviderConfig(cfg)
-	if err != nil {
+	if err != nil && blockedReason == "" {
 		return nil, err
 	}
-	for _, required := range validation.Confirmations {
-		if _, ok := confirmations[string(required)]; !ok {
-			return nil, fmt.Errorf("runtime config: confirmation %q is required", required)
+	if err == nil {
+		for _, required := range validation.Confirmations {
+			if _, ok := confirmations[string(required)]; !ok {
+				if cfg.CommitStrategy == ai.CommitStrategyIntent {
+					blockedReason = runtimeConfigureReason("confirmation " + string(required) + " is required")
+					break
+				}
+				return nil, fmt.Errorf("runtime config: confirmation %q is required", required)
+			}
 		}
 	}
 	build := b.BuildProvider
 	if build == nil {
 		build = buildValidatedRuntimeProvider
 	}
-	provider, closer, err := build(cfg)
-	if err != nil {
-		return nil, aiError(err)
+	var provider ai.Provider
+	var closer io.Closer
+	if blockedReason == "" {
+		provider, closer, err = build(cfg)
+		if err != nil {
+			if cfg.CommitStrategy == ai.CommitStrategyIntent {
+				blockedReason = runtimeConfigureReason("the configured provider is unavailable")
+			} else {
+				return nil, aiError(err)
+			}
+		}
+	}
+	if blockedReason != "" {
+		provider = ai.DeterministicProvider{CommitFormat: cfg.CommitFormat}
 	}
 	failed := true
 	defer func() {
@@ -100,16 +155,17 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 		}
 	}()
 
+	intentIncludeDiffs := runtimeIntentIncludeDiffs(cfg, confirmations, provider)
 	repoRoot := b.RepoRoot
-	if !cfg.DiffEgress || !ai.ProviderNeedsDiff(provider) {
+	if (!cfg.DiffEgress && !intentIncludeDiffs) || !ai.ProviderNeedsDiff(provider) {
 		repoRoot = ""
 	}
 	messageFn := providerMessageFnWithPromptTrace(provider, repoRoot, b.PromptTrace)
 	planner, ok := provider.(ai.IntentPlanner)
-	if cfg.CommitStrategy == ai.CommitStrategyIntent && !ok {
+	if cfg.CommitStrategy == ai.CommitStrategyIntent && !ok && blockedReason == "" {
 		return nil, errors.New("runtime config: provider does not support intent planning")
 	}
-	if cfg.CommitStrategy != ai.CommitStrategyIntent {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent || blockedReason != "" {
 		planner = nil
 	}
 	providerName := ai.PrimaryProviderName(provider)
@@ -136,14 +192,45 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 		Provider: provider, ProviderCloser: closer, MessageFn: messageFn,
 		IntentPlanner: planner, IntentHealth: health, HealthIdentity: identity,
 		HealthFingerprint: fingerprint, Model: model, DiffEgress: cfg.DiffEgress,
-		CommitStrategy: cfg.CommitStrategy, CommitFormat: cfg.CommitFormat,
+		IntentIncludeDiffs: intentIncludeDiffs,
+		CommitStrategy:     cfg.CommitStrategy, CommitFormat: cfg.CommitFormat,
+		PresetID: metadata.PresetID, PresetVersion: metadata.PresetVersion,
+		PresetCustomized: metadata.Customized, IntentPreset: preset,
 		IntentRetryLimit: runtimeInt(values, acdconfig.FieldIntentRetryOnInvalid, resolvedIntentRetryLimit()),
 		IntentWindow:     cfg.IntentWindow, IntentMinPending: cfg.IntentMinPending,
-		IntentSettleWindow:   cfg.IntentSettleWindow,
-		IntentMaxPendingAge:  cfg.IntentMaxPendingAge,
-		IntentRecentCommits:  cfg.IntentRecentCommits,
-		IntentDeferLimit:     cfg.IntentDeferLimit,
-		IntentPathCoalescing: runtimeBool(values, acdconfig.FieldIntentPathCoalescing, false),
+		IntentSettleWindow:     cfg.IntentSettleWindow,
+		IntentMaxPendingAge:    cfg.IntentMaxPendingAge,
+		IntentRecentCommits:    cfg.IntentRecentCommits,
+		IntentDeferLimit:       cfg.IntentDeferLimit,
+		IntentPathCoalescing:   runtimeBool(values, acdconfig.FieldIntentPathCoalescing, false),
+		IntentVerificationMode: values[acdconfig.FieldIntentVerification],
+		IntentRepairEnabled:    runtimeBool(values, acdconfig.FieldIntentRepairEnabled, false),
+		IntentRepairHorizon:    runtimeDuration(values, acdconfig.FieldIntentRepairHorizon, 10*time.Minute),
+		IntentRepairMaxCommits: runtimeInt(values, acdconfig.FieldIntentRepairMaxCommits, 3),
+		ReplayBlockedReason:    blockedReason,
+	}
+	if blockedReason == "" && cfg.CommitStrategy == ai.CommitStrategyIntent &&
+		bundle.IntentVerificationMode != "" &&
+		bundle.IntentVerificationMode != "none" {
+		commandKey := acdconfig.FieldVerificationFastCommand
+		timeoutKey := acdconfig.FieldVerificationFastTimeout
+		mode := verification.ModeFast
+		if bundle.IntentVerificationMode == "full" {
+			commandKey = acdconfig.FieldVerificationFullCommand
+			timeoutKey = acdconfig.FieldVerificationFullTimeout
+			mode = verification.ModeFull
+		}
+		approved, approvalErr := verification.NewApprovedCommand(
+			b.RepoRoot, fmt.Sprintf("runtime-revision-%d", revision.ID), mode,
+			values[commandKey], runtimeDuration(values, timeoutKey, 0))
+		if approvalErr != nil {
+			bundle.ReplayBlockedReason = runtimeConfigureReason(
+				"the approved verification command is unavailable")
+			bundle.IntentPlanner = nil
+		} else {
+			bundle.IntentVerificationCommand = approved
+			bundle.IntentVerificationReady = true
+		}
 	}
 	if experiment, ok, err := runtimeExperimentForRevision(ctx, b.DB, revision.ID); err != nil {
 		return nil, err
@@ -240,22 +327,48 @@ func aiError(err error) error {
 	return errors.New(ai.SanitizePlannerError(err.Error()))
 }
 
-func decodeRuntimeSnapshot(raw string) (map[string]string, map[string]struct{}, error) {
+type runtimeSnapshotMetadata struct {
+	PresetID      string
+	PresetVersion int
+	Customized    bool
+}
+
+func decodeRuntimeSnapshot(raw string) (map[string]string, map[string]struct{}, runtimeSnapshotMetadata, error) {
 	var object map[string]json.RawMessage
 	dec := json.NewDecoder(strings.NewReader(raw))
 	if err := dec.Decode(&object); err != nil {
-		return nil, nil, fmt.Errorf("runtime config: decode snapshot: %w", err)
+		return nil, nil, runtimeSnapshotMetadata{}, fmt.Errorf("runtime config: decode snapshot: %w", err)
 	}
 	values := make(map[string]string)
 	confirmations := make(map[string]struct{})
+	var metadata runtimeSnapshotMetadata
 	for key, encoded := range object {
 		if key == "confirmations" {
 			var items []string
 			if err := json.Unmarshal(encoded, &items); err != nil {
-				return nil, nil, errors.New("runtime config: confirmations must be a string array")
+				return nil, nil, runtimeSnapshotMetadata{}, errors.New("runtime config: confirmations must be a string array")
 			}
 			for _, item := range items {
 				confirmations[strings.TrimSpace(item)] = struct{}{}
+			}
+			continue
+		}
+		switch key {
+		case "preset_id":
+			if err := json.Unmarshal(encoded, &metadata.PresetID); err != nil {
+				return nil, nil, runtimeSnapshotMetadata{}, errors.New("runtime config: preset_id must be a string")
+			}
+			continue
+		case "preset_version":
+			var value int
+			if err := json.Unmarshal(encoded, &value); err != nil || value <= 0 {
+				return nil, nil, runtimeSnapshotMetadata{}, errors.New("runtime config: preset_version must be a positive integer")
+			}
+			metadata.PresetVersion = value
+			continue
+		case "customized":
+			if err := json.Unmarshal(encoded, &metadata.Customized); err != nil {
+				return nil, nil, runtimeSnapshotMetadata{}, errors.New("runtime config: customized must be a boolean")
 			}
 			continue
 		}
@@ -272,7 +385,7 @@ func decodeRuntimeSnapshot(raw string) (map[string]string, map[string]struct{}, 
 					if window, exists := nested["window"]; exists {
 						text, err := runtimeScalar(window)
 						if err != nil {
-							return nil, nil, err
+							return nil, nil, runtimeSnapshotMetadata{}, err
 						}
 						values[acdconfig.FieldIntentWindow] = text
 						continue
@@ -281,18 +394,113 @@ func decodeRuntimeSnapshot(raw string) (map[string]string, map[string]struct{}, 
 			}
 		}
 		if !ok {
-			return nil, nil, fmt.Errorf("runtime config: unknown snapshot field %q", key)
+			return nil, nil, runtimeSnapshotMetadata{}, fmt.Errorf("runtime config: unknown snapshot field %q", key)
 		}
 		if field.Boundary != acdconfig.ApplyHot {
-			return nil, nil, fmt.Errorf("runtime config: field %q requires restart", key)
+			return nil, nil, runtimeSnapshotMetadata{}, fmt.Errorf("runtime config: field %q requires restart", key)
 		}
 		text, err := runtimeScalar(encoded)
 		if err != nil {
-			return nil, nil, fmt.Errorf("runtime config: field %q: %w", key, err)
+			return nil, nil, runtimeSnapshotMetadata{}, fmt.Errorf("runtime config: field %q: %w", key, err)
 		}
 		values[key] = text
 	}
-	return values, confirmations, nil
+	return values, confirmations, metadata, nil
+}
+
+func runtimePreset(
+	metadata runtimeSnapshotMetadata,
+	strategy ai.CommitStrategy,
+	values map[string]string,
+) (acdconfig.PresetName, error) {
+	name := acdconfig.PresetName(values[acdconfig.FieldCommitPreset])
+	if name == "" {
+		if strategy == ai.CommitStrategyIntent {
+			name = acdconfig.PresetBalanced
+		} else {
+			name = acdconfig.PresetFast
+		}
+	}
+	if metadata.PresetID == "" {
+		return "", errors.New("runtime config: runtime revision has no Intent v2 preset metadata")
+	}
+	wantID := string(strategy) + "." + string(name)
+	if metadata.PresetID != wantID || metadata.PresetVersion != acdconfig.PresetCatalogVersion {
+		return "", fmt.Errorf("runtime config: unsupported preset reference %s@%d",
+			metadata.PresetID, metadata.PresetVersion)
+	}
+	if _, ok := acdconfig.LookupPreset(acdconfig.CommitStrategy(strategy), name); !ok {
+		return "", fmt.Errorf("runtime config: unsupported preset %q", name)
+	}
+	return name, nil
+}
+
+func runtimeIntentPrerequisiteBlock(
+	cfg ai.ProviderConfig,
+	values map[string]string,
+	confirmations map[string]struct{},
+	preset acdconfig.PresetName,
+	metadata runtimeSnapshotMetadata,
+) string {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent {
+		return ""
+	}
+	if metadata.PresetVersion != acdconfig.PresetCatalogVersion ||
+		metadata.PresetID != "intent."+string(preset) {
+		return runtimeConfigureReason("Intent v2 preset metadata is missing")
+	}
+	if cfg.Mode == "" || cfg.Mode == "deterministic" {
+		return runtimeConfigureReason("Intent v2 requires a tested semantic provider")
+	}
+	if !cfg.DiffEgress && !strings.HasPrefix(cfg.Mode, "subprocess:") {
+		return runtimeConfigureReason("Intent v2 requires approved redacted diff context")
+	}
+	if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {
+		return runtimeConfigureReason("diff context consent is missing")
+	}
+	mode := values[acdconfig.FieldIntentVerification]
+	if preset == acdconfig.PresetBalanced || preset == acdconfig.PresetQuality {
+		if mode == "" || mode == "none" {
+			return runtimeConfigureReason("preset-required verification is not configured")
+		}
+		command := values[acdconfig.FieldVerificationFastCommand]
+		if mode == "full" {
+			command = values[acdconfig.FieldVerificationFullCommand]
+		}
+		if strings.TrimSpace(command) == "" {
+			return runtimeConfigureReason("the exact verification command is missing")
+		}
+		if _, ok := confirmations[string(ai.ConfirmationVerificationCommand)]; !ok {
+			return runtimeConfigureReason("verification command approval is missing")
+		}
+	}
+	if runtimeBool(values, acdconfig.FieldIntentRepairEnabled, false) {
+		if _, ok := confirmations[string(ai.ConfirmationIntentRepair)]; !ok {
+			return runtimeConfigureReason("automatic repair approval is missing")
+		}
+	}
+	return ""
+}
+
+func runtimeIntentIncludeDiffs(
+	cfg ai.ProviderConfig,
+	confirmations map[string]struct{},
+	provider ai.Provider,
+) bool {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent || !ai.ProviderNeedsDiff(provider) {
+		return false
+	}
+	if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {
+		return false
+	}
+	// Local subprocess planners can consume approved redacted diffs without
+	// enabling network egress. Network providers still require the explicit
+	// diff-egress setting in addition to the same confirmation.
+	return strings.HasPrefix(cfg.Mode, "subprocess:") || cfg.DiffEgress
+}
+
+func runtimeConfigureReason(reason string) string {
+	return "Intent v2 needs attention: " + reason + "; run `acd configure`"
 }
 
 func runtimeScalar(raw json.RawMessage) (string, error) {
@@ -394,6 +602,18 @@ func runtimeBool(values map[string]string, key string, fallback bool) bool {
 	}
 	return fallback
 }
+
+func runtimeDuration(values map[string]string, key string, fallback time.Duration) time.Duration {
+	raw, ok := values[key]
+	if !ok {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
 func parseRuntimeBool(raw string) bool {
 	value, _ := strconv.ParseBool(strings.TrimSpace(raw))
 	return value
@@ -454,6 +674,15 @@ func NewRuntimeBundleManager(initial *RuntimeBundle, builder RuntimeBundleBuilde
 		logger = slog.Default()
 	}
 	return &RuntimeBundleManager{active: &runtimeBundleSlot{bundle: initial}, builder: builder, db: builder.DB, logger: logger, closeTimeout: closeTimeout}
+}
+
+func (m *RuntimeBundleManager) SetCredentialStore(store *credentials.Store) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.builder.CredentialStore = store
+	m.mu.Unlock()
 }
 
 type RuntimeBundleLease struct {

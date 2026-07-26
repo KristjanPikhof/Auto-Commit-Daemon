@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -342,6 +343,174 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	// handle to mirror an external controller and avoid stale read-pool
 	// snapshots from the long-lived fixture handle under macOS broad runs.
 	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
+}
+
+func TestRun_IntentV2MissingPrerequisitesCapturesWithoutReplay(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvDiffEgress, "false")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: wakeCh,
+			ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "blocked-intent.txt"),
+		[]byte("durable capture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	waitForCaptureEventCount(t, f.db, 1, 3*time.Second)
+	waitForMetaValue(t, f.db, metaIntentV2MigrationState,
+		"needs_attention", 2*time.Second)
+
+	var eventState string
+	if err := f.db.SQL().QueryRow(
+		`SELECT state FROM capture_events ORDER BY seq DESC LIMIT 1`,
+	).Scan(&eventState); err != nil {
+		t.Fatal(err)
+	}
+	if eventState != "pending" {
+		t.Fatalf("captured event state=%q want pending", eventState)
+	}
+	time.Sleep(100 * time.Millisecond)
+	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("blocked Intent v2 replay advanced HEAD: %s -> %s",
+			startHead, head)
+	}
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("needs-attention guidance=%q ok=%v err=%v",
+			attention, ok, err)
+	}
+}
+
+func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv(ai.EnvProvider, "deterministic")
+	configPath := filepath.Join(t.TempDir(), "config-is-a-file")
+	if err := os.WriteFile(configPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configPath)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	if err := state.MetaSetMany(context.Background(), f.db,
+		map[string]string{
+			metaIntentV2CutoverRequired: "true",
+			"commit.strategy":           "intent",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: wakeCh,
+			ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+			runtimeBuildProvider: func(
+				cfg ai.ProviderConfig,
+			) (ai.Provider, io.Closer, error) {
+				return &runtimeTestProvider{name: cfg.Mode}, nil, nil
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	if err := os.WriteFile(filepath.Join(f.dir, "cutover-error.txt"),
+		[]byte("captured\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	waitForCaptureEventCount(t, f.db, 1, 3*time.Second)
+	time.Sleep(100 * time.Millisecond)
+	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("cutover failure replay advanced HEAD: %s -> %s",
+			startHead, head)
+	}
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("cutover attention=%q ok=%v err=%v", attention, ok, err)
+	}
+
+	revision := runtimeRevision(t, f.db, "configured", 1,
+		map[string]any{
+			"commit.strategy": "intent",
+			"intent.window":   10,
+		})
+	if _, activated, err := state.RequestConfigActivation(
+		context.Background(), f.db, revision.ID, sql.NullInt64{},
+	); err != nil || !activated {
+		t.Fatalf("request configured revision: activated=%v err=%v",
+			activated, err)
+	}
+	if err := os.Remove(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(configPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnqueueFlushRequest(context.Background(), f.db,
+		"flush_logical", true,
+		sql.NullString{String: "test-session", Valid: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	if newHead == startHead {
+		t.Fatal("configured v2 revision did not resume replay")
+	}
+	waitForMetaValue(t, f.db, metaIntentV2MigrationState,
+		"active", 2*time.Second)
 }
 
 // TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
@@ -3637,10 +3806,13 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	}
 }
 
-func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
+func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
 	t.Setenv(ai.EnvIntentMinPending, "4")
 	t.Setenv(ai.EnvIntentMaxPendingAge, "1h")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
 
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -3660,7 +3832,6 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 		ErrorCeiling: time.Hour,
 	}
 	planner := &recordingIntentPlanner{}
-	trace := &memoryTraceLogger{}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -3676,7 +3847,6 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 			WakeCh:        wakeCh,
 			ShutdownCh:    shutdownCh,
 			SkipSignals:   true,
-			Trace:         trace,
 			IntentPlanner: planner,
 		})
 	}()
@@ -3701,11 +3871,9 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 		pending, err := state.PendingEvents(context.Background(), f.db, 0)
 		return err == nil && len(pending) == 1
 	})
-	waitFor(t, 2*time.Second, "intent batch wait trace", func() bool {
-		return len(traceEventsByClass(trace.Events(), "intent.batch_wait")) == 1
-	})
 	if planner.calls != 0 {
-		t.Fatalf("planner calls=%d want 0 for wake-only drain below MinPending", planner.calls)
+		t.Fatalf("planner calls=%d want 0 before immutable v2 activation",
+			planner.calls)
 	}
 	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
 	if err != nil {
@@ -3714,11 +3882,11 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 	if head != startHead {
 		t.Fatalf("HEAD advanced on wake-only drain below MinPending: got %s want %s", head, startHead)
 	}
-	if events := traceEventsByClass(trace.Events(), "replay.intent.wake_drained"); len(events) != 1 {
-		t.Fatalf("wake_drained trace=%+v want exactly one event", events)
-	}
-	if events := traceEventsByClass(trace.Events(), "intent.batch_wait"); len(events) != 1 {
-		t.Fatalf("intent.batch_wait trace=%+v want exactly one event", events)
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("needs-attention guidance=%q ok=%v err=%v",
+			attention, ok, err)
 	}
 }
 

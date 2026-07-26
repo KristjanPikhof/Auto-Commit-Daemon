@@ -67,6 +67,7 @@ type statusReport struct {
 	DecisionCursor        int64                `json:"decision_cursor,omitempty"`
 	IntentStrategy        intentStrategyReport `json:"intent_strategy"`
 	RuntimeConfig         runtimeConfigReport  `json:"runtime_config"`
+	IntentV2              intentV2Report       `json:"intent_v2"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -343,6 +344,11 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	} else {
 		report.RuntimeConfig = runtimeConfig
 	}
+	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.IntentV2 = intentV2
+	}
 
 	return report, nil
 }
@@ -490,6 +496,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	}
 	fmt.Fprintf(out, "Daemon: %s\n", joinParens(parts))
 	renderRuntimeConfigHuman(out, r.RuntimeConfig)
+	renderIntentV2Human(out, r.IntentV2)
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))
 	for _, c := range r.Clients {

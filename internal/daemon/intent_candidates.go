@@ -44,7 +44,17 @@ type IntentCandidateMaterializer func(context.Context, []IntentCandidateCapture)
 
 // IntentCandidateVerifier runs the already-approved preset command against the
 // exact materialized candidate tree. P7 supplies the bounded runner.
-type IntentCandidateVerifier func(context.Context, []IntentCandidateCapture) error
+type IntentCandidateVerification struct {
+	Status    string
+	Output    string
+	CheckedTS float64
+}
+
+type IntentCandidateVerifier func(
+	context.Context,
+	ai.IntentCandidateAssignment,
+	[]IntentCandidateCapture,
+) (IntentCandidateVerification, error)
 
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
@@ -590,6 +600,7 @@ func evaluateIntentCandidateAssignment(
 
 	verificationRequired := input.Preset == config.PresetBalanced ||
 		input.Preset == config.PresetQuality
+	var verificationResult IntentCandidateVerification
 	if !verificationRequired {
 		results = append(results, ai.IntentAtomicityGateResult{
 			Gate:   ai.IntentAtomicityVerification,
@@ -599,17 +610,26 @@ func evaluateIntentCandidateAssignment(
 		results = append(results, pendingIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityVerification, "candidate_not_sealed",
 			"waiting candidate is not eligible for verification"))
+	} else if !intentPreVerificationGatesPassed(results) {
+		results = append(results, pendingIntentGate(assignment.CandidateID,
+			ai.IntentAtomicityVerification, "candidate_not_atomic",
+			"candidate must pass structural and materialization gates before verification"))
 	} else if input.Verify == nil {
 		results = append(results, pendingIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityVerification, "verification_unavailable",
 			"approved candidate verification has not run"))
-	} else if err := input.Verify(ctx, candidateCaptures); err != nil {
-		results = append(results, failedIntentGate(assignment.CandidateID,
-			ai.IntentAtomicityVerification, "verification_failed", err))
 	} else {
-		results = append(results, ai.IntentAtomicityGateResult{
-			Gate: ai.IntentAtomicityVerification, Status: ai.IntentAtomicityPassed,
-		})
+		var verifyErr error
+		verificationResult, verifyErr = input.Verify(
+			ctx, assignment, candidateCaptures)
+		if verifyErr != nil {
+			results = append(results, failedIntentGate(assignment.CandidateID,
+				ai.IntentAtomicityVerification, "verification_failed", verifyErr))
+		} else {
+			results = append(results, ai.IntentAtomicityGateResult{
+				Gate: ai.IntentAtomicityVerification, Status: ai.IntentAtomicityPassed,
+			})
+		}
 	}
 	report := ai.NewIntentAtomicityReport(assignment.CandidateID, results...)
 	if err := ai.ValidateIntentAtomicityReport(report); err != nil {
@@ -669,12 +689,21 @@ func evaluateIntentCandidateAssignment(
 		ConfigProfile:      sql.NullString{String: input.ConfigProfile, Valid: input.ConfigProfile != ""},
 		PresetID:           sql.NullString{String: input.PresetID, Valid: true},
 		PresetVersion:      sql.NullInt64{Int64: int64(input.PresetVersion), Valid: true},
-		VerificationStatus: sql.NullString{
-			String: string(intentAtomicityGateStatus(report,
-				ai.IntentAtomicityVerification)),
-			Valid: true,
-		},
-		Events: events,
+		Events:             events,
+	}
+	verificationStatus := verificationResult.Status
+	if verificationStatus == "" {
+		verificationStatus = string(intentAtomicityGateStatus(
+			report, ai.IntentAtomicityVerification))
+	}
+	candidate.VerificationStatus = sql.NullString{
+		String: verificationStatus, Valid: verificationStatus != "",
+	}
+	candidate.VerificationOutput = verificationResult.Output
+	if verificationResult.CheckedTS > 0 {
+		candidate.VerificationTS = sql.NullFloat64{
+			Float64: verificationResult.CheckedTS, Valid: true,
+		}
 	}
 	if prior, ok := existing[assignment.CandidateID]; ok {
 		candidate.PublishedCommitOID = prior.PublishedCommitOID
@@ -687,6 +716,21 @@ func evaluateIntentCandidateAssignment(
 	decision.Atomicity = report
 	decision.Publishable = report.Valid && assignment.Readiness == ai.IntentCandidateReady
 	return decision, nil
+}
+
+func intentPreVerificationGatesPassed(
+	results []ai.IntentAtomicityGateResult,
+) bool {
+	for _, result := range results {
+		if result.Gate == ai.IntentAtomicityVerification {
+			continue
+		}
+		if result.Status != ai.IntentAtomicityPassed &&
+			result.Status != ai.IntentAtomicityNotRequired {
+			return false
+		}
+	}
+	return true
 }
 
 func deterministicIntentCandidatePlan(

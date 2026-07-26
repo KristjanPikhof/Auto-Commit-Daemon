@@ -144,6 +144,21 @@ func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 			return fmt.Errorf("state: add v14 runtime config indexes: %w", err)
 		}
 	}
+	if cur < 15 {
+		// Only repositories with pre-existing runtime/capture evidence need
+		// the one-time Intent v2 cutover. A brand-new v15 database must not
+		// synthesize legacy configuration merely because its initial
+		// user_version is zero.
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO daemon_meta(key, value, updated_ts)
+SELECT 'intent.v2.cutover_required', 'true',
+       CAST(strftime('%s','now') AS REAL)
+WHERE EXISTS(SELECT 1 FROM capture_events LIMIT 1)
+   OR EXISTS(SELECT 1 FROM config_revisions LIMIT 1)
+   OR EXISTS(SELECT 1 FROM daemon_meta WHERE key='commit.strategy')`); err != nil {
+			return fmt.Errorf("state: mark Intent v2 cutover: %w", err)
+		}
+	}
 	return nil
 }
 

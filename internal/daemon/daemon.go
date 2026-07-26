@@ -26,8 +26,11 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
@@ -226,6 +229,11 @@ type Options struct {
 	// leaves this nil; tests inject a recorder to assert run-loop gate
 	// behavior without involving network or subprocess providers.
 	IntentPlanner ai.IntentPlanner
+	// runtimeBuildProvider is a test-only seam for constructing providers
+	// from immutable runtime revisions. It preserves the production cutover
+	// contract while letting run-loop tests assert provider reuse and health
+	// continuity without executing a real subprocess or network request.
+	runtimeBuildProvider runtimeBundleBuildFunc
 
 	// beforeBranchTransitionAccept is a test-only synchronization point after
 	// prospective shadow preparation and before the final token/pause CAS.
@@ -370,6 +378,22 @@ func Run(ctx context.Context, opts Options) error {
 
 	providerCfg := ai.LoadProviderConfigFromEnv()
 	providerCfg.Logger = logger
+	var runtimeCredentialStore *credentials.Store
+	runtimeRoots, rootsErr := paths.Resolve()
+	if rootsErr != nil {
+		logger.Warn("resolve runtime configuration roots",
+			"err", ai.SanitizePlannerError(rootsErr.Error()))
+	} else {
+		store := credentials.NewStore(runtimeRoots)
+		runtimeCredentialStore = &store
+		key, _, credentialErr := credentials.Resolve(store, os.LookupEnv)
+		if credentialErr != nil {
+			logger.Warn("load protected provider credential",
+				"err", ai.SanitizePlannerError(credentialErr.Error()))
+		} else {
+			providerCfg.APIKey = key
+		}
+	}
 	// Install the package-level rejects logger before any planner call can
 	// fire. The logger is best-effort: any write failure surfaces as a
 	// slog.Warn rather than blocking replay. ConfigureIntentRejectsLogger
@@ -382,7 +406,6 @@ func Run(ctx context.Context, opts Options) error {
 	// where capture skips the stamp before the first replay tick.
 	_ = resolvePathQuiescenceSeconds()
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
-		"commit.strategy":        string(providerCfg.CommitStrategy),
 		"commit.format":          string(providerCfg.CommitFormat),
 		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
 		"intent.min_pending":     strconv.Itoa(providerCfg.IntentMinPending),
@@ -506,11 +529,52 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
 	}
 	defer func() { _ = dlock.Release() }()
+	cutoverBlock := ""
+	if rootsErr == nil {
+		if cutover, cutoverErr := EnsureIntentV2RuntimeCutover(
+			ctx, opts.DB, opts.RepoPath, runtimeRoots, os.LookupEnv); cutoverErr != nil {
+			cutoverBlock = runtimeConfigureReason(
+				"the Intent v2 runtime cutover could not be completed")
+			logger.Warn("Intent v2 runtime cutover needs attention",
+				"err", ai.SanitizePlannerError(cutoverErr.Error()))
+			_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+				metaIntentV2MigrationState:  "needs_attention",
+				"intent.v2.needs_attention": cutoverBlock,
+			})
+		} else if cutover.Migrated {
+			logger.Info("materialized Intent v2 runtime revision",
+				"revision_id", cutover.RevisionID,
+				"preset_id", cutover.PresetID,
+				"preset_version", cutover.PresetVersion,
+				"customized", cutover.Customized)
+		}
+	} else if required, ok, metaErr := state.MetaGet(
+		ctx, opts.DB, metaIntentV2CutoverRequired,
+	); metaErr != nil || ok && parseRuntimeBool(required) {
+		cutoverBlock = runtimeConfigureReason(
+			"the Intent v2 runtime cutover could not resolve configuration storage")
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			metaIntentV2MigrationState:  "needs_attention",
+			"intent.v2.needs_attention": cutoverBlock,
+		})
+	}
 	if runIntentPlanner != nil {
 		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
 	}
 	initialIdentity := intentHealthOptions.Provider
 	initialFingerprint := IntentPlannerProviderFingerprint(initialIdentity)
+	initialPreset := config.PresetFast
+	initialPresetID := "event.fast"
+	initialReplayBlock := ""
+	if providerCfg.CommitStrategy == ai.CommitStrategyIntent {
+		initialPreset = config.PresetBalanced
+		initialPresetID = "intent.balanced"
+		initialReplayBlock = runtimeConfigureReason(
+			"an immutable Intent v2 runtime revision is not active")
+	}
+	if cutoverBlock != "" {
+		initialReplayBlock = cutoverBlock
+	}
 	initialBundle := &RuntimeBundle{
 		Provider: provider, ProviderCloser: providerCloser, MessageFn: msgFn,
 		IntentPlanner: runIntentPlanner, IntentHealth: intentHealth,
@@ -518,6 +582,10 @@ func Run(ctx context.Context, opts Options) error {
 		Model: intentPlannerModel, DiffEgress: providerCfg.DiffEgress,
 		CommitStrategy:       providerCfg.CommitStrategy,
 		CommitFormat:         providerCfg.CommitFormat,
+		PresetID:             initialPresetID,
+		PresetVersion:        config.PresetCatalogVersion,
+		IntentPreset:         initialPreset,
+		ReplayBlockedReason:  initialReplayBlock,
 		IntentRetryLimit:     resolvedIntentRetryLimit(),
 		IntentWindow:         providerCfg.IntentWindow,
 		IntentMinPending:     providerCfg.IntentMinPending,
@@ -530,12 +598,36 @@ func Run(ctx context.Context, opts Options) error {
 	runtimeBundles := NewRuntimeBundleManager(initialBundle, RuntimeBundleBuilder{
 		DB: opts.DB, RepoRoot: opts.RepoPath, PromptTrace: promptTracer,
 		Logger: logger, Now: now,
+		BuildProvider:   opts.runtimeBuildProvider,
+		CredentialStore: runtimeCredentialStore, LookupEnv: os.LookupEnv,
 	}, closeTimeout)
 	// RuntimeBundleManager now owns the initial closer. Leave the legacy
 	// deferred guard installed with a nil target for compatibility with early
 	// returns above this point.
 	providerCloser = nil
 	defer runtimeBundles.Close()
+	if cutoverBlock == "" {
+		if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+			logger.Warn("activate Intent v2 runtime revision",
+				"err", ai.SanitizePlannerError(err.Error()))
+		}
+	}
+	currentRuntime := runtimeBundles.Current()
+	if currentRuntime != nil && currentRuntime.ReplayBlockedReason != "" {
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"intent.v2.needs_attention": currentRuntime.ReplayBlockedReason,
+			metaIntentV2MigrationState:  "needs_attention",
+			"intent.v2.preset_id":       currentRuntime.PresetID,
+			"intent.v2.preset_version":  strconv.Itoa(currentRuntime.PresetVersion),
+		})
+	} else if currentRuntime != nil && currentRuntime.RevisionID > 0 {
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"intent.v2.needs_attention": "",
+			metaIntentV2MigrationState:  "active",
+			"intent.v2.preset_id":       currentRuntime.PresetID,
+			"intent.v2.preset_version":  strconv.Itoa(currentRuntime.PresetVersion),
+		})
+	}
 
 	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
 	// OrphanFlushAckThreshold are presumed orphans from a previous daemon
@@ -1646,15 +1738,37 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		// The prior capture/replay pass has fully returned. Converge desired
 		// runtime revisions before any new pass can obtain a lease.
-		if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-			logger.Warn("activate desired runtime config; retaining last-known-good",
-				"err", ai.SanitizePlannerError(err.Error()))
+		if cutoverBlock != "" {
+			retryRoots, retryRootsErr := paths.Resolve()
+			if retryRootsErr == nil {
+				if cutover, retryErr := EnsureIntentV2RuntimeCutover(
+					ctx, opts.DB, opts.RepoPath, retryRoots,
+					os.LookupEnv); retryErr == nil {
+					runtimeRoots = retryRoots
+					if runtimeCredentialStore == nil {
+						store := credentials.NewStore(runtimeRoots)
+						runtimeCredentialStore = &store
+						runtimeBundles.SetCredentialStore(
+							runtimeCredentialStore)
+					}
+					cutoverBlock = ""
+					logger.Info("Intent v2 runtime cutover recovered",
+						"revision_id", cutover.RevisionID,
+						"preset_id", cutover.PresetID)
+				}
+			}
 		}
-		if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
-			logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
-		} else if queued {
+		if cutoverBlock == "" {
 			if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-				logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+				logger.Warn("activate desired runtime config; retaining last-known-good",
+					"err", ai.SanitizePlannerError(err.Error()))
+			}
+			if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
+				logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+			} else if queued {
+				if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+					logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+				}
 			}
 		}
 
@@ -1700,7 +1814,7 @@ func Run(ctx context.Context, opts Options) error {
 				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
 				// First-observation transition: stamp marker name +
 				// set_at + head_at atomically.
-				_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
 					MetaKeyOperationInProgress:      operationName,
 					MetaKeyOperationInProgressSetAt: stamp,
 					MetaKeyOperationInProgressHead:  currentHead,
@@ -1887,6 +2001,9 @@ func Run(ctx context.Context, opts Options) error {
 		// its own dedicated gate above.
 		runtimeLease := runtimeBundles.Lease()
 		passBundle := runtimeLease.Bundle()
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"commit.strategy": string(passBundle.CommitStrategy),
+		})
 		passCtx := withRuntimeTelemetry(ctx, passBundle)
 		var (
 			capSum     CaptureSummary
@@ -1959,28 +2076,55 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
-			repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn:             passBundle.MessageFn,
-				GitDir:                opts.GitDir,
-				Trace:                 tracer,
-				PromptTrace:           promptTracer,
-				Limit:                 DefaultReplayLimit,
-				CommitStrategy:        passBundle.CommitStrategy,
-				IntentWindow:          passBundle.IntentWindow,
-				IntentMinPending:      passBundle.IntentMinPending,
-				IntentSettleWindow:    passBundle.IntentSettleWindow,
-				IntentMaxPendingAge:   passBundle.IntentMaxPendingAge,
-				IntentRecentCommits:   passBundle.IntentRecentCommits,
-				IntentDeferLimit:      passBundle.IntentDeferLimit,
-				IntentRetryLimit:      &passBundle.IntentRetryLimit,
-				IntentPathCoalescing:  &passBundle.IntentPathCoalescing,
-				IntentBypassBatchWait: flushedLogical > 0,
-				IntentPlanner:         passBundle.IntentPlanner,
-				IntentHealth:          passBundle.IntentHealth,
-				IntentPlannerProvider: passBundle.HealthIdentity.Provider,
-				IntentPlannerModel:    passBundle.Model,
-				IntentIncludeDiffs:    passBundle.DiffEgress && ai.ProviderNeedsDiff(passBundle.Provider),
-			})
+			if passBundle.ReplayBlockedReason != "" {
+				repSum = ReplaySummary{
+					Skipped: true, SkippedReason: "intent_v2_needs_attention",
+					BaseHead: cctx.BaseHead,
+				}
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+					"intent.v2.needs_attention": passBundle.ReplayBlockedReason,
+					metaIntentV2MigrationState:  "needs_attention",
+					"intent.v2.preset_id":       passBundle.PresetID,
+					"intent.v2.preset_version":  strconv.Itoa(passBundle.PresetVersion),
+				})
+			} else {
+				var candidateVerify IntentCandidateVerifier
+				if passBundle.IntentVerificationReady {
+					candidateVerify = runtimeIntentCandidateVerifier(
+						opts.RepoPath, opts.GitDir, cctx.BaseHead,
+						passBundle.RevisionID,
+						passBundle.IntentVerificationCommand)
+				}
+				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+					MessageFn:              passBundle.MessageFn,
+					GitDir:                 opts.GitDir,
+					Trace:                  tracer,
+					PromptTrace:            promptTracer,
+					Limit:                  DefaultReplayLimit,
+					CommitStrategy:         passBundle.CommitStrategy,
+					IntentWindow:           passBundle.IntentWindow,
+					IntentMinPending:       passBundle.IntentMinPending,
+					IntentSettleWindow:     passBundle.IntentSettleWindow,
+					IntentMaxPendingAge:    passBundle.IntentMaxPendingAge,
+					IntentRecentCommits:    passBundle.IntentRecentCommits,
+					IntentDeferLimit:       passBundle.IntentDeferLimit,
+					IntentRetryLimit:       &passBundle.IntentRetryLimit,
+					IntentPathCoalescing:   &passBundle.IntentPathCoalescing,
+					IntentBypassBatchWait:  flushedLogical > 0,
+					IntentPlanner:          passBundle.IntentPlanner,
+					IntentHealth:           passBundle.IntentHealth,
+					IntentPlannerProvider:  passBundle.HealthIdentity.Provider,
+					IntentPlannerModel:     passBundle.Model,
+					IntentIncludeDiffs:     passBundle.IntentIncludeDiffs,
+					IntentPreset:           passBundle.IntentPreset,
+					IntentCandidateVerify:  candidateVerify,
+					IntentRepairEnabled:    passBundle.IntentRepairEnabled,
+					IntentRepairHorizon:    passBundle.IntentRepairHorizon,
+					IntentRepairMaxCommits: passBundle.IntentRepairMaxCommits,
+				})
+				_ = updateIntentV2EvaluationMeta(
+					ctx, opts.DB, passBundle, repSum, repErr)
+			}
 			if repErr == nil && repSum.Published > 0 {
 				// Refresh BaseHead to the exact commit replay just wrote.
 				cctx.BaseHead = repSum.BaseHead

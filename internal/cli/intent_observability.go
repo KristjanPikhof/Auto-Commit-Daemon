@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -195,6 +196,285 @@ type runtimeConfigReport struct {
 	Failure                 string                   `json:"failure,omitempty"`
 	ApplyBoundary           string                   `json:"apply_boundary"`
 	Experiment              *runtimeExperimentReport `json:"experiment,omitempty"`
+}
+
+type intentV2Report struct {
+	Available                bool   `json:"available"`
+	SchemaVersion            int    `json:"schema_version"`
+	MigrationState           string `json:"migration_state,omitempty"`
+	ReplayState              string `json:"replay_state,omitempty"`
+	NeedsAttention           string `json:"needs_attention,omitempty"`
+	PresetID                 string `json:"preset_id,omitempty"`
+	PresetVersion            int    `json:"preset_version,omitempty"`
+	Customized               bool   `json:"customized,omitempty"`
+	VerificationMode         string `json:"verification_mode,omitempty"`
+	RepairEnabled            bool   `json:"repair_enabled,omitempty"`
+	RepairHorizon            string `json:"repair_horizon,omitempty"`
+	RepairMaxCommits         int    `json:"repair_max_commits,omitempty"`
+	OpenCandidates           int    `json:"open_candidates,omitempty"`
+	ReadyCandidates          int    `json:"ready_candidates,omitempty"`
+	WaitingCandidates        int    `json:"waiting_candidates,omitempty"`
+	BlockedCandidates        int    `json:"blocked_candidates,omitempty"`
+	SoftPublishedCandidates  int    `json:"soft_published_candidates,omitempty"`
+	VerificationAttention    int    `json:"verification_attention,omitempty"`
+	RecoverableRepairs       int    `json:"recoverable_repairs,omitempty"`
+	LastBoundaryEpoch        int64  `json:"last_boundary_epoch,omitempty"`
+	LatestCandidateStatus    string `json:"latest_candidate_status,omitempty"`
+	LatestPlannerProtocol    string `json:"latest_planner_protocol,omitempty"`
+	LatestAtomicityStatus    string `json:"latest_atomicity_status,omitempty"`
+	LatestAtomicitySummary   string `json:"latest_atomicity_summary,omitempty"`
+	LatestVerificationStatus string `json:"latest_verification_status,omitempty"`
+	LatestRepairStatus       string `json:"latest_repair_status,omitempty"`
+	LatestRepairError        string `json:"latest_repair_error,omitempty"`
+}
+
+func loadIntentV2Report(ctx context.Context, conn *sql.DB) (intentV2Report, error) {
+	var report intentV2Report
+	if conn == nil {
+		return report, nil
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&report.SchemaVersion); err != nil {
+		return report, errors.New("read Intent v2 schema version failed")
+	}
+	if report.SchemaVersion < 15 {
+		return report, nil
+	}
+	for _, table := range []string{
+		"intent_candidates", "intent_candidate_events",
+		"intent_capture_dependencies", "intent_activity_boundaries",
+		"intent_repairs", "intent_repair_commits",
+	} {
+		exists, err := sqliteTableExists(ctx, conn, table)
+		if err != nil {
+			return report, errors.New("inspect Intent v2 tables failed")
+		}
+		if !exists {
+			return report, nil
+		}
+	}
+	report.Available = true
+	if value, ok, _ := metaLookup(ctx, conn, "intent.v2.migration_state"); ok {
+		report.MigrationState = sanitizeObservabilityText(value)
+	}
+	if value, ok, _ := metaLookup(ctx, conn, "intent.v2.needs_attention"); ok {
+		report.NeedsAttention = sanitizeObservabilityText(value)
+	}
+	if value, ok, _ := metaLookup(ctx, conn,
+		"intent.v2.cutover_required"); ok && parseIntentV2MetaBool(value) {
+		report.NeedsAttention = "Intent v2 cutover is required; run acd configure"
+		report.ReplayState = "needs_attention"
+	}
+	if strings.HasPrefix(strings.ToLower(report.MigrationState),
+		"needs_attention") && report.NeedsAttention == "" {
+		report.NeedsAttention = "Intent v2 migration needs attention; run acd configure"
+	}
+	if report.NeedsAttention != "" {
+		report.ReplayState = "needs_attention"
+	} else {
+		report.ReplayState = "active"
+	}
+
+	var revisionID, desiredRevision, appliedRevision sql.NullInt64
+	var runtimeFailure sql.NullString
+	if exists, _ := sqliteTableExists(ctx, conn, "runtime_config_state"); exists {
+		_ = conn.QueryRowContext(ctx, `
+SELECT COALESCE(desired_revision_id, applied_revision_id,
+                last_known_good_revision_id),
+       desired_revision_id, applied_revision_id, last_error
+FROM runtime_config_state WHERE id=1`).Scan(
+			&revisionID, &desiredRevision, &appliedRevision, &runtimeFailure)
+	}
+	if revisionID.Valid {
+		var snapshot string
+		if err := conn.QueryRowContext(ctx,
+			`SELECT snapshot_json FROM config_revisions WHERE id=?`,
+			revisionID.Int64).Scan(&snapshot); err == nil {
+			decodeIntentV2Snapshot(snapshot, &report)
+		}
+	}
+	if report.PresetID == "" {
+		if value, ok, _ := metaLookup(ctx, conn, "intent.v2.preset_id"); ok {
+			report.PresetID = sanitizeObservabilityText(value)
+		}
+	}
+	if report.PresetVersion == 0 {
+		if value, ok, _ := metaLookup(ctx, conn, "intent.v2.preset_version"); ok {
+			report.PresetVersion, _ = strconv.Atoi(strings.TrimSpace(value))
+		}
+	}
+	if report.NeedsAttention == "" && runtimeFailure.Valid &&
+		strings.TrimSpace(runtimeFailure.String) != "" {
+		report.NeedsAttention = sanitizeObservabilityText(runtimeFailure.String)
+		report.ReplayState = "needs_attention"
+	} else if report.NeedsAttention == "" && desiredRevision.Valid &&
+		(!appliedRevision.Valid ||
+			desiredRevision.Int64 != appliedRevision.Int64) {
+		report.ReplayState = "pending"
+	}
+
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(status='ready'),0),
+       COALESCE(SUM(status IN ('open','waiting')),0),
+       COALESCE(SUM(status='blocked'),0),
+       COALESCE(SUM(status='soft_published'),0),
+       COALESCE(SUM(
+           (status='blocked'
+            OR verification_status IN
+               ('failed','timed_out','needs_attention'))
+           AND EXISTS (
+               SELECT 1
+               FROM intent_candidate_events pending_membership
+               JOIN capture_events pending_event
+                 ON pending_event.seq=pending_membership.event_seq
+                AND pending_event.state='pending'
+               WHERE pending_membership.candidate_id=intent_candidates.id
+                 AND pending_membership.membership_state='active'
+           )
+       ),0)
+FROM intent_candidates
+WHERE status IN ('open','waiting','ready','soft_published','blocked')
+  AND EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`).Scan(
+		&report.OpenCandidates, &report.ReadyCandidates,
+		&report.WaitingCandidates, &report.BlockedCandidates,
+		&report.SoftPublishedCandidates, &report.VerificationAttention,
+	); err != nil {
+		return report, errors.New("read Intent v2 candidate summary failed")
+	}
+	var candidateStatus, protocol, atomicity, atomicitySummary, verificationStatus sql.NullString
+	err := conn.QueryRowContext(ctx, `
+SELECT status, planner_protocol, atomicity_status, atomicity_summary,
+       verification_status
+FROM intent_candidates
+ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
+		&candidateStatus, &protocol, &atomicity, &atomicitySummary,
+		&verificationStatus)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, errors.New("read latest Intent v2 candidate failed")
+	}
+	report.LatestCandidateStatus = sanitizeObservabilityText(candidateStatus.String)
+	report.LatestPlannerProtocol = sanitizeObservabilityText(protocol.String)
+	report.LatestAtomicityStatus = sanitizeObservabilityText(atomicity.String)
+	report.LatestAtomicitySummary = sanitizeObservabilityText(atomicitySummary.String)
+	report.LatestVerificationStatus = sanitizeObservabilityText(verificationStatus.String)
+
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_repairs
+WHERE status IN ('prepared','git_applied')`).Scan(
+		&report.RecoverableRepairs); err != nil {
+		return report, errors.New("read Intent v2 repair summary failed")
+	}
+	var repairStatus, repairError sql.NullString
+	err = conn.QueryRowContext(ctx, `
+SELECT status, error FROM intent_repairs
+ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
+		&repairStatus, &repairError)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, errors.New("read latest Intent v2 repair failed")
+	}
+	report.LatestRepairStatus = sanitizeObservabilityText(repairStatus.String)
+	report.LatestRepairError = sanitizeObservabilityText(repairError.String)
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(epoch),0) FROM intent_activity_boundaries`).Scan(
+		&report.LastBoundaryEpoch); err != nil {
+		return report, errors.New("read Intent v2 boundary summary failed")
+	}
+	return report, nil
+}
+
+func parseIntentV2MetaBool(value string) bool {
+	parsed, _ := strconv.ParseBool(strings.TrimSpace(value))
+	return parsed
+}
+
+func decodeIntentV2Snapshot(snapshot string, report *intentV2Report) {
+	if report == nil {
+		return
+	}
+	var values map[string]json.RawMessage
+	if json.Unmarshal([]byte(snapshot), &values) != nil {
+		return
+	}
+	_ = json.Unmarshal(values["preset_id"], &report.PresetID)
+	_ = json.Unmarshal(values["preset_version"], &report.PresetVersion)
+	report.Customized = decodeIntentV2SnapshotBool(values["customized"])
+	_ = json.Unmarshal(values[config.FieldIntentVerification],
+		&report.VerificationMode)
+	report.RepairEnabled = decodeIntentV2SnapshotBool(
+		values[config.FieldIntentRepairEnabled])
+	if report.RepairHorizon == "" {
+		_ = json.Unmarshal(values[config.FieldIntentRepairHorizon],
+			&report.RepairHorizon)
+	}
+	var maxCommits string
+	if json.Unmarshal(values[config.FieldIntentRepairMaxCommits],
+		&maxCommits) == nil {
+		report.RepairMaxCommits, _ = strconv.Atoi(maxCommits)
+	} else {
+		_ = json.Unmarshal(values[config.FieldIntentRepairMaxCommits],
+			&report.RepairMaxCommits)
+	}
+	report.PresetID = sanitizeObservabilityText(report.PresetID)
+	report.VerificationMode = sanitizeObservabilityText(report.VerificationMode)
+	report.RepairHorizon = sanitizeObservabilityText(report.RepairHorizon)
+}
+
+func decodeIntentV2SnapshotBool(raw json.RawMessage) bool {
+	var direct bool
+	if json.Unmarshal(raw, &direct) == nil {
+		return direct
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		value, _ := strconv.ParseBool(strings.TrimSpace(text))
+		return value
+	}
+	return false
+}
+
+func renderIntentV2Human(out io.Writer, report intentV2Report) {
+	if !report.Available {
+		fmt.Fprintf(out, "Intent v2: unavailable (schema v%d; read-only compatibility mode)\n",
+			report.SchemaVersion)
+		return
+	}
+	customized := ""
+	if report.Customized {
+		customized = " customized"
+	}
+	fmt.Fprintf(out,
+		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_attention=%d recoverable_repairs=%d\n",
+		valueOrUnset(report.ReplayState), valueOrUnset(report.MigrationState),
+		valueOrUnset(report.PresetID), report.PresetVersion, customized,
+		valueOrUnset(report.VerificationMode), report.RepairEnabled,
+		valueOrUnset(report.RepairHorizon), report.RepairMaxCommits,
+		report.OpenCandidates,
+		report.ReadyCandidates, report.WaitingCandidates,
+		report.BlockedCandidates, report.SoftPublishedCandidates,
+		report.VerificationAttention,
+		report.RecoverableRepairs)
+	if report.NeedsAttention != "" {
+		fmt.Fprintf(out, "  Replay attention: %s\n", report.NeedsAttention)
+	}
+	if report.LatestCandidateStatus != "" {
+		fmt.Fprintf(out,
+			"  Latest candidate: status=%s protocol=%s atomicity=%s verification=%s\n",
+			report.LatestCandidateStatus,
+			valueOrUnset(report.LatestPlannerProtocol),
+			valueOrUnset(report.LatestAtomicityStatus),
+			valueOrUnset(report.LatestVerificationStatus))
+	}
+	if report.LatestRepairStatus != "" {
+		fmt.Fprintf(out, "  Latest repair: %s", report.LatestRepairStatus)
+		if report.LatestRepairError != "" {
+			fmt.Fprintf(out, " (%s)", report.LatestRepairError)
+		}
+		fmt.Fprintln(out)
+	}
 }
 
 func loadRuntimeConfigReport(ctx context.Context, conn *sql.DB, repoHash string, now time.Time) (runtimeConfigReport, error) {

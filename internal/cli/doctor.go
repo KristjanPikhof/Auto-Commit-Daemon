@@ -59,6 +59,7 @@ type doctorRepoReport struct {
 	FailedEvents           int                  `json:"failed_events"`
 	FailedBlockingPending  int                  `json:"failed_blocking_pending"`
 	IntentStrategy         intentStrategyReport `json:"intent_strategy"`
+	IntentV2               intentV2Report       `json:"intent_v2"`
 	LastReplayConflictTS   int64                `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath string               `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr  string               `json:"last_replay_conflict_error,omitempty"`
@@ -1269,6 +1270,15 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	} else {
 		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
 	}
+	if intentV2, err := loadIntentV2Report(ctx, conn); err == nil {
+		rr.IntentV2 = intentV2
+		if intentV2.NeedsAttention != "" {
+			rr.Notes = append(rr.Notes,
+				"Intent v2 replay stopped; capture remains durable; run acd configure")
+		}
+	} else {
+		rr.Notes = append(rr.Notes, "Intent v2 summary failed: "+err.Error())
+	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
@@ -1524,6 +1534,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 				fmt.Fprintf(out, "      planner err: seq %d %s\n",
 					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
 			}
+		}
+		if rr.IntentV2.Available {
+			renderIntentV2Human(out, rr.IntentV2)
 		}
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",

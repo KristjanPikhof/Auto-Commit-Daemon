@@ -258,6 +258,36 @@ func TestPlanIntentV2WithCompatibilityAdaptsLegacyPlanner(t *testing.T) {
 	}
 }
 
+func TestAdaptIntentPlanV1UsesStableDistinctCandidateIDsAcrossWindows(t *testing.T) {
+	adapt := func(seq int64) IntentPlanV2 {
+		t.Helper()
+		req := mustIntentPlanRequestV2(t,
+			[]OfferedCapture{{Seq: seq, Path: "a.go", Op: "modify"}},
+			nil,
+		)
+		got, err := AdaptIntentPlanV1(req, IntentPlan{
+			SelectedSeqs:   []int64{seq},
+			Subject:        "Update candidate planner",
+			GroupingReason: "capture is independently ready",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	first := adapt(41)
+	retry := adapt(41)
+	next := adapt(42)
+	firstID := first.Candidates[0].CandidateID
+	if firstID == "" || retry.Candidates[0].CandidateID != firstID {
+		t.Fatalf("retry candidate IDs differ: %q and %q",
+			firstID, retry.Candidates[0].CandidateID)
+	}
+	if next.Candidates[0].CandidateID == firstID {
+		t.Fatalf("consecutive windows reused candidate ID %q", firstID)
+	}
+}
+
 func TestNewIntentPlanRequestV2RedactsAndCapsDiff(t *testing.T) {
 	secret := "Authorization: Bearer sk-" + strings.Repeat("x", 80)
 	longDiff := secret + "\n" + strings.Repeat("+sensitive-looking-source\n", IntentStageDiffCap)

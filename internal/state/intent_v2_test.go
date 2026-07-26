@@ -378,6 +378,24 @@ func TestLoadIntentV2StateReadOnlyCurrentProjection(t *testing.T) {
 		got.RecoverableRepairs != 1 || got.LastBoundaryEpoch != 1 {
 		t.Fatalf("projection=%+v", got)
 	}
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "projection-replacement", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: IntentCandidateWaiting,
+		Readiness: IntentReadinessWait,
+		VerificationStatus: sql.NullString{
+			String: "passed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{EventSeq: seq, EventRole: "code"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = LoadIntentV2StateReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OpenCandidates != 1 || got.VerificationAttention != 0 {
+		t.Fatalf("superseded failure projection=%+v", got)
+	}
 }
 
 func TestIntentV2SchemaHasNoRawDiffColumns(t *testing.T) {
