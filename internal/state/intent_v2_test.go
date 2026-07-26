@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+const testIntentRepairPlanDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func TestIntentV2CandidateRoundTripAndReassignment(t *testing.T) {
 	t.Parallel()
@@ -143,12 +147,21 @@ func TestIntentV2OpenCandidateAndRepairCapsFailClosed(t *testing.T) {
 	ctx := context.Background()
 	seq := appendIntentV2Event(t, d, "refs/heads/main", 4, "cap.go")
 	for i := 0; i < IntentCandidateMaxOpenPerPair; i++ {
+		memberSeq := appendIntentV2Event(t, d, "refs/heads/main", 4,
+			fmt.Sprintf("existing-%03d.go", i))
 		if _, err := d.SQL().ExecContext(ctx, `
 INSERT INTO intent_candidates(
     id, branch_ref, branch_generation, status, created_ts, updated_ts
 ) VALUES (?, 'refs/heads/main', 4, 'open', 1, 1)`,
 			fmt.Sprintf("existing-%03d", i)); err != nil {
 			t.Fatalf("seed open candidate %d: %v", i, err)
+		}
+		if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO intent_candidate_events(
+    candidate_id, ord, event_seq, event_role, membership_state
+) VALUES (?, 0, ?, 'code', 'active')`,
+			fmt.Sprintf("existing-%03d", i), memberSeq); err != nil {
+			t.Fatalf("seed open membership %d: %v", i, err)
 		}
 	}
 	err := SaveIntentCandidate(ctx, d, IntentCandidate{
@@ -167,7 +180,8 @@ INSERT INTO intent_candidates(
 	err = SaveIntentRepair(ctx, d, IntentRepair{
 		ID: "over-repair-cap", BranchRef: "refs/heads/main",
 		BranchGeneration: 4, ExpectedHead: "head",
-		Commits: commits,
+		PlanDigest: testIntentRepairPlanDigest,
+		Commits:    commits,
 	})
 	if err == nil || !strings.Contains(err.Error(), "1..5") {
 		t.Fatalf("repair cap err=%v", err)
@@ -178,6 +192,148 @@ INSERT INTO intent_candidates(
 	}
 	if repairs != 0 {
 		t.Fatalf("repair count=%d want=0", repairs)
+	}
+}
+
+func TestIntentV2TerminalAndEmptyCandidatesDoNotConsumeOpenCap(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	first := appendIntentV2Event(t, d, "refs/heads/main", 5, "first.go")
+	second := appendIntentV2Event(t, d, "refs/heads/main", 5, "second.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "old", BranchRef: "refs/heads/main", BranchGeneration: 5,
+		Status: IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Events: []IntentCandidateEvent{
+			{EventSeq: first, EventRole: "code"},
+			{EventSeq: second, EventRole: "test"},
+		},
+	}); err != nil {
+		t.Fatalf("save old candidate: %v", err)
+	}
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "replacement", BranchRef: "refs/heads/main", BranchGeneration: 5,
+		Status: IntentCandidateReady, Readiness: IntentReadinessReady,
+		Events: []IntentCandidateEvent{
+			{EventSeq: first, EventRole: "code"},
+			{EventSeq: second, EventRole: "test"},
+		},
+	}); err != nil {
+		t.Fatalf("save replacement: %v", err)
+	}
+	old, ok, err := IntentCandidateByID(ctx, d, "old")
+	if err != nil || !ok || old.Status != IntentCandidateSuperseded ||
+		len(old.Events) != 0 {
+		t.Fatalf("retired old candidate=%+v ok=%v err=%v", old, ok, err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='published', published_commit_oid='commit'
+WHERE id='replacement'`); err != nil {
+		t.Fatal(err)
+	}
+	open, err := IntentCandidatesForPair(ctx, d, "refs/heads/main", 5, 0)
+	if err != nil || len(open) != 0 {
+		t.Fatalf("open candidates=%+v err=%v", open, err)
+	}
+}
+
+func TestIntentV2FinalizeExpiredSoftPublication(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	seq := appendIntentV2Event(t, d, "refs/heads/main", 6, "late.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "soft", BranchRef: "refs/heads/main", BranchGeneration: 6,
+		Status: IntentCandidateSoftPublished, Readiness: IntentReadinessReady,
+		SoftPublicationDeadline: sql.NullFloat64{Float64: 10, Valid: true},
+		Events:                  []IntentCandidateEvent{{EventSeq: seq, EventRole: "code"}},
+	}); err != nil {
+		t.Fatalf("save soft candidate: %v", err)
+	}
+	if n, err := FinalizeExpiredIntentCandidates(
+		ctx, d, "refs/heads/main", 6, 11,
+	); err != nil || n != 1 {
+		t.Fatalf("finalize expired=(%d,%v)", n, err)
+	}
+	got, ok, err := IntentCandidateByID(ctx, d, "soft")
+	if err != nil || !ok || got.Status != IntentCandidatePublished {
+		t.Fatalf("finalized candidate=%+v ok=%v err=%v", got, ok, err)
+	}
+	open, err := IntentCandidatesForPair(ctx, d, "refs/heads/main", 6, 0)
+	if err != nil || len(open) != 0 {
+		t.Fatalf("open after expiry=%+v err=%v", open, err)
+	}
+}
+
+func TestIntentV2PublishedPruneCleansTerminalGraphAndProtectsOpenMember(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	appendPublished := func(path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			BaseHead: "base", Operation: "update", Path: path,
+			Fidelity: "full", CapturedTS: 10, State: EventStatePublished,
+		}, nil)
+		if err != nil {
+			t.Fatalf("append published %s: %v", path, err)
+		}
+		return seq
+	}
+	terminalSeq := appendPublished("terminal.go")
+	protectedSeq := appendPublished("soft.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "terminal", BranchRef: "refs/heads/main", BranchGeneration: 7,
+		Status: IntentCandidatePublished, Readiness: IntentReadinessReady,
+		PublishedCommitOID: sql.NullString{String: "old", Valid: true},
+		Events:             []IntentCandidateEvent{{EventSeq: terminalSeq, EventRole: "code"}},
+	}); err != nil {
+		t.Fatalf("save terminal candidate: %v", err)
+	}
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "repairable", BranchRef: "refs/heads/main", BranchGeneration: 7,
+		Status: IntentCandidateSoftPublished, Readiness: IntentReadinessReady,
+		SoftPublicationDeadline: sql.NullFloat64{Float64: 200, Valid: true},
+		PublishedCommitOID:      sql.NullString{String: "head", Valid: true},
+		Events:                  []IntentCandidateEvent{{EventSeq: protectedSeq, EventRole: "code"}},
+	}); err != nil {
+		t.Fatalf("save repairable candidate: %v", err)
+	}
+	if err := ReplaceIntentCaptureDependencies(ctx, d, "refs/heads/main", 7,
+		[]IntentCaptureDependency{{
+			PrerequisiteSeq: terminalSeq, DependentSeq: protectedSeq,
+			Strength: IntentDependencySoft, Kind: "module_proximity",
+		}}); err != nil {
+		t.Fatalf("save dependency: %v", err)
+	}
+	if n, err := PrunePublishedEventsBefore(ctx, d, 100); err != nil || n != 1 {
+		t.Fatalf("prune published=(%d,%v)", n, err)
+	}
+	var terminalExists, protectedExists int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq=?`, terminalSeq,
+	).Scan(&terminalExists); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM capture_events WHERE seq=?`, protectedSeq,
+	).Scan(&protectedExists); err != nil {
+		t.Fatal(err)
+	}
+	if terminalExists != 0 || protectedExists != 1 {
+		t.Fatalf("event counts terminal=%d protected=%d",
+			terminalExists, protectedExists)
+	}
+	terminal, ok, err := IntentCandidateByID(ctx, d, "terminal")
+	if err != nil || !ok || len(terminal.Events) != 0 {
+		t.Fatalf("terminal candidate=%+v ok=%v err=%v", terminal, ok, err)
+	}
+	deps, err := IntentCaptureDependenciesForPair(
+		ctx, d, "refs/heads/main", 7)
+	if err != nil || len(deps) != 0 {
+		t.Fatalf("dependencies after prune=%+v err=%v", deps, err)
 	}
 }
 
@@ -223,6 +379,7 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 	repair := IntentRepair{
 		ID: "repair-1", BranchRef: "refs/heads/main", BranchGeneration: 9,
 		Status: IntentRepairPrepared, ExpectedHead: "head-2",
+		PlanDigest: testIntentRepairPlanDigest,
 		Commits: []IntentRepairCommit{
 			{OldOID: "head-1", CandidateID: sql.NullString{String: "candidate-a", Valid: true}},
 			{OldOID: "head-2", CandidateID: sql.NullString{String: "candidate-b", Valid: true}},
@@ -254,6 +411,49 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 	if err != nil || !ok || gotRepair.Status != IntentRepairCompleted ||
 		len(gotRepair.Commits) != 2 || gotRepair.Commits[1].NewOID.String != "new-2" {
 		t.Fatalf("repair=%+v ok=%v err=%v", gotRepair, ok, err)
+	}
+}
+
+func TestIntentActivityBoundaryRetriesConcurrentEpochAllocation(t *testing.T) {
+	d1, dbPath := openTestDB(t)
+	d2, err := Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d2.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	errs := make(chan error, 20)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		db := d1
+		if i%2 == 1 {
+			db = d2
+		}
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			_, err := AppendIntentActivityBoundary(
+				ctx, db, IntentActivityBoundary{
+					Kind:   IntentBoundaryHard,
+					Source: fmt.Sprintf("concurrent-%d", index),
+				})
+			errs <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent boundary: %v", err)
+		}
+	}
+	pending, err := PendingIntentActivityBoundaries(ctx, d1, 0, 25)
+	if err != nil || len(pending) != 20 {
+		t.Fatalf("boundaries=%d err=%v", len(pending), err)
 	}
 }
 
@@ -365,7 +565,8 @@ func TestLoadIntentV2StateReadOnlyCurrentProjection(t *testing.T) {
 	if err := SaveIntentRepair(ctx, d, IntentRepair{
 		ID: "projection-repair", BranchRef: "refs/heads/main",
 		BranchGeneration: 1, ExpectedHead: "head",
-		Commits: []IntentRepairCommit{{OldOID: "head"}},
+		PlanDigest: testIntentRepairPlanDigest,
+		Commits:    []IntentRepairCommit{{OldOID: "head"}},
 	}); err != nil {
 		t.Fatal(err)
 	}

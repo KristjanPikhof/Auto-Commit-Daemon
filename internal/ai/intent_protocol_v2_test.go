@@ -59,24 +59,31 @@ func TestValidateIntentPlanV2RejectsDisconnectedMegaGroup(t *testing.T) {
 	}
 }
 
-func TestValidateIntentPlanV2DoesNotTreatTimeAsCohesion(t *testing.T) {
-	req := mustIntentPlanRequestV2(t,
-		[]OfferedCapture{
-			{Seq: 1, Path: "internal/a.go", Op: "modify"},
-			{Seq: 2, Path: "docs/b.md", Op: "modify"},
-		},
-		[]IntentCaptureDependency{{
-			FromSeq: 1, ToSeq: 2, Strength: IntentDependencySoft,
-			Kind: "temporal_proximity",
-		}},
-	)
-	err := ValidateIntentPlanV2(req, IntentPlanV2{
-		ProtocolVersion: IntentPlannerProtocolV2,
-		Candidates:      []IntentCandidateAssignment{readyCandidate("mega", []int64{1, 2})},
-	})
-	var validationErr *IntentPlanV2ValidationError
-	if !errors.As(err, &validationErr) || validationErr.Findings[0].Code != "candidate_disconnected" {
-		t.Fatalf("error = %T %v", err, err)
+func TestValidateIntentPlanV2DoesNotTreatWeakProximityAsCohesion(t *testing.T) {
+	for _, kind := range []string{"temporal_proximity", "module_proximity"} {
+		t.Run(kind, func(t *testing.T) {
+			req := mustIntentPlanRequestV2(t,
+				[]OfferedCapture{
+					{Seq: 1, Path: "internal/a.go", Op: "modify"},
+					{Seq: 2, Path: "internal/b.go", Op: "modify"},
+				},
+				[]IntentCaptureDependency{{
+					FromSeq: 1, ToSeq: 2,
+					Strength: IntentDependencySoft, Kind: kind,
+				}},
+			)
+			err := ValidateIntentPlanV2(req, IntentPlanV2{
+				ProtocolVersion: IntentPlannerProtocolV2,
+				Candidates: []IntentCandidateAssignment{
+					readyCandidate("mega", []int64{1, 2}),
+				},
+			})
+			var validationErr *IntentPlanV2ValidationError
+			if !errors.As(err, &validationErr) ||
+				validationErr.Findings[0].Code != "candidate_disconnected" {
+				t.Fatalf("error = %T %v", err, err)
+			}
+		})
 	}
 }
 

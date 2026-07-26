@@ -370,7 +370,7 @@ CREATE TABLE IF NOT EXISTS intent_candidates(
     branch_generation        INTEGER NOT NULL,
     status                   TEXT NOT NULL CHECK (status IN
                               ('open','waiting','ready','soft_published',
-                               'published','blocked','failed')),
+                               'published','superseded','blocked','failed')),
     purpose                  TEXT NOT NULL DEFAULT '',
     created_ts               REAL NOT NULL,
     updated_ts               REAL NOT NULL,
@@ -475,6 +475,7 @@ CREATE TABLE IF NOT EXISTS intent_repairs(
     status              TEXT NOT NULL CHECK (status IN
                            ('prepared','git_applied','completed','skipped','failed')),
     expected_head       TEXT NOT NULL,
+    plan_digest         TEXT NOT NULL,
     backup_ref          TEXT,
     old_head            TEXT,
     new_head            TEXT,

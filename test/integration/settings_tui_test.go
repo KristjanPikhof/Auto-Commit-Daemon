@@ -56,6 +56,66 @@ func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
 	assertAltScreenRestored(t, resized.Stdout)
 }
 
+func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
+	repo := tempRepo(t)
+	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+
+	for _, tc := range []struct {
+		name       string
+		env        []string
+		cols, rows int
+		args       []string
+		input      string
+	}{
+		{name: "narrow", env: baseEnv, cols: 52, rows: 18, input: "\x03"},
+		{name: "accessible", env: baseEnv, cols: 58, rows: 20,
+			args: []string{"--accessible"}, input: "1\n\x00\x03"},
+		{name: "no_color", env: envWith(baseEnv, "NO_COLOR=1"),
+			cols: 72, rows: 24, input: "\x03"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			args := append([]string{"configure", "--repo", repo}, tc.args...)
+			command := append([]string{bin}, args...)
+			result := runPTYCommand(t, ctx, tc.env, tc.cols, tc.rows, 0, 0,
+				tc.input, command...)
+			if result.ExitCode == 0 {
+				t.Fatalf("cancelled configure unexpectedly succeeded\n%s",
+					result.Stdout)
+			}
+			if !strings.Contains(result.Stdout, "Commit strategy") ||
+				!strings.Contains(result.Stdout, "Intent") ||
+				!strings.Contains(result.Stdout, "Preset") {
+				t.Fatalf("configure choices unreadable at %dx%d\n%s",
+					tc.cols, tc.rows, result.Stdout)
+			}
+			if tc.name == "accessible" &&
+				strings.Contains(result.Stdout, "\x1b[?1049h") {
+				t.Fatalf("accessible configure entered alternate screen\n%q",
+					result.Stdout)
+			}
+			if tc.name == "no_color" &&
+				(strings.Contains(result.Stdout, "\x1b[38;") ||
+					strings.Contains(result.Stdout, "\x1b[48;")) {
+				t.Fatalf("NO_COLOR configure emitted color SGR\n%q",
+					result.Stdout)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resized := runPTYCommand(t, ctx, baseEnv, 100, 32, 52, 18,
+		"\x03", bin, "configure", "--repo", repo)
+	if resized.ExitCode == 0 ||
+		!strings.Contains(resized.Stdout, "Commit strategy") ||
+		!strings.Contains(resized.Stdout, "Preset") {
+		t.Fatalf("resized configure transcript incomplete\n%s", resized.Stdout)
+	}
+}
+
 func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	repo := tempRepo(t)
 	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")

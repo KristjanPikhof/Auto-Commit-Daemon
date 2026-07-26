@@ -66,6 +66,46 @@ func TestReplayIntentV2PublishesCandidatesInPlannerOrder(t *testing.T) {
 	}
 }
 
+func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		"first.txt": "one\n", "second.txt": "two\n",
+	} {
+		if err := os.WriteFile(filepath.Join(f.dir, path),
+			[]byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: &disconnectedIntentV2Planner{},
+		IntentPreset:  config.PresetFast, IntentBypassBatchWait: true,
+		IntentWindow: 10, IntentDeferLimit: 5,
+	}
+	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || first.Published != 1 {
+		t.Fatalf("first replay=%+v err=%v", first, err)
+	}
+	f.cctx.BaseHead = first.BaseHead
+	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || second.Published != 1 {
+		t.Fatalf("second replay=%+v err=%v", second, err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+}
+
 func TestReplayIntentV2LateCompanionRepairsSoftCommit(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -115,6 +155,10 @@ func TestReplayIntentV2LateCompanionRepairsSoftCommit(t *testing.T) {
 		"rev-list", "--first-parent", "HEAD")); len(commits) != 2 {
 		t.Fatalf("repair should replace, not append, soft commit: commits=%v", commits)
 	}
+	if status := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "status", "--short")); status != "" {
+		t.Fatalf("repair left live index or worktree dirty: %s", status)
+	}
 	var candidateID string
 	if err := f.db.ReadSQL().QueryRowContext(ctx, `
 SELECT member.candidate_id
@@ -133,6 +177,98 @@ LIMIT 1`).Scan(&candidateID); err != nil {
 	repairs, err := state.RecoverableIntentRepairs(ctx, f.db, 10)
 	if err != nil || len(repairs) != 0 {
 		t.Fatalf("recoverable repairs=%+v err=%v", repairs, err)
+	}
+}
+
+func TestReplayIntentV2RepairsOwnedCommitSuffix(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	planner := &suffixRepairIntentV2Planner{}
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRepairEnabled: true, IntentRepairHorizon: 10 * time.Minute,
+		IntentRepairMaxCommits: 3,
+	}
+	writeCapture := func(path, contents string) ReplaySummary {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(f.dir, path),
+			[]byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.cctx.BaseHead = sum.BaseHead
+		return sum
+	}
+	first := writeCapture("feature.go", "package feature\n\nfunc Value() int { return 1 }\n")
+	second := writeCapture("guide.md", "# Guide\n")
+	third := writeCapture("feature_test.go",
+		"package feature\n\nfunc ExampleValue() { _ = Value() }\n")
+	if first.Published != 1 || second.Published != 1 ||
+		third.Published != 1 {
+		t.Fatalf("replays first=%+v second=%+v third=%+v",
+			first, second, third)
+	}
+	subjects := strings.Split(strings.TrimSpace(mustGitOutput(
+		t, f.dir, "log", "-2", "--format=%s")), "\n")
+	if strings.Join(subjects, "|") != "Document feature|Add tested feature" {
+		t.Fatalf("subjects=%v", subjects)
+	}
+	var completed int
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_repairs
+WHERE status='completed'`).Scan(&completed); err != nil || completed != 1 {
+		t.Fatalf("completed repairs=%d err=%v", completed, err)
+	}
+}
+
+func TestReplayIntentV2AdvancesDeferredCaptureState(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "pending.go"),
+		[]byte("package pending\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: &waitingIntentV2Planner{},
+		IntentPreset:  config.PresetFast, IntentBypassBatchWait: true,
+		IntentWindow: 10, IntentDeferLimit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Skipped || result.Published != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	plannerState, ok, err := state.PlannerStateForEvent(
+		ctx, f.db, pending[0].Seq)
+	if err != nil || !ok || plannerState.DeferCount != 1 {
+		t.Fatalf("planner state=%+v ok=%v err=%v", plannerState, ok, err)
 	}
 }
 
@@ -204,6 +340,35 @@ type orderedIntentV2Planner struct{}
 
 type tracedInvalidIntentV2Planner struct{}
 
+type disconnectedIntentV2Planner struct{}
+
+func (*disconnectedIntentV2Planner) Name() string { return "disconnected-v2-test" }
+
+func (*disconnectedIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (*disconnectedIntentV2Planner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "disconnected", SelectedSeqs: seqs,
+			Purpose: "mix independent captures", Readiness: ai.IntentCandidateReady,
+			Subject: "Mix captures", GroupingReason: "same window",
+		}},
+	}, nil
+}
+
 func (*tracedInvalidIntentV2Planner) Name() string { return "openai-compat" }
 
 func (*tracedInvalidIntentV2Planner) PlanIntent(
@@ -247,6 +412,101 @@ func (orderedIntentV2Planner) PlanIntent(
 }
 
 type revisingIntentV2Planner struct{}
+
+type waitingIntentV2Planner struct{}
+
+type suffixRepairIntentV2Planner struct{}
+
+func (*suffixRepairIntentV2Planner) Name() string { return "suffix-repair-v2-test" }
+
+func (*suffixRepairIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (*suffixRepairIntentV2Planner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	byPath := make(map[string]int64)
+	for _, capture := range req.OfferedCaptures {
+		byPath[capture.Path] = capture.Seq
+	}
+	featureID := "candidate-feature"
+	docID := "candidate-doc"
+	for _, candidate := range req.Candidates {
+		switch {
+		case strings.Contains(candidate.Purpose, "documentation"):
+			docID = candidate.CandidateID
+		case strings.Contains(candidate.Purpose, "feature"):
+			featureID = candidate.CandidateID
+		}
+	}
+	var assignments []ai.IntentCandidateAssignment
+	switch {
+	case byPath["feature.go"] != 0:
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID:    featureID,
+			SelectedSeqs:   []int64{byPath["feature.go"]},
+			Purpose:        "add feature with its test",
+			Readiness:      ai.IntentCandidateReady,
+			Subject:        "Add tested feature",
+			GroupingReason: "feature candidate",
+		})
+	case byPath["feature_test.go"] != 0:
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID:    featureID,
+			SelectedSeqs:   []int64{byPath["feature_test.go"]},
+			Purpose:        "add feature with its test",
+			Readiness:      ai.IntentCandidateReady,
+			Subject:        "Add tested feature",
+			GroupingReason: "late companion completes feature candidate",
+		})
+	case byPath["guide.md"] != 0:
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID:    docID,
+			SelectedSeqs:   []int64{byPath["guide.md"]},
+			Purpose:        "feature documentation",
+			Readiness:      ai.IntentCandidateReady,
+			Subject:        "Document feature",
+			GroupingReason: "independent documentation candidate",
+		})
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      assignments,
+	}, nil
+}
+
+func (*waitingIntentV2Planner) Name() string { return "waiting-v2-test" }
+
+func (*waitingIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (*waitingIntentV2Planner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "waiting", SelectedSeqs: seqs,
+			Purpose: "wait for a companion", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"companion test"},
+			Subject:           "Add pending unit", GroupingReason: "companion expected",
+		}},
+	}, nil
+}
 
 func (*revisingIntentV2Planner) Name() string { return "revising-v2-test" }
 
@@ -373,6 +633,72 @@ func TestIntentRepairCrashAfterCASRecoversOnRestart(t *testing.T) {
 		t.Fatalf("recovered=%+v", recovered)
 	}
 	assertIntentRepairReconciled(t, f, applied.NewHead)
+}
+
+func TestRunRecoversIntentRepairBeforeStartupTransition(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	crash := errors.New("simulated crash after CAS")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	intentRepairAfterGitApply = nil
+	shutdown := make(chan struct{})
+	close(shutdown)
+	if err := Run(ctx, Options{
+		RepoPath: f.repo.dir, GitDir: f.repo.gitDir, DB: f.repo.db,
+		MessageFn: DeterministicMessage, ShutdownCh: shutdown,
+		SkipSignals: true, BootGrace: time.Hour,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	assertIntentRepairReconciled(t, f, applied.NewHead)
+	generation, err := LoadBranchGeneration(ctx, f.repo.db)
+	if err != nil || generation != f.cctx.BranchGeneration {
+		t.Fatalf("generation=%d err=%v", generation, err)
+	}
+}
+
+func TestIntentRepairRecoveryRejectsDifferentReplacementChain(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	crash := errors.New("simulated crash after CAS")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	intentRepairAfterGitApply = nil
+	base := strings.TrimSpace(mustGitOutput(
+		t, f.repo.dir, "rev-parse", f.oldCommits[0]+"^"))
+	alternate, err := git.CommitTree(
+		ctx, f.repo.dir, f.plan.Candidates[0].TreeOID,
+		"External replacement", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := git.UpdateRef(ctx, f.repo.dir, f.cctx.BranchRef,
+		alternate, applied.NewHead); err != nil {
+		t.Fatal(err)
+	}
+	_, err = RecoverIntentRepairs(
+		ctx, f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx)
+	if err == nil || !strings.Contains(err.Error(),
+		"does not match prepared plan") {
+		t.Fatalf("RecoverIntentRepairs err=%v", err)
+	}
+	if backup, backupErr := git.RevParse(
+		ctx, f.repo.dir, applied.BackupRef); backupErr != nil ||
+		backup != f.plan.ExpectedHead {
+		t.Fatalf("backup=%q err=%v", backup, backupErr)
+	}
 }
 
 func TestIntentRepairDirtyOverlapSkipsWithoutMutation(t *testing.T) {

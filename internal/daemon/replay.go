@@ -435,9 +435,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		sum.HasMore = true
 	}
 	if !intentCfg.candidateMode || len(pending) == 0 {
-		if err := consumeInactiveIntentActivityBoundaries(
-			ctx, db, cctx.BranchRef, cctx.BranchGeneration,
-		); err != nil {
+		if err := consumeInactiveIntentActivityBoundaries(ctx, db); err != nil {
 			return sum, err
 		}
 	}
@@ -849,8 +847,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 func consumeInactiveIntentActivityBoundaries(
 	ctx context.Context,
 	db *state.DB,
-	branchRef string,
-	generation int64,
 ) error {
 	for {
 		boundaries, err := state.PendingIntentActivityBoundaries(
@@ -860,12 +856,6 @@ func consumeInactiveIntentActivityBoundaries(
 		}
 		var through int64
 		for _, boundary := range boundaries {
-			if boundary.BranchRef.Valid &&
-				(boundary.BranchRef.String != branchRef ||
-					!boundary.BranchGeneration.Valid ||
-					boundary.BranchGeneration.Int64 != generation) {
-				break
-			}
 			through = boundary.Epoch
 		}
 		if through == 0 {

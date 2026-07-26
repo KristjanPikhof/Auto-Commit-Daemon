@@ -702,6 +702,15 @@ CREATE TEMP TABLE IF NOT EXISTS acd_prune_recovery_context(
 	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_recovery_context`); err != nil {
 		return 0, fmt.Errorf("state: clear published prune context: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TEMP TABLE IF NOT EXISTS acd_prune_intent_events(
+    event_seq INTEGER PRIMARY KEY
+) WITHOUT ROWID`); err != nil {
+		return 0, fmt.Errorf("state: create intent prune set: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_intent_events`); err != nil {
+		return 0, fmt.Errorf("state: clear intent prune set: %w", err)
+	}
 
 	rows, err := tx.QueryContext(ctx, `
 SELECT branch_ref, branch_generation, MIN(seq), MAX(seq)
@@ -832,8 +841,9 @@ WHERE published.state = 'published'
 		return 0, fmt.Errorf("state: retain interleaved published prune context: %w", err)
 	}
 
-	res, err := tx.ExecContext(ctx, `
-DELETE FROM capture_events
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO acd_prune_intent_events(event_seq)
+SELECT seq FROM capture_events
 WHERE state = 'published'
   AND captured_ts < ?
   AND NOT EXISTS (
@@ -845,7 +855,32 @@ WHERE state = 'published'
       SELECT 1
       FROM acd_prune_recovery_context context
       WHERE context.event_seq = capture_events.seq
-  )`, cutoff)
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM intent_candidate_events member
+      JOIN intent_candidates candidate ON candidate.id=member.candidate_id
+      WHERE member.event_seq=capture_events.seq
+        AND member.membership_state='active'
+        AND candidate.status IN
+            ('open','waiting','ready','soft_published','blocked')
+  )`, cutoff); err != nil {
+		return 0, fmt.Errorf("state: select published intent prune set: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM intent_capture_dependencies
+WHERE prerequisite_seq IN (SELECT event_seq FROM acd_prune_intent_events)
+   OR dependent_seq IN (SELECT event_seq FROM acd_prune_intent_events)`); err != nil {
+		return 0, fmt.Errorf("state: prune intent dependency edges: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM intent_candidate_events
+WHERE event_seq IN (SELECT event_seq FROM acd_prune_intent_events)`); err != nil {
+		return 0, fmt.Errorf("state: prune terminal intent membership: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE seq IN (SELECT event_seq FROM acd_prune_intent_events)`)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune published events: %w", err)
 	}
@@ -855,6 +890,9 @@ WHERE state = 'published'
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_recovery_context`); err != nil {
 		return 0, fmt.Errorf("state: clear completed published prune context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_intent_events`); err != nil {
+		return 0, fmt.Errorf("state: clear completed intent prune set: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("state: commit published prune: %w", err)

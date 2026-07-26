@@ -1153,7 +1153,7 @@ func edgeSupportsCohesion(edge IntentCaptureDependency) bool {
 		return true
 	}
 	switch edge.Kind {
-	case "activity_epoch", "temporal_proximity":
+	case "activity_epoch", "temporal_proximity", "module_proximity":
 		return false
 	default:
 		return true

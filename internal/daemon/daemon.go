@@ -734,7 +734,50 @@ func Run(ctx context.Context, opts Options) error {
 		branchRef = tokenBranchRef(currentToken)
 		headOID = tokenSHA(currentToken)
 	}
-	branchTransitionBlocked := false
+	startupRepairBlocked := false
+	if branchRef != "" && headOID != "" {
+		recoverable, recoverErr := state.RecoverableIntentRepairs(
+			ctx, opts.DB, intentRepairBackupCap)
+		if recoverErr != nil {
+			logger.Warn("inspect recoverable intent repairs at startup",
+				"err", recoverErr.Error())
+			startupRepairBlocked = true
+		} else if len(recoverable) > 0 {
+			recoveryCtx := CaptureContext{
+				BranchRef: branchRef, BranchGeneration: persistedGen,
+				BaseHead: headOID,
+			}
+			recovered, recoverErr := RecoverIntentRepairs(
+				ctx, opts.RepoPath, opts.GitDir, opts.DB, recoveryCtx)
+			if recoverErr != nil {
+				logger.Warn("recover intent repairs before branch transition",
+					"err", recoverErr.Error())
+				startupRepairBlocked = true
+			} else {
+				completed := false
+				for _, repair := range recovered {
+					if repair.Status == state.IntentRepairCompleted {
+						completed = true
+						logger.Info("recovered intent repair at startup",
+							"repair_id", repair.ID, "new_head", repair.NewHead)
+					}
+				}
+				if completed {
+					persistedHead = headOID
+					if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
+						MetaKeyBranchGeneration: strconv.FormatInt(persistedGen, 10),
+						MetaKeyBranchHead:       headOID,
+						MetaKeyBranchToken:      currentToken,
+					}); err != nil {
+						logger.Warn("accept recovered intent repair metadata",
+							"err", err.Error())
+						startupRepairBlocked = true
+					}
+				}
+			}
+		}
+	}
+	branchTransitionBlocked := startupRepairBlocked
 	startupPreviousToken := currentToken
 	startupPreviousGeneration := persistedGen
 	startupTokenChanged := false

@@ -685,6 +685,104 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 	}
 }
 
+func TestIntentCandidateEngineRejectsSameDirectoryMegaGroup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	first := appendIntentCandidateCapture(t, db, "internal/api/alpha.go", "create", "", "a1")
+	second := appendIntentCandidateCapture(t, db, "internal/api/beta.go", "create", "", "b1")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "same-directory-mega",
+			SelectedSeqs: []int64{first.Event.Seq, second.Event.Seq},
+			Purpose:      "mix unrelated same-directory work",
+			Readiness:    ai.IntentCandidateReady, Subject: "Update API work",
+			GroupingReason: "files share a module directory",
+		}},
+	}}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{first, second},
+		Planner:  planner, Preset: config.PresetFast,
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Fallback != "hard_dependency_component" ||
+		len(result.Decisions) != 2 ||
+		!result.Decisions[0].Publishable ||
+		result.Decisions[1].Publishable {
+		t.Fatalf("same-directory mega-group was not split safely: %+v", result)
+	}
+	for _, decision := range result.Decisions {
+		if len(decision.Assignment.SelectedSeqs) != 1 {
+			t.Fatalf("fallback component=%+v", decision)
+		}
+	}
+}
+
+func TestIntentCandidateEngineAdvancesFastFallbackComponents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	first := appendIntentCandidateCapture(t, db, "first.txt", "create", "", "a1")
+	second := appendIntentCandidateCapture(t, db, "second.txt", "create", "", "b1")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "disconnected",
+			SelectedSeqs: []int64{first.Event.Seq, second.Event.Seq},
+			Purpose:      "mix independent captures", Readiness: ai.IntentCandidateReady,
+			Subject: "Mix captures", GroupingReason: "same window",
+		}},
+	}}
+	evaluate := func(captures []IntentCandidateCapture) IntentCandidateEvaluationResult {
+		result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			Captures: captures, Planner: planner, Preset: config.PresetFast,
+			Materialize: func(context.Context, []IntentCandidateCapture) error {
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	initial := evaluate([]IntentCandidateCapture{first, second})
+	if len(initial.Decisions) != 2 ||
+		!initial.Decisions[0].Publishable ||
+		initial.Decisions[1].Publishable {
+		t.Fatalf("initial fallback=%+v", initial)
+	}
+	firstID := initial.Decisions[0].Candidate.ID
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='soft_published', published_commit_oid='first-commit',
+    soft_publication_deadline=?
+WHERE id=?`,
+		float64(time.Now().Add(time.Minute).UnixNano())/1e9,
+		firstID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published', commit_oid='first-commit'
+WHERE seq=?`, first.Event.Seq); err != nil {
+		t.Fatal(err)
+	}
+	next := evaluate([]IntentCandidateCapture{second})
+	if len(next.Decisions) != 1 || !next.Decisions[0].Publishable ||
+		len(next.Decisions[0].Assignment.SelectedSeqs) != 1 ||
+		next.Decisions[0].Assignment.SelectedSeqs[0] != second.Event.Seq {
+		t.Fatalf("next fallback=%+v", next)
+	}
+}
+
 func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -936,6 +1034,33 @@ func TestIntentCandidateEngineReportsV1CompatibilityAndConsumesBoundary(t *testi
 	}
 }
 
+func TestIntentCandidateBoundariesSkipStaleBranchEpochs(t *testing.T) {
+	t.Parallel()
+	boundaries := []state.IntentActivityBoundary{
+		{
+			Epoch: 1,
+			BranchRef: sql.NullString{
+				String: "refs/heads/old", Valid: true,
+			},
+			BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+		},
+		{Epoch: 2, Kind: state.IntentBoundarySoft, Source: "global"},
+		{
+			Epoch: 3, Kind: state.IntentBoundarySoft, Source: "active",
+			BranchRef: sql.NullString{
+				String: "refs/heads/main", Valid: true,
+			},
+			BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
+		},
+	}
+	got, through := consumableBoundariesForPair(
+		boundaries, "refs/heads/main", 2)
+	if through != 3 || len(got) != 2 ||
+		got[0].Epoch != 2 || got[1].Epoch != 3 {
+		t.Fatalf("boundaries=%+v through=%d", got, through)
+	}
+}
+
 func TestBuildIntentCandidateDependenciesHashesEvidenceAndEnforcesCap(t *testing.T) {
 	t.Parallel()
 	first := intentCandidateCaptureFixture(1, "a.go", "create", "", "a1")
@@ -1000,6 +1125,27 @@ func TestBuildIntentCandidateDependenciesKeepsDocumentationIndependent(t *testin
 		if edge.Kind != "temporal_proximity" {
 			t.Fatalf("documentation and code gained cohesion evidence: %+v", edge)
 		}
+	}
+}
+
+func TestRuntimeIntentDependencyHintsUseSourceEvidence(t *testing.T) {
+	t.Parallel()
+	source := intentCandidateCaptureFixture(
+		1, "internal/api/client.go", "create", "", "source")
+	source.CapturedDiff = "+func ResolveTicketClient() {}\n"
+	generated := intentCandidateCaptureFixture(
+		2, "internal/api/client_generated.go", "create", "", "generated")
+	generated.CapturedDiff = "// Code generated from client.go\n+ResolveTicketClient()\n"
+	hints := runtimeIntentDependencyHints(
+		[]IntentCandidateCapture{source, generated})
+	kinds := make(map[string]ai.IntentDependencyStrength)
+	for _, hint := range hints {
+		kinds[hint.Kind] = hint.Strength
+	}
+	if kinds["symbol_hash"] != ai.IntentDependencySoft ||
+		kinds["import_reference"] != ai.IntentDependencySoft ||
+		kinds["generated_source"] != ai.IntentDependencyHard {
+		t.Fatalf("runtime hints=%+v", hints)
 	}
 }
 

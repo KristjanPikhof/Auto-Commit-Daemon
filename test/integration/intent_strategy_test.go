@@ -108,7 +108,7 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 	}
 }
 
-func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
+func TestIntentStrategy_RapidFiveCapturesOfferedThenSeparated(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -184,26 +184,45 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	for attempt := 0; attempt < len(files)+1; attempt++ {
+		allPublished := true
+		for _, name := range files {
+			if sqliteScalar(t, dbPath,
+				"SELECT state FROM capture_events WHERE path='"+name+
+					"' ORDER BY seq DESC LIMIT 1") != "published" {
+				allPublished = false
+				break
+			}
+		}
+		if allPublished {
+			break
+		}
+		flushed := runAcd(t, ctx, fullEnv, "flush", "--repo", repo,
+			"--session-id", sessionID, "--logical", "--json")
+		if flushed.ExitCode != 0 {
+			t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s",
+				flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 	for _, name := range files {
 		waitForEventState(t, dbPath, name, "published", 25*time.Second)
 	}
-	if hits.Load() != 1 {
-		t.Fatalf("planner hits=%d want 1", hits.Load())
+	if hits.Load() < 1 {
+		t.Fatal("planner was not called")
 	}
 	seqs, ok := firstOffered.Load().([]int64)
 	if !ok || len(seqs) != 5 {
 		t.Fatalf("first offered seqs=%v want 5 seqs", firstOffered.Load())
 	}
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d (one grouped rapid-five commit)", got, startCount+1)
-	}
-	if subj := headSubject(t, repo); subj != "Group rapid five" {
-		t.Fatalf("subject=%q want grouped rapid-five subject", subj)
+	if got := commitCount(t, repo); got != startCount+len(files) {
+		t.Fatalf("commit count=%d want %d (five independent commits)",
+			got, startCount+len(files))
 	}
 	if got := sqliteScalar(t, dbPath, `
 SELECT COUNT(*) FROM intent_candidates
-WHERE planner_protocol='v2'`); got != "1" {
-		t.Fatalf("native v2 rapid candidate=%s want 1", got)
+WHERE planner_protocol='v2' AND status IN ('published','soft_published')`); got != "5" {
+		t.Fatalf("native v2 rapid candidates=%s want 5", got)
 	}
 }
 

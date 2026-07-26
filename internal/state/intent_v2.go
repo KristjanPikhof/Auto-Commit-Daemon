@@ -3,11 +3,13 @@ package state
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -26,6 +28,7 @@ const (
 	IntentCandidateReady         = "ready"
 	IntentCandidateSoftPublished = "soft_published"
 	IntentCandidatePublished     = "published"
+	IntentCandidateSuperseded    = "superseded"
 	IntentCandidateBlocked       = "blocked"
 	IntentCandidateFailed        = "failed"
 
@@ -123,6 +126,7 @@ type IntentRepair struct {
 	BranchGeneration int64
 	Status           string
 	ExpectedHead     string
+	PlanDigest       string
 	BackupRef        sql.NullString
 	OldHead          sql.NullString
 	NewHead          sql.NullString
@@ -201,7 +205,12 @@ func SaveIntentCandidate(ctx context.Context, d *DB, candidate IntentCandidate) 
 		if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM intent_candidates
 WHERE branch_ref=? AND branch_generation=?
-  AND status IN ('open','waiting','ready','soft_published','blocked')`,
+  AND status IN ('open','waiting','ready','soft_published','blocked')
+  AND EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`,
 			candidate.BranchRef, candidate.BranchGeneration).Scan(&open); err != nil {
 			return fmt.Errorf("state: count open intent candidates: %w", err)
 		}
@@ -312,6 +321,18 @@ ON CONFLICT(candidate_id, event_seq) DO UPDATE SET
 			return fmt.Errorf("state: save candidate event %d: %w", event.EventSeq, err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded', readiness='wait', updated_ts=?
+WHERE branch_ref=? AND branch_generation=? AND id<>?
+  AND status IN ('open','waiting','ready','soft_published','blocked')
+  AND NOT EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`, now, candidate.BranchRef, candidate.BranchGeneration, candidate.ID); err != nil {
+		return fmt.Errorf("state: retire empty reassigned candidates: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("state: commit intent candidate save: %w", err)
 	}
@@ -339,6 +360,39 @@ func IntentCandidateByID(ctx context.Context, d *DB, id string) (IntentCandidate
 	return candidate, true, nil
 }
 
+// IntentCandidateByPublishedCommit resolves the semantic candidate that owns
+// one ACD-published commit on an exact branch pair.
+func IntentCandidateByPublishedCommit(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	generation int64,
+	commitOID string,
+) (IntentCandidate, bool, error) {
+	if d == nil || branchRef == "" || generation < 0 || commitOID == "" {
+		return IntentCandidate{}, false,
+			errors.New("state: IntentCandidateByPublishedCommit: invalid input")
+	}
+	candidate, err := scanIntentCandidate(d.readSQL().QueryRowContext(ctx,
+		intentCandidateSelect+`
+ WHERE branch_ref=? AND branch_generation=? AND published_commit_oid=?
+   AND status IN ('soft_published','published')
+ ORDER BY updated_ts DESC, id DESC LIMIT 1`,
+		branchRef, generation, commitOID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentCandidate{}, false, nil
+	}
+	if err != nil {
+		return IntentCandidate{}, false, err
+	}
+	events, err := loadIntentCandidateEvents(ctx, d.readSQL(), candidate.ID, true)
+	if err != nil {
+		return IntentCandidate{}, false, err
+	}
+	candidate.Events = events
+	return candidate, true, nil
+}
+
 // IntentCandidateEventHistory returns both active and superseded memberships
 // for diagnostics and planner reconciliation.
 func IntentCandidateEventHistory(ctx context.Context, d *DB, id string) ([]IntentCandidateEvent, error) {
@@ -348,8 +402,9 @@ func IntentCandidateEventHistory(ctx context.Context, d *DB, id string) ([]Inten
 	return loadIntentCandidateEvents(ctx, d.readSQL(), id, false)
 }
 
-// IntentCandidatesForPair returns the oldest-updated candidates for one exact
-// branch pair. A non-positive limit uses the open-candidate cap.
+// IntentCandidatesForPair returns the oldest-updated nonterminal candidates
+// with active membership for one exact branch pair. A non-positive limit uses
+// the open-candidate cap.
 func IntentCandidatesForPair(ctx context.Context, d *DB, branchRef string, generation int64, limit int) ([]IntentCandidate, error) {
 	if d == nil || branchRef == "" || generation < 0 {
 		return nil, errors.New("state: IntentCandidatesForPair: invalid input")
@@ -359,6 +414,12 @@ func IntentCandidatesForPair(ctx context.Context, d *DB, branchRef string, gener
 	}
 	rows, err := d.readSQL().QueryContext(ctx, intentCandidateSelect+`
  WHERE branch_ref=? AND branch_generation=?
+   AND status IN ('open','waiting','ready','soft_published','blocked')
+   AND EXISTS (
+       SELECT 1 FROM intent_candidate_events active_membership
+       WHERE active_membership.candidate_id=intent_candidates.id
+         AND active_membership.membership_state='active'
+   )
  ORDER BY updated_ts, id LIMIT ?`, branchRef, generation, limit)
 	if err != nil {
 		return nil, fmt.Errorf("state: query intent candidates: %w", err)
@@ -381,6 +442,40 @@ func IntentCandidatesForPair(ctx context.Context, d *DB, branchRef string, gener
 		return nil, fmt.Errorf("state: iterate intent candidates: %w", err)
 	}
 	return out, nil
+}
+
+// FinalizeExpiredIntentCandidates makes soft publication terminal once its
+// repair horizon has elapsed. Terminal candidates remain available by ID for
+// diagnostics but no longer consume planner capacity.
+func FinalizeExpiredIntentCandidates(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	generation int64,
+	now float64,
+) (int64, error) {
+	if d == nil || branchRef == "" || generation < 0 {
+		return 0, errors.New("state: FinalizeExpiredIntentCandidates: invalid input")
+	}
+	if now <= 0 {
+		now = nowSeconds()
+	}
+	res, err := d.conn.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='published', updated_ts=?
+WHERE branch_ref=? AND branch_generation=?
+  AND status='soft_published'
+  AND soft_publication_deadline IS NOT NULL
+  AND soft_publication_deadline<=?`,
+		now, branchRef, generation, now)
+	if err != nil {
+		return 0, fmt.Errorf("state: finalize expired intent candidates: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: expired intent candidate count: %w", err)
+	}
+	return n, nil
 }
 
 const intentCandidateSelect = `
@@ -555,6 +650,31 @@ func AppendIntentActivityBoundary(ctx context.Context, d *DB, boundary IntentAct
 	if err := validateIntentBoundary(boundary); err != nil {
 		return IntentActivityBoundary{}, err
 	}
+	const attempts = 8
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		current := boundary
+		result, err := appendIntentActivityBoundaryOnce(ctx, d, current)
+		if err == nil || !isSQLiteLocked(err) {
+			return result, err
+		}
+		lastErr = err
+		timer := time.NewTimer(time.Duration(attempt+1) * 25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return IntentActivityBoundary{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return IntentActivityBoundary{}, lastErr
+}
+
+func appendIntentActivityBoundaryOnce(
+	ctx context.Context,
+	d *DB,
+	boundary IntentActivityBoundary,
+) (IntentActivityBoundary, error) {
 	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return IntentActivityBoundary{}, fmt.Errorf("state: begin activity boundary: %w", err)
@@ -675,12 +795,12 @@ func SaveIntentRepair(ctx context.Context, d *DB, repair IntentRepair) error {
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO intent_repairs(
-    id, branch_ref, branch_generation, status, expected_head, backup_ref,
+    id, branch_ref, branch_generation, status, expected_head, plan_digest, backup_ref,
     old_head, new_head, created_ts, updated_ts, git_applied_ts, completed_ts,
     error
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		repair.ID, repair.BranchRef, repair.BranchGeneration, repair.Status,
-		repair.ExpectedHead, repair.BackupRef, repair.OldHead, repair.NewHead,
+		repair.ExpectedHead, repair.PlanDigest, repair.BackupRef, repair.OldHead, repair.NewHead,
 		now, repair.UpdatedTS, repair.GitAppliedTS, repair.CompletedTS,
 		repair.Error); err != nil {
 		return fmt.Errorf("state: insert intent repair: %w", err)
@@ -816,7 +936,7 @@ func RecoverableIntentRepairs(ctx context.Context, d *DB, limit int) ([]IntentRe
 }
 
 const intentRepairSelect = `
-SELECT id, branch_ref, branch_generation, status, expected_head, backup_ref,
+SELECT id, branch_ref, branch_generation, status, expected_head, plan_digest, backup_ref,
        old_head, new_head, created_ts, updated_ts, git_applied_ts, completed_ts,
        error
 FROM intent_repairs`
@@ -825,7 +945,7 @@ func scanIntentRepair(row intentCandidateScanner) (IntentRepair, error) {
 	var repair IntentRepair
 	if err := row.Scan(
 		&repair.ID, &repair.BranchRef, &repair.BranchGeneration,
-		&repair.Status, &repair.ExpectedHead, &repair.BackupRef,
+		&repair.Status, &repair.ExpectedHead, &repair.PlanDigest, &repair.BackupRef,
 		&repair.OldHead, &repair.NewHead, &repair.CreatedTS,
 		&repair.UpdatedTS, &repair.GitAppliedTS, &repair.CompletedTS,
 		&repair.Error,
@@ -1083,6 +1203,14 @@ func validateIntentRepair(repair IntentRepair) error {
 		strings.TrimSpace(repair.ExpectedHead) == "" {
 		return errors.New("state: intent repair provenance is incomplete")
 	}
+	if !strings.HasPrefix(repair.PlanDigest, "sha256:") ||
+		len(repair.PlanDigest) != len("sha256:")+64 {
+		return errors.New("state: intent repair plan digest is invalid")
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(
+		repair.PlanDigest, "sha256:")); err != nil {
+		return errors.New("state: intent repair plan digest is invalid")
+	}
 	if err := boundedIntentSummary("intent repair error", repair.Error,
 		IntentCandidateSummaryMaxChars); err != nil {
 		return err
@@ -1098,7 +1226,8 @@ func validIntentCandidateStatus(status string) bool {
 	switch status {
 	case IntentCandidateOpen, IntentCandidateWaiting, IntentCandidateReady,
 		IntentCandidateSoftPublished, IntentCandidatePublished,
-		IntentCandidateBlocked, IntentCandidateFailed:
+		IntentCandidateSuperseded, IntentCandidateBlocked,
+		IntentCandidateFailed:
 		return true
 	default:
 		return false
@@ -1106,7 +1235,9 @@ func validIntentCandidateStatus(status string) bool {
 }
 
 func isTerminalIntentCandidateStatus(status string) bool {
-	return status == IntentCandidatePublished || status == IntentCandidateFailed
+	return status == IntentCandidatePublished ||
+		status == IntentCandidateSuperseded ||
+		status == IntentCandidateFailed
 }
 
 func validIntentRepairTransition(from, to string) bool {

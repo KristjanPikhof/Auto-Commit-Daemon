@@ -153,6 +153,12 @@ func EvaluateIntentCandidates(
 	if input.RetryLimit < 0 {
 		input.RetryLimit = 0
 	}
+	nowSeconds := float64(input.Now.UnixNano()) / 1e9
+	if _, err := state.FinalizeExpiredIntentCandidates(
+		ctx, db, input.BranchRef, input.BranchGeneration, nowSeconds,
+	); err != nil {
+		return result, err
+	}
 
 	existing, err := state.IntentCandidatesForPair(ctx, db, input.BranchRef,
 		input.BranchGeneration, state.IntentCandidateMaxOpenPerPair)
@@ -449,6 +455,7 @@ func buildIntentCandidateRequest(
 	boundaries []state.IntentActivityBoundary,
 ) (ai.IntentPlanRequestV2, error) {
 	offered := make([]ai.OfferedCapture, 0, len(input.Captures))
+	visibleSeqs := make(map[int64]struct{}, len(input.Captures))
 	for _, capture := range input.Captures {
 		op := capture.Event.Operation
 		if len(capture.Ops) == 1 && capture.Ops[0].Op != "" {
@@ -459,6 +466,7 @@ func buildIntentCandidateRequest(
 			Timestamp: time.Unix(0, int64(capture.Event.CapturedTS*1e9)).UTC(),
 			Fidelity:  capture.Event.Fidelity, CapturedDiff: capture.CapturedDiff,
 		})
+		visibleSeqs[capture.Event.Seq] = struct{}{}
 	}
 	candidates := make([]ai.IntentCandidateSummary, 0, len(existing))
 	for _, candidate := range existing {
@@ -468,6 +476,7 @@ func buildIntentCandidateRequest(
 				continue
 			}
 			seqs = append(seqs, event.EventSeq)
+			visibleSeqs[event.EventSeq] = struct{}{}
 		}
 		candidates = append(candidates, ai.IntentCandidateSummary{
 			CandidateID: candidate.ID, Status: candidate.Status,
@@ -480,6 +489,12 @@ func buildIntentCandidateRequest(
 	}
 	edges := make([]ai.IntentCaptureDependency, 0, len(dependencies))
 	for _, dependency := range dependencies {
+		if _, ok := visibleSeqs[dependency.PrerequisiteSeq]; !ok {
+			continue
+		}
+		if _, ok := visibleSeqs[dependency.DependentSeq]; !ok {
+			continue
+		}
 		edges = append(edges, ai.IntentCaptureDependency{
 			FromSeq: dependency.PrerequisiteSeq, ToSeq: dependency.DependentSeq,
 			Strength: ai.IntentDependencyStrength(dependency.Strength),
@@ -671,6 +686,8 @@ func evaluateIntentCandidateAssignment(
 			"candidate is waiting for required companions")
 	}
 	if err := validateIntentCandidateComponent(selected, dependencies); err != nil {
+		results[0] = failedIntentGate(assignment.CandidateID,
+			ai.IntentAtomicityCohesion, "candidate_lacks_semantic_cohesion", err)
 		results[2] = failedIntentGate(assignment.CandidateID,
 			ai.IntentAtomicitySeparation, "candidate_disconnected", err)
 		results[4] = failedIntentGate(assignment.CandidateID,
@@ -941,8 +958,7 @@ func intentDependencyComponents(req ai.IntentPlanRequestV2, includeSemantic bool
 			continue
 		}
 		if edge.Strength == ai.IntentDependencyHard ||
-			(includeSemantic && edge.Kind != "activity_epoch" &&
-				edge.Kind != "temporal_proximity") {
+			(includeSemantic && strongIntentSemanticDependency(edge.Kind)) {
 			union(edge.FromSeq, edge.ToSeq)
 		}
 	}
@@ -1005,7 +1021,7 @@ func validateIntentCandidateComponent(
 	adj := make(map[int64][]int64, len(seqs))
 	for _, edge := range dependencies {
 		if edge.Strength == state.IntentDependencySoft &&
-			(edge.Kind == "activity_epoch" || edge.Kind == "temporal_proximity") {
+			!strongIntentSemanticDependency(edge.Kind) {
 			continue
 		}
 		if _, ok := allowed[edge.PrerequisiteSeq]; !ok {
@@ -1034,6 +1050,15 @@ func validateIntentCandidateComponent(
 		return errors.New("candidate merges independent dependency components")
 	}
 	return nil
+}
+
+func strongIntentSemanticDependency(kind string) bool {
+	switch kind {
+	case "activity_epoch", "temporal_proximity", "module_proximity":
+		return false
+	default:
+		return true
+	}
 }
 
 func loadCandidateCaptureContext(
@@ -1179,13 +1204,13 @@ func consumableBoundariesForPair(
 	out := make([]state.IntentActivityBoundary, 0, len(boundaries))
 	var through int64
 	for _, boundary := range boundaries {
+		through = boundary.Epoch
 		if boundary.BranchRef.Valid &&
 			(boundary.BranchRef.String != branchRef ||
 				boundary.BranchGeneration.Int64 != generation) {
-			break
+			continue
 		}
 		out = append(out, boundary)
-		through = boundary.Epoch
 	}
 	return out, through
 }

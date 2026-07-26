@@ -224,8 +224,10 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 	if err := state.SaveIntentRepair(ctx, d, state.IntentRepair{
 		ID: "repair-observable", BranchRef: "refs/heads/main",
 		BranchGeneration: 7, Status: state.IntentRepairPrepared,
-		ExpectedHead: "old-head", Error: "prompt=private",
-		Commits: []state.IntentRepairCommit{{OldOID: "old-head"}},
+		ExpectedHead: "old-head",
+		PlanDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Error:        "prompt=private",
+		Commits:      []state.IntentRepairCommit{{OldOID: "old-head"}},
 	}); err != nil {
 		t.Fatal(err)
 	}

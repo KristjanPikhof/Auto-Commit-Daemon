@@ -4,7 +4,9 @@
 asks the same intent planner family to improve commit messages, saves a plan,
 lets you review or edit that plan, and applies it only when you say yes.
 
-The daemon never rewrites commits automatically.
+This command never runs automatically. Intent Balanced and Quality have a
+separate bounded repair path for recent private ACD-owned commits when a late
+capture completes a soft-published candidate.
 
 ## Boundaries
 

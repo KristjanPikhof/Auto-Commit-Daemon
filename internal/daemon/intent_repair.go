@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -39,6 +40,7 @@ type IntentRepairPlan struct {
 	BranchRef        string
 	BranchGeneration int64
 	ExpectedHead     string
+	PlanDigest       string
 	Paths            []string
 	MaxCommits       int
 	Candidates       []IntentRepairCandidatePlan
@@ -86,6 +88,15 @@ func ApplyIntentRepairTransaction(
 		plan.ID = id
 	}
 	result.ID = plan.ID
+	digest, digestErr := intentRepairPlanDigest(ctx, repoRoot, plan)
+	if digestErr != nil {
+		return result, digestErr
+	}
+	if plan.PlanDigest != "" && plan.PlanDigest != digest {
+		return result, errors.New(
+			"daemon: intent repair: supplied plan digest does not match plan")
+	}
+	plan.PlanDigest = digest
 
 	lock, err := AcquireControlLock(gitDir)
 	if err != nil {
@@ -111,8 +122,9 @@ func ApplyIntentRepairTransaction(
 		ID: plan.ID, BranchRef: plan.BranchRef,
 		BranchGeneration: plan.BranchGeneration,
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
-		OldHead: sql.NullString{String: plan.ExpectedHead, Valid: true},
-		Commits: intentRepairStateCommits(plan, nil),
+		PlanDigest: plan.PlanDigest,
+		OldHead:    sql.NullString{String: plan.ExpectedHead, Valid: true},
+		Commits:    intentRepairStateCommits(plan, nil),
 	}
 	if err := state.SaveIntentRepair(ctx, db, prepared); err != nil {
 		return result, fmt.Errorf("daemon: intent repair: persist prepared transaction: %w", err)
@@ -200,6 +212,10 @@ func RecoverIntentRepairs(
 	}
 	var out []IntentRepairResult
 	for _, repair := range repairs {
+		if repair.BranchRef != cctx.BranchRef ||
+			repair.BranchGeneration != cctx.BranchGeneration {
+			continue
+		}
 		result, recoverErr := recoverIntentRepair(ctx, repoRoot, db, cctx, repair)
 		if recoverErr != nil {
 			return out, recoverErr
@@ -252,6 +268,16 @@ func recoverIntentRepair(
 		mappings, mapErr := reconstructIntentRepairMappings(ctx, repoRoot, repair, head)
 		if mapErr != nil {
 			return result, mapErr
+		}
+		digest, digestErr := recoveredIntentRepairPlanDigest(
+			ctx, repoRoot, repair, mappings)
+		if digestErr != nil {
+			return result, digestErr
+		}
+		if digest != repair.PlanDigest {
+			return result, fmt.Errorf(
+				"daemon: recover intent repair %s: rebuilt chain does not match prepared plan; backup retained at %s",
+				repair.ID, backupRef)
 		}
 		ok, transErr := state.TransitionIntentRepair(ctx, db, repair.ID,
 			state.IntentRepairTransition{
@@ -549,7 +575,8 @@ func persistSkippedIntentRepair(ctx context.Context, db *state.DB, plan IntentRe
 		ID: plan.ID, BranchRef: plan.BranchRef,
 		BranchGeneration: plan.BranchGeneration,
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
-		Commits: intentRepairStateCommits(plan, nil),
+		PlanDigest: plan.PlanDigest,
+		Commits:    intentRepairStateCommits(plan, nil),
 	}); err != nil {
 		return IntentRepairResult{}, err
 	}
@@ -643,6 +670,107 @@ func reconstructIntentRepairMappings(
 		}
 	}
 	return mappings, nil
+}
+
+type intentRepairDigestCandidate struct {
+	candidateID string
+	replaces    []string
+	treeOID     string
+	message     string
+	authorOID   string
+}
+
+func intentRepairPlanDigest(
+	ctx context.Context,
+	repoRoot string,
+	plan IntentRepairPlan,
+) (string, error) {
+	candidates := make([]intentRepairDigestCandidate, 0, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		authorOID := candidate.AuthorOID
+		if authorOID == "" {
+			authorOID = candidate.Replaces[0]
+		}
+		candidates = append(candidates, intentRepairDigestCandidate{
+			candidateID: candidate.CandidateID,
+			replaces:    append([]string(nil), candidate.Replaces...),
+			treeOID:     candidate.TreeOID,
+			message:     candidate.Message,
+			authorOID:   authorOID,
+		})
+	}
+	return hashIntentRepairCandidates(ctx, repoRoot, candidates)
+}
+
+func recoveredIntentRepairPlanDigest(
+	ctx context.Context,
+	repoRoot string,
+	repair state.IntentRepair,
+	mappings []state.IntentRepairCommit,
+) (string, error) {
+	var candidates []intentRepairDigestCandidate
+	for i := 0; i < len(mappings); {
+		candidateID := mappings[i].CandidateID.String
+		newOID := mappings[i].NewOID.String
+		candidate := intentRepairDigestCandidate{
+			candidateID: candidateID,
+			authorOID:   newOID,
+		}
+		for i < len(mappings) &&
+			mappings[i].CandidateID.Valid &&
+			mappings[i].CandidateID.String == candidateID {
+			if !mappings[i].NewOID.Valid || mappings[i].NewOID.String != newOID {
+				return "", errors.New(
+					"daemon: recover intent repair: inconsistent candidate mapping")
+			}
+			candidate.replaces = append(candidate.replaces, mappings[i].OldOID)
+			i++
+		}
+		tree, err := resolveTreeOID(ctx, repoRoot, newOID)
+		if err != nil {
+			return "", err
+		}
+		message, err := git.Run(ctx, git.RunOpts{
+			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
+		}, "show", "-s", "--format=%B", newOID)
+		if err != nil {
+			return "", fmt.Errorf(
+				"daemon: recover intent repair: read rebuilt message: %w", err)
+		}
+		candidate.treeOID = tree
+		candidate.message = string(message)
+		candidates = append(candidates, candidate)
+	}
+	return hashIntentRepairCandidates(ctx, repoRoot, candidates)
+}
+
+func hashIntentRepairCandidates(
+	ctx context.Context,
+	repoRoot string,
+	candidates []intentRepairDigestCandidate,
+) (string, error) {
+	hash := sha256.New()
+	writeField := func(value string) {
+		_, _ = fmt.Fprintf(hash, "%d:", len(value))
+		_, _ = hash.Write([]byte(value))
+	}
+	writeField("acd-intent-repair-plan-v1")
+	for _, candidate := range candidates {
+		author, err := git.Run(ctx, git.RunOpts{
+			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
+		}, "show", "-s", "--format=%an%x00%ae%x00%aI", candidate.authorOID)
+		if err != nil {
+			return "", fmt.Errorf("daemon: intent repair: read author identity: %w", err)
+		}
+		writeField(candidate.candidateID)
+		for _, oldOID := range candidate.replaces {
+			writeField(oldOID)
+		}
+		writeField(candidate.treeOID)
+		writeField(strings.TrimRight(candidate.message, "\n"))
+		writeField(strings.TrimRight(string(author), "\n"))
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // PruneIntentRepairBackups enforces the seven-day/fifty-ref retention bound.

@@ -356,8 +356,9 @@ ACD_REPO_AUTODISCOVERY=enabled acd start
 
 ## Rewrite commit messages
 
-The daemon never rewrites history on its own. Use `rewrite-commits` only for an
-explicit local cleanup before sharing a branch:
+`rewrite-commits` is an explicit, message-only cleanup tool. It is separate
+from Intent Balanced and Quality's bounded automatic repair, which may replace
+recent private ACD-owned commits to attach a late semantic companion:
 
 ~~~bash
 acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
