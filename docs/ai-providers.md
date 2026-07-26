@@ -1,14 +1,15 @@
 # AI providers
 
-ACD always has a commit-message provider. If the configured provider fails, it
-falls back to the deterministic provider and keeps replay moving.
+ACD always has a commit-message provider. Event mode can fall back to a
+deterministic message. Intent v2 applies the selected preset's planner policy;
+Quality deliberately stops replay instead of publishing a fallback candidate.
 
 ## Provider choices
 
 | Provider | Configure with | Network? | Diff support |
 |---|---|---:|---|
 | `deterministic` | Nothing | No | No |
-| `openai-compat` | `ACD_AI_PROVIDER=openai-compat` plus `ACD_AI_API_KEY` | Yes | Yes, only with opt-in |
+| `openai-compat` | `acd configure` or `ACD_AI_PROVIDER=openai-compat` | Yes | Yes, only with opt-in |
 | `subprocess:<name>` | `ACD_AI_PROVIDER=subprocess:<name>` and `acd-provider-<name>` on `$PATH` | Plugin decides | Yes, only with opt-in |
 
 The default is `deterministic`. It uses path and symbol hints, does not call a
@@ -16,10 +17,12 @@ model, and does not need a key.
 
 ## Quick setup
 
-Prefer `acd settings` for provider and model selection. Saved explicit values
-do not need shell sourcing. Keep `ACD_AI_API_KEY` in the environment because
-the settings file and config revision ledger never store credentials. The full
-workflow and confirmation flags are in [the settings guide](settings.md).
+Prefer `acd configure` for provider, credential, consent, and verification
+setup. Use `acd settings` for later advanced overrides. Saved non-secret values
+do not need shell sourcing. `ACD_AI_API_KEY` can stay in the environment or the
+key can be stored with `acd auth set`; the environment remains higher priority.
+The settings file, runtime revision ledger, and repository database never store
+the secret.
 
 Offline default:
 
@@ -48,15 +51,13 @@ export PATH="$PATH:/path/to/plugin/bin"
 Intent grouping:
 
 ~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=sk-...
-export ACD_AI_DIFF_EGRESS=1
+acd configure --strategy intent --preset balanced
 ~~~
 
-`ACD_AI_DIFF_EGRESS=1` is optional for commit messages, but it usually improves
-intent grouping because the planner sees the captured diff instead of metadata
-only.
+Diff context is optional for Event commit messages. Every regular Intent preset
+requires bounded, redacted captured diffs. A network provider needs explicit
+diff-egress approval; a local subprocess can receive diffs without network
+egress.
 
 ## Diff privacy
 
@@ -67,8 +68,9 @@ Diffs leave the machine only when both checks pass:
 | Provider can use diffs | `openai-compat` or `subprocess:<name>` declares `NeedsDiff=true` |
 | Operator opts in | `ACD_AI_DIFF_EGRESS=1` or another truthy value |
 
-When either check fails, the provider gets metadata only: path, operation,
-branch, repo root, timestamp, and multi-op entries.
+When either check fails, Event message generation gets metadata only. Regular
+Intent v2 configuration fails its prerequisite check and stops replay while
+capture continues.
 
 When both checks pass, ACD rebuilds the diff from captured `before_oid` and
 `after_oid` blobs. It does not read the live worktree for provider payloads.
@@ -88,13 +90,14 @@ private repo unless the endpoint or plugin is trusted.
 |---|---:|---|
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | Must be an absolute HTTPS URL. |
-| `ACD_AI_API_KEY` | unset | Required for `openai-compat`; missing key falls back to deterministic. |
+| `ACD_AI_API_KEY` | unset | Overrides the protected credential file. Required for network planning. |
 | `ACD_AI_MODEL` | `gpt-5.4-mini` | Sent to the OpenAI-compatible endpoint. |
 | `ACD_AI_TIMEOUT` | `30s` | Applies to HTTP and subprocess providers. Plain seconds also work. |
 | `ACD_AI_CA_FILE` | unset | PEM CA bundle for private HTTPS gateways. |
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local prompt diagnostics under `<gitDir>/acd/prompt-trace/`. |
 | `ACD_COMMIT_STRATEGY` | `event` | Set `intent` to ask the planner to group captures. |
+| `ACD_COMMIT_PRESET` | strategy default | `fast`, `balanced`, or `quality`. |
 | `ACD_COMMIT_FORMAT` | `imperative` | `imperative` uses verb-led subjects; `conventional` uses scope-less Conventional Commit subjects. |
 | `ACD_INTENT_WINDOW` | `10` | Max captures offered to one planner pass. |
 | `ACD_INTENT_MIN_PENDING` | `10` | Preferred pending count before planning. |
@@ -104,6 +107,14 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before forced one-capture planning. |
 | `ACD_INTENT_PATH_COALESCE` | off | Truthy folds consecutive same-path captures into one planner offer. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after typed planner validation errors. `0` or false-like values disable retries. |
+| `ACD_INTENT_VERIFICATION` | `none` | `none`, `fast`, or `full`. Presets provide regular defaults. |
+| `ACD_VERIFICATION_FAST_COMMAND` | unset | Exact approved repository command used by Balanced. |
+| `ACD_VERIFICATION_FAST_TIMEOUT` | `2m` | Fast candidate verification timeout. |
+| `ACD_VERIFICATION_FULL_COMMAND` | unset | Exact approved repository command used by Quality. |
+| `ACD_VERIFICATION_FULL_TIMEOUT` | `10m` | Full candidate verification timeout. |
+| `ACD_INTENT_REPAIR_ENABLED` | off | Enables eligible recent ACD commit repair. |
+| `ACD_INTENT_REPAIR_HORIZON` | `10m` | Maximum repair age. |
+| `ACD_INTENT_REPAIR_MAX_COMMITS` | `3` | Maximum chain, capped at five. |
 | `ACD_INTENT_REJECTS_RAW` | off | Truthy stores raw rejected planner responses. Sensitive. |
 | `ACD_PATH_QUIESCENCE_SECONDS` | `0` | Waits for paths to go quiet before planner offer. Capture still persists. |
 | `ACD_RECENT_COMMIT_AFFINITY_SECONDS` | `0` | Adds a recent-HEAD hint when enabled. Off avoids extra `git log` work. |
@@ -175,7 +186,42 @@ Commit-message response:
 }
 ~~~
 
-Intent planner requests set `request_type` to `intent_plan`, include
+Intent v2 starts a subprocess with an ordinary v1 request for compatibility. A
+plugin advertises native support by returning
+`"capabilities":["intent_plan_v2"]`. Later planner requests use `version: 2`,
+`request_type: "intent_plan_v2"`, `planner_protocol: "v2"`, and
+`planner_request_v2`. The response envelope is:
+
+~~~json
+{
+  "version": 2,
+  "planner_protocol": "v2",
+  "intent_plan_v2": {
+    "protocol_version": "v2",
+    "candidates": [
+      {
+        "candidate_id": "checkout-code",
+        "selected_seqs": [101, 103],
+        "purpose": "validate checkout behavior",
+        "readiness": "ready",
+        "missing_companions": [],
+        "depends_on_candidates": [],
+        "subject": "Validate checkout behavior",
+        "body": "- Cover the implementation with its focused test",
+        "grouping_reason": "implementation and test form one change"
+      }
+    ]
+  }
+}
+~~~
+
+The native request includes persisted candidate summaries, dependency edges,
+activity boundaries, recent soft commits, and prior atomicity findings.
+Candidate order is publication order. Every visible capture must appear in
+exactly one candidate. Hard dependencies that cross candidates must be
+declared in `depends_on_candidates`.
+
+Legacy v1 requests use `request_type: "intent_plan"`, include
 `commit_format`, and include `planner_request.offered_captures`. The response
 must classify every offered seq. A single-group response still works:
 
@@ -231,9 +277,9 @@ required. When `commit_groups` is present,
 `selected_seqs` must be the union of all group selections; the top-level
 message can mirror the first group or summarize the selected window.
 
-ACD's built-in prompt tells the planner to use `commit_groups` for independent
-intents inside one visible window. Custom subprocess planners should follow the
-same contract instead of returning one broad selected group for unrelated work.
+ACD adapts valid v1 responses to one-pass candidates and reports
+`planner_protocol=v1_compat`. Compatibility preserves safety but cannot claim
+native v2 readiness quality. New plugins should negotiate and implement v2.
 
 Rules:
 
@@ -241,7 +287,9 @@ Rules:
 |---|---|
 | `selected_seqs` must be non-empty | Replay must make progress. |
 | Every offered seq must be selected or deferred | The planner cannot ignore work. |
-| `commit_groups`, when present, must be ordered and non-overlapping | Replay publishes groups sequentially and must preserve chronology. |
+| Native candidates must assign every visible seq exactly once | Candidate state cannot lose or duplicate durable work. |
+| Candidate dependencies must be acyclic and topologically ordered | Replay cannot publish a dependent candidate first. |
+| Legacy `commit_groups` must be ordered and non-overlapping | The v1 adapter needs deterministic one-pass membership. |
 | `deferred_reasons` may mention only deferred seqs | Reasons stay aligned with the plan. |
 | `subject` must match `commit_format` | Wrong-format output gets rejected, corrected, or falls back deterministically. |
 | Non-empty `error` is a soft error | ACD keeps the plugin alive and falls back for that request. |
@@ -259,13 +307,14 @@ Expected output is one JSON line with a non-empty `subject` and an empty
 
 ## Security notes
 
-The strict test in `acd settings` sends exactly one fixed synthetic request and
-may incur one provider charge. It sends no repository path, diff, captured
-metadata, prompt trace, commit, or experiment sample. Non-default endpoint and
-subprocess risks require confirmation before the test. Diff egress is an
-activation-only confirmation because the synthetic test contains no diff. The
-lab asks inside the current session, while CLI flags can pre-authorize each
-specific risk. See [Test a provider safely](settings.md#test-a-provider-safely).
+The strict test in `acd configure` or `acd settings` sends exactly one fixed
+synthetic request and may incur one provider charge. It sends no repository
+path, diff, captured metadata, prompt trace, commit, or experiment sample.
+Non-default endpoint and subprocess risks require confirmation before the test.
+Diff egress is an activation-only confirmation because the synthetic test
+contains no diff. The lab asks inside the current session, while CLI flags can
+pre-authorize each specific risk. See
+[Test a provider safely](settings.md#test-a-provider-safely).
 
 | Risk | What to do |
 |---|---|
@@ -281,16 +330,18 @@ specific risk. See [Test a provider safely](settings.md#test-a-provider-safely).
 | Provider unset | Deterministic provider. |
 | `openai-compat` succeeds | Provider result is used. |
 | Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
-| Intent planner transport failure | Open the persisted circuit immediately and use deterministic fallback. |
+| Intent Fast planner failure | Publish the smallest valid hard-dependency component. |
+| Intent Balanced planner failure | Reuse a valid or deterministic dependency partition, then run fast verification. |
+| Intent Quality planner failure | Keep candidates pending and report `needs_attention`. |
 | Three consecutive intent validation failures | Open the persisted circuit after configured correction retries are exhausted. |
-| Intent circuit open | Skip the remote planner and use deterministic fallback without repeated planner-error decisions. |
-| Intent circuit half-open | Allow one provider probe; other windows use deterministic fallback. |
-| `openai-compat` has no key | Deterministic provider. |
+| Intent circuit open | Skip the remote planner and apply the preset policy without repeated planner-error decisions. |
+| Intent circuit half-open | Allow one provider probe; other evaluations apply the preset policy. |
+| Intent v2 has no key or diff consent | Capture continues; replay reports `needs_attention`. |
 | Subprocess response has `error` | Deterministic fallback, plugin stays alive. |
 | Subprocess crashes or times out | Deterministic fallback; the plugin restarts on the next allowed provider probe. |
 
-The deterministic provider is the final backstop and should always return a
-message.
+The deterministic provider remains the final message backstop. Intent
+candidate publication still follows the selected preset policy.
 
 ### Inspect the intent planner circuit
 

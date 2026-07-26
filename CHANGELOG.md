@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Added
+
+- Added Intent v2 semantic candidates, dependency-aware non-contiguous
+  grouping, explicit atomicity gates, exact candidate-tree verification, and
+  preset-aware planner fallback.
+- Added versioned Fast, Balanced, and Quality presets for Event and Intent
+  strategies. Runtime revisions retain preset identity, version, and
+  customization state.
+- Added `acd configure` for guided strategy, preset, provider, credential,
+  diff-consent, verification, repair, and activation setup. Dry-run previews
+  the complete transaction without calls, commands, writes, starts, or hook
+  changes.
+- Added protected XDG credential storage and `acd auth set|status|remove`.
+  `ACD_AI_API_KEY` remains higher priority, and secrets stay out of settings,
+  SQLite, logs, traces, status, diagnostics, and fingerprints.
+- Added bounded automatic repair for eligible private ACD commit suffixes.
+  Repair uses backup refs, atomic ref compare-and-swap, durable old-to-new
+  mappings, restart reconciliation, and strict staging and ref-containment
+  checks.
+- Added native Intent v2 protocols for OpenAI-compatible and capability-aware
+  subprocess providers. Legacy subprocess results remain available through
+  the reported `v1_compat` adapter.
+
+### Changed
+
+- Existing Intent repositories migrate to `intent.balanced@2`. Missing
+  provider, diff-context, credential, or approved verification prerequisites
+  now stop replay with `needs_attention` while capture continues. ACD no longer
+  silently resumes v1 or metadata-only Intent planning.
+- Intent candidates now survive planner windows and publish in dependency
+  order. Same-path and object dependencies remain ordered, while independent
+  `A1, B1, A2` sequences can publish as `A=[1,3]` and `B=[2]` when scratch
+  materialization proves independence.
+- Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
+  hard evaluation boundaries; neither boundary bypasses atomicity,
+  verification, branch, pause, Git-operation, conflict, or replay safety.
+- Repository state is now SQLite `SchemaVersion=15`, adding candidate,
+  dependency, activity-boundary, verification, and repair state without
+  removing v14 events, decisions, revisions, experiments, or recovery data.
+
 ## v2026-07-26
 
 ### Changed

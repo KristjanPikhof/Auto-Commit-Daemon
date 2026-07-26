@@ -148,7 +148,7 @@ rewrite diffs are capped at 16000 bytes.
 | Strategy | Replay behavior |
 |---|---|
 | `event` | FIFO replay. One capture can become one commit. |
-| `intent` | A bounded pending window goes to the planner. Selected groups publish sequentially; deferred seqs stay pending. |
+| `intent` | Bounded evaluations revise durable candidates. Atomic candidates publish in dependency order; waiting candidates stay pending. |
 
 Intent waits for one of these:
 
@@ -157,25 +157,27 @@ Intent waits for one of these:
 | `ACD_INTENT_MIN_PENDING` | Enough visible pending captures exist. |
 | `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait briefly for bursty edits to stop arriving. |
 | `ACD_INTENT_MAX_PENDING_AGE` | Oldest visible capture reached the age escape hatch. |
+| `acd touch --soft-boundary --session-id <active-session>` | A harness records the end of one activity epoch. |
 | `acd flush --logical --session-id <active-session>` | A registered harness session asks to drain the visible batch now. |
-| Forced aging | A repeatedly deferred capture reached `ACD_INTENT_DEFER_LIMIT`. |
+| Full evaluation capacity | The preset capture window is full. |
 
 Plain `acd wake` nudges capture and replay. It does not bypass intent batch
 gates.
 
-Planner-window records are stored separately from raw prompt traces. They show
-which seqs were offered, selected, deferred, forced, or hidden by optional
-same-path coalescing. Prompt traces remain the opt-in source for exact provider
+Planner-window records are stored separately from candidate and raw prompt
+records. Candidates may survive many windows, and one candidate can contain
+non-contiguous captures when its dependency graph and scratch materialization
+prove the grouping. Prompt traces remain the opt-in source for exact provider
 requests and may contain source text.
 
 ### Planner circuit breaker
 
 | Condition | Circuit action | Replay action |
 |---|---|---|
-| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure, use deterministic planning. |
-| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan, use deterministic planning. |
+| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure and apply the preset policy. |
+| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan and apply the preset policy. |
 | Circuit open | Wait 30 seconds, then 2 minutes, then 10 minutes after repeated probe failures. | Bypass the provider without adding repeated planner-error rows. |
-| Cooldown expired | Allow one half-open provider probe. | Other windows keep using deterministic planning. |
+| Cooldown expired | Allow one half-open provider probe. | Other evaluations apply the preset policy. |
 | Validated probe succeeds | Close and reset the backoff. | Resume configured provider planning. |
 
 Circuit health survives daemon restarts in `daemon_meta`. Bare `acd` reports

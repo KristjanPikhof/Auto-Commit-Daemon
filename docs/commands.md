@@ -27,16 +27,29 @@ acd on
 acd off
 ~~~
 
-Use `acd settings` for provider, model, commit strategy, and intent tuning. It
-replaces shell exports for saved explicit values, except API keys, which remain
-environment only. See [Configure ACD with the settings lab](settings.md).
+Use `acd configure` for guided strategy, preset, provider, credential, and
+safety setup. Use `acd settings` for profiles, experiments, and advanced
+overrides. See [Configure ACD](settings.md).
 
 ## Configure ACD
 
-`acd settings` opens the rich terminal settings lab for the current repository.
-It shows `DRAFT`, `TESTED`, `QUEUED`, and `ACTIVE` state, including each value's
-source, shadowed environment value, and apply boundary. Start with **Test
-current settings** to validate the current provider before editing anything.
+`acd configure` stages a complete everyday configuration and shows one final
+preview. It recommends Intent Balanced, tests the provider with synthetic
+content, runs only an exact verification command you approve, stores an
+optional protected credential, creates one immutable runtime revision, and
+enables ACD. It never changes hook files.
+
+~~~bash
+acd configure
+acd configure --accessible
+acd configure --strategy intent --preset balanced
+acd configure --dry-run --json
+~~~
+
+Dry-run performs no provider call, command execution, credential or settings
+write, daemon start, or hook change.
+
+`acd settings` opens the advanced terminal settings lab:
 
 ~~~bash
 acd settings
@@ -50,9 +63,19 @@ not fan out to running repositories. Accessible mode uses linear prompts, and
 `TERM=dumb` selects it automatically. Rich mode requires interactive stdin and
 stdout; `--json` is not supported for the interactive command.
 
-Accessible mode is action-first and keyboard-only. **Quick provider setup**
-asks for provider essentials; **Advanced settings** opens the full
-non-sensitive catalog. Keep the API key in `ACD_AI_API_KEY`, never in a prompt.
+Accessible mode is action-first and keyboard-only. **Change strategy or
+preset** comes before **Quick provider setup** and **Advanced settings**.
+
+Credential commands never print the secret:
+
+~~~bash
+acd auth set
+printf '%s\n' "$ACD_AI_API_KEY" | acd auth set --stdin
+acd auth status --json
+acd auth remove --yes
+~~~
+
+`ACD_AI_API_KEY` remains higher priority than the protected file.
 
 Provider tests use one fixed synthetic request and may incur one provider
 charge. Endpoint credentials and subprocess execution require confirmation for
@@ -289,9 +312,10 @@ of wiring them by hand unless you are building an adapter.
 | `acd start` | Register a client session and start or refresh the repo daemon. Harnesses pass `--session-id`, `--harness`, and sometimes `--watch-pid`. |
 | `acd stop` | Stop one repo, deregister one session, or stop every daemon with `--all`. `--force` bypasses session refcounts. |
 | `acd wake` | Refresh a session heartbeat and nudge the daemon. It requires `--session-id` and does not bypass intent batch waits. |
-| `acd touch` | Refresh a session heartbeat without signaling the daemon. Codex uses this for its turn-level `Stop` event. |
+| `acd touch` | Refresh a session heartbeat. `--soft-boundary` records a semantic evaluation boundary and nudges the daemon; Codex uses it for Stop. |
 | `acd flush` | Refresh a heartbeat. With `--logical`, ask the next replay pass to drain the visible intent window now. |
 
-Logical flush requires an already registered session. It bypasses only the
-intent batch wait. Detached HEAD, Git operations, manual pauses, validation,
-and replay safety still apply.
+Soft and logical boundaries require an already registered session. They
+trigger candidate evaluation but cannot bypass atomicity, verification,
+detached HEAD, Git operations, manual pauses, branch generation, conflicts, or
+other replay safety checks.

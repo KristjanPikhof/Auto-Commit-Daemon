@@ -53,8 +53,8 @@ func newSettingsCmd() *cobra.Command {
 
 The lab shows active and draft values, their source and shadowed environment,
 and whether each setting activates at the next safe work boundary or requires a
-restart. Provider tests use synthetic content only. API keys remain environment
-only and are displayed solely as set or unset.
+restart. Provider tests use synthetic content only. API keys come from the
+environment or protected file and are displayed only by source, never value.
 
 Repository scope is the default. --profile edits or creates one named profile;
 --global saves global defaults without changing running repositories. Rich mode
