@@ -277,6 +277,25 @@ func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 	}
 }
 
+func TestConfigureGlobalFinalApprovalDoesNotPromiseActivation(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	var out bytes.Buffer
+	approval, err := ConfirmConfigurePreview(
+		context.Background(),
+		&bytewiseReader{r: strings.NewReader("y\n")},
+		&out,
+		true,
+		ConfigurePreviewApprovalOptions{Global: true, RepairEnabled: true},
+	)
+	if err != nil || !approval.Apply || !approval.Repair {
+		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
+	}
+	if !strings.Contains(out.String(), "save these global defaults") ||
+		strings.Contains(out.String(), "enable ACD") {
+		t.Fatalf("global approval prompt=%q", out.String())
+	}
+}
+
 func TestConfigureHelpersKeepLocalProviderAndPresetVerification(t *testing.T) {
 	kind, name := configureProviderParts("subprocess:planner")
 	if kind != "subprocess" || name != "planner" {

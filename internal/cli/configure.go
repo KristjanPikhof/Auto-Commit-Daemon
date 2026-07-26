@@ -29,7 +29,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-const configureReportVersion = 3
+const configureReportVersion = 4
 
 type configureOptions struct {
 	Strategy        string
@@ -55,7 +55,8 @@ type configureVerificationReport struct {
 type configureReport struct {
 	Version          int                         `json:"version"`
 	DryRun           bool                        `json:"dry_run"`
-	Repo             string                      `json:"repo"`
+	Scope            string                      `json:"scope"`
+	Repo             string                      `json:"repo,omitempty"`
 	Experience       string                      `json:"experience"`
 	Strategy         string                      `json:"strategy"`
 	Preset           string                      `json:"preset"`
@@ -88,12 +89,21 @@ type configureValidationService interface {
 	Close() error
 }
 
+type configureGlobalSettingsService interface {
+	configureValidationService
+	TestProvider(context.Context, map[string]string, []ai.ConfirmationRequirement) (settings.ProviderTestResult, error)
+	SaveGlobalSetup(context.Context, settings.SaveGlobalSetupRequest) (settings.SaveGlobalSetupResult, error)
+}
+
 var (
 	openConfigureSettingsService = func(ctx context.Context, opts settings.Options) (settingsCLIService, error) {
 		return settings.NewService(ctx, opts)
 	}
 	openConfigureValidationService = func(ctx context.Context, opts settings.Options) (configureValidationService, error) {
 		return settings.NewValidationService(ctx, opts)
+	}
+	openConfigureGlobalSettingsService = func(ctx context.Context, opts settings.Options) (configureGlobalSettingsService, error) {
+		return settings.NewGlobalService(ctx, opts)
 	}
 	runConfigureWizard        = settingsui.RunConfigureWizard
 	confirmConfigurePreview   = settingsui.ConfirmConfigurePreview
@@ -121,22 +131,25 @@ func newConfigureCmd() *cobra.Command {
 	var opts configureOptions
 	cmd := &cobra.Command{
 		Use:   "configure",
-		Short: "Guided strategy, preset, provider, and safety setup",
+		Short: "Configure global defaults or one repository",
 		Long: `Configure ACD for everyday use through one reviewed transaction.
 
-Choose Everyday work, Maximum speed, or Strict review. The wizard reuses valid
-provider settings, asks for missing endpoint, model, or credential details,
-and shows one exact review with the check and permissions.
+Without --repo, configure global defaults that new repositories inherit.
+Global setup offers Everyday work or Maximum speed, tests the provider before
+writing, and never opens repository state, runs project commands, or starts a
+daemon.
 
-The provider is tested before any write. Intent setup then queues a durable
-background validation gate, keeps capture active, and returns immediately.
-Use --wait to follow that gate until it passes or needs attention. ACD never
-edits harness hook files.
+With an explicit --repo, configure that repository. Strict Review is available
+only in repository setup and gates publishing on an approved full project
+check. Everyday uses ACD's internal structural checks without running project
+tests. Use --wait only with repository Strict Review to follow validation.
+ACD never edits harness hook files.
 
 --dry-run prints the final projection without provider calls, command
 execution, credential/settings writes, daemon starts, or hook changes.`,
 		Example: `  acd configure
-  acd configure --wait
+  acd configure --repo .
+  acd configure --repo . --strategy intent --preset quality --wait
   acd configure --accessible
   acd configure --strategy intent --preset balanced
   printf '%s\n' "$ACD_AI_API_KEY" | acd configure --credential-stdin
@@ -154,7 +167,7 @@ execution, credential/settings writes, daemon starts, or hook changes.`,
 	cmd.Flags().BoolVar(&opts.Accessible, "accessible", false, "Use linear screen-reader-friendly prompts")
 	cmd.Flags().BoolVar(&opts.CredentialStdin, "credential-stdin", false, "Read the credential from the first standard-input line")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Preview without calls, commands, writes, starts, or hook changes")
-	cmd.Flags().BoolVar(&opts.Wait, "wait", false, "Wait for queued setup validation to finish")
+	cmd.Flags().BoolVar(&opts.Wait, "wait", false, "Wait for repository Strict Review validation")
 	return cmd
 }
 
@@ -168,8 +181,346 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if opts.Wait && opts.DryRun {
 		return errors.New("acd configure: --wait cannot be used with --dry-run")
 	}
+	repositoryScope := cmd.Flags().Changed("repo")
+	if opts.Wait && !repositoryScope {
+		return errors.New("acd configure: --wait requires an explicit --repo and Strict Review")
+	}
+	if repositoryScope {
+		return runRepositoryConfigure(cmd, opts)
+	}
+	return runGlobalConfigure(cmd, opts)
+}
+
+func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	strategy, preset, err := normalizeConfigureMode(opts.Strategy, opts.Preset)
 	if err != nil {
+		return err
+	}
+	if err := validateGlobalConfigureMode(strategy, preset); err != nil {
+		return err
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		return fmt.Errorf("acd configure: resolve paths: %w", err)
+	}
+	if opts.DryRun {
+		selection := dryRunConfigureSelection(
+			strategy, preset, configureVerificationDetection{},
+		)
+		report, reportErr := buildConfigureReport(
+			"", selection, credentials.SourceNone, true,
+		)
+		if reportErr != nil {
+			return reportErr
+		}
+		configureGlobalReport(&report)
+		return renderConfigureReport(cmd.OutOrStdout(), report, opts.JSON)
+	}
+
+	accessible := opts.Accessible ||
+		strings.EqualFold(os.Getenv("TERM"), "dumb") ||
+		configureTerminalTooShort(cmd.OutOrStdout())
+	if !accessible &&
+		(!settingsInputTTY(cmd.InOrStdin()) ||
+			!settingsOutputTTY(cmd.OutOrStdout())) {
+		return errors.New(
+			"acd configure: rich mode requires interactive stdin and stdout; use --accessible",
+		)
+	}
+	wizardInput := cmd.InOrStdin()
+	var stagedCredential []byte
+	if opts.CredentialStdin {
+		stagedCredential, wizardInput, err =
+			readConfigureCredentialLine(cmd.InOrStdin())
+		if err != nil {
+			return err
+		}
+		defer clearBytes(stagedCredential)
+	}
+	source, hasCredential, err := configureCredentialStatus(
+		roots, os.LookupEnv,
+	)
+	if err != nil {
+		return fmt.Errorf("acd configure: credential status: %w", err)
+	}
+
+	lookup := configureLookupEnv(string(stagedCredential))
+	previewService, err := openConfigureGlobalSettingsService(
+		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: prepare global preview: %w", err,
+		)
+	}
+	authoring, err := previewService.AuthoringPreview()
+	if err != nil {
+		previewService.Close()
+		return fmt.Errorf(
+			"acd configure: resolve global defaults: %w", err,
+		)
+	}
+	defaults := authoring.Values
+	originalProvider := defaults[config.FieldProvider]
+	defaults[config.FieldCommitStrategy] = strategy
+	defaults[config.FieldCommitPreset] = preset
+	defaults[config.FieldIntentVerification] =
+		configureSelectionVerificationMode(strategy, preset)
+	if strategy == "intent" &&
+		defaults[config.FieldProvider] == "deterministic" {
+		defaults[config.FieldProvider] = "openai-compat"
+	}
+	providerConfigured := configureSourceIsExplicit(
+		authoring.Sources[config.FieldProvider],
+	) && originalProvider == defaults[config.FieldProvider]
+	openAIConfigured := configureSourceIsExplicit(
+		authoring.Sources[config.FieldBaseURL],
+	) && configureSourceIsExplicit(
+		authoring.Sources[config.FieldModel],
+	)
+	if err := previewService.Close(); err != nil {
+		return fmt.Errorf("acd configure: close global preview: %w", err)
+	}
+
+	explicitMode := cmd.Flags().Changed("strategy") ||
+		cmd.Flags().Changed("preset")
+	selection, err := runConfigureWizard(
+		cmd.Context(), settingsui.ConfigureWizardOptions{
+			Input: wizardInput, Output: cmd.OutOrStdout(),
+			Accessible: accessible, Defaults: defaults,
+			ExplicitMode: explicitMode, HasCredential: hasCredential ||
+				len(stagedCredential) > 0,
+			CredentialFromStdin: opts.CredentialStdin,
+			ProviderConfigured:  providerConfigured,
+			OpenAIConfigured:    openAIConfigured,
+			RepositoryScoped:    false,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("acd configure: wizard: %w", err)
+	}
+	selection.Strategy, selection.Preset, err =
+		normalizeConfigureMode(selection.Strategy, selection.Preset)
+	if err != nil {
+		return err
+	}
+	if err := validateGlobalConfigureMode(
+		selection.Strategy, selection.Preset,
+	); err != nil {
+		return err
+	}
+	selection.VerificationMode = configureSelectionVerificationMode(
+		selection.Strategy, selection.Preset,
+	)
+	selection.VerificationCommand = ""
+	selection.VerificationSource = ""
+	selection.ExecutionMode = "global defaults only"
+	if len(stagedCredential) > 0 {
+		selection.Credential = string(stagedCredential)
+	}
+	if err := validateConfigureSelection(
+		selection, hasCredential || len(stagedCredential) > 0,
+	); err != nil {
+		return err
+	}
+
+	lookup = configureLookupEnv(selection.Credential)
+	service, err := openConfigureGlobalSettingsService(
+		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: open global settings service: %w", err,
+		)
+	}
+	defer service.Close()
+	draft := selectionDraft(selection)
+	providerConfirmations := selectionProviderConfirmations(selection)
+	validation, err := service.Validate(
+		cmd.Context(), draft, providerConfirmations,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: resolve reviewed global settings: %w", err,
+		)
+	}
+	report, err := buildResolvedConfigureReport(
+		"", selection, source, false, validation,
+	)
+	if err != nil {
+		return err
+	}
+	configureGlobalReport(&report)
+	if selection.Credential != "" &&
+		source != credentials.SourceEnvironment {
+		report.CredentialSource = credentials.SourceFile
+	}
+	if err := renderConfigureReport(
+		cmd.OutOrStdout(), report, false,
+	); err != nil {
+		return err
+	}
+	approval, err := confirmConfigurePreview(
+		cmd.Context(), wizardInput, cmd.OutOrStdout(), accessible,
+		settingsui.ConfigurePreviewApprovalOptions{
+			VerificationMode: report.Verification.Mode,
+			RepairEnabled:    report.RepairEnabled,
+			RepairHorizon:    report.RepairHorizon,
+			RepairMaxCommits: report.RepairMaxCommits,
+			Global:           true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: final confirmation: %w", err,
+		)
+	}
+	if !approval.Apply {
+		return errors.New(
+			"acd configure: final preview declined; no provider call or write was made",
+		)
+	}
+	if report.RepairEnabled && !approval.Repair {
+		return errors.New(
+			"acd configure: automatic repair declined; no provider call or write was made",
+		)
+	}
+	selection.RepairApproved = approval.Repair
+	confirmations := selectionConfirmations(selection)
+	validation, err = service.Validate(
+		cmd.Context(), draft, confirmations,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: confirm reviewed global settings: %w", err,
+		)
+	}
+	if len(validation.Missing) > 0 {
+		return &settings.ConfirmationRequiredError{
+			Missing: validation.Missing,
+		}
+	}
+	if validation.SourceGeneration != authoring.Generation {
+		return errors.New(
+			"acd configure: global settings changed while the preview was open; rerun configure",
+		)
+	}
+
+	fmt.Fprintln(
+		cmd.ErrOrStderr(), "Applying reviewed global configuration...",
+	)
+	fmt.Fprintln(
+		cmd.ErrOrStderr(),
+		"[1/3] Testing provider with synthetic content...",
+	)
+	tested, err := service.TestProvider(
+		cmd.Context(), draft, confirmations,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"acd configure: test provider failed: %w; no configuration was changed",
+			err,
+		)
+	}
+	if !tested.Success {
+		return errors.New(
+			"acd configure: provider test failed; no configuration was changed",
+		)
+	}
+	fmt.Fprintln(cmd.ErrOrStderr(), "[1/3] Provider test passed.")
+
+	var previousCredential string
+	previousCredentialSet := false
+	if selection.Credential != "" {
+		fmt.Fprintln(
+			cmd.ErrOrStderr(),
+			"[2/3] Storing protected credential...",
+		)
+		previousCredential, err = configureCredentialRead(roots)
+		if err == nil {
+			previousCredentialSet = true
+		} else if !errors.Is(err, credentials.ErrNotFound) {
+			return fmt.Errorf(
+				"acd configure: inspect protected credential: %w", err,
+			)
+		}
+		if err := configureCredentialWrite(
+			roots, selection.Credential,
+		); err != nil {
+			return fmt.Errorf(
+				"acd configure: persist protected credential: %w", err,
+			)
+		}
+		fmt.Fprintln(
+			cmd.ErrOrStderr(),
+			"[2/3] Protected credential stored.",
+		)
+	} else {
+		fmt.Fprintln(
+			cmd.ErrOrStderr(),
+			"[2/3] Existing credential retained.",
+		)
+	}
+
+	fmt.Fprintln(
+		cmd.ErrOrStderr(), "[3/3] Saving global defaults...",
+	)
+	saved, err := service.SaveGlobalSetup(
+		cmd.Context(), settings.SaveGlobalSetupRequest{
+			Values:             draft,
+			TestedFingerprint:  tested.Fingerprint,
+			Confirmations:      confirmations,
+			ExpectedGeneration: authoring.Generation,
+		},
+	)
+	if err != nil {
+		rollback := rollbackConfigureCredential(
+			roots, selection.Credential != "",
+			previousCredentialSet, previousCredential,
+		)
+		return fmt.Errorf(
+			"acd configure: save global defaults failed: %w; rollback: %s",
+			err, rollback,
+		)
+	}
+	fmt.Fprintln(
+		cmd.ErrOrStderr(), "[3/3] Global defaults saved.",
+	)
+	report.Operations = []string{
+		"provider_test:passed",
+		"credential:persisted_or_unchanged",
+		fmt.Sprintf("global_settings:saved_generation_%d", saved.Generation),
+		"repository_state:not_opened",
+		"daemon:not_started",
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "Global configuration saved.")
+	fmt.Fprintln(
+		cmd.OutOrStdout(),
+		"Repositories: inherit these defaults unless they have an override",
+	)
+	if selection.VerificationMode == "structural" {
+		fmt.Fprintln(
+			cmd.OutOrStdout(),
+			"Verification: ACD internal atomicity and materialization checks",
+		)
+	}
+	fmt.Fprintln(
+		cmd.OutOrStdout(),
+		"Project tests: not configured; use `acd configure --repo .` for Strict Review",
+	)
+	fmt.Fprintln(cmd.OutOrStdout(), "Daemon: not started")
+	for _, guidance := range report.HarnessGuidance {
+		fmt.Fprintln(cmd.OutOrStdout(), guidance)
+	}
+	return nil
+}
+
+func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
+	strategy, preset, err := normalizeConfigureMode(opts.Strategy, opts.Preset)
+	if err != nil {
+		return err
+	}
+	if err := validateRepositoryConfigureMode(strategy, preset); err != nil {
 		return err
 	}
 	repo, err := resolveRepo(opts.Repo)
@@ -338,6 +689,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		CredentialFromStdin:  opts.CredentialStdin,
 		ProviderConfigured:   providerConfigured,
 		OpenAIConfigured:     openAIConfigured,
+		RepositoryScoped:     true,
 	})
 	if err != nil {
 		return fmt.Errorf("acd configure: wizard: %w", err)
@@ -346,11 +698,21 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := validateRepositoryConfigureMode(
+		selection.Strategy, selection.Preset,
+	); err != nil {
+		return err
+	}
 	if len(stagedCredential) > 0 {
 		selection.Credential = string(stagedCredential)
 	}
 	if err := validateConfigureSelection(selection, hasCredential || len(stagedCredential) > 0); err != nil {
 		return err
+	}
+	if opts.Wait && selection.VerificationMode != "full" {
+		return errors.New(
+			"acd configure: --wait is available only for repository Strict Review",
+		)
 	}
 	if err := previewService.Close(); err != nil {
 		return fmt.Errorf("acd configure: close initial preview: %w", err)
@@ -459,7 +821,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	progress.complete("provider_test:passed")
 	progress.success(1, "Provider test passed.")
 	var setupValidation *settings.SetupValidation
-	if report.Verification.Mode != "none" {
+	if report.Verification.Mode == "full" {
 		target, targetErr := resolveConfigureValidationTarget(
 			cmd.Context(), repo,
 		)
@@ -611,6 +973,34 @@ func normalizeConfigureMode(strategy, preset string) (string, string, error) {
 	return strategy, preset, nil
 }
 
+func validateGlobalConfigureMode(strategy, preset string) error {
+	if strategy == "intent" && preset == "quality" {
+		return errors.New(
+			"acd configure: Strict Review requires an explicit --repo; global setup supports Everyday or Maximum Speed",
+		)
+	}
+	if (strategy == "intent" && preset == "balanced") ||
+		(strategy == "event" && preset == "fast") {
+		return nil
+	}
+	return fmt.Errorf(
+		"acd configure: %s.%s is not a global experience; use intent.balanced (Everyday) or event.fast (Maximum Speed)",
+		strategy, preset,
+	)
+}
+
+func validateRepositoryConfigureMode(strategy, preset string) error {
+	if (strategy == "intent" &&
+		(preset == "balanced" || preset == "quality")) ||
+		(strategy == "event" && preset == "fast") {
+		return nil
+	}
+	return fmt.Errorf(
+		"acd configure: %s.%s is not a guided repository experience; use intent.balanced, event.fast, or intent.quality",
+		strategy, preset,
+	)
+}
+
 func configureTerminalTooShort(output io.Writer) bool {
 	file, ok := output.(*os.File)
 	if !ok || !term.IsTerminal(file.Fd()) {
@@ -629,8 +1019,11 @@ func dryRunConfigureSelection(
 		provider = "deterministic"
 	}
 	mode := configureSelectionVerificationMode(strategy, preset)
-	command, source := detected.QuickCommand, detected.QuickSource
-	if mode == "full" {
+	var command, source string
+	switch mode {
+	case "fast":
+		command, source = detected.QuickCommand, detected.QuickSource
+	case "full":
 		command, source = detected.FullCommand, detected.FullSource
 	}
 	if mode == "fast" && command == "" {
@@ -643,7 +1036,7 @@ func dryRunConfigureSelection(
 		Provider: provider, Model: "gpt-5.4-mini", BaseURL: ai.DefaultOpenAIBaseURL,
 		ProviderTimeout: "30s", VerificationMode: mode,
 		VerificationCommand: command, VerificationSource: source,
-		ExecutionMode: configureExecutionMode(strategy),
+		ExecutionMode: configureExecutionMode(strategy, preset),
 	}
 }
 
@@ -758,7 +1151,10 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 		return configureReport{}, errors.New("acd configure: selected preset is unavailable")
 	}
 	verificationStatus := "not_required"
-	if selection.VerificationMode != "none" {
+	switch selection.VerificationMode {
+	case "structural":
+		verificationStatus = "internal_only"
+	case "fast", "full":
 		if dryRun {
 			verificationStatus = "approval_required"
 		} else {
@@ -772,8 +1168,13 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 			diff = "approved_redacted"
 		}
 	}
+	scope := "repository"
+	if repo == "" {
+		scope = "global"
+	}
 	report := configureReport{
-		Version: configureReportVersion, DryRun: dryRun, Repo: repo,
+		Version: configureReportVersion, DryRun: dryRun,
+		Scope: scope, Repo: repo,
 		Experience: fallbackConfigureExperience(selection),
 		Strategy:   selection.Strategy, Preset: selection.Preset,
 		PresetID: definition.ID(), PresetVersion: definition.Version,
@@ -789,9 +1190,13 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 		RepairEnabled:    definition.Values[config.FieldIntentRepairEnabled] == "true",
 		RepairHorizon:    definition.Values[config.FieldIntentRepairHorizon],
 		RepairMaxCommits: definition.Values[config.FieldIntentRepairMaxCommits],
-		ExecutionMode:    configureExecutionMode(selection.Strategy),
-		Readiness:        configureInitialReadiness(selection.Strategy),
-		Daemon:           "unchanged", HarnessGuidance: configureHarnessGuidance(),
+		ExecutionMode: configureExecutionMode(
+			selection.Strategy, selection.Preset,
+		),
+		Readiness: configureInitialReadiness(
+			selection.Strategy, selection.Preset,
+		),
+		Daemon: "unchanged", HarnessGuidance: configureHarnessGuidance(),
 		Risks: configureRisks(selection, definition),
 		Operations: []string{
 			"provider_test:planned", "credential:persist_after_provider_test",
@@ -799,6 +1204,11 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 			"validation:queue_if_required", "daemon:enable",
 			"harness:report_only",
 		},
+	}
+	if selection.VerificationMode == "full" {
+		report.Operations[4] = "validation:queue"
+	} else {
+		report.Operations[4] = "validation:not_required"
 	}
 	if selection.VerificationMode == "fast" {
 		report.Verification.Timeout = definition.Values[config.FieldVerificationFastTimeout]
@@ -810,6 +1220,26 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 		report.Verification.ExpectedDuration = "usually a few seconds"
 	}
 	return report, nil
+}
+
+func configureGlobalReport(report *configureReport) {
+	if report == nil {
+		return
+	}
+	report.Scope = "global"
+	report.Repo = ""
+	report.ExecutionMode = "global defaults only"
+	report.Readiness = "saved after provider test"
+	report.Daemon = "not_started"
+	report.RuntimeRevision = 0
+	report.Operations = []string{
+		"provider_test:planned",
+		"credential:persist_after_provider_test",
+		"global_settings:save_with_approval",
+		"repository_state:not_opened",
+		"daemon:not_started",
+		"harness:report_only",
+	}
 }
 
 func buildResolvedConfigureReport(repo string, selection settingsui.ConfigureSelection, source credentials.Source, dryRun bool, validation settings.Validation) (configureReport, error) {
@@ -867,7 +1297,11 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 		suffix = " (dry run)"
 	}
 	fmt.Fprintf(out, "ACD CONFIGURE PREVIEW%s\n", suffix)
-	fmt.Fprintf(out, "Repository: %s\n", safeRepoPreview(report.Repo))
+	if report.Scope == "global" {
+		fmt.Fprintln(out, "Scope: Global defaults")
+	} else {
+		fmt.Fprintf(out, "Repository: %s\n", safeRepoPreview(report.Repo))
+	}
 	fmt.Fprintf(out, "Experience: %s\n", report.Experience)
 	fmt.Fprintf(out, "Mode: %s %s%s [%s@%d]\n", displayConfigureWord(report.Strategy),
 		displayConfigureWord(report.Preset), customized, report.PresetID, report.PresetVersion)
@@ -900,8 +1334,17 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 		report.RepairEnabled, report.RepairHorizon, report.RepairMaxCommits)
 	fmt.Fprintln(out, "Execution:", report.ExecutionMode)
 	fmt.Fprintln(out, "Readiness after save:", report.Readiness)
-	fmt.Fprintln(out, "Apply order: provider test > credential > settings > one runtime revision + validation job > acd on")
-	if report.Verification.Mode != "none" {
+	if report.Scope == "global" {
+		fmt.Fprintln(out,
+			"Apply order: provider test > credential > global defaults")
+	} else if report.Verification.Mode == "full" {
+		fmt.Fprintln(out,
+			"Apply order: provider test > credential > settings > one runtime revision + validation job > acd on")
+	} else {
+		fmt.Fprintln(out,
+			"Apply order: provider test > credential > settings > one runtime revision > acd on")
+	}
+	if report.Verification.Mode == "full" {
 		fmt.Fprintln(out, "Validation runs after setup returns; capture stays active while commit publishing waits.")
 	}
 	fmt.Fprintln(out, "Harness hooks: report only; no external hook file will be edited")
@@ -1141,9 +1584,6 @@ func configureRisks(selection settingsui.ConfigureSelection, preset config.Prese
 		selection.VerificationMode == "full" {
 		risks = append(risks, "repository command will run in an ephemeral worktree: "+
 			safeCommandPreview(selection.VerificationCommand))
-	} else if selection.VerificationMode == "structural" {
-		risks = append(risks,
-			"built-in structural and materialization checks will run against the reviewed commit")
 	}
 	if preset.Values[config.FieldIntentRepairEnabled] == "true" {
 		risks = append(risks, "eligible recent ACD-owned commits may be repaired automatically")
@@ -1335,7 +1775,7 @@ func configureSelectionVerificationMode(strategy, preset string) string {
 	}
 	switch preset {
 	case "balanced":
-		return "fast"
+		return "structural"
 	case "quality":
 		return "full"
 	default:
@@ -1515,27 +1955,27 @@ func configureExperienceName(strategy, preset string) string {
 
 func displayConfigureExperience(value string) string {
 	switch value {
-	case "speed":
+	case "speed", "Maximum Speed":
 		return "Maximum Speed"
-	case "strict":
+	case "strict", "Strict Review":
 		return "Strict Review"
 	default:
 		return "Everyday"
 	}
 }
 
-func configureExecutionMode(strategy string) string {
-	if strategy == "event" {
-		return "immediate activation"
+func configureExecutionMode(strategy, preset string) string {
+	if strategy == "intent" && preset == "quality" {
+		return "background activation gate"
 	}
-	return "background activation gate"
+	return "immediate activation"
 }
 
-func configureInitialReadiness(strategy string) string {
-	if strategy == "event" {
-		return "ready"
+func configureInitialReadiness(strategy, preset string) string {
+	if strategy == "intent" && preset == "quality" {
+		return "validating"
 	}
-	return "validating"
+	return "ready"
 }
 
 func configureValidationLabel(mode string) string {

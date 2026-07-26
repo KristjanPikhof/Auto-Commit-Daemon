@@ -21,10 +21,12 @@ import (
 )
 
 type configureFakeService struct {
-	order    *[]string
-	snapshot settings.Snapshot
-	saveErr  error
-	applyErr error
+	order       *[]string
+	snapshot    settings.Snapshot
+	saveErr     error
+	applyErr    error
+	providerErr error
+	globalSave  func(settings.SaveGlobalSetupRequest)
 }
 
 func (f *configureFakeService) Close() error { return nil }
@@ -47,6 +49,19 @@ func (f *configureFakeService) Save(context.Context, settings.SaveRequest) (sett
 	}
 	return settings.SaveResult{Generation: f.snapshot.SavedGeneration + 1, Scope: settings.ScopeRepository}, nil
 }
+func (f *configureFakeService) SaveGlobalSetup(_ context.Context, req settings.SaveGlobalSetupRequest) (settings.SaveGlobalSetupResult, error) {
+	*f.order = append(*f.order, "global_settings")
+	if f.globalSave != nil {
+		f.globalSave(req)
+	}
+	if f.saveErr != nil {
+		return settings.SaveGlobalSetupResult{}, f.saveErr
+	}
+	return settings.SaveGlobalSetupResult{
+		Generation:  req.ExpectedGeneration + 1,
+		Fingerprint: req.TestedFingerprint,
+	}, nil
+}
 func (f *configureFakeService) Validate(_ context.Context, draft map[string]string, confirmed []ai.ConfirmationRequirement) (settings.Validation, error) {
 	*f.order = append(*f.order, "validate")
 	strategy := config.CommitStrategy(draft[config.FieldCommitStrategy])
@@ -65,7 +80,8 @@ func (f *configureFakeService) Validate(_ context.Context, draft map[string]stri
 		}
 	}
 	var required []ai.ConfirmationRequirement
-	if resolved[config.FieldIntentVerification] != "none" {
+	if resolved[config.FieldIntentVerification] == "fast" ||
+		resolved[config.FieldIntentVerification] == "full" {
 		required = append(required, ai.ConfirmationVerificationCommand)
 	}
 	if resolved[config.FieldIntentRepairEnabled] == "true" {
@@ -87,8 +103,275 @@ func (f *configureFakeService) Validate(_ context.Context, draft map[string]stri
 		Missing: missing, Confirmations: required,
 	}, nil
 }
+
+func TestConfigureGlobalDryRunWorksOutsideRepository(t *testing.T) {
+	t.Chdir(t.TempDir())
+	withIsolatedHome(t)
+	restoreConfigureFakes(t)
+	called := false
+	openConfigureGlobalSettingsService = func(context.Context, settings.Options) (configureGlobalSettingsService, error) {
+		called = true
+		return nil, errors.New("must not open")
+	}
+	openConfigureSettingsService = func(context.Context, settings.Options) (settingsCLIService, error) {
+		called = true
+		return nil, errors.New("must not open")
+	}
+	openConfigureValidationService = func(context.Context, settings.Options) (configureValidationService, error) {
+		called = true
+		return nil, errors.New("must not open")
+	}
+	configureEnable = func(context.Context, io.Writer, string, bool) error {
+		called = true
+		return nil
+	}
+
+	out, _, err := executeConfigureCommand(
+		t, "", "--dry-run", "--json",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("global dry-run reached an operational seam")
+	}
+	var report configureReport
+	if err := jsonUnmarshalStrict([]byte(out), &report); err != nil {
+		t.Fatalf("decode report: %v\n%s", err, out)
+	}
+	if report.Version != configureReportVersion ||
+		report.Scope != "global" || report.Repo != "" ||
+		report.Experience != "Everyday" ||
+		report.Verification.Mode != "structural" ||
+		report.Verification.Command != "" ||
+		report.ExecutionMode != "global defaults only" ||
+		report.Daemon != "not_started" ||
+		report.RuntimeRevision != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+
+	out, _, err = executeConfigureCommand(
+		t, "", "--strategy", "event", "--preset", "fast",
+		"--dry-run", "--json",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report = configureReport{}
+	if err := jsonUnmarshalStrict([]byte(out), &report); err != nil {
+		t.Fatalf("decode Maximum Speed report: %v\n%s", err, out)
+	}
+	if report.Experience != "Maximum Speed" ||
+		report.Strategy != "event" || report.Preset != "fast" ||
+		report.Provider != "deterministic" ||
+		report.Verification.Mode != "none" ||
+		report.RepairEnabled {
+		t.Fatalf("Maximum Speed report=%+v", report)
+	}
+}
+
+func TestConfigureGlobalSavesOnlyReviewedDefaults(t *testing.T) {
+	t.Chdir(t.TempDir())
+	withIsolatedHome(t)
+	restoreConfigureFakes(t)
+	var order []string
+	service := &configureFakeService{
+		order: &order,
+		snapshot: settings.Snapshot{
+			SavedGeneration: 4,
+			Fields: []settings.FieldSnapshot{
+				{Name: config.FieldProvider, DraftValue: "openai-compat"},
+				{Name: config.FieldModel, DraftValue: "model"},
+				{Name: config.FieldBaseURL, DraftValue: ai.DefaultOpenAIBaseURL},
+				{Name: config.FieldTimeout, DraftValue: "30s"},
+				{Name: config.FieldCommitFormat, DraftValue: "imperative"},
+			},
+		},
+	}
+	service.globalSave = func(req settings.SaveGlobalSetupRequest) {
+		if req.Values[config.FieldIntentVerification] != "structural" {
+			t.Fatalf(
+				"global verification=%q",
+				req.Values[config.FieldIntentVerification],
+			)
+		}
+		if strings.TrimSpace(
+			req.Values[config.FieldVerificationFastCommand],
+		) != "" ||
+			strings.TrimSpace(
+				req.Values[config.FieldVerificationFullCommand],
+			) != "" {
+			t.Fatalf("global setup saved a project command: %+v", req.Values)
+		}
+		for _, confirmation := range req.Confirmations {
+			if confirmation == ai.ConfirmationVerificationCommand {
+				t.Fatal("global setup saved repository command approval")
+			}
+		}
+		if req.TestedFingerprint != "reviewed-fingerprint" ||
+			req.ExpectedGeneration != 4 {
+			t.Fatalf("save request=%+v", req)
+		}
+	}
+	openConfigureGlobalSettingsService = func(_ context.Context, opts settings.Options) (configureGlobalSettingsService, error) {
+		if opts.RepoPath != "" {
+			t.Fatalf("global service received repo %q", opts.RepoPath)
+		}
+		return service, nil
+	}
+	openConfigureSettingsService = func(context.Context, settings.Options) (settingsCLIService, error) {
+		t.Fatal("global setup opened repository settings")
+		return nil, nil
+	}
+	openConfigureValidationService = func(context.Context, settings.Options) (configureValidationService, error) {
+		t.Fatal("global setup opened repository validation")
+		return nil, nil
+	}
+	configureCredentialStatus = func(paths.Roots, func(string) (string, bool)) (credentials.Source, bool, error) {
+		order = append(order, "credential_status")
+		return credentials.SourceEnvironment, true, nil
+	}
+	runConfigureWizard = func(_ context.Context, opts settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
+		order = append(order, "wizard")
+		if opts.RepositoryScoped {
+			t.Fatal("global wizard marked repository-scoped")
+		}
+		if opts.DetectedQuickCommand != "" ||
+			opts.DetectedFullCommand != "" {
+			t.Fatal("global wizard received project commands")
+		}
+		return settingsui.ConfigureSelection{
+			Experience: "everyday", Strategy: "intent", Preset: "balanced",
+			CommitFormat: "imperative", Provider: "openai-compat",
+			Model: "model", BaseURL: ai.DefaultOpenAIBaseURL,
+			ProviderTimeout: "30s", DiffContextApproved: true,
+			VerificationMode: "structural",
+		}, nil
+	}
+	confirmConfigurePreview = func(_ context.Context, _ io.Reader, _ io.Writer, _ bool, opts settingsui.ConfigurePreviewApprovalOptions) (settingsui.ConfigurePreviewApproval, error) {
+		order = append(order, "confirm")
+		if !opts.Global {
+			t.Fatal("global preview used repository confirmation")
+		}
+		if opts.VerificationCommand != "" {
+			t.Fatalf("global preview requested command %q", opts.VerificationCommand)
+		}
+		return settingsui.ConfigurePreviewApproval{
+			Apply: true, Repair: opts.RepairEnabled,
+		}, nil
+	}
+	configureCredentialWrite = func(paths.Roots, string) error {
+		t.Fatal("environment credential was rewritten")
+		return nil
+	}
+	configureEnable = func(context.Context, io.Writer, string, bool) error {
+		t.Fatal("global setup started a daemon")
+		return nil
+	}
+	settingsInputTTY = func(io.Reader) bool { return true }
+	settingsOutputTTY = func(io.Writer) bool { return true }
+
+	out, progress, err := executeConfigureCommand(t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := "credential_status,authoring,wizard,validate,confirm,validate,provider,global_settings"
+	if got := strings.Join(order, ","); got != wantOrder {
+		t.Fatalf("order=%s want=%s", got, wantOrder)
+	}
+	for _, want := range []string{
+		"Scope: Global defaults",
+		"Verification: structural",
+		"Project tests: not configured",
+		"Daemon: not started",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out+progress, "runtime revision") ||
+		strings.Contains(out+progress, "validation job") {
+		t.Fatalf("global setup created repository work:\n%s\n%s", out, progress)
+	}
+}
+
+func TestConfigureGlobalProviderFailureWritesNothing(t *testing.T) {
+	t.Chdir(t.TempDir())
+	withIsolatedHome(t)
+	restoreConfigureFakes(t)
+	var order []string
+	service := &configureFakeService{
+		order:       &order,
+		providerErr: errors.New("provider rejected synthetic request"),
+		snapshot: settings.Snapshot{
+			SavedGeneration: 1,
+			Fields: []settings.FieldSnapshot{
+				{Name: config.FieldProvider, DraftValue: "openai-compat"},
+				{Name: config.FieldModel, DraftValue: "model"},
+				{Name: config.FieldBaseURL, DraftValue: ai.DefaultOpenAIBaseURL},
+				{Name: config.FieldTimeout, DraftValue: "30s"},
+				{Name: config.FieldCommitFormat, DraftValue: "imperative"},
+			},
+		},
+	}
+	openConfigureGlobalSettingsService = func(context.Context, settings.Options) (configureGlobalSettingsService, error) {
+		return service, nil
+	}
+	configureCredentialStatus = func(paths.Roots, func(string) (string, bool)) (credentials.Source, bool, error) {
+		return credentials.SourceNone, false, nil
+	}
+	runConfigureWizard = func(context.Context, settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
+		return settingsui.ConfigureSelection{
+			Experience: "everyday", Strategy: "intent", Preset: "balanced",
+			CommitFormat: "imperative", Provider: "openai-compat",
+			Model: "model", BaseURL: ai.DefaultOpenAIBaseURL,
+			ProviderTimeout: "30s", Credential: "staged-secret",
+			DiffContextApproved: true, VerificationMode: "structural",
+		}, nil
+	}
+	confirmConfigurePreview = func(_ context.Context, _ io.Reader, _ io.Writer, _ bool, opts settingsui.ConfigurePreviewApprovalOptions) (settingsui.ConfigurePreviewApproval, error) {
+		return settingsui.ConfigurePreviewApproval{
+			Apply: true, Repair: opts.RepairEnabled,
+		}, nil
+	}
+	configureCredentialWrite = func(paths.Roots, string) error {
+		t.Fatal("provider failure wrote credential")
+		return nil
+	}
+	configureEnable = func(context.Context, io.Writer, string, bool) error {
+		t.Fatal("provider failure started daemon")
+		return nil
+	}
+	settingsInputTTY = func(io.Reader) bool { return true }
+	settingsOutputTTY = func(io.Writer) bool { return true }
+
+	_, _, err := executeConfigureCommand(t, "")
+	if err == nil ||
+		!strings.Contains(err.Error(), "no configuration was changed") {
+		t.Fatalf("err=%v", err)
+	}
+	if got := strings.Join(order, ","); got !=
+		"authoring,validate,validate,provider" {
+		t.Fatalf("order=%s", got)
+	}
+}
+
+func TestConfigureGlobalRejectsStrictReview(t *testing.T) {
+	t.Chdir(t.TempDir())
+	withIsolatedHome(t)
+	_, _, err := executeConfigureCommand(
+		t, "", "--strategy", "intent", "--preset", "quality", "--dry-run",
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "requires an explicit --repo") {
+		t.Fatalf("err=%v", err)
+	}
+}
 func (f *configureFakeService) TestProvider(context.Context, map[string]string, []ai.ConfirmationRequirement) (settings.ProviderTestResult, error) {
 	*f.order = append(*f.order, "provider")
+	if f.providerErr != nil {
+		return settings.ProviderTestResult{}, f.providerErr
+	}
 	return settings.ProviderTestResult{Fingerprint: "reviewed-fingerprint", Provider: "openai-compat", Success: true}, nil
 }
 func (f *configureFakeService) Apply(_ context.Context, req settings.ApplyRequest) (settings.ApplyResult, error) {
@@ -162,12 +445,15 @@ func TestConfigureDryRunJSONHasNoOperationalSideEffects(t *testing.T) {
 	if err := jsonUnmarshalStrict([]byte(out), &report); err != nil {
 		t.Fatalf("decode report: %v\n%s", err, out)
 	}
-	if !report.DryRun || report.Version != 3 ||
+	if !report.DryRun || report.Version != configureReportVersion ||
+		report.Scope != "repository" ||
 		report.Experience != "Everyday" ||
 		report.PresetID != "intent.balanced" ||
 		report.Verification.Mode != "structural" ||
-		report.Verification.Status != "approval_required" ||
-		report.Daemon != "unchanged" || len(report.Risks) != 3 ||
+		report.Verification.Command != "" ||
+		report.Verification.CommandSource != "" ||
+		report.Verification.Status != "internal_only" ||
+		report.Daemon != "unchanged" || len(report.Risks) != 2 ||
 		report.HarnessGuidance == nil {
 		t.Fatalf("report=%+v", report)
 	}
@@ -201,11 +487,11 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	runConfigureWizard = func(context.Context, settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
 		order = append(order, "wizard")
 		return settingsui.ConfigureSelection{
-			Strategy: "intent", Preset: "balanced", CommitFormat: "imperative",
+			Strategy: "intent", Preset: "quality", CommitFormat: "imperative",
 			Provider: "openai-compat", Model: "gpt-5.4-mini",
 			BaseURL: ai.DefaultOpenAIBaseURL, ProviderTimeout: "30s",
 			Credential: "staged-secret", DiffContextApproved: true,
-			VerificationMode: "fast", VerificationCommand: "make test",
+			VerificationMode: "full", VerificationCommand: "make test",
 			VerificationApproved: true,
 		}, nil
 	}
@@ -247,7 +533,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 		t.Fatalf("revision count in %v", order)
 	}
 	if !strings.Contains(out, "Configuration saved.") ||
-		!strings.Contains(out, "Commit publishing: waiting for quick validation") ||
+		!strings.Contains(out, "Commit publishing: waiting for full validation") ||
 		!strings.Contains(out, "Safe to close this terminal.") ||
 		!strings.Contains(out, "no external hook file will be edited") ||
 		!strings.Contains(out, "repository command will run in an ephemeral worktree: make test") ||
@@ -299,9 +585,9 @@ func TestConfigureDeclinedPreviewStopsBeforeCallsAndWrites(t *testing.T) {
 	}
 	runConfigureWizard = func(context.Context, settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
 		return settingsui.ConfigureSelection{
-			Strategy: "intent", Preset: "fast", CommitFormat: "imperative",
+			Strategy: "intent", Preset: "balanced", CommitFormat: "imperative",
 			Provider: "openai-compat", Model: "model", BaseURL: ai.DefaultOpenAIBaseURL,
-			ProviderTimeout: "30s", DiffContextApproved: true, VerificationMode: "none",
+			ProviderTimeout: "30s", DiffContextApproved: true, VerificationMode: "structural",
 		}, nil
 	}
 	confirmConfigurePreview = func(context.Context, io.Reader, io.Writer, bool, settingsui.ConfigurePreviewApprovalOptions) (settingsui.ConfigurePreviewApproval, error) {
@@ -379,10 +665,10 @@ func TestConfigureQueuesVerificationWithoutBlockingSetup(t *testing.T) {
 	}
 	runConfigureWizard = func(context.Context, settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
 		return settingsui.ConfigureSelection{
-			Strategy: "intent", Preset: "balanced", CommitFormat: "imperative",
+			Strategy: "intent", Preset: "quality", CommitFormat: "imperative",
 			Provider: "openai-compat", Model: "model", BaseURL: ai.DefaultOpenAIBaseURL,
 			ProviderTimeout: "30s", DiffContextApproved: true,
-			VerificationMode: "fast", VerificationCommand: "make test",
+			VerificationMode: "full", VerificationCommand: "make test",
 			VerificationApproved: true,
 		}, nil
 	}
@@ -420,6 +706,79 @@ func TestConfigureQueuesVerificationWithoutBlockingSetup(t *testing.T) {
 	got := strings.Join(order, ",")
 	if got != "authoring,validate,validate,snapshot,validate,provider,settings,revision,on" {
 		t.Fatalf("order=%v", order)
+	}
+}
+
+func TestConfigureRepositoryEverydaySkipsProjectValidation(t *testing.T) {
+	repo := materializeTestRepo(t, true)
+	withIsolatedHome(t)
+	var order []string
+	service := &configureFakeService{
+		order: &order,
+		snapshot: settings.Snapshot{
+			SavedGeneration: 3,
+			Fields: []settings.FieldSnapshot{
+				{Name: config.FieldProvider, DraftValue: "openai-compat"},
+				{Name: config.FieldModel, DraftValue: "model"},
+				{Name: config.FieldBaseURL, DraftValue: ai.DefaultOpenAIBaseURL},
+				{Name: config.FieldTimeout, DraftValue: "30s"},
+				{Name: config.FieldCommitFormat, DraftValue: "imperative"},
+			},
+		},
+	}
+	restoreConfigureFakes(t)
+	openConfigureSettingsService = func(context.Context, settings.Options) (settingsCLIService, error) {
+		return service, nil
+	}
+	openConfigureValidationService = func(context.Context, settings.Options) (configureValidationService, error) {
+		return service, nil
+	}
+	configureCredentialStatus = func(paths.Roots, func(string) (string, bool)) (credentials.Source, bool, error) {
+		return credentials.SourceEnvironment, true, nil
+	}
+	runConfigureWizard = func(_ context.Context, opts settingsui.ConfigureWizardOptions) (settingsui.ConfigureSelection, error) {
+		if !opts.RepositoryScoped {
+			t.Fatal("repository wizard was not scoped")
+		}
+		return settingsui.ConfigureSelection{
+			Experience: "everyday", Strategy: "intent", Preset: "balanced",
+			CommitFormat: "imperative", Provider: "openai-compat",
+			Model: "model", BaseURL: ai.DefaultOpenAIBaseURL,
+			ProviderTimeout: "30s", DiffContextApproved: true,
+			VerificationMode: "structural",
+		}, nil
+	}
+	confirmConfigurePreview = func(_ context.Context, _ io.Reader, _ io.Writer, _ bool, opts settingsui.ConfigurePreviewApprovalOptions) (settingsui.ConfigurePreviewApproval, error) {
+		if opts.VerificationCommand != "" {
+			t.Fatalf("Everyday requested project command %q", opts.VerificationCommand)
+		}
+		return settingsui.ConfigurePreviewApproval{
+			Apply: true, Repair: opts.RepairEnabled,
+		}, nil
+	}
+	configureEnable = func(context.Context, io.Writer, string, bool) error {
+		order = append(order, "on")
+		return nil
+	}
+	settingsInputTTY = func(io.Reader) bool { return true }
+	settingsOutputTTY = func(io.Writer) bool { return true }
+
+	out, progress, err := executeConfigureCommand(t, "", "--repo", repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out+progress, "validation job") ||
+		strings.Contains(out+progress, "Background validation target") ||
+		strings.Contains(out+progress, "make test") {
+		t.Fatalf("Everyday queued project validation:\n%s\n%s", out, progress)
+	}
+	if !strings.Contains(out, "Verification: structural") ||
+		!strings.Contains(out, "Configuration ready:") {
+		t.Fatalf("output=%s", out)
+	}
+	if got := strings.Join(order, ","); got !=
+		"authoring,validate,validate,snapshot,validate,provider,settings,revision,on" {
+		t.Fatalf("order=%s", got)
 	}
 }
 
@@ -590,7 +949,8 @@ func TestConfigureResolvedPreviewShowsRetainedCustomization(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !report.Customized || report.RepairEnabled ||
-		report.Verification.Command != "go test ./internal/... ignored" ||
+		report.Verification.Mode != "structural" ||
+		report.Verification.Command != "" ||
 		strings.Contains(strings.Join(report.Risks, "\n"), "\nignored") {
 		t.Fatalf("report=%+v", report)
 	}
@@ -668,7 +1028,7 @@ func TestConfigureHelpAndInvalidFlags(t *testing.T) {
 	help := commandHelp(t, "configure")
 	for _, want := range []string{
 		"--accessible", "--strategy", "--preset", "--credential-stdin",
-		"--dry-run", "--wait", "Everyday work", "background validation",
+		"--dry-run", "--wait", "Everyday work", "repository Strict Review",
 		"edits harness hook",
 	} {
 		if !strings.Contains(help, want) {
@@ -693,6 +1053,7 @@ func restoreConfigureFakes(t *testing.T) {
 	t.Helper()
 	oldOpen, oldWizard, oldConfirm := openConfigureSettingsService, runConfigureWizard, confirmConfigurePreview
 	oldPreview := openConfigureValidationService
+	oldGlobal := openConfigureGlobalSettingsService
 	oldStatus, oldWrite := configureCredentialStatus, configureCredentialWrite
 	oldRead, oldRemove := configureCredentialRead, configureCredentialRemove
 	oldEnable := configureEnable
@@ -700,6 +1061,7 @@ func restoreConfigureFakes(t *testing.T) {
 	t.Cleanup(func() {
 		openConfigureSettingsService, runConfigureWizard, confirmConfigurePreview = oldOpen, oldWizard, oldConfirm
 		openConfigureValidationService = oldPreview
+		openConfigureGlobalSettingsService = oldGlobal
 		configureCredentialStatus, configureCredentialWrite = oldStatus, oldWrite
 		configureCredentialRead, configureCredentialRemove = oldRead, oldRemove
 		configureEnable = oldEnable

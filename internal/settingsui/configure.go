@@ -276,6 +276,7 @@ type ConfigurePreviewApprovalOptions struct {
 	RepairEnabled       bool
 	RepairHorizon       string
 	RepairMaxCommits    string
+	Global              bool
 }
 
 type ConfigureRecoveryChoice string
@@ -319,9 +320,12 @@ func ChooseConfigureRecovery(
 // exact final preview.
 func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
 	approval := ConfigurePreviewApproval{}
+	title := "Approve every permission shown above, save this configuration, and enable ACD?"
+	if opts.Global {
+		title = "Approve every permission shown above and save these global defaults?"
+	}
 	form := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().Key("apply").Title(
-			"Approve every permission shown above, save this configuration, and enable ACD?").
+		huh.NewConfirm().Key("apply").Title(title).
 			Value(&approval.Apply),
 	))
 	if accessible || os.Getenv("NO_COLOR") != "" {
