@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
@@ -237,6 +238,23 @@ type ReplayOpts struct {
 	// visible pending window without waiting for IntentMinPending or
 	// IntentMaxPendingAge.
 	IntentBypassBatchWait bool
+
+	// IntentPreset enables the durable v2 candidate path. Empty preserves the
+	// v1 compatibility path for old runtime revisions and direct tests; v2
+	// runtime revisions always materialize one of the versioned preset names.
+	IntentPreset config.PresetName
+
+	// IntentCandidateVerify executes the already-approved repository-scoped
+	// command against an exact ephemeral candidate tree. Balanced and Quality
+	// stay pending when this callback is unavailable or fails.
+	IntentCandidateVerify IntentCandidateVerifier
+
+	// IntentRepairEnabled and IntentRepairHorizon control whether a newly
+	// published candidate remains soft-published and eligible for a later
+	// strict automatic repair transaction.
+	IntentRepairEnabled    bool
+	IntentRepairHorizon    time.Duration
+	IntentRepairMaxCommits int
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -415,6 +433,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if batchLimit > 0 && len(pending) > batchLimit {
 		pending = pending[:batchLimit]
 		sum.HasMore = true
+	}
+	if !intentCfg.candidateMode || len(pending) == 0 {
+		if err := consumeInactiveIntentActivityBoundaries(
+			ctx, db, cctx.BranchRef, cctx.BranchGeneration,
+		); err != nil {
+			return sum, err
+		}
 	}
 	if len(pending) == 0 {
 		return sum, nil
@@ -821,6 +846,64 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	return sum, nil
 }
 
+func consumeInactiveIntentActivityBoundaries(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) error {
+	for {
+		boundaries, err := state.PendingIntentActivityBoundaries(
+			ctx, db, 0, ai.IntentActivityBoundaryCap)
+		if err != nil {
+			return fmt.Errorf("daemon: replay: load inactive intent boundaries: %w", err)
+		}
+		var through int64
+		for _, boundary := range boundaries {
+			if boundary.BranchRef.Valid &&
+				(boundary.BranchRef.String != branchRef ||
+					!boundary.BranchGeneration.Valid ||
+					boundary.BranchGeneration.Int64 != generation) {
+				break
+			}
+			through = boundary.Epoch
+		}
+		if through == 0 {
+			return pruneConsumedIntentActivityBoundaries(ctx, db)
+		}
+		if _, err := state.ConsumeIntentActivityBoundaries(
+			ctx, db, through, float64(time.Now().UnixNano())/1e9,
+		); err != nil {
+			return fmt.Errorf("daemon: replay: consume inactive intent boundaries: %w", err)
+		}
+		if len(boundaries) < ai.IntentActivityBoundaryCap {
+			return pruneConsumedIntentActivityBoundaries(ctx, db)
+		}
+	}
+}
+
+const retainedConsumedIntentActivityBoundaries = 256
+
+func pruneConsumedIntentActivityBoundaries(
+	ctx context.Context,
+	db *state.DB,
+) error {
+	_, err := db.SQL().ExecContext(ctx, `
+DELETE FROM intent_activity_boundaries
+WHERE consumed_ts IS NOT NULL
+  AND id NOT IN (
+      SELECT id
+      FROM intent_activity_boundaries
+      WHERE consumed_ts IS NOT NULL
+      ORDER BY epoch DESC
+      LIMIT ?
+  )`, retainedConsumedIntentActivityBoundaries)
+	if err != nil {
+		return fmt.Errorf("daemon: replay: prune consumed intent boundaries: %w", err)
+	}
+	return nil
+}
+
 func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
 	if !cfg.enabled {
 		return opts.Limit
@@ -847,6 +930,11 @@ type intentReplayConfig struct {
 	pathCoalescing  bool
 	includeDiffs    bool
 	bypassBatchWait bool
+	// candidateMode enables durable Intent v2 candidate semantics. A pending
+	// activity boundary may trigger evaluation before the legacy min-pending
+	// and quiet-time gate, but never before path quiescence or replay safety
+	// gates.
+	candidateMode bool
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -890,6 +978,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		pathCoalescing:       pathCoalesceEnabled(),
 		includeDiffs:         opts.IntentIncludeDiffs,
 		bypassBatchWait:      opts.IntentBypassBatchWait,
+		candidateMode:        opts.IntentPreset != "",
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 		commitFormat:         cfg.CommitFormat,
@@ -1105,6 +1194,10 @@ func replayIntentBatch(
 		if err := state.RecordPlannerOffer(ctx, db, item.event.Seq, nowSec); err != nil {
 			return sum, err
 		}
+	}
+	if opts.IntentPreset != "" {
+		return replayIntentCandidateBatch(ctx, repoRoot, db, activeCtx, opts, cfg,
+			indexFile, items, req, parent, parentTree, sum)
 	}
 
 	// Forced-aging singleton deterministic fast path: when intent mode is
@@ -1342,7 +1435,17 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return []state.CaptureEvent{forcedEvent}, true, "", nil
 	}
-	if !cfg.bypassBatchWait {
+	boundaryTriggered := false
+	boundaryCaptureLimit := 0
+	if cfg.candidateMode && !cfg.bypassBatchWait {
+		var boundaryErr error
+		boundaryCaptureLimit, boundaryTriggered, boundaryErr =
+			intentActivityBoundaryCaptureLimit(ctx, db, pending)
+		if boundaryErr != nil {
+			return nil, false, "", boundaryErr
+		}
+	}
+	if !cfg.bypassBatchWait && !boundaryTriggered {
 		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
 			return nil, false, waitReason, nil
 		}
@@ -1351,7 +1454,45 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if n > len(pending) {
 		n = len(pending)
 	}
+	if boundaryTriggered && boundaryCaptureLimit < n {
+		n = boundaryCaptureLimit
+	}
 	return pending[:n], false, "", nil
+}
+
+func intentActivityBoundaryCaptureLimit(
+	ctx context.Context,
+	db *state.DB,
+	pending []state.CaptureEvent,
+) (int, bool, error) {
+	boundaries, err := state.PendingIntentActivityBoundaries(
+		ctx, db, 0, ai.IntentActivityBoundaryCap)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(boundaries) == 0 {
+		return 0, false, nil
+	}
+	latest := boundaries[len(boundaries)-1]
+	limit := 0
+	for _, event := range pending {
+		if event.CapturedTS > latest.CreatedTS {
+			break
+		}
+		limit++
+	}
+	if limit > 0 {
+		return limit, true, nil
+	}
+	if _, err := state.ConsumeIntentActivityBoundaries(
+		ctx, db, latest.Epoch, float64(time.Now().UnixNano())/1e9,
+	); err != nil {
+		return 0, false, err
+	}
+	if err := pruneConsumedIntentActivityBoundaries(ctx, db); err != nil {
+		return 0, false, err
+	}
+	return 0, false, nil
 }
 
 // MetaKeyPathQuiescenceGatedCount surfaces the most recent count of pending

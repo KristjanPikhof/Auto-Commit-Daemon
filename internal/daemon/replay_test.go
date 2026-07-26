@@ -222,6 +222,221 @@ func TestReplay_ReconcilesLiveIndexForTrackedChanges(t *testing.T) {
 	}
 }
 
+func TestSelectIntentWindowV2ActivityBoundaryTriggersEvaluation(t *testing.T) {
+	now := time.Now()
+	pending := []state.CaptureEvent{{
+		Seq:        1,
+		CapturedTS: float64(now.UnixNano()) / 1e9,
+	}}
+	baseConfig := intentReplayConfig{
+		window:          20,
+		minPending:      20,
+		settleWindow:    30 * time.Second,
+		maxPendingAge:   3 * time.Minute,
+		deferLimit:      2,
+		candidateMode:   true,
+		bypassBatchWait: false,
+	}
+
+	for _, kind := range []string{state.IntentBoundarySoft, state.IntentBoundaryHard} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			if _, err := state.AppendIntentActivityBoundary(
+				context.Background(), f.db, state.IntentActivityBoundary{
+					Kind: kind, Source: "test_" + kind,
+				},
+			); err != nil {
+				t.Fatalf("append boundary: %v", err)
+			}
+
+			window, forced, reason, err := selectIntentWindow(
+				context.Background(), f.db, pending, baseConfig)
+			if err != nil {
+				t.Fatalf("selectIntentWindow: %v", err)
+			}
+			if len(window) != 1 || forced || reason != "" {
+				t.Fatalf("boundary window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+
+			legacy := baseConfig
+			legacy.candidateMode = false
+			window, forced, reason, err = selectIntentWindow(
+				context.Background(), f.db, pending, legacy)
+			if err != nil {
+				t.Fatalf("legacy selectIntentWindow: %v", err)
+			}
+			if len(window) != 0 || forced ||
+				reason != "skipped_due_intent_batch_wait" {
+				t.Fatalf("legacy window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+		})
+	}
+}
+
+func TestReplayV2ConsumesBoundaryWhenBoundaryPassHasNoWork(t *testing.T) {
+	for _, kind := range []string{state.IntentBoundarySoft, state.IntentBoundaryHard} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			if _, err := state.AppendIntentActivityBoundary(
+				ctx, f.db, state.IntentActivityBoundary{
+					Kind: kind, Source: "empty_pass_" + kind,
+				},
+			); err != nil {
+				t.Fatalf("append boundary: %v", err)
+			}
+
+			if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+				GitDir:         f.gitDir,
+				CommitStrategy: ai.CommitStrategyIntent,
+				IntentPreset:   "balanced",
+			}); err != nil {
+				t.Fatalf("empty Replay: %v", err)
+			}
+			boundaries, err := state.PendingIntentActivityBoundaries(ctx, f.db, 0, 10)
+			if err != nil {
+				t.Fatalf("pending boundaries: %v", err)
+			}
+			if len(boundaries) != 0 {
+				t.Fatalf("empty pass left stale boundaries: %+v", boundaries)
+			}
+
+			now := time.Now()
+			window, forced, reason, err := selectIntentWindow(
+				ctx, f.db,
+				[]state.CaptureEvent{{
+					Seq:        1,
+					CapturedTS: float64(now.UnixNano()) / 1e9,
+				}},
+				intentReplayConfig{
+					window: 20, minPending: 20,
+					settleWindow:  30 * time.Second,
+					maxPendingAge: 3 * time.Minute,
+					deferLimit:    2,
+					candidateMode: true,
+				},
+			)
+			if err != nil {
+				t.Fatalf("later selectIntentWindow: %v", err)
+			}
+			if len(window) != 0 || forced ||
+				reason != "skipped_due_intent_batch_wait" {
+				t.Fatalf("later window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+		})
+	}
+}
+
+func TestSelectIntentWindowIgnoresBoundaryOlderThanCaptures(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	boundary, err := state.AppendIntentActivityBoundary(
+		ctx, f.db, state.IntentActivityBoundary{
+			Kind: state.IntentBoundarySoft, Source: "stopped_daemon",
+		},
+	)
+	if err != nil {
+		t.Fatalf("append boundary: %v", err)
+	}
+	pending := []state.CaptureEvent{{
+		Seq:        1,
+		CapturedTS: boundary.CreatedTS + 1,
+	}}
+	cfg := intentReplayConfig{
+		window: 20, minPending: 20,
+		settleWindow:  30 * time.Second,
+		maxPendingAge: 3 * time.Minute,
+		deferLimit:    2,
+		candidateMode: true,
+	}
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending, cfg)
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if len(window) != 0 || forced ||
+		reason != "skipped_due_intent_batch_wait" {
+		t.Fatalf("window=%+v forced=%v reason=%q", window, forced, reason)
+	}
+	boundaries, err := state.PendingIntentActivityBoundaries(ctx, f.db, 0, 10)
+	if err != nil {
+		t.Fatalf("pending boundaries: %v", err)
+	}
+	if len(boundaries) != 0 {
+		t.Fatalf("stale boundary remains pending: %+v", boundaries)
+	}
+}
+
+func TestSelectIntentWindowBoundaryExcludesLaterCaptures(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	boundary, err := state.AppendIntentActivityBoundary(
+		ctx, f.db, state.IntentActivityBoundary{
+			Kind: state.IntentBoundarySoft, Source: "turn_end",
+		},
+	)
+	if err != nil {
+		t.Fatalf("append boundary: %v", err)
+	}
+	pending := []state.CaptureEvent{
+		{Seq: 1, CapturedTS: boundary.CreatedTS - 1},
+		{Seq: 2, CapturedTS: boundary.CreatedTS + 1},
+	}
+	window, forced, reason, err := selectIntentWindow(
+		ctx, f.db, pending, intentReplayConfig{
+			window: 20, minPending: 20,
+			settleWindow:  30 * time.Second,
+			maxPendingAge: 3 * time.Minute,
+			deferLimit:    2,
+			candidateMode: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if len(window) != 1 || window[0].Seq != 1 || forced || reason != "" {
+		t.Fatalf("window=%+v forced=%v reason=%q", window, forced, reason)
+	}
+}
+
+func TestPruneConsumedIntentActivityBoundariesKeepsBoundedTail(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	var lastEpoch int64
+	total := retainedConsumedIntentActivityBoundaries + 17
+	for i := 0; i < total; i++ {
+		boundary, err := state.AppendIntentActivityBoundary(
+			ctx, f.db, state.IntentActivityBoundary{
+				Kind: state.IntentBoundarySoft, Source: "prune_test",
+			},
+		)
+		if err != nil {
+			t.Fatalf("append boundary %d: %v", i, err)
+		}
+		lastEpoch = boundary.Epoch
+	}
+	if _, err := state.ConsumeIntentActivityBoundaries(
+		ctx, f.db, lastEpoch, float64(time.Now().UnixNano())/1e9,
+	); err != nil {
+		t.Fatalf("consume boundaries: %v", err)
+	}
+	if err := pruneConsumedIntentActivityBoundaries(ctx, f.db); err != nil {
+		t.Fatalf("prune boundaries: %v", err)
+	}
+	var got int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_activity_boundaries`,
+	).Scan(&got); err != nil {
+		t.Fatalf("count boundaries: %v", err)
+	}
+	if got != retainedConsumedIntentActivityBoundaries {
+		t.Fatalf("retained boundaries=%d want %d",
+			got, retainedConsumedIntentActivityBoundaries)
+	}
+}
+
 func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
