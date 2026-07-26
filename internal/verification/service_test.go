@@ -91,6 +91,42 @@ func TestRunnerRunExactCandidateTreePreservesLiveState(t *testing.T) {
 	assertWorkspaceRootEmpty(t, workspaceRoot)
 }
 
+func TestRunnerStructuralCheckMaterializesWithoutLiveChanges(t *testing.T) {
+	repo := initVerificationRepo(t)
+	commit := candidateCommitWithFile(
+		t, repo, "candidate-only.txt", "candidate\n",
+	)
+	if err := os.WriteFile(
+		filepath.Join(repo, "live-only.txt"), []byte("live\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	before := runGitRaw(t, repo, "status", "--porcelain=v1", "-z")
+	runner := Runner{
+		WorkspaceRoot: filepath.Join(t.TempDir(), "verification"),
+	}
+	result, err := runner.CheckStructural(
+		context.Background(),
+		StructuralRequest{
+			RepoPath: repo, CandidateID: "candidate-structural",
+			CommitOID: commit,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != StatusPassed || result.Mode != ModeStructural ||
+		result.NeedsAttention || result.ExitCode != 0 {
+		t.Fatalf("result=%+v", result)
+	}
+	if after := runGitRaw(
+		t, repo, "status", "--porcelain=v1", "-z",
+	); after != before {
+		t.Fatalf("live status changed: got %q want %q", after, before)
+	}
+	assertWorkspaceRootEmpty(t, runner.WorkspaceRoot)
+}
+
 func TestRunnerFailureRetainsSanitizedFinal64KiB(t *testing.T) {
 	repo := initVerificationRepo(t)
 	commit := runGit(t, repo, "rev-parse", "HEAD")
@@ -203,8 +239,10 @@ func TestRunnerUsesPrivateHomeAndCapabilityFreeEnvironment(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "cloud-capability")
 	root := filepath.Join(t.TempDir(), "verification")
 	command := `test ! -e "$XDG_CONFIG_HOME/acd/credentials.json"; ` +
-		`printf 'home=%s\nconfig=%s\nssh=%s\naws=%s\n' ` +
-		`"$HOME" "$XDG_CONFIG_HOME" "$SSH_AUTH_SOCK" "$AWS_ACCESS_KEY_ID"`
+		`probe="$(mktemp -d "$TMPDIR/probe.XXXXXX")"; ` +
+		`if git -C "$probe" rev-parse --show-toplevel >/dev/null 2>&1; then exit 17; fi; ` +
+		`printf 'home=%s\nconfig=%s\ntmp=%s\nprobe=%s\nssh=%s\naws=%s\n' ` +
+		`"$HOME" "$XDG_CONFIG_HOME" "$TMPDIR" "$probe" "$SSH_AUTH_SOCK" "$AWS_ACCESS_KEY_ID"`
 	approved := mustApprove(t, repo, command, 5*time.Second)
 	result, err := (Runner{WorkspaceRoot: root}).Run(context.Background(), Request{
 		RepoPath:    repo,
@@ -218,11 +256,30 @@ func TestRunnerUsesPrivateHomeAndCapabilityFreeEnvironment(t *testing.T) {
 	if result.Status != StatusPassed {
 		t.Fatalf("result=%+v", result)
 	}
-	if !strings.Contains(result.Output, "home="+root) ||
-		!strings.Contains(result.Output, "config="+root) ||
+	home := outputValue(result.Output, "home")
+	config := outputValue(result.Output, "config")
+	temp := outputValue(result.Output, "tmp")
+	probe := outputValue(result.Output, "probe")
+	if home == "" || config == "" || temp == "" || probe == "" ||
 		!strings.Contains(result.Output, "ssh=\n") ||
 		!strings.Contains(result.Output, "aws=\n") {
 		t.Fatalf("environment was not isolated: %q", result.Output)
+	}
+	resolvedRepo, err := gitpkg.ResolveWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"home": home, "config": config, "tmp": temp, "probe": probe,
+	} {
+		if pathWithin(repo, path) ||
+			pathWithin(resolvedRepo.GitDir, path) ||
+			pathWithin(root, path) {
+			t.Fatalf("%s path %q is inside repository verification ancestry", name, path)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s path was not cleaned: %v; output=%q", name, err, result.Output)
+		}
 	}
 	if strings.Contains(result.Output, externalConfig) ||
 		strings.Contains(result.Output, "external-credential-secret") ||
@@ -292,6 +349,9 @@ func TestRunnerCleanupStaleRemovesDeadAndPreservesActive(t *testing.T) {
 	deadMarker := readMarkerForTest(t, dead.sessionPath)
 	deadMarker.PID = 99999999
 	rewriteMarkerForTest(t, dead.sessionPath, deadMarker)
+	rewriteEnvironmentOwnerForTest(t, dead, func(owner *environmentOwnerMarker) {
+		owner.PID = deadMarker.PID
+	})
 
 	active, err := prepareWorkspace(ctx, root, repo, "candidate-active", commit)
 	if err != nil {
@@ -355,6 +415,75 @@ func TestRunnerCleanupStaleRetriesCleanupRequiredFromLiveProcess(t *testing.T) {
 	}
 	if _, err := os.Stat(stale.sessionPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cleanup-required workspace remains: %v", err)
+	}
+}
+
+func TestCleanupRejectsExternalEnvironmentMarkerMismatch(t *testing.T) {
+	repoPath := initVerificationRepo(t)
+	ctx := context.Background()
+	repo, err := gitpkg.ResolveWorktree(ctx, repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := Runner{WorkspaceRoot: filepath.Join(t.TempDir(), "verification")}
+	root, err := runner.workspaceRoot(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws, err := prepareWorkspace(
+		ctx,
+		root,
+		repo,
+		"candidate-owner-mismatch",
+		runGit(t, repoPath, "rev-parse", "HEAD"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(ws.environmentPath)
+		_ = os.RemoveAll(ws.sessionPath)
+	})
+	ownerPath := filepath.Join(ws.environmentPath, environmentMarker)
+	owner, err := readEnvironmentOwner(ownerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.EnvironmentToken = "different-token"
+	if err := os.Remove(ownerPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(ownerPath, owner); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupWorkspace(ctx, repoPath, ws); err == nil ||
+		!strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("cleanup error=%v", err)
+	}
+	if _, err := os.Stat(ws.environmentPath); err != nil {
+		t.Fatalf("mismatched external environment was removed: %v", err)
+	}
+}
+
+func TestExternalEnvironmentAvoidsUnsafeHostTempDirectory(t *testing.T) {
+	repoPath := initVerificationRepo(t)
+	repo, err := gitpkg.ResolveWorktree(context.Background(), repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsafeTemp := filepath.Join(repo.GitDir, "acd", "host-temp")
+	if err := os.MkdirAll(unsafeTemp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", unsafeTemp)
+
+	path, err := externalEnvironmentPath(repo, "0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pathWithin(repo.Root, path) || pathWithin(repo.GitDir, path) {
+		t.Fatalf("external environment remained inside Git ancestry: %s", path)
 	}
 }
 
@@ -609,6 +738,26 @@ func rewriteMarkerForTest(t *testing.T, sessionPath string, marker workspaceMark
 	}
 }
 
+func rewriteEnvironmentOwnerForTest(
+	t *testing.T,
+	ws workspace,
+	update func(*environmentOwnerMarker),
+) {
+	t.Helper()
+	path := filepath.Join(ws.environmentPath, environmentMarker)
+	owner, err := readEnvironmentOwner(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update(&owner)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(path, owner); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func jsonMarshal(value any) ([]byte, error) {
 	var builder strings.Builder
 	encoder := json.NewEncoder(&builder)
@@ -620,4 +769,14 @@ func jsonMarshal(value any) ([]byte, error) {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func outputValue(output, key string) string {
+	prefix := key + "="
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
 }

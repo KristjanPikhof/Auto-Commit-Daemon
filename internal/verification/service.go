@@ -30,11 +30,13 @@ const (
 	// OutputLimit is the maximum sanitized command output returned to callers.
 	OutputLimit = 64 * 1024
 
-	markerVersion       = 1
+	markerVersion       = 2
 	workspaceDirName    = "verification-worktrees"
 	workspacePrefix     = "candidate-"
 	workspaceMarkerName = "marker.json"
 	workspaceTreeName   = "tree"
+	environmentPrefix   = "acd-verification-env-"
+	environmentMarker   = "owner.json"
 	maxApprovalIDBytes  = 128
 	maxCommandBytes     = 16 * 1024
 	maxMarkerBytes      = 8 * 1024
@@ -45,8 +47,9 @@ const (
 type Mode string
 
 const (
-	ModeFast Mode = "fast"
-	ModeFull Mode = "full"
+	ModeStructural Mode = "structural"
+	ModeFast       Mode = "fast"
+	ModeFull       Mode = "full"
 )
 
 type Status string
@@ -120,6 +123,14 @@ type Request struct {
 	Command     ApprovedCommand
 }
 
+// StructuralRequest identifies an exact commit that must materialize in an
+// isolated detached worktree without running a repository command.
+type StructuralRequest struct {
+	RepoPath    string
+	CandidateID string
+	CommitOID   string
+}
+
 // Result is safe to retain in candidate state. Output is sanitized and limited
 // to its final 64 KiB. Any non-passing result requires operator attention and
 // must not be used as publication approval.
@@ -151,20 +162,34 @@ type Runner struct {
 }
 
 type workspace struct {
-	sessionPath string
-	treePath    string
-	marker      workspaceMarker
+	sessionPath     string
+	treePath        string
+	environmentPath string
+	marker          workspaceMarker
 }
 
 type workspaceMarker struct {
-	Version     int    `json:"version"`
-	State       string `json:"state"`
-	RepoPath    string `json:"repo_path"`
-	GitDir      string `json:"git_dir"`
-	CandidateID string `json:"candidate_id"`
-	CommitOID   string `json:"commit_oid"`
-	PID         int    `json:"pid"`
-	CreatedNS   int64  `json:"created_ns"`
+	Version          int    `json:"version"`
+	State            string `json:"state"`
+	RepoPath         string `json:"repo_path"`
+	GitDir           string `json:"git_dir"`
+	CandidateID      string `json:"candidate_id"`
+	CommitOID        string `json:"commit_oid"`
+	EnvironmentPath  string `json:"environment_path,omitempty"`
+	EnvironmentToken string `json:"environment_token,omitempty"`
+	PID              int    `json:"pid"`
+	CreatedNS        int64  `json:"created_ns"`
+}
+
+type environmentOwnerMarker struct {
+	Version          int    `json:"version"`
+	SessionPath      string `json:"session_path"`
+	RepoPath         string `json:"repo_path"`
+	GitDir           string `json:"git_dir"`
+	CandidateID      string `json:"candidate_id"`
+	EnvironmentToken string `json:"environment_token"`
+	PID              int    `json:"pid"`
+	CreatedNS        int64  `json:"created_ns"`
 }
 
 const (
@@ -233,7 +258,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr
 	runErr, timedOut, cancelled := runApprovedCommand(
 		ctx,
 		ws.treePath,
-		filepath.Join(ws.sessionPath, "environment"),
+		ws.environmentPath,
 		request.Command,
 		output,
 	)
@@ -267,6 +292,71 @@ func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr
 		return result, nil
 	}
 	return result, fmt.Errorf("verification: execute approved command: %w", runErr)
+}
+
+// CheckStructural proves that an exact commit can be materialized and cleaned
+// without touching the live index or worktree.
+func (r Runner) CheckStructural(
+	ctx context.Context,
+	request StructuralRequest,
+) (result Result, retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result = Result{
+		Status:         StatusNeedsAttention,
+		NeedsAttention: true,
+		Mode:           ModeStructural,
+		ExitCode:       -1,
+		CommitOID:      request.CommitOID,
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if err := boundedLabel("candidate id", request.CandidateID, 128); err != nil {
+		return result, err
+	}
+	worktree, err := gitpkg.ResolveWorktree(ctx, request.RepoPath)
+	if err != nil {
+		return result, fmt.Errorf(
+			"verification: resolve repository: %w", err,
+		)
+	}
+	commitOID, err := resolveExactCommit(
+		ctx, worktree.Root, request.CommitOID,
+	)
+	if err != nil {
+		return result, err
+	}
+	result.CommitOID = commitOID
+	root, err := r.workspaceRoot(worktree)
+	if err != nil {
+		return result, err
+	}
+	ws, err := prepareWorkspace(
+		ctx, root, worktree, request.CandidateID, commitOID,
+	)
+	if err != nil {
+		return result, err
+	}
+	defer func() {
+		markerErr := markWorkspaceCleanupRequired(ws)
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), 10*time.Second,
+		)
+		defer cancel()
+		if cleanupErr := cleanupWorkspace(
+			cleanupCtx, worktree.Root, ws,
+		); cleanupErr != nil {
+			result.Status = StatusNeedsAttention
+			result.NeedsAttention = true
+			retErr = errors.Join(retErr, markerErr, cleanupErr)
+		}
+	}()
+	result.Status = StatusPassed
+	result.NeedsAttention = false
+	result.ExitCode = 0
+	return result, nil
 }
 
 // CleanupStale removes marked workspaces whose creating process is no longer
@@ -336,15 +426,19 @@ func (r Runner) CleanupStale(ctx context.Context, repoPath string) (CleanupResul
 			continue
 		}
 		ws := workspace{
-			sessionPath: sessionPath,
-			treePath:    filepath.Join(sessionPath, workspaceTreeName),
-			marker:      marker,
+			sessionPath:     sessionPath,
+			treePath:        filepath.Join(sessionPath, workspaceTreeName),
+			environmentPath: marker.EnvironmentPath,
+			marker:          marker,
 		}
 		if err := cleanupWorkspace(ctx, worktree.Root, ws); err != nil {
 			cleanupErrs = append(cleanupErrs, err)
 			continue
 		}
 		result.Removed++
+	}
+	if err := cleanupOrphanEnvironments(root, worktree); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
 	}
 	return result, errors.Join(cleanupErrs...)
 }
@@ -383,22 +477,41 @@ func prepareWorkspace(
 		sessionPath: sessionPath,
 		treePath:    filepath.Join(sessionPath, workspaceTreeName),
 	}
-	marker := workspaceMarker{
-		Version:     markerVersion,
-		State:       workspaceActive,
-		RepoPath:    repo.Root,
-		GitDir:      repo.GitDir,
-		CandidateID: candidateID,
-		CommitOID:   commitOID,
-		PID:         os.Getpid(),
-		CreatedNS:   time.Now().UnixNano(),
+	environmentToken, err := randomID()
+	if err != nil {
+		_ = os.RemoveAll(sessionPath)
+		return workspace{}, fmt.Errorf("verification: allocate environment token: %w", err)
 	}
+	environmentPath, err := externalEnvironmentPath(repo, environmentToken)
+	if err != nil {
+		_ = os.RemoveAll(sessionPath)
+		return workspace{}, err
+	}
+	marker := workspaceMarker{
+		Version:          markerVersion,
+		State:            workspaceActive,
+		RepoPath:         repo.Root,
+		GitDir:           repo.GitDir,
+		CandidateID:      candidateID,
+		CommitOID:        commitOID,
+		EnvironmentPath:  environmentPath,
+		EnvironmentToken: environmentToken,
+		PID:              os.Getpid(),
+		CreatedNS:        time.Now().UnixNano(),
+	}
+	ws.environmentPath = environmentPath
 	ws.marker = marker
 	if err := writeWorkspaceMarker(sessionPath, marker); err != nil {
 		_ = os.RemoveAll(sessionPath)
 		return workspace{}, err
 	}
+	if err := createExternalEnvironment(ws); err != nil {
+		_ = os.RemoveAll(ws.environmentPath)
+		_ = os.RemoveAll(sessionPath)
+		return workspace{}, err
+	}
 	if err := syncDirectory(root); err != nil {
+		_ = cleanupEnvironment(ws)
 		_ = os.RemoveAll(sessionPath)
 		return workspace{}, fmt.Errorf("verification: sync workspace root: %w", err)
 	}
@@ -462,6 +575,9 @@ func cleanupWorkspace(ctx context.Context, repoPath string, ws workspace) error 
 		if registered {
 			return fmt.Errorf("verification cleanup: remove registered worktree: %w", err)
 		}
+	}
+	if err := cleanupEnvironment(ws); err != nil {
+		return err
 	}
 	if err := os.RemoveAll(ws.sessionPath); err != nil {
 		return fmt.Errorf("verification cleanup: remove marked workspace: %w", err)
@@ -682,7 +798,8 @@ func readWorkspaceMarker(path string) (workspaceMarker, error) {
 	if err != nil {
 		return workspaceMarker{}, fmt.Errorf("verification cleanup: inspect workspace marker: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		!ownedByCurrentUser(info) {
 		return workspaceMarker{}, errors.New("verification cleanup: workspace marker must be a regular file")
 	}
 	if info.Mode().Perm()&0o077 != 0 {
@@ -711,7 +828,7 @@ func readWorkspaceMarker(path string) (workspaceMarker, error) {
 		}
 		return workspaceMarker{}, fmt.Errorf("verification cleanup: decode workspace marker suffix: %w", err)
 	}
-	if marker.Version != markerVersion ||
+	if (marker.Version != 1 && marker.Version != markerVersion) ||
 		(marker.State != workspaceActive && marker.State != workspaceCleanupRequired) ||
 		marker.RepoPath == "" ||
 		marker.GitDir == "" ||
@@ -720,12 +837,261 @@ func readWorkspaceMarker(path string) (workspaceMarker, error) {
 		marker.CreatedNS <= 0 {
 		return workspaceMarker{}, errors.New("verification cleanup: invalid workspace marker")
 	}
+	if marker.Version == markerVersion &&
+		(marker.EnvironmentPath == "" || marker.EnvironmentToken == "") {
+		return workspaceMarker{}, errors.New("verification cleanup: invalid external environment marker")
+	}
 	return marker, nil
 }
 
 func ownedByCurrentUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid())
+}
+
+func externalEnvironmentPath(repo gitpkg.Worktree, token string) (string, error) {
+	if err := boundedLabel("environment token", token, 128); err != nil {
+		return "", err
+	}
+	for _, parent := range safeEnvironmentParents() {
+		candidate := filepath.Join(parent, environmentPrefix+token)
+		if pathWithin(repo.Root, candidate) || pathWithin(repo.GitDir, candidate) {
+			continue
+		}
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("verification: no safe external environment directory is available")
+}
+
+func createExternalEnvironment(ws workspace) error {
+	if err := validateExternalEnvironmentTarget(ws); err != nil {
+		return err
+	}
+	if err := os.Mkdir(ws.environmentPath, 0o700); err != nil {
+		return fmt.Errorf("verification: create external environment: %w", err)
+	}
+	if err := os.Chmod(ws.environmentPath, 0o700); err != nil {
+		return fmt.Errorf("verification: protect external environment: %w", err)
+	}
+	owner := environmentOwnerMarker{
+		Version:          1,
+		SessionPath:      ws.sessionPath,
+		RepoPath:         ws.marker.RepoPath,
+		GitDir:           ws.marker.GitDir,
+		CandidateID:      ws.marker.CandidateID,
+		EnvironmentToken: ws.marker.EnvironmentToken,
+		PID:              ws.marker.PID,
+		CreatedNS:        ws.marker.CreatedNS,
+	}
+	if err := writeJSONFile(filepath.Join(ws.environmentPath, environmentMarker), owner); err != nil {
+		return fmt.Errorf("verification: write external environment marker: %w", err)
+	}
+	return syncDirectory(filepath.Dir(ws.environmentPath))
+}
+
+func cleanupEnvironment(ws workspace) error {
+	if ws.environmentPath == "" {
+		return nil
+	}
+	if err := validateExternalEnvironmentTarget(ws); err != nil {
+		return err
+	}
+	info, err := os.Lstat(ws.environmentPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verification cleanup: inspect external environment: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
+		return errors.New("verification cleanup: unsafe external environment directory")
+	}
+	owner, err := readEnvironmentOwner(filepath.Join(ws.environmentPath, environmentMarker))
+	if err != nil {
+		return err
+	}
+	if owner.Version != 1 ||
+		owner.SessionPath != ws.sessionPath ||
+		owner.RepoPath != ws.marker.RepoPath ||
+		owner.GitDir != ws.marker.GitDir ||
+		owner.CandidateID != ws.marker.CandidateID ||
+		owner.EnvironmentToken != ws.marker.EnvironmentToken ||
+		owner.PID != ws.marker.PID ||
+		owner.CreatedNS != ws.marker.CreatedNS {
+		return errors.New("verification cleanup: external environment ownership mismatch")
+	}
+	if err := os.RemoveAll(ws.environmentPath); err != nil {
+		return fmt.Errorf("verification cleanup: remove external environment: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(ws.environmentPath)); err != nil {
+		return fmt.Errorf("verification cleanup: sync external environment parent: %w", err)
+	}
+	return nil
+}
+
+func validateExternalEnvironmentTarget(ws workspace) error {
+	if ws.environmentPath == "" ||
+		ws.marker.EnvironmentToken == "" ||
+		filepath.Base(ws.environmentPath) != environmentPrefix+ws.marker.EnvironmentToken {
+		return errors.New("verification: invalid external environment identity")
+	}
+	path, err := filepath.Abs(ws.environmentPath)
+	if err != nil || path != filepath.Clean(ws.environmentPath) {
+		return errors.New("verification: invalid external environment path")
+	}
+	for _, unsafe := range []string{ws.marker.RepoPath, ws.marker.GitDir, ws.sessionPath, ws.treePath} {
+		if unsafe != "" && pathWithin(unsafe, path) {
+			return errors.New("verification: external environment is inside Git or workspace state")
+		}
+	}
+	return nil
+}
+
+func pathWithin(parent, child string) bool {
+	parent, parentErr := filepath.Abs(parent)
+	child, childErr := filepath.Abs(child)
+	if parentErr != nil || childErr != nil {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		parent = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(child); err == nil {
+		child = resolved
+	}
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && (rel == "." ||
+		(rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+}
+
+func writeJSONFile(path string, value any) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(file)
+	encoder.SetEscapeHTML(false)
+	writeErr := encoder.Encode(value)
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func readEnvironmentOwner(path string) (environmentOwnerMarker, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return environmentOwnerMarker{}, fmt.Errorf("verification cleanup: inspect external environment marker: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm()&0o077 != 0 || info.Size() > maxMarkerBytes ||
+		!ownedByCurrentUser(info) {
+		return environmentOwnerMarker{}, errors.New("verification cleanup: unsafe external environment marker")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return environmentOwnerMarker{}, fmt.Errorf("verification cleanup: read external environment marker: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var owner environmentOwnerMarker
+	if err := decoder.Decode(&owner); err != nil {
+		return environmentOwnerMarker{}, fmt.Errorf("verification cleanup: decode external environment marker: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return environmentOwnerMarker{}, errors.New("verification cleanup: invalid external environment marker suffix")
+	}
+	return owner, nil
+}
+
+func cleanupOrphanEnvironments(root string, repo gitpkg.Worktree) error {
+	var cleanupErrs []error
+	for _, parent := range safeEnvironmentParents() {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf(
+				"verification cleanup: read external environment root: %w",
+				err,
+			))
+			continue
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), environmentPrefix) {
+				continue
+			}
+			environmentPath := filepath.Join(parent, entry.Name())
+			owner, err := readEnvironmentOwner(filepath.Join(environmentPath, environmentMarker))
+			if err != nil {
+				continue
+			}
+			if owner.RepoPath != repo.Root || owner.GitDir != repo.GitDir ||
+				!pathWithin(root, owner.SessionPath) ||
+				filepath.Base(owner.SessionPath) == "." ||
+				!strings.HasPrefix(filepath.Base(owner.SessionPath), workspacePrefix) {
+				continue
+			}
+			_, sessionErr := os.Lstat(owner.SessionPath)
+			if sessionErr == nil &&
+				processAlive(owner.PID) &&
+				time.Since(time.Unix(0, owner.CreatedNS)) < incompleteGrace {
+				continue
+			}
+			marker := workspaceMarker{
+				Version:          markerVersion,
+				State:            workspaceCleanupRequired,
+				RepoPath:         owner.RepoPath,
+				GitDir:           owner.GitDir,
+				CandidateID:      owner.CandidateID,
+				EnvironmentPath:  environmentPath,
+				EnvironmentToken: owner.EnvironmentToken,
+				PID:              owner.PID,
+				CreatedNS:        owner.CreatedNS,
+			}
+			ws := workspace{
+				sessionPath:     owner.SessionPath,
+				treePath:        filepath.Join(owner.SessionPath, workspaceTreeName),
+				environmentPath: environmentPath,
+				marker:          marker,
+			}
+			if err := cleanupEnvironment(ws); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			}
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func safeEnvironmentParents() []string {
+	candidates := []string{os.TempDir(), "/tmp"}
+	parents := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		parent, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			parent = resolved
+		}
+		if _, ok := seen[parent]; ok {
+			continue
+		}
+		info, err := os.Lstat(parent)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		seen[parent] = struct{}{}
+		parents = append(parents, parent)
+	}
+	return parents
 }
 
 func verificationEnv(root string) ([]string, error) {
@@ -736,6 +1102,8 @@ func verificationEnv(root string) ([]string, error) {
 		"XDG_STATE_HOME":   filepath.Join(root, "state"),
 		"XDG_RUNTIME_DIR":  filepath.Join(root, "runtime"),
 		"TMPDIR":           filepath.Join(root, "tmp"),
+		"TMP":              filepath.Join(root, "tmp"),
+		"TEMP":             filepath.Join(root, "tmp"),
 		"GOPATH":           filepath.Join(root, "go"),
 		"NPM_CONFIG_CACHE": filepath.Join(root, "npm-cache"),
 	}
