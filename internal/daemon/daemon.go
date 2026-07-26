@@ -2188,6 +2188,7 @@ func Run(ctx context.Context, opts Options) error {
 					IntentPlannerModel:     passBundle.Model,
 					IntentIncludeDiffs:     passBundle.IntentIncludeDiffs,
 					IntentPreset:           passBundle.IntentPreset,
+					IntentVerificationMode: passBundle.IntentVerificationMode,
 					IntentCandidateVerify:  candidateVerify,
 					IntentRepairEnabled:    passBundle.IntentRepairEnabled,
 					IntentRepairHorizon:    passBundle.IntentRepairHorizon,

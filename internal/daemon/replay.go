@@ -245,9 +245,11 @@ type ReplayOpts struct {
 	IntentPreset config.PresetName
 
 	// IntentCandidateVerify executes the already-approved repository-scoped
-	// command against an exact ephemeral candidate tree. Balanced and Quality
-	// stay pending when this callback is unavailable or fails.
-	IntentCandidateVerify IntentCandidateVerifier
+	// command against an exact ephemeral candidate tree. Fast/full modes stay
+	// pending when this callback is unavailable or fails; structural mode uses
+	// the candidate engine's built-in atomicity and materialization gates.
+	IntentVerificationMode string
+	IntentCandidateVerify  IntentCandidateVerifier
 
 	// IntentRepairEnabled and IntentRepairHorizon control whether a newly
 	// published candidate remains soft-published and eligible for a later

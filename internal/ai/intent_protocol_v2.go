@@ -610,14 +610,20 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 			"candidate dependency graph contains a cycle")
 	}
 
-	adjacent := make(map[int64]map[int64]struct{}, len(offered))
+	knownSeqs := make(map[int64]struct{}, len(offered)+len(persistedOwnerBySeq))
+	for seq := range offered {
+		knownSeqs[seq] = struct{}{}
+	}
+	for seq := range persistedOwnerBySeq {
+		knownSeqs[seq] = struct{}{}
+	}
+	adjacent := make(map[int64]map[int64]struct{}, len(knownSeqs))
 	for _, edge := range req.Dependencies {
-		_, fromVisible := assignments[edge.FromSeq]
-		toCandidate, toVisible := assignments[edge.ToSeq]
-		if fromVisible && toVisible {
-			if edgeSupportsCohesion(edge) {
-				addUndirectedEdge(adjacent, edge.FromSeq, edge.ToSeq)
-			}
+		toCandidate := assignments[edge.ToSeq]
+		_, fromKnown := knownSeqs[edge.FromSeq]
+		_, toKnown := knownSeqs[edge.ToSeq]
+		if fromKnown && toKnown && edgeSupportsCohesion(edge) {
+			addUndirectedEdge(adjacent, edge.FromSeq, edge.ToSeq)
 		}
 		if edge.Strength == IntentDependencyHard {
 			fromID, fromOutput, fromKnown := intentDependencyOwner(edge.FromSeq, assignments, plan, persistedOwnerBySeq)
@@ -638,7 +644,11 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 		}
 	}
 	for _, candidate := range plan.Candidates {
-		if len(candidate.SelectedSeqs) > 1 && !seqSetConnected(candidate.SelectedSeqs, adjacent) {
+		connectedSeqs := append([]int64(nil), candidate.SelectedSeqs...)
+		if persisted, ok := persistedByID[candidate.CandidateID]; ok {
+			connectedSeqs = append(connectedSeqs, persisted.SelectedSeqs...)
+		}
+		if len(connectedSeqs) > 1 && !seqSetConnected(connectedSeqs, adjacent) {
 			return v2ValidationError(candidate.CandidateID, IntentAtomicitySeparation, "candidate_disconnected",
 				"candidate merges captures without dependency evidence connecting every component")
 		}

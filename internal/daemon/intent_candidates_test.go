@@ -848,6 +848,251 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	prerequisite := appendIntentCandidateCapture(
+		t, db, "same.go", "create", "", "first")
+	dependent := appendIntentCandidateCapture(
+		t, db, "same.go", "modify", "first", "second")
+	const candidateID = "persisted-dependent"
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Status: state.IntentCandidateWaiting, Purpose: "finish same-path change",
+		Readiness: state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{
+			{EventSeq: prerequisite.Event.Seq, EventRole: "code"},
+			{EventSeq: dependent.Event.Seq, EventRole: "code"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{prerequisite},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if result.Fallback != "verified_dependency_partition" ||
+		len(result.Decisions) != 1 {
+		t.Fatalf("fallback result=%+v", result)
+	}
+	decision := result.Decisions[0]
+	if !decision.Publishable || decision.Candidate.ID != candidateID ||
+		len(decision.Candidate.Events) != 2 {
+		t.Fatalf("continued candidate=%+v", decision.Candidate)
+	}
+	if decision.Candidate.Events[0].EventSeq != prerequisite.Event.Seq ||
+		decision.Candidate.Events[1].EventSeq != dependent.Event.Seq {
+		t.Fatalf("continued events=%+v", decision.Candidate.Events)
+	}
+}
+
+func TestIntentCandidateEngineFallbackContinuesPersistedPrerequisite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	prerequisite := appendIntentCandidateCapture(
+		t, db, "same.go", "create", "", "first")
+	dependent := appendIntentCandidateCapture(
+		t, db, "same.go", "modify", "first", "second")
+	const candidateID = "persisted-prerequisite"
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Status:    state.IntentCandidateWaiting,
+		Purpose:   "wait for prerequisite completion",
+		Readiness: state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: prerequisite.Event.Seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{dependent},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if result.Fallback != "verified_dependency_partition" ||
+		len(result.Decisions) != 1 {
+		t.Fatalf("fallback result=%+v", result)
+	}
+	decision := result.Decisions[0]
+	if !decision.Publishable || decision.Candidate.ID != candidateID ||
+		len(decision.Candidate.Events) != 2 {
+		t.Fatalf("continued fallback=%+v", decision)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackMergesThroughPersistedCandidate(t *testing.T) {
+	t.Parallel()
+	testIntentCandidateFallbackMergesThroughPersistedCandidate(
+		t, config.PresetBalanced)
+}
+
+func TestIntentCandidateEngineFastFallbackMergesThroughPersistedCandidate(t *testing.T) {
+	t.Parallel()
+	testIntentCandidateFallbackMergesThroughPersistedCandidate(
+		t, config.PresetFast)
+}
+
+func testIntentCandidateFallbackMergesThroughPersistedCandidate(
+	t *testing.T,
+	preset config.PresetName,
+) {
+	t.Helper()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	firstA := appendIntentCandidateCapture(
+		t, db, "a.go", "create", "", "a1")
+	firstB := appendIntentCandidateCapture(
+		t, db, "b.go", "create", "", "b1")
+	secondA := appendIntentCandidateCapture(
+		t, db, "a.go", "modify", "a1", "a2")
+	secondB := appendIntentCandidateCapture(
+		t, db, "b.go", "modify", "b1", "b2")
+	const candidateID = "persisted-bridge"
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Status: state.IntentCandidateWaiting, Purpose: "finish related changes",
+		Readiness: state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{
+			{EventSeq: secondA.Event.Seq, EventRole: "code"},
+			{EventSeq: secondB.Event.Seq, EventRole: "code"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{firstA, firstB},
+		Hints: []IntentDependencyHint{{
+			PrerequisiteSeq: secondA.Event.Seq,
+			DependentSeq:    secondB.Event.Seq,
+			Strength:        ai.IntentDependencySoft,
+			Kind:            "import_reference",
+			Evidence:        "persisted bridge",
+		}},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: preset,
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+		Verify: func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			return IntentCandidateVerification{Status: "passed"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if len(result.Decisions) != 1 ||
+		result.Decisions[0].Candidate.ID != candidateID ||
+		len(result.Decisions[0].Candidate.Events) != 4 ||
+		!result.Decisions[0].Publishable {
+		t.Fatalf("merged fallback=%+v", result)
+	}
+}
+
+func TestIntentCandidateEngineStructuralVerificationUsesAtomicityGates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "same.go", "create", "", "first")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "structural", SelectedSeqs: []int64{capture.Event.Seq},
+			Purpose:        "apply one structurally valid change",
+			Readiness:      ai.IntentCandidateReady,
+			Subject:        "Apply structurally valid change",
+			GroupingReason: "single capture is independently materializable",
+		}},
+	}}
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture},
+		Planner:  planner, Preset: config.PresetBalanced,
+		VerificationMode: "structural",
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if len(result.Decisions) != 1 || !result.Decisions[0].Publishable {
+		t.Fatalf("structural decision=%+v", result)
+	}
+	for _, gate := range result.Decisions[0].Atomicity.Gates {
+		if gate.Gate == ai.IntentAtomicityVerification &&
+			gate.Status != ai.IntentAtomicityNotRequired {
+			t.Fatalf("verification gate=%+v", gate)
+		}
+	}
+}
+
+func TestIntentCandidateEngineRejectsUnknownVerificationMode(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "same.go", "create", "", "first")
+	_, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset:           config.PresetBalanced,
+		VerificationMode: "unexpected",
+	})
+	if err == nil || !strings.Contains(err.Error(),
+		`unsupported verification mode "unexpected"`) {
+		t.Fatalf("unknown verification mode error=%v", err)
+	}
+}
+
 func TestIntentCandidateEngineVerificationFailureStaysPending(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

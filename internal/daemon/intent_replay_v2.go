@@ -104,8 +104,9 @@ func replayIntentCandidateBatch(
 		Hints:         runtimeIntentDependencyHints(captures),
 		Materialize: intentCandidateScratchMaterializer(
 			repoRoot, opts.GitDir, parent),
-		Verify: opts.IntentCandidateVerify,
-		Now:    time.Now().UTC(),
+		VerificationMode: opts.IntentVerificationMode,
+		Verify:           opts.IntentCandidateVerify,
+		Now:              time.Now().UTC(),
 	})
 	if err != nil {
 		return sum, err
