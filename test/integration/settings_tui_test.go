@@ -86,14 +86,23 @@ func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 					result.Stdout)
 			}
 			if !strings.Contains(result.Stdout, "Commit strategy") ||
-				!strings.Contains(result.Stdout, "Intent") ||
-				!strings.Contains(result.Stdout, "Preset") {
+				!strings.Contains(result.Stdout, "Intent") {
 				t.Fatalf("configure choices unreadable at %dx%d\n%s",
 					tc.cols, tc.rows, result.Stdout)
 			}
-			if tc.name == "accessible" &&
+			if tc.name == "no_color" && !strings.Contains(result.Stdout, "Preset") {
+				t.Fatalf("rich configure omitted preset at %dx%d\n%s",
+					tc.cols, tc.rows, result.Stdout)
+			}
+			if (tc.name == "narrow" || tc.name == "accessible") &&
 				strings.Contains(result.Stdout, "\x1b[?1049h") {
-				t.Fatalf("accessible configure entered alternate screen\n%q",
+				t.Fatalf("linear configure entered alternate screen\n%q",
+					result.Stdout)
+			}
+			if (tc.name == "narrow" || tc.name == "accessible") &&
+				(strings.Contains(result.Stdout, "\x1b[?2026") ||
+					strings.Contains(result.Stdout, "\x1b[?2027")) {
+				t.Fatalf("linear configure queried terminal capabilities\n%q",
 					result.Stdout)
 			}
 			if tc.name == "no_color" &&
@@ -129,17 +138,16 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 	)
 	bin := buildAcdBinary(t)
 
-	// Advance through the rich wizard one form at a time, approve only the
-	// preview prerequisites, then cancel when the final approval is visible.
+	// A short terminal selects the linear renderer for the whole wizard.
+	// Approve only the preview prerequisites, then cancel when the final
+	// approval is visible.
 	input := strings.Join([]string{
-		"\r", "\r", "\r", // strategy, preset, commit format
-		"\r",             // provider
-		"\r", "\r", "\r", // model, endpoint, timeout
-		"\r",     // verification command
-		"y", "y", // diff context and custom endpoint
+		"1\n", "3\n", "1\n", // strategy, preset, commit format
+		"1\n",            // provider
+		"\n", "\n", "\n", // model, endpoint, timeout
+		"y\n", "y\n", // diff context and custom endpoint
 		"y\n", "y\n", // exact verification and automatic repair
-		"\x03", // cancel apply without provider calls, verification, or writes
-	}, "\x00")
+	}, "") + "\x00\x03" // cancel apply without provider calls, verification, or writes
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, input,
@@ -165,6 +173,11 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 	for _, rawMode := range []string{"\x1b[?25l", "\x1b[?2004h", "\x1b[?1004h"} {
 		if strings.Contains(final, rawMode) {
 			t.Errorf("final approval entered rich raw mode %q\n%q", rawMode, final)
+		}
+	}
+	for _, query := range []string{"\x1b[?2026", "\x1b[?2027"} {
+		if strings.Contains(result.Stdout, query) {
+			t.Errorf("linear configure queried terminal capability %q\n%q", query, result.Stdout)
 		}
 	}
 }

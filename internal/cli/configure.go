@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
@@ -182,7 +183,9 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return renderConfigureReport(cmd.OutOrStdout(), report, opts.JSON)
 	}
 
-	accessible := opts.Accessible || strings.EqualFold(os.Getenv("TERM"), "dumb")
+	accessible := opts.Accessible ||
+		strings.EqualFold(os.Getenv("TERM"), "dumb") ||
+		configureTerminalTooShort(cmd.OutOrStdout())
 	if !accessible && (!settingsInputTTY(cmd.InOrStdin()) || !settingsOutputTTY(cmd.OutOrStdout())) {
 		return errors.New("acd configure: rich mode requires interactive stdin and stdout; use --accessible")
 	}
@@ -220,7 +223,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	selection, err := runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
 		Input: wizardInput, Output: cmd.OutOrStdout(), Accessible: accessible,
-		Defaults: defaults, SuggestedCommand: suggested, HasCredential: hasCredential || len(stagedCredential) > 0,
+		Defaults: defaults, DetectedCommand: suggested, HasCredential: hasCredential || len(stagedCredential) > 0,
 		CredentialFromStdin: opts.CredentialStdin,
 	})
 	if err != nil {
@@ -283,16 +286,20 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	selection.VerificationApproved = approval.Verification
 	selection.RepairApproved = approval.Repair
+	progress := newConfigureProgress(cmd.ErrOrStderr())
+	progress.start()
 	confirmations := selectionConfirmations(selection)
 	validation, err = previewService.Validate(cmd.Context(), draft, confirmations)
 	if err != nil {
-		return fmt.Errorf("acd configure: confirm reviewed settings: %w", err)
+		return progress.fail("confirm reviewed settings", err,
+			"No configuration was changed; rerun acd configure.")
 	}
 	if len(validation.Missing) > 0 {
-		return &settings.ConfirmationRequiredError{Missing: validation.Missing}
+		return progress.fail("confirm reviewed settings",
+			&settings.ConfirmationRequiredError{Missing: validation.Missing},
+			"No configuration was changed; rerun acd configure and approve every displayed risk.")
 	}
 
-	progress := configureProgress{}
 	service, err := openConfigureSettingsService(cmd.Context(), settings.Options{
 		Roots: roots, RepoPath: repo, LookupEnv: lookup,
 	})
@@ -325,6 +332,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			&settings.ConfirmationRequiredError{Missing: liveValidation.Missing},
 			"No changes were made; rerun acd configure and approve every displayed risk.")
 	}
+	progress.begin(1, "Testing provider with synthetic content...")
 	tested, err := service.TestProvider(cmd.Context(), draft, confirmations)
 	if err != nil {
 		return progress.fail("test provider", err, "No configuration was changed; correct the provider and rerun acd configure.")
@@ -334,6 +342,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"No configuration was changed; correct the provider and rerun acd configure.")
 	}
 	progress.complete("provider_test:passed")
+	progress.success(1, "Provider test passed.")
 	if report.Verification.Mode != "none" {
 		head, err := gitpkg.RevParse(cmd.Context(), repo, "HEAD^{commit}")
 		if err != nil {
@@ -346,6 +355,12 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			verificationCommand = liveValidation.ResolvedHot[config.FieldVerificationFullCommand]
 			verificationTimeout = liveValidation.ResolvedHot[config.FieldVerificationFullTimeout]
 		}
+		progress.begin(2, fmt.Sprintf(
+			"Running %s verification in an ephemeral worktree: %s (timeout %s)...",
+			safePreviewText(report.Verification.Mode, 16),
+			safePreviewText(verificationCommand, 256),
+			safePreviewText(verificationTimeout, 32),
+		))
 		result, err := configureRunVerification(cmd.Context(), repo, report.Verification.Mode,
 			verificationCommand, verificationTimeout, head)
 		if err != nil {
@@ -353,17 +368,21 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 				"No configuration was changed; fix the exact approved command or choose Intent Fast.")
 		}
 		if result.NeedsAttention || result.Status != verification.StatusPassed {
+			progress.verificationFailure(result, verificationTimeout)
 			return progress.fail("run approved verification",
-				fmt.Errorf("%s verification did not pass (%s)", report.Verification.Mode, result.Status),
+				configureVerificationFailure(result, report.Verification.Mode, verificationTimeout),
 				"No configuration was changed; fix the command failure or choose Intent Fast.")
 		}
 		progress.complete("verification:passed")
+		progress.success(2, "Verification passed.")
 	} else {
 		progress.complete("verification:not_required")
+		progress.success(2, "Verification is not required by this preset.")
 	}
 	var previousCredential string
 	previousCredentialSet := false
 	if selection.Credential != "" {
+		progress.begin(3, "Storing protected credential...")
 		previousCredential, err = configureCredentialRead(roots)
 		if err == nil {
 			previousCredentialSet = true
@@ -376,8 +395,13 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 				"No settings or runtime revision were changed; repair protected credential permissions and retry.")
 		}
 		progress.complete("credential:persisted")
+		progress.success(3, "Protected credential stored.")
+	} else {
+		progress.complete("credential:unchanged")
+		progress.success(3, "Existing credential retained; no credential write required.")
 	}
 	changes := configureSaveValues(selection)
+	progress.begin(4, "Saving repository settings...")
 	saved, err := service.Save(cmd.Context(), settings.SaveRequest{
 		Scope: settings.ScopeRepository, Values: changes,
 		ExpectedGeneration: authoring.Generation,
@@ -389,6 +413,8 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"Settings were not saved; rerun acd configure after resolving the reported conflict.")
 	}
 	progress.complete("settings:saved")
+	progress.success(4, "Repository settings saved.")
+	progress.begin(5, "Creating immutable runtime revision...")
 	applied, err := service.Apply(cmd.Context(), settings.ApplyRequest{
 		Values: draft, TestedFingerprint: tested.Fingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: snapshot.DesiredRevisionID,
@@ -400,12 +426,15 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"Repository settings were saved but not activated; rerun acd configure to test and activate them.")
 	}
 	progress.complete(fmt.Sprintf("runtime_revision:%d", applied.RevisionID))
+	progress.success(5, fmt.Sprintf("Runtime revision %d created.", applied.RevisionID))
+	progress.begin(6, "Enabling ACD...")
 	if err := configureEnable(cmd.Context(), io.Discard, repo, false); err != nil {
 		return progress.fail("enable daemon", err,
 			fmt.Sprintf("Runtime revision %d is queued; run `acd on --repo %s` after resolving daemon health.",
 				applied.RevisionID, safeRepoPreview(repo)))
 	}
 	progress.complete("daemon:enabled")
+	progress.success(6, "ACD enabled.")
 	report.RuntimeRevision = applied.RevisionID
 	report.Daemon = "enabled"
 	report.CredentialSource = source
@@ -413,8 +442,9 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		report.CredentialSource = credentials.SourceFile
 	}
 	report.Operations = append([]string(nil), progress.completed...)
-	fmt.Fprintf(cmd.OutOrStdout(), "Configured %s.%s@%d in runtime revision %d\n",
-		selection.Strategy, selection.Preset, config.PresetCatalogVersion, applied.RevisionID)
+	fmt.Fprintf(cmd.OutOrStdout(),
+		"Configuration active: %s@%d; runtime revision %d; daemon enabled.\n",
+		report.PresetID, report.PresetVersion, applied.RevisionID)
 	for _, guidance := range report.HarnessGuidance {
 		fmt.Fprintln(cmd.OutOrStdout(), guidance)
 	}
@@ -441,6 +471,15 @@ func normalizeConfigureMode(strategy, preset string) (string, string, error) {
 		return "", "", fmt.Errorf("acd configure: unsupported preset %q", preset)
 	}
 	return strategy, preset, nil
+}
+
+func configureTerminalTooShort(output io.Writer) bool {
+	file, ok := output.(*os.File)
+	if !ok || !term.IsTerminal(file.Fd()) {
+		return false
+	}
+	_, rows, err := term.GetSize(file.Fd())
+	return err == nil && rows > 0 && rows < 24
 }
 
 func dryRunConfigureSelection(strategy, preset, suggested string) settingsui.ConfigureSelection {
@@ -756,6 +795,60 @@ func configureRisksResolved(selection settingsui.ConfigureSelection, report conf
 
 type configureProgress struct {
 	completed []string
+	out       io.Writer
+	color     bool
+}
+
+func newConfigureProgress(out io.Writer) configureProgress {
+	if out == nil {
+		out = io.Discard
+	}
+	return configureProgress{
+		out:   out,
+		color: os.Getenv("NO_COLOR") == "" && rewriteProgressIsTerminal(out),
+	}
+}
+
+func (p configureProgress) start() {
+	p.writeLine("", "Applying reviewed configuration...")
+}
+
+func (p configureProgress) begin(step int, message string) {
+	p.writeLine("\x1b[36m", fmt.Sprintf("[%d/6] %s", step, message))
+}
+
+func (p configureProgress) success(step int, message string) {
+	p.writeLine("\x1b[32m", fmt.Sprintf("[%d/6] %s", step, message))
+}
+
+func (p configureProgress) failure(step int, message string) {
+	p.writeLine("\x1b[31m", fmt.Sprintf("[%d/6] %s", step, message))
+}
+
+func (p configureProgress) writeLine(color, message string) {
+	if p.color && color != "" {
+		fmt.Fprintf(p.out, "%s%s\x1b[0m\n", color, message)
+		return
+	}
+	fmt.Fprintln(p.out, message)
+}
+
+func (p configureProgress) verificationFailure(result verification.Result, timeout string) {
+	switch {
+	case result.TimedOut || result.Status == verification.StatusTimedOut:
+		p.failure(2, "Verification timed out after "+safePreviewText(timeout, 32)+".")
+	case result.ExitCode != 0:
+		p.failure(2, fmt.Sprintf("Verification failed with exit code %d.", result.ExitCode))
+	default:
+		p.failure(2, "Verification failed ("+safePreviewText(string(result.Status), 32)+").")
+	}
+	output := safeConfigureVerificationOutput(result.Output, 8*1024)
+	if output == "" {
+		p.writeLine("", "Verification produced no retained output.")
+		return
+	}
+	p.writeLine("", "Verification output (sanitized tail):")
+	fmt.Fprintln(p.out, output)
 }
 
 func (p *configureProgress) complete(stage string) {
@@ -780,6 +873,42 @@ func (p configureProgress) failWithRollback(stage string, cause error, rollback,
 		message += "; remediation: " + safePreviewText(remediation, 512)
 	}
 	return errors.New(message)
+}
+
+func configureVerificationFailure(result verification.Result, mode, timeout string) error {
+	mode = safePreviewText(mode, 16)
+	if result.TimedOut || result.Status == verification.StatusTimedOut {
+		return fmt.Errorf("%s verification timed out after %s", mode, safePreviewText(timeout, 32))
+	}
+	if result.ExitCode != 0 {
+		return fmt.Errorf("%s verification failed with exit code %d", mode, result.ExitCode)
+	}
+	return fmt.Errorf("%s verification did not pass (%s)", mode, result.Status)
+}
+
+func safeConfigureVerificationOutput(value string, limit int) string {
+	value = observabilityANSI.ReplaceAllString(value, "")
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\t':
+			return r
+		case '\r':
+			return '\n'
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+	value = strings.TrimSpace(value)
+	if limit > 0 && len(value) > limit {
+		value = value[len(value)-limit:]
+		for len(value) > 0 && value[0]&0xc0 == 0x80 {
+			value = value[1:]
+		}
+		value = "[earlier output omitted]\n" + value
+	}
+	return value
 }
 
 func rollbackConfigureCredential(roots paths.Roots, changed, previousSet bool, previous string) string {

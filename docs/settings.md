@@ -15,6 +15,25 @@ The wizard recommends Intent Balanced. Use `acd configure --dry-run` or
 not call a provider, run a command, write a credential or setting, start the
 daemon, or change hooks.
 
+After final approval, configure prints six stable progress stages to stderr:
+provider test, verification, credential, settings, runtime revision, and
+daemon enablement. Terminal output uses color when supported unless
+`NO_COLOR` is set, but every state is also written in text. Verification
+failures include the exit code or timeout and a bounded sanitized output tail;
+no configuration is changed when either pre-save test fails.
+
+Regular setup never asks the user to invent a shell command. Balanced and
+Quality reuse an existing repository-scoped verification command or detect a
+supported project command such as `make test` or `go test ./...`. The final
+preview shows the exact command and requires approval before it runs. If no
+safe command is detected, configure asks the user to choose Intent Fast or set
+one through advanced settings.
+
+Terminals shorter than 24 rows automatically use the same linear renderer as
+`--accessible`. This keeps every approval visible and avoids terminal control
+replies leaking into the shell. The final stdout result explicitly reports the
+active preset, runtime revision, and daemon state.
+
 Use `acd settings` for advanced overrides, profiles, experiments, and revision
 recovery. Its first action is **Change strategy or preset**, followed by
 **Quick provider setup** and **Advanced settings**.

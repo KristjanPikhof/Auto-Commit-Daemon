@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fixed `acd configure` appearing blocked after final approval. It now reports
+  numbered progress, exposes sanitized verification failure output, and avoids
+  delayed terminal capability replies corrupting short-terminal shell prompts.
+- Removed the regular wizard's free-form verification command question.
+  Balanced and Quality now reuse or detect a command and ask only for exact
+  approval in the final preview.
+
 ### Added
 
 - Added Intent v2 semantic candidates, dependency-aware non-contiguous

@@ -49,6 +49,17 @@ acd configure --dry-run --json
 Dry-run performs no provider call, command execution, credential or settings
 write, daemon start, or hook change.
 
+After approval, six numbered stderr stages show the provider test,
+verification, credential, settings, runtime revision, and daemon work.
+Verification failures show a bounded sanitized output tail. Short terminals
+automatically use the linear prompt renderer; `NO_COLOR` disables progress
+colors.
+
+The regular wizard does not request free-form shell input. It reuses an
+existing repository command or detects a supported project command, then shows
+that exact command in the final approval. Custom commands remain an advanced
+`acd settings` action.
+
 `acd settings` opens the advanced terminal settings lab:
 
 ~~~bash

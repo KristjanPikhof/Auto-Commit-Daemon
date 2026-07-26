@@ -234,7 +234,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	settingsInputTTY = func(io.Reader) bool { return true }
 	settingsOutputTTY = func(io.Writer) bool { return true }
 
-	out, _, err := executeConfigureCommand(t, "", "--repo", repo)
+	out, progress, err := executeConfigureCommand(t, "", "--repo", repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,12 +249,38 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	if strings.Count(strings.Join(order, ","), "revision") != 1 {
 		t.Fatalf("revision count in %v", order)
 	}
-	if !strings.Contains(out, "runtime revision 42") ||
+	if !strings.Contains(out, "Configuration active: intent.balanced@2; runtime revision 42; daemon enabled.") ||
 		!strings.Contains(out, "no external hook file will be edited") ||
 		!strings.Contains(out, "repository command will run in an ephemeral worktree: make test") ||
 		!strings.Contains(out, "eligible recent ACD-owned commits may be repaired automatically") ||
 		!strings.Contains(out, "`acd setup codex`") {
 		t.Fatalf("output=%s", out)
+	}
+	progressLines := []string{
+		"Applying reviewed configuration...",
+		"[1/6] Testing provider with synthetic content...",
+		"[1/6] Provider test passed.",
+		"[2/6] Running fast verification in an ephemeral worktree: make test (timeout 2m)...",
+		"[2/6] Verification passed.",
+		"[3/6] Storing protected credential...",
+		"[3/6] Protected credential stored.",
+		"[4/6] Saving repository settings...",
+		"[4/6] Repository settings saved.",
+		"[5/6] Creating immutable runtime revision...",
+		"[5/6] Runtime revision 42 created.",
+		"[6/6] Enabling ACD...",
+		"[6/6] ACD enabled.",
+	}
+	at := 0
+	for _, want := range progressLines {
+		next := strings.Index(progress[at:], want)
+		if next < 0 {
+			t.Fatalf("progress missing %q after byte %d:\n%s", want, at, progress)
+		}
+		at += next + len(want)
+	}
+	if strings.Contains(progress, "staged-secret") {
+		t.Fatalf("progress leaked credential: %q", progress)
 	}
 }
 
@@ -371,7 +397,12 @@ func TestConfigureVerificationFailureLeavesCredentialAndSettingsUntouched(t *tes
 	}
 	configureRunVerification = func(context.Context, string, string, string, string, string) (verification.Result, error) {
 		order = append(order, "verification")
-		return verification.Result{Status: verification.StatusFailed, NeedsAttention: true}, nil
+		return verification.Result{
+			Status:         verification.StatusFailed,
+			NeedsAttention: true,
+			ExitCode:       1,
+			Output:         "ok example/one\nFAIL example/two\n",
+		}, nil
 	}
 	configureCredentialWrite = func(paths.Roots, string) error {
 		order = append(order, "credential")
@@ -383,9 +414,23 @@ func TestConfigureVerificationFailureLeavesCredentialAndSettingsUntouched(t *tes
 	}
 	settingsInputTTY = func(io.Reader) bool { return true }
 	settingsOutputTTY = func(io.Writer) bool { return true }
-	_, _, err := executeConfigureCommand(t, "", "--repo", repo)
-	if err == nil || !strings.Contains(err.Error(), "No configuration was changed") {
+	_, progress, err := executeConfigureCommand(t, "", "--repo", repo)
+	if err == nil ||
+		!strings.Contains(err.Error(), "fast verification failed with exit code 1") ||
+		!strings.Contains(err.Error(), "No configuration was changed") {
 		t.Fatalf("err=%v", err)
+	}
+	for _, want := range []string{
+		"[1/6] Testing provider with synthetic content...",
+		"[1/6] Provider test passed.",
+		"[2/6] Running fast verification in an ephemeral worktree: make test (timeout 2m)...",
+		"[2/6] Verification failed with exit code 1.",
+		"Verification output (sanitized tail):",
+		"ok example/one\nFAIL example/two",
+	} {
+		if !strings.Contains(progress, want) {
+			t.Errorf("progress missing %q:\n%s", want, progress)
+		}
 	}
 	got := strings.Join(order, ",")
 	if got != "authoring,validate,validate,snapshot,validate,provider,verification" {
@@ -419,6 +464,32 @@ func TestConfigureEnvironmentCredentialRetainsPriority(t *testing.T) {
 	value, set = configureLookupEnv("protected-file-secret")(ai.EnvAPIKey)
 	if !set || value != "protected-file-secret" {
 		t.Fatalf("staged API key=%q set=%t", value, set)
+	}
+}
+
+func TestDetectVerificationCommandPrefersMakeTarget(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
+		[]byte(".PHONY: test\n\ntest:\n\tgo test ./...\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"),
+		[]byte("module example.test/repo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectVerificationCommand(repo); got != "make test" {
+		t.Fatalf("detected command=%q", got)
+	}
+}
+
+func TestDetectVerificationCommandUsesGoFallback(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"),
+		[]byte("module example.test/repo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectVerificationCommand(repo); got != "go test ./..." {
+		t.Fatalf("detected command=%q", got)
 	}
 }
 

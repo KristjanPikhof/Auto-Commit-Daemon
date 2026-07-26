@@ -19,7 +19,7 @@ type ConfigureWizardOptions struct {
 	Output              io.Writer
 	Accessible          bool
 	Defaults            map[string]string
-	SuggestedCommand    string
+	DetectedCommand     string
 	HasCredential       bool
 	CredentialFromStdin bool
 }
@@ -132,15 +132,17 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 
 	selection.VerificationMode = configureVerificationMode(selection.Strategy, selection.Preset)
 	if selection.VerificationMode != "none" {
-		selection.VerificationCommand = strings.TrimSpace(opts.SuggestedCommand)
-		commandForm := huh.NewForm(huh.NewGroup(
-			huh.NewInput().Key("verification").Title(
-				titleSetting(selection.VerificationMode) + " verification command").
-				Description("The exact command runs only in an ephemeral detached candidate worktree.").
-				Value(&selection.VerificationCommand),
-		))
-		if err := runConfigureForm(ctx, commandForm, opts); err != nil {
-			return ConfigureSelection{}, err
+		field := "verification." + selection.VerificationMode + ".command"
+		selection.VerificationCommand = strings.TrimSpace(defaults[field])
+		if selection.VerificationCommand == "" {
+			selection.VerificationCommand = strings.TrimSpace(opts.DetectedCommand)
+		}
+		if selection.VerificationCommand == "" {
+			return ConfigureSelection{}, fmt.Errorf(
+				"configure wizard: no %s verification command was detected; "+
+					"choose Intent Fast or set an exact command in acd settings",
+				safeText(selection.VerificationMode),
+			)
 		}
 	}
 
@@ -243,7 +245,7 @@ type ConfigurePreviewApprovalOptions struct {
 
 // ConfirmConfigurePreview binds consent to the exact effective command and
 // repair policy shown in the resolved final preview.
-func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, _ bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
+func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
 	approval := ConfigurePreviewApproval{}
 	fields := make([]huh.Field, 0, 3)
 	if opts.VerificationMode != "none" {
@@ -263,13 +265,11 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 		"Apply this reviewed configuration, create one runtime revision, and enable ACD?").
 		Value(&approval.Apply))
 
-	// The preview is already printed inline and can consume nearly the whole
-	// terminal. Starting another rich renderer below it can leave the consent
-	// fields outside a short viewport. Security-critical approvals stay
-	// line-oriented so every exact prompt remains visible and scrolls normally.
-	form := huh.NewForm(huh.NewGroup(fields...)).
-		WithTheme(huh.ThemeFunc(huh.ThemeBase)).
-		WithAccessible(true)
+	form := huh.NewForm(huh.NewGroup(fields...))
+	if accessible || os.Getenv("NO_COLOR") != "" {
+		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
+	}
+	form = form.WithAccessible(accessible)
 	if err := form.WithInput(input).WithOutput(output).
 		WithShowHelp(true).RunWithContext(ctx); err != nil {
 		return ConfigurePreviewApproval{}, err

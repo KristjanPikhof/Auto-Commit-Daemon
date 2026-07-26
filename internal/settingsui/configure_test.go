@@ -21,14 +21,13 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 		"", // base URL
 		"", // timeout
 		"staged-secret",
-		"",  // suggested make test
 		"y", // approve network diff context
 		"",
 	}, "\n")
 	var out bytes.Buffer
 	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
-		Accessible: true, SuggestedCommand: "make test",
+		Accessible: true, DetectedCommand: "make test",
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
@@ -49,10 +48,65 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 	if strings.Contains(out.String(), "staged-secret") || strings.Contains(out.String(), "\x1b[") {
 		t.Fatalf("accessible output leaked secret or color: %q", out.String())
 	}
-	for _, want := range []string{"Commit strategy", "Balanced (recommended)", "verification command", "redacted repository diff context"} {
+	for _, want := range []string{"Commit strategy", "Balanced (recommended)", "redacted repository diff context"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output missing %q\n%s", want, out.String())
 		}
+	}
+	if strings.Contains(out.String(), "verification command") {
+		t.Errorf("regular wizard asked the user to enter a verification command:\n%s", out.String())
+	}
+}
+
+func TestConfigureWizardUsesSavedVerificationBeforeDetection(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	input := strings.Join([]string{
+		"", "", "", "", // intent, balanced, imperative, provider
+		"", "", "", // model, base URL, timeout
+		"y", // approve diff context
+		"",
+	}, "\n")
+	var out bytes.Buffer
+	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
+		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
+		Accessible: true, DetectedCommand: "make test", HasCredential: true,
+		Defaults: map[string]string{
+			"commit.strategy": "intent", "commit.preset": "balanced",
+			"commit.format": "imperative", "ai.provider": "openai-compat",
+			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.timeout": "30s", "verification.fast.command": "go test ./...",
+		},
+	})
+	if err != nil {
+		t.Fatalf("wizard: %v\n%s", err, out.String())
+	}
+	if selection.VerificationCommand != "go test ./..." {
+		t.Fatalf("verification command=%q", selection.VerificationCommand)
+	}
+	if strings.Contains(out.String(), "verification command") {
+		t.Fatalf("regular wizard asked for command input:\n%s", out.String())
+	}
+}
+
+func TestConfigureWizardRequiresDetectedVerification(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	input := strings.Join([]string{
+		"", "", "", "", // intent, balanced, imperative, provider
+		"", "", "", // model, base URL, timeout
+	}, "\n")
+	var out bytes.Buffer
+	_, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
+		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
+		Accessible: true, HasCredential: true,
+		Defaults: map[string]string{
+			"commit.strategy": "intent", "commit.preset": "balanced",
+			"commit.format": "imperative", "ai.provider": "openai-compat",
+			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.timeout": "30s",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "choose Intent Fast") {
+		t.Fatalf("err=%v\n%s", err, out.String())
 	}
 }
 
@@ -134,7 +188,7 @@ func TestAccessibleFastToQualityResetsOnlyPresetSources(t *testing.T) {
 func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 	var out bytes.Buffer
 	approval, err := ConfirmConfigurePreview(context.Background(),
-		&bytewiseReader{r: strings.NewReader("y\ny\ny\n")}, &out, false,
+		&bytewiseReader{r: strings.NewReader("y\ny\ny\n")}, &out, true,
 		ConfigurePreviewApprovalOptions{
 			VerificationMode: "full", VerificationCommand: "make test\nunsafe",
 			RepairEnabled: true, RepairHorizon: "30m", RepairMaxCommits: "5",
