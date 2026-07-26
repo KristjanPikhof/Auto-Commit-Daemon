@@ -15,18 +15,26 @@ import (
 // ConfigureWizardOptions contains presentation-safe setup defaults. Credential
 // values are accepted only in ConfigureSelection and are never rendered.
 type ConfigureWizardOptions struct {
-	Input               io.Reader
-	Output              io.Writer
-	Accessible          bool
-	Defaults            map[string]string
-	DetectedCommand     string
-	HasCredential       bool
-	CredentialFromStdin bool
+	Input                io.Reader
+	Output               io.Writer
+	Accessible           bool
+	Defaults             map[string]string
+	DetectedCommand      string
+	DetectedQuickCommand string
+	DetectedQuickSource  string
+	DetectedFullCommand  string
+	DetectedFullSource   string
+	ExplicitMode         bool
+	HasCredential        bool
+	CredentialFromStdin  bool
+	ProviderConfigured   bool
+	OpenAIConfigured     bool
 }
 
 // ConfigureSelection is an in-memory draft. Callers must discard Credential
 // after the protected store has accepted it.
 type ConfigureSelection struct {
+	Experience                  string
 	Strategy                    string
 	Preset                      string
 	CommitFormat                string
@@ -40,6 +48,8 @@ type ConfigureSelection struct {
 	SubprocessApproved          bool
 	VerificationMode            string
 	VerificationCommand         string
+	VerificationSource          string
+	ExecutionMode               string
 	VerificationApproved        bool
 	RepairApproved              bool
 	Confirmed                   bool
@@ -64,47 +74,65 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		BaseURL:         fallback(defaults["ai.base_url"], "https://api.openai.com/v1"),
 		ProviderTimeout: fallback(defaults["ai.timeout"], "30s"),
 	}
-	modeForm := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().Key("strategy").Title("Commit strategy").Description(
-			"Intent plans semantic atomic commits; Event publishes one capture per commit.").Options(
-			huh.NewOption("Intent (recommended)", "intent"),
-			huh.NewOption("Event", "event"),
-		).Value(&selection.Strategy),
-		huh.NewSelect[string]().Key("preset").Title("Preset").Description(
-			"Balanced is the everyday default. Advanced settings can customize it later.").Options(
-			huh.NewOption("Balanced (recommended)", "balanced"),
-			huh.NewOption("Fast", "fast"),
-			huh.NewOption("Quality", "quality"),
-		).Value(&selection.Preset),
-		huh.NewSelect[string]().Key("format").Title("Commit message format").Options(
-			huh.NewOption("Imperative", "imperative"),
-			huh.NewOption("Conventional", "conventional"),
-		).Value(&selection.CommitFormat),
-	))
-	if err := runConfigureForm(ctx, modeForm, opts); err != nil {
-		return ConfigureSelection{}, err
+	selection.Experience = configureExperience(selection.Strategy, selection.Preset)
+	if !opts.ExplicitMode {
+		experienceForm := huh.NewForm(huh.NewGroup(
+			huh.NewSelect[string]().Key("experience").Title("How should ACD work?").
+				Description("Everyday is the recommended balance. Strict Review can take several minutes.").
+				Options(
+					huh.NewOption("Everyday work — semantic commits with a quick background check (recommended)", "everyday"),
+					huh.NewOption("Maximum speed — immediate one-change commits, no project checks", "speed"),
+					huh.NewOption("Strict review — semantic commits gated by the full test suite (multi-minute)", "strict"),
+				).Value(&selection.Experience),
+		))
+		if err := runConfigureForm(ctx, experienceForm, opts); err != nil {
+			return ConfigureSelection{}, err
+		}
+		selection.Strategy, selection.Preset = configureExperienceMode(selection.Experience)
 	}
 
 	providerKind, subprocessName := configureProviderParts(selection.Provider)
-	providerForm := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().Key("provider").Title("Provider").Options(
+	providerReady := opts.ProviderConfigured && (providerKind == "subprocess" ||
+		(providerKind == "openai-compat" && opts.HasCredential) ||
+		(providerKind == "deterministic" &&
+			selection.Strategy == "event" && selection.Preset == "fast"))
+	providerSelected := false
+	if !providerReady {
+		options := []huh.Option[string]{
 			huh.NewOption("OpenAI-compatible network provider", "openai-compat"),
 			huh.NewOption("Local subprocess provider", "subprocess"),
-			huh.NewOption("Deterministic messages (Event Fast only)", "deterministic"),
-		).Value(&providerKind),
-	))
-	if err := runConfigureForm(ctx, providerForm, opts); err != nil {
-		return ConfigureSelection{}, err
+		}
+		if selection.Strategy == "event" && selection.Preset == "fast" {
+			options = append(options,
+				huh.NewOption("Deterministic messages", "deterministic"))
+		}
+		providerForm := huh.NewForm(huh.NewGroup(
+			huh.NewSelect[string]().Key("provider").Title("Commit message provider").
+				Options(options...).Value(&providerKind),
+		))
+		if err := runConfigureForm(ctx, providerForm, opts); err != nil {
+			return ConfigureSelection{}, err
+		}
+		providerSelected = true
 	}
 	switch providerKind {
 	case "openai-compat":
-		details := huh.NewForm(huh.NewGroup(
-			huh.NewInput().Key("model").Title("Model").Value(&selection.Model),
-			huh.NewInput().Key("base_url").Title("OpenAI-compatible base URL").Value(&selection.BaseURL),
-			huh.NewInput().Key("timeout").Title("Provider timeout").Value(&selection.ProviderTimeout),
-		))
-		if err := runConfigureForm(ctx, details, opts); err != nil {
-			return ConfigureSelection{}, err
+		if providerSelected || !opts.OpenAIConfigured {
+			providerForm := huh.NewForm(huh.NewGroup(
+				huh.NewInput().Key("endpoint").
+					Title("OpenAI-compatible endpoint").
+					Description("Use the base URL ending in /v1.").
+					Value(&selection.BaseURL),
+				huh.NewInput().Key("model").
+					Title("Model").
+					Description("The model name supported by this endpoint.").
+					Value(&selection.Model),
+			))
+			if err := runConfigureForm(ctx, providerForm, opts); err != nil {
+				return ConfigureSelection{}, err
+			}
+			selection.BaseURL = strings.TrimSpace(selection.BaseURL)
+			selection.Model = strings.TrimSpace(selection.Model)
 		}
 		if !opts.HasCredential && !opts.CredentialFromStdin {
 			credential, readErr := readConfigureSecret(opts.Input, opts.Output)
@@ -131,19 +159,42 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	}
 
 	selection.VerificationMode = configureVerificationMode(selection.Strategy, selection.Preset)
-	if selection.VerificationMode != "none" {
+	if selection.VerificationMode == "fast" || selection.VerificationMode == "full" {
 		field := "verification." + selection.VerificationMode + ".command"
 		selection.VerificationCommand = strings.TrimSpace(defaults[field])
-		if selection.VerificationCommand == "" {
-			selection.VerificationCommand = strings.TrimSpace(opts.DetectedCommand)
+		if selection.VerificationCommand != "" {
+			selection.VerificationSource = "saved setting"
 		}
 		if selection.VerificationCommand == "" {
-			return ConfigureSelection{}, fmt.Errorf(
-				"configure wizard: no %s verification command was detected; "+
-					"choose Intent Fast or set an exact command in acd settings",
-				safeText(selection.VerificationMode),
-			)
+			if selection.VerificationMode == "fast" {
+				selection.VerificationCommand = strings.TrimSpace(opts.DetectedQuickCommand)
+				selection.VerificationSource = strings.TrimSpace(opts.DetectedQuickSource)
+			} else {
+				selection.VerificationCommand = strings.TrimSpace(opts.DetectedFullCommand)
+				selection.VerificationSource = strings.TrimSpace(opts.DetectedFullSource)
+			}
+			if selection.VerificationCommand == "" {
+				selection.VerificationCommand = strings.TrimSpace(opts.DetectedCommand)
+				if selection.VerificationCommand != "" {
+					selection.VerificationSource = "detected project command"
+				}
+			}
 		}
+		if selection.VerificationCommand == "" {
+			if selection.VerificationMode == "fast" {
+				selection.VerificationMode = "structural"
+				selection.VerificationSource = "built-in structural verification"
+			} else {
+				return ConfigureSelection{}, errors.New(
+					"configure wizard: Strict Review is unavailable because no full verification command was detected; " +
+						"set one in acd settings",
+				)
+			}
+		}
+	}
+	selection.ExecutionMode = "background activation gate"
+	if selection.Strategy == "event" {
+		selection.ExecutionMode = "immediate"
 	}
 
 	needsDiff := selection.Strategy == "intent" ||
@@ -151,31 +202,9 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	networkDiff := needsDiff && !strings.HasPrefix(selection.Provider, "subprocess:")
 	customEndpoint := selection.Provider == "openai-compat" &&
 		strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
-	var confirmations []huh.Field
-	if networkDiff {
-		confirmations = append(confirmations, huh.NewConfirm().Key("diff").Title(
-			"Approve redacted repository diff context for this network provider?").
-			Value(&selection.DiffContextApproved))
-	} else if needsDiff {
-		confirmations = append(confirmations, huh.NewConfirm().Key("diff").Title(
-			"Approve redacted repository diff context for this local provider?").
-			Value(&selection.DiffContextApproved))
-	}
-	if customEndpoint {
-		confirmations = append(confirmations, huh.NewConfirm().Key("endpoint").Title(
-			"Approve sending provider credentials to "+safeText(selection.BaseURL)+" ?").
-			Value(&selection.EndpointCredentialsApproved))
-	}
-	if strings.HasPrefix(selection.Provider, "subprocess:") {
-		confirmations = append(confirmations, huh.NewConfirm().Key("subprocess").Title(
-			"Approve execution of local provider "+safeText(selection.Provider)+" ?").
-			Value(&selection.SubprocessApproved))
-	}
-	if len(confirmations) > 0 {
-		if err := runConfigureForm(ctx, huh.NewForm(huh.NewGroup(confirmations...)), opts); err != nil {
-			return ConfigureSelection{}, err
-		}
-	}
+	selection.DiffContextApproved = needsDiff || networkDiff
+	selection.EndpointCredentialsApproved = customEndpoint
+	selection.SubprocessApproved = strings.HasPrefix(selection.Provider, "subprocess:")
 	return selection, nil
 }
 
@@ -243,29 +272,52 @@ type ConfigurePreviewApprovalOptions struct {
 	RepairMaxCommits    string
 }
 
-// ConfirmConfigurePreview binds consent to the exact effective command and
-// repair policy shown in the resolved final preview.
+type ConfigureRecoveryChoice string
+
+const (
+	ConfigureRecoveryRetry    ConfigureRecoveryChoice = "retry"
+	ConfigureRecoverySwitch   ConfigureRecoveryChoice = "switch"
+	ConfigureRecoveryAdvanced ConfigureRecoveryChoice = "advanced"
+	ConfigureRecoveryLeave    ConfigureRecoveryChoice = "leave"
+)
+
+func ChooseConfigureRecovery(
+	ctx context.Context,
+	input io.Reader,
+	output io.Writer,
+	accessible bool,
+) (ConfigureRecoveryChoice, error) {
+	choice := ConfigureRecoveryRetry
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[ConfigureRecoveryChoice]().
+			Title("Previous configuration validation needs attention").
+			Description("The reviewed setup is preserved; capture remains active and commit publishing is paused.").
+			Options(
+				huh.NewOption("Retry the same exact check", ConfigureRecoveryRetry),
+				huh.NewOption("Switch experience", ConfigureRecoverySwitch),
+				huh.NewOption("Open advanced settings", ConfigureRecoveryAdvanced),
+				huh.NewOption("Leave capture-only state unchanged", ConfigureRecoveryLeave),
+			).Value(&choice),
+	))
+	if accessible || os.Getenv("NO_COLOR") != "" {
+		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
+	}
+	if err := form.WithAccessible(accessible).WithInput(input).
+		WithOutput(output).WithShowHelp(true).RunWithContext(ctx); err != nil {
+		return "", err
+	}
+	return choice, nil
+}
+
+// ConfirmConfigurePreview binds one consent to every permission shown in the
+// exact final preview.
 func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
 	approval := ConfigurePreviewApproval{}
-	fields := make([]huh.Field, 0, 3)
-	if opts.VerificationMode != "none" {
-		fields = append(fields, huh.NewConfirm().Key("verification").Title(
-			"Approve exact "+safePreviewValue(opts.VerificationMode, 16)+
-				" verification command: "+safePreviewValue(opts.VerificationCommand, 256)+" ?").
-			Value(&approval.Verification))
-	}
-	if opts.RepairEnabled {
-		fields = append(fields, huh.NewConfirm().Key("repair").Title(
-			"Approve automatic repair of eligible ACD commits within "+
-				safePreviewValue(opts.RepairHorizon, 32)+", up to "+
-				safePreviewValue(opts.RepairMaxCommits, 8)+" commits?").
-			Value(&approval.Repair))
-	}
-	fields = append(fields, huh.NewConfirm().Key("apply").Title(
-		"Apply this reviewed configuration, create one runtime revision, and enable ACD?").
-		Value(&approval.Apply))
-
-	form := huh.NewForm(huh.NewGroup(fields...))
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Key("apply").Title(
+			"Approve every permission shown above, save this configuration, and enable ACD?").
+			Value(&approval.Apply),
+	))
 	if accessible || os.Getenv("NO_COLOR") != "" {
 		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
 	}
@@ -274,6 +326,9 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 		WithShowHelp(true).RunWithContext(ctx); err != nil {
 		return ConfigurePreviewApproval{}, err
 	}
+	approval.Verification = approval.Apply &&
+		(opts.VerificationMode == "fast" || opts.VerificationMode == "full")
+	approval.Repair = approval.Apply && opts.RepairEnabled
 	return approval, nil
 }
 
@@ -309,5 +364,27 @@ func configureVerificationMode(strategy, preset string) string {
 		return "full"
 	default:
 		return "none"
+	}
+}
+
+func configureExperience(strategy, preset string) string {
+	switch {
+	case strategy == "event" && preset == "fast":
+		return "speed"
+	case strategy == "intent" && preset == "quality":
+		return "strict"
+	default:
+		return "everyday"
+	}
+}
+
+func configureExperienceMode(experience string) (string, string) {
+	switch experience {
+	case "speed":
+		return "event", "fast"
+	case "strict":
+		return "intent", "quality"
+	default:
+		return "intent", "balanced"
 	}
 }

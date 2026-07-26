@@ -30,7 +30,8 @@ marks the result `Balanced (customized)`.
 ## Resolve migration attention
 
 Intent v2 requires a tested provider, redacted diff context, and an approved
-fast verification command for Balanced. If any prerequisite is missing, ACD
+fast verification command or built-in structural gate for Balanced. If any
+prerequisite is missing, ACD
 continues capturing changes but stops replay:
 
 ~~~text

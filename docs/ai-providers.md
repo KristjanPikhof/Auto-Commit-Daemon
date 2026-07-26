@@ -24,6 +24,13 @@ key can be stored with `acd auth set`; the environment remains higher priority.
 The settings file, runtime revision ledger, and repository database never store
 the secret.
 
+Configure reuses a valid saved provider, model, endpoint, timeout, and
+credential. It asks for the provider only when setup is missing or unusable.
+A fresh or incomplete OpenAI-compatible setup asks for the endpoint and model,
+then asks for a masked API key only when neither the environment nor protected
+file has one. Timeout remains available in `acd settings`. All effective
+values are shown in the final review.
+
 Offline default:
 
 ~~~bash

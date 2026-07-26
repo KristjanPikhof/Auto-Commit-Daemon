@@ -85,13 +85,14 @@ func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 				t.Fatalf("cancelled configure unexpectedly succeeded\n%s",
 					result.Stdout)
 			}
-			if !strings.Contains(result.Stdout, "Commit strategy") ||
-				!strings.Contains(result.Stdout, "Intent") {
+			if !strings.Contains(result.Stdout, "How should ACD work?") ||
+				!strings.Contains(result.Stdout, "Everyday work") {
 				t.Fatalf("configure choices unreadable at %dx%d\n%s",
 					tc.cols, tc.rows, result.Stdout)
 			}
-			if tc.name == "no_color" && !strings.Contains(result.Stdout, "Preset") {
-				t.Fatalf("rich configure omitted preset at %dx%d\n%s",
+			if tc.name == "no_color" &&
+				!strings.Contains(result.Stdout, "Strict review") {
+				t.Fatalf("rich configure omitted experiences at %dx%d\n%s",
 					tc.cols, tc.rows, result.Stdout)
 			}
 			if (tc.name == "narrow" || tc.name == "accessible") &&
@@ -119,8 +120,8 @@ func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 	resized := runPTYCommand(t, ctx, baseEnv, 100, 32, 52, 18,
 		"\x03", bin, "configure", "--repo", repo)
 	if resized.ExitCode == 0 ||
-		!strings.Contains(resized.Stdout, "Commit strategy") ||
-		!strings.Contains(resized.Stdout, "Preset") {
+		!strings.Contains(resized.Stdout, "How should ACD work?") ||
+		!strings.Contains(resized.Stdout, "Everyday work") {
 		t.Fatalf("resized configure transcript incomplete\n%s", resized.Stdout)
 	}
 }
@@ -142,12 +143,9 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 	// Approve only the preview prerequisites, then cancel when the final
 	// approval is visible.
 	input := strings.Join([]string{
-		"1\n", "3\n", "1\n", // strategy, preset, commit format
-		"1\n",            // provider
-		"\n", "\n", "\n", // model, endpoint, timeout
-		"y\n", "y\n", // diff context and custom endpoint
-		"y\n", "y\n", // exact verification and automatic repair
-	}, "") + "\x00\x03" // cancel apply without provider calls, verification, or writes
+		"1\n",      // OpenAI-compatible provider
+		"\n", "\n", // keep environment endpoint and default model
+	}, "") + "\x00\x03" // cancel the one approval before calls or writes
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, input,
@@ -162,9 +160,10 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 	}
 	final := result.Stdout[previewAt:]
 	for _, want := range []string{
-		"Approve exact full verification command: make test",
-		"Approve automatic repair of eligible ACD commits",
-		"Apply this reviewed configuration",
+		"Verification: full",
+		"repository command will run in an ephemeral worktree: make test",
+		"eligible recent ACD-owned commits may be repaired automatically",
+		"Approve every permission shown above",
 	} {
 		if !strings.Contains(final, want) {
 			t.Errorf("final approval missing %q\n%s", want, final)

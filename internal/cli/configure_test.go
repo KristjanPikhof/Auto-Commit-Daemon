@@ -17,7 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type configureFakeService struct {
@@ -91,12 +91,17 @@ func (f *configureFakeService) TestProvider(context.Context, map[string]string, 
 	*f.order = append(*f.order, "provider")
 	return settings.ProviderTestResult{Fingerprint: "reviewed-fingerprint", Provider: "openai-compat", Success: true}, nil
 }
-func (f *configureFakeService) Apply(context.Context, settings.ApplyRequest) (settings.ApplyResult, error) {
+func (f *configureFakeService) Apply(_ context.Context, req settings.ApplyRequest) (settings.ApplyResult, error) {
 	*f.order = append(*f.order, "revision")
 	if f.applyErr != nil {
 		return settings.ApplyResult{}, f.applyErr
 	}
-	return settings.ApplyResult{RevisionID: 42, Queued: true}, nil
+	result := settings.ApplyResult{RevisionID: 42, RequestID: 7, Queued: true}
+	if req.SetupValidation != nil {
+		result.ValidationRunID = 9
+		result.ValidationStatus = state.ConfigValidationQueued
+	}
+	return result, nil
 }
 func (f *configureFakeService) Revert(context.Context, settings.RevertRequest) (settings.ApplyResult, error) {
 	return settings.ApplyResult{}, errors.New("not used")
@@ -119,11 +124,11 @@ func TestConfigureDryRunJSONHasNoOperationalSideEffects(t *testing.T) {
 	withIsolatedHome(t)
 	oldOpen, oldWizard, oldConfirm := openConfigureSettingsService, runConfigureWizard, confirmConfigurePreview
 	oldStatus, oldWrite := configureCredentialStatus, configureCredentialWrite
-	oldVerify, oldEnable := configureRunVerification, configureEnable
+	oldEnable := configureEnable
 	defer func() {
 		openConfigureSettingsService, runConfigureWizard, confirmConfigurePreview = oldOpen, oldWizard, oldConfirm
 		configureCredentialStatus, configureCredentialWrite = oldStatus, oldWrite
-		configureRunVerification, configureEnable = oldVerify, oldEnable
+		configureEnable = oldEnable
 	}()
 	called := false
 	openConfigureSettingsService = func(context.Context, settings.Options) (settingsCLIService, error) {
@@ -143,10 +148,6 @@ func TestConfigureDryRunJSONHasNoOperationalSideEffects(t *testing.T) {
 		return credentials.SourceNone, false, nil
 	}
 	configureCredentialWrite = func(paths.Roots, string) error { called = true; return nil }
-	configureRunVerification = func(context.Context, string, string, string, string, string) (verification.Result, error) {
-		called = true
-		return verification.Result{}, nil
-	}
 	configureEnable = func(context.Context, io.Writer, string, bool) error { called = true; return nil }
 
 	out, _, err := executeConfigureCommand(t, "", "--repo", repo, "--strategy", "intent",
@@ -161,8 +162,11 @@ func TestConfigureDryRunJSONHasNoOperationalSideEffects(t *testing.T) {
 	if err := jsonUnmarshalStrict([]byte(out), &report); err != nil {
 		t.Fatalf("decode report: %v\n%s", err, out)
 	}
-	if !report.DryRun || report.PresetID != "intent.balanced" ||
-		report.Verification.Mode != "fast" || report.Verification.Status != "approval_required" ||
+	if !report.DryRun || report.Version != 3 ||
+		report.Experience != "Everyday" ||
+		report.PresetID != "intent.balanced" ||
+		report.Verification.Mode != "structural" ||
+		report.Verification.Status != "approval_required" ||
 		report.Daemon != "unchanged" || len(report.Risks) != 3 ||
 		report.HarnessGuidance == nil {
 		t.Fatalf("report=%+v", report)
@@ -213,13 +217,6 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 			Apply:        true,
 		}, nil
 	}
-	configureRunVerification = func(_ context.Context, _, mode, command, timeout, _ string) (verification.Result, error) {
-		order = append(order, "verification")
-		if mode != "fast" || command != "make test" || timeout != "2m" {
-			t.Fatalf("verification=%q %q %q", mode, command, timeout)
-		}
-		return verification.Result{Status: verification.StatusPassed}, nil
-	}
 	configureCredentialWrite = func(_ paths.Roots, secret string) error {
 		order = append(order, "credential")
 		if secret != "staged-secret" {
@@ -240,7 +237,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	}
 	want := []string{
 		"credential_status", "authoring", "wizard", "validate", "confirm",
-		"validate", "snapshot", "validate", "provider", "verification",
+		"validate", "snapshot", "validate", "provider",
 		"credential", "settings", "revision", "on",
 	}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
@@ -249,7 +246,9 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	if strings.Count(strings.Join(order, ","), "revision") != 1 {
 		t.Fatalf("revision count in %v", order)
 	}
-	if !strings.Contains(out, "Configuration active: intent.balanced@2; runtime revision 42; daemon enabled.") ||
+	if !strings.Contains(out, "Configuration saved.") ||
+		!strings.Contains(out, "Commit publishing: waiting for quick validation") ||
+		!strings.Contains(out, "Safe to close this terminal.") ||
 		!strings.Contains(out, "no external hook file will be edited") ||
 		!strings.Contains(out, "repository command will run in an ephemeral worktree: make test") ||
 		!strings.Contains(out, "eligible recent ACD-owned commits may be repaired automatically") ||
@@ -260,14 +259,13 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 		"Applying reviewed configuration...",
 		"[1/6] Testing provider with synthetic content...",
 		"[1/6] Provider test passed.",
-		"[2/6] Running fast verification in an ephemeral worktree: make test (timeout 2m)...",
-		"[2/6] Verification passed.",
+		"[2/6] Background validation target prepared.",
 		"[3/6] Storing protected credential...",
 		"[3/6] Protected credential stored.",
 		"[4/6] Saving repository settings...",
 		"[4/6] Repository settings saved.",
 		"[5/6] Creating immutable runtime revision...",
-		"[5/6] Runtime revision 42 created.",
+		"[5/6] Runtime revision 42 created; validation job 9 queued.",
 		"[6/6] Enabling ACD...",
 		"[6/6] ACD enabled.",
 	}
@@ -355,7 +353,7 @@ func TestConfigureDeclineDoesNotCreateConfigOrState(t *testing.T) {
 	}
 }
 
-func TestConfigureVerificationFailureLeavesCredentialAndSettingsUntouched(t *testing.T) {
+func TestConfigureQueuesVerificationWithoutBlockingSetup(t *testing.T) {
 	repo := materializeTestRepo(t, true)
 	withIsolatedHome(t)
 	var order []string
@@ -395,15 +393,6 @@ func TestConfigureVerificationFailureLeavesCredentialAndSettingsUntouched(t *tes
 			Apply:        true,
 		}, nil
 	}
-	configureRunVerification = func(context.Context, string, string, string, string, string) (verification.Result, error) {
-		order = append(order, "verification")
-		return verification.Result{
-			Status:         verification.StatusFailed,
-			NeedsAttention: true,
-			ExitCode:       1,
-			Output:         "ok example/one\nFAIL example/two\n",
-		}, nil
-	}
 	configureCredentialWrite = func(paths.Roots, string) error {
 		order = append(order, "credential")
 		return nil
@@ -414,27 +403,23 @@ func TestConfigureVerificationFailureLeavesCredentialAndSettingsUntouched(t *tes
 	}
 	settingsInputTTY = func(io.Reader) bool { return true }
 	settingsOutputTTY = func(io.Writer) bool { return true }
-	_, progress, err := executeConfigureCommand(t, "", "--repo", repo)
-	if err == nil ||
-		!strings.Contains(err.Error(), "fast verification failed with exit code 1") ||
-		!strings.Contains(err.Error(), "No configuration was changed") {
-		t.Fatalf("err=%v", err)
+	out, progress, err := executeConfigureCommand(t, "", "--repo", repo)
+	if err != nil {
+		t.Fatalf("configure: %v", err)
 	}
 	for _, want := range []string{
 		"[1/6] Testing provider with synthetic content...",
 		"[1/6] Provider test passed.",
-		"[2/6] Running fast verification in an ephemeral worktree: make test (timeout 2m)...",
-		"[2/6] Verification failed with exit code 1.",
-		"Verification output (sanitized tail):",
-		"ok example/one\nFAIL example/two",
+		"[2/6] Background validation target prepared.",
+		"validation job 9 queued",
 	} {
-		if !strings.Contains(progress, want) {
-			t.Errorf("progress missing %q:\n%s", want, progress)
+		if !strings.Contains(progress+out, want) {
+			t.Errorf("output missing %q:\n%s\n%s", want, progress, out)
 		}
 	}
 	got := strings.Join(order, ",")
-	if got != "authoring,validate,validate,snapshot,validate,provider,verification" {
-		t.Fatalf("failure order=%v", order)
+	if got != "authoring,validate,validate,snapshot,validate,provider,settings,revision,on" {
+		t.Fatalf("order=%v", order)
 	}
 }
 
@@ -490,6 +475,47 @@ func TestDetectVerificationCommandUsesGoFallback(t *testing.T) {
 	}
 	if got := detectVerificationCommand(repo); got != "go test ./..." {
 		t.Fatalf("detected command=%q", got)
+	}
+}
+
+func TestDetectVerificationCommandsSeparatesQuickAndFull(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"), []byte(
+		"verify-fast:\n\tgo test ./... -run '^$'\n\n"+
+			"test:\n\tgo test ./...\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"),
+		[]byte("module example.test/repo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := detectVerificationCommands(repo)
+	if got.QuickCommand != "make verify-fast" ||
+		got.QuickSource != "Makefile target verify-fast" ||
+		got.FullCommand != "make test" ||
+		got.FullSource != "Makefile target test" {
+		t.Fatalf("detected=%+v", got)
+	}
+}
+
+func TestDetectVerificationManifestWinsWithProvenance(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "acd.verification.json"),
+		[]byte(`{"version":1,"quick":"./check quick","full":"./check full"}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
+		[]byte("test:\n\tfalse\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := detectVerificationCommands(repo)
+	if got.QuickCommand != "./check quick" ||
+		got.FullCommand != "./check full" ||
+		got.QuickSource != "repository ACD verification manifest" ||
+		got.FullSource != "repository ACD verification manifest" {
+		t.Fatalf("detected=%+v", got)
 	}
 }
 
@@ -640,7 +666,11 @@ func TestConfigureApplyFailureReportsStagesAndRestoresCredential(t *testing.T) {
 
 func TestConfigureHelpAndInvalidFlags(t *testing.T) {
 	help := commandHelp(t, "configure")
-	for _, want := range []string{"--accessible", "--strategy", "--preset", "--credential-stdin", "--dry-run", "one immutable", "never edits harness"} {
+	for _, want := range []string{
+		"--accessible", "--strategy", "--preset", "--credential-stdin",
+		"--dry-run", "--wait", "Everyday work", "background validation",
+		"edits harness hook",
+	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help missing %q", want)
 		}
@@ -651,6 +681,7 @@ func TestConfigureHelpAndInvalidFlags(t *testing.T) {
 		{"--repo", repo, "--preset", "huge", "--dry-run"},
 		{"--repo", repo, "--json"},
 		{"--repo", repo, "--dry-run", "--credential-stdin"},
+		{"--repo", repo, "--dry-run", "--wait"},
 	} {
 		if _, _, err := executeConfigureCommand(t, "", args...); err == nil {
 			t.Fatalf("args %v succeeded", args)
@@ -664,14 +695,14 @@ func restoreConfigureFakes(t *testing.T) {
 	oldPreview := openConfigureValidationService
 	oldStatus, oldWrite := configureCredentialStatus, configureCredentialWrite
 	oldRead, oldRemove := configureCredentialRead, configureCredentialRemove
-	oldVerify, oldEnable := configureRunVerification, configureEnable
+	oldEnable := configureEnable
 	oldIn, oldOut := settingsInputTTY, settingsOutputTTY
 	t.Cleanup(func() {
 		openConfigureSettingsService, runConfigureWizard, confirmConfigurePreview = oldOpen, oldWizard, oldConfirm
 		openConfigureValidationService = oldPreview
 		configureCredentialStatus, configureCredentialWrite = oldStatus, oldWrite
 		configureCredentialRead, configureCredentialRemove = oldRead, oldRemove
-		configureRunVerification, configureEnable = oldVerify, oldEnable
+		configureEnable = oldEnable
 		settingsInputTTY, settingsOutputTTY = oldIn, oldOut
 	})
 }

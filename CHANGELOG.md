@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Isolated verification subprocess environment directories from repository and
+  Git ancestry. Temporary Git-negative tests can no longer discover the
+  candidate repository through `TMPDIR`.
 - Fixed `acd configure` appearing blocked after final approval. It now reports
   numbered progress, exposes sanitized verification failure output, and avoids
   delayed terminal capability replies corrupting short-terminal shell prompts.
@@ -13,6 +16,13 @@
 
 ### Added
 
+- Added Everyday work, Maximum speed, and Strict review setup experiences with
+  adaptive provider reuse, first-time endpoint and model prompts, one
+  fingerprint-bound approval, separate quick and full check detection, and
+  `acd configure --wait`.
+- Added durable background configuration validation. Capture remains active
+  while replay and repair wait, and failed checks preserve the desired
+  revision, last-known-good runtime, sanitized output, and retry state.
 - Added Intent v2 semantic candidates, dependency-aware non-contiguous
   grouping, explicit atomicity gates, exact candidate-tree verification, and
   preset-aware planner fallback.
@@ -47,9 +57,11 @@
 - Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
   hard evaluation boundaries; neither boundary bypasses atomicity,
   verification, branch, pause, Git-operation, conflict, or replay safety.
-- Repository state is now SQLite `SchemaVersion=15`, adding candidate,
+- Repository state is now SQLite `SchemaVersion=16`, adding candidate,
   dependency, activity-boundary, verification, and repair state without
   removing v14 events, decisions, revisions, experiments, or recovery data.
+  Version 16 adds durable setup-validation attempts without revalidating
+  existing applied revisions.
 
 ## v2026-07-26
 

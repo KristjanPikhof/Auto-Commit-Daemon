@@ -32,6 +32,11 @@ non-secret values do not require shell sourcing. See the
 [settings guide](settings.md) for source precedence, safe activation, and
 rejected-revision recovery.
 
+Normal Intent setup returns after provider testing and durable validation
+queueing. Capture stays active while commit publishing waits. Use
+`acd configure --wait` to follow the job, or close the terminal and inspect it
+later with `acd status`.
+
 See [commands.md](commands.md) for the complete public command reference,
 including repo administration, maintenance, and the hook protocol.
 
@@ -279,6 +284,11 @@ Missing Intent v2 prerequisites always block replay, not capture. Run
 `acd configure` when status reports missing provider testing, credential, diff
 consent, or verification approval. ACD does not fall back to v1 or
 metadata-only planning.
+
+Configuration validation uses the same capture-only safety state. A queued or
+running job needs no action. A failed or timed-out job preserves the desired
+revision and last-known-good runtime. Re-run `acd configure` to retry the exact
+check or switch experience.
 
 To check whether work was captured, planner-visible, and committed as intended:
 

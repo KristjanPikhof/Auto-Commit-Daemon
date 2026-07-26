@@ -50,7 +50,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands, health/control, recovery, setup, start cache |
 | `internal/daemon` | Run loop, capture/replay, exact-chain reconciliation, intent circuit, shadow, fsnotify |
-| `internal/state` | SQLite v15: events/ops, candidates/dependencies/repairs, runtime settings, recovery, meta/clients/flush |
+| `internal/state` | SQLite v16: events/ops, candidates/dependencies/repairs, runtime settings/validation, recovery, meta/clients/flush |
 | `internal/git` | Bounded Git/ref/tree/diff/blob/index/history/ignore helpers |
 | `internal/ai` | Deterministic, OpenAI-compatible, subprocess providers; prompts and planner |
 | `internal/{central,config,identity,logger,paths,pause,prompttrace,trace}` | Registry/config, XDG/logging, pause and diagnostics |
@@ -85,7 +85,7 @@ Commit messages:
 
 ## State, branches and capture
 
-- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. v12 adds immutable recovery snapshots, v13 adds same-base recovery-prefix retention, v14 adds runtime config revisions and experiments, and `SchemaVersion=15` adds Intent candidates, dependencies, boundaries and repair transactions; see `internal/state/migrate.go`.
+- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. v12 adds immutable recovery snapshots, v13 adds same-base recovery-prefix retention, v14 adds runtime config revisions and experiments, v15 adds Intent candidates, dependencies, boundaries and repairs, and `SchemaVersion=16` adds durable setup validation; see `internal/state/migrate.go`.
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2, atomic temp+rename. `acd stop` removes matching/all caches.
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Reset/rebase/switch/same-SHA ref switch bumps generation; ordinary FF keeps it, except FF during rewind grace bumps, reseeds, and clears grace. Legacy bare rev upgrades as Diverged.
 - Every non-unchanged token transition reconciles the prior exact pair before acceptance; dead-ref sweeps alone skip live refs.
@@ -100,7 +100,7 @@ Commit messages:
 
 ## Replay and intent
 
-- `acd configure` is regular-user onboarding: strategy/preset, provider, protected credential, diff consent, exact approved verification command, final preview, one runtime revision, then `acd on`. Dry-run performs no provider call, command, write, start or hook change. It reports missing harness setup without editing external files.
+- `acd configure` is regular-user onboarding: Everyday, Maximum speed, or Strict review; adaptive provider/endpoint/model/credential prompts; one fingerprint-bound preview; synchronous provider test; then one runtime revision plus a durable background validation job and `acd on`. Capture continues while replay/repair wait. `--wait` follows the job. Dry-run performs no provider call, command, write, start or hook change. It reports missing harness setup without editing external files.
 - `acd settings` remains the advanced configuration lab. It uses Bubble Tea v2.0.8, Bubbles v2.1.1, Lip Gloss v2.0.5, and Huh v2.0.3. Preserve static CGO-disabled builds, responsive/accessible/no-color behavior, `DRAFT > TESTED > QUEUED > ACTIVE`, and first-class strategy/preset actions.
 - Resolution is experiment > repository > profile > global > environment > selected preset > field default. Runtime revisions materialize `preset_id`, `preset_version` and `customized`. Reset removes only preset-owned overrides. Hot revisions activate between passes; restart-required fields resolve on the next daemon start. Global saves do not fan out and stopped-daemon settings apply never starts it.
 - Credentials use `${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json` schema v1. Require a regular owner-only `0600` file below an owner-only `0700` directory; reject symlinks, wrong ownership, broad permissions, malformed/multiple JSON and future versions. Write by same-directory `0600` temp, fsync, rename and directory fsync. `ACD_AI_API_KEY` wins. Secrets never enter settings, revisions, SQLite, logs, traces, fingerprints, status, diagnostics or errors.

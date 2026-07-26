@@ -33,14 +33,15 @@ overrides. See [Configure ACD](settings.md).
 
 ## Configure ACD
 
-`acd configure` stages a complete everyday configuration and shows one final
-preview. It recommends Intent Balanced, tests the provider with synthetic
-content, runs only an exact verification command you approve, stores an
-optional protected credential, creates one immutable runtime revision, and
-enables ACD. It never changes hook files.
+`acd configure` offers Everyday work, Maximum speed, and Strict review, then
+shows one final approval. It reuses valid provider details. A fresh or
+incomplete OpenAI-compatible setup asks for the endpoint and model, plus a
+masked API key when no credential exists. The final review includes the model,
+endpoint, verification source, exact command, and repair policy.
 
 ~~~bash
 acd configure
+acd configure --wait
 acd configure --accessible
 acd configure --strategy intent --preset balanced
 acd configure --dry-run --json
@@ -49,15 +50,16 @@ acd configure --dry-run --json
 Dry-run performs no provider call, command execution, credential or settings
 write, daemon start, or hook change.
 
-After approval, six numbered stderr stages show the provider test,
-verification, credential, settings, runtime revision, and daemon work.
-Verification failures show a bounded sanitized output tail. Short terminals
-automatically use the linear prompt renderer; `NO_COLOR` disables progress
-colors.
+After approval, configure tests the provider before any write. Event Fast
+activates immediately. Intent setup creates one immutable runtime revision and
+durable background validation job. Capture remains active while replay and
+repair wait for that job. The normal command returns after the job is queued;
+`--wait` follows it to a terminal result.
 
 The regular wizard does not request free-form shell input. It reuses an
-existing repository command or detects a supported project command, then shows
-that exact command in the final approval. Custom commands remain an advanced
+approved repository command or detects quick and full project checks
+separately. Everyday can use built-in structural verification. Strict review
+requires a detected full command. Custom commands remain an advanced
 `acd settings` action.
 
 `acd settings` opens the advanced terminal settings lab:

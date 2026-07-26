@@ -119,11 +119,17 @@ Use the guided setup for a regular repository:
 acd configure
 ~~~
 
-The wizard recommends Intent Balanced. It previews the exact provider, diff
-context, verification command, and automatic repair policy before changing
-anything. Apply creates one immutable runtime revision and enables ACD. It does
-not edit hook files, so run the reported `acd setup <harness>` command
-separately when needed.
+Choose Everyday work, Maximum speed, or Strict review. Everyday is the
+recommended default and maps to Intent Balanced. Existing provider, model,
+endpoint, timeout, and credential values are reused when valid. A fresh
+OpenAI-compatible setup asks for the endpoint, model, and masked API key, then
+shows those exact values in the final review.
+
+One approval covers the displayed diff context, endpoint, verification, and
+repair permissions. The provider test runs before any write. Intent setup
+queues a durable background validation job, keeps capture active, and returns
+without waiting for the project check. Commit publishing starts only after the
+check passes.
 
 Preview the default or preselect a mode without making calls or writes:
 
@@ -131,7 +137,12 @@ Preview the default or preselect a mode without making calls or writes:
 acd configure --dry-run
 acd configure --strategy intent --preset balanced
 acd configure --accessible
+acd configure --wait
 ~~~
+
+Use `--wait` when you want the terminal to follow the queued validation until
+it passes or needs attention. Re-running `acd configure` resumes or retries an
+unfinished setup without discarding the reviewed revision.
 
 Use `acd settings` after onboarding for profiles, experiments, and advanced
 field overrides. See the [settings guide](docs/settings.md) for authoring

@@ -13,21 +13,18 @@ import (
 func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	input := strings.Join([]string{
-		"", // intent
-		"", // balanced
-		"", // imperative
+		"", // Everyday
 		"", // openai-compat
-		"", // model
-		"", // base URL
-		"", // timeout
+		"https://gateway.example/v1",
+		"gateway-model",
 		"staged-secret",
-		"y", // approve network diff context
 		"",
 	}, "\n")
 	var out bytes.Buffer
 	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
-		Accessible: true, DetectedCommand: "make test",
+		Accessible: true, DetectedQuickCommand: "go test ./... -run '^$'",
+		DetectedQuickSource: "Go language default",
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
@@ -40,36 +37,42 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 	}
 	if selection.Strategy != "intent" || selection.Preset != "balanced" ||
 		selection.VerificationMode != "fast" ||
-		selection.VerificationCommand != "make test" ||
+		selection.VerificationCommand != "go test ./... -run '^$'" ||
 		selection.VerificationApproved || !selection.DiffContextApproved ||
-		selection.Credential != "staged-secret" {
+		selection.Credential != "staged-secret" ||
+		selection.BaseURL != "https://gateway.example/v1" ||
+		selection.Model != "gateway-model" {
 		t.Fatalf("selection=%+v\n%s", selection, out.String())
 	}
 	if strings.Contains(out.String(), "staged-secret") || strings.Contains(out.String(), "\x1b[") {
 		t.Fatalf("accessible output leaked secret or color: %q", out.String())
 	}
-	for _, want := range []string{"Commit strategy", "Balanced (recommended)", "redacted repository diff context"} {
+	for _, want := range []string{
+		"How should ACD work?", "Everyday work", "Commit message provider",
+		"OpenAI-compatible endpoint", "Model", "API key",
+	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output missing %q\n%s", want, out.String())
 		}
 	}
-	if strings.Contains(out.String(), "verification command") {
-		t.Errorf("regular wizard asked the user to enter a verification command:\n%s", out.String())
+	for _, forbidden := range []string{
+		"verification command", "Commit message format", "Provider timeout",
+	} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Errorf("regular wizard rendered technical prompt %q:\n%s",
+				forbidden, out.String())
+		}
 	}
 }
 
 func TestConfigureWizardUsesSavedVerificationBeforeDetection(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
-	input := strings.Join([]string{
-		"", "", "", "", // intent, balanced, imperative, provider
-		"", "", "", // model, base URL, timeout
-		"y", // approve diff context
-		"",
-	}, "\n")
+	input := "\n"
 	var out bytes.Buffer
 	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
 		Accessible: true, DetectedCommand: "make test", HasCredential: true,
+		ProviderConfigured: true, OpenAIConfigured: true,
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
@@ -83,21 +86,47 @@ func TestConfigureWizardUsesSavedVerificationBeforeDetection(t *testing.T) {
 	if selection.VerificationCommand != "go test ./..." {
 		t.Fatalf("verification command=%q", selection.VerificationCommand)
 	}
-	if strings.Contains(out.String(), "verification command") {
-		t.Fatalf("regular wizard asked for command input:\n%s", out.String())
+	for _, forbidden := range []string{
+		"Commit message provider", "API key", "verification command",
+		"Model", "base URL", "Provider timeout",
+	} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("existing provider flow rendered %q:\n%s",
+				forbidden, out.String())
+		}
 	}
 }
 
-func TestConfigureWizardRequiresDetectedVerification(t *testing.T) {
+func TestConfigureWizardStrictUnavailableWithoutFullCheck(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
-	input := strings.Join([]string{
-		"", "", "", "", // intent, balanced, imperative, provider
-		"", "", "", // model, base URL, timeout
-	}, "\n")
 	var out bytes.Buffer
 	_, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
+		Input:  &bytewiseReader{r: strings.NewReader("3\n")},
+		Output: &out, Accessible: true, HasCredential: true,
+		ProviderConfigured: true, OpenAIConfigured: true,
+		Defaults: map[string]string{
+			"commit.strategy": "intent", "commit.preset": "balanced",
+			"commit.format": "imperative", "ai.provider": "openai-compat",
+			"ai.model":    "gpt-5.4-mini",
+			"ai.base_url": "https://api.openai.com/v1",
+			"ai.timeout":  "30s",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(),
+		"Strict Review is unavailable") ||
+		!strings.Contains(err.Error(), "acd settings") {
+		t.Fatalf("err=%v\n%s", err, out.String())
+	}
+}
+
+func TestConfigureWizardFallsBackToStructuralVerification(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	input := "\n"
+	var out bytes.Buffer
+	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
 		Accessible: true, HasCredential: true,
+		ProviderConfigured: true, OpenAIConfigured: true,
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
@@ -105,8 +134,9 @@ func TestConfigureWizardRequiresDetectedVerification(t *testing.T) {
 			"ai.timeout": "30s",
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "choose Intent Fast") {
-		t.Fatalf("err=%v\n%s", err, out.String())
+	if err != nil || selection.VerificationMode != "structural" ||
+		selection.VerificationSource != "built-in structural verification" {
+		t.Fatalf("selection=%+v err=%v\n%s", selection, err, out.String())
 	}
 }
 
@@ -188,7 +218,7 @@ func TestAccessibleFastToQualityResetsOnlyPresetSources(t *testing.T) {
 func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 	var out bytes.Buffer
 	approval, err := ConfirmConfigurePreview(context.Background(),
-		&bytewiseReader{r: strings.NewReader("y\ny\ny\n")}, &out, true,
+		&bytewiseReader{r: strings.NewReader("y\n")}, &out, true,
 		ConfigurePreviewApprovalOptions{
 			VerificationMode: "full", VerificationCommand: "make test\nunsafe",
 			RepairEnabled: true, RepairHorizon: "30m", RepairMaxCommits: "5",
@@ -197,13 +227,11 @@ func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
 	}
 	view := out.String()
-	for _, want := range []string{"make test unsafe", "within 30m", "up to 5 commits"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("missing %q\n%s", want, view)
-		}
+	if !strings.Contains(view, "Approve every permission shown above") {
+		t.Errorf("single approval missing:\n%s", view)
 	}
-	if strings.Contains(view, "make test\nunsafe") {
-		t.Fatalf("unsanitized command rendered: %q", view)
+	if strings.Contains(view, "make test") || strings.Contains(view, "30m") {
+		t.Fatalf("single approval repeated preview details: %q", view)
 	}
 	if strings.Contains(view, "\x1b[") {
 		t.Fatalf("final approval used rich terminal rendering: %q", view)

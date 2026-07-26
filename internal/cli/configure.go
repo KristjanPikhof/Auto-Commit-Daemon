@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,14 +21,15 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-const configureReportVersion = 2
+const configureReportVersion = 3
 
 type configureOptions struct {
 	Strategy        string
@@ -35,22 +37,26 @@ type configureOptions struct {
 	Accessible      bool
 	CredentialStdin bool
 	DryRun          bool
+	Wait            bool
 	JSON            bool
 	Repo            string
 }
 
 type configureVerificationReport struct {
-	Mode     string `json:"mode"`
-	Command  string `json:"command,omitempty"`
-	Timeout  string `json:"timeout,omitempty"`
-	Approved bool   `json:"approved"`
-	Status   string `json:"status"`
+	Mode             string `json:"mode"`
+	Command          string `json:"command,omitempty"`
+	CommandSource    string `json:"command_source,omitempty"`
+	Timeout          string `json:"timeout,omitempty"`
+	ExpectedDuration string `json:"expected_duration,omitempty"`
+	Approved         bool   `json:"approved"`
+	Status           string `json:"status"`
 }
 
 type configureReport struct {
 	Version          int                         `json:"version"`
 	DryRun           bool                        `json:"dry_run"`
 	Repo             string                      `json:"repo"`
+	Experience       string                      `json:"experience"`
 	Strategy         string                      `json:"strategy"`
 	Preset           string                      `json:"preset"`
 	PresetID         string                      `json:"preset_id"`
@@ -58,6 +64,9 @@ type configureReport struct {
 	Customized       bool                        `json:"customized"`
 	CommitFormat     string                      `json:"commit_format"`
 	Provider         string                      `json:"provider"`
+	Model            string                      `json:"model,omitempty"`
+	Endpoint         string                      `json:"endpoint,omitempty"`
+	ProviderTimeout  string                      `json:"provider_timeout,omitempty"`
 	CredentialSource credentials.Source          `json:"credential_source"`
 	DiffContext      string                      `json:"diff_context"`
 	Verification     configureVerificationReport `json:"verification"`
@@ -65,6 +74,8 @@ type configureReport struct {
 	RepairHorizon    string                      `json:"repair_horizon"`
 	RepairMaxCommits string                      `json:"repair_max_commits"`
 	RuntimeRevision  int64                       `json:"runtime_revision,omitempty"`
+	ExecutionMode    string                      `json:"execution_mode"`
+	Readiness        string                      `json:"readiness"`
 	Daemon           string                      `json:"daemon"`
 	HarnessGuidance  []string                    `json:"harness_guidance"`
 	Risks            []string                    `json:"risks"`
@@ -86,6 +97,7 @@ var (
 	}
 	runConfigureWizard        = settingsui.RunConfigureWizard
 	confirmConfigurePreview   = settingsui.ConfirmConfigurePreview
+	chooseConfigureRecovery   = settingsui.ChooseConfigureRecovery
 	configureCredentialStatus = func(roots paths.Roots, lookup func(string) (string, bool)) (credentials.Source, bool, error) {
 		store := credentials.NewStore(roots)
 		_, source, err := credentials.Resolve(store, lookup)
@@ -101,20 +113,6 @@ var (
 		_, err := credentials.NewStore(roots).Remove()
 		return err
 	}
-	configureRunVerification = func(ctx context.Context, repo, mode, command, timeout, commit string) (verification.Result, error) {
-		duration, err := time.ParseDuration(timeout)
-		if err != nil {
-			return verification.Result{}, errors.New("acd configure: invalid verification timeout")
-		}
-		approved, err := verification.NewApprovedCommand(
-			repo, "configure-preview", verification.Mode(mode), command, duration)
-		if err != nil {
-			return verification.Result{}, err
-		}
-		return (verification.Runner{}).Run(ctx, verification.Request{
-			RepoPath: repo, CandidateID: "configure-preview", CommitOID: commit, Command: approved,
-		})
-	}
 	configureEnable    = runControlOn
 	configureHarnesses = adapter.DetectInstalled
 )
@@ -126,14 +124,19 @@ func newConfigureCmd() *cobra.Command {
 		Short: "Guided strategy, preset, provider, and safety setup",
 		Long: `Configure ACD for everyday use through one reviewed transaction.
 
-The wizard recommends Intent Balanced, tests the provider with synthetic
-content, runs only an exact repository verification command you approve,
-stores an optional credential in the protected XDG file, creates one immutable
-runtime revision, and enables ACD. It never edits harness hook files.
+Choose Everyday work, Maximum speed, or Strict review. The wizard reuses valid
+provider settings, asks for missing endpoint, model, or credential details,
+and shows one exact review with the check and permissions.
+
+The provider is tested before any write. Intent setup then queues a durable
+background validation gate, keeps capture active, and returns immediately.
+Use --wait to follow that gate until it passes or needs attention. ACD never
+edits harness hook files.
 
 --dry-run prints the final projection without provider calls, command
 execution, credential/settings writes, daemon starts, or hook changes.`,
 		Example: `  acd configure
+  acd configure --wait
   acd configure --accessible
   acd configure --strategy intent --preset balanced
   printf '%s\n' "$ACD_AI_API_KEY" | acd configure --credential-stdin
@@ -151,6 +154,7 @@ execution, credential/settings writes, daemon starts, or hook changes.`,
 	cmd.Flags().BoolVar(&opts.Accessible, "accessible", false, "Use linear screen-reader-friendly prompts")
 	cmd.Flags().BoolVar(&opts.CredentialStdin, "credential-stdin", false, "Read the credential from the first standard-input line")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Preview without calls, commands, writes, starts, or hook changes")
+	cmd.Flags().BoolVar(&opts.Wait, "wait", false, "Wait for queued setup validation to finish")
 	return cmd
 }
 
@@ -160,6 +164,9 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	if opts.CredentialStdin && opts.DryRun {
 		return errors.New("acd configure: --credential-stdin has no effect with --dry-run")
+	}
+	if opts.Wait && opts.DryRun {
+		return errors.New("acd configure: --wait cannot be used with --dry-run")
 	}
 	strategy, preset, err := normalizeConfigureMode(opts.Strategy, opts.Preset)
 	if err != nil {
@@ -173,9 +180,9 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if err != nil {
 		return fmt.Errorf("acd configure: resolve paths: %w", err)
 	}
-	suggested := detectVerificationCommand(repo)
+	detected := detectVerificationCommands(repo)
 	if opts.DryRun {
-		selection := dryRunConfigureSelection(strategy, preset, suggested)
+		selection := dryRunConfigureSelection(strategy, preset, detected)
 		report, err := buildConfigureReport(repo, selection, credentials.SourceNone, true)
 		if err != nil {
 			return err
@@ -188,6 +195,95 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		configureTerminalTooShort(cmd.OutOrStdout())
 	if !accessible && (!settingsInputTTY(cmd.InOrStdin()) || !settingsOutputTTY(cmd.OutOrStdout())) {
 		return errors.New("acd configure: rich mode requires interactive stdin and stdout; use --accessible")
+	}
+	explicitMode := cmd.Flags().Changed("strategy") ||
+		cmd.Flags().Changed("preset")
+	if !explicitMode && !opts.CredentialStdin {
+		existing, found, existingErr := existingConfigureValidation(
+			cmd.Context(), repo,
+		)
+		if existingErr != nil {
+			return fmt.Errorf(
+				"acd configure: inspect unfinished setup: %w", existingErr,
+			)
+		}
+		if found {
+			switch existing.Status {
+			case state.ConfigValidationQueued, state.ConfigValidationRunning:
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"Configuration validation is %s (attempt %d).\n",
+					existing.Status, existing.Attempt)
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"Capture remains active; commit publishing is waiting.")
+				if opts.Wait {
+					return waitForConfigureValidation(
+						cmd.Context(), cmd.OutOrStdout(), repo, existing.ID,
+					)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"Safe to close this terminal. Use `acd configure --wait` to follow it.")
+				return nil
+			case state.ConfigValidationFailed,
+				state.ConfigValidationTimedOut,
+				state.ConfigValidationCancelled:
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"Configuration validation %s (attempt %d).\n",
+					existing.Status, existing.Attempt)
+				choice, choiceErr := chooseConfigureRecovery(
+					cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(),
+					accessible,
+				)
+				if choiceErr != nil {
+					return fmt.Errorf(
+						"acd configure: choose recovery: %w", choiceErr,
+					)
+				}
+				switch choice {
+				case settingsui.ConfigureRecoveryRetry:
+					retry, retried, retryErr := retryConfigureValidation(
+						cmd.Context(), repo, existing.ActivationRequestID,
+					)
+					if retryErr != nil {
+						return fmt.Errorf(
+							"acd configure: retry validation: %w", retryErr,
+						)
+					}
+					if !retried {
+						return errors.New(
+							"acd configure: validation is no longer retryable; rerun configure",
+						)
+					}
+					if err := configureEnable(
+						cmd.Context(), io.Discard, repo, false,
+					); err != nil {
+						return fmt.Errorf(
+							"acd configure: enable validation worker: %w", err,
+						)
+					}
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"Validation retry queued (attempt %d).\n",
+						retry.Attempt)
+					if opts.Wait {
+						return waitForConfigureValidation(
+							cmd.Context(), cmd.OutOrStdout(), repo, retry.ID,
+						)
+					}
+					fmt.Fprintln(cmd.OutOrStdout(),
+						"Capture remains active; commit publishing is waiting.")
+					return nil
+				case settingsui.ConfigureRecoveryAdvanced:
+					fmt.Fprintln(cmd.OutOrStdout(),
+						"Run `acd settings` to edit advanced verification settings.")
+					return nil
+				case settingsui.ConfigureRecoveryLeave:
+					fmt.Fprintln(cmd.OutOrStdout(),
+						"Capture-only state left unchanged.")
+					return nil
+				case settingsui.ConfigureRecoverySwitch:
+					// Continue into the normal experience selector.
+				}
+			}
+		}
 	}
 	wizardInput := cmd.InOrStdin()
 	var stagedCredential []byte
@@ -216,15 +312,32 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd configure: resolve authoring defaults: %w", err)
 	}
 	defaults := authoring.Values
+	originalProvider := defaults[config.FieldProvider]
 	defaults[config.FieldCommitStrategy] = strategy
 	defaults[config.FieldCommitPreset] = preset
 	if strategy == "intent" && defaults[config.FieldProvider] == "deterministic" {
 		defaults[config.FieldProvider] = "openai-compat"
 	}
+	providerConfigured := configureSourceIsExplicit(
+		authoring.Sources[config.FieldProvider],
+	) && originalProvider == defaults[config.FieldProvider]
+	openAIConfigured := configureSourceIsExplicit(
+		authoring.Sources[config.FieldBaseURL],
+	) && configureSourceIsExplicit(
+		authoring.Sources[config.FieldModel],
+	)
 	selection, err := runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
 		Input: wizardInput, Output: cmd.OutOrStdout(), Accessible: accessible,
-		Defaults: defaults, DetectedCommand: suggested, HasCredential: hasCredential || len(stagedCredential) > 0,
-		CredentialFromStdin: opts.CredentialStdin,
+		Defaults:             defaults,
+		DetectedQuickCommand: detected.QuickCommand,
+		DetectedQuickSource:  detected.QuickSource,
+		DetectedFullCommand:  detected.FullCommand,
+		DetectedFullSource:   detected.FullSource,
+		ExplicitMode:         explicitMode,
+		HasCredential:        hasCredential || len(stagedCredential) > 0,
+		CredentialFromStdin:  opts.CredentialStdin,
+		ProviderConfigured:   providerConfigured,
+		OpenAIConfigured:     openAIConfigured,
 	})
 	if err != nil {
 		return fmt.Errorf("acd configure: wizard: %w", err)
@@ -278,7 +391,9 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if !approval.Apply {
 		return errors.New("acd configure: final preview declined; no provider call, command, or write was made")
 	}
-	if report.Verification.Mode != "none" && !approval.Verification {
+	if (report.Verification.Mode == "fast" ||
+		report.Verification.Mode == "full") &&
+		!approval.Verification {
 		return errors.New("acd configure: exact verification command declined; no provider call, command, or write was made")
 	}
 	if report.RepairEnabled && !approval.Repair {
@@ -343,41 +458,31 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	progress.complete("provider_test:passed")
 	progress.success(1, "Provider test passed.")
+	var setupValidation *settings.SetupValidation
 	if report.Verification.Mode != "none" {
-		head, err := gitpkg.RevParse(cmd.Context(), repo, "HEAD^{commit}")
-		if err != nil {
-			return progress.fail("resolve verification candidate", err,
+		target, targetErr := resolveConfigureValidationTarget(
+			cmd.Context(), repo,
+		)
+		if targetErr != nil {
+			return progress.fail("resolve validation target", targetErr,
 				"No configuration was changed; restore an attached valid HEAD and rerun acd configure.")
 		}
-		verificationCommand := liveValidation.ResolvedHot[config.FieldVerificationFastCommand]
-		verificationTimeout := liveValidation.ResolvedHot[config.FieldVerificationFastTimeout]
-		if report.Verification.Mode == "full" {
-			verificationCommand = liveValidation.ResolvedHot[config.FieldVerificationFullCommand]
-			verificationTimeout = liveValidation.ResolvedHot[config.FieldVerificationFullTimeout]
+		command := report.Verification.Command
+		sum := sha256.Sum256([]byte(command))
+		setupValidation = &settings.SetupValidation{
+			BranchRef:        target.BranchRef,
+			BranchGeneration: target.BranchGeneration,
+			ExpectedHead:     target.ExpectedHead,
+			Mode:             report.Verification.Mode,
+			CommandSource:    report.Verification.CommandSource,
+			CommandDigest:    fmt.Sprintf("%x", sum[:]),
+			ApprovalID:       tested.Fingerprint,
 		}
-		progress.begin(2, fmt.Sprintf(
-			"Running %s verification in an ephemeral worktree: %s (timeout %s)...",
-			safePreviewText(report.Verification.Mode, 16),
-			safePreviewText(verificationCommand, 256),
-			safePreviewText(verificationTimeout, 32),
-		))
-		result, err := configureRunVerification(cmd.Context(), repo, report.Verification.Mode,
-			verificationCommand, verificationTimeout, head)
-		if err != nil {
-			return progress.fail("run approved verification", err,
-				"No configuration was changed; fix the exact approved command or choose Intent Fast.")
-		}
-		if result.NeedsAttention || result.Status != verification.StatusPassed {
-			progress.verificationFailure(result, verificationTimeout)
-			return progress.fail("run approved verification",
-				configureVerificationFailure(result, report.Verification.Mode, verificationTimeout),
-				"No configuration was changed; fix the command failure or choose Intent Fast.")
-		}
-		progress.complete("verification:passed")
-		progress.success(2, "Verification passed.")
+		progress.complete("validation:prepared")
+		progress.success(2, "Background validation target prepared.")
 	} else {
-		progress.complete("verification:not_required")
-		progress.success(2, "Verification is not required by this preset.")
+		progress.complete("validation:not_required")
+		progress.success(2, "Project validation is not required.")
 	}
 	var previousCredential string
 	previousCredentialSet := false
@@ -418,6 +523,7 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	applied, err := service.Apply(cmd.Context(), settings.ApplyRequest{
 		Values: draft, TestedFingerprint: tested.Fingerprint, Confirmations: confirmations,
 		ExpectedGeneration: saved.Generation, ExpectedDesiredRevision: snapshot.DesiredRevisionID,
+		SetupValidation: setupValidation,
 	})
 	if err != nil {
 		rollback := rollbackConfigureCredential(roots, selection.Credential != "",
@@ -426,7 +532,14 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"Repository settings were saved but not activated; rerun acd configure to test and activate them.")
 	}
 	progress.complete(fmt.Sprintf("runtime_revision:%d", applied.RevisionID))
-	progress.success(5, fmt.Sprintf("Runtime revision %d created.", applied.RevisionID))
+	if applied.ValidationRunID > 0 {
+		progress.complete(fmt.Sprintf("validation_queued:%d", applied.ValidationRunID))
+		progress.success(5, fmt.Sprintf(
+			"Runtime revision %d created; validation job %d queued.",
+			applied.RevisionID, applied.ValidationRunID))
+	} else {
+		progress.success(5, fmt.Sprintf("Runtime revision %d created.", applied.RevisionID))
+	}
 	progress.begin(6, "Enabling ACD...")
 	if err := configureEnable(cmd.Context(), io.Discard, repo, false); err != nil {
 		return progress.fail("enable daemon", err,
@@ -442,9 +555,34 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		report.CredentialSource = credentials.SourceFile
 	}
 	report.Operations = append([]string(nil), progress.completed...)
-	fmt.Fprintf(cmd.OutOrStdout(),
-		"Configuration active: %s@%d; runtime revision %d; daemon enabled.\n",
-		report.PresetID, report.PresetVersion, applied.RevisionID)
+	if applied.ValidationRunID > 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "Configuration saved.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Capture: active")
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"Commit publishing: waiting for %s validation\n",
+			configureValidationLabel(report.Verification.Mode))
+		fmt.Fprintln(cmd.OutOrStdout(), "Validation: running in background")
+		if report.Verification.Command != "" {
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"Command:", safeCommandPreview(report.Verification.Command))
+		} else {
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"Check: built-in structural and materialization gates")
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "Safe to close this terminal.")
+		if opts.Wait {
+			if err := waitForConfigureValidation(
+				cmd.Context(), cmd.OutOrStdout(), repo,
+				applied.ValidationRunID,
+			); err != nil {
+				return err
+			}
+		}
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(),
+			"Configuration ready: %s@%d; runtime revision %d; daemon enabled.\n",
+			report.PresetID, report.PresetVersion, applied.RevisionID)
+	}
 	for _, guidance := range report.HarnessGuidance {
 		fmt.Fprintln(cmd.OutOrStdout(), guidance)
 	}
@@ -482,17 +620,30 @@ func configureTerminalTooShort(output io.Writer) bool {
 	return err == nil && rows > 0 && rows < 24
 }
 
-func dryRunConfigureSelection(strategy, preset, suggested string) settingsui.ConfigureSelection {
+func dryRunConfigureSelection(
+	strategy, preset string,
+	detected configureVerificationDetection,
+) settingsui.ConfigureSelection {
 	provider := "openai-compat"
 	if strategy == "event" && preset == "fast" {
 		provider = "deterministic"
 	}
 	mode := configureSelectionVerificationMode(strategy, preset)
+	command, source := detected.QuickCommand, detected.QuickSource
+	if mode == "full" {
+		command, source = detected.FullCommand, detected.FullSource
+	}
+	if mode == "fast" && command == "" {
+		mode = "structural"
+		source = "built-in structural verification"
+	}
 	return settingsui.ConfigureSelection{
-		Strategy: strategy, Preset: preset, CommitFormat: "imperative",
+		Experience: configureExperienceName(strategy, preset),
+		Strategy:   strategy, Preset: preset, CommitFormat: "imperative",
 		Provider: provider, Model: "gpt-5.4-mini", BaseURL: ai.DefaultOpenAIBaseURL,
 		ProviderTimeout: "30s", VerificationMode: mode,
-		VerificationCommand: suggested,
+		VerificationCommand: command, VerificationSource: source,
+		ExecutionMode: configureExecutionMode(strategy),
 	}
 }
 
@@ -514,8 +665,10 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 	if needsDiff && !selection.DiffContextApproved {
 		return errors.New("acd configure: regular selected preset requires explicit redacted diff-context approval")
 	}
-	if selection.VerificationMode != "none" && strings.TrimSpace(selection.VerificationCommand) == "" {
-		return errors.New("acd configure: enter an exact verification command or choose Intent Fast")
+	if (selection.VerificationMode == "fast" ||
+		selection.VerificationMode == "full") &&
+		strings.TrimSpace(selection.VerificationCommand) == "" {
+		return errors.New("acd configure: no project verification command is available for this experience")
 	}
 	return nil
 }
@@ -609,7 +762,7 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 		if dryRun {
 			verificationStatus = "approval_required"
 		} else {
-			verificationStatus = "approved_pending_test"
+			verificationStatus = "approved_pending_background_validation"
 		}
 	}
 	diff := "not_required"
@@ -621,30 +774,40 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 	}
 	report := configureReport{
 		Version: configureReportVersion, DryRun: dryRun, Repo: repo,
-		Strategy: selection.Strategy, Preset: selection.Preset,
+		Experience: fallbackConfigureExperience(selection),
+		Strategy:   selection.Strategy, Preset: selection.Preset,
 		PresetID: definition.ID(), PresetVersion: definition.Version,
 		CommitFormat: selection.CommitFormat, Provider: selection.Provider,
+		Model: selection.Model, Endpoint: safeEndpointPreview(selection.BaseURL),
+		ProviderTimeout:  selection.ProviderTimeout,
 		CredentialSource: source, DiffContext: diff,
 		Verification: configureVerificationReport{
 			Mode: selection.VerificationMode, Command: selection.VerificationCommand,
-			Approved: selection.VerificationApproved, Status: verificationStatus,
+			CommandSource: selection.VerificationSource,
+			Approved:      selection.VerificationApproved, Status: verificationStatus,
 		},
 		RepairEnabled:    definition.Values[config.FieldIntentRepairEnabled] == "true",
 		RepairHorizon:    definition.Values[config.FieldIntentRepairHorizon],
 		RepairMaxCommits: definition.Values[config.FieldIntentRepairMaxCommits],
+		ExecutionMode:    configureExecutionMode(selection.Strategy),
+		Readiness:        configureInitialReadiness(selection.Strategy),
 		Daemon:           "unchanged", HarnessGuidance: configureHarnessGuidance(),
 		Risks: configureRisks(selection, definition),
 		Operations: []string{
-			"provider_test:planned", "verification:planned_if_required",
-			"credential:persist_after_tests", "settings:save",
-			"runtime_revision:create_one", "daemon:enable",
+			"provider_test:planned", "credential:persist_after_provider_test",
+			"settings:save", "runtime_revision:create_one",
+			"validation:queue_if_required", "daemon:enable",
 			"harness:report_only",
 		},
 	}
 	if selection.VerificationMode == "fast" {
 		report.Verification.Timeout = definition.Values[config.FieldVerificationFastTimeout]
+		report.Verification.ExpectedDuration = "usually under 2 minutes"
 	} else if selection.VerificationMode == "full" {
 		report.Verification.Timeout = definition.Values[config.FieldVerificationFullTimeout]
+		report.Verification.ExpectedDuration = "potentially several minutes"
+	} else if selection.VerificationMode == "structural" {
+		report.Verification.ExpectedDuration = "usually a few seconds"
 	}
 	return report, nil
 }
@@ -705,43 +868,244 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 	}
 	fmt.Fprintf(out, "ACD CONFIGURE PREVIEW%s\n", suffix)
 	fmt.Fprintf(out, "Repository: %s\n", safeRepoPreview(report.Repo))
+	fmt.Fprintf(out, "Experience: %s\n", report.Experience)
 	fmt.Fprintf(out, "Mode: %s %s%s [%s@%d]\n", displayConfigureWord(report.Strategy),
 		displayConfigureWord(report.Preset), customized, report.PresetID, report.PresetVersion)
 	fmt.Fprintf(out, "Provider: %s; credential source: %s\n",
 		safePreviewText(report.Provider, 128), report.CredentialSource)
+	if report.Provider == "openai-compat" {
+		fmt.Fprintf(out, "Model: %s\n", safePreviewText(report.Model, 128))
+		fmt.Fprintf(out, "Endpoint: %s\n", report.Endpoint)
+		fmt.Fprintf(out, "Provider timeout: %s\n",
+			safePreviewText(report.ProviderTimeout, 32))
+	}
 	fmt.Fprintf(out, "Diff context: %s\n", report.DiffContext)
 	fmt.Fprintf(out, "Verification: %s", report.Verification.Mode)
 	if report.Verification.Command != "" {
 		fmt.Fprintf(out, " — exact command: %s", safeCommandPreview(report.Verification.Command))
 	}
 	fmt.Fprintln(out)
+	if report.Verification.CommandSource != "" {
+		fmt.Fprintln(out, "Verification source:",
+			safePreviewText(report.Verification.CommandSource, 128))
+	}
+	if report.Verification.ExpectedDuration != "" {
+		fmt.Fprintln(out, "Expected duration:",
+			report.Verification.ExpectedDuration)
+	}
 	for _, risk := range report.Risks {
 		fmt.Fprintln(out, "Approval:", risk)
 	}
 	fmt.Fprintf(out, "Automatic repair: %t; horizon %s; maximum commits %s\n",
 		report.RepairEnabled, report.RepairHorizon, report.RepairMaxCommits)
-	fmt.Fprintln(out, "Apply order: provider test > verification > credential > settings > one runtime revision > acd on")
+	fmt.Fprintln(out, "Execution:", report.ExecutionMode)
+	fmt.Fprintln(out, "Readiness after save:", report.Readiness)
+	fmt.Fprintln(out, "Apply order: provider test > credential > settings > one runtime revision + validation job > acd on")
+	if report.Verification.Mode != "none" {
+		fmt.Fprintln(out, "Validation runs after setup returns; capture stays active while commit publishing waits.")
+	}
 	fmt.Fprintln(out, "Harness hooks: report only; no external hook file will be edited")
 	return nil
 }
 
-func detectVerificationCommand(repo string) string {
-	makefile := filepath.Join(repo, "Makefile")
-	if file, err := os.Open(makefile); err == nil {
-		defer file.Close()
-		body, readErr := io.ReadAll(io.LimitReader(file, 1024*1024+1))
-		if readErr != nil || len(body) > 1024*1024 {
-			return ""
-		}
-		text := "\n" + string(body)
-		if strings.Contains(text, "\ntest:") {
-			return "make test"
-		}
+type configureVerificationDetection struct {
+	QuickCommand string
+	QuickSource  string
+	FullCommand  string
+	FullSource   string
+}
+
+func detectVerificationCommands(repo string) configureVerificationDetection {
+	if detected, ok := readVerificationManifest(repo); ok {
+		return detected
+	}
+	var detected configureVerificationDetection
+	makeTargets := readMakeTargets(filepath.Join(repo, "Makefile"))
+	switch {
+	case makeTargets["verify-fast"]:
+		detected.QuickCommand = "make verify-fast"
+		detected.QuickSource = "Makefile target verify-fast"
+	case makeTargets["test-fast"]:
+		detected.QuickCommand = "make test-fast"
+		detected.QuickSource = "Makefile target test-fast"
+	}
+	if makeTargets["test"] {
+		detected.FullCommand = "make test"
+		detected.FullSource = "Makefile target test"
 	}
 	if _, err := os.Stat(filepath.Join(repo, "go.mod")); err == nil {
-		return "go test ./..."
+		if detected.QuickCommand == "" {
+			detected.QuickCommand = "go test ./... -run '^$'"
+			detected.QuickSource = "Go language default"
+		}
+		if detected.FullCommand == "" {
+			detected.FullCommand = "go test ./..."
+			detected.FullSource = "Go language default"
+		}
 	}
-	return ""
+	if node := detectNodeVerification(repo); node.QuickCommand != "" ||
+		node.FullCommand != "" {
+		if detected.QuickCommand == "" {
+			detected.QuickCommand, detected.QuickSource =
+				node.QuickCommand, node.QuickSource
+		}
+		if detected.FullCommand == "" {
+			detected.FullCommand, detected.FullSource =
+				node.FullCommand, node.FullSource
+		}
+	}
+	if _, err := os.Stat(filepath.Join(repo, "Cargo.toml")); err == nil {
+		if detected.QuickCommand == "" {
+			detected.QuickCommand = "cargo check --all-targets"
+			detected.QuickSource = "Rust language default"
+		}
+		if detected.FullCommand == "" {
+			detected.FullCommand = "cargo test"
+			detected.FullSource = "Rust language default"
+		}
+	}
+	if hasPythonTestConfiguration(repo) && detected.FullCommand == "" {
+		detected.FullCommand = "python -m pytest"
+		detected.FullSource = "Python test configuration"
+	}
+	return detected
+}
+
+func detectVerificationCommand(repo string) string {
+	detected := detectVerificationCommands(repo)
+	if detected.FullCommand != "" {
+		return detected.FullCommand
+	}
+	return detected.QuickCommand
+}
+
+func readVerificationManifest(
+	repo string,
+) (configureVerificationDetection, bool) {
+	for _, name := range []string{
+		filepath.Join(".acd", "verification.json"),
+		"acd.verification.json",
+	} {
+		body, err := readBoundedConfigureFile(filepath.Join(repo, name))
+		if err != nil {
+			continue
+		}
+		var manifest struct {
+			Version int    `json:"version"`
+			Quick   string `json:"quick"`
+			Full    string `json:"full"`
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(body)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&manifest); err != nil ||
+			manifest.Version != 1 {
+			continue
+		}
+		detected := configureVerificationDetection{
+			QuickCommand: strings.TrimSpace(manifest.Quick),
+			FullCommand:  strings.TrimSpace(manifest.Full),
+		}
+		if detected.QuickCommand != "" {
+			detected.QuickSource = "repository ACD verification manifest"
+		}
+		if detected.FullCommand != "" {
+			detected.FullSource = "repository ACD verification manifest"
+		}
+		return detected, true
+	}
+	return configureVerificationDetection{}, false
+}
+
+func readMakeTargets(path string) map[string]bool {
+	body, err := readBoundedConfigureFile(path)
+	if err != nil {
+		return nil
+	}
+	targets := map[string]bool{}
+	for _, line := range strings.Split(string(body), "\n") {
+		if line == "" || line[0] == '\t' || line[0] == ' ' {
+			continue
+		}
+		name, _, ok := strings.Cut(line, ":")
+		if !ok || strings.ContainsAny(name, " \t=$") {
+			continue
+		}
+		targets[strings.TrimSpace(name)] = true
+	}
+	return targets
+}
+
+func detectNodeVerification(repo string) configureVerificationDetection {
+	body, err := readBoundedConfigureFile(filepath.Join(repo, "package.json"))
+	if err != nil {
+		return configureVerificationDetection{}
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return configureVerificationDetection{}
+	}
+	runner := "npm run"
+	for _, candidate := range []struct {
+		path   string
+		runner string
+	}{
+		{"pnpm-lock.yaml", "pnpm"},
+		{"yarn.lock", "yarn"},
+		{"bun.lock", "bun run"},
+		{"bun.lockb", "bun run"},
+	} {
+		if _, err := os.Stat(filepath.Join(repo, candidate.path)); err == nil {
+			runner = candidate.runner
+			break
+		}
+	}
+	command := func(script string) string {
+		if runner == "npm run" {
+			return runner + " " + script
+		}
+		return runner + " " + script
+	}
+	var detected configureVerificationDetection
+	switch {
+	case strings.TrimSpace(manifest.Scripts["test:fast"]) != "":
+		detected.QuickCommand = command("test:fast")
+	case strings.TrimSpace(manifest.Scripts["check"]) != "":
+		detected.QuickCommand = command("check")
+	}
+	if detected.QuickCommand != "" {
+		detected.QuickSource = "package.json script"
+	}
+	if strings.TrimSpace(manifest.Scripts["test"]) != "" {
+		detected.FullCommand = command("test")
+		detected.FullSource = "package.json script"
+	}
+	return detected
+}
+
+func hasPythonTestConfiguration(repo string) bool {
+	for _, name := range []string{
+		"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini",
+	} {
+		if _, err := os.Stat(filepath.Join(repo, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func readBoundedConfigureFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, 1024*1024+1))
+	if err != nil || len(body) > 1024*1024 {
+		return nil, errors.New("configure detection file is too large")
+	}
+	return body, nil
 }
 
 func configureHarnessGuidance() []string {
@@ -773,9 +1137,13 @@ func configureRisks(selection settingsui.ConfigureSelection, preset config.Prese
 	if strings.HasPrefix(selection.Provider, "subprocess:") {
 		risks = append(risks, "local executable "+safePreviewText(selection.Provider, 128)+" will run")
 	}
-	if selection.VerificationMode != "none" {
+	if selection.VerificationMode == "fast" ||
+		selection.VerificationMode == "full" {
 		risks = append(risks, "repository command will run in an ephemeral worktree: "+
 			safeCommandPreview(selection.VerificationCommand))
+	} else if selection.VerificationMode == "structural" {
+		risks = append(risks,
+			"built-in structural and materialization checks will run against the reviewed commit")
 	}
 	if preset.Values[config.FieldIntentRepairEnabled] == "true" {
 		risks = append(risks, "eligible recent ACD-owned commits may be repaired automatically")
@@ -821,34 +1189,12 @@ func (p configureProgress) success(step int, message string) {
 	p.writeLine("\x1b[32m", fmt.Sprintf("[%d/6] %s", step, message))
 }
 
-func (p configureProgress) failure(step int, message string) {
-	p.writeLine("\x1b[31m", fmt.Sprintf("[%d/6] %s", step, message))
-}
-
 func (p configureProgress) writeLine(color, message string) {
 	if p.color && color != "" {
 		fmt.Fprintf(p.out, "%s%s\x1b[0m\n", color, message)
 		return
 	}
 	fmt.Fprintln(p.out, message)
-}
-
-func (p configureProgress) verificationFailure(result verification.Result, timeout string) {
-	switch {
-	case result.TimedOut || result.Status == verification.StatusTimedOut:
-		p.failure(2, "Verification timed out after "+safePreviewText(timeout, 32)+".")
-	case result.ExitCode != 0:
-		p.failure(2, fmt.Sprintf("Verification failed with exit code %d.", result.ExitCode))
-	default:
-		p.failure(2, "Verification failed ("+safePreviewText(string(result.Status), 32)+").")
-	}
-	output := safeConfigureVerificationOutput(result.Output, 8*1024)
-	if output == "" {
-		p.writeLine("", "Verification produced no retained output.")
-		return
-	}
-	p.writeLine("", "Verification output (sanitized tail):")
-	fmt.Fprintln(p.out, output)
 }
 
 func (p *configureProgress) complete(stage string) {
@@ -873,17 +1219,6 @@ func (p configureProgress) failWithRollback(stage string, cause error, rollback,
 		message += "; remediation: " + safePreviewText(remediation, 512)
 	}
 	return errors.New(message)
-}
-
-func configureVerificationFailure(result verification.Result, mode, timeout string) error {
-	mode = safePreviewText(mode, 16)
-	if result.TimedOut || result.Status == verification.StatusTimedOut {
-		return fmt.Errorf("%s verification timed out after %s", mode, safePreviewText(timeout, 32))
-	}
-	if result.ExitCode != 0 {
-		return fmt.Errorf("%s verification failed with exit code %d", mode, result.ExitCode)
-	}
-	return fmt.Errorf("%s verification did not pass (%s)", mode, result.Status)
 }
 
 func safeConfigureVerificationOutput(value string, limit int) string {
@@ -1005,6 +1340,212 @@ func configureSelectionVerificationMode(strategy, preset string) string {
 		return "full"
 	default:
 		return "none"
+	}
+}
+
+func configureSourceIsExplicit(source config.Source) bool {
+	switch source {
+	case config.SourceExperiment,
+		config.SourceRepository,
+		config.SourceProfile,
+		config.SourceGlobal,
+		config.SourceEnvironment:
+		return true
+	default:
+		return false
+	}
+}
+
+type configureValidationTarget struct {
+	BranchRef        string
+	BranchGeneration int64
+	ExpectedHead     string
+}
+
+func resolveConfigureValidationTarget(
+	ctx context.Context,
+	repo string,
+) (configureValidationTarget, error) {
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return configureValidationTarget{}, err
+	}
+	branch, err := gitpkg.RunBranchRef(ctx, worktree.Root)
+	if err != nil || branch == "" {
+		return configureValidationTarget{},
+			errors.New("configuration validation requires an attached branch")
+	}
+	head, err := gitpkg.RevParse(ctx, worktree.Root, "HEAD^{commit}")
+	if err != nil {
+		return configureValidationTarget{}, err
+	}
+	db, err := state.Open(ctx, state.DBPathFromGitDir(worktree.GitDir))
+	if err != nil {
+		return configureValidationTarget{}, err
+	}
+	defer db.Close()
+	generation, err := daemon.LoadBranchGeneration(ctx, db)
+	if err != nil {
+		return configureValidationTarget{}, err
+	}
+	return configureValidationTarget{
+		BranchRef: branch, BranchGeneration: generation, ExpectedHead: head,
+	}, nil
+}
+
+func waitForConfigureValidation(
+	ctx context.Context,
+	out io.Writer,
+	repo string,
+	runID int64,
+) error {
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return err
+	}
+	db, err := state.Open(ctx, state.DBPathFromGitDir(worktree.GitDir))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	lastStatus := ""
+	for {
+		run, err := state.ConfigValidationByID(ctx, db, runID)
+		if err != nil {
+			return fmt.Errorf("acd configure: read validation job: %w", err)
+		}
+		if run.Status != lastStatus {
+			fmt.Fprintf(out, "Validation: %s (attempt %d)\n",
+				run.Status, run.Attempt)
+			lastStatus = run.Status
+		}
+		switch run.Status {
+		case state.ConfigValidationPassed:
+			fmt.Fprintln(out,
+				"Configuration ready. Commit publishing is enabled.")
+			return nil
+		case state.ConfigValidationFailed,
+			state.ConfigValidationTimedOut,
+			state.ConfigValidationCancelled:
+			fmt.Fprintln(out, "Configuration needs attention.")
+			fmt.Fprintln(out,
+				"Capture remains active; no commits were published.")
+			if run.ExitCode.Valid {
+				fmt.Fprintf(out, "Validation failed with exit code %d.\n",
+					run.ExitCode.Int64)
+			}
+			if tail := safeConfigureVerificationOutput(
+				run.SanitizedOutput, 8*1024,
+			); tail != "" {
+				fmt.Fprintln(out, "Sanitized validation output:")
+				fmt.Fprintln(out, tail)
+			}
+			return errors.New(
+				"acd configure: validation needs attention; run `acd configure` to retry or select another experience",
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func existingConfigureValidation(
+	ctx context.Context,
+	repo string,
+) (state.ConfigValidationRun, bool, error) {
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return state.ConfigValidationRun{}, false, err
+	}
+	dbPath := state.DBPathFromGitDir(worktree.GitDir)
+	if _, err := os.Lstat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return state.ConfigValidationRun{}, false, nil
+	} else if err != nil {
+		return state.ConfigValidationRun{}, false, err
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		return state.ConfigValidationRun{}, false, err
+	}
+	defer db.Close()
+	return state.DesiredConfigValidation(ctx, db)
+}
+
+func retryConfigureValidation(
+	ctx context.Context,
+	repo string,
+	requestID int64,
+) (state.ConfigValidationRun, bool, error) {
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return state.ConfigValidationRun{}, false, err
+	}
+	db, err := state.Open(ctx, state.DBPathFromGitDir(worktree.GitDir))
+	if err != nil {
+		return state.ConfigValidationRun{}, false, err
+	}
+	defer db.Close()
+	return state.RetryConfigValidation(ctx, db, requestID)
+}
+
+func fallbackConfigureExperience(
+	selection settingsui.ConfigureSelection,
+) string {
+	if selection.Experience != "" {
+		return displayConfigureExperience(selection.Experience)
+	}
+	return configureExperienceName(selection.Strategy, selection.Preset)
+}
+
+func configureExperienceName(strategy, preset string) string {
+	switch {
+	case strategy == "event" && preset == "fast":
+		return "Maximum Speed"
+	case strategy == "intent" && preset == "quality":
+		return "Strict Review"
+	default:
+		return "Everyday"
+	}
+}
+
+func displayConfigureExperience(value string) string {
+	switch value {
+	case "speed":
+		return "Maximum Speed"
+	case "strict":
+		return "Strict Review"
+	default:
+		return "Everyday"
+	}
+}
+
+func configureExecutionMode(strategy string) string {
+	if strategy == "event" {
+		return "immediate activation"
+	}
+	return "background activation gate"
+}
+
+func configureInitialReadiness(strategy string) string {
+	if strategy == "event" {
+		return "ready"
+	}
+	return "validating"
+}
+
+func configureValidationLabel(mode string) string {
+	switch mode {
+	case "full":
+		return "full"
+	case "structural":
+		return "structural"
+	default:
+		return "quick"
 	}
 }
 

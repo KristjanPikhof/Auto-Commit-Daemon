@@ -1,38 +1,55 @@
 # Configure ACD
 
 Use `acd configure` for initial setup and everyday mode changes. It stages all
-choices in memory, shows one final preview, tests the selected provider and
-approved verification command, saves one runtime revision, and enables ACD.
+choices in memory, shows one final preview, tests the selected provider, saves
+one runtime revision with a durable validation job, and enables capture.
 
 ~~~bash
 acd configure
+acd configure --wait
 acd configure --strategy intent --preset balanced
 acd configure --accessible
 ~~~
 
-The wizard recommends Intent Balanced. Use `acd configure --dry-run` or
+The regular wizard offers three experiences:
+
+| Experience | Internal mode | Activation check |
+|---|---|---|
+| Everyday work | Intent Balanced | Detected quick check or built-in structural check |
+| Maximum speed | Event Fast | None |
+| Strict review | Intent Quality | Detected full suite, which may take several minutes |
+
+Existing valid provider, model, endpoint, timeout, and credential values are
+reused. A fresh or incomplete OpenAI-compatible setup asks for the endpoint
+and model, then asks for a masked API key when neither the environment nor the
+protected file supplies one. Provider timeout, commit format, and custom
+verification commands remain advanced settings. Every effective value is
+visible in the final review.
+
+Use `acd configure --dry-run` or
 `acd configure --dry-run --json` for a side-effect-free preview. Dry-run does
 not call a provider, run a command, write a credential or setting, start the
 daemon, or change hooks.
 
-After final approval, configure prints six stable progress stages to stderr:
-provider test, verification, credential, settings, runtime revision, and
-daemon enablement. Terminal output uses color when supported unless
-`NO_COLOR` is set, but every state is also written in text. Verification
-failures include the exit code or timeout and a bounded sanitized output tail;
-no configuration is changed when either pre-save test fails.
+One final approval covers every displayed endpoint, diff-egress permission,
+verification command, and repair permission. Configure tests the provider
+before any write. Event Fast activates immediately. Intent setup saves the
+credential and settings, atomically creates one revision, activation request,
+and validation job, then returns while validation runs in the background.
+Capture remains active, but replay and repair stay blocked until validation
+passes.
 
 Regular setup never asks the user to invent a shell command. Balanced and
-Quality reuse an existing repository-scoped verification command or detect a
-supported project command such as `make test` or `go test ./...`. The final
-preview shows the exact command and requires approval before it runs. If no
-safe command is detected, configure asks the user to choose Intent Fast or set
-one through advanced settings.
+Quality first reuse an approved repository command, then check a repository
+manifest, Make targets, and language defaults. Everyday falls back to built-in
+structural verification when no quick command exists. Strict review is
+unavailable when no full command can be detected; custom commands belong in
+`acd settings`.
 
-Terminals shorter than 24 rows automatically use the same linear renderer as
-`--accessible`. This keeps every approval visible and avoids terminal control
-replies leaking into the shell. The final stdout result explicitly reports the
-active preset, runtime revision, and daemon state.
+Use `acd configure --wait` to stream the same durable job until it passes,
+fails, or times out. Re-running configure resumes a queued job or offers to
+retry the exact failed check, switch experience, open advanced settings, or
+leave capture-only state unchanged.
 
 Use `acd settings` for advanced overrides, profiles, experiments, and revision
 recovery. Its first action is **Change strategy or preset**, followed by
@@ -217,13 +234,15 @@ content.
 
 ## Approve candidate verification
 
-Balanced and Quality Intent require an exact repository-scoped command. The
-configure wizard may detect likely commands, but it cannot activate one until
-it shows the complete command and receives approval.
+Balanced uses a detected quick command when one exists. If it does not,
+Everyday uses the built-in structural and materialization gates. Quality
+requires an exact repository-scoped full command. Configure cannot activate a
+detected command until it shows the complete command and receives approval.
 
 | Mode | Preset | Default timeout |
 |---|---|---:|
 | `none` | Intent Fast | No command |
+| `structural` | Intent Balanced fallback | No shell command |
 | `fast` | Intent Balanced | 2 minutes |
 | `full` | Intent Quality | 10 minutes |
 
@@ -266,14 +285,18 @@ Human and JSON output add saved generation, desired, applied, and
 last-known-good config revision IDs, profile, apply state, pending age,
 sanitized failure, safe boundary, and experiment progress. Intent v2 output
 also shows migration state, preset identity, candidate counts, verification
-attention, and repair recovery. Older pre-v14 databases return an empty
-settings projection; pre-v15 databases return an unavailable Intent v2
-projection. Read-only commands never migrate either schema.
+attention, and repair recovery. Configuration readiness adds experience,
+validation status, command provenance, expected or elapsed duration, attempt,
+and a sanitized failure tail. Older pre-v14 databases return an empty settings
+projection; pre-v15 databases return unavailable Intent v2, and pre-v16
+databases return no setup-validation projection. Read-only commands never
+migrate these schemas.
 
 Settings are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/acd/config.json`.
 Runtime revisions and experiments use the repository database at
-`<gitDir>/acd/state.db`. The runtime ledger is SQLite `SchemaVersion=15` and
-stores only canonical, sanitized, non-secret snapshots.
+`<gitDir>/acd/state.db`. The runtime ledger is SQLite `SchemaVersion=16` and
+stores only canonical, sanitized, non-secret snapshots and bounded validation
+results.
 
 See [AI providers](ai-providers.md) for the environment reference and provider
 fallback behavior, and [intent commit flow](intent-commit-flow.md) for planner

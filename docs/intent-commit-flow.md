@@ -18,15 +18,20 @@ Start with the guided setup:
 acd configure --strategy intent --preset balanced
 ~~~
 
-Intent Balanced is the regular default. It requires a tested provider,
-redacted diff context, and an approved fast verification command. The wizard
-shows the exact endpoint, command, timeout, diff-egress policy, and repair
-limits before applying one immutable runtime revision.
+Everyday work is the regular default and maps to Intent Balanced. It requires
+a tested provider and redacted diff context. Configure uses a detected quick
+check when available, otherwise it uses built-in structural verification. The
+wizard shows the exact endpoint, check source, timeout, diff-egress policy, and
+repair limits before one approval.
+
+The provider test runs synchronously before any write. Candidate verification
+is queued as a durable background activation gate. Capture continues while
+replay and repair wait. Use `acd configure --wait` to follow the gate.
 
 | Preset | Evaluation | Verification | Planner failure | Recent repair |
 |---|---|---|---|---|
 | Fast | 10 captures, 10-second quiet time, 90-second max wait | None | Smallest valid hard-dependency component | Off |
-| Balanced | 20 captures, 30-second quiet time, 3-minute max wait | Approved fast command, 2-minute timeout | Last valid or deterministic dependency partition, then verification | Up to 3 commits or 10 minutes |
+| Balanced | 20 captures, 30-second quiet time, 3-minute max wait | Detected fast command or built-in structural gate | Last valid or deterministic dependency partition, then verification | Up to 3 commits or 10 minutes |
 | Quality | 30 captures, 60-second quiet time, 10-minute max wait | Approved full command, 10-minute timeout | Keep pending and report `needs_attention` | Up to 5 commits or 30 minutes |
 
 All regular Intent presets need redacted diff context. Network providers also
@@ -215,7 +220,7 @@ redacted unless the advanced sensitive override
 ## Recover from blocked v2 replay
 
 Existing Intent repositories migrate to `intent.balanced@2`. If the effective
-provider, diff consent, credential, or approved fast verification command is
+provider, diff consent, credential, or approved quick or structural gate is
 missing, capture continues and replay stops with `needs_attention`.
 
 Run:
