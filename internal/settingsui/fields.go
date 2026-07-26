@@ -38,7 +38,7 @@ var fieldDescriptors = []FieldDescriptor{
 	{Key: "intent.repair.enabled", Label: "Automatic repair", Description: "Repair eligible recent soft-published ACD commits", Apply: "next safe boundary", Choices: []string{"false", "true"}},
 	{Key: "intent.repair.horizon", Label: "Repair horizon", Description: "Maximum age of eligible soft-published commits", Apply: "next safe boundary"},
 	{Key: "intent.repair.max_commits", Label: "Repair commit limit", Description: "Maximum automatic rewrite chain, capped at five", Apply: "next safe boundary"},
-	{Key: "intent.verification", Label: "Intent verification", Description: "None, fast, or full approved project verification", Apply: "next safe boundary", Choices: []string{"none", "fast", "full"}},
+	{Key: "intent.verification", Label: "Intent verification", Description: "Structural, fast, or full verification", Apply: "next safe boundary", Choices: []string{"none", "structural", "fast", "full"}},
 	{Key: "verification.fast.command", Label: "Fast verification command", Description: "Exact repository-approved shell command", Apply: "next safe boundary"},
 	{Key: "verification.fast.timeout", Label: "Fast verification timeout", Description: "Bound for the approved fast command", Apply: "next safe boundary"},
 	{Key: "verification.full.command", Label: "Full verification command", Description: "Exact repository-approved shell command", Apply: "next safe boundary"},

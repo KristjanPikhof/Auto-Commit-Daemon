@@ -112,7 +112,7 @@ func TestIntentV2CutoverMigratesLegacyIntentOnceAndBlocksUnsafeReplay(t *testing
 	if metadata.PresetID != "intent.balanced" ||
 		values[config.FieldIntentWindow] != "17" ||
 		values[config.FieldCommitFormat] != "conventional" ||
-		values[config.FieldIntentVerification] != "fast" ||
+		values[config.FieldIntentVerification] != "structural" ||
 		values[config.FieldIntentRepairEnabled] != "true" {
 		t.Fatalf("migrated values=%+v metadata=%+v", values, metadata)
 	}

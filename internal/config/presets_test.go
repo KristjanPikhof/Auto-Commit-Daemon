@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestPresetCatalogV2Contract(t *testing.T) {
+func TestPresetCatalogV3Contract(t *testing.T) {
 	t.Parallel()
 	catalog := PresetCatalog()
 	if len(catalog) != 6 {
@@ -39,7 +39,7 @@ func TestPresetCatalogV2Contract(t *testing.T) {
 		{StrategyIntent, PresetBalanced, map[string]string{
 			FieldIntentWindow: "20", FieldIntentSettleWindow: "30s",
 			FieldIntentMaxPendingAge: "3m0s", FieldIntentDeferLimit: "2",
-			FieldIntentVerification: "fast", FieldIntentRepairEnabled: "true",
+			FieldIntentVerification: "structural", FieldIntentRepairEnabled: "true",
 			FieldIntentRepairHorizon: "10m0s", FieldIntentRepairMaxCommits: "3",
 			FieldVerificationFastTimeout: "2m0s",
 		}, "verified_dependency_partition", false},
@@ -59,7 +59,7 @@ func TestPresetCatalogV2Contract(t *testing.T) {
 			if !ok {
 				t.Fatal("preset missing")
 			}
-			if preset.Version != 2 || preset.Reference() != string(tt.strategy)+"."+string(tt.name)+"@2" {
+			if preset.Version != 3 || preset.Reference() != string(tt.strategy)+"."+string(tt.name)+"@3" {
 				t.Fatalf("identity = %s v%d", preset.Reference(), preset.Version)
 			}
 			for name, want := range tt.values {
@@ -119,7 +119,7 @@ func TestResolveAllPresetPrecedenceAndCustomization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preset.Reference() != "intent.quality@2" || !preset.Customized {
+	if preset.Reference() != "intent.quality@3" || !preset.Customized {
 		t.Fatalf("preset = %+v", preset)
 	}
 	if got := resolved[FieldIntentWindow]; got.EffectiveValue() != "19" || got.Source != SourceRepository {
@@ -160,7 +160,7 @@ func TestIntentDefaultsBalancedAndResetOwnsOnlyPresetFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preset.Reference() != "intent.balanced@2" ||
+	if preset.Reference() != "intent.balanced@3" ||
 		resolved[FieldCommitPreset].EffectiveValue() != "balanced" {
 		t.Fatalf("implicit Intent preset = %+v / %#v", preset, resolved[FieldCommitPreset])
 	}

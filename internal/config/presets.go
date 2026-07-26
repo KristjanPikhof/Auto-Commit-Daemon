@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const PresetCatalogVersion = 2
+const PresetCatalogVersion = 3
 
 type CommitStrategy string
 
@@ -106,7 +106,7 @@ var presetCatalog = []PresetDefinition{
 			FieldIntentMinPending: "20", FieldIntentSettleWindow: "30s",
 			FieldIntentMaxPendingAge: "3m", FieldIntentDeferLimit: "2",
 			FieldIntentRetryOnInvalid: "2", FieldIntentPathCoalescing: "false",
-			FieldIntentVerification: "fast", FieldIntentRepairEnabled: "true",
+			FieldIntentVerification: "structural", FieldIntentRepairEnabled: "true",
 			FieldIntentRepairHorizon: "10m", FieldIntentRepairMaxCommits: "3",
 			FieldVerificationFastTimeout: "2m",
 		},
