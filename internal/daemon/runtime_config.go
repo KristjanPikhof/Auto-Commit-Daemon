@@ -135,17 +135,27 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	var provider ai.Provider
 	var closer io.Closer
+	plannerUnavailable := false
 	if blockedReason == "" {
 		provider, closer, err = build(cfg)
 		if err != nil {
 			if cfg.CommitStrategy == ai.CommitStrategyIntent {
-				blockedReason = runtimeConfigureReason("the configured provider is unavailable")
+				// Fast and Balanced have explicit provider-failure fallback
+				// policies. Keep replay eligible with no planner so the
+				// candidate engine can apply those policies. Quality is
+				// intentionally fail-closed.
+				if preset == acdconfig.PresetQuality {
+					blockedReason = runtimeConfigureReason(
+						"the configured provider is unavailable")
+				} else {
+					plannerUnavailable = true
+				}
 			} else {
 				return nil, aiError(err)
 			}
 		}
 	}
-	if blockedReason != "" {
+	if blockedReason != "" || plannerUnavailable {
 		provider = ai.DeterministicProvider{CommitFormat: cfg.CommitFormat}
 	}
 	failed := true
@@ -162,10 +172,12 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	messageFn := providerMessageFnWithPromptTrace(provider, repoRoot, b.PromptTrace)
 	planner, ok := provider.(ai.IntentPlanner)
-	if cfg.CommitStrategy == ai.CommitStrategyIntent && !ok && blockedReason == "" {
+	if cfg.CommitStrategy == ai.CommitStrategyIntent && !ok &&
+		blockedReason == "" && !plannerUnavailable {
 		return nil, errors.New("runtime config: provider does not support intent planning")
 	}
-	if cfg.CommitStrategy != ai.CommitStrategyIntent || blockedReason != "" {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent || blockedReason != "" ||
+		plannerUnavailable {
 		planner = nil
 	}
 	providerName := ai.PrimaryProviderName(provider)

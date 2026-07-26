@@ -20,17 +20,19 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	t.Parallel()
 
 	repo := tempRepo(t)
-	env := envWith(withIsolatedHome(t),
+	baseEnv := withIsolatedHome(t)
+	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=2",
 		"ACD_INTENT_SETTLE_WINDOW=1h",
 		"ACD_INTENT_MAX_PENDING_AGE=1h",
-		"ACD_AI_PROVIDER=deterministic",
 		"ACD_PATH_QUIESCENCE_SECONDS=0",
 		"ACD_REWIND_GRACE_SECONDS=0",
 		"ACD_FSNOTIFY_ENABLED=0",
-	)
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	env := envWith(baseEnv, extra...)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

@@ -13,6 +13,8 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +27,123 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// activateIntentV2Runtime installs an explicit, already-applied Intent Fast v2
+// revision before daemon startup. Integration tests may still use environment
+// variables to customize provider and timing fields, but never rely on the
+// unsupported env-only v1 startup path.
+func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []string {
+	t.Helper()
+	values := make(map[string]string, len(extra))
+	cleaned := make([]string, 0, len(extra))
+	for _, item := range extra {
+		name, value, ok := strings.Cut(item, "=")
+		if !ok {
+			cleaned = append(cleaned, item)
+			continue
+		}
+		values[name] = value
+		if name != ai.EnvCommitStrategy && name != "ACD_COMMIT_PRESET" {
+			cleaned = append(cleaned, item)
+		}
+	}
+	lookup := func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	}
+	overrides := config.Overrides{}
+	overrides[config.FieldCommitStrategy], _ = json.Marshal("intent")
+	overrides[config.FieldCommitPreset], _ = json.Marshal("fast")
+	if _, configured := values[ai.EnvProvider]; !configured {
+		overrides[config.FieldProvider], _ =
+			json.Marshal("subprocess:missing-integration")
+	}
+	resolved, preset, err := config.ResolveAll(config.ResolveInput{
+		Repository: overrides, LookupEnv: lookup,
+	}, overrides)
+	if err != nil {
+		t.Fatalf("resolve Intent v2 integration revision: %v", err)
+	}
+	snapshot := map[string]any{
+		"preset_id": preset.ID(), "preset_version": preset.Version(),
+		"customized": preset.Customized,
+	}
+	for _, field := range config.Catalog() {
+		if field.Boundary == config.ApplyHot && field.Persistable &&
+			!field.Sensitive {
+			snapshot[field.Name] = resolved[field.Name].EffectiveValue()
+		}
+	}
+	provider := resolved[config.FieldProvider].EffectiveValue()
+	confirmations := []string{string(ai.ConfirmationDiffEgress)}
+	if strings.HasPrefix(provider, "subprocess:") {
+		confirmations = append(confirmations,
+			string(ai.ConfirmationSubprocessExecution))
+	}
+	if provider == "openai-compat" &&
+		strings.TrimRight(resolved[config.FieldBaseURL].EffectiveValue(), "/") !=
+			strings.TrimRight(ai.DefaultOpenAIBaseURL, "/") {
+		confirmations = append(confirmations,
+			string(ai.ConfirmationEndpointCredentials))
+	}
+	snapshot["confirmations"] = confirmations
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode Intent v2 integration revision: %v", err)
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("open Intent v2 integration state: %v", err)
+	}
+	defer db.Close()
+	revision, err := state.InsertConfigRevision(context.Background(), db,
+		state.ConfigRevisionInput{
+			Snapshot: body, Profile: "integration", Scope: "repository",
+			SourceGeneration: 0, Reason: "integration Intent v2 fixture",
+		})
+	if err != nil {
+		t.Fatalf("insert Intent v2 integration revision: %v", err)
+	}
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	if ok, err := state.AcknowledgeConfigActivation(
+		context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("acknowledge Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	if ok, err := state.ApplyConfigActivation(
+		context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("apply Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	return cleaned
+}
+
+func assertIntentV2RuntimeActive(t *testing.T, repo string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	got := sqliteScalar(t, dbPath, `
+SELECT COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.migration_state'), '') || '|' ||
+       COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.preset_id'), '') || '|' ||
+       COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.needs_attention'), '')`)
+	if !strings.HasPrefix(got, "active|intent.fast|") ||
+		strings.TrimPrefix(got, "active|intent.fast|") != "" {
+		t.Fatalf("Intent v2 runtime is not active: %q", got)
+	}
+}
 
 // acdBinaryPath is the per-process build cache. We compile the `acd` binary
 // once and reuse it across every integration scenario. The directory is

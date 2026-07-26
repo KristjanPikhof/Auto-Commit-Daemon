@@ -13,6 +13,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -57,11 +58,11 @@ func TestReplayIntentV2PublishesCandidatesInPlannerOrder(t *testing.T) {
 	if strings.Join(subjects, "|") != "Add beta unit|Add alpha unit" {
 		t.Fatalf("subjects=%v", subjects)
 	}
-	for _, id := range []string{"candidate-alpha", "candidate-beta"} {
-		candidate, ok, err := state.IntentCandidateByID(ctx, f.db, id)
-		if err != nil || !ok || candidate.Status != state.IntentCandidatePublished {
-			t.Fatalf("candidate %s=%+v ok=%v err=%v", id, candidate, ok, err)
-		}
+	var published int
+	if err := f.db.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_candidates WHERE status='published'`,
+	).Scan(&published); err != nil || published != 2 {
+		t.Fatalf("published candidates=%d err=%v", published, err)
 	}
 }
 
@@ -114,7 +115,16 @@ func TestReplayIntentV2LateCompanionRepairsSoftCommit(t *testing.T) {
 		"rev-list", "--first-parent", "HEAD")); len(commits) != 2 {
 		t.Fatalf("repair should replace, not append, soft commit: commits=%v", commits)
 	}
-	candidate, ok, err := state.IntentCandidateByID(ctx, f.db, "candidate-feature")
+	var candidateID string
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT member.candidate_id
+FROM intent_candidate_events member
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE capture.path='feature.go' AND member.membership_state='active'
+LIMIT 1`).Scan(&candidateID); err != nil {
+		t.Fatalf("candidate id: %v", err)
+	}
+	candidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidateID)
 	if err != nil || !ok || candidate.Status != state.IntentCandidatePublished ||
 		len(candidate.Events) != 2 ||
 		candidate.PublishedCommitOID.String != second.BaseHead {
@@ -126,7 +136,106 @@ func TestReplayIntentV2LateCompanionRepairsSoftCommit(t *testing.T) {
 	}
 }
 
+func TestReplayIntentV2WiresPromptAndOperationalTrace(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{
+		RevisionID: 42, Profile: "quality-check",
+	})
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "trace.go"),
+		[]byte("package trace\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prompts := &intentHealthPromptRecorder{}
+	traces := &memoryTraceLogger{}
+	retryLimit := 0
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: &tracedInvalidIntentV2Planner{},
+		IntentPreset:  config.PresetFast, IntentRetryLimit: &retryLimit,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentIncludeDiffs: true, IntentPlannerProvider: "openai-compat",
+		IntentPlannerModel: "trace-model",
+		PromptTrace:        prompts, Trace: traces,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if result.Published != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+	records := prompts.Records()
+	if len(records) != 2 {
+		t.Fatalf("prompt records=%+v", records)
+	}
+	for _, record := range records {
+		if record.Strategy != "intent_v2" ||
+			record.Protocol != ai.IntentPlannerProtocolV2 ||
+			len(record.OfferedSeqs) != 1 ||
+			record.BranchRef != f.cctx.BranchRef ||
+			record.Generation != f.cctx.BranchGeneration ||
+			!record.DiffIncluded || record.DiffCap != ai.IntentStageDiffCap ||
+			record.ConfigRevisionID != 42 ||
+			record.ConfigProfile != "quality-check" ||
+			record.RetryCount != 0 {
+			t.Fatalf("prompt metadata=%+v", record)
+		}
+	}
+	events := traces.Events()
+	for _, class := range []string{
+		"intent.planner.input",
+		"intent.planner.validation_failed",
+		"intent.planner.output",
+	} {
+		if !traceHasClass(events, class) {
+			t.Fatalf("trace class %q missing from %+v", class, events)
+		}
+	}
+}
+
 type orderedIntentV2Planner struct{}
+
+type tracedInvalidIntentV2Planner struct{}
+
+func (*tracedInvalidIntentV2Planner) Name() string { return "openai-compat" }
+
+func (*tracedInvalidIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (*tracedInvalidIntentV2Planner) PlanIntentV2(
+	ctx context.Context,
+	_ ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	logger, meta, ok := prompttrace.From(ctx)
+	if !ok {
+		return ai.IntentPlanV2{}, errors.New("native v2 prompt trace context missing")
+	}
+	record := func(stage string) {
+		logger.Record(prompttrace.Record{
+			Stage: stage, Strategy: meta.Strategy, Protocol: meta.Protocol,
+			Provider: meta.Provider, Model: meta.Model,
+			OfferedSeqs: append([]int64(nil), meta.OfferedSeqs...),
+			BranchRef:   meta.BranchRef, Generation: meta.Generation,
+			DiffIncluded: meta.DiffIncluded, DiffCap: meta.DiffCap,
+			ConfigRevisionID: meta.ConfigRevisionID,
+			ConfigProfile:    meta.ConfigProfile, RetryCount: meta.RetryCount,
+		})
+	}
+	record("request")
+	record("response")
+	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}, nil
+}
 
 func (orderedIntentV2Planner) Name() string { return "ordered-v2-test" }
 
@@ -156,10 +265,14 @@ func (*revisingIntentV2Planner) PlanIntentV2(
 	for _, capture := range req.OfferedCaptures {
 		seqs = append(seqs, capture.Seq)
 	}
+	candidateID := "candidate-feature"
+	if len(req.Candidates) > 0 {
+		candidateID = req.Candidates[0].CandidateID
+	}
 	return ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
-			CandidateID: "candidate-feature", SelectedSeqs: seqs,
+			CandidateID: candidateID, SelectedSeqs: seqs,
 			Purpose: "add feature with its test", Readiness: ai.IntentCandidateReady,
 			Subject:        "Add tested feature",
 			Body:           "- Keep implementation and companion coverage atomic",

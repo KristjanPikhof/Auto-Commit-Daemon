@@ -14,6 +14,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -24,6 +25,11 @@ type IntentCandidateCapture struct {
 	Event        state.CaptureEvent
 	Ops          []state.CaptureOp
 	CapturedDiff string
+	// CoveredEvents are original captures represented by Event after the
+	// opt-in same-path coalescing pass. They remain durable candidate
+	// members, while planning and materialization use the merged Event/Ops
+	// semantic unit.
+	CoveredEvents []state.CaptureEvent
 }
 
 // IntentDependencyHint lets upstream analyzers contribute bounded symbol,
@@ -64,6 +70,9 @@ type IntentCandidateEvaluation struct {
 	Captures          []IntentCandidateCapture
 	Hints             []IntentDependencyHint
 	Planner           interface{ Name() string }
+	Health            *IntentPlannerHealth
+	RetryLimit        int
+	RetryLimitSet     bool
 	Preset            config.PresetName
 	CommitFormat      ai.CommitFormat
 	IncludeDiffs      bool
@@ -95,6 +104,8 @@ type IntentCandidateDecision struct {
 type IntentCandidateEvaluationResult struct {
 	ProtocolVersion string
 	Fallback        string
+	PlannerFailure  string
+	RetryCount      int
 	NeedsAttention  bool
 	Boundaries      []state.IntentActivityBoundary
 	Dependencies    []state.IntentCaptureDependency
@@ -135,6 +146,12 @@ func EvaluateIntentCandidates(
 	}
 	if input.Provider == "" && input.Planner != nil {
 		input.Provider = input.Planner.Name()
+	}
+	if !input.RetryLimitSet {
+		input.RetryLimit = 1
+	}
+	if input.RetryLimit < 0 {
+		input.RetryLimit = 0
 	}
 
 	existing, err := state.IntentCandidatesForPair(ctx, db, input.BranchRef,
@@ -179,13 +196,16 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
-	plan, fallback, needsAttention, err := chooseIntentCandidatePlan(ctx, req,
-		input.Planner, input.Preset, existing)
+	plan, fallback, plannerFailure, retryCount, needsAttention, err :=
+		chooseIntentCandidatePlan(ctx, req, input.Planner, input.Health,
+			input.RetryLimit, input.Preset, existing)
 	if err != nil {
 		return result, err
 	}
 	result.ProtocolVersion = plan.ProtocolVersion
 	result.Fallback = fallback
+	result.PlannerFailure = plannerFailure
+	result.RetryCount = retryCount
 	result.NeedsAttention = needsAttention
 	plan, err = stabilizeIntentCandidatePlan(plan, existing, input.BranchRef,
 		input.BranchGeneration)
@@ -444,6 +464,9 @@ func buildIntentCandidateRequest(
 	for _, candidate := range existing {
 		seqs := make([]int64, 0, len(candidate.Events))
 		for _, event := range candidate.Events {
+			if event.EventRole == "coalesced" {
+				continue
+			}
 			seqs = append(seqs, event.EventSeq)
 		}
 		candidates = append(candidates, ai.IntentCandidateSummary{
@@ -486,43 +509,97 @@ func chooseIntentCandidatePlan(
 	ctx context.Context,
 	req ai.IntentPlanRequestV2,
 	planner interface{ Name() string },
+	health *IntentPlannerHealth,
+	retryLimit int,
 	preset config.PresetName,
 	existing []state.IntentCandidate,
-) (ai.IntentPlanV2, string, bool, error) {
+) (ai.IntentPlanV2, string, string, int, bool, error) {
+	plannerFailure := ""
+	retryCount := 0
 	if planner != nil {
-		plan, err := ai.PlanIntentV2WithCompatibility(ctx, planner, req)
-		if err == nil {
-			return plan, "", false, nil
-		}
-		if ctx.Err() != nil {
-			return ai.IntentPlanV2{}, "", false, ctx.Err()
-		}
-		var validation *ai.IntentPlanV2ValidationError
-		if errors.As(err, &validation) && len(validation.Findings) > 0 {
-			retry := req
-			retry.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
-			if corrected, retryErr := ai.PlanIntentV2WithCompatibility(ctx, planner, retry); retryErr == nil {
-				return corrected, "", false, nil
-			} else if ctx.Err() != nil {
-				return ai.IntentPlanV2{}, "", false, ctx.Err()
+		var permit IntentPlannerHealthPermit
+		if health != nil {
+			var acquireErr error
+			permit, acquireErr = health.Acquire(ctx)
+			if acquireErr != nil {
+				var openErr *IntentPlannerCircuitOpenError
+				if !errors.As(acquireErr, &openErr) {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, acquireErr
+				}
+				planner = nil
 			}
+		}
+		if planner != nil {
+			plan, err := ai.PlanIntentV2WithCompatibility(ctx, planner, req)
+			if err == nil {
+				if health != nil {
+					if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+					}
+				}
+				return plan, "", "", retryCount, false, nil
+			}
+			if ctx.Err() != nil {
+				if health != nil {
+					_ = health.Complete(ctx, permit, err)
+				}
+				return ai.IntentPlanV2{}, "", "", retryCount, false, ctx.Err()
+			}
+			plannerCallFailed := true
+			for attempt := 0; attempt < retryLimit; attempt++ {
+				var validation *ai.IntentPlanV2ValidationError
+				if !errors.As(err, &validation) ||
+					len(validation.Findings) == 0 {
+					break
+				}
+				retry := req
+				retry.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
+				retryCount++
+				retryCtx := prompttrace.WithRetryCount(ctx, retryCount)
+				if corrected, retryErr := ai.PlanIntentV2WithCompatibility(retryCtx, planner, retry); retryErr == nil {
+					if health != nil {
+						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+						}
+					}
+					return corrected, "", "", retryCount, false, nil
+				} else if ctx.Err() != nil {
+					if health != nil {
+						_ = health.Complete(ctx, permit, retryErr)
+					}
+					return ai.IntentPlanV2{}, "", "", retryCount, false, ctx.Err()
+				} else {
+					err = retryErr
+					plannerCallFailed = true
+				}
+			}
+			if health != nil {
+				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+				if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+				}
+			}
+			plannerFailure = ai.SanitizePlannerError(err.Error())
 		}
 	}
 	switch preset {
 	case config.PresetFast:
 		plan := deterministicIntentCandidatePlan(req, false, true)
-		return plan, "hard_dependency_component", false, ai.ValidateIntentPlanV2(req, plan)
+		return plan, "hard_dependency_component", plannerFailure, retryCount, false,
+			ai.ValidateIntentPlanV2(req, plan)
 	case config.PresetBalanced:
 		if plan, ok := reuseIntentCandidatePartition(req, existing); ok {
-			return plan, "last_valid_partition", false, nil
+			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil
 		}
 		plan := deterministicIntentCandidatePlan(req, true, false)
-		return plan, "verified_dependency_partition", false, ai.ValidateIntentPlanV2(req, plan)
+		return plan, "verified_dependency_partition", plannerFailure, retryCount, false,
+			ai.ValidateIntentPlanV2(req, plan)
 	case config.PresetQuality:
 		plan := holdIntentCandidatePlan(req)
-		return plan, "needs_attention", true, ai.ValidateIntentPlanV2(req, plan)
+		return plan, "needs_attention", plannerFailure, retryCount, true,
+			ai.ValidateIntentPlanV2(req, plan)
 	default:
-		return ai.IntentPlanV2{}, "", false,
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
 }
@@ -541,6 +618,9 @@ func evaluateIntentCandidateAssignment(
 	selected := append([]int64(nil), assignment.SelectedSeqs...)
 	if prior, ok := existing[assignment.CandidateID]; ok {
 		for _, event := range prior.Events {
+			if event.EventRole == "coalesced" {
+				continue
+			}
 			if !containsIntentSeq(selected, event.EventSeq) {
 				selected = append(selected, event.EventSeq)
 			}
@@ -555,10 +635,25 @@ func evaluateIntentCandidateAssignment(
 			return decision, fmt.Errorf("daemon: intent candidate %s missing capture %d",
 				assignment.CandidateID, seq)
 		}
+		if len(events) >= state.IntentCandidateMaxCaptures {
+			return decision, fmt.Errorf(
+				"daemon: intent candidate %s exceeds capture cap %d",
+				assignment.CandidateID, state.IntentCandidateMaxCaptures)
+		}
 		candidateCaptures = append(candidateCaptures, capture)
 		events = append(events, state.IntentCandidateEvent{
 			EventSeq: seq, EventRole: intentCaptureRole(capture),
 		})
+		for _, covered := range capture.CoveredEvents {
+			if len(events) >= state.IntentCandidateMaxCaptures {
+				return decision, fmt.Errorf(
+					"daemon: intent candidate %s exceeds capture cap %d",
+					assignment.CandidateID, state.IntentCandidateMaxCaptures)
+			}
+			events = append(events, state.IntentCandidateEvent{
+				EventSeq: covered.Seq, EventRole: "coalesced",
+			})
+		}
 	}
 
 	results := []ai.IntentAtomicityGateResult{
@@ -957,19 +1052,61 @@ func loadCandidateCaptureContext(
 		bySeq[capture.Event.Seq] = capture
 	}
 	for _, candidate := range existing {
-		for _, member := range candidate.Events {
-			if _, ok := bySeq[member.EventSeq]; ok {
+		for i := 0; i < len(candidate.Events); i++ {
+			member := candidate.Events[i]
+			if member.EventRole == "coalesced" {
 				continue
 			}
-			event, err := loadIntentCaptureEvent(ctx, db, member.EventSeq)
+			members := []state.IntentCandidateEvent{member}
+			for i+1 < len(candidate.Events) &&
+				candidate.Events[i+1].EventRole == "coalesced" {
+				i++
+				members = append(members, candidate.Events[i])
+			}
+			if len(members) == 1 {
+				if _, ok := bySeq[member.EventSeq]; ok {
+					continue
+				}
+				event, err := loadIntentCaptureEvent(ctx, db, member.EventSeq)
+				if err != nil {
+					return nil, err
+				}
+				ops, err := state.LoadCaptureOps(ctx, db, member.EventSeq)
+				if err != nil {
+					return nil, err
+				}
+				bySeq[member.EventSeq] = IntentCandidateCapture{
+					Event: event, Ops: ops,
+				}
+				continue
+			}
+			events := make([]state.CaptureEvent, 0, len(members))
+			for _, grouped := range members {
+				event, err := loadIntentCaptureEvent(ctx, db, grouped.EventSeq)
+				if err != nil {
+					return nil, err
+				}
+				events = append(events, event)
+			}
+			offers, err := coalesceIntentWindow(
+				ctx, db, events, true, state.LoadCaptureOps)
 			if err != nil {
 				return nil, err
 			}
-			ops, err := state.LoadCaptureOps(ctx, db, member.EventSeq)
-			if err != nil {
-				return nil, err
+			if len(offers) != 1 ||
+				len(offers[0].Token.Covered) != len(events)-1 {
+				return nil, fmt.Errorf(
+					"daemon: intent candidates: cannot reconstruct coalesced candidate %s",
+					candidate.ID)
 			}
-			bySeq[member.EventSeq] = IntentCandidateCapture{Event: event, Ops: ops}
+			capture := IntentCandidateCapture{
+				Event: offers[0].Primary, Ops: offers[0].MergedOps,
+				CoveredEvents: offers[0].Token.Covered,
+			}
+			if current, ok := bySeq[member.EventSeq]; ok {
+				capture.CapturedDiff = current.CapturedDiff
+			}
+			bySeq[member.EventSeq] = capture
 		}
 	}
 	out := make([]IntentCandidateCapture, 0, len(bySeq))
@@ -1065,6 +1202,9 @@ func stabilizeIntentCandidatePlan(
 		for _, candidate := range existing {
 			overlap := false
 			for _, event := range candidate.Events {
+				if event.EventRole == "coalesced" {
+					continue
+				}
 				if containsIntentSeq(assignment.SelectedSeqs, event.EventSeq) {
 					overlap = true
 					break
@@ -1087,16 +1227,22 @@ func stabilizeIntentCandidatePlan(
 	}
 	remap := make(map[string]string, len(plan.Candidates))
 	used := make(map[string]struct{}, len(plan.Candidates))
+	existingIDs := make(map[string]struct{}, len(existing))
+	for _, candidate := range existing {
+		existingIDs[candidate.ID] = struct{}{}
+	}
 	for i := range plan.Candidates {
 		oldID := plan.Candidates[i].CandidateID
-		newID := oldID
-		if overlapCandidate[i] != "" && overlapCounts[overlapCandidate[i]] == 1 {
+		newID := ""
+		if _, explicitlyContinued := existingIDs[oldID]; explicitlyContinued {
+			newID = oldID
+		} else if overlapCandidate[i] != "" &&
+			overlapCounts[overlapCandidate[i]] == 1 {
 			newID = overlapCandidate[i]
 		}
 		if newID == "" {
-			sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%v",
-				branchRef, generation, plan.Candidates[i].SelectedSeqs)))
-			newID = fmt.Sprintf("intent-%x", sum[:12])
+			newID = stableIntentCandidateID(
+				branchRef, generation, plan.Candidates[i].SelectedSeqs)
 		}
 		if _, duplicate := used[newID]; duplicate {
 			return ai.IntentPlanV2{}, fmt.Errorf(
@@ -1114,6 +1260,18 @@ func stabilizeIntentCandidatePlan(
 		}
 	}
 	return plan, nil
+}
+
+func stableIntentCandidateID(
+	branchRef string,
+	generation int64,
+	seqs []int64,
+) string {
+	ordered := append([]int64(nil), seqs...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%v",
+		branchRef, generation, ordered)))
+	return fmt.Sprintf("intent-%x", sum[:12])
 }
 
 func stableGeneratedCandidateID(req ai.IntentPlanRequestV2, seqs []int64) string {

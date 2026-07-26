@@ -95,37 +95,7 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 			"grouping_reason":  "atomicity test: select all four offered seqs",
 			"deferred_reasons": []map[string]any{},
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-atomic-4",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_atomic",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_atomic", plan)
 	}))
 	defer server.Close()
 
@@ -141,6 +111,7 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-atomic-batch4", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
@@ -153,7 +124,12 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	files := []string{"atomic-a.txt", "atomic-b.txt", "atomic-c.txt", "atomic-d.txt"}
+	files := []string{
+		"internal/atomic/a.go",
+		"internal/atomic/b.go",
+		"internal/atomic/c.go",
+		"internal/atomic/d.go",
+	}
 	for _, name := range files {
 		writeFile(t, filepath.Join(repo, name), "atomic content for "+name+"\n")
 	}
@@ -180,9 +156,9 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 
 	// All four capture rows must share the same commit_oid.
 	oid := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='atomic-a.txt' AND state='published' ORDER BY seq DESC LIMIT 1")
+		"SELECT commit_oid FROM capture_events WHERE path='internal/atomic/a.go' AND state='published' ORDER BY seq DESC LIMIT 1")
 	if oid == "" {
-		t.Fatalf("expected non-empty commit_oid for atomic-a.txt")
+		t.Fatalf("expected non-empty commit_oid for internal/atomic/a.go")
 	}
 	for _, name := range files {
 		got := sqliteScalar(t, dbPath,
@@ -213,6 +189,11 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 	if plannerErrors != "0" {
 		t.Fatalf("intent_planner_error decisions=%s want 0 for clean grouped publish", plannerErrors)
 	}
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates
+WHERE planner_protocol='v2' AND status='published'`); got != "1" {
+		t.Fatalf("native v2 published candidates=%s want 1", got)
+	}
 }
 
 // TestIntentAtomicity_DeferredMiddleSplitsCommit drives an A, B, C three-file
@@ -222,7 +203,7 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 // the middle of the offered window, the daemon honors it and does NOT fold
 // the prefix and suffix together. The deferred capture remains in
 // planner_state with defer_count >= 1.
-func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
+func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -256,37 +237,7 @@ func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 			"grouping_reason":  "split: select first and third, defer middle",
 			"deferred_reasons": buildDeferredReasons(deferred),
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-split",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_split",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_split", plan)
 	}))
 	defer server.Close()
 
@@ -308,6 +259,7 @@ func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-split-middle", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
@@ -334,38 +286,42 @@ func TestIntentAtomicity_DeferredMiddleSplitsCommit(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "split-a.txt", "published", 20*time.Second)
-	waitForEventState(t, dbPath, "split-c.txt", "published", 20*time.Second)
 
-	// One new commit (the bookends grouped); the deferred middle is still
-	// pending. With IntentDeferLimit=5 the next tick can't force-publish
-	// it, so commitCount stays at startCount+1.
+	// The bookends have no dependency evidence once their middle capture is
+	// deferred. Intent v2 rejects that disconnected group and Fast publishes
+	// only its smallest safe component.
 	if got, want := commitCount(t, repo), startCount+1; got != want {
-		t.Fatalf("commit count=%d want %d (one grouped commit for A+C; deferred B must remain pending)",
+		t.Fatalf("commit count=%d want %d (one smallest safe component)",
 			got, want)
 	}
 
-	// Bookends share commit_oid. The deferred middle MUST stay pending
-	// (state='pending', commit_oid empty/null).
+	// Neither deferred B nor disconnected C may be folded into A.
 	oidA := sqliteScalar(t, dbPath,
 		"SELECT commit_oid FROM capture_events WHERE path='split-a.txt' AND state='published'")
 	oidC := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='split-c.txt' AND state='published'")
-	if oidA == "" || oidA != oidC {
-		t.Fatalf("bookend commit_oids A=%q C=%q (expected to share one commit)", oidA, oidC)
+		"SELECT commit_oid FROM capture_events WHERE path='split-c.txt' ORDER BY seq DESC LIMIT 1")
+	if oidA == "" || oidC != "" {
+		t.Fatalf("bookend commit_oids A=%q C=%q (disconnected C must remain pending)", oidA, oidC)
 	}
 	stateB := sqliteScalar(t, dbPath,
 		"SELECT state FROM capture_events WHERE path='split-b.txt' ORDER BY seq DESC LIMIT 1")
 	if stateB != "pending" {
 		t.Fatalf("split-b.txt state=%q want pending (planner deferred it; daemon must NOT coalesce across)", stateB)
 	}
-	deferCount := sqliteScalar(t, dbPath,
-		"SELECT IFNULL(MAX(defer_count), 0) FROM planner_state ps JOIN capture_events ce ON ce.seq=ps.event_seq WHERE ce.path='split-b.txt'")
-	if deferCount == "" || deferCount == "0" {
-		t.Fatalf("planner_state.defer_count for split-b.txt=%q want >=1 (defer must be recorded)", deferCount)
+	waiting := sqliteScalar(t, dbPath, `
+SELECT COUNT(*)
+FROM intent_candidates candidate
+JOIN intent_candidate_events member ON member.candidate_id=candidate.id
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE capture.path IN ('split-b.txt','split-c.txt')
+  AND candidate.status='waiting'`)
+	if waiting != "2" {
+		t.Fatalf("waiting v2 candidates=%s want 2 for deferred B and disconnected C",
+			waiting)
 	}
 
-	if hits.Load() != 1 {
-		t.Fatalf("planner hits=%d want 1 (single offered window for the three creates)", hits.Load())
+	if hits.Load() != 3 {
+		t.Fatalf("planner hits=%d want 3 (initial plan plus two configured corrections)", hits.Load())
 	}
 }
 
@@ -403,26 +359,20 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 			}
 			byPath[capture.Path] = capture.Seq
 		}
-		if len(sameSeqs) != 2 || byPath["feature-api.txt"] == 0 ||
-			byPath["feature-ui.txt"] == 0 || byPath["unrelated-note.txt"] == 0 {
+		if len(sameSeqs) != 2 || byPath["feature/api.go"] == 0 ||
+			byPath["feature/ui.go"] == 0 || byPath["unrelated-note.txt"] == 0 {
 			http.Error(w, "unexpected offered paths", http.StatusBadRequest)
 			return
 		}
 		commitGroups := []map[string]any{
 			{
-				"selected_seqs":   []int64{sameSeqs[0]},
-				"subject":         "Update alpha helper",
-				"body":            "- Keep the alpha function change atomic.",
-				"grouping_reason": "same-file alpha edit is independent",
+				"selected_seqs":   sameSeqs,
+				"subject":         "Update same-file helpers",
+				"body":            "- Preserve the dependent same-file capture chain.",
+				"grouping_reason": "same-path hard dependency keeps both captures together",
 			},
 			{
-				"selected_seqs":   []int64{sameSeqs[1]},
-				"subject":         "Update beta helper",
-				"body":            "- Keep the beta function change atomic.",
-				"grouping_reason": "same-file beta edit is independent",
-			},
-			{
-				"selected_seqs":   []int64{byPath["feature-api.txt"], byPath["feature-ui.txt"]},
+				"selected_seqs":   []int64{byPath["feature/api.go"], byPath["feature/ui.go"]},
 				"subject":         "Add related feature files",
 				"body":            "- Group related API and UI notes together.",
 				"grouping_reason": "feature API and UI edits share one intent",
@@ -437,8 +387,8 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 		selected := []int64{
 			sameSeqs[0],
 			sameSeqs[1],
-			byPath["feature-api.txt"],
-			byPath["feature-ui.txt"],
+			byPath["feature/api.go"],
+			byPath["feature/ui.go"],
 			byPath["unrelated-note.txt"],
 		}
 		plan := map[string]any{
@@ -450,37 +400,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 			"commit_groups":    commitGroups,
 			"deferred_reasons": []map[string]any{},
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-partition-window",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_partition_window",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_partition_window", plan)
 	}))
 	defer server.Close()
 
@@ -499,6 +419,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	sessionID := "intent-partition-window"
 	startSession(t, ctx, env, repo, sessionID, "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
@@ -513,8 +434,8 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 	}{
 		{"same.go", "package main\n\nfunc alpha() string { return \"a1\" }\n\nfunc beta() string { return \"b0\" }\n", "1"},
 		{"same.go", "package main\n\nfunc alpha() string { return \"a1\" }\n\nfunc beta() string { return \"b1\" }\n", "2"},
-		{"feature-api.txt", "api half of a related feature\n", "3"},
-		{"feature-ui.txt", "ui half of a related feature\n", "4"},
+		{"feature/api.go", "package feature\n\nfunc API() {}\n", "3"},
+		{"feature/ui.go", "package feature\n\nfunc UI() {}\n", "4"},
 		{"unrelated-note.txt", "independent note\n", ""},
 	}
 	for _, step := range steps {
@@ -529,7 +450,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 	}
 
 	waitForEventState(t, dbPath, "same.go", "published", 25*time.Second)
-	for _, path := range []string{"feature-api.txt", "feature-ui.txt", "unrelated-note.txt"} {
+	for _, path := range []string{"feature/api.go", "feature/ui.go", "unrelated-note.txt"} {
 		waitForEventState(t, dbPath, path, "published", 25*time.Second)
 	}
 	waitFor(t, "two same.go captures published", 10*time.Second, func() bool {
@@ -539,19 +460,19 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 	if hits.Load() != 1 {
 		t.Fatalf("planner hits=%d want 1 for one five-capture window", hits.Load())
 	}
-	if got, want := commitCount(t, repo), startCount+4; got != want {
-		t.Fatalf("commit count=%d want %d (two same-file commits, one related group, one unrelated commit)", got, want)
+	if got, want := commitCount(t, repo), startCount+3; got != want {
+		t.Fatalf("commit count=%d want %d (one same-file chain, one related group, one unrelated commit)", got, want)
 	}
 
 	sameDistinct := sqliteScalar(t, dbPath,
 		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='same.go' AND state='published'")
-	if sameDistinct != "2" {
-		t.Fatalf("same.go distinct commit_oids=%s want 2 (independent same-file edits should split)", sameDistinct)
+	if sameDistinct != "1" {
+		t.Fatalf("same.go distinct commit_oids=%s want 1 (dependent same-file edits stay atomic)", sameDistinct)
 	}
 	featureAPI := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='feature-api.txt' AND state='published'")
+		"SELECT commit_oid FROM capture_events WHERE path='feature/api.go' AND state='published'")
 	featureUI := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='feature-ui.txt' AND state='published'")
+		"SELECT commit_oid FROM capture_events WHERE path='feature/ui.go' AND state='published'")
 	unrelated := sqliteScalar(t, dbPath,
 		"SELECT commit_oid FROM capture_events WHERE path='unrelated-note.txt' AND state='published'")
 	if featureAPI == "" || featureAPI != featureUI {
@@ -561,29 +482,26 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 		t.Fatalf("unrelated commit_oid=%q feature_oid=%q want separate commits", unrelated, featureAPI)
 	}
 
-	win := loadLastPlannerWindowRow(t, dbPath)
-	if len(win.OfferedSeqs) != 5 || len(win.VisibleOriginalSeqs) != 5 || len(win.HiddenSeqs) != 0 {
-		t.Fatalf("planner window seqs = %+v, want five offered/visible and no hidden coalesce", win)
-	}
-	if len(win.SelectedGroups) != 4 || len(win.DeferredSeqs) != 0 {
-		t.Fatalf("planner selected groups = %+v deferred=%v, want four groups and no defers", win.SelectedGroups, win.DeferredSeqs)
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates
+WHERE planner_protocol='v2'`); got != "3" {
+		t.Fatalf("native v2 durable candidates=%s want 3", got)
 	}
 
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
 	if status.ExitCode != 0 {
 		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
 	}
-	if !strings.Contains(status.Stdout, `"last_planner_window"`) ||
-		!strings.Contains(status.Stdout, `"selected_groups"`) {
-		t.Fatalf("status JSON missing planner-window summary:\n%s", status.Stdout)
+	if !strings.Contains(status.Stdout, `"latest_planner_protocol": "v2"`) {
+		t.Fatalf("status JSON missing native v2 candidate protocol:\n%s",
+			status.Stdout)
 	}
 	events := runAcd(t, ctx, fullEnv, "events", "--repo", repo, "--json", "--limit", "20")
 	if events.ExitCode != 0 {
 		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
 	}
-	if !strings.Contains(events.Stdout, `"planner_window"`) ||
-		!strings.Contains(events.Stdout, `"visible_original_seqs"`) {
-		t.Fatalf("events JSON missing planner-window summary:\n%s", events.Stdout)
+	if !strings.Contains(events.Stdout, `"candidate_id"`) {
+		t.Fatalf("events JSON missing candidate decisions:\n%s", events.Stdout)
 	}
 }
 

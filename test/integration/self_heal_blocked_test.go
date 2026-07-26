@@ -82,6 +82,7 @@ func TestSelfHeal_BlockedPromotesToPublishedOnReplay(t *testing.T) {
 	// recognises as replayErrorBeforeStateMismatch — required by
 	// selfHealEligibleByClass.
 	seedSQL := fmt.Sprintf(`
+PRAGMA busy_timeout=5000;
 INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state, error)
 VALUES ('refs/heads/main', %s, '%s', 'modify', 'self-heal.txt', 'rescan', %f, 'blocked_conflict', 'modify before-state mismatch for self-heal.txt');
 INSERT INTO capture_ops(event_seq, ord, op, path, before_oid, before_mode, after_oid, after_mode, fidelity)

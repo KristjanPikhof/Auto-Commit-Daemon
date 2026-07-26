@@ -87,6 +87,40 @@ func TestCheckIntentRepairEligibilityRejectsUnsafeVisibility(t *testing.T) {
 	}
 }
 
+func TestCheckIntentRepairEligibilityRejectsLinkedWorktreeVisibility(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	head := commitWorktreePath(t, ctx, repo, "one.txt", "one\n", "one")
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout},
+		"worktree", "add", "-b", "shared", linked, head); err != nil {
+		t.Fatalf("add linked worktree: %v", err)
+	}
+	linkedHeadBefore, err := RevParse(ctx, linked, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := CheckIntentRepairEligibility(ctx, repo,
+		intentRepairEligibility(head, []string{head}, []string{"one.txt"}))
+	if err != nil {
+		t.Fatalf("CheckIntentRepairEligibility: %v", err)
+	}
+	if result.Eligible ||
+		result.Reason != IntentRepairReasonAlternateRef ||
+		strings.Join(result.ContainingRefs, ",") != "refs/heads/shared" {
+		t.Fatalf("linked-worktree eligibility=%+v", result)
+	}
+	linkedHeadAfter, err := RevParse(ctx, linked, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linkedHeadAfter != linkedHeadBefore ||
+		string(mustReadFile(t, filepath.Join(linked, "one.txt"))) != "one\n" {
+		t.Fatalf("eligibility check mutated linked worktree: before=%s after=%s",
+			linkedHeadBefore, linkedHeadAfter)
+	}
+}
+
 func TestCheckIntentRepairEligibilityRejectsStagedOverlap(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()

@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -31,6 +33,7 @@ func replayIntentCandidateBatch(
 	items []intentReplayItem,
 	legacyRequest ai.IntentPlanRequest,
 	parent, parentTree string,
+	forced bool,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
 	diffBySeq := make(map[int64]string, len(legacyRequest.OfferedCaptures))
@@ -39,19 +42,46 @@ func replayIntentCandidateBatch(
 	}
 	captures := make([]IntentCandidateCapture, 0, len(items))
 	for _, item := range items {
+		var covered []state.CaptureEvent
 		if item.coalesce != nil {
-			return sum, errors.New("daemon: intent v2: path coalescing is unsupported by v2 presets")
+			covered = append(covered, item.coalesce.Covered...)
 		}
 		captures = append(captures, IntentCandidateCapture{
 			Event: item.event, Ops: item.ops, CapturedDiff: diffBySeq[item.event.Seq],
+			CoveredEvents: covered,
 		})
 	}
+	retryLimit := resolvedIntentRetryLimit()
+	if cfg.retryLimit != nil {
+		retryLimit = *cfg.retryLimit
+	}
 	telemetry := runtimeTelemetryFromContext(ctx)
-	evaluation, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+	evaluationStartedTS := float64(time.Now().UnixNano()) / 1e9
+	plannerCtx := ctx
+	if opts.PromptTrace != nil {
+		plannerCtx = prompttrace.With(ctx, opts.PromptTrace, prompttrace.Metadata{
+			Strategy: "intent_v2", Protocol: ai.IntentPlannerProtocolV2,
+			Provider: cfg.plannerProvider, Model: cfg.plannerModel,
+			OfferedSeqs: intentOfferedSeqs(legacyRequest),
+			BranchRef:   activeCtx.BranchRef, Generation: activeCtx.BranchGeneration,
+			DiffIncluded:     intentRequestIncludesDiff(legacyRequest),
+			DiffCap:          ai.IntentStageDiffCap,
+			ConfigRevisionID: telemetry.revisionID,
+			ConfigProfile:    telemetry.profile,
+		})
+	}
+	plannerCtx, attemptCounter := ai.WithIntentAttemptCounter(plannerCtx)
+	if !forced {
+		traceIntentPlannerInput(opts.Trace, repoRoot, activeCtx, items,
+			legacyRequest, cfg)
+	}
+	evaluation, err := EvaluateIntentCandidates(plannerCtx, db, IntentCandidateEvaluation{
 		BranchRef: activeCtx.BranchRef, BranchGeneration: activeCtx.BranchGeneration,
-		Captures: captures, Planner: cfg.planner, Preset: opts.IntentPreset,
+		Captures: captures, Planner: cfg.planner, Health: opts.IntentHealth,
+		RetryLimit: retryLimit, RetryLimitSet: true,
+		Preset:       opts.IntentPreset,
 		CommitFormat: cfg.commitFormat, IncludeDiffs: cfg.includeDiffs,
-		ForcedAging: false, Provider: cfg.plannerProvider, Model: cfg.plannerModel,
+		ForcedAging: forced, Provider: cfg.plannerProvider, Model: cfg.plannerModel,
 		ConfigRevisionID: sql.NullInt64{
 			Int64: telemetry.revisionID, Valid: telemetry.revisionID > 0,
 		},
@@ -67,6 +97,42 @@ func replayIntentCandidateBatch(
 	})
 	if err != nil {
 		return sum, err
+	}
+	if counted := attemptCounter.RetryCount(); counted > evaluation.RetryCount {
+		evaluation.RetryCount = counted
+	}
+	windowCfg := cfg
+	windowCfg.retryCount = evaluation.RetryCount
+	windowCfg.fallbackUsed = evaluation.Fallback != ""
+	windowPlan := intentCandidatePlannerWindowPlan(
+		legacyRequest, evaluation)
+	if evaluation.PlannerFailure != "" {
+		traceIntentPlannerValidationFailure(opts.Trace, repoRoot, activeCtx,
+			items, evaluation.PlannerFailure)
+	}
+	traceIntentPlannerOutput(opts.Trace, repoRoot, activeCtx, items, windowPlan)
+	if err := recordIntentPlannerWindow(ctx, db, windowCfg, legacyRequest,
+		windowPlan, items, activeCtx, evaluationStartedTS, forced,
+		evaluation.PlannerFailure); err != nil {
+		return sum, err
+	}
+	if evaluation.PlannerFailure != "" {
+		nowSec := float64(time.Now().UnixNano()) / 1e9
+		for _, item := range items {
+			if err := state.RecordPlannerError(ctx, db, item.event.Seq, nowSec,
+				evaluation.PlannerFailure); err != nil {
+				return sum, err
+			}
+			if err := appendIntentPlannerDecision(
+				ctx, db, item.event, activeCtx, nowSec,
+				state.DecisionKindIntentPlannerError,
+				evaluation.PlannerFailure,
+				"Intent v2 planner failed",
+				"Intent v2 applied the configured preset fallback policy.",
+			); err != nil {
+				return sum, err
+			}
+		}
 	}
 
 	itemBySeq := make(map[int64]intentReplayItem, len(items))
@@ -90,6 +156,9 @@ func replayIntentCandidateBatch(
 		selected := make([]intentReplayItem, 0, len(decision.Candidate.Events))
 		hasPublished := false
 		for _, member := range decision.Candidate.Events {
+			if member.EventRole == "coalesced" {
+				continue
+			}
 			item, ok := itemBySeq[member.EventSeq]
 			if !ok {
 				event, loadErr := loadIntentCaptureEvent(ctx, db, member.EventSeq)
@@ -176,6 +245,84 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func intentCandidatePlannerWindowPlan(
+	request ai.IntentPlanRequest,
+	evaluation IntentCandidateEvaluationResult,
+) ai.IntentPlan {
+	offered := make(map[int64]struct{}, len(request.OfferedCaptures))
+	for _, capture := range request.OfferedCaptures {
+		offered[capture.Seq] = struct{}{}
+	}
+	plan := ai.IntentPlan{Source: evaluation.ProtocolVersion}
+	covered := make(map[int64]struct{}, len(offered))
+	for _, decision := range evaluation.Decisions {
+		seqs := make([]int64, 0, len(decision.Assignment.SelectedSeqs))
+		for _, seq := range decision.Assignment.SelectedSeqs {
+			if _, ok := offered[seq]; !ok {
+				continue
+			}
+			seqs = append(seqs, seq)
+			covered[seq] = struct{}{}
+		}
+		if len(seqs) == 0 {
+			continue
+		}
+		if decision.Publishable {
+			plan.SelectedSeqs = append(plan.SelectedSeqs, seqs...)
+			plan.CommitGroups = append(plan.CommitGroups, ai.IntentCommitGroup{
+				SelectedSeqs:   append([]int64(nil), seqs...),
+				Subject:        decision.Assignment.Subject,
+				Body:           decision.Assignment.Body,
+				GroupingReason: decision.Assignment.GroupingReason,
+			})
+			continue
+		}
+		reason := intentCandidateDeferredReason(decision, evaluation)
+		for _, seq := range seqs {
+			plan.DeferredSeqs = append(plan.DeferredSeqs, seq)
+			plan.DeferredReasons = append(plan.DeferredReasons, ai.DeferredReason{
+				Seq: seq, Reason: reason,
+			})
+		}
+	}
+	for _, capture := range request.OfferedCaptures {
+		if _, ok := covered[capture.Seq]; ok {
+			continue
+		}
+		plan.DeferredSeqs = append(plan.DeferredSeqs, capture.Seq)
+		plan.DeferredReasons = append(plan.DeferredReasons, ai.DeferredReason{
+			Seq:    capture.Seq,
+			Reason: "candidate evaluation retained this capture",
+		})
+	}
+	sort.Slice(plan.SelectedSeqs, func(i, j int) bool {
+		return plan.SelectedSeqs[i] < plan.SelectedSeqs[j]
+	})
+	sort.Slice(plan.DeferredSeqs, func(i, j int) bool {
+		return plan.DeferredSeqs[i] < plan.DeferredSeqs[j]
+	})
+	sort.Slice(plan.DeferredReasons, func(i, j int) bool {
+		return plan.DeferredReasons[i].Seq < plan.DeferredReasons[j].Seq
+	})
+	return plan
+}
+
+func intentCandidateDeferredReason(
+	decision IntentCandidateDecision,
+	evaluation IntentCandidateEvaluationResult,
+) string {
+	if len(decision.Assignment.MissingCompanions) > 0 {
+		return strings.Join(decision.Assignment.MissingCompanions, "; ")
+	}
+	if evaluation.PlannerFailure != "" {
+		return "planner failure retained this candidate"
+	}
+	if evaluation.NeedsAttention {
+		return "candidate requires attention before publication"
+	}
+	return "candidate is waiting for an atomic publish boundary"
 }
 
 func intentCandidateScratchMaterializer(
@@ -270,7 +417,7 @@ func repairIntentCandidateDecision(
 			Event: item.event, Ops: item.ops,
 		})
 		if item.event.State == state.EventStatePending {
-			pendingCount++
+			pendingCount += 1 + coverLen(item.coalesce)
 		}
 		for _, path := range touchedPaths(item.ops) {
 			paths[path] = struct{}{}

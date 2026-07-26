@@ -704,21 +704,26 @@ func (p *OpenAIProvider) recordPromptRequest(ctx context.Context, body []byte, t
 	rec, err := openAITraceRequest(body, transform)
 	if err != nil {
 		logger.Record(prompttrace.Record{
-			Stage:        "request",
-			Strategy:     meta.Strategy,
-			Provider:     meta.Provider,
-			Model:        meta.Model,
-			Seq:          meta.Seq,
-			OfferedSeqs:  meta.OfferedSeqs,
-			BranchRef:    meta.BranchRef,
-			Generation:   meta.Generation,
-			DiffIncluded: meta.DiffIncluded,
-			DiffCap:      meta.DiffCap,
-			Error:        err.Error(),
+			Stage:            "request",
+			Strategy:         meta.Strategy,
+			Protocol:         meta.Protocol,
+			Provider:         meta.Provider,
+			Model:            meta.Model,
+			Seq:              meta.Seq,
+			OfferedSeqs:      meta.OfferedSeqs,
+			BranchRef:        meta.BranchRef,
+			Generation:       meta.Generation,
+			DiffIncluded:     meta.DiffIncluded,
+			DiffCap:          meta.DiffCap,
+			ConfigRevisionID: meta.ConfigRevisionID,
+			ConfigProfile:    meta.ConfigProfile,
+			RetryCount:       meta.RetryCount,
+			Error:            err.Error(),
 		})
 		return
 	}
 	rec.Strategy = meta.Strategy
+	rec.Protocol = meta.Protocol
 	rec.Provider = meta.Provider
 	rec.Model = meta.Model
 	rec.Seq = meta.Seq
@@ -727,6 +732,9 @@ func (p *OpenAIProvider) recordPromptRequest(ctx context.Context, body []byte, t
 	rec.Generation = meta.Generation
 	rec.DiffIncluded = meta.DiffIncluded
 	rec.DiffCap = meta.DiffCap
+	rec.ConfigRevisionID = meta.ConfigRevisionID
+	rec.ConfigProfile = meta.ConfigProfile
+	rec.RetryCount = meta.RetryCount
 	logger.Record(rec)
 }
 
@@ -745,17 +753,21 @@ func (p *OpenAIProvider) recordPromptResponse(ctx context.Context, model, strate
 	response.ValidationError = SanitizePlannerError(response.ValidationError)
 	meta = promptTraceMetadata(meta, p.Name(), meta.Model)
 	logger.Record(prompttrace.Record{
-		Stage:        "response",
-		Strategy:     meta.Strategy,
-		Provider:     meta.Provider,
-		Model:        meta.Model,
-		Seq:          meta.Seq,
-		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
-		BranchRef:    meta.BranchRef,
-		Generation:   meta.Generation,
-		DiffIncluded: meta.DiffIncluded,
-		DiffCap:      meta.DiffCap,
-		Response:     &response,
+		Stage:            "response",
+		Strategy:         meta.Strategy,
+		Protocol:         meta.Protocol,
+		Provider:         meta.Provider,
+		Model:            meta.Model,
+		Seq:              meta.Seq,
+		OfferedSeqs:      append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:        meta.BranchRef,
+		Generation:       meta.Generation,
+		DiffIncluded:     meta.DiffIncluded,
+		DiffCap:          meta.DiffCap,
+		ConfigRevisionID: meta.ConfigRevisionID,
+		ConfigProfile:    meta.ConfigProfile,
+		RetryCount:       meta.RetryCount,
+		Response:         &response,
 	})
 }
 

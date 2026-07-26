@@ -927,6 +927,7 @@ type intentReplayConfig struct {
 	deferLimit      int
 	retryLimit      *int
 	retryCount      int
+	fallbackUsed    bool
 	pathCoalescing  bool
 	includeDiffs    bool
 	bypassBatchWait bool
@@ -1197,7 +1198,7 @@ func replayIntentBatch(
 	}
 	if opts.IntentPreset != "" {
 		return replayIntentCandidateBatch(ctx, repoRoot, db, activeCtx, opts, cfg,
-			indexFile, items, req, parent, parentTree, sum)
+			indexFile, items, req, parent, parentTree, forced, sum)
 	}
 
 	// Forced-aging singleton deterministic fast path: when intent mode is
@@ -2241,6 +2242,10 @@ func classifyIntentPlannerHealthFailure(err error, plannerCallFailed bool) error
 	if errors.As(err, &validationErr) {
 		return &IntentPlannerValidationFailure{Err: err}
 	}
+	var validationV2Err *ai.IntentPlanV2ValidationError
+	if errors.As(err, &validationV2Err) {
+		return &IntentPlannerValidationFailure{Err: err}
+	}
 	return &IntentPlannerTransportFailure{Err: err}
 }
 
@@ -2305,9 +2310,13 @@ func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, r
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
 	selected := map[int64]struct{}{}
-	groups, err := ai.IntentPlanCommitGroups(plan)
-	if err != nil {
-		return err
+	var groups []ai.IntentCommitGroup
+	if len(plan.SelectedSeqs) > 0 || len(plan.CommitGroups) > 0 {
+		var err error
+		groups, err = ai.IntentPlanCommitGroups(plan)
+		if err != nil {
+			return err
+		}
 	}
 	for _, group := range groups {
 		for _, seq := range group.SelectedSeqs {
@@ -2429,9 +2438,13 @@ func recordIntentPlannerWindow(
 	forced bool,
 	validationFailure string,
 ) error {
-	groups, err := ai.IntentPlanCommitGroups(plan)
-	if err != nil {
-		return err
+	var groups []ai.IntentCommitGroup
+	if len(plan.SelectedSeqs) > 0 || len(plan.CommitGroups) > 0 {
+		var err error
+		groups, err = ai.IntentPlanCommitGroups(plan)
+		if err != nil {
+			return err
+		}
 	}
 	itemBySeq := make(map[int64]intentReplayItem, len(items))
 	eventRows := make(map[int64]*state.IntentPlannerWindowEvent, len(items))
@@ -2522,7 +2535,7 @@ func recordIntentPlannerWindow(
 		forcedReason = "defer_limit"
 	}
 	telemetry := runtimeTelemetryFromContext(ctx)
-	fallbackUsed := validationFailure != ""
+	fallbackUsed := cfg.fallbackUsed || validationFailure != ""
 	if !fallbackUsed && provider != "" && provider != (ai.DeterministicProvider{}).Name() && strings.TrimSpace(plan.Source) == (ai.DeterministicProvider{}).Name() {
 		fallbackUsed = true
 	}
@@ -2535,7 +2548,7 @@ func recordIntentPlannerWindow(
 	if validationFailure != "" {
 		outcome = "provider_error_fallback_" + outcome
 	}
-	_, err = state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+	_, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
 		PlannedTS:           ts,
 		Provider:            nullString(provider),
 		Model:               nullString(model),

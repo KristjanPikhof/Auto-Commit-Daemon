@@ -853,6 +853,7 @@ func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body [
 	logger.Record(prompttrace.Record{
 		Stage:              "request",
 		Strategy:           meta.Strategy,
+		Protocol:           meta.Protocol,
 		Provider:           meta.Provider,
 		Model:              meta.Model,
 		Seq:                meta.Seq,
@@ -861,6 +862,9 @@ func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body [
 		Generation:         meta.Generation,
 		DiffIncluded:       meta.DiffIncluded,
 		DiffCap:            meta.DiffCap,
+		ConfigRevisionID:   meta.ConfigRevisionID,
+		ConfigProfile:      meta.ConfigProfile,
+		RetryCount:         meta.RetryCount,
 		Transform:          transform,
 		SubprocessEnvelope: append([]byte(nil), body...),
 	})
@@ -878,17 +882,21 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 	response.ValidationError = SanitizePlannerError(response.ValidationError)
 	meta = promptTraceMetadata(meta, p.Name(), "")
 	logger.Record(prompttrace.Record{
-		Stage:        "response",
-		Strategy:     meta.Strategy,
-		Provider:     meta.Provider,
-		Model:        meta.Model,
-		Seq:          meta.Seq,
-		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
-		BranchRef:    meta.BranchRef,
-		Generation:   meta.Generation,
-		DiffIncluded: meta.DiffIncluded,
-		DiffCap:      meta.DiffCap,
-		Response:     &response,
+		Stage:            "response",
+		Strategy:         meta.Strategy,
+		Protocol:         meta.Protocol,
+		Provider:         meta.Provider,
+		Model:            meta.Model,
+		Seq:              meta.Seq,
+		OfferedSeqs:      append([]int64(nil), meta.OfferedSeqs...),
+		BranchRef:        meta.BranchRef,
+		Generation:       meta.Generation,
+		DiffIncluded:     meta.DiffIncluded,
+		DiffCap:          meta.DiffCap,
+		ConfigRevisionID: meta.ConfigRevisionID,
+		ConfigProfile:    meta.ConfigProfile,
+		RetryCount:       meta.RetryCount,
+		Response:         &response,
 	})
 }
 
