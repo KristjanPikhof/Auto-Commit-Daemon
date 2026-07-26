@@ -28,10 +28,20 @@ type Document struct {
 // SettingsDocument contains global defaults, named profiles, and per-repo
 // profile selections/overrides.
 type SettingsDocument struct {
-	Global       Overrides
-	Profiles     map[string]Profile
-	Repositories map[string]RepositorySettings
-	Extra        map[string]json.RawMessage
+	Global              Overrides
+	GlobalSetupApproval *GlobalSetupApproval
+	Profiles            map[string]Profile
+	Repositories        map[string]RepositorySettings
+	Extra               map[string]json.RawMessage
+}
+
+// GlobalSetupApproval records the reviewed, presentation-safe permissions for
+// one exact generation of the global authoring configuration. Repository
+// command approval is deliberately unsupported at global scope.
+type GlobalSetupApproval struct {
+	Generation    uint64   `json:"generation"`
+	Fingerprint   string   `json:"fingerprint"`
+	Confirmations []string `json:"confirmations"`
 }
 
 // Profile is a named set of explicit field overrides.
@@ -117,6 +127,13 @@ func parseSettings(body json.RawMessage) (SettingsDocument, error) {
 		if err := json.Unmarshal(value, &out.Global); err != nil {
 			return SettingsDocument{}, fmt.Errorf("acd config: settings.global: %w", err)
 		}
+	}
+	if value, ok := takeRaw(raw, "global_setup_approval"); ok {
+		var approval GlobalSetupApproval
+		if err := json.Unmarshal(value, &approval); err != nil {
+			return SettingsDocument{}, fmt.Errorf("acd config: settings.global_setup_approval: %w", err)
+		}
+		out.GlobalSetupApproval = &approval
 	}
 	if value, ok := takeRaw(raw, "profiles"); ok {
 		var profiles map[string]json.RawMessage
@@ -213,6 +230,15 @@ func (s SettingsDocument) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.GlobalSetupApproval != nil {
+		approval, err := json.Marshal(s.GlobalSetupApproval)
+		if err != nil {
+			return nil, err
+		}
+		raw["global_setup_approval"] = approval
+	} else {
+		delete(raw, "global_setup_approval")
+	}
 	profiles, err := json.Marshal(nonNilProfiles(s.Profiles))
 	if err != nil {
 		return nil, err
@@ -225,6 +251,20 @@ func (s SettingsDocument) MarshalJSON() ([]byte, error) {
 	raw["profiles"] = profiles
 	raw["repositories"] = repositories
 	return json.Marshal(raw)
+}
+
+// ActiveGlobalSetupApproval returns the approval only while it is bound to the
+// document's current generation. Callers receive a copy safe to retain.
+func ActiveGlobalSetupApproval(doc *Document) (GlobalSetupApproval, bool) {
+	if doc == nil || doc.Settings.GlobalSetupApproval == nil {
+		return GlobalSetupApproval{}, false
+	}
+	approval := *doc.Settings.GlobalSetupApproval
+	if approval.Generation != doc.Generation || approval.Fingerprint == "" {
+		return GlobalSetupApproval{}, false
+	}
+	approval.Confirmations = append([]string(nil), approval.Confirmations...)
+	return approval, true
 }
 
 func (p Profile) MarshalJSON() ([]byte, error) {

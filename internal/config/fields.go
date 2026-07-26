@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,6 +267,9 @@ func ValidateDocument(doc *Document) error {
 	if err := validateOverrides("global", doc.Settings.Global); err != nil {
 		return err
 	}
+	if err := validateGlobalSetupApproval(doc); err != nil {
+		return err
+	}
 	for name, profile := range doc.Settings.Profiles {
 		if strings.TrimSpace(name) == "" {
 			return errors.New("acd config: empty profile name")
@@ -289,6 +293,41 @@ func ValidateDocument(doc *Document) error {
 	}
 	return nil
 }
+
+func validateGlobalSetupApproval(doc *Document) error {
+	approval := doc.Settings.GlobalSetupApproval
+	if approval == nil {
+		return nil
+	}
+	if approval.Generation == 0 || approval.Generation > doc.Generation {
+		return errors.New("acd config: global setup approval has an invalid generation")
+	}
+	if len(approval.Fingerprint) != sha256HexLength {
+		return errors.New("acd config: global setup approval has an invalid fingerprint")
+	}
+	if _, err := hex.DecodeString(approval.Fingerprint); err != nil {
+		return errors.New("acd config: global setup approval has an invalid fingerprint")
+	}
+	allowed := map[string]bool{
+		"endpoint_credentials": true,
+		"subprocess_execution": true,
+		"diff_egress":          true,
+		"intent_repair":        true,
+	}
+	seen := make(map[string]bool, len(approval.Confirmations))
+	for _, confirmation := range approval.Confirmations {
+		if !allowed[confirmation] {
+			return fmt.Errorf("acd config: global setup approval has unsupported confirmation %q", confirmation)
+		}
+		if seen[confirmation] {
+			return fmt.Errorf("acd config: global setup approval repeats confirmation %q", confirmation)
+		}
+		seen[confirmation] = true
+	}
+	return nil
+}
+
+const sha256HexLength = 64
 
 func validateOverrides(scope string, values Overrides) error {
 	for name, raw := range values {
