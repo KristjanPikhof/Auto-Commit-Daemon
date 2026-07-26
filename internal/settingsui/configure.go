@@ -25,6 +25,7 @@ type ConfigureWizardOptions struct {
 	DetectedFullCommand  string
 	DetectedFullSource   string
 	ExplicitMode         bool
+	RepositoryScoped     bool
 	HasCredential        bool
 	CredentialFromStdin  bool
 	ProviderConfigured   bool
@@ -75,15 +76,30 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		ProviderTimeout: fallback(defaults["ai.timeout"], "30s"),
 	}
 	selection.Experience = configureExperience(selection.Strategy, selection.Preset)
+	if opts.ExplicitMode && !opts.RepositoryScoped &&
+		selection.Strategy == "intent" && selection.Preset == "quality" {
+		return ConfigureSelection{}, errors.New(
+			"configure wizard: Strict Review is available only for repository-scoped setup",
+		)
+	}
 	if !opts.ExplicitMode {
+		options := []huh.Option[string]{
+			huh.NewOption("Everyday work — semantic commits with ACD safety checks (recommended)", "everyday"),
+			huh.NewOption("Maximum speed — immediate one-change commits, no project checks", "speed"),
+		}
+		description := "Everyday is the recommended balance. Project tests are not run."
+		if opts.RepositoryScoped {
+			options = append(options,
+				huh.NewOption("Strict review — semantic commits gated by the full test suite (multi-minute)", "strict"),
+			)
+			description = "Everyday runs no project tests. Strict Review can take several minutes."
+		} else if selection.Experience == "strict" {
+			selection.Experience = "everyday"
+		}
 		experienceForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("experience").Title("How should ACD work?").
-				Description("Everyday is the recommended balance. Strict Review can take several minutes.").
-				Options(
-					huh.NewOption("Everyday work — semantic commits with a quick background check (recommended)", "everyday"),
-					huh.NewOption("Maximum speed — immediate one-change commits, no project checks", "speed"),
-					huh.NewOption("Strict review — semantic commits gated by the full test suite (multi-minute)", "strict"),
-				).Value(&selection.Experience),
+				Description(description).
+				Options(options...).Value(&selection.Experience),
 		))
 		if err := runConfigureForm(ctx, experienceForm, opts); err != nil {
 			return ConfigureSelection{}, err
@@ -159,20 +175,15 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	}
 
 	selection.VerificationMode = configureVerificationMode(selection.Strategy, selection.Preset)
-	if selection.VerificationMode == "fast" || selection.VerificationMode == "full" {
+	if selection.VerificationMode == "full" {
 		field := "verification." + selection.VerificationMode + ".command"
 		selection.VerificationCommand = strings.TrimSpace(defaults[field])
 		if selection.VerificationCommand != "" {
 			selection.VerificationSource = "saved setting"
 		}
 		if selection.VerificationCommand == "" {
-			if selection.VerificationMode == "fast" {
-				selection.VerificationCommand = strings.TrimSpace(opts.DetectedQuickCommand)
-				selection.VerificationSource = strings.TrimSpace(opts.DetectedQuickSource)
-			} else {
-				selection.VerificationCommand = strings.TrimSpace(opts.DetectedFullCommand)
-				selection.VerificationSource = strings.TrimSpace(opts.DetectedFullSource)
-			}
+			selection.VerificationCommand = strings.TrimSpace(opts.DetectedFullCommand)
+			selection.VerificationSource = strings.TrimSpace(opts.DetectedFullSource)
 			if selection.VerificationCommand == "" {
 				selection.VerificationCommand = strings.TrimSpace(opts.DetectedCommand)
 				if selection.VerificationCommand != "" {
@@ -181,19 +192,14 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 			}
 		}
 		if selection.VerificationCommand == "" {
-			if selection.VerificationMode == "fast" {
-				selection.VerificationMode = "structural"
-				selection.VerificationSource = "built-in structural verification"
-			} else {
-				return ConfigureSelection{}, errors.New(
-					"configure wizard: Strict Review is unavailable because no full verification command was detected; " +
-						"set one in acd settings",
-				)
-			}
+			return ConfigureSelection{}, errors.New(
+				"configure wizard: Strict Review is unavailable because no full verification command was detected; " +
+					"set one in acd settings",
+			)
 		}
 	}
 	selection.ExecutionMode = "background activation gate"
-	if selection.Strategy == "event" {
+	if selection.VerificationMode != "full" {
 		selection.ExecutionMode = "immediate"
 	}
 
@@ -359,7 +365,7 @@ func configureVerificationMode(strategy, preset string) string {
 	}
 	switch preset {
 	case "balanced":
-		return "fast"
+		return "structural"
 	case "quality":
 		return "full"
 	default:

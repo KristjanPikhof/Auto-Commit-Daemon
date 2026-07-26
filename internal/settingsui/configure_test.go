@@ -10,7 +10,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 )
 
-func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
+func TestConfigureWizardAccessibleStagesGlobalIntentBalancedWithoutTests(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	input := strings.Join([]string{
 		"", // Everyday
@@ -36,8 +36,9 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 		t.Fatalf("wizard: %v\n%s", err, out.String())
 	}
 	if selection.Strategy != "intent" || selection.Preset != "balanced" ||
-		selection.VerificationMode != "fast" ||
-		selection.VerificationCommand != "go test ./... -run '^$'" ||
+		selection.VerificationMode != "structural" ||
+		selection.VerificationCommand != "" ||
+		selection.ExecutionMode != "immediate" ||
 		selection.VerificationApproved || !selection.DiffContextApproved ||
 		selection.Credential != "staged-secret" ||
 		selection.BaseURL != "https://gateway.example/v1" ||
@@ -57,6 +58,7 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"verification command", "Commit message format", "Provider timeout",
+		"Strict review", "background check",
 	} {
 		if strings.Contains(out.String(), forbidden) {
 			t.Errorf("regular wizard rendered technical prompt %q:\n%s",
@@ -65,7 +67,7 @@ func TestConfigureWizardAccessibleStagesReviewedIntentBalanced(t *testing.T) {
 	}
 }
 
-func TestConfigureWizardUsesSavedVerificationBeforeDetection(t *testing.T) {
+func TestConfigureWizardBalancedIgnoresSavedAndDetectedVerification(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	input := "\n"
 	var out bytes.Buffer
@@ -83,8 +85,9 @@ func TestConfigureWizardUsesSavedVerificationBeforeDetection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wizard: %v\n%s", err, out.String())
 	}
-	if selection.VerificationCommand != "go test ./..." {
-		t.Fatalf("verification command=%q", selection.VerificationCommand)
+	if selection.VerificationMode != "structural" || selection.VerificationCommand != "" ||
+		selection.VerificationSource != "" {
+		t.Fatalf("selection=%+v", selection)
 	}
 	for _, forbidden := range []string{
 		"Commit message provider", "API key", "verification command",
@@ -103,6 +106,7 @@ func TestConfigureWizardStrictUnavailableWithoutFullCheck(t *testing.T) {
 	_, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input:  &bytewiseReader{r: strings.NewReader("3\n")},
 		Output: &out, Accessible: true, HasCredential: true,
+		RepositoryScoped:   true,
 		ProviderConfigured: true, OpenAIConfigured: true,
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
@@ -119,14 +123,39 @@ func TestConfigureWizardStrictUnavailableWithoutFullCheck(t *testing.T) {
 	}
 }
 
-func TestConfigureWizardFallsBackToStructuralVerification(t *testing.T) {
+func TestConfigureWizardGlobalExplicitStrictIsUnavailable(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
-	input := "\n"
+	var out bytes.Buffer
+	_, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
+		Input: &bytewiseReader{r: strings.NewReader("")}, Output: &out,
+		Accessible: true, HasCredential: true,
+		ExplicitMode:       true,
+		ProviderConfigured: true, OpenAIConfigured: true,
+		Defaults: map[string]string{
+			"commit.strategy": "intent", "commit.preset": "quality",
+			"commit.format": "imperative", "ai.provider": "openai-compat",
+			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.timeout": "30s",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(),
+		"Strict Review is available only for repository-scoped setup") {
+		t.Fatalf("err=%v\n%s", err, out.String())
+	}
+}
+
+func TestConfigureWizardRepositoryStrictUsesDetectedFullCheck(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
 	var out bytes.Buffer
 	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
-		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
-		Accessible: true, HasCredential: true,
+		Input:  &bytewiseReader{r: strings.NewReader("3\n")},
+		Output: &out, Accessible: true, HasCredential: true,
+		RepositoryScoped:   true,
 		ProviderConfigured: true, OpenAIConfigured: true,
+		DetectedQuickCommand: "go test ./... -run '^$'",
+		DetectedQuickSource:  "Go language default",
+		DetectedFullCommand:  "make test",
+		DetectedFullSource:   "Makefile target",
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
@@ -134,9 +163,19 @@ func TestConfigureWizardFallsBackToStructuralVerification(t *testing.T) {
 			"ai.timeout": "30s",
 		},
 	})
-	if err != nil || selection.VerificationMode != "structural" ||
-		selection.VerificationSource != "built-in structural verification" {
-		t.Fatalf("selection=%+v err=%v\n%s", selection, err, out.String())
+	if err != nil {
+		t.Fatalf("wizard: %v\n%s", err, out.String())
+	}
+	if selection.Experience != "strict" ||
+		selection.Strategy != "intent" || selection.Preset != "quality" ||
+		selection.VerificationMode != "full" ||
+		selection.VerificationCommand != "make test" ||
+		selection.VerificationSource != "Makefile target" ||
+		selection.ExecutionMode != "background activation gate" {
+		t.Fatalf("selection=%+v\n%s", selection, out.String())
+	}
+	if !strings.Contains(out.String(), "Strict review") {
+		t.Fatalf("repository setup did not offer Strict Review:\n%s", out.String())
 	}
 }
 
@@ -250,7 +289,7 @@ func TestConfigureHelpersKeepLocalProviderAndPresetVerification(t *testing.T) {
 	}{
 		{"event", "quality", "none"},
 		{"intent", "fast", "none"},
-		{"intent", "balanced", "fast"},
+		{"intent", "balanced", "structural"},
 		{"intent", "quality", "full"},
 	} {
 		if got := configureVerificationMode(test.strategy, test.preset); got != test.want {
