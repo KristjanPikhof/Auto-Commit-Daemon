@@ -13,6 +13,12 @@
 - Removed the regular wizard's free-form verification command question.
   Everyday runs no project command; repository Strict Review detects a full
   command and asks only for exact approval in the final preview.
+- Fixed Intent Everyday getting stuck in `needs_attention` after successful
+  setup. Structural verification now relies on ACD's atomicity and
+  materialization gates instead of waiting for a repository command.
+- Fixed planner fallback repeatedly rejecting hard-linked work from an
+  existing candidate. Balanced and Fast now continue or merge the persisted
+  candidate without losing dependency order or leaving it permanently waiting.
 
 ### Added
 
