@@ -26,8 +26,9 @@ package state
 // adds an index for published-prefix retention while unresolved same-base
 // recovery chains remain in the ledger; v14 adds immutable runtime
 // configuration revisions, activation and experiment ledgers, and revision
-// metadata on planner windows and decisions.
-const SchemaVersion = 14
+// metadata on planner windows and decisions; v15 adds the durable Intent v2
+// candidate, dependency, boundary, verification, and repair ledgers.
+const SchemaVersion = 15
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -359,6 +360,147 @@ CREATE INDEX IF NOT EXISTS idx_config_experiments_status_expiry
 
 CREATE INDEX IF NOT EXISTS idx_config_experiments_candidate_status
     ON config_experiments(candidate_revision_id, status, id);
+
+-- v15 Intent v2 state. Candidate rows contain only bounded, privacy-safe
+-- summaries. Source material remains in immutable capture_ops and is
+-- reconstructed when a planner or verifier needs it.
+CREATE TABLE IF NOT EXISTS intent_candidates(
+    id                       TEXT PRIMARY KEY,
+    branch_ref               TEXT NOT NULL,
+    branch_generation        INTEGER NOT NULL,
+    status                   TEXT NOT NULL CHECK (status IN
+                              ('open','waiting','ready','soft_published',
+                               'published','blocked','failed')),
+    purpose                  TEXT NOT NULL DEFAULT '',
+    created_ts               REAL NOT NULL,
+    updated_ts               REAL NOT NULL,
+    ready_ts                 REAL,
+    readiness                TEXT NOT NULL DEFAULT 'wait'
+                              CHECK (readiness IN ('ready','wait')),
+    missing_companions       TEXT NOT NULL DEFAULT '',
+    atomicity_status         TEXT,
+    atomicity_summary        TEXT NOT NULL DEFAULT '',
+    atomicity_checked_ts     REAL,
+    provider                 TEXT,
+    model                    TEXT,
+    planner_protocol         TEXT,
+    config_revision_id       INTEGER,
+    config_profile           TEXT,
+    preset_id                TEXT,
+    preset_version           INTEGER,
+    soft_publication_deadline REAL,
+    verification_status      TEXT,
+    verification_output      TEXT NOT NULL DEFAULT '',
+    verification_ts          REAL,
+    published_commit_oid     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidates_pair_status_updated
+    ON intent_candidates(branch_ref, branch_generation, status, updated_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidates_published_oid
+    ON intent_candidates(published_commit_oid, id);
+
+CREATE TABLE IF NOT EXISTS intent_candidate_events(
+    candidate_id       TEXT NOT NULL,
+    ord                INTEGER NOT NULL CHECK (ord >= 0),
+    event_seq          INTEGER NOT NULL CHECK (event_seq > 0),
+    event_role         TEXT NOT NULL,
+    membership_state   TEXT NOT NULL DEFAULT 'active'
+                       CHECK (membership_state IN ('active','superseded')),
+    PRIMARY KEY (candidate_id, event_seq),
+    FOREIGN KEY (candidate_id) REFERENCES intent_candidates(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidate_events_candidate_state_ord
+    ON intent_candidate_events(candidate_id, membership_state, ord);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidate_events_seq_candidate
+    ON intent_candidate_events(event_seq, candidate_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_candidate_events_active_seq
+    ON intent_candidate_events(event_seq)
+    WHERE membership_state = 'active';
+
+CREATE TABLE IF NOT EXISTS intent_capture_dependencies(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_ref          TEXT NOT NULL,
+    branch_generation   INTEGER NOT NULL,
+    prerequisite_seq    INTEGER NOT NULL CHECK (prerequisite_seq > 0),
+    dependent_seq       INTEGER NOT NULL CHECK (dependent_seq > 0),
+    strength            TEXT NOT NULL CHECK (strength IN ('hard','soft')),
+    kind                TEXT NOT NULL,
+    evidence            TEXT NOT NULL DEFAULT '',
+    created_ts          REAL NOT NULL,
+    CHECK (prerequisite_seq <> dependent_seq),
+    UNIQUE (branch_ref, branch_generation, prerequisite_seq,
+            dependent_seq, strength, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_capture_dependencies_pair_from
+    ON intent_capture_dependencies(
+        branch_ref, branch_generation, prerequisite_seq, dependent_seq);
+
+CREATE INDEX IF NOT EXISTS idx_intent_capture_dependencies_pair_to
+    ON intent_capture_dependencies(
+        branch_ref, branch_generation, dependent_seq, prerequisite_seq);
+
+CREATE TABLE IF NOT EXISTS intent_activity_boundaries(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    epoch               INTEGER NOT NULL UNIQUE CHECK (epoch > 0),
+    kind                TEXT NOT NULL CHECK (kind IN ('soft','hard')),
+    source              TEXT NOT NULL,
+    branch_ref          TEXT,
+    branch_generation   INTEGER,
+    created_ts          REAL NOT NULL,
+    consumed_ts         REAL,
+    CHECK ((branch_ref IS NULL AND branch_generation IS NULL) OR
+           (branch_ref IS NOT NULL AND branch_generation IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_activity_boundaries_consumed_epoch
+    ON intent_activity_boundaries(consumed_ts, epoch);
+
+CREATE TABLE IF NOT EXISTS intent_repairs(
+    id                  TEXT PRIMARY KEY,
+    branch_ref          TEXT NOT NULL,
+    branch_generation   INTEGER NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN
+                           ('prepared','git_applied','completed','skipped','failed')),
+    expected_head       TEXT NOT NULL,
+    backup_ref          TEXT,
+    old_head            TEXT,
+    new_head            TEXT,
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    git_applied_ts      REAL,
+    completed_ts        REAL,
+    error               TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repairs_pair_status_updated
+    ON intent_repairs(branch_ref, branch_generation, status, updated_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repairs_backup_ref
+    ON intent_repairs(backup_ref, id);
+
+CREATE TABLE IF NOT EXISTS intent_repair_commits(
+    repair_id           TEXT NOT NULL,
+    ord                 INTEGER NOT NULL CHECK (ord >= 0),
+    candidate_id        TEXT,
+    old_oid             TEXT NOT NULL,
+    new_oid             TEXT,
+    PRIMARY KEY (repair_id, ord),
+    UNIQUE (repair_id, old_oid),
+    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_old_oid
+    ON intent_repair_commits(old_oid, repair_id);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_candidate
+    ON intent_repair_commits(candidate_id, repair_id);
 
 -- v12: one durable record for an all-or-none unpublished-chain transition.
 -- capture event provenance remains on capture_events; this table records the

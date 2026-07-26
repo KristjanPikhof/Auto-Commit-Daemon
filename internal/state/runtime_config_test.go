@@ -243,8 +243,8 @@ PRAGMA user_version=13;`)
 		t.Fatalf("Open migrated v13: %v", err)
 	}
 	defer d.Close()
-	if got, _ := d.UserVersion(context.Background()); got != 14 {
-		t.Fatalf("user_version=%d", got)
+	if got, _ := d.UserVersion(context.Background()); got != SchemaVersion {
+		t.Fatalf("user_version=%d want=%d", got, SchemaVersion)
 	}
 	var reason string
 	if err := d.SQL().QueryRow(`SELECT reason FROM decision_records WHERE id=1`).Scan(&reason); err != nil || reason != "keep" {
