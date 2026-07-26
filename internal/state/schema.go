@@ -27,8 +27,10 @@ package state
 // recovery chains remain in the ledger; v14 adds immutable runtime
 // configuration revisions, activation and experiment ledgers, and revision
 // metadata on planner windows and decisions; v15 adds the durable Intent v2
-// candidate, dependency, boundary, verification, and repair ledgers.
-const SchemaVersion = 15
+// candidate, dependency, boundary, verification, and repair ledgers; v16 adds
+// durable background setup-validation attempts without backfilling existing
+// applied revisions.
+const SchemaVersion = 16
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -334,6 +336,40 @@ CREATE INDEX IF NOT EXISTS idx_config_activation_requests_status_id
 
 CREATE INDEX IF NOT EXISTS idx_config_activation_requests_revision_id
     ON config_activation_requests(revision_id, id);
+
+-- v16 durable setup validation. Commands remain in immutable runtime
+-- revisions; this ledger stores only provenance and a digest.
+CREATE TABLE IF NOT EXISTS config_validation_runs(
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    activation_request_id INTEGER NOT NULL,
+    revision_id           INTEGER NOT NULL,
+    attempt               INTEGER NOT NULL CHECK (attempt > 0),
+    branch_ref            TEXT NOT NULL,
+    branch_generation     INTEGER NOT NULL CHECK (branch_generation >= 0),
+    expected_head         TEXT NOT NULL,
+    mode                  TEXT NOT NULL CHECK (mode IN ('structural','fast','full')),
+    command_source        TEXT NOT NULL,
+    command_digest        TEXT NOT NULL,
+    approval_id           TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN
+                          ('queued','running','passed','failed','timed_out','cancelled')),
+    owner_pid             INTEGER,
+    requested_ts          REAL NOT NULL,
+    started_ts            REAL,
+    completed_ts          REAL,
+    exit_code             INTEGER,
+    sanitized_output      TEXT NOT NULL DEFAULT '',
+    bounded_error         TEXT,
+    FOREIGN KEY (activation_request_id) REFERENCES config_activation_requests(id),
+    FOREIGN KEY (revision_id) REFERENCES config_revisions(id),
+    UNIQUE (activation_request_id, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_validation_runs_status_id
+    ON config_validation_runs(status, id);
+
+CREATE INDEX IF NOT EXISTS idx_config_validation_runs_request_attempt
+    ON config_validation_runs(activation_request_id, attempt);
 
 CREATE TABLE IF NOT EXISTS config_experiments(
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -93,7 +93,7 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldIntentRepairEnabled, Environment: "ACD_INTENT_REPAIR_ENABLED", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentRepairHorizon, Environment: "ACD_INTENT_REPAIR_HORIZON", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentRepairMaxCommits, Environment: "ACD_INTENT_REPAIR_MAX_COMMITS", Default: "3", Kind: KindInteger, Minimum: 1, Maximum: 5, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: "none", Kind: KindString, Choices: []string{"none", "fast", "full"}, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: "none", Kind: KindString, Choices: []string{"none", "structural", "fast", "full"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFastCommand, Environment: "ACD_VERIFICATION_FAST_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFastTimeout, Environment: "ACD_VERIFICATION_FAST_TIMEOUT", Default: "2m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFullCommand, Environment: "ACD_VERIFICATION_FULL_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},

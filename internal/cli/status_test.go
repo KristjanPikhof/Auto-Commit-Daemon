@@ -247,7 +247,7 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := report.IntentV2
-	if !got.Available || got.SchemaVersion != 15 ||
+	if !got.Available || got.SchemaVersion != state.SchemaVersion ||
 		got.ReplayState != "needs_attention" ||
 		got.PresetID != "intent.balanced" ||
 		got.PresetVersion != config.PresetCatalogVersion ||
@@ -309,6 +309,7 @@ func TestStatusRuntimeConfigPreV14MissingTablesReadOnly(t *testing.T) {
 	repo, dbPath, d := makeRepoStateDB(t)
 	registerRepo(t, roots, repo, dbPath, "codex")
 	if _, err := d.SQL().Exec(`
+DROP TABLE config_validation_runs;
 DROP TABLE config_experiments;
 DROP TABLE config_activation_requests;
 DROP TABLE runtime_config_state;

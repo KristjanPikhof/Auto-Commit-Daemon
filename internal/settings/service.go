@@ -113,6 +113,7 @@ func newService(ctx context.Context, opts Options, openState bool) (*Service, er
 
 type AuthoringPreview struct {
 	Values     map[string]string
+	Sources    map[string]config.Source
 	Generation uint64
 	Preset     config.PresetResolution
 }
@@ -127,12 +128,27 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
-	resolved, _, preset, err := s.resolveDraft(doc, nil)
+	repo := doc.Settings.Repositories[s.repoHash]
+	profile := doc.Settings.Profiles[repo.Profile]
+	fields, preset, err := config.ResolveAll(config.ResolveInput{
+		Repository: repo.Fields,
+		Profile:    profile.Fields,
+		Global:     doc.Settings.Global,
+		LookupEnv:  s.lookupEnv,
+	}, repo.Fields)
 	if err != nil {
-		return AuthoringPreview{}, err
+		return AuthoringPreview{}, sanitizeError(err)
+	}
+	values := make(map[string]string, len(fields))
+	sources := make(map[string]config.Source, len(fields))
+	for _, definition := range config.Catalog() {
+		field := fields[definition.Name]
+		values[definition.Name] = field.EffectiveValue()
+		sources[definition.Name] = field.Source
 	}
 	return AuthoringPreview{
-		Values: hotValues(resolved), Generation: doc.Generation, Preset: preset,
+		Values: hotValues(values), Sources: sources,
+		Generation: doc.Generation, Preset: preset,
 	}, nil
 }
 
@@ -271,11 +287,12 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	case "full":
 		verificationCommand = resolved[config.FieldVerificationFullCommand]
 	}
-	if verificationMode != "none" && strings.TrimSpace(verificationCommand) == "" {
+	if (verificationMode == "fast" || verificationMode == "full") &&
+		strings.TrimSpace(verificationCommand) == "" {
 		return Validation{}, errors.New("acd settings: preset-required verification command is not configured")
 	}
 	required := append([]ai.ConfirmationRequirement(nil), providerValidation.Confirmations...)
-	if verificationMode != "none" {
+	if verificationMode == "fast" || verificationMode == "full" {
 		required = append(required, ai.ConfirmationVerificationCommand)
 	}
 	if resolved[config.FieldIntentRepairEnabled] == "true" {
@@ -542,6 +559,7 @@ func sanitizeErrorWithSecrets(err error, secrets ...string) error {
 			message = strings.ReplaceAll(message, secret, "[redacted]")
 		}
 	}
+	message = ai.SanitizePlannerError(message)
 	return sanitizeError(errors.New(message))
 }
 

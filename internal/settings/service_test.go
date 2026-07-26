@@ -133,6 +133,39 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	}
 }
 
+func TestAuthoringPreviewReportsProviderSources(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvProvider {
+			return "openai-compat", true
+		}
+		return "", false
+	}
+	svc, roots := testService(t, lookup, nil, nil)
+	store := config.NewStore(roots)
+	if err := store.Update(func(doc *config.Document) error {
+		doc.Settings.Repositories[svc.repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldBaseURL: json.RawMessage(
+					`"https://gateway.example/v1"`,
+				),
+				config.FieldModel: json.RawMessage(`"gateway-model"`),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Sources[config.FieldProvider] != config.SourceEnvironment ||
+		preview.Sources[config.FieldBaseURL] != config.SourceRepository ||
+		preview.Sources[config.FieldModel] != config.SourceRepository {
+		t.Fatalf("sources=%+v", preview.Sources)
+	}
+}
+
 func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {
 	svc, _ := testService(t, nil, nil, nil)
 	ctx := context.Background()
@@ -359,12 +392,16 @@ func TestSettingsActionProviderTestRedactsProbeError(t *testing.T) {
 		return "", false
 	}
 	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-		return ai.ProviderProbeResult{Provider: "openai-compat"}, errors.New("hidden-key\x1b[2J upstream failure")
+		return ai.ProviderProbeResult{Provider: "openai-compat"},
+			errors.New("hidden-key\x1b[2J upstream rejected sk-HCKZa********UC3m")
 	}, nil)
 	_, err := svc.TestProvider(context.Background(), map[string]string{
 		config.FieldProvider: "openai-compat", config.FieldModel: "model",
 	}, nil)
-	if err == nil || strings.Contains(err.Error(), "hidden-key") || strings.Contains(err.Error(), "\x1b") {
+	if err == nil || strings.Contains(err.Error(), "hidden-key") ||
+		strings.Contains(err.Error(), "HCKZa") ||
+		strings.Contains(err.Error(), "UC3m") ||
+		strings.Contains(err.Error(), "\x1b") {
 		t.Fatalf("probe error leaked unsafe content: %v", err)
 	}
 }

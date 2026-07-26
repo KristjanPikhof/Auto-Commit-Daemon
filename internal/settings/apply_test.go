@@ -2,9 +2,11 @@ package settings
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -216,6 +218,62 @@ func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
 			ai.ConfirmationIntentRepair,
 		}) {
 		t.Fatalf("Apply confirmation error = %v", err)
+	}
+}
+
+func TestSettingsApplyQueuesFingerprintBoundSetupValidation(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
+	}, nil)
+	command := "go test ./... -run '^$'"
+	draft := map[string]string{
+		config.FieldCommitStrategy:          "intent",
+		config.FieldCommitPreset:            "balanced",
+		config.FieldProvider:                "openai-compat",
+		config.FieldDiffEgress:              "true",
+		config.FieldVerificationFastCommand: command,
+	}
+	confirmed := []ai.ConfirmationRequirement{
+		ai.ConfirmationDiffEgress,
+		ai.ConfirmationVerificationCommand,
+		ai.ConfirmationIntentRepair,
+	}
+	validation, tested := testedDraft(t, svc, draft, confirmed)
+	digest := sha256.Sum256([]byte(command))
+	result, err := svc.Apply(context.Background(), ApplyRequest{
+		Values: draft, TestedFingerprint: tested.Fingerprint,
+		ExpectedGeneration: validation.SourceGeneration,
+		Confirmations:      confirmed,
+		SetupValidation: &SetupValidation{
+			BranchRef:        "refs/heads/main",
+			BranchGeneration: 2,
+			ExpectedHead:     strings.Repeat("a", 40),
+			Mode:             "fast",
+			CommandSource:    "Go language default",
+			CommandDigest:    fmt.Sprintf("%x", digest),
+			ApprovalID:       tested.Fingerprint,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if result.ValidationRunID == 0 ||
+		result.ValidationStatus != state.ConfigValidationQueued {
+		t.Fatalf("result=%+v", result)
+	}
+	run, err := state.ConfigValidationByID(
+		context.Background(), svc.db, result.ValidationRunID,
+	)
+	if err != nil || run.RevisionID != result.RevisionID ||
+		run.ActivationRequestID != result.RequestID ||
+		run.CommandDigest != fmt.Sprintf("%x", digest) {
+		t.Fatalf("validation=%+v err=%v", run, err)
 	}
 }
 

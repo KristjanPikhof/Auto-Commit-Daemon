@@ -223,7 +223,8 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	if blockedReason == "" && cfg.CommitStrategy == ai.CommitStrategyIntent &&
 		bundle.IntentVerificationMode != "" &&
-		bundle.IntentVerificationMode != "none" {
+		bundle.IntentVerificationMode != "none" &&
+		bundle.IntentVerificationMode != "structural" {
 		commandKey := acdconfig.FieldVerificationFastCommand
 		timeoutKey := acdconfig.FieldVerificationFastTimeout
 		mode := verification.ModeFast
@@ -475,15 +476,17 @@ func runtimeIntentPrerequisiteBlock(
 		if mode == "" || mode == "none" {
 			return runtimeConfigureReason("preset-required verification is not configured")
 		}
-		command := values[acdconfig.FieldVerificationFastCommand]
-		if mode == "full" {
-			command = values[acdconfig.FieldVerificationFullCommand]
-		}
-		if strings.TrimSpace(command) == "" {
-			return runtimeConfigureReason("the exact verification command is missing")
-		}
-		if _, ok := confirmations[string(ai.ConfirmationVerificationCommand)]; !ok {
-			return runtimeConfigureReason("verification command approval is missing")
+		if mode != "structural" {
+			command := values[acdconfig.FieldVerificationFastCommand]
+			if mode == "full" {
+				command = values[acdconfig.FieldVerificationFullCommand]
+			}
+			if strings.TrimSpace(command) == "" {
+				return runtimeConfigureReason("the exact verification command is missing")
+			}
+			if _, ok := confirmations[string(ai.ConfirmationVerificationCommand)]; !ok {
+				return runtimeConfigureReason("verification command approval is missing")
+			}
 		}
 	}
 	if runtimeBool(values, acdconfig.FieldIntentRepairEnabled, false) {
@@ -669,12 +672,15 @@ type runtimeBundleSlot struct {
 }
 
 type RuntimeBundleManager struct {
-	mu           sync.Mutex
-	active       *runtimeBundleSlot
-	builder      RuntimeBundleBuilder
-	db           *state.DB
-	logger       *slog.Logger
-	closeTimeout time.Duration
+	mu                  sync.Mutex
+	active              *runtimeBundleSlot
+	builder             RuntimeBundleBuilder
+	db                  *state.DB
+	logger              *slog.Logger
+	closeTimeout        time.Duration
+	validationStartOnce sync.Once
+	validationCancel    context.CancelFunc
+	validationWG        sync.WaitGroup
 }
 
 func NewRuntimeBundleManager(initial *RuntimeBundle, builder RuntimeBundleBuilder, closeTimeout time.Duration) *RuntimeBundleManager {
@@ -808,6 +814,12 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 					return nil
 				}
 			}
+			if validation, exists, validationErr :=
+				state.LatestConfigValidationForRequest(ctx, m.db, request.ID); validationErr != nil {
+				return validationErr
+			} else if exists && validation.Status != state.ConfigValidationPassed {
+				return nil
+			}
 		}
 		current := m.Current()
 		currentMatches := current != nil && current.RevisionID == revisionID
@@ -904,6 +916,13 @@ func (m *RuntimeBundleManager) QueueExperimentRevert(ctx context.Context, now ti
 }
 
 func (m *RuntimeBundleManager) Close() {
+	m.mu.Lock()
+	validationCancel := m.validationCancel
+	m.mu.Unlock()
+	if validationCancel != nil {
+		validationCancel()
+		m.validationWG.Wait()
+	}
 	m.mu.Lock()
 	slot := m.active
 	slot.retired = true

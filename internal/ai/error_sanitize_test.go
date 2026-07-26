@@ -27,6 +27,16 @@ func TestSanitizePlannerErrorRedactsMalformedJSONFallback(t *testing.T) {
 	}
 }
 
+func TestSanitizePlannerErrorRedactsProviderMaskedKey(t *testing.T) {
+	raw := `openai-compat: http 401: Incorrect API key provided: sk-HCKZa********UC3m`
+	clean := SanitizePlannerError(raw)
+	if strings.Contains(clean, "HCKZa") ||
+		strings.Contains(clean, "UC3m") ||
+		!strings.Contains(clean, "[REDACTED]") {
+		t.Fatalf("masked provider key was not redacted: %q", clean)
+	}
+}
+
 func TestSanitizePlannerErrorBoundsAndNormalizes(t *testing.T) {
 	raw := "request https://alice:password@example.com/v1?api_key=query-secret#fragment " +
 		"Authorization: Bearer bearer-secret token=token-secret api_key=key-secret " +

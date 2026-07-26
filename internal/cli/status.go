@@ -35,39 +35,40 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                  string               `json:"repo"`
-	RepoHash              string               `json:"repo_hash"`
-	Daemon                string               `json:"daemon"`
-	Stale                 bool                 `json:"stale"`
-	PID                   int                  `json:"pid"`
-	StartedTS             int64                `json:"started_ts,omitempty"`
-	UptimeSeconds         int64                `json:"uptime_seconds,omitempty"`
-	HeartbeatTS           int64                `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds   int64                `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef             string               `json:"branch_ref,omitempty"`
-	BranchGenToken        string               `json:"branch_generation_token,omitempty"`
-	Clients               []statusClient       `json:"clients"`
-	PendingEvents         int                  `json:"pending_events"`
-	BlockedConflicts      int                  `json:"blocked_conflicts"`
-	ActiveBarriers        int                  `json:"active_barriers,omitempty"`
-	ActiveTerminalEvents  int                  `json:"active_terminal_events,omitempty"`
-	FailedEvents          int                  `json:"failed_events"`
-	FailedBlockingPending int                  `json:"failed_blocking_pending"`
-	LastCommitOID         string               `json:"last_commit_oid,omitempty"`
-	LastCommitTS          int64                `json:"last_commit_ts,omitempty"`
-	LastCommitMessage     string               `json:"last_commit_message,omitempty"`
-	CaptureErrors         int                  `json:"capture_errors"`
-	Paused                bool                 `json:"paused,omitempty"`
-	Pause                 *pauseInfo           `json:"pause,omitempty"`
-	BackpressurePaused    bool                 `json:"backpressure_paused,omitempty"`
-	BackpressurePausedAt  string               `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal    int64                `json:"events_dropped_total,omitempty"`
-	DecisionCounts        map[string]int       `json:"decision_counts,omitempty"`
-	RecentDecisions       []eventEntry         `json:"recent_decisions,omitempty"`
-	DecisionCursor        int64                `json:"decision_cursor,omitempty"`
-	IntentStrategy        intentStrategyReport `json:"intent_strategy"`
-	RuntimeConfig         runtimeConfigReport  `json:"runtime_config"`
-	IntentV2              intentV2Report       `json:"intent_v2"`
+	Repo                  string                `json:"repo"`
+	RepoHash              string                `json:"repo_hash"`
+	Daemon                string                `json:"daemon"`
+	Stale                 bool                  `json:"stale"`
+	PID                   int                   `json:"pid"`
+	StartedTS             int64                 `json:"started_ts,omitempty"`
+	UptimeSeconds         int64                 `json:"uptime_seconds,omitempty"`
+	HeartbeatTS           int64                 `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds   int64                 `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef             string                `json:"branch_ref,omitempty"`
+	BranchGenToken        string                `json:"branch_generation_token,omitempty"`
+	Clients               []statusClient        `json:"clients"`
+	PendingEvents         int                   `json:"pending_events"`
+	BlockedConflicts      int                   `json:"blocked_conflicts"`
+	ActiveBarriers        int                   `json:"active_barriers,omitempty"`
+	ActiveTerminalEvents  int                   `json:"active_terminal_events,omitempty"`
+	FailedEvents          int                   `json:"failed_events"`
+	FailedBlockingPending int                   `json:"failed_blocking_pending"`
+	LastCommitOID         string                `json:"last_commit_oid,omitempty"`
+	LastCommitTS          int64                 `json:"last_commit_ts,omitempty"`
+	LastCommitMessage     string                `json:"last_commit_message,omitempty"`
+	CaptureErrors         int                   `json:"capture_errors"`
+	Paused                bool                  `json:"paused,omitempty"`
+	Pause                 *pauseInfo            `json:"pause,omitempty"`
+	BackpressurePaused    bool                  `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt  string                `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal    int64                 `json:"events_dropped_total,omitempty"`
+	DecisionCounts        map[string]int        `json:"decision_counts,omitempty"`
+	RecentDecisions       []eventEntry          `json:"recent_decisions,omitempty"`
+	DecisionCursor        int64                 `json:"decision_cursor,omitempty"`
+	IntentStrategy        intentStrategyReport  `json:"intent_strategy"`
+	RuntimeConfig         runtimeConfigReport   `json:"runtime_config"`
+	Configuration         configReadinessReport `json:"configuration"`
+	IntentV2              intentV2Report        `json:"intent_v2"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -344,6 +345,11 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	} else {
 		report.RuntimeConfig = runtimeConfig
 	}
+	if readiness, err := loadConfigReadinessReport(ctx, conn, now); err != nil {
+		return report, fmt.Errorf("configuration readiness: %w", err)
+	} else {
+		report.Configuration = readiness
+	}
 	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {
 		return report, err
 	} else {
@@ -496,6 +502,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	}
 	fmt.Fprintf(out, "Daemon: %s\n", joinParens(parts))
 	renderRuntimeConfigHuman(out, r.RuntimeConfig)
+	renderConfigReadinessHuman(out, r.Configuration)
 	renderIntentV2Human(out, r.IntentV2)
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))

@@ -80,6 +80,7 @@ type diagnoseReport struct {
 	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
 	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
 	RuntimeConfig              runtimeConfigReport             `json:"runtime_config"`
+	Configuration              configReadinessReport           `json:"configuration"`
 	IntentV2                   intentV2Report                  `json:"intent_v2"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
@@ -196,6 +197,15 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.RuntimeConfig = runtimeConfig
+	}
+	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err != nil {
+		return report, err
+	} else {
+		report.Configuration = readiness
+		if readiness.Configuration == "needs_attention" {
+			report.Remediation = append(report.Remediation,
+				"Run `acd configure` to retry validation or select another experience.")
+		}
 	}
 	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {
 		return report, err
@@ -796,6 +806,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	}
 	renderIntentStrategyHuman(out, r.IntentStrategy)
 	renderRuntimeConfigHuman(out, r.RuntimeConfig)
+	renderConfigReadinessHuman(out, r.Configuration)
 	renderIntentV2Human(out, r.IntentV2)
 
 	if r.OperationInProgress != "" {

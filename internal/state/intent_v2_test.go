@@ -483,8 +483,8 @@ PRAGMA user_version=14;`); err != nil {
 	if err != nil {
 		t.Fatalf("Open migrated v14: %v", err)
 	}
-	if version, _ := d.UserVersion(context.Background()); version != 15 {
-		t.Fatalf("user_version=%d want=15", version)
+	if version, _ := d.UserVersion(context.Background()); version != SchemaVersion {
+		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var keep string
 	if err := d.SQL().QueryRow(`SELECT value FROM daemon_meta WHERE key='v14.keep'`).Scan(&keep); err != nil || keep != "yes" {

@@ -705,6 +705,7 @@ func Run(ctx context.Context, opts Options) error {
 	if shutdownCh == nil && sig != nil {
 		shutdownCh = sig.Shutdown
 	}
+	validationWakeCh := make(chan struct{}, 1)
 
 	// Resolve the active branch ref / generation up-front. The generation
 	// counter is loaded from daemon_meta so a daemon restart preserves the
@@ -1767,6 +1768,10 @@ func Run(ctx context.Context, opts Options) error {
 	var wakeAckCount int
 	var wakeAckLastID int64
 
+	// Start setup validation only after startup branch reconciliation has
+	// established the exact branch generation recorded by configure.
+	runtimeBundles.StartValidationWorker(ctx, validationWakeCh)
+
 	for {
 		branchTransitionBlocked = false
 
@@ -1822,6 +1827,10 @@ func Run(ctx context.Context, opts Options) error {
 		// before the previous tick doesn't double-fire.
 		select {
 		case <-wakeCh:
+		default:
+		}
+		select {
+		case <-validationWakeCh:
 		default:
 		}
 		if fsWakeReader != nil {
@@ -2119,7 +2128,24 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
-			if passBundle.ReplayBlockedReason != "" {
+			setupValidation, validationPending, validationErr :=
+				state.DesiredConfigValidation(ctx, opts.DB)
+			if validationErr != nil {
+				repErr = validationErr
+			} else if validationPending &&
+				setupValidation.Status != state.ConfigValidationPassed {
+				repSum = ReplaySummary{
+					Skipped: true,
+					SkippedReason: "configuration_validation_" +
+						setupValidation.Status,
+					BaseHead: cctx.BaseHead,
+				}
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+					"config.validation.status": setupValidation.Status,
+					"config.validation.attempt": strconv.Itoa(
+						setupValidation.Attempt),
+				})
+			} else if passBundle.ReplayBlockedReason != "" {
 				repSum = ReplaySummary{
 					Skipped: true, SkippedReason: "intent_v2_needs_attention",
 					BaseHead: cctx.BaseHead,
@@ -2308,6 +2334,9 @@ func Run(ctx context.Context, opts Options) error {
 			timer.Stop()
 			return gracefulWithSweep("signal shutdown")
 		case <-wakeCh:
+			timer.Stop()
+			currentDelay = opts.Scheduler.Reset()
+		case <-validationWakeCh:
 			timer.Stop()
 			currentDelay = opts.Scheduler.Reset()
 		case <-fsWakeReader:

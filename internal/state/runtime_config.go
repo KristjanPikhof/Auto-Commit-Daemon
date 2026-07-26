@@ -49,6 +49,16 @@ type ConfigRevisionInput struct {
 	CreatedTS        float64
 }
 
+type preparedConfigRevision struct {
+	profile          string
+	scope            string
+	canonical        []byte
+	hash             string
+	sourceGeneration int64
+	reason           any
+	createdTS        float64
+}
+
 // RuntimeConfigState is the singleton desired/applied activation projection.
 type RuntimeConfigState struct {
 	DesiredRevisionID       sql.NullInt64
@@ -102,37 +112,18 @@ func InsertConfigRevision(ctx context.Context, d *DB, in ConfigRevisionInput) (C
 	if d == nil {
 		return ConfigRevision{}, fmt.Errorf("state: InsertConfigRevision: nil db")
 	}
-	profile, err := safeConfigLabel("profile", in.Profile)
+	prepared, err := prepareConfigRevision(in)
 	if err != nil {
 		return ConfigRevision{}, err
 	}
-	scope, err := safeConfigLabel("scope", in.Scope)
-	if err != nil {
-		return ConfigRevision{}, err
-	}
-	if profile == "" || scope == "" {
-		return ConfigRevision{}, fmt.Errorf("state: config revision profile and scope are required")
-	}
-	if in.SourceGeneration < 0 {
-		return ConfigRevision{}, fmt.Errorf("state: config revision source generation must be non-negative")
-	}
-	canonical, err := canonicalNonSecretJSON(in.Snapshot)
-	if err != nil {
-		return ConfigRevision{}, err
-	}
-	sum := sha256.Sum256(canonical)
-	created := in.CreatedTS
-	if created <= 0 {
-		created = nowSeconds()
-	}
-	reason := nullableSanitizedText(in.Reason)
 	res, err := d.conn.ExecContext(ctx, `
 INSERT INTO config_revisions(
     created_ts, profile, scope, snapshot_json, snapshot_hash,
     source_generation, reason
 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		created, profile, scope,
-		string(canonical), hex.EncodeToString(sum[:]), in.SourceGeneration, reason)
+		prepared.createdTS, prepared.profile, prepared.scope,
+		string(prepared.canonical), prepared.hash, prepared.sourceGeneration,
+		prepared.reason)
 	if err != nil {
 		return ConfigRevision{}, fmt.Errorf("state: insert config revision: %w", err)
 	}
@@ -141,6 +132,65 @@ INSERT INTO config_revisions(
 		return ConfigRevision{}, fmt.Errorf("state: config revision id: %w", err)
 	}
 	return ConfigRevisionByID(ctx, d, id)
+}
+
+func prepareConfigRevision(in ConfigRevisionInput) (preparedConfigRevision, error) {
+	profile, err := safeConfigLabel("profile", in.Profile)
+	if err != nil {
+		return preparedConfigRevision{}, err
+	}
+	scope, err := safeConfigLabel("scope", in.Scope)
+	if err != nil {
+		return preparedConfigRevision{}, err
+	}
+	if profile == "" || scope == "" {
+		return preparedConfigRevision{}, fmt.Errorf("state: config revision profile and scope are required")
+	}
+	if in.SourceGeneration < 0 {
+		return preparedConfigRevision{}, fmt.Errorf("state: config revision source generation must be non-negative")
+	}
+	canonical, err := canonicalNonSecretJSON(in.Snapshot)
+	if err != nil {
+		return preparedConfigRevision{}, err
+	}
+	sum := sha256.Sum256(canonical)
+	created := in.CreatedTS
+	if created <= 0 {
+		created = nowSeconds()
+	}
+	reason := nullableSanitizedText(in.Reason)
+	return preparedConfigRevision{
+		profile:          profile,
+		scope:            scope,
+		canonical:        canonical,
+		hash:             hex.EncodeToString(sum[:]),
+		sourceGeneration: in.SourceGeneration,
+		reason:           reason,
+		createdTS:        created,
+	}, nil
+}
+
+func insertConfigRevisionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	prepared preparedConfigRevision,
+) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO config_revisions(
+    created_ts, profile, scope, snapshot_json, snapshot_hash,
+    source_generation, reason
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		prepared.createdTS, prepared.profile, prepared.scope,
+		string(prepared.canonical), prepared.hash, prepared.sourceGeneration,
+		prepared.reason)
+	if err != nil {
+		return 0, fmt.Errorf("state: insert config revision: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("state: config revision id: %w", err)
+	}
+	return id, nil
 }
 
 func ConfigRevisionByID(ctx context.Context, d *DB, id int64) (ConfigRevision, error) {
@@ -193,6 +243,22 @@ func RequestConfigActivation(ctx context.Context, d *DB, revisionID int64, expec
 		return ConfigActivationRequest{}, false, fmt.Errorf("state: begin activation request: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	request, ok, err := requestConfigActivationTx(ctx, tx, revisionID, expectedDesired)
+	if err != nil || !ok {
+		return request, ok, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ConfigActivationRequest{}, false, fmt.Errorf("state: commit activation request: %w", err)
+	}
+	return request, true, nil
+}
+
+func requestConfigActivationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	revisionID int64,
+	expectedDesired sql.NullInt64,
+) (ConfigActivationRequest, bool, error) {
 	if err := ensureRuntimeConfigState(ctx, tx); err != nil {
 		return ConfigActivationRequest{}, false, err
 	}
@@ -236,9 +302,6 @@ UPDATE runtime_config_state
 SET desired_revision_id=?, desired_request_id=?, desired_ts=?, last_error=NULL, updated_ts=?
 WHERE id=1`, revisionID, id, now, now); err != nil {
 		return ConfigActivationRequest{}, false, fmt.Errorf("state: set desired revision: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return ConfigActivationRequest{}, false, fmt.Errorf("state: commit activation request: %w", err)
 	}
 	return ConfigActivationRequest{ID: id, RevisionID: revisionID,
 		PriorDesiredRevisionID: current, Status: ActivationPending, RequestedTS: now}, true, nil

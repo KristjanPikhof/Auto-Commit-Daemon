@@ -33,41 +33,42 @@ import (
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
-	Path                   string               `json:"path"`
-	RepoHash               string               `json:"repo_hash"`
-	StateDB                string               `json:"state_db"`
-	StateDBReadable        bool                 `json:"state_db_readable"`
-	DaemonPID              int                  `json:"daemon_pid"`
-	DaemonAlive            bool                 `json:"daemon_alive"`
-	DaemonProcessCount     int                  `json:"daemon_process_count,omitempty"`
-	DaemonProcessPIDs      []int                `json:"daemon_process_pids,omitempty"`
-	DaemonMode             string               `json:"daemon_mode"`
-	HeartbeatTS            int64                `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeS          int64                `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale         bool                 `json:"heartbeat_stale"`
-	Clients                int                  `json:"client_count"`
-	Harnesses              []string             `json:"harnesses,omitempty"`
-	LogPath                string               `json:"log_path"`
-	LogLines               []string             `json:"log_tail,omitempty"`
-	FsnotifyMode           string               `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches        int                  `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped        int                  `json:"fsnotify_dropped,omitempty"`
-	FsnotifyFallbackReason string               `json:"fsnotify_fallback_reason,omitempty"`
-	LastCaptureError       string               `json:"last_capture_error,omitempty"`
-	PendingEvents          int                  `json:"pending_events"`
-	BlockedConflicts       int                  `json:"blocked_conflicts"`
-	FailedEvents           int                  `json:"failed_events"`
-	FailedBlockingPending  int                  `json:"failed_blocking_pending"`
-	IntentStrategy         intentStrategyReport `json:"intent_strategy"`
-	IntentV2               intentV2Report       `json:"intent_v2"`
-	LastReplayConflictTS   int64                `json:"last_replay_conflict_ts,omitempty"`
-	LastReplayConflictPath string               `json:"last_replay_conflict_path,omitempty"`
-	LastReplayConflictErr  string               `json:"last_replay_conflict_error,omitempty"`
-	LastReplayFailureTS    int64                `json:"last_replay_failure_ts,omitempty"`
-	LastReplayFailurePath  string               `json:"last_replay_failure_path,omitempty"`
-	LastReplayFailureErr   string               `json:"last_replay_failure_error,omitempty"`
-	Notes                  []string             `json:"notes,omitempty"`
-	FlushSessionID         string               `json:"-"`
+	Path                   string                `json:"path"`
+	RepoHash               string                `json:"repo_hash"`
+	StateDB                string                `json:"state_db"`
+	StateDBReadable        bool                  `json:"state_db_readable"`
+	DaemonPID              int                   `json:"daemon_pid"`
+	DaemonAlive            bool                  `json:"daemon_alive"`
+	DaemonProcessCount     int                   `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs      []int                 `json:"daemon_process_pids,omitempty"`
+	DaemonMode             string                `json:"daemon_mode"`
+	HeartbeatTS            int64                 `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeS          int64                 `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale         bool                  `json:"heartbeat_stale"`
+	Clients                int                   `json:"client_count"`
+	Harnesses              []string              `json:"harnesses,omitempty"`
+	LogPath                string                `json:"log_path"`
+	LogLines               []string              `json:"log_tail,omitempty"`
+	FsnotifyMode           string                `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches        int                   `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped        int                   `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason string                `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError       string                `json:"last_capture_error,omitempty"`
+	PendingEvents          int                   `json:"pending_events"`
+	BlockedConflicts       int                   `json:"blocked_conflicts"`
+	FailedEvents           int                   `json:"failed_events"`
+	FailedBlockingPending  int                   `json:"failed_blocking_pending"`
+	IntentStrategy         intentStrategyReport  `json:"intent_strategy"`
+	Configuration          configReadinessReport `json:"configuration"`
+	IntentV2               intentV2Report        `json:"intent_v2"`
+	LastReplayConflictTS   int64                 `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath string                `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr  string                `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS    int64                 `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath  string                `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr   string                `json:"last_replay_failure_error,omitempty"`
+	Notes                  []string              `json:"notes,omitempty"`
+	FlushSessionID         string                `json:"-"`
 }
 
 type doctorHarnessReport struct {
@@ -1279,6 +1280,16 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	} else {
 		rr.Notes = append(rr.Notes, "Intent v2 summary failed: "+err.Error())
 	}
+	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err == nil {
+		rr.Configuration = readiness
+		if readiness.Configuration == "needs_attention" {
+			rr.Notes = append(rr.Notes,
+				"configuration validation needs attention; run acd configure")
+		}
+	} else {
+		rr.Notes = append(rr.Notes,
+			"configuration readiness failed: "+err.Error())
+	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
 	// concrete path + timestamp to investigate without rummaging the DB.
@@ -1537,6 +1548,9 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 		if rr.IntentV2.Available {
 			renderIntentV2Human(out, rr.IntentV2)
+		}
+		if rr.Configuration.Available {
+			renderConfigReadinessHuman(out, rr.Configuration)
 		}
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
