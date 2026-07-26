@@ -282,9 +282,11 @@ ORDER BY id DESC LIMIT 1`, revisionID).Scan(
 }
 
 type runtimeTelemetry struct {
-	revisionID   int64
-	profile      string
-	experimentID int64
+	revisionID    int64
+	profile       string
+	experimentID  int64
+	presetID      string
+	presetVersion int
 }
 type runtimeTelemetryContextKey struct{}
 
@@ -295,6 +297,7 @@ func withRuntimeTelemetry(ctx context.Context, bundle *RuntimeBundle) context.Co
 	return context.WithValue(ctx, runtimeTelemetryContextKey{}, runtimeTelemetry{
 		revisionID: bundle.RevisionID, profile: bundle.Profile,
 		experimentID: bundle.ExperimentID,
+		presetID:     bundle.PresetID, presetVersion: bundle.PresetVersion,
 	})
 }
 
@@ -304,6 +307,27 @@ func runtimeTelemetryFromContext(ctx context.Context) runtimeTelemetry {
 	}
 	telemetry, _ := ctx.Value(runtimeTelemetryContextKey{}).(runtimeTelemetry)
 	return telemetry
+}
+
+// configuredRuntimeReplayBlock prevents the environment-derived startup
+// bundle from publishing while a persisted runtime revision still needs to be
+// constructed. This is especially important for Event repositories: unlike
+// Intent, their legacy startup bundle is otherwise publishable.
+func configuredRuntimeReplayBlock(ctx context.Context, db *state.DB) string {
+	if db == nil {
+		return ""
+	}
+	projection, err := state.RuntimeConfigActivationState(ctx, db)
+	if err != nil {
+		return runtimeConfigureReason(
+			"the configured runtime state could not be read")
+	}
+	if projection.DesiredRevisionID.Valid ||
+		projection.LastKnownGoodRevisionID.Valid {
+		return runtimeConfigureReason(
+			"the configured runtime revision is not active")
+	}
+	return ""
 }
 
 func stampDecisionRuntime(ctx context.Context, rec *state.DecisionRecord) {

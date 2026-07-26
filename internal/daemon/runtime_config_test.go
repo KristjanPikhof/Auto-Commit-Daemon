@@ -361,6 +361,55 @@ func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T
 	}
 }
 
+func TestFirstEventRuntimeActivationFailureKeepsReplayBlocked(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	revision := runtimeRevision(t, db, "global", 1, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldBaseURL:        "https://repo-override.example/v1",
+		config.FieldModel:          "repo-model",
+		config.FieldCommitStrategy: "event",
+	})
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request activation: ok=%v err=%v", ok, err)
+	}
+	blockedReason := configuredRuntimeReplayBlock(context.Background(), db)
+	if blockedReason == "" {
+		t.Fatal("persisted desired revision did not block startup replay")
+	}
+	initial := &RuntimeBundle{
+		Provider:            &runtimeTestProvider{name: "deterministic"},
+		MessageFn:           DeterministicMessage,
+		CommitStrategy:      ai.CommitStrategyEvent,
+		PresetID:            "event.fast",
+		PresetVersion:       config.PresetCatalogVersion,
+		ReplayBlockedReason: blockedReason,
+	}
+	manager := NewRuntimeBundleManager(
+		initial, runtimeBuilder(db, map[string]*runtimeTestCloser{}),
+		time.Second,
+	)
+	defer manager.Close()
+	if err := manager.ActivateDesired(context.Background()); err == nil {
+		t.Fatal("drifted Event activation unexpectedly succeeded")
+	}
+	current := manager.Current()
+	if current.RevisionID != 0 || current.ReplayBlockedReason == "" {
+		t.Fatalf("unsafe startup fallback became publishable: %+v", current)
+	}
+	gotRequest, err := state.ActivationRequestByID(
+		context.Background(), db, request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRequest.Status != state.ActivationRejected {
+		t.Fatalf("activation request status=%q", gotRequest.Status)
+	}
+}
+
 func TestRuntimeConfigRejectsFailedExperimentAndQueuesBaseline(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "test-only-key")
 	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
@@ -606,9 +655,16 @@ func TestConfigRevisionStampsDecisionsAndPlannerWindows(t *testing.T) {
 	db := openTestDB(t)
 	revision := runtimeRevision(t, db, "candidate", 1, map[string]any{"ai.provider": "deterministic"})
 	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{
-		RevisionID: revision.ID,
-		Profile:    revision.Profile,
+		RevisionID:    revision.ID,
+		Profile:       revision.Profile,
+		PresetID:      "intent.balanced",
+		PresetVersion: config.PresetCatalogVersion,
 	})
+	telemetry := runtimeTelemetryFromContext(ctx)
+	if telemetry.presetID != "intent.balanced" ||
+		telemetry.presetVersion != config.PresetCatalogVersion {
+		t.Fatalf("runtime preset telemetry=%+v", telemetry)
+	}
 	cctx := CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 3, BaseHead: "abc123"}
 	ev := state.CaptureEvent{
 		BranchRef:        cctx.BranchRef,

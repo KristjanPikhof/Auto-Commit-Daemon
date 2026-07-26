@@ -39,6 +39,9 @@ type ExperimentResult struct {
 // currently applied baseline. The daemon is nudged only after the bounded
 // experiment row exists, and no existing commit is changed or removed.
 func (s *Service) StartExperiment(ctx context.Context, req ExperimentRequest) (ExperimentResult, error) {
+	if err := s.requireRepository("start experiment"); err != nil {
+		return ExperimentResult{}, err
+	}
 	if req.WindowBudget <= 0 || req.WindowBudget > MaxExperimentWindows {
 		return ExperimentResult{}, errors.New("acd settings: experiment window budget must be between 1 and 1000")
 	}
@@ -122,6 +125,9 @@ func (s *Service) StartExperiment(ctx context.Context, req ExperimentRequest) (E
 }
 
 func (s *Service) ExperimentProgress(ctx context.Context, id int64) (ExperimentSnapshot, error) {
+	if err := s.requireRepository("inspect experiment"); err != nil {
+		return ExperimentSnapshot{}, err
+	}
 	if id <= 0 {
 		return ExperimentSnapshot{}, errors.New("acd settings: invalid experiment id")
 	}
@@ -141,6 +147,9 @@ func (s *Service) RevertExperiment(ctx context.Context, id int64) (ExperimentRes
 }
 
 func (s *Service) finishExperiment(ctx context.Context, id int64, reason string) (ExperimentResult, error) {
+	if err := s.requireRepository("finish experiment"); err != nil {
+		return ExperimentResult{}, err
+	}
 	if id <= 0 {
 		return ExperimentResult{}, errors.New("acd settings: invalid experiment id")
 	}
@@ -187,6 +196,9 @@ func (s *Service) finishExperiment(ctx context.Context, id int64, reason string)
 
 // Compare returns descriptive operational evidence for immutable revisions.
 func (s *Service) Compare(ctx context.Context, revisionIDs ...int64) (Comparison, error) {
+	if err := s.requireRepository("compare runtime revisions"); err != nil {
+		return Comparison{}, err
+	}
 	comparison, err := CompareRevisions(ctx, s.db.ReadSQL(), revisionIDs...)
 	if err != nil {
 		return Comparison{}, sanitizeError(err)

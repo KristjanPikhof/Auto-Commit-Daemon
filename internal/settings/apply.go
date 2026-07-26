@@ -48,6 +48,9 @@ type ApplyResult struct {
 // Apply records one immutable resolved hot snapshot and atomically requests
 // it as desired. It never saves XDG config or enqueues a normal wake request.
 func (s *Service) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, error) {
+	if err := s.requireRepository("apply runtime revision"); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := s.rejectWhileExperimentActive(ctx); err != nil {
 		return ApplyResult{}, err
 	}
@@ -221,6 +224,9 @@ type RevertRequest struct {
 }
 
 func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, error) {
+	if err := s.requireRepository("revert runtime revision"); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := s.rejectWhileExperimentActive(ctx); err != nil {
 		return ApplyResult{}, err
 	}
@@ -266,6 +272,9 @@ func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, e
 }
 
 func (s *Service) rejectWhileExperimentActive(ctx context.Context) error {
+	if err := s.requireRepository("inspect runtime experiments"); err != nil {
+		return err
+	}
 	if _, active, err := state.ActiveConfigExperiment(ctx, s.db); err != nil {
 		return sanitizeError(err)
 	} else if active {

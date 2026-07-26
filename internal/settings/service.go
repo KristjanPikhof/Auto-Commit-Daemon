@@ -4,9 +4,7 @@ package settings
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -206,7 +204,7 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 		return SaveResult{}, err
 	}
 	if s.globalOnly && req.Scope != ScopeGlobal {
-		return SaveResult{}, repositoryRequired("save non-global scope")
+		return SaveResult{}, s.requireRepository("save non-global scope")
 	}
 	err := s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
 		var target config.Overrides
@@ -279,8 +277,8 @@ type SaveGlobalSetupResult struct {
 }
 
 // SaveGlobalSetup atomically stores global authoring values and their exact
-// generation-bound approval. Repository shell commands cannot be approved or
-// activated through this path.
+// fingerprint-bound approval. The generation records its originating CAS
+// write. Repository shell commands cannot be approved or activated here.
 func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupRequest) (SaveGlobalSetupResult, error) {
 	if s == nil || s.store == nil {
 		return SaveGlobalSetupResult{}, errors.New("acd settings: service unavailable")
@@ -444,7 +442,7 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 			missing = append(missing, item)
 		}
 	}
-	fingerprint, err := settingsFingerprint(resolved, preset)
+	fingerprint, err := config.SettingsFingerprint(resolved, preset)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -560,9 +558,12 @@ func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (m
 	return resolved, restartChanged, preset, nil
 }
 
-var errRepositoryRequired = errors.New("acd settings: repository service required")
+var errRepositoryRequired = errors.New("acd settings: repository runtime service required")
 
-func repositoryRequired(operation string) error {
+func (s *Service) requireRepository(operation string) error {
+	if s != nil && s.db != nil {
+		return nil
+	}
 	return fmt.Errorf("acd settings: %s: %w", operation, errRepositoryRequired)
 }
 
@@ -617,22 +618,6 @@ func hotValues(values map[string]string) map[string]string {
 		}
 	}
 	return out
-}
-
-func settingsFingerprint(values map[string]string, preset config.PresetResolution) (string, error) {
-	payload := map[string]any{}
-	for key, value := range hotValues(values) {
-		payload[key] = value
-	}
-	payload["preset_id"] = preset.ID()
-	payload["preset_version"] = preset.Version()
-	payload["customized"] = preset.Customized
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("acd settings: fingerprint: %w", err)
-	}
-	sum := sha256.Sum256(body)
-	return hex.EncodeToString(sum[:]), nil
 }
 
 func validateScope(scope Scope, profile string) error {

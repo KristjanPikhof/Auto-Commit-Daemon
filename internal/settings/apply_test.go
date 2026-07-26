@@ -198,6 +198,7 @@ func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
 		config.FieldCommitStrategy:          "intent",
 		config.FieldCommitPreset:            "balanced",
 		config.FieldProvider:                "openai-compat",
+		config.FieldIntentVerification:      "fast",
 		config.FieldVerificationFastCommand: "go test ./...",
 	}
 	all := []ai.ConfirmationRequirement{
@@ -237,6 +238,7 @@ func TestSettingsApplyQueuesFingerprintBoundSetupValidation(t *testing.T) {
 		config.FieldCommitPreset:            "balanced",
 		config.FieldProvider:                "openai-compat",
 		config.FieldDiffEgress:              "true",
+		config.FieldIntentVerification:      "fast",
 		config.FieldVerificationFastCommand: command,
 	}
 	confirmed := []ai.ConfirmationRequirement{

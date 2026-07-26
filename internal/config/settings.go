@@ -35,9 +35,10 @@ type SettingsDocument struct {
 	Extra               map[string]json.RawMessage
 }
 
-// GlobalSetupApproval records the reviewed, presentation-safe permissions for
-// one exact generation of the global authoring configuration. Repository
-// command approval is deliberately unsupported at global scope.
+// GlobalSetupApproval records reviewed, presentation-safe global permissions.
+// Generation identifies the originating write; consumers bind trust to the
+// effective-settings fingerprint so unrelated repository writes do not revoke
+// it. Repository command approval is deliberately unsupported at global scope.
 type GlobalSetupApproval struct {
 	Generation    uint64   `json:"generation"`
 	Fingerprint   string   `json:"fingerprint"`
@@ -253,14 +254,18 @@ func (s SettingsDocument) MarshalJSON() ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-// ActiveGlobalSetupApproval returns the approval only while it is bound to the
-// document's current generation. Callers receive a copy safe to retain.
+// ActiveGlobalSetupApproval returns a structurally valid stored approval.
+// Consumers must compare its fingerprint with their exact effective settings.
+// Callers receive a copy safe to retain.
 func ActiveGlobalSetupApproval(doc *Document) (GlobalSetupApproval, bool) {
 	if doc == nil || doc.Settings.GlobalSetupApproval == nil {
 		return GlobalSetupApproval{}, false
 	}
+	if err := validateGlobalSetupApproval(doc); err != nil {
+		return GlobalSetupApproval{}, false
+	}
 	approval := *doc.Settings.GlobalSetupApproval
-	if approval.Generation != doc.Generation || approval.Fingerprint == "" {
+	if approval.Fingerprint == "" {
 		return GlobalSetupApproval{}, false
 	}
 	approval.Confirmations = append([]string(nil), approval.Confirmations...)

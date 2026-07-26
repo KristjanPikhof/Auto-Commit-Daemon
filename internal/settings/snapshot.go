@@ -63,6 +63,9 @@ type Snapshot struct {
 
 // Snapshot projects authoring and runtime state without writing config or DB.
 func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string) (Snapshot, error) {
+	if err := s.requireRepository("snapshot runtime state"); err != nil {
+		return Snapshot{}, err
+	}
 	if err := validateScope(scope, profileName); err != nil {
 		return Snapshot{}, err
 	}

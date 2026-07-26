@@ -154,6 +154,143 @@ func TestIntentV2CutoverMigratesLegacyIntentOnceAndBlocksUnsafeReplay(t *testing
 	}
 }
 
+func TestIntentV2CutoverDoesNotFanOutGlobalApprovalToLegacyRuntime(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath := intentV2MigrationRepo(t)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	legacy := runtimeRevision(t, db, "legacy", 7, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldBaseURL:        ai.DefaultOpenAIBaseURL,
+		config.FieldModel:          "legacy-model",
+		config.FieldCommitStrategy: "intent",
+		config.FieldDiffEgress:     true,
+		"confirmations": []string{
+			string(ai.ConfirmationDiffEgress),
+		},
+	})
+	var legacySnapshot map[string]any
+	if err := json.Unmarshal(
+		[]byte(legacy.SnapshotJSON), &legacySnapshot,
+	); err != nil {
+		t.Fatal(err)
+	}
+	legacySnapshot["preset_version"] = config.PresetCatalogVersion - 1
+	legacyBody, err := json.Marshal(legacySnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err = state.InsertConfigRevision(
+		ctx, db, state.ConfigRevisionInput{
+			Snapshot: legacyBody, Profile: "legacy", Scope: "repository",
+			SourceGeneration: 7, Reason: "legacy preset revision",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, ok, err := state.RequestConfigActivation(
+		ctx, db, legacy.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request legacy activation: ok=%v err=%v", ok, err)
+	}
+	if _, err := state.AcknowledgeConfigActivation(
+		ctx, db, request.ID, legacy.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ApplyConfigActivation(
+		ctx, db, request.ID, legacy.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := intentV2MigrationRoots(t)
+	raw := func(value string) json.RawMessage {
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	global := config.Overrides{
+		config.FieldCommitStrategy:      raw("intent"),
+		config.FieldCommitPreset:        raw("balanced"),
+		config.FieldProvider:            raw("openai-compat"),
+		config.FieldBaseURL:             raw("https://global.example/v1"),
+		config.FieldModel:               raw("global-model"),
+		config.FieldDiffEgress:          raw("true"),
+		config.FieldIntentVerification:  raw("structural"),
+		config.FieldIntentRepairEnabled: raw("true"),
+	}
+	resolved, preset, err := config.ResolveAll(
+		config.ResolveInput{Global: global}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := make(map[string]string, len(resolved))
+	for name, field := range resolved {
+		effective[name] = field.EffectiveValue()
+	}
+	fingerprint, err := config.SettingsFingerprint(effective, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global = global
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation: 1, Fingerprint: fingerprint,
+			Confirmations: []string{
+				string(ai.ConfirmationDiffEgress),
+				string(ai.ConfirmationEndpointCredentials),
+				string(ai.ConfirmationIntentRepair),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := EnsureIntentV2RuntimeCutover(
+		ctx, db, repo, roots, func(name string) (string, bool) {
+			if name == ai.EnvAPIKey {
+				return "test-key", true
+			}
+			return "", false
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Migrated ||
+		result.PresetVersion != config.PresetCatalogVersion {
+		t.Fatalf("legacy migration=%+v", result)
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, result.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, confirmations, _, err :=
+		decodeRuntimeSnapshot(revision.SnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values[config.FieldBaseURL] != ai.DefaultOpenAIBaseURL ||
+		values[config.FieldModel] != "legacy-model" {
+		t.Fatalf("legacy runtime values were replaced: %+v", values)
+	}
+	if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {
+		t.Fatalf("legacy confirmation was lost: %+v", confirmations)
+	}
+	if _, ok := confirmations[string(ai.ConfirmationEndpointCredentials)]; ok {
+		t.Fatalf("global endpoint consent fanned out: %+v", confirmations)
+	}
+}
+
 func TestIntentV2CutoverPreservesMetaOnlyLegacyIntent(t *testing.T) {
 	ctx := context.Background()
 	repo, dbPath := intentV2MigrationRepo(t)
@@ -389,6 +526,296 @@ func TestIntentV2CutoverResolvesIntentAcrossAuthoringLayers(t *testing.T) {
 				t.Fatalf("%s cutover=%+v", layer, result)
 			}
 		})
+	}
+}
+
+func TestIntentV2CutoverInheritsMatchingGlobalSetupApproval(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath := intentV2MigrationRepo(t)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	roots := intentV2MigrationRoots(t)
+	raw := func(value string) json.RawMessage {
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	global := config.Overrides{
+		config.FieldCommitStrategy:      raw("intent"),
+		config.FieldCommitPreset:        raw("balanced"),
+		config.FieldProvider:            raw("openai-compat"),
+		config.FieldBaseURL:             raw("https://gateway.example/v1"),
+		config.FieldModel:               raw("gateway-model"),
+		config.FieldDiffEgress:          raw("true"),
+		config.FieldIntentVerification:  raw("structural"),
+		config.FieldIntentRepairEnabled: raw("true"),
+	}
+	resolved, preset, err := config.ResolveAll(
+		config.ResolveInput{Global: global}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := make(map[string]string, len(resolved))
+	for name, field := range resolved {
+		effective[name] = field.EffectiveValue()
+	}
+	fingerprint, err := config.SettingsFingerprint(effective, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global = global
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation:  1,
+			Fingerprint: fingerprint,
+			Confirmations: []string{
+				string(ai.ConfirmationDiffEgress),
+				string(ai.ConfirmationEndpointCredentials),
+				string(ai.ConfirmationIntentRepair),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Repositories["unrelated-repository"] =
+			config.RepositorySettings{Fields: config.Overrides{
+				config.FieldCommitFormat: raw("conventional"),
+			}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := EnsureIntentV2RuntimeCutover(
+		ctx, db, repo, roots, func(name string) (string, bool) {
+			if name == ai.EnvAPIKey {
+				return "test-key", true
+			}
+			return "", false
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, result.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, confirmations, _, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values[config.FieldIntentVerification] != "structural" {
+		t.Fatalf("verification=%q", values[config.FieldIntentVerification])
+	}
+	for _, confirmation := range []ai.ConfirmationRequirement{
+		ai.ConfirmationDiffEgress,
+		ai.ConfirmationEndpointCredentials,
+		ai.ConfirmationIntentRepair,
+	} {
+		if _, ok := confirmations[string(confirmation)]; !ok {
+			t.Fatalf("missing inherited confirmation %q: %+v",
+				confirmation, confirmations)
+		}
+	}
+
+	driftRepo, driftDBPath := intentV2MigrationRepo(t)
+	driftDB, err := state.Open(ctx, driftDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driftDB.Close()
+	driftHash, err := paths.RepoHash(driftRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Repositories[driftHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldBaseURL: raw("https://other.example/v1"),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	driftResult, err := EnsureIntentV2RuntimeCutover(
+		ctx, driftDB, driftRepo, roots, func(name string) (string, bool) {
+			if name == ai.EnvAPIKey {
+				return "test-key", true
+			}
+			return "", false
+		},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "do not match the tested global setup") {
+		t.Fatalf("drifted repository result=%+v err=%v", driftResult, err)
+	}
+	if !driftResult.Required || driftResult.RevisionID != 0 {
+		t.Fatalf("drifted repository cutover=%+v", driftResult)
+	}
+}
+
+func TestRuntimeCutoverMaterializesApprovedGlobalEventDefaults(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath := intentV2MigrationRepo(t)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	roots := intentV2MigrationRoots(t)
+	raw := func(value string) json.RawMessage {
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	global := config.Overrides{
+		config.FieldCommitStrategy:     raw("event"),
+		config.FieldCommitPreset:       raw("fast"),
+		config.FieldCommitFormat:       raw("imperative"),
+		config.FieldProvider:           raw("deterministic"),
+		config.FieldDiffEgress:         raw("false"),
+		config.FieldIntentVerification: raw("none"),
+	}
+	resolved, preset, err := config.ResolveAll(
+		config.ResolveInput{Global: global}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := make(map[string]string, len(resolved))
+	for name, field := range resolved {
+		effective[name] = field.EffectiveValue()
+	}
+	fingerprint, err := config.SettingsFingerprint(effective, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global = global
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation: 1, Fingerprint: fingerprint,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := EnsureIntentV2RuntimeCutover(ctx, db, repo, roots, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Required || !result.Migrated ||
+		result.PresetID != "event.fast" {
+		t.Fatalf("global Event cutover=%+v", result)
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, result.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, confirmations, _, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values[config.FieldCommitStrategy] != "event" ||
+		values[config.FieldProvider] != "deterministic" ||
+		values[config.FieldIntentVerification] != "none" ||
+		len(confirmations) != 0 {
+		t.Fatalf("global Event values=%+v confirmations=%+v",
+			values, confirmations)
+	}
+}
+
+func TestRuntimeCutoverRejectsUntestedGlobalEventModelDrift(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath := intentV2MigrationRepo(t)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	roots := intentV2MigrationRoots(t)
+	raw := func(value string) json.RawMessage {
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	global := config.Overrides{
+		config.FieldCommitStrategy:     raw("event"),
+		config.FieldCommitPreset:       raw("fast"),
+		config.FieldCommitFormat:       raw("imperative"),
+		config.FieldProvider:           raw("openai-compat"),
+		config.FieldBaseURL:            raw(ai.DefaultOpenAIBaseURL),
+		config.FieldModel:              raw("tested-model"),
+		config.FieldDiffEgress:         raw("false"),
+		config.FieldIntentVerification: raw("none"),
+	}
+	resolved, preset, err := config.ResolveAll(
+		config.ResolveInput{Global: global}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := make(map[string]string, len(resolved))
+	for name, field := range resolved {
+		effective[name] = field.EffectiveValue()
+	}
+	fingerprint, err := config.SettingsFingerprint(effective, preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global = global
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation: 1, Fingerprint: fingerprint,
+		}
+		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldModel: raw("untested-repository-model"),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := EnsureIntentV2RuntimeCutover(
+		ctx, db, repo, roots, func(name string) (string, bool) {
+			if name == ai.EnvAPIKey {
+				return "test-key", true
+			}
+			return "", false
+		},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "do not match the tested global setup") {
+		t.Fatalf("model drift result=%+v err=%v", result, err)
+	}
+	if !result.Required {
+		t.Fatalf("model drift did not require capture-only cutover: %+v", result)
+	}
+	var revisions int
+	if err := db.ReadSQL().QueryRowContext(
+		ctx, `SELECT COUNT(*) FROM config_revisions`,
+	).Scan(&revisions); err != nil {
+		t.Fatal(err)
+	}
+	if revisions != 0 {
+		t.Fatalf("untested model created %d runtime revisions", revisions)
 	}
 }
 

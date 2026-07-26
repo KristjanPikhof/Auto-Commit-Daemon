@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -58,6 +59,14 @@ func replayIntentCandidateBatch(
 		retryLimit = *cfg.retryLimit
 	}
 	telemetry := runtimeTelemetryFromContext(ctx)
+	presetID := telemetry.presetID
+	if presetID == "" {
+		presetID = "intent." + string(opts.IntentPreset)
+	}
+	presetVersion := telemetry.presetVersion
+	if presetVersion <= 0 {
+		presetVersion = config.PresetCatalogVersion
+	}
 	evaluationStartedTS := float64(time.Now().UnixNano()) / 1e9
 	plannerCtx := ctx
 	if opts.PromptTrace != nil {
@@ -88,8 +97,8 @@ func replayIntentCandidateBatch(
 			Int64: telemetry.revisionID, Valid: telemetry.revisionID > 0,
 		},
 		ConfigProfile: telemetry.profile,
-		PresetID:      "intent." + string(opts.IntentPreset),
-		PresetVersion: 2,
+		PresetID:      presetID,
+		PresetVersion: presetVersion,
 		LatestCommit:  legacyRequest.LatestCommit,
 		PathContext:   legacyRequest.PathCommitContext,
 		Hints:         runtimeIntentDependencyHints(captures),

@@ -565,12 +565,14 @@ func Run(ctx context.Context, opts Options) error {
 	initialFingerprint := IntentPlannerProviderFingerprint(initialIdentity)
 	initialPreset := config.PresetFast
 	initialPresetID := "event.fast"
-	initialReplayBlock := ""
+	initialReplayBlock := configuredRuntimeReplayBlock(ctx, opts.DB)
 	if providerCfg.CommitStrategy == ai.CommitStrategyIntent {
 		initialPreset = config.PresetBalanced
 		initialPresetID = "intent.balanced"
-		initialReplayBlock = runtimeConfigureReason(
-			"an immutable Intent v2 runtime revision is not active")
+		if initialReplayBlock == "" {
+			initialReplayBlock = runtimeConfigureReason(
+				"an immutable Intent v2 runtime revision is not active")
+		}
 	}
 	if cutoverBlock != "" {
 		initialReplayBlock = cutoverBlock

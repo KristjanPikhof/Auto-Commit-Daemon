@@ -267,7 +267,7 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Intent v2: needs_attention", "intent.balanced@2 customized",
+		"Intent v2: needs_attention", "intent.balanced@3 customized",
 		"verification=fast", "recoverable_repairs=1",
 		"Latest candidate: status=blocked protocol=v2",
 	} {

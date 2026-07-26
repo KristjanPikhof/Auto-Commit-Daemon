@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -265,8 +266,9 @@ func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, m
 			"intent.window": "1", "intent.min_pending": "1",
 			"intent.settle_window": "0s", "intent.max_pending_age": "30s",
 			"intent.verification": "none", "intent.repair.enabled": "false",
-			"preset_id": "intent.fast", "preset_version": 2,
-			"customized": true,
+			"preset_id":      "intent.fast",
+			"preset_version": config.PresetCatalogVersion,
+			"customized":     true,
 			"confirmations": []string{
 				"endpoint_credentials", "diff_egress",
 			},
@@ -280,7 +282,7 @@ func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, m
 	if _, ok := values["preset_id"]; !ok {
 		values["commit.preset"] = "fast"
 		values["preset_id"] = strategy + ".fast"
-		values["preset_version"] = 2
+		values["preset_version"] = config.PresetCatalogVersion
 		values["customized"] = true
 	}
 	body, err := json.Marshal(values)

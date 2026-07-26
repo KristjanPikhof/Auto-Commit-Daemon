@@ -77,7 +77,9 @@ func EnsureIntentV2RuntimeCutover(
 	}
 	authoredIntent := base[config.FieldCommitStrategy].EffectiveValue() ==
 		string(config.StrategyIntent)
-	result.Required = markerPresent && parseRuntimeBool(required) || authoredIntent
+	_, globalSetupApproved := config.ActiveGlobalSetupApproval(doc)
+	result.Required = markerPresent && parseRuntimeBool(required) ||
+		authoredIntent || globalSetupApproved
 	if !result.Required {
 		return result, nil
 	}
@@ -171,12 +173,34 @@ func EnsureIntentV2RuntimeCutover(
 	if err != nil {
 		return result, fmt.Errorf("daemon: Intent v2 cutover: materialize preset: %w", err)
 	}
+	if approval, ok := config.ActiveGlobalSetupApproval(doc); ok &&
+		sourceRevisionID == 0 {
+		effective := make(map[string]string, len(resolved))
+		for name, field := range resolved {
+			effective[name] = field.EffectiveValue()
+		}
+		fingerprint, fingerprintErr := config.SettingsFingerprint(effective, preset)
+		if fingerprintErr != nil {
+			return result, fmt.Errorf(
+				"daemon: Intent v2 cutover: fingerprint global setup: %w",
+				fingerprintErr,
+			)
+		}
+		if fingerprint != approval.Fingerprint {
+			return result, errors.New(
+				"daemon: Intent v2 cutover: effective settings do not match the tested global setup; run acd configure --repo .",
+			)
+		}
+		for _, confirmation := range approval.Confirmations {
+			confirmations[confirmation] = struct{}{}
+		}
+	}
 	if strategy == config.StrategyIntent &&
 		resolved[config.FieldIntentRepairEnabled].EffectiveValue() == "true" {
 		// The v2 cutover contract explicitly activates strict automatic repair
 		// for migrated Balanced/Quality repositories. Diff context and exact
-		// verification commands remain unapproved until configure records
-		// their separate confirmations.
+		// verification commands remain unapproved unless a matching reviewed
+		// setup supplied their separate confirmations.
 		confirmations[string(ai.ConfirmationIntentRepair)] = struct{}{}
 	}
 	snapshot := make(map[string]any)
