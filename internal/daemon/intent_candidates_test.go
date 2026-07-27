@@ -1324,6 +1324,129 @@ func TestIntentCandidateEngineBalancedFallbackUsesUnambiguousTestCompanion(
 	}
 }
 
+func TestIntentCandidateEngineBalancedFallbackContinuesPersistedTestCompanion(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	source := appendIntentCandidateCapture(
+		t, db, "feature.go", "create", "", "source")
+	test := appendIntentCandidateCapture(
+		t, db, "feature_test.go", "create", "", "test")
+	saveSoftPublishedIntentCandidate(
+		t, db, "persisted-source", source, "source-commit", 100)
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{test},
+		Hints: []IntentDependencyHint{{
+			PrerequisiteSeq: source.Event.Seq,
+			DependentSeq:    test.Event.Seq,
+			Strength:        ai.IntentDependencySoft,
+			Kind:            "test_source",
+			Evidence:        "exact persisted test companion",
+		}},
+		Now: time.Unix(120, 0),
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{source.Event.Seq, test.Event.Seq},
+			) {
+				return fmt.Errorf("materialized persisted companion=%v", got)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if result.Fallback != "verified_dependency_partition" ||
+		result.NeedsAttention || len(result.Decisions) != 1 {
+		t.Fatalf("fallback result=%+v", result)
+	}
+	decision := result.Decisions[0]
+	if !decision.Publishable ||
+		decision.Candidate.ID != "persisted-source" ||
+		!reflect.DeepEqual(
+			intentCandidateEventSeqs(decision.Candidate.Events),
+			[]int64{source.Event.Seq, test.Event.Seq},
+		) {
+		t.Fatalf("continued persisted companion=%+v", decision)
+	}
+	if decision.Assignment.GroupingReason !=
+		"bounded deterministic persisted companion continuation" {
+		t.Fatalf("grouping reason=%q",
+			decision.Assignment.GroupingReason)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousPersistedCompanion(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	firstSource := appendIntentCandidateCapture(
+		t, db, "first.go", "create", "", "first")
+	secondSource := appendIntentCandidateCapture(
+		t, db, "second.go", "create", "", "second")
+	test := appendIntentCandidateCapture(
+		t, db, "feature_test.go", "create", "", "test")
+	saveSoftPublishedIntentCandidate(
+		t, db, "persisted-first", firstSource, "first-commit", 100)
+	saveSoftPublishedIntentCandidate(
+		t, db, "persisted-second", secondSource, "second-commit", 101)
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{test},
+		Hints: []IntentDependencyHint{
+			{
+				PrerequisiteSeq: firstSource.Event.Seq,
+				DependentSeq:    test.Event.Seq,
+				Strength:        ai.IntentDependencySoft,
+				Kind:            "test_source",
+				Evidence:        "first possible persisted companion",
+			},
+			{
+				PrerequisiteSeq: secondSource.Event.Seq,
+				DependentSeq:    test.Event.Seq,
+				Strength:        ai.IntentDependencySoft,
+				Kind:            "test_source",
+				Evidence:        "second possible persisted companion",
+			},
+		},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Now: time.Unix(120, 0),
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return errors.New("ambiguous companion must not materialize")
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if !result.NeedsAttention || len(result.Decisions) != 1 ||
+		result.Decisions[0].Publishable ||
+		!strings.Contains(strings.Join(
+			result.Decisions[0].Assignment.MissingCompanions, " "),
+			"ambiguous persisted companion") {
+		t.Fatalf("ambiguous persisted companion=%+v", result)
+	}
+}
+
 func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousCompanions(
 	t *testing.T,
 ) {

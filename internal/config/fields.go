@@ -77,7 +77,7 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldBaseURL, Environment: "ACD_AI_BASE_URL", Default: "https://api.openai.com/v1", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldAPIKey, Environment: "ACD_AI_API_KEY", Kind: KindString, Boundary: ApplyHot, Sensitive: true, Persistable: false},
 	{Name: FieldModel, Environment: "ACD_AI_MODEL", Default: "gpt-5.4-mini", Kind: KindString, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldTimeout, Environment: "ACD_AI_TIMEOUT", Default: "30s", Kind: KindDuration, PlainSeconds: true, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldTimeout, Environment: "ACD_AI_TIMEOUT", Default: "5m", Kind: KindDuration, PlainSeconds: true, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCAFile, Environment: "ACD_AI_CA_FILE", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldDiffEgress, Environment: "ACD_AI_DIFF_EGRESS", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitStrategy, Environment: "ACD_COMMIT_STRATEGY", Default: "event", Kind: KindString, Choices: []string{"event", "intent"}, Boundary: ApplyHot, Persistable: true},

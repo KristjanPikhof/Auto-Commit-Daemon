@@ -29,6 +29,19 @@ type configureFakeService struct {
 	globalSave  func(settings.SaveGlobalSetupRequest)
 }
 
+func TestDryRunConfigureSelectionUsesProviderDefaultTimeout(t *testing.T) {
+	t.Parallel()
+	selection := dryRunConfigureSelection(
+		"intent",
+		"balanced",
+		configureVerificationDetection{},
+	)
+	if selection.ProviderTimeout != ai.DefaultProviderTimeout.String() {
+		t.Fatalf("provider timeout=%q want=%q",
+			selection.ProviderTimeout, ai.DefaultProviderTimeout)
+	}
+}
+
 func (f *configureFakeService) Close() error { return nil }
 func (f *configureFakeService) AuthoringPreview() (settings.AuthoringPreview, error) {
 	*f.order = append(*f.order, "authoring")

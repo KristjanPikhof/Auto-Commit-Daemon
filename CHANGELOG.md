@@ -28,6 +28,10 @@
   doctor, and events now report the bounded error, repeat count, blocked
   capture, candidate IDs, and fallback size. Identical log lines are rate
   limited and recovery is reported explicitly.
+- Fixed Balanced fallback splitting a source change from its exact test or
+  migration companion when the planner window ended between them. One-to-one
+  persisted companions now rejoin the candidate and use bounded repair;
+  ambiguous matches stay pending for planner review.
 
 ### Added
 
@@ -84,6 +88,9 @@
   dependencies remain hard edges. Ambiguous groups, groups above 32 captures,
   and groups above 12 paths stay pending for planner review. Import, symbol,
   hunk, module, activity, and time similarity cannot merge fallback components.
+- Increased the default per-request AI provider timeout from 30 seconds to
+  5 minutes for slower approved endpoints. Correction retries remain bounded
+  by `intent.retry_on_invalid`.
 - Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
   hard evaluation boundaries; neither boundary bypasses atomicity,
   verification, branch, pause, Git-operation, conflict, or replay safety.

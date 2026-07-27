@@ -59,7 +59,7 @@ const (
 
 // DefaultProviderTimeout is the per-request timeout applied to the
 // OpenAI-compat HTTP provider when ACD_AI_TIMEOUT is unset or invalid.
-const DefaultProviderTimeout = 30 * time.Second
+const DefaultProviderTimeout = 5 * time.Minute
 
 const (
 	DefaultIntentWindow        = 10

@@ -58,6 +58,12 @@ candidate as the canonical target and records the other candidate IDs, status,
 and published commit OIDs in the lineage ledger. Membership moves in one
 transaction. Nested lineage remains traversable for later repair.
 
+During Balanced fallback, an exact one-to-one `test_source` or
+`migration_test` edge can also reconnect new work to a persisted candidate
+across planner windows. That continuation enters the same bounded repair path.
+Multiple possible persisted companions stay pending for planner review instead
+of publishing a deterministic singleton.
+
 Candidate tables store paths, change classes, bounded explanations, and hashes
 of symbol evidence. They do not store raw diffs. A planner request reconstructs
 bounded, redacted diff context from immutable capture operations.

@@ -1034,7 +1034,7 @@ func dryRunConfigureSelection(
 		Experience: configureExperienceName(strategy, preset),
 		Strategy:   strategy, Preset: preset, CommitFormat: "imperative",
 		Provider: provider, Model: "gpt-5.4-mini", BaseURL: ai.DefaultOpenAIBaseURL,
-		ProviderTimeout: "30s", VerificationMode: mode,
+		ProviderTimeout: ai.DefaultProviderTimeout.String(), VerificationMode: mode,
 		VerificationCommand: command, VerificationSource: source,
 		ExecutionMode: configureExecutionMode(strategy, preset),
 	}

@@ -189,7 +189,7 @@ boundary; fields labeled `restart required` need an explicit daemon restart.
 | Trace | `ACD_TRACE=off`; `ACD_TRACE_DIR=<gitDir>/acd/trace`; `ACD_AI_PROMPT_TRACE=off` (sensitive) |
 | Shadow/recovery | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60`; `ACD_KEEP_DEAD_BRANCH_BARRIERS` disables dead-ref recovery sweep |
 | Capture | `ACD_MAX_FILE_BYTES=5 MiB`; `ACD_MAX_PENDING_EVENTS=50000`; `ACD_PATH_QUIESCENCE_SECONDS=0`; `ACD_EVENT_RETENTION_DAYS=7`; `ACD_SENSITIVE_GLOBS`; `ACD_SAFE_IGNORE`; `ACD_SAFE_IGNORE_EXTRA` |
-| AI | `ACD_AI_PROVIDER`: `deterministic`, `openai-compat` or `subprocess:<name>`; `ACD_AI_BASE_URL=https://api.openai.com/v1`; `ACD_AI_MODEL=gpt-5.4-mini`; `ACD_AI_TIMEOUT=30s`; `ACD_AI_API_KEY` overrides protected file; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS=off`; `ACD_COMMIT_FORMAT`: `imperative` or `conventional`; `ACD_INTENT_REJECTS_RAW=off` |
+| AI | `ACD_AI_PROVIDER`: `deterministic`, `openai-compat` or `subprocess:<name>`; `ACD_AI_BASE_URL=https://api.openai.com/v1`; `ACD_AI_MODEL=gpt-5.4-mini`; `ACD_AI_TIMEOUT=5m`; `ACD_AI_API_KEY` overrides protected file; `ACD_AI_CA_FILE`; `ACD_AI_DIFF_EGRESS=off`; `ACD_COMMIT_FORMAT`: `imperative` or `conventional`; `ACD_INTENT_REJECTS_RAW=off` |
 | Intent | `ACD_COMMIT_STRATEGY`: `event` or `intent`; `ACD_COMMIT_PRESET`: `fast`, `balanced`, `quality`; legacy tuning remains advanced; `ACD_INTENT_VERIFICATION`; `ACD_VERIFICATION_{FAST,FULL}_{COMMAND,TIMEOUT}`; `ACD_INTENT_REPAIR_{ENABLED,HORIZON,MAX_COMMITS}`; `ACD_INTENT_REPAIR_MAX_COMMITS<=5`; all built-ins keep path coalescing off |
 | Watch/client | `ACD_FSNOTIFY_ENABLED=off`; `ACD_DISABLE_FSNOTIFY` forces poll; `ACD_MAX_INOTIFY_WATCHES`; `ACD_CLIENT_TTL_SECONDS=1800` |
 

@@ -37,7 +37,7 @@
 //   - Spawn on first Generate after construction (or after a crash/timeout).
 //   - One owner goroutine per provider holds (stdin, stdout, process); a
 //     buffered request channel feeds it serialised work.
-//   - Per-request timeout (default 30s) is enforced via context.WithTimeout
+//   - Per-request timeout (default 5m) is enforced via context.WithTimeout
 //     on the caller side. On timeout we kill the plugin so the next request
 //     gets a fresh process — a stuck plugin must never wedge the daemon.
 //   - On any I/O error or unexpected EOF on stdin/stdout the provider is

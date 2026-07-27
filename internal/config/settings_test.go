@@ -358,6 +358,9 @@ func TestFieldCatalogClassifiesHotRestartAndValidates(t *testing.T) {
 		t.Fatal("invalid strategy accepted")
 	}
 	timeout, _ := LookupField(FieldTimeout)
+	if timeout.Default != "5m" {
+		t.Fatalf("AI timeout default = %q, want 5m", timeout.Default)
+	}
 	for _, value := range []string{"1e20", "Inf", "NaN"} {
 		if _, err := normalizeValue(timeout, value); err == nil {
 			t.Fatalf("overflowing timeout %q accepted", value)

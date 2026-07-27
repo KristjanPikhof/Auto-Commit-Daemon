@@ -46,7 +46,7 @@ export ACD_AI_PROVIDER=openai-compat
 export ACD_AI_API_KEY=sk-...
 export ACD_AI_BASE_URL=https://api.openai.com/v1
 export ACD_AI_MODEL=gpt-5.4-mini
-export ACD_AI_TIMEOUT=30s
+export ACD_AI_TIMEOUT=5m
 ~~~
 
 Subprocess plugin:
@@ -100,7 +100,7 @@ private repo unless the endpoint or plugin is trusted.
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | Must be an absolute HTTPS URL. |
 | `ACD_AI_API_KEY` | unset | Overrides the protected credential file. Required for network planning. |
 | `ACD_AI_MODEL` | `gpt-5.4-mini` | Sent to the OpenAI-compatible endpoint. |
-| `ACD_AI_TIMEOUT` | `30s` | Applies to HTTP and subprocess providers. Plain seconds also work. |
+| `ACD_AI_TIMEOUT` | `5m` | Applies to each HTTP and subprocess provider request. Plain seconds also work. |
 | `ACD_AI_CA_FILE` | unset | PEM CA bundle for private HTTPS gateways. |
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs when the provider can use them. |
 | `ACD_AI_PROMPT_TRACE` | off | Writes local prompt diagnostics under `<gitDir>/acd/prompt-trace/`. |
@@ -339,7 +339,7 @@ pre-authorize each specific risk. See
 | `openai-compat` succeeds | Provider result is used. |
 | Provider returns the wrong message format | ACD rejects the response, retries when configured, then falls back deterministically. |
 | Intent Fast planner failure | Publish the smallest valid hard-dependency component. |
-| Intent Balanced planner failure | Reuse a valid or deterministic dependency partition, then run structural verification. |
+| Intent Balanced planner failure | Reuse a valid or deterministic dependency partition, reconnect one-to-one persisted test/source or migration companions, then run structural verification. Ambiguous persisted companions stay pending. |
 | Intent Quality planner failure | Keep candidates pending and report `needs_attention`. |
 | Three consecutive intent validation failures | Open the persisted circuit after configured correction retries are exhausted. |
 | Intent circuit open | Skip the remote planner and apply the preset policy without repeated planner-error decisions. |
