@@ -25,6 +25,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	daemonpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -1131,6 +1133,7 @@ func collectDoctorAI() doctorAIReport {
 }
 
 var doctorProcessList = defaultDoctorProcessList
+var doctorRepoIdentityResolver = doctorRepoIdentity
 
 type doctorProcess struct {
 	PID     int
@@ -1138,7 +1141,14 @@ type doctorProcess struct {
 }
 
 func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
-	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	psPath := "ps"
+	switch runtime.GOOS {
+	case "darwin":
+		psPath = "/bin/ps"
+	case "linux":
+		psPath = "/usr/bin/ps"
+	}
+	out, err := exec.CommandContext(ctx, psPath, "-axo", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -1166,20 +1176,70 @@ func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
 }
 
 func findDaemonProcesses(ctx context.Context, repo string) []int {
-	processes, err := doctorProcessList(ctx)
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	processes, err := doctorProcessList(probeCtx)
 	if err != nil {
 		return nil
 	}
+	target, err := doctorRepoIdentityResolver(probeCtx, repo)
+	if err != nil {
+		return nil
+	}
+	identities := map[string]string{repo: target}
 	var pids []int
 	for _, proc := range processes {
-		cmd := proc.Command
-		if strings.Contains(cmd, "acd daemon run") &&
-			strings.Contains(cmd, "--repo") &&
-			strings.Contains(cmd, repo) {
+		repoArg, ok := daemonRepoArg(proc.Command)
+		if !ok {
+			continue
+		}
+		identity, cached := identities[repoArg]
+		if !cached {
+			identity, err = doctorRepoIdentityResolver(probeCtx, repoArg)
+			if err != nil {
+				identities[repoArg] = ""
+				continue
+			}
+			identities[repoArg] = identity
+		}
+		if identity == target {
 			pids = append(pids, proc.PID)
 		}
 	}
 	return pids
+}
+
+// daemonRepoArg delegates to the daemon's direct production-command parser so
+// ownership fencing and diagnostics cannot drift.
+func daemonRepoArg(command string) (string, bool) {
+	return daemonpkg.ParseDaemonRunRepoArg(command)
+}
+
+func doctorRepoIdentity(ctx context.Context, repo string) (string, error) {
+	wt, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	commonDir := wt.GitDir
+	body, err := os.ReadFile(filepath.Join(wt.GitDir, "commondir"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err == nil {
+		value := strings.TrimSpace(string(body))
+		if value == "" {
+			return "", errors.New("empty Git commondir")
+		}
+		if filepath.IsAbs(value) {
+			commonDir = filepath.Clean(value)
+		} else {
+			commonDir = filepath.Clean(filepath.Join(wt.GitDir, value))
+		}
+	}
+	if real, err := filepath.EvalSymlinks(commonDir); err == nil {
+		commonDir = filepath.Clean(real)
+	}
+	return commonDir, nil
 }
 
 // readRepoState opens the per-repo DB read-only and fills the report fields
