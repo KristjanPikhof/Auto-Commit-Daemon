@@ -316,6 +316,188 @@ func TestDiagnoseWriterSelfPublicationRemediationParity(t *testing.T) {
 	}
 }
 
+func TestSelfPublicationDurableAttentionStatusDiagnoseDoctorParity(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLISelfPublication(t, d, "publication-attention",
+		strings.Repeat("a", 40), strings.Repeat("b", 40),
+		state.SelfPublicationGitApplied, now)
+	unsafe := "Automatic recovery is blocked: api_key=sk-private prompt=repository_diff=secret\x1b[31m"
+	if err := state.SetSelfPublicationRecoveryAttention(
+		ctx, d, "publication-attention", unsafe); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "needs_attention" ||
+		report.RemediationKind != "needs_attention" ||
+		report.NeedsAttention == "" ||
+		report.Remediation != report.NeedsAttention {
+		t.Fatalf("durable-attention report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonBody, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := string(jsonBody) + statusOut.String() +
+		diagnoseOut.String() + doctorOut.String()
+	for _, want := range []string{
+		"phase=needs_attention", "remediation (needs_attention)",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("shared projection missing %q: %s", want, combined)
+		}
+	}
+	for _, forbidden := range []string{
+		"sk-private", "repository_diff=secret", "\x1b",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("shared projection leaked %q: %s", forbidden, combined)
+		}
+	}
+}
+
+func TestSelfPublicationWriterWinsOverRecoveryAttentionParity(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLISelfPublication(t, d, "publication-writer-attention",
+		strings.Repeat("a", 40), strings.Repeat("b", 40),
+		state.SelfPublicationGitApplied, now)
+	if err := state.SetSelfPublicationRecoveryAttention(
+		ctx, d, "publication-writer-attention",
+		"Automatic recovery is blocked"); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" ||
+		report.RemediationKind != "stop_old_owner" ||
+		report.NeedsAttention == "" {
+		t.Fatalf("writer-attention report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonBody, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(jsonBody), `"phase":"stale"`) ||
+		!strings.Contains(
+			string(jsonBody), `"remediation_kind":"stop_old_owner"`) {
+		t.Fatalf("JSON masks split-brain remediation: %s", jsonBody)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"Self-publication: phase=stale",
+			"writers=2",
+			"remediation (stop_old_owner)",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s missing %q: %s", name, want, output)
+			}
+		}
+	}
+}
+
+func TestSelfPublicationUnknownPreMarkerStatusDiagnoseDoctorParity(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLIUnknownSelfPublication(t, d, "unknown-pre-marker", now)
+	if _, ok, err := state.MetaGet(
+		ctx, d, state.SelfPublicationNeedsAttentionMetaKey); err != nil || ok {
+		t.Fatalf("unexpected preexisting attention ok=%v err=%v", ok, err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "needs_attention" ||
+		report.JournalPhase != state.SelfPublicationPrepared ||
+		report.RemediationKind != "needs_attention" ||
+		!strings.Contains(report.NeedsAttention, "unknown completion") {
+		t.Fatalf("unknown pre-marker report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"phase=needs_attention", "remediation (needs_attention)",
+			"unknown completion",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s missing %q: %s", name, want, output)
+			}
+		}
+	}
+}
+
 func TestDoctorPublicationStaleWakeDiagnosis(t *testing.T) {
 	ctx := context.Background()
 	_, dbPath, d := makeRepoStateDB(t)
@@ -478,6 +660,32 @@ WHERE id=?`, ts, ts, id); err != nil {
 		}
 	} else if phase != state.SelfPublicationPrepared {
 		t.Fatalf("unsupported fixture phase %q", phase)
+	}
+}
+
+func seedCLIUnknownSelfPublication(
+	t *testing.T,
+	d *state.DB,
+	id string,
+	now time.Time,
+) {
+	t.Helper()
+	ts := float64(now.UnixNano()) / 1e9
+	digest := "sha256:" + strings.Repeat("1", 64)
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, completion_published_ts, completion_candidate_status
+) VALUES (?, 'refs/heads/migrated', 2, 'old-source', 'old-target',
+          'old-tree', ?, 1, 'prepared', ?, ?, 0, 'unknown')`,
+		id, digest, ts, ts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publication_members(publication_id, ord, event_seq)
+VALUES (?, 0, 1)`, id); err != nil {
+		t.Fatal(err)
 	}
 }
 

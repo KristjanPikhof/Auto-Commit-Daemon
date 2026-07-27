@@ -252,6 +252,7 @@ type selfPublicationReport struct {
 	HeartbeatStale      bool   `json:"heartbeat_stale"`
 	PendingWakes        int    `json:"pending_wakes"`
 	AcknowledgedWakes   int    `json:"acknowledged_wakes"`
+	NeedsAttention      string `json:"needs_attention,omitempty"`
 	RemediationKind     string `json:"remediation_kind"`
 	Remediation         string `json:"remediation,omitempty"`
 }
@@ -281,6 +282,8 @@ func loadSelfPublicationReport(
 		CompletedCount:   projection.Completed,
 		AbandonedCount:   projection.Abandoned,
 		RecoverableCount: len(projection.Recoverable),
+		NeedsAttention: sanitizeObservabilityText(
+			projection.NeedsAttention),
 	}
 	if !projection.Available {
 		return report, nil
@@ -335,12 +338,29 @@ FROM flush_requests WHERE command='wake'`).Scan(
 	} else if report.DaemonAlive && !report.HeartbeatStale {
 		report.Phase = "active"
 	}
+	if projection.UnknownRecoverable != nil {
+		unknown := projection.UnknownRecoverable
+		report.JournalPhase = unknown.Phase
+		report.PublicationID = shortOID(
+			sanitizeObservabilityText(unknown.ID), 12)
+		report.SourceHead = shortOID(
+			sanitizeObservabilityText(unknown.SourceHead), 12)
+		report.TargetHead = shortOID(
+			sanitizeObservabilityText(unknown.TargetCommitOID), 12)
+		report.NeedsAttention = fmt.Sprintf(
+			"Automatic recovery is blocked: publication=%s has unknown completion semantics after a v18 upgrade",
+			valueOrUnset(report.PublicationID))
+	}
 
 	switch {
 	case report.CanonicalWriters > 1:
 		report.Phase = "stale"
 		report.RemediationKind = "stop_old_owner"
 		report.Remediation = "Stop the older ACD daemon owner; the stable repository lock permits one canonical writer."
+	case report.NeedsAttention != "":
+		report.Phase = "needs_attention"
+		report.RemediationKind = "needs_attention"
+		report.Remediation = report.NeedsAttention
 	case report.HeartbeatStale &&
 		(report.PendingWakes > 0 || report.AcknowledgedWakes > 0):
 		report.Phase = "stale"
