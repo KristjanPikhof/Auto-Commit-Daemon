@@ -173,7 +173,7 @@ WHERE EXISTS(SELECT 1 FROM capture_events LIMIT 1)
 		}{
 			{"completion_published_ts", "REAL NOT NULL DEFAULT 0"},
 			{"completion_candidate_status",
-				"TEXT NOT NULL DEFAULT 'published'"},
+				"TEXT NOT NULL DEFAULT 'unknown'"},
 			{"completion_soft_deadline", "REAL"},
 		} {
 			if err := addColumnIfMissing(
@@ -182,9 +182,6 @@ WHERE EXISTS(SELECT 1 FROM capture_events LIMIT 1)
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `
-UPDATE self_publications
-SET completion_published_ts=created_ts
-WHERE completion_published_ts=0;
 DROP TRIGGER IF EXISTS self_publications_identity_immutable;
 CREATE TRIGGER self_publications_identity_immutable
 BEFORE UPDATE OF branch_ref, branch_generation, source_head,

@@ -673,6 +673,140 @@ func TestRecoverSelfPublicationCancellationIsBounded(t *testing.T) {
 	}
 }
 
+func TestRecoverSelfPublicationUnknownCompletionFailsBeforeMutation(
+	t *testing.T,
+) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	publication, seq, _ := seedRecoverableSelfPublication(
+		t, ctx, f, state.SelfPublicationPrepared)
+	publication.Completion.CandidateStatus =
+		state.SelfPublicationCompletionUnknown
+
+	_, err := recoverSelfPublication(ctx, f.dir, f.db, publication)
+	if !errors.Is(err, ErrSelfPublicationRecoveryAmbiguous) ||
+		!strings.Contains(err.Error(), "completion semantics are unknown") {
+		t.Fatalf("err=%v want unknown-completion ambiguity", err)
+	}
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publication.ID, state.SelfPublicationPrepared)
+	assertSelfPublicationRecoveryEvent(
+		t, ctx, f.db, seq, state.EventStatePending, "")
+}
+
+func TestRecoverSelfPublicationAttentionPersistsUntilConvergence(
+	t *testing.T,
+) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	publication, _, target := seedRecoverableSelfPublication(
+		t, ctx, f, state.SelfPublicationGitApplied)
+	if err := git.UpdateRef(
+		ctx, f.dir, "refs/tags/recovery-attention", target, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RecoverSelfPublications(
+		ctx, f.dir, f.db, f.cctx, ReplayOpts{}); !errors.Is(
+		err, ErrSelfPublicationRecoveryAmbiguous) {
+		t.Fatalf("first recovery err=%v want ambiguity", err)
+	}
+	attention, ok, err := state.MetaGet(
+		ctx, f.db, state.SelfPublicationNeedsAttentionMetaKey)
+	if err != nil || !ok ||
+		!strings.Contains(attention, "Automatic recovery is blocked") ||
+		strings.Contains(attention, target) {
+		t.Fatalf("attention=(%q,%v,%v)", attention, ok, err)
+	}
+	blockerID, ok, err := state.MetaGet(
+		ctx, f.db, state.SelfPublicationAttentionBlockerMetaKey)
+	if err != nil || !ok || blockerID != publication.ID {
+		t.Fatalf("attention blocker=(%q,%v,%v)", blockerID, ok, err)
+	}
+	otherSeq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/ordinary", BranchGeneration: 2,
+		BaseHead: "ordinary-source", Operation: "update",
+		Path: "ordinary.txt", Fidelity: "full",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := state.SelfPublication{
+		ID: "ordinary-other-pair", BranchRef: "refs/heads/ordinary",
+		BranchGeneration: 2, SourceHead: "ordinary-source",
+		TargetCommitOID: "ordinary-target", TargetTreeOID: "ordinary-tree",
+		Members: []state.SelfPublicationMember{{EventSeq: otherSeq}},
+	}
+	if created, err := state.PrepareSelfPublication(
+		ctx, f.db, ordinary); err != nil || !created {
+		t.Fatalf("prepare ordinary publication=(%v,%v)", created, err)
+	}
+
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"update-ref", "-d", "refs/tags/recovery-attention", target); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := RecoverSelfPublications(
+		ctx, f.dir, f.db, f.cctx, ReplayOpts{})
+	if err != nil || summary.Completed != 1 {
+		t.Fatalf("converged recovery summary=%+v err=%v", summary, err)
+	}
+	if _, ok, err := state.MetaGet(
+		ctx, f.db, state.SelfPublicationNeedsAttentionMetaKey); err != nil ||
+		ok {
+		t.Fatalf("attention after convergence ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := state.MetaGet(
+		ctx, f.db,
+		state.SelfPublicationAttentionBlockerMetaKey); err != nil || ok {
+		t.Fatalf("attention owner after convergence ok=%v err=%v", ok, err)
+	}
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publication.ID, state.SelfPublicationCompleted)
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, ordinary.ID, state.SelfPublicationPrepared)
+}
+
+func TestRecoverSelfPublicationAttentionOnOtherPairBlocksMutation(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/other", BranchGeneration: 2,
+		BaseHead: "other-source", Operation: "update",
+		Path: "other.txt", Fidelity: "full",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := state.SelfPublication{
+		ID: "other-pair", BranchRef: "refs/heads/other",
+		BranchGeneration: 2, SourceHead: "other-source",
+		TargetCommitOID: "other-target", TargetTreeOID: "other-tree",
+		Members: []state.SelfPublicationMember{{EventSeq: seq}},
+	}
+	if created, err := state.PrepareSelfPublication(
+		ctx, f.db, other); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication=(%v,%v)", created, err)
+	}
+	const attention = "existing recovery blocker"
+	if err := state.SetSelfPublicationRecoveryAttention(
+		ctx, f.db, other.ID, attention); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := RecoverSelfPublications(
+		ctx, f.dir, f.db, f.cctx, ReplayOpts{})
+	if !errors.Is(err, ErrSelfPublicationRecoveryAmbiguous) ||
+		summary.Inspected != 0 {
+		t.Fatalf("current-pair summary=%+v err=%v want ambiguity", summary, err)
+	}
+	got, ok, err := state.MetaGet(
+		ctx, f.db, state.SelfPublicationNeedsAttentionMetaKey)
+	if err != nil || !ok || got != attention {
+		t.Fatalf("attention=(%q,%v,%v)", got, ok, err)
+	}
+}
+
 func TestRecoveryPreservesPendingSiblingsOnPreparedAmbiguity(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -801,8 +935,17 @@ func TestRun_AmbiguousSelfPublicationBlocksMutationButServicesFlush(
 	})
 
 	waitForDaemonMode(t, f.db, "running", 3*time.Second)
-	waitFor(t, 3*time.Second, "flush serviced while recovery blocked", func() bool {
+	// These 10s waits are load-tolerant harness bounds inside the 60s wake
+	// contract. Strict sub-3s liveness is asserted separately by
+	// TestRun_HeartbeatAndWakeAfterSelfPublication and integration coverage.
+	waitFor(t, 10*time.Second, "flush serviced while recovery blocked", func() bool {
 		return countFlushByStatus(t, f.db, "completed") == 1
+	})
+	waitFor(t, 10*time.Second, "durable recovery attention", func() bool {
+		value, ok, err := state.MetaGet(
+			ctx, f.db, state.SelfPublicationNeedsAttentionMetaKey)
+		return err == nil && ok &&
+			strings.Contains(value, "Automatic recovery is blocked")
 	})
 	assertSelfPublicationRecoveryPhase(
 		t, ctx, f.db, publication.ID, state.SelfPublicationGitApplied)
@@ -821,6 +964,54 @@ func TestRun_AmbiguousSelfPublicationBlocksMutationButServicesFlush(
 	if snapshots != 0 {
 		t.Fatalf("recovery snapshots=%d want 0", snapshots)
 	}
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+}
+
+func TestRun_UnknownSelfPublicationOnOtherPairBlocksMutation(
+	t *testing.T,
+) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+	current, seq, _ := seedDaemonRestartSelfPublication(
+		t, ctx, f, state.SelfPublicationPrepared, false)
+	unknown, _ := seedUnknownRecoveryPublication(
+		t, ctx, f.db, "refs/heads/migrated-other", 7)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn:   DeterministicMessage,
+			WakeCh:      make(chan struct{}, 1),
+			ShutdownCh:  make(chan struct{}, 1),
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 3*time.Second)
+	waitFor(t, 10*time.Second, "global unknown recovery blocker", func() bool {
+		id, ok, err := state.MetaGet(
+			ctx, f.db, state.SelfPublicationAttentionBlockerMetaKey)
+		return err == nil && ok && id == unknown.ID
+	})
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, current.ID, state.SelfPublicationPrepared)
+	assertSelfPublicationRecoveryEvent(
+		t, ctx, f.db, seq, state.EventStatePending, "")
 	cancel()
 	wg.Wait()
 	if runErr != nil {
@@ -893,6 +1084,64 @@ func seedDaemonRestartSelfPublication(
 		}
 	}
 	return publication, seq, target
+}
+
+func seedUnknownRecoveryPublication(
+	t *testing.T,
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) (state.SelfPublication, int64) {
+	t.Helper()
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: branchRef, BranchGeneration: generation,
+		BaseHead: "migrated-source", Operation: "update",
+		Path: "migrated.txt", Fidelity: "full",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []state.SelfPublicationMember{{EventSeq: seq}}
+	digest, err := state.SelfPublicationMembershipDigest(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := state.SelfPublication{
+		ID:        "unknown-" + strings.ReplaceAll(branchRef, "/", "-"),
+		BranchRef: branchRef, BranchGeneration: generation,
+		SourceHead:       "migrated-source",
+		TargetCommitOID:  "migrated-target",
+		TargetTreeOID:    "migrated-tree",
+		MembershipDigest: digest, MemberCount: 1,
+		Phase: state.SelfPublicationPrepared,
+		Completion: state.SelfPublicationCompletion{
+			CandidateStatus: state.SelfPublicationCompletionUnknown,
+		},
+		Members: members,
+	}
+	ts := selfPublicationNow()
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, error, completion_published_ts,
+    completion_candidate_status, completion_soft_deadline
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, '', 0, ?, NULL)`,
+		publication.ID, publication.BranchRef,
+		publication.BranchGeneration, publication.SourceHead,
+		publication.TargetCommitOID, publication.TargetTreeOID,
+		publication.MembershipDigest, publication.MemberCount, ts, ts,
+		state.SelfPublicationCompletionUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO self_publication_members(
+    publication_id, ord, event_seq, candidate_id
+) VALUES (?, 0, ?, NULL)`, publication.ID, seq); err != nil {
+		t.Fatal(err)
+	}
+	return publication, seq
 }
 
 func seedRecoverableSelfPublication(

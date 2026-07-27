@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -104,6 +105,11 @@ CREATE TABLE self_publication_members(
     candidate_id TEXT,
     PRIMARY KEY (publication_id, ord)
 );
+CREATE TABLE daemon_meta(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_ts REAL NOT NULL
+);
 CREATE TRIGGER self_publications_identity_immutable
 BEFORE UPDATE OF branch_ref, branch_generation, source_head,
                  target_commit_oid, target_tree_oid, membership_digest,
@@ -112,6 +118,20 @@ ON self_publications
 BEGIN
     SELECT RAISE(ABORT, 'self-publication identity is immutable');
 END;
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, git_applied_ts
+) VALUES
+    ('v18-prepared', 'refs/heads/main', 1, 'source-1', 'target-1',
+     'tree-1', 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+     1, 'prepared', 10, 10, NULL),
+    ('v18-applied', 'refs/heads/main', 1, 'source-2', 'target-2',
+     'tree-2', 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+     1, 'git_applied', 20, 21, 21);
+INSERT INTO self_publication_members(
+    publication_id, ord, event_seq
+) VALUES ('v18-prepared', 0, 1), ('v18-applied', 0, 2);
 PRAGMA user_version=18;`); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +140,14 @@ PRAGMA user_version=18;`); err != nil {
 	}
 	projection, err := LoadSelfPublicationStateReadOnly(ctx, dbPath)
 	if err != nil || !projection.Available ||
-		projection.SchemaVersion != 18 {
+		projection.SchemaVersion != 18 ||
+		len(projection.Recoverable) != 2 ||
+		projection.Recoverable[0].Completion.CandidateStatus !=
+			SelfPublicationCompletionUnknown ||
+		projection.Recoverable[1].Completion.CandidateStatus !=
+			SelfPublicationCompletionUnknown ||
+		projection.UnknownRecoverable == nil ||
+		projection.UnknownRecoverable.ID != "v18-prepared" {
 		t.Fatalf("v18 read-only projection=%+v err=%v", projection, err)
 	}
 
@@ -129,6 +156,21 @@ PRAGMA user_version=18;`); err != nil {
 		t.Fatalf("Open v18 fixture: %v", err)
 	}
 	assertSelfPublicationCompletionColumns(t, migrated.SQL())
+	for _, id := range []string{"v18-prepared", "v18-applied"} {
+		got, ok, err := SelfPublicationByID(ctx, migrated, id)
+		if err != nil || !ok ||
+			got.Completion.CandidateStatus !=
+				SelfPublicationCompletionUnknown ||
+			got.Completion.PublishedTS != 0 ||
+			got.Completion.SoftPublicationDeadline.Valid {
+			t.Fatalf("migrated %s=%+v ok=%v err=%v", id, got, ok, err)
+		}
+	}
+	if unknown, ok, err := FirstUnknownRecoverableSelfPublication(
+		ctx, migrated); err != nil || !ok || unknown.ID != "v18-prepared" {
+		t.Fatalf("first migrated unknown=%+v ok=%v err=%v",
+			unknown, ok, err)
+	}
 	if version, err := migrated.UserVersion(ctx); err != nil ||
 		version != SchemaVersion {
 		t.Fatalf("version=(%d,%v), want %d", version, err, SchemaVersion)
@@ -142,6 +184,11 @@ PRAGMA user_version=18;`); err != nil {
 	}
 	defer reopened.Close()
 	assertSelfPublicationCompletionColumns(t, reopened.SQL())
+	got, ok, err := SelfPublicationByID(ctx, reopened, "v18-applied")
+	if err != nil || !ok ||
+		got.Completion.CandidateStatus != SelfPublicationCompletionUnknown {
+		t.Fatalf("reopened v18-applied=%+v ok=%v err=%v", got, ok, err)
+	}
 }
 
 func TestReadOnlySelfPublicationV17DoesNotMigrate(t *testing.T) {
@@ -261,6 +308,27 @@ func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
 		publish.TargetCommitOID.String != "target" ||
 		publish.Status != "published" {
 		t.Fatalf("publish_state=%+v ok=%v err=%v", publish, ok, err)
+	}
+}
+
+func TestPrepareSelfPublicationRejectsUnknownCompletion(t *testing.T) {
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	seq := appendSelfPublicationEvent(
+		t, d, "refs/heads/main", 1, "unknown.go")
+	publication := SelfPublication{
+		ID: "unknown-completion", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, SourceHead: "source",
+		TargetCommitOID: "target", TargetTreeOID: "tree",
+		Completion: SelfPublicationCompletion{
+			CandidateStatus: SelfPublicationCompletionUnknown,
+		},
+		Members: []SelfPublicationMember{{EventSeq: seq}},
+	}
+	if _, err := PrepareSelfPublication(
+		ctx, d, publication); err == nil ||
+		!strings.Contains(err.Error(), "invalid self-publication completion") {
+		t.Fatalf("PrepareSelfPublication unknown completion err=%v", err)
 	}
 }
 

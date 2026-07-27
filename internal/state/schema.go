@@ -614,7 +614,7 @@ CREATE TABLE IF NOT EXISTS self_publications(
     completion_published_ts REAL NOT NULL,
     completion_candidate_status TEXT NOT NULL CHECK (
                         completion_candidate_status IN
-                        ('published','soft_published')),
+                        ('unknown','published','soft_published')),
     completion_soft_deadline REAL,
     CHECK (length(id) BETWEEN 1 AND 128),
     CHECK (length(branch_ref) BETWEEN 1 AND 1024),
@@ -626,6 +626,10 @@ CREATE TABLE IF NOT EXISTS self_publications(
     CHECK (length(membership_digest) = 71
            AND substr(membership_digest, 1, 7) = 'sha256:'),
     CHECK (
+        (completion_candidate_status = 'unknown'
+         AND completion_published_ts = 0
+         AND completion_soft_deadline IS NULL)
+        OR
         (completion_candidate_status = 'published'
          AND completion_soft_deadline IS NULL)
         OR

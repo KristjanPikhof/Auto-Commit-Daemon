@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -69,6 +70,10 @@ func RecoverSelfPublications(
 	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
+	if err := preflightSelfPublicationRecovery(
+		ctx, db, cctx); err != nil {
+		return summary, err
+	}
 
 	limit := opts.Limit
 	if limit <= 0 || limit > selfPublicationRecoveryLimit {
@@ -91,6 +96,14 @@ func RecoverSelfPublications(
 			ctx, repoRoot, db, publication)
 		summary.Results = append(summary.Results, result)
 		if recoverErr != nil {
+			if errors.Is(recoverErr, ErrSelfPublicationRecoveryAmbiguous) {
+				if persistErr := persistSelfPublicationRecoveryAttention(
+					ctx, db, result); persistErr != nil {
+					return summary, errors.Join(recoverErr, fmt.Errorf(
+						"daemon: persist self-publication recovery attention: %w",
+						persistErr))
+				}
+			}
 			return summary, recoverErr
 		}
 		switch result.Outcome {
@@ -101,7 +114,93 @@ func RecoverSelfPublications(
 			summary.Abandoned++
 		}
 	}
+	if err := clearConvergedSelfPublicationAttention(ctx, db); err != nil {
+		return summary, err
+	}
 	return summary, nil
+}
+
+func preflightSelfPublicationRecovery(
+	ctx context.Context,
+	db *state.DB,
+	cctx CaptureContext,
+) error {
+	unknown, ok, err := state.FirstUnknownRecoverableSelfPublication(ctx, db)
+	if err != nil {
+		return fmt.Errorf(
+			"daemon: inspect globally unknown self-publication: %w", err)
+	}
+	if ok {
+		result := SelfPublicationRecoveryResult{
+			ID: unknown.ID, Phase: unknown.Phase,
+			TargetOID: unknown.TargetCommitOID,
+		}
+		recoverErr := ambiguousSelfPublication(unknown,
+			"prepare-time completion semantics are unknown after v18 upgrade",
+			nil)
+		if persistErr := persistSelfPublicationRecoveryAttention(
+			ctx, db, result); persistErr != nil {
+			return errors.Join(recoverErr, fmt.Errorf(
+				"daemon: persist unknown self-publication attention: %w",
+				persistErr))
+		}
+		return recoverErr
+	}
+
+	blockerID, blocker, recoverable, err :=
+		state.SelfPublicationAttentionBlocker(ctx, db)
+	if err != nil {
+		return fmt.Errorf(
+			"daemon: inspect self-publication attention owner: %w", err)
+	}
+	if blockerID == "" {
+		return nil
+	}
+	if !recoverable {
+		if _, err := state.ClearSelfPublicationRecoveryAttention(
+			ctx, db, blockerID); err != nil {
+			return fmt.Errorf(
+				"daemon: clear stale self-publication attention: %w", err)
+		}
+		return nil
+	}
+	if blocker.BranchRef != cctx.BranchRef ||
+		blocker.BranchGeneration != cctx.BranchGeneration {
+		return ambiguousSelfPublication(blocker,
+			"durable recovery blocker belongs to another exact branch pair",
+			nil)
+	}
+	return nil
+}
+
+func persistSelfPublicationRecoveryAttention(
+	ctx context.Context,
+	db *state.DB,
+	result SelfPublicationRecoveryResult,
+) error {
+	return state.SetSelfPublicationRecoveryAttention(
+		ctx, db, result.ID, selfPublicationRecoveryAttention(result))
+}
+
+func clearConvergedSelfPublicationAttention(
+	ctx context.Context,
+	db *state.DB,
+) error {
+	blockerID, _, recoverable, err :=
+		state.SelfPublicationAttentionBlocker(ctx, db)
+	if err != nil {
+		return fmt.Errorf(
+			"daemon: inspect self-publication attention convergence: %w", err)
+	}
+	if blockerID == "" || recoverable {
+		return nil
+	}
+	if _, err := state.ClearSelfPublicationRecoveryAttention(
+		ctx, db, blockerID); err != nil {
+		return fmt.Errorf(
+			"daemon: clear converged self-publication attention: %w", err)
+	}
+	return nil
 }
 
 func recoverableSelfPublicationsForPair(
@@ -181,6 +280,12 @@ func recoverSelfPublication(
 	result := SelfPublicationRecoveryResult{
 		ID: publication.ID, Phase: publication.Phase,
 		TargetOID: publication.TargetCommitOID,
+	}
+	if publication.Completion.CandidateStatus ==
+		state.SelfPublicationCompletionUnknown {
+		return result, ambiguousSelfPublication(publication,
+			"prepare-time completion semantics are unknown after v18 upgrade",
+			nil)
 	}
 	refOID, refExists, err := resolveSelfPublicationRef(
 		ctx, repoRoot, publication.BranchRef)
@@ -499,4 +604,41 @@ func ambiguousSelfPublication(
 		return errors.Join(err, cause)
 	}
 	return err
+}
+
+func selfPublicationRecoveryAttention(
+	result SelfPublicationRecoveryResult,
+) string {
+	id := sanitizeSelfPublicationRecoveryIdentity(result.ID, 64)
+	phase := sanitizeSelfPublicationRecoveryIdentity(result.Phase, 32)
+	target := sanitizeSelfPublicationRecoveryIdentity(result.TargetOID, 12)
+	return fmt.Sprintf(
+		"Automatic recovery is blocked: publication=%s phase=%s target=%s has ambiguous Git or journal evidence",
+		id, phase, target)
+}
+
+func sanitizeSelfPublicationRecoveryIdentity(value string, limit int) string {
+	value = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) && r != '\u007f' {
+			return r
+		}
+		return -1
+	}, value))
+	lower := strings.ToLower(value)
+	for _, sensitive := range []string{
+		"://", "api_key", "api-key", "token", "password", "credential",
+		"prompt", "repository_diff", "repository-diff", "raw_response",
+		"provider_response",
+	} {
+		if strings.Contains(lower, sensitive) {
+			return "[redacted]"
+		}
+	}
+	if value == "" {
+		return "unknown"
+	}
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	return value
 }

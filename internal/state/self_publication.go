@@ -20,6 +20,19 @@ const (
 	SelfPublicationCompleted  = "completed"
 	SelfPublicationAbandoned  = "abandoned"
 
+	// SelfPublicationCompletionUnknown is reserved for v18 journal rows whose
+	// prepare-time completion semantics were never persisted. Normal prepare
+	// callers must never create it; restart recovery fails closed on it.
+	SelfPublicationCompletionUnknown = "unknown"
+
+	// SelfPublicationNeedsAttentionMetaKey is the durable, read-only-visible
+	// recovery blocker written when Git and journal evidence are ambiguous.
+	SelfPublicationNeedsAttentionMetaKey = "self_publication.needs_attention"
+	// SelfPublicationAttentionBlockerMetaKey owns the accompanying message.
+	// Keeping the exact recoverable row ID lets recovery clear stale attention
+	// without conflating it with unrelated ordinary journal rows.
+	SelfPublicationAttentionBlockerMetaKey = "self_publication.attention_blocker_id"
+
 	// SelfPublicationMaxMembers matches the maximum capture window accepted
 	// by Intent v2. Publication recovery stays bounded even if a caller passes
 	// a malformed or unexpectedly large membership set.
@@ -88,13 +101,16 @@ type SelfPublicationCompletion struct {
 // Pre-v18 databases return Available=false without creating or migrating
 // anything. Recoverable is capped and ordered oldest-first.
 type SelfPublicationReadOnlyProjection struct {
-	Available     bool
-	SchemaVersion int
-	Prepared      int
-	GitApplied    int
-	Completed     int
-	Abandoned     int
-	Recoverable   []SelfPublication
+	Available          bool
+	SchemaVersion      int
+	Prepared           int
+	GitApplied         int
+	Completed          int
+	Abandoned          int
+	Recoverable        []SelfPublication
+	NeedsAttention     string
+	AttentionBlockerID string
+	UnknownRecoverable *SelfPublication
 }
 
 // SelfPublicationMembershipDigest returns the canonical identity digest for
@@ -444,6 +460,109 @@ func RecoverableSelfPublications(ctx context.Context, d *DB, limit int) ([]SelfP
 	return queryRecoverableSelfPublications(ctx, d.readSQL(), limit)
 }
 
+// FirstUnknownRecoverableSelfPublication returns the oldest live v18-upgraded
+// row whose completion semantics cannot be reconstructed. It is an unbounded
+// inventory check implemented as a single indexed LIMIT 1 query.
+func FirstUnknownRecoverableSelfPublication(
+	ctx context.Context,
+	d *DB,
+) (SelfPublication, bool, error) {
+	if d == nil {
+		return SelfPublication{}, false, errors.New(
+			"state: FirstUnknownRecoverableSelfPublication: nil db")
+	}
+	return queryFirstUnknownRecoverableSelfPublication(ctx, d.readSQL())
+}
+
+// SelfPublicationAttentionBlocker resolves the durable attention owner. A
+// non-empty blockerID with recoverable=false is stale ownership that callers
+// may clear with ClearSelfPublicationRecoveryAttention.
+func SelfPublicationAttentionBlocker(
+	ctx context.Context,
+	d *DB,
+) (blockerID string, publication SelfPublication, recoverable bool, err error) {
+	if d == nil {
+		return "", SelfPublication{}, false, errors.New(
+			"state: SelfPublicationAttentionBlocker: nil db")
+	}
+	blockerID, ok, err := MetaGet(
+		ctx, d, SelfPublicationAttentionBlockerMetaKey)
+	if err != nil || !ok {
+		return "", SelfPublication{}, false, err
+	}
+	publication, ok, err = SelfPublicationByID(ctx, d, blockerID)
+	if err != nil || !ok {
+		return blockerID, SelfPublication{}, false, err
+	}
+	recoverable = publication.Phase == SelfPublicationPrepared ||
+		publication.Phase == SelfPublicationGitApplied
+	return blockerID, publication, recoverable, nil
+}
+
+// SetSelfPublicationRecoveryAttention atomically persists the bounded message
+// and its exact recoverable owner.
+func SetSelfPublicationRecoveryAttention(
+	ctx context.Context,
+	d *DB,
+	blockerID, message string,
+) error {
+	blockerID = strings.TrimSpace(blockerID)
+	message = strings.TrimSpace(message)
+	if d == nil || blockerID == "" || len(blockerID) > 128 ||
+		message == "" || len(message) > 1024 {
+		return errors.New("state: invalid self-publication recovery attention")
+	}
+	return MetaSetMany(ctx, d, map[string]string{
+		SelfPublicationNeedsAttentionMetaKey:   message,
+		SelfPublicationAttentionBlockerMetaKey: blockerID,
+	})
+}
+
+// ClearSelfPublicationRecoveryAttention atomically removes message and owner
+// only when the caller still owns the marker.
+func ClearSelfPublicationRecoveryAttention(
+	ctx context.Context,
+	d *DB,
+	expectedBlockerID string,
+) (bool, error) {
+	expectedBlockerID = strings.TrimSpace(expectedBlockerID)
+	if d == nil || expectedBlockerID == "" {
+		return false, errors.New(
+			"state: invalid self-publication attention clear")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf(
+			"state: begin self-publication attention clear: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var current string
+	if err := tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key=?`,
+		SelfPublicationAttentionBlockerMetaKey).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf(
+			"state: read self-publication attention owner: %w", err)
+	}
+	if current != expectedBlockerID {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM daemon_meta WHERE key IN (?, ?)`,
+		SelfPublicationNeedsAttentionMetaKey,
+		SelfPublicationAttentionBlockerMetaKey); err != nil {
+		return false, fmt.Errorf(
+			"state: clear self-publication attention: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"state: commit self-publication attention clear: %w", err)
+	}
+	return true, nil
+}
+
 // PruneTerminalSelfPublicationsBefore removes at most limit completed or
 // abandoned journal rows older than cutoff, including their exact membership.
 // Active prepared/git_applied crash evidence is never eligible.
@@ -520,6 +639,21 @@ WHERE type='table' AND name IN (
 		return projection, nil
 	}
 	projection.Available = true
+	var persistedAttention, persistedBlocker string
+	if err := conn.QueryRowContext(ctx, `
+SELECT
+    COALESCE(MAX(CASE WHEN key=? THEN value END), ''),
+    COALESCE(MAX(CASE WHEN key=? THEN value END), '')
+FROM daemon_meta
+WHERE key IN (?, ?)`,
+		SelfPublicationNeedsAttentionMetaKey,
+		SelfPublicationAttentionBlockerMetaKey,
+		SelfPublicationNeedsAttentionMetaKey,
+		SelfPublicationAttentionBlockerMetaKey,
+	).Scan(&persistedAttention, &persistedBlocker); err != nil {
+		return SelfPublicationReadOnlyProjection{},
+			fmt.Errorf("state: project self-publication attention: %w", err)
+	}
 	rows, err := conn.QueryContext(ctx, `
 SELECT phase, COUNT(*) FROM self_publications GROUP BY phase`)
 	if err != nil {
@@ -558,6 +692,42 @@ SELECT phase, COUNT(*) FROM self_publications GROUP BY phase`)
 	}
 	if err != nil {
 		return SelfPublicationReadOnlyProjection{}, err
+	}
+	for i := range projection.Recoverable {
+		current := &projection.Recoverable[i]
+		if current.Completion.CandidateStatus ==
+			SelfPublicationCompletionUnknown &&
+			projection.UnknownRecoverable == nil {
+			projection.UnknownRecoverable = current
+		}
+		if persistedBlocker != "" && current.ID == persistedBlocker {
+			projection.AttentionBlockerID = persistedBlocker
+			projection.NeedsAttention = persistedAttention
+		}
+	}
+	if projection.SchemaVersion >= 19 && persistedBlocker != "" &&
+		projection.AttentionBlockerID == "" {
+		blocker, ok, blockerErr := selfPublicationByIDQuery(
+			ctx, conn, persistedBlocker)
+		if blockerErr != nil {
+			return SelfPublicationReadOnlyProjection{}, blockerErr
+		}
+		if ok && (blocker.Phase == SelfPublicationPrepared ||
+			blocker.Phase == SelfPublicationGitApplied) {
+			projection.AttentionBlockerID = persistedBlocker
+			projection.NeedsAttention = persistedAttention
+		}
+	}
+	if projection.SchemaVersion >= 19 &&
+		projection.UnknownRecoverable == nil {
+		unknown, ok, unknownErr := queryFirstUnknownRecoverableSelfPublication(
+			ctx, conn)
+		if unknownErr != nil {
+			return SelfPublicationReadOnlyProjection{}, unknownErr
+		}
+		if ok {
+			projection.UnknownRecoverable = &unknown
+		}
 	}
 	return projection, nil
 }
@@ -1092,6 +1262,35 @@ func queryRecoverableSelfPublications(
 	return publications, nil
 }
 
+func queryFirstUnknownRecoverableSelfPublication(
+	ctx context.Context,
+	q selfPublicationQueryer,
+) (SelfPublication, bool, error) {
+	var id string
+	if err := q.QueryRowContext(ctx, `
+SELECT id
+FROM self_publications
+WHERE phase IN ('prepared','git_applied')
+  AND completion_candidate_status=?
+ORDER BY created_ts, id
+LIMIT 1`, SelfPublicationCompletionUnknown).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SelfPublication{}, false, nil
+		}
+		return SelfPublication{}, false, fmt.Errorf(
+			"state: query unknown recoverable self-publication: %w", err)
+	}
+	publication, ok, err := selfPublicationByIDQuery(ctx, q, id)
+	if err != nil || !ok {
+		return publication, ok, err
+	}
+	publication.Members, err = loadSelfPublicationMembers(ctx, q, id)
+	if err != nil {
+		return SelfPublication{}, false, err
+	}
+	return publication, true, nil
+}
+
 func queryRecoverableSelfPublicationsV18(
 	ctx context.Context,
 	q selfPublicationQueryer,
@@ -1125,8 +1324,7 @@ ORDER BY created_ts, id LIMIT ?`, limit)
 				"state: scan v18 recoverable self-publication: %w", err)
 		}
 		publication.Completion = SelfPublicationCompletion{
-			PublishedTS:     publication.CreatedTS,
-			CandidateStatus: IntentCandidatePublished,
+			CandidateStatus: SelfPublicationCompletionUnknown,
 		}
 		publications = append(publications, publication)
 	}
