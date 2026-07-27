@@ -30,8 +30,9 @@ package state
 // candidate, dependency, boundary, verification, and repair ledgers; v16 adds
 // durable background setup-validation attempts without backfilling existing
 // applied revisions; v17 adds durable candidate lineage for dependency-driven
-// canonical merges.
-const SchemaVersion = 17
+// canonical merges; v18 adds an immutable, crash-recoverable self-publication
+// journal spanning the Git-applied and SQLite-completed boundary.
+const SchemaVersion = 18
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -586,6 +587,95 @@ CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_old_oid
 
 CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_candidate
     ON intent_repair_commits(candidate_id, repair_id);
+
+-- v18: crash-safe journal for ACD-authored branch advances. Identity columns
+-- are immutable after prepare; only phase/timestamp/error columns advance.
+-- Exact event/candidate membership is retained in the child ledger so
+-- completion and restart recovery never infer ownership from a moving queue.
+CREATE TABLE IF NOT EXISTS self_publications(
+    id                  TEXT PRIMARY KEY,
+    branch_ref          TEXT NOT NULL,
+    branch_generation   INTEGER NOT NULL CHECK (branch_generation >= 0),
+    source_head         TEXT NOT NULL,
+    target_commit_oid   TEXT NOT NULL,
+    target_tree_oid     TEXT NOT NULL,
+    membership_digest   TEXT NOT NULL,
+    member_count        INTEGER NOT NULL
+                        CHECK (member_count BETWEEN 1 AND 256),
+    phase               TEXT NOT NULL CHECK (phase IN
+                           ('prepared','git_applied','completed','abandoned')),
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    git_applied_ts      REAL,
+    completed_ts        REAL,
+    abandoned_ts        REAL,
+    error               TEXT NOT NULL DEFAULT '',
+    CHECK (length(id) BETWEEN 1 AND 128),
+    CHECK (length(branch_ref) BETWEEN 1 AND 1024),
+    CHECK (length(source_head) BETWEEN 1 AND 128),
+    CHECK (length(target_commit_oid) BETWEEN 1 AND 128),
+    CHECK (length(target_tree_oid) BETWEEN 1 AND 128),
+    CHECK (length(membership_digest) = 71
+           AND substr(membership_digest, 1, 7) = 'sha256:')
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_self_publications_pair_target
+    ON self_publications(branch_ref, branch_generation, target_commit_oid);
+
+CREATE INDEX IF NOT EXISTS idx_self_publications_pair_phase_created
+    ON self_publications(
+        branch_ref, branch_generation, phase, created_ts, id);
+
+CREATE INDEX IF NOT EXISTS idx_self_publications_phase_created
+    ON self_publications(phase, created_ts, id);
+
+CREATE TABLE IF NOT EXISTS self_publication_members(
+    publication_id      TEXT NOT NULL,
+    ord                 INTEGER NOT NULL CHECK (ord >= 0),
+    event_seq           INTEGER NOT NULL CHECK (event_seq > 0),
+    candidate_id        TEXT,
+    PRIMARY KEY (publication_id, ord),
+    UNIQUE (publication_id, event_seq),
+    CHECK (candidate_id IS NULL OR
+           length(candidate_id) BETWEEN 1 AND 128),
+    FOREIGN KEY (publication_id) REFERENCES self_publications(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_publication_members_event
+    ON self_publication_members(event_seq, publication_id);
+
+CREATE INDEX IF NOT EXISTS idx_self_publication_members_candidate
+    ON self_publication_members(candidate_id, publication_id, ord)
+    WHERE candidate_id IS NOT NULL;
+
+-- Defense in depth for callers that bypass package APIs. SQLite triggers
+-- reject every attempted change to immutable publication identity.
+CREATE TRIGGER IF NOT EXISTS self_publications_identity_immutable
+BEFORE UPDATE OF branch_ref, branch_generation, source_head,
+                 target_commit_oid, target_tree_oid, membership_digest,
+                 member_count
+ON self_publications
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS self_publication_members_immutable_update
+BEFORE UPDATE ON self_publication_members
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS self_publication_members_immutable_delete
+BEFORE DELETE ON self_publication_members
+WHEN EXISTS (
+    SELECT 1 FROM self_publications publication
+    WHERE publication.id = OLD.publication_id
+      AND publication.phase <> 'prepared'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication membership is immutable');
+END;
 
 -- v12: one durable record for an all-or-none unpublished-chain transition.
 -- capture event provenance remains on capture_events; this table records the

@@ -69,9 +69,10 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // additive planner/decision metadata. v15 adds the durable Intent v2
 // candidate, dependency, boundary, and repair ledgers. v16 adds durable setup
 // validation attempts without backfilling already-applied revisions. v17 adds
-// the candidate-lineage ledger without rewriting existing candidates. New
-// tables are pure DDL; columns on existing tables are added explicitly for
-// upgraded databases.
+// the candidate-lineage ledger without rewriting existing candidates. v18
+// adds the immutable self-publication journal without backfilling historical
+// publishes. New tables are pure DDL; columns on existing tables are added
+// explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -81,7 +82,7 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // migrations (such as v2→v3). v6 uses an explicit table rebuild for only
 // pre-v6 databases whose decision_records table still has the old event_seq
 // foreign key. v7, v8, v11, v12, and v13 are pure DDL migrations through schemaDDL.
-// v15, v16, and v17 are additive and deliberately have no data backfill:
+// v15, v16, v17, and v18 are additive and deliberately have no data backfill:
 // existing intent repositories are cut over by runtime configuration
 // orchestration, not by mutating their capture ledger during schema bootstrap.
 // Migrate is wired now so future phases requiring separate data backfill have
