@@ -29,8 +29,9 @@ package state
 // metadata on planner windows and decisions; v15 adds the durable Intent v2
 // candidate, dependency, boundary, verification, and repair ledgers; v16 adds
 // durable background setup-validation attempts without backfilling existing
-// applied revisions.
-const SchemaVersion = 16
+// applied revisions; v17 adds durable candidate lineage for dependency-driven
+// canonical merges.
+const SchemaVersion = 17
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -443,6 +444,9 @@ CREATE INDEX IF NOT EXISTS idx_intent_candidates_status_updated
 CREATE INDEX IF NOT EXISTS idx_intent_candidates_updated
     ON intent_candidates(updated_ts DESC, id);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_candidates_id_pair
+    ON intent_candidates(id, branch_ref, branch_generation);
+
 CREATE TABLE IF NOT EXISTS intent_candidate_events(
     candidate_id       TEXT NOT NULL,
     ord                INTEGER NOT NULL CHECK (ord >= 0),
@@ -464,6 +468,38 @@ CREATE INDEX IF NOT EXISTS idx_intent_candidate_events_seq_candidate
 CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_candidate_events_active_seq
     ON intent_candidate_events(event_seq)
     WHERE membership_state = 'active';
+
+-- v17 durable candidate lineage. This ledger contains only candidate
+-- identities, bounded status/reason metadata, and an optional published
+-- commit OID. Raw source or diff content remains in the capture ledger.
+CREATE TABLE IF NOT EXISTS intent_candidate_lineage(
+    branch_ref                  TEXT NOT NULL,
+    branch_generation          INTEGER NOT NULL,
+    target_candidate_id        TEXT NOT NULL,
+    source_candidate_id        TEXT NOT NULL,
+    source_status              TEXT NOT NULL CHECK (source_status IN
+                                ('open','waiting','ready','soft_published',
+                                 'published','superseded','blocked','failed')),
+    source_published_commit_oid TEXT,
+    reason                      TEXT NOT NULL,
+    created_ts                  REAL NOT NULL,
+    PRIMARY KEY (branch_ref, branch_generation, source_candidate_id),
+    CHECK (target_candidate_id <> source_candidate_id),
+    CHECK (length(target_candidate_id) BETWEEN 1 AND 128),
+    CHECK (length(source_candidate_id) BETWEEN 1 AND 128),
+    CHECK (length(reason) BETWEEN 1 AND 512),
+    CHECK (source_published_commit_oid IS NULL OR
+           length(source_published_commit_oid) BETWEEN 1 AND 128),
+    FOREIGN KEY (target_candidate_id, branch_ref, branch_generation)
+        REFERENCES intent_candidates(id, branch_ref, branch_generation),
+    FOREIGN KEY (source_candidate_id, branch_ref, branch_generation)
+        REFERENCES intent_candidates(id, branch_ref, branch_generation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_candidate_lineage_target_created
+    ON intent_candidate_lineage(
+        branch_ref, branch_generation, target_candidate_id,
+        created_ts, source_candidate_id);
 
 CREATE TABLE IF NOT EXISTS intent_capture_dependencies(
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -81,6 +81,7 @@ type diagnoseReport struct {
 	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
 	RuntimeConfig              runtimeConfigReport             `json:"runtime_config"`
 	Configuration              configReadinessReport           `json:"configuration"`
+	Replay                     replayObservabilityReport       `json:"replay"`
 	IntentV2                   intentV2Report                  `json:"intent_v2"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
@@ -211,6 +212,11 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.IntentV2 = intentV2
+	}
+	if replay, err := loadReplayObservabilityReport(ctx, conn); err != nil {
+		return report, err
+	} else {
+		report.Replay = replay
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
@@ -635,6 +641,18 @@ func classifyDiagnoseError(seq int64, message string, last replayConflictMeta) s
 
 func diagnoseRemediation(report diagnoseReport) []string {
 	var remediation []string
+	if report.Replay.State == "needs_attention" {
+		location := ""
+		if report.Replay.BlockedSeq > 0 {
+			location = fmt.Sprintf(" at seq %d", report.Replay.BlockedSeq)
+		}
+		remediation = append(remediation,
+			fmt.Sprintf("Replay failed %d consecutive time(s)%s; capture remains durable. Inspect the bounded error and candidate IDs above before retrying.",
+				report.Replay.ErrorRepeatCount, location))
+	} else if report.Replay.State == "degraded" {
+		remediation = append(remediation,
+			"Replay encountered one retryable error; capture remains durable and the daemon will retry automatically.")
+	}
 	if report.IntentV2.NeedsAttention != "" {
 		remediation = append(remediation,
 			"Intent v2 replay is stopped while durable capture continues: "+
@@ -807,6 +825,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	renderIntentStrategyHuman(out, r.IntentStrategy)
 	renderRuntimeConfigHuman(out, r.RuntimeConfig)
 	renderConfigReadinessHuman(out, r.Configuration)
+	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
 
 	if r.OperationInProgress != "" {

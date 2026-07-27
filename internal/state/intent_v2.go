@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -15,13 +16,15 @@ import (
 )
 
 const (
-	IntentCandidateMaxCaptures       = 256
-	IntentCandidateMaxOpenPerPair    = 128
-	IntentDependencyMaxPerPair       = 4096
-	IntentCandidatePurposeMaxChars   = 512
-	IntentCandidateSummaryMaxChars   = 2048
-	IntentVerificationOutputMaxBytes = 64 * 1024
-	IntentRepairMaxCommits           = 5
+	IntentCandidateMaxCaptures           = 256
+	IntentCandidateMaxOpenPerPair        = 128
+	IntentDependencyMaxPerPair           = 4096
+	IntentCandidatePurposeMaxChars       = 512
+	IntentCandidateSummaryMaxChars       = 2048
+	IntentCandidateLineageReasonMaxChars = 512
+	IntentCandidateLineageMaxPerPair     = 4096
+	IntentVerificationOutputMaxBytes     = 64 * 1024
+	IntentRepairMaxCommits               = 5
 
 	IntentCandidateOpen          = "open"
 	IntentCandidateWaiting       = "waiting"
@@ -90,6 +93,34 @@ type IntentCandidateEvent struct {
 	EventSeq        int64
 	EventRole       string
 	MembershipState string
+}
+
+// IntentCandidateLineage records one direct canonical merge without source
+// content. SourceStatus and SourcePublishedCommitOID preserve repair-relevant
+// provenance from immediately before the source was superseded. A canonical
+// target may later become another merge's source, so consumers that need full
+// ancestry must traverse these direct edges transitively.
+type IntentCandidateLineage struct {
+	BranchRef                string
+	BranchGeneration         int64
+	TargetCandidateID        string
+	SourceCandidateID        string
+	SourceStatus             string
+	SourcePublishedCommitOID sql.NullString
+	Reason                   string
+	CreatedTS                float64
+}
+
+type IntentCandidateMergeRequest struct {
+	Target             IntentCandidate
+	SourceCandidateIDs []string
+	Reason             string
+	MergedTS           float64
+}
+
+type IntentCandidateMergeResult struct {
+	Candidate IntentCandidate
+	Lineage   []IntentCandidateLineage
 }
 
 // IntentCaptureDependency is one hard ordering edge or soft semantic edge.
@@ -164,12 +195,14 @@ type IntentRepairTransition struct {
 // status paths. Available is false for pre-v15 databases and no migration is
 // attempted.
 type IntentV2ReadOnlyProjection struct {
-	Available             bool
-	SchemaVersion         int
-	OpenCandidates        int
-	VerificationAttention int
-	RecoverableRepairs    int
-	LastBoundaryEpoch     int64
+	Available                 bool
+	SchemaVersion             int
+	CandidateLineageAvailable bool
+	CandidateLineageRecords   int
+	OpenCandidates            int
+	VerificationAttention     int
+	RecoverableRepairs        int
+	LastBoundaryEpoch         int64
 }
 
 // SaveIntentCandidate inserts or revises one candidate and its active
@@ -238,6 +271,60 @@ SELECT EXISTS(
 	if now <= 0 {
 		now = nowSeconds()
 	}
+	if err := upsertIntentCandidateRow(ctx, tx, candidate, now); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events
+SET membership_state='superseded'
+WHERE candidate_id=? AND membership_state='active'`, candidate.ID); err != nil {
+		return fmt.Errorf("state: supersede prior candidate membership: %w", err)
+	}
+	for ord, event := range candidate.Events {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events
+SET membership_state='superseded'
+WHERE event_seq=? AND candidate_id<>? AND membership_state='active'`,
+			event.EventSeq, candidate.ID); err != nil {
+			return fmt.Errorf("state: supersede reassigned event %d: %w", event.EventSeq, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_candidate_events(
+    candidate_id, ord, event_seq, event_role, membership_state
+) VALUES (?, ?, ?, ?, 'active')
+ON CONFLICT(candidate_id, event_seq) DO UPDATE SET
+    ord=excluded.ord,
+    event_role=excluded.event_role,
+    membership_state='active'`,
+			candidate.ID, ord, event.EventSeq, event.EventRole); err != nil {
+			return fmt.Errorf("state: save candidate event %d: %w", event.EventSeq, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded', readiness='wait', updated_ts=?
+WHERE branch_ref=? AND branch_generation=? AND id<>?
+  AND status IN ('open','waiting','ready','soft_published','blocked')
+  AND NOT EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`, now, candidate.BranchRef, candidate.BranchGeneration, candidate.ID); err != nil {
+		return fmt.Errorf("state: retire empty reassigned candidates: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("state: commit intent candidate save: %w", err)
+	}
+	return nil
+}
+
+func upsertIntentCandidateRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidate IntentCandidate,
+	now float64,
+) error {
 	created := candidate.CreatedTS
 	if created <= 0 {
 		created = now
@@ -294,21 +381,279 @@ WHERE intent_candidates.branch_ref=excluded.branch_ref
 		}
 		return fmt.Errorf("state: candidate %s exact branch pair changed", candidate.ID)
 	}
+	return nil
+}
 
-	if _, err := tx.ExecContext(ctx, `
-UPDATE intent_candidate_events
-SET membership_state='superseded'
-WHERE candidate_id=? AND membership_state='active'`, candidate.ID); err != nil {
-		return fmt.Errorf("state: supersede prior candidate membership: %w", err)
+// MergeIntentCandidates canonically combines persisted nonterminal candidates
+// in one transaction. Every active source membership is retained on Target,
+// emptied sources become superseded, and repair-relevant lineage is recorded
+// without storing raw capture content.
+func MergeIntentCandidates(
+	ctx context.Context,
+	d *DB,
+	req IntentCandidateMergeRequest,
+) (IntentCandidateMergeResult, error) {
+	if d == nil {
+		return IntentCandidateMergeResult{},
+			errors.New("state: MergeIntentCandidates: nil db")
 	}
-	for ord, event := range candidate.Events {
+	if req.Target.Readiness == "" {
+		req.Target.Readiness = IntentReadinessWait
+	}
+	if err := validateIntentCandidate(req.Target); err != nil {
+		return IntentCandidateMergeResult{}, err
+	}
+	if isTerminalIntentCandidateStatus(req.Target.Status) {
+		return IntentCandidateMergeResult{},
+			errors.New("state: merged target must remain nonterminal")
+	}
+	if len(req.SourceCandidateIDs) == 0 ||
+		len(req.SourceCandidateIDs) >= IntentCandidateMaxOpenPerPair {
+		return IntentCandidateMergeResult{}, fmt.Errorf(
+			"state: candidate merge requires 1..%d sources",
+			IntentCandidateMaxOpenPerPair-1)
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		return IntentCandidateMergeResult{},
+			errors.New("state: candidate lineage reason is required")
+	}
+	if err := boundedIntentSummary("candidate lineage reason", req.Reason,
+		IntentCandidateLineageReasonMaxChars); err != nil {
+		return IntentCandidateMergeResult{}, err
+	}
+	sourceIDs := append([]string(nil), req.SourceCandidateIDs...)
+	sort.Strings(sourceIDs)
+	unique := sourceIDs[:0]
+	for _, sourceID := range sourceIDs {
+		if err := boundedIntentLabel("source candidate id", sourceID, 128, true); err != nil {
+			return IntentCandidateMergeResult{}, err
+		}
+		if sourceID == req.Target.ID {
+			return IntentCandidateMergeResult{},
+				errors.New("state: merge target cannot also be a source")
+		}
+		if len(unique) == 0 || unique[len(unique)-1] != sourceID {
+			unique = append(unique, sourceID)
+		}
+	}
+	sourceIDs = unique
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return IntentCandidateMergeResult{},
+			fmt.Errorf("state: begin intent candidate merge: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var targetStatus string
+	var targetCreated float64
+	if err := tx.QueryRowContext(ctx, `
+SELECT status, created_ts FROM intent_candidates
+WHERE id=? AND branch_ref=? AND branch_generation=?`,
+		req.Target.ID, req.Target.BranchRef, req.Target.BranchGeneration,
+	).Scan(&targetStatus, &targetCreated); errors.Is(err, sql.ErrNoRows) {
+		return IntentCandidateMergeResult{},
+			errors.New("state: merge target does not exist on exact branch pair")
+	} else if err != nil {
+		return IntentCandidateMergeResult{},
+			fmt.Errorf("state: load merge target: %w", err)
+	}
+	if isTerminalIntentCandidateStatus(targetStatus) {
+		return IntentCandidateMergeResult{},
+			fmt.Errorf("state: merge target %s is terminal in status %s",
+				req.Target.ID, targetStatus)
+	}
+	if req.Target.CreatedTS <= 0 {
+		req.Target.CreatedTS = targetCreated
+	}
+
+	type sourceState struct {
+		id        string
+		status    string
+		published sql.NullString
+		existing  *IntentCandidateLineage
+	}
+	sources := make([]sourceState, 0, len(sourceIDs))
+	newLineage := 0
+	for _, sourceID := range sourceIDs {
+		var source sourceState
+		source.id = sourceID
+		var branchRef string
+		var generation int64
+		if err := tx.QueryRowContext(ctx, `
+SELECT branch_ref, branch_generation, status, published_commit_oid
+FROM intent_candidates WHERE id=?`, sourceID).Scan(
+			&branchRef, &generation, &source.status, &source.published,
+		); errors.Is(err, sql.ErrNoRows) {
+			return IntentCandidateMergeResult{},
+				fmt.Errorf("state: merge source %s does not exist", sourceID)
+		} else if err != nil {
+			return IntentCandidateMergeResult{},
+				fmt.Errorf("state: load merge source %s: %w", sourceID, err)
+		}
+		if branchRef != req.Target.BranchRef ||
+			generation != req.Target.BranchGeneration {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: merge source %s does not belong to exact branch pair",
+				sourceID)
+		}
+		lineage, ok, err := intentCandidateLineageBySourceTx(
+			ctx, tx, branchRef, generation, sourceID)
+		if err != nil {
+			return IntentCandidateMergeResult{}, err
+		}
+		if ok {
+			if lineage.TargetCandidateID != req.Target.ID ||
+				lineage.Reason != req.Reason {
+				return IntentCandidateMergeResult{}, fmt.Errorf(
+					"state: source candidate %s already has different lineage",
+					sourceID)
+			}
+			source.existing = &lineage
+		} else {
+			if isTerminalIntentCandidateStatus(source.status) {
+				return IntentCandidateMergeResult{}, fmt.Errorf(
+					"state: merge source %s is terminal in status %s",
+					sourceID, source.status)
+			}
+			if source.published.Valid {
+				if err := boundedIntentLabel("source published commit oid",
+					source.published.String, 128, true); err != nil {
+					return IntentCandidateMergeResult{}, err
+				}
+			}
+			newLineage++
+		}
+		sources = append(sources, source)
+	}
+	var lineageCount int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_candidate_lineage
+WHERE branch_ref=? AND branch_generation=?`,
+		req.Target.BranchRef, req.Target.BranchGeneration,
+	).Scan(&lineageCount); err != nil {
+		return IntentCandidateMergeResult{},
+			fmt.Errorf("state: count candidate lineage: %w", err)
+	}
+	if lineageCount+newLineage > IntentCandidateLineageMaxPerPair {
+		return IntentCandidateMergeResult{}, fmt.Errorf(
+			"state: candidate lineage cap %d exceeded for exact branch pair",
+			IntentCandidateLineageMaxPerPair)
+	}
+
+	members := make(map[int64]IntentCandidateEvent)
+	loadMembers := func(candidateID string) ([]IntentCandidateEvent, error) {
+		events, err := loadIntentCandidateEvents(ctx, tx, candidateID, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			members[event.EventSeq] = event
+		}
+		return events, nil
+	}
+	if _, err := loadMembers(req.Target.ID); err != nil {
+		return IntentCandidateMergeResult{}, err
+	}
+	for _, source := range sources {
+		events, err := loadMembers(source.id)
+		if err != nil {
+			return IntentCandidateMergeResult{}, err
+		}
+		if source.existing == nil && len(events) == 0 {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: merge source %s has no active membership", source.id)
+		}
+	}
+	allowedOwners := make(map[string]struct{}, len(sources)+1)
+	allowedOwners[req.Target.ID] = struct{}{}
+	for _, source := range sources {
+		allowedOwners[source.id] = struct{}{}
+	}
+	for _, event := range req.Target.Events {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM capture_events
+    WHERE seq=? AND branch_ref=? AND branch_generation=?
+)`, event.EventSeq, req.Target.BranchRef,
+			req.Target.BranchGeneration).Scan(&exists); err != nil {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: validate merged candidate event %d: %w",
+				event.EventSeq, err)
+		}
+		if exists == 0 {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: merged candidate event %d does not belong to exact branch pair",
+				event.EventSeq)
+		}
+		var owner string
+		err := tx.QueryRowContext(ctx, `
+SELECT candidate_id FROM intent_candidate_events
+WHERE event_seq=? AND membership_state='active'`, event.EventSeq).Scan(&owner)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: load merged event %d owner: %w", event.EventSeq, err)
+		}
+		if err == nil {
+			if _, ok := allowedOwners[owner]; !ok {
+				return IntentCandidateMergeResult{}, fmt.Errorf(
+					"state: merged event %d belongs to unlisted candidate %s",
+					event.EventSeq, owner)
+			}
+		}
+		members[event.EventSeq] = event
+	}
+	if len(members) == 0 || len(members) > IntentCandidateMaxCaptures {
+		return IntentCandidateMergeResult{}, fmt.Errorf(
+			"state: merged candidate requires 1..%d captures",
+			IntentCandidateMaxCaptures)
+	}
+	seqs := make([]int64, 0, len(members))
+	for seq := range members {
+		seqs = append(seqs, seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	req.Target.Events = make([]IntentCandidateEvent, 0, len(seqs))
+	for ord, seq := range seqs {
+		event := members[seq]
+		event.CandidateID = req.Target.ID
+		event.Ord = ord
+		event.MembershipState = IntentMembershipActive
+		req.Target.Events = append(req.Target.Events, event)
+	}
+	if err := validateIntentCandidate(req.Target); err != nil {
+		return IntentCandidateMergeResult{}, err
+	}
+
+	lineage := make([]IntentCandidateLineage, 0, len(sources))
+	for _, source := range sources {
+		if source.existing != nil {
+			lineage = append(lineage, *source.existing)
+		}
+	}
+
+	mergedTS := req.MergedTS
+	if mergedTS <= 0 {
+		mergedTS = nowSeconds()
+	}
+	req.Target.UpdatedTS = mergedTS
+	if err := upsertIntentCandidateRow(
+		ctx, tx, req.Target, mergedTS); err != nil {
+		return IntentCandidateMergeResult{}, err
+	}
+	candidateIDs := append([]string{req.Target.ID}, sourceIDs...)
+	for _, candidateID := range candidateIDs {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE intent_candidate_events
 SET membership_state='superseded'
-WHERE event_seq=? AND candidate_id<>? AND membership_state='active'`,
-			event.EventSeq, candidate.ID); err != nil {
-			return fmt.Errorf("state: supersede reassigned event %d: %w", event.EventSeq, err)
+WHERE candidate_id=? AND membership_state='active'`, candidateID); err != nil {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: supersede merged membership for %s: %w",
+				candidateID, err)
 		}
+	}
+	for ord, event := range req.Target.Events {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO intent_candidate_events(
     candidate_id, ord, event_seq, event_role, membership_state
@@ -317,26 +662,182 @@ ON CONFLICT(candidate_id, event_seq) DO UPDATE SET
     ord=excluded.ord,
     event_role=excluded.event_role,
     membership_state='active'`,
-			candidate.ID, ord, event.EventSeq, event.EventRole); err != nil {
-			return fmt.Errorf("state: save candidate event %d: %w", event.EventSeq, err)
+			req.Target.ID, ord, event.EventSeq, event.EventRole); err != nil {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: save merged candidate event %d: %w",
+				event.EventSeq, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `
+	for _, source := range sources {
+		if source.existing != nil {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
 UPDATE intent_candidates
 SET status='superseded', readiness='wait', updated_ts=?
-WHERE branch_ref=? AND branch_generation=? AND id<>?
-  AND status IN ('open','waiting','ready','soft_published','blocked')
-  AND NOT EXISTS (
-      SELECT 1 FROM intent_candidate_events active_membership
-      WHERE active_membership.candidate_id=intent_candidates.id
-        AND active_membership.membership_state='active'
-  )`, now, candidate.BranchRef, candidate.BranchGeneration, candidate.ID); err != nil {
-		return fmt.Errorf("state: retire empty reassigned candidates: %w", err)
+WHERE id=? AND branch_ref=? AND branch_generation=?
+  AND status IN ('open','waiting','ready','soft_published','blocked')`,
+			mergedTS, source.id, req.Target.BranchRef,
+			req.Target.BranchGeneration); err != nil {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: supersede merged source %s: %w", source.id, err)
+		}
+		record := IntentCandidateLineage{
+			BranchRef:                req.Target.BranchRef,
+			BranchGeneration:         req.Target.BranchGeneration,
+			TargetCandidateID:        req.Target.ID,
+			SourceCandidateID:        source.id,
+			SourceStatus:             source.status,
+			SourcePublishedCommitOID: source.published,
+			Reason:                   req.Reason,
+			CreatedTS:                mergedTS,
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_candidate_lineage(
+    branch_ref, branch_generation, target_candidate_id, source_candidate_id,
+    source_status, source_published_commit_oid, reason, created_ts
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			record.BranchRef, record.BranchGeneration,
+			record.TargetCandidateID, record.SourceCandidateID,
+			record.SourceStatus, record.SourcePublishedCommitOID,
+			record.Reason, record.CreatedTS); err != nil {
+			return IntentCandidateMergeResult{}, fmt.Errorf(
+				"state: record candidate lineage for %s: %w",
+				source.id, err)
+		}
+		lineage = append(lineage, record)
 	}
+	sort.Slice(lineage, func(i, j int) bool {
+		return lineage[i].SourceCandidateID <
+			lineage[j].SourceCandidateID
+	})
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("state: commit intent candidate save: %w", err)
+		return IntentCandidateMergeResult{},
+			fmt.Errorf("state: commit intent candidate merge: %w", err)
 	}
-	return nil
+	req.Target.VerificationOutput =
+		sanitizedOutputTail(req.Target.VerificationOutput)
+	return IntentCandidateMergeResult{
+		Candidate: req.Target,
+		Lineage:   lineage,
+	}, nil
+}
+
+type intentCandidateLineageScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanIntentCandidateLineage(
+	row intentCandidateLineageScanner,
+) (IntentCandidateLineage, error) {
+	var lineage IntentCandidateLineage
+	if err := row.Scan(
+		&lineage.BranchRef, &lineage.BranchGeneration,
+		&lineage.TargetCandidateID, &lineage.SourceCandidateID,
+		&lineage.SourceStatus, &lineage.SourcePublishedCommitOID,
+		&lineage.Reason, &lineage.CreatedTS,
+	); err != nil {
+		return IntentCandidateLineage{},
+			fmt.Errorf("state: scan intent candidate lineage: %w", err)
+	}
+	return lineage, nil
+}
+
+func intentCandidateLineageBySourceTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	branchRef string,
+	generation int64,
+	sourceCandidateID string,
+) (IntentCandidateLineage, bool, error) {
+	lineage, err := scanIntentCandidateLineage(tx.QueryRowContext(ctx, `
+SELECT branch_ref, branch_generation, target_candidate_id,
+       source_candidate_id, source_status, source_published_commit_oid,
+       reason, created_ts
+FROM intent_candidate_lineage
+WHERE branch_ref=? AND branch_generation=? AND source_candidate_id=?`,
+		branchRef, generation, sourceCandidateID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentCandidateLineage{}, false, nil
+	}
+	if err != nil {
+		return IntentCandidateLineage{}, false, err
+	}
+	return lineage, true, nil
+}
+
+// IntentCandidateLineageBySource returns one direct canonical lineage edge.
+func IntentCandidateLineageBySource(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	generation int64,
+	sourceCandidateID string,
+) (IntentCandidateLineage, bool, error) {
+	if d == nil || branchRef == "" || generation < 0 ||
+		strings.TrimSpace(sourceCandidateID) == "" {
+		return IntentCandidateLineage{}, false,
+			errors.New("state: IntentCandidateLineageBySource: invalid input")
+	}
+	lineage, err := scanIntentCandidateLineage(
+		d.readSQL().QueryRowContext(ctx, `
+SELECT branch_ref, branch_generation, target_candidate_id,
+       source_candidate_id, source_status, source_published_commit_oid,
+       reason, created_ts
+FROM intent_candidate_lineage
+WHERE branch_ref=? AND branch_generation=? AND source_candidate_id=?`,
+			branchRef, generation, sourceCandidateID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentCandidateLineage{}, false, nil
+	}
+	if err != nil {
+		return IntentCandidateLineage{}, false, err
+	}
+	return lineage, true, nil
+}
+
+// IntentCandidateLineageForTarget returns bounded direct source edges in
+// deterministic creation/source order.
+func IntentCandidateLineageForTarget(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	generation int64,
+	targetCandidateID string,
+	limit int,
+) ([]IntentCandidateLineage, error) {
+	if d == nil || branchRef == "" || generation < 0 ||
+		strings.TrimSpace(targetCandidateID) == "" {
+		return nil,
+			errors.New("state: IntentCandidateLineageForTarget: invalid input")
+	}
+	if limit <= 0 || limit > IntentCandidateLineageMaxPerPair {
+		limit = IntentCandidateLineageMaxPerPair
+	}
+	rows, err := d.readSQL().QueryContext(ctx, `
+SELECT branch_ref, branch_generation, target_candidate_id,
+       source_candidate_id, source_status, source_published_commit_oid,
+       reason, created_ts
+FROM intent_candidate_lineage
+WHERE branch_ref=? AND branch_generation=? AND target_candidate_id=?
+ORDER BY created_ts, source_candidate_id
+LIMIT ?`, branchRef, generation, targetCandidateID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: query intent candidate lineage: %w", err)
+	}
+	defer rows.Close()
+	var out []IntentCandidateLineage
+	for rows.Next() {
+		lineage, err := scanIntentCandidateLineage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lineage)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate intent candidate lineage: %w", err)
+	}
+	return out, nil
 }
 
 // IntentCandidateByID returns a candidate and active memberships in order.
@@ -1008,8 +1509,9 @@ WHERE repair_id=? ORDER BY ord`, repairID)
 	return out, nil
 }
 
-// LoadIntentV2StateReadOnly projects v15 state without running Open or any
-// migration. Pre-v15 and missing databases return Available=false.
+// LoadIntentV2StateReadOnly projects v15+ state without running Open or any
+// migration. Pre-v15 and missing databases return Available=false. v15/v16
+// projections remain available but report candidate lineage as unavailable.
 func LoadIntentV2StateReadOnly(ctx context.Context, dbPath string) (IntentV2ReadOnlyProjection, error) {
 	var projection IntentV2ReadOnlyProjection
 	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
@@ -1049,6 +1551,25 @@ WHERE type='table' AND name IN (
 		return projection, nil
 	}
 	projection.Available = true
+	if projection.SchemaVersion >= 17 {
+		var lineageTables int
+		if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master
+WHERE type='table' AND name='intent_candidate_lineage'`,
+		).Scan(&lineageTables); err != nil {
+			return IntentV2ReadOnlyProjection{},
+				fmt.Errorf("state: inspect intent candidate lineage: %w", err)
+		}
+		if lineageTables == 1 {
+			projection.CandidateLineageAvailable = true
+			if err := conn.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM intent_candidate_lineage`,
+			).Scan(&projection.CandidateLineageRecords); err != nil {
+				return IntentV2ReadOnlyProjection{},
+					fmt.Errorf("state: project intent candidate lineage: %w", err)
+			}
+		}
+	}
 	if err := conn.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM intent_candidates
 WHERE status IN ('open','waiting','ready','soft_published','blocked')

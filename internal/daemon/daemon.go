@@ -1120,6 +1120,7 @@ func Run(ctx context.Context, opts Options) error {
 		lastRollup        = time.Time{}
 		lastRollupUTCDay  = ""
 		stopped           bool
+		replayErrorLogs   replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker
@@ -2120,10 +2121,12 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		var (
-			repSum ReplaySummary
-			repErr error
+			repSum        ReplaySummary
+			repErr        error
+			replayChecked bool
 		)
 		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
+			replayChecked = true
 			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
 			// pending queue cannot starve flush_request claims, heartbeat
 			// refresh, or shutdown observation. ReplaySummary.HasMore is
@@ -2160,39 +2163,44 @@ func Run(ctx context.Context, opts Options) error {
 				})
 			} else {
 				var candidateVerify IntentCandidateVerifier
+				var repairCommitVerify git.IntentRepairCommitVerifier
 				if passBundle.IntentVerificationReady {
 					candidateVerify = runtimeIntentCandidateVerifier(
 						opts.RepoPath, opts.GitDir, cctx.BaseHead,
 						passBundle.RevisionID,
 						passBundle.IntentVerificationCommand)
+					repairCommitVerify = runtimeIntentRepairCommitVerifier(
+						opts.RepoPath, passBundle.RevisionID,
+						passBundle.IntentVerificationCommand)
 				}
 				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-					MessageFn:              passBundle.MessageFn,
-					GitDir:                 opts.GitDir,
-					Trace:                  tracer,
-					PromptTrace:            promptTracer,
-					Limit:                  DefaultReplayLimit,
-					CommitStrategy:         passBundle.CommitStrategy,
-					IntentWindow:           passBundle.IntentWindow,
-					IntentMinPending:       passBundle.IntentMinPending,
-					IntentSettleWindow:     passBundle.IntentSettleWindow,
-					IntentMaxPendingAge:    passBundle.IntentMaxPendingAge,
-					IntentRecentCommits:    passBundle.IntentRecentCommits,
-					IntentDeferLimit:       passBundle.IntentDeferLimit,
-					IntentRetryLimit:       &passBundle.IntentRetryLimit,
-					IntentPathCoalescing:   &passBundle.IntentPathCoalescing,
-					IntentBypassBatchWait:  flushedLogical > 0,
-					IntentPlanner:          passBundle.IntentPlanner,
-					IntentHealth:           passBundle.IntentHealth,
-					IntentPlannerProvider:  passBundle.HealthIdentity.Provider,
-					IntentPlannerModel:     passBundle.Model,
-					IntentIncludeDiffs:     passBundle.IntentIncludeDiffs,
-					IntentPreset:           passBundle.IntentPreset,
-					IntentVerificationMode: passBundle.IntentVerificationMode,
-					IntentCandidateVerify:  candidateVerify,
-					IntentRepairEnabled:    passBundle.IntentRepairEnabled,
-					IntentRepairHorizon:    passBundle.IntentRepairHorizon,
-					IntentRepairMaxCommits: passBundle.IntentRepairMaxCommits,
+					MessageFn:                passBundle.MessageFn,
+					GitDir:                   opts.GitDir,
+					Trace:                    tracer,
+					PromptTrace:              promptTracer,
+					Limit:                    DefaultReplayLimit,
+					CommitStrategy:           passBundle.CommitStrategy,
+					IntentWindow:             passBundle.IntentWindow,
+					IntentMinPending:         passBundle.IntentMinPending,
+					IntentSettleWindow:       passBundle.IntentSettleWindow,
+					IntentMaxPendingAge:      passBundle.IntentMaxPendingAge,
+					IntentRecentCommits:      passBundle.IntentRecentCommits,
+					IntentDeferLimit:         passBundle.IntentDeferLimit,
+					IntentRetryLimit:         &passBundle.IntentRetryLimit,
+					IntentPathCoalescing:     &passBundle.IntentPathCoalescing,
+					IntentBypassBatchWait:    flushedLogical > 0,
+					IntentPlanner:            passBundle.IntentPlanner,
+					IntentHealth:             passBundle.IntentHealth,
+					IntentPlannerProvider:    passBundle.HealthIdentity.Provider,
+					IntentPlannerModel:       passBundle.Model,
+					IntentIncludeDiffs:       passBundle.IntentIncludeDiffs,
+					IntentPreset:             passBundle.IntentPreset,
+					IntentVerificationMode:   passBundle.IntentVerificationMode,
+					IntentCandidateVerify:    candidateVerify,
+					IntentRepairCommitVerify: repairCommitVerify,
+					IntentRepairEnabled:      passBundle.IntentRepairEnabled,
+					IntentRepairHorizon:      passBundle.IntentRepairHorizon,
+					IntentRepairMaxCommits:   passBundle.IntentRepairMaxCommits,
 				})
 				_ = updateIntentV2EvaluationMeta(
 					ctx, opts.DB, passBundle, repSum, repErr)
@@ -2222,11 +2230,33 @@ func Run(ctx context.Context, opts Options) error {
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", capErr.Error())
 		} else if repErr != nil {
 			consecutiveErrors++
-			logger.Warn("replay error", "n", consecutiveErrors, "err", repErr.Error())
-			_ = state.MetaSet(ctx, opts.DB, "last_replay_error", repErr.Error())
+			clean, repeats, metaErr := recordReplayErrorObservability(
+				ctx, opts.DB, repErr, now())
+			if metaErr != nil {
+				logger.Warn("persist replay error observability",
+					"err", metaErr.Error())
+			}
+			if emit, suppressed := replayErrorLogs.observe(clean, now()); emit {
+				logger.Warn("replay error", "n", repeats, "err", clean,
+					"suppressed", suppressed)
+			}
 		} else {
 			consecutiveErrors = 0
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
+			if replayChecked {
+				previous, repeats, metaErr := clearReplayErrorObservability(
+					ctx, opts.DB)
+				if metaErr != nil {
+					logger.Warn("clear replay error observability",
+						"err", metaErr.Error())
+				} else if previous != "" {
+					_, suppressed := replayErrorLogs.recover()
+					logger.Info("replay recovered", "previous_err", previous,
+						"repeats", repeats, "suppressed", suppressed)
+				} else {
+					replayErrorLogs.recover()
+				}
+			}
 		}
 
 		// A recovered active chain invalidates shadow and needs another pass to

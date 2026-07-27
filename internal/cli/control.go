@@ -365,6 +365,11 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "Configuration validation needs attention; capture remains active."
 		res.NextAction = "Run `acd configure` to retry validation or select another experience."
+	case status.Replay.State == "needs_attention":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "Replay is repeatedly failing; capture remains active."
+		res.NextAction = "Run `acd diagnose` to inspect the blocked sequence and candidate context."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -396,6 +401,10 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running, but persisted intent planner health metadata could not be read safely."
 		res.NextAction = "Run `acd diagnose` for the safe metadata warning."
+	case status.Replay.State == "degraded":
+		res.Health = controlHealthDegraded
+		res.Summary = "Replay encountered an error and remains retryable."
+		res.NextAction = "Run `acd diagnose` if the error repeats."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."

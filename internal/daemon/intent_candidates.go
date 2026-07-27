@@ -111,6 +111,21 @@ type IntentCandidateEvaluationResult struct {
 	Boundaries      []state.IntentActivityBoundary
 	Dependencies    []state.IntentCaptureDependency
 	Decisions       []IntentCandidateDecision
+	// VisibleCandidateIDs records durable nonterminal candidates included in
+	// this exact dependency/planner evaluation, including candidates whose
+	// already-published captures needed no new assignment.
+	VisibleCandidateIDs []string
+}
+
+const (
+	intentBalancedFallbackCaptureCap = 32
+	intentBalancedFallbackPathCap    = 12
+)
+
+type intentCandidateContinuation struct {
+	TargetID   string
+	SourceIDs  []string
+	HoldReason string
 }
 
 // EvaluateIntentCandidates builds and persists the dependency graph, evaluates
@@ -180,6 +195,10 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	for _, candidate := range existing {
+		result.VisibleCandidateIDs = append(
+			result.VisibleCandidateIDs, candidate.ID)
+	}
 	allCaptures, err := loadCandidateCaptureContext(ctx, db, input, existing)
 	if err != nil {
 		return result, err
@@ -217,7 +236,7 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
-	plan, fallback, plannerFailure, retryCount, needsAttention, err :=
+	plan, fallback, plannerFailure, retryCount, needsAttention, continuations, err :=
 		chooseIntentCandidatePlan(ctx, req, input.Planner, input.Health,
 			input.RetryLimit, input.Preset, existing)
 	if err != nil {
@@ -233,9 +252,6 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
-	if err := ai.ValidateIntentPlanV2(req, plan); err != nil {
-		return result, err
-	}
 
 	existingByID := make(map[string]state.IntentCandidate, len(existing))
 	for _, candidate := range existing {
@@ -245,14 +261,63 @@ func EvaluateIntentCandidates(
 	for _, capture := range allCaptures {
 		captureBySeq[capture.Event.Seq] = capture
 	}
+	if applyIntentCandidateContinuationLimits(
+		&plan, continuations, existingByID, captureBySeq) {
+		result.NeedsAttention = true
+	}
+	existingByID, err = mergeIntentCandidateContinuationViews(
+		existingByID, continuations)
+	if err != nil {
+		return result, err
+	}
+	if input.Preset == config.PresetBalanced && fallback != "" {
+		if applyBalancedFallbackBounds(&plan, existingByID, captureBySeq) {
+			result.NeedsAttention = true
+		}
+	}
+	validationRequest := intentCandidateContinuationValidationRequest(
+		req, continuations)
+	if err := ai.ValidateIntentPlanV2(validationRequest, plan); err != nil {
+		return result, err
+	}
+	continuationByTarget := make(map[string]intentCandidateContinuation,
+		len(continuations))
+	for _, continuation := range continuations {
+		continuationByTarget[continuation.TargetID] = continuation
+	}
+	evaluationDependencies := appendIntentCandidateMembershipDependencies(
+		dependencies, existing)
 
 	for _, assignment := range plan.Candidates {
+		if continuation, ok := continuationByTarget[assignment.CandidateID]; ok && continuation.HoldReason != "" {
+			decision, holdErr := heldIntentCandidateContinuationDecision(
+				assignment, continuation, existingByID)
+			if holdErr != nil {
+				return result, holdErr
+			}
+			result.Decisions = append(result.Decisions, decision)
+			result.NeedsAttention = true
+			continue
+		}
 		decision, err := evaluateIntentCandidateAssignment(ctx, input, plan,
-			assignment, dependencies, existingByID, captureBySeq)
+			assignment, evaluationDependencies, existingByID, captureBySeq)
 		if err != nil {
 			return result, err
 		}
-		if err := state.SaveIntentCandidate(ctx, db, decision.Candidate); err != nil {
+		if continuation, ok := continuationByTarget[assignment.CandidateID]; ok && len(continuation.SourceIDs) > 0 {
+			merged, mergeErr := state.MergeIntentCandidates(ctx, db,
+				state.IntentCandidateMergeRequest{
+					Target:             decision.Candidate,
+					SourceCandidateIDs: continuation.SourceIDs,
+					Reason:             "hard_dependency_continuation",
+					MergedTS:           nowSeconds,
+				})
+			if mergeErr != nil {
+				return result, mergeErr
+			}
+			decision.Candidate = merged.Candidate
+		} else if err := state.SaveIntentCandidate(
+			ctx, db, decision.Candidate); err != nil {
 			return result, err
 		}
 		result.Decisions = append(result.Decisions, decision)
@@ -543,9 +608,20 @@ func chooseIntentCandidatePlan(
 	retryLimit int,
 	preset config.PresetName,
 	existing []state.IntentCandidate,
-) (ai.IntentPlanV2, string, string, int, bool, error) {
+) (ai.IntentPlanV2, string, string, int, bool, []intentCandidateContinuation, error) {
 	plannerFailure := ""
 	retryCount := 0
+	plannerRequest := req
+	if planner != nil {
+		probe := holdIntentCandidatePlan(req)
+		continuations, err := continuePersistedIntentCandidates(
+			req, &probe, false)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, err
+		}
+		plannerRequest = intentCandidateContinuationValidationRequest(
+			req, continuations)
+	}
 	if planner != nil {
 		var permit IntentPlannerHealthPermit
 		if health != nil {
@@ -554,59 +630,87 @@ func chooseIntentCandidatePlan(
 			if acquireErr != nil {
 				var openErr *IntentPlannerCircuitOpenError
 				if !errors.As(acquireErr, &openErr) {
-					return ai.IntentPlanV2{}, "", "", retryCount, false, acquireErr
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, acquireErr
 				}
 				planner = nil
 			}
 		}
 		if planner != nil {
-			plan, err := ai.PlanIntentV2WithCompatibility(ctx, planner, req)
+			plan, err := ai.PlanIntentV2WithCompatibility(
+				ctx, planner, plannerRequest)
+			plannerCallFailed := err != nil
+			var continuations []intentCandidateContinuation
+			if err == nil {
+				continuations, err =
+					continuePersistedIntentCandidates(req, &plan, false)
+				if err == nil {
+					err = ai.ValidateIntentPlanV2(
+						intentCandidateContinuationValidationRequest(
+							req, continuations), plan)
+				}
+				plannerCallFailed = false
+			}
 			if err == nil {
 				if health != nil {
 					if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
-						return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
 					}
 				}
-				return plan, "", "", retryCount, false, nil
+				return plan, "", "", retryCount, false, continuations, nil
 			}
 			if ctx.Err() != nil {
 				if health != nil {
 					_ = health.Complete(ctx, permit, err)
 				}
-				return ai.IntentPlanV2{}, "", "", retryCount, false, ctx.Err()
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, ctx.Err()
 			}
-			plannerCallFailed := true
 			for attempt := 0; attempt < retryLimit; attempt++ {
 				var validation *ai.IntentPlanV2ValidationError
 				if !errors.As(err, &validation) ||
 					len(validation.Findings) == 0 {
 					break
 				}
-				retry := req
+				retry := plannerRequest
 				retry.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
 				retryCount++
 				retryCtx := prompttrace.WithRetryCount(ctx, retryCount)
-				if corrected, retryErr := ai.PlanIntentV2WithCompatibility(retryCtx, planner, retry); retryErr == nil {
+				corrected, retryErr := ai.PlanIntentV2WithCompatibility(
+					retryCtx, planner, retry)
+				retryCallFailed := retryErr != nil
+				var correctedContinuations []intentCandidateContinuation
+				if retryErr == nil {
+					correctedContinuations, retryErr =
+						continuePersistedIntentCandidates(
+							req, &corrected, false)
+					if retryErr == nil {
+						retryErr = ai.ValidateIntentPlanV2(
+							intentCandidateContinuationValidationRequest(
+								req, correctedContinuations), corrected)
+					}
+					retryCallFailed = false
+				}
+				if retryErr == nil {
 					if health != nil {
 						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
-							return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
 						}
 					}
-					return corrected, "", "", retryCount, false, nil
+					return corrected, "", "", retryCount, false,
+						correctedContinuations, nil
 				} else if ctx.Err() != nil {
 					if health != nil {
 						_ = health.Complete(ctx, permit, retryErr)
 					}
-					return ai.IntentPlanV2{}, "", "", retryCount, false, ctx.Err()
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, ctx.Err()
 				} else {
 					err = retryErr
-					plannerCallFailed = true
+					plannerCallFailed = retryCallFailed
 				}
 			}
 			if health != nil {
 				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
 				if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
-					return ai.IntentPlanV2{}, "", "", retryCount, false, healthErr
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
 				}
 			}
 			plannerFailure = ai.SanitizePlannerError(err.Error())
@@ -615,30 +719,45 @@ func chooseIntentCandidatePlan(
 	switch preset {
 	case config.PresetFast:
 		plan := deterministicIntentCandidatePlan(req, false, true)
-		if err := continuePersistedIntentCandidates(req, &plan); err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, err
+		continuations, err := continuePersistedIntentCandidates(
+			req, &plan, true)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
 		}
 		return plan, "hard_dependency_component", plannerFailure, retryCount, false,
-			ai.ValidateIntentPlanV2(req, plan)
+			continuations,
+			ai.ValidateIntentPlanV2(
+				intentCandidateContinuationValidationRequest(
+					req, continuations), plan)
 	case config.PresetBalanced:
 		if plan, ok := reuseIntentCandidatePartition(req, existing); ok {
-			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil
+			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil, nil
 		}
-		plan := deterministicIntentCandidatePlan(req, true, false)
-		if err := continuePersistedIntentCandidates(req, &plan); err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, err
+		plan, fallbackNeedsAttention := balancedIntentCandidatePlan(req)
+		continuations, err := continuePersistedIntentCandidates(
+			req, &plan, true)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
 		}
-		return plan, "verified_dependency_partition", plannerFailure, retryCount, false,
-			ai.ValidateIntentPlanV2(req, plan)
+		return plan, "verified_dependency_partition", plannerFailure, retryCount,
+			fallbackNeedsAttention, continuations,
+			ai.ValidateIntentPlanV2(
+				intentCandidateContinuationValidationRequest(
+					req, continuations), plan)
 	case config.PresetQuality:
 		plan := holdIntentCandidatePlan(req)
-		if err := continuePersistedIntentCandidates(req, &plan); err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, err
+		continuations, err := continuePersistedIntentCandidates(
+			req, &plan, true)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
 		}
 		return plan, "needs_attention", plannerFailure, retryCount, true,
-			ai.ValidateIntentPlanV2(req, plan)
+			continuations,
+			ai.ValidateIntentPlanV2(
+				intentCandidateContinuationValidationRequest(
+					req, continuations), plan)
 	default:
-		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil,
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
 }
@@ -896,6 +1015,128 @@ func deterministicIntentCandidatePlan(
 	return plan
 }
 
+// balancedIntentCandidatePlan keeps hard dependency components intact and only
+// joins them through one-to-one companion evidence. Weak similarity signals
+// cannot turn a planner outage into a broad semantic guess.
+func balancedIntentCandidatePlan(
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, bool) {
+	hardComponents := intentDependencyComponents(req, false)
+	componentBySeq := make(map[int64]int, len(req.OfferedCaptures))
+	for component, seqs := range hardComponents {
+		for _, seq := range seqs {
+			componentBySeq[seq] = component
+		}
+	}
+	parent := make([]int, len(hardComponents))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(component int) int {
+		if parent[component] != component {
+			parent[component] = find(parent[component])
+		}
+		return parent[component]
+	}
+	union := func(left, right int) {
+		leftRoot, rightRoot := find(left), find(right)
+		if leftRoot != rightRoot {
+			parent[rightRoot] = leftRoot
+		}
+	}
+
+	type companionPair struct{ left, right int }
+	var pairs []companionPair
+	neighbors := make([]map[int]struct{}, len(hardComponents))
+	for _, edge := range req.Dependencies {
+		if edge.Strength != ai.IntentDependencySoft ||
+			!balancedIntentCompanionDependency(edge.Kind) {
+			continue
+		}
+		left, leftOK := componentBySeq[edge.FromSeq]
+		right, rightOK := componentBySeq[edge.ToSeq]
+		if !leftOK || !rightOK || left == right {
+			continue
+		}
+		if neighbors[left] == nil {
+			neighbors[left] = make(map[int]struct{})
+		}
+		if neighbors[right] == nil {
+			neighbors[right] = make(map[int]struct{})
+		}
+		neighbors[left][right] = struct{}{}
+		neighbors[right][left] = struct{}{}
+		pairs = append(pairs, companionPair{left: left, right: right})
+	}
+	ambiguous := make([]bool, len(hardComponents))
+	for _, pair := range pairs {
+		if len(neighbors[pair.left]) == 1 && len(neighbors[pair.right]) == 1 {
+			union(pair.left, pair.right)
+			continue
+		}
+		ambiguous[pair.left] = true
+		ambiguous[pair.right] = true
+	}
+
+	seqsByRoot := make(map[int][]int64)
+	ambiguousByRoot := make(map[int]bool)
+	for component, seqs := range hardComponents {
+		root := find(component)
+		seqsByRoot[root] = append(seqsByRoot[root], seqs...)
+		if ambiguous[component] {
+			ambiguousByRoot[root] = true
+		}
+	}
+	groups := make([][]int64, 0, len(seqsByRoot))
+	for _, seqs := range seqsByRoot {
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		groups = append(groups, seqs)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if len(groups[i]) != len(groups[j]) {
+			return len(groups[i]) < len(groups[j])
+		}
+		return groups[i][0] < groups[j][0]
+	})
+
+	needsAttention := false
+	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
+	for _, seqs := range groups {
+		subject, purpose := deterministicIntentCandidateMessage(req, seqs)
+		readiness := ai.IntentCandidateReady
+		var missing []string
+		groupingReason := "bounded deterministic dependency component"
+		root := find(componentBySeq[seqs[0]])
+		if ambiguousByRoot[root] {
+			readiness = ai.IntentCandidateWait
+			subject = ""
+			missing = []string{
+				"ambiguous companion evidence requires planner review",
+			}
+			groupingReason = "ambiguous companion evidence is retained for planner review"
+			needsAttention = true
+		}
+		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
+			CandidateID:  stableGeneratedCandidateID(req, seqs),
+			SelectedSeqs: seqs, Purpose: purpose, Readiness: readiness,
+			MissingCompanions: missing, Subject: subject,
+			GroupingReason: groupingReason,
+		})
+	}
+	addIntentCandidateDependencies(req, &plan)
+	return plan, needsAttention
+}
+
+func balancedIntentCompanionDependency(kind string) bool {
+	switch kind {
+	case "test_source", "migration_test":
+		return true
+	default:
+		return false
+	}
+}
+
 func holdIntentCandidatePlan(req ai.IntentPlanRequestV2) ai.IntentPlanV2 {
 	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
 	for _, capture := range req.OfferedCaptures {
@@ -911,55 +1152,145 @@ func holdIntentCandidatePlan(req ai.IntentPlanRequestV2) ai.IntentPlanV2 {
 	return plan
 }
 
-// continuePersistedIntentCandidates keeps deterministic fallback safe when a
-// hard edge connects newly offered work to an existing candidate. The v2
-// response carries only offered sequences, so continuing the persisted
-// candidate is expressed by reusing its ID; evaluation then restores its prior
-// membership before materialization.
+// continuePersistedIntentCandidates computes the full hard closure across
+// offered assignments and durable candidates. When a bridge joins multiple
+// candidates it chooses one deterministic survivor and asks the state layer to
+// merge every other lineage transactionally after the atomicity gates run.
 func continuePersistedIntentCandidates(
 	req ai.IntentPlanRequestV2,
 	plan *ai.IntentPlanV2,
-) error {
+	rewriteDeterministicMessage bool,
+) ([]intentCandidateContinuation, error) {
+	parent := make(map[int64]int64)
+	add := func(seq int64) {
+		if _, ok := parent[seq]; !ok {
+			parent[seq] = seq
+		}
+	}
+	var find func(int64) int64
+	find = func(seq int64) int64 {
+		if parent[seq] != seq {
+			parent[seq] = find(parent[seq])
+		}
+		return parent[seq]
+	}
+	union := func(left, right int64) {
+		leftRoot, rightRoot := find(left), find(right)
+		if leftRoot != rightRoot {
+			parent[rightRoot] = leftRoot
+		}
+	}
+
 	outputOwner := make(map[int64]int, len(req.OfferedCaptures))
 	for i, candidate := range plan.Candidates {
+		var previous int64
 		for _, seq := range candidate.SelectedSeqs {
+			add(seq)
 			outputOwner[seq] = i
+			if previous > 0 {
+				union(previous, seq)
+			}
+			previous = seq
 		}
 	}
 	persistedOwner := make(map[int64]string)
 	for _, candidate := range req.Candidates {
+		var previous int64
 		for _, seq := range candidate.SelectedSeqs {
+			add(seq)
 			persistedOwner[seq] = candidate.CandidateID
+			if previous > 0 {
+				union(previous, seq)
+			}
+			previous = seq
 		}
-	}
-	continuedByOutput := make(map[int]string)
-	bind := func(output int, seq int64, candidateID string) error {
-		if previous := continuedByOutput[output]; previous != "" &&
-			previous != candidateID {
-			return fmt.Errorf(
-				"daemon: intent candidates: fallback capture %d connects persisted candidates %q and %q",
-				seq, previous, candidateID)
-		}
-		continuedByOutput[output] = candidateID
-		return nil
 	}
 	for _, edge := range req.Dependencies {
 		if edge.Strength != ai.IntentDependencyHard {
 			continue
 		}
-		fromOutput, fromVisible := outputOwner[edge.FromSeq]
-		toOutput, toVisible := outputOwner[edge.ToSeq]
-		fromPersisted, fromPersistedOK := persistedOwner[edge.FromSeq]
-		toPersisted, toPersistedOK := persistedOwner[edge.ToSeq]
-		switch {
-		case fromVisible && !toVisible && toPersistedOK:
-			if err := bind(fromOutput, edge.FromSeq, toPersisted); err != nil {
-				return err
+		if _, leftOK := parent[edge.FromSeq]; !leftOK {
+			continue
+		}
+		if _, rightOK := parent[edge.ToSeq]; !rightOK {
+			continue
+		}
+		union(edge.FromSeq, edge.ToSeq)
+	}
+
+	type hardClosure struct {
+		outputs   map[int]struct{}
+		persisted map[string]struct{}
+	}
+	closures := make(map[int64]*hardClosure)
+	for seq := range parent {
+		root := find(seq)
+		closure := closures[root]
+		if closure == nil {
+			closure = &hardClosure{
+				outputs:   make(map[int]struct{}),
+				persisted: make(map[string]struct{}),
 			}
-		case !fromVisible && fromPersistedOK && toVisible:
-			if err := bind(toOutput, edge.ToSeq, fromPersisted); err != nil {
-				return err
+			closures[root] = closure
+		}
+		if output, ok := outputOwner[seq]; ok {
+			closure.outputs[output] = struct{}{}
+		}
+		if candidateID := persistedOwner[seq]; candidateID != "" {
+			closure.persisted[candidateID] = struct{}{}
+		}
+	}
+	firstPersistedSeq := make(map[string]int64, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			if current := firstPersistedSeq[candidate.CandidateID]; current == 0 || seq < current {
+				firstPersistedSeq[candidate.CandidateID] = seq
 			}
+		}
+	}
+	canonicalID := func(ids map[string]struct{}) string {
+		sortedIDs := make([]string, 0, len(ids))
+		for candidateID := range ids {
+			sortedIDs = append(sortedIDs, candidateID)
+		}
+		sort.Slice(sortedIDs, func(i, j int) bool {
+			leftSeq, rightSeq := firstPersistedSeq[sortedIDs[i]],
+				firstPersistedSeq[sortedIDs[j]]
+			if leftSeq != rightSeq {
+				if leftSeq == 0 {
+					return false
+				}
+				if rightSeq == 0 {
+					return true
+				}
+				return leftSeq < rightSeq
+			}
+			return sortedIDs[i] < sortedIDs[j]
+		})
+		if len(sortedIDs) == 0 {
+			return ""
+		}
+		return sortedIDs[0]
+	}
+
+	continuedByOutput := make(map[int]string)
+	continuationSources := make(map[string]map[string]struct{})
+	for _, closure := range closures {
+		if len(closure.outputs) == 0 || len(closure.persisted) == 0 {
+			continue
+		}
+		targetID := canonicalID(closure.persisted)
+		for output := range closure.outputs {
+			continuedByOutput[output] = targetID
+		}
+		for sourceID := range closure.persisted {
+			if sourceID == targetID {
+				continue
+			}
+			if continuationSources[targetID] == nil {
+				continuationSources[targetID] = make(map[string]struct{})
+			}
+			continuationSources[targetID][sourceID] = struct{}{}
 		}
 	}
 	remappedIDs := make(map[string]string, len(continuedByOutput))
@@ -1025,16 +1356,379 @@ func continuePersistedIntentCandidates(
 				candidate.Readiness = ai.IntentCandidateWait
 			}
 		}
-		subject, purpose := deterministicIntentCandidateMessage(
-			req, candidate.SelectedSeqs)
-		candidate.Purpose = purpose
-		if candidate.Readiness == ai.IntentCandidateReady {
-			candidate.Subject = subject
-			candidate.Body = ""
+		if rewriteDeterministicMessage {
+			subject, purpose := deterministicIntentCandidateMessage(
+				req, candidate.SelectedSeqs)
+			candidate.Purpose = purpose
+			if candidate.Readiness == ai.IntentCandidateReady {
+				candidate.Subject = subject
+				candidate.Body = ""
+			}
 		}
 	}
 	plan.Candidates = merged
-	return nil
+	continuations := make([]intentCandidateContinuation, 0,
+		len(continuationSources))
+	for targetID, sourceSet := range continuationSources {
+		sourceIDs := make([]string, 0, len(sourceSet))
+		for sourceID := range sourceSet {
+			sourceIDs = append(sourceIDs, sourceID)
+		}
+		sort.Strings(sourceIDs)
+		continuations = append(continuations, intentCandidateContinuation{
+			TargetID: targetID, SourceIDs: sourceIDs,
+		})
+	}
+	sort.Slice(continuations, func(i, j int) bool {
+		return continuations[i].TargetID < continuations[j].TargetID
+	})
+	return continuations, nil
+}
+
+func applyIntentCandidateContinuationLimits(
+	plan *ai.IntentPlanV2,
+	continuations []intentCandidateContinuation,
+	existing map[string]state.IntentCandidate,
+	captures map[int64]IntentCandidateCapture,
+) bool {
+	needsAttention := false
+	for i := range continuations {
+		continuation := &continuations[i]
+		members := make(map[int64]struct{})
+		addExisting := func(candidateID string) {
+			for _, event := range existing[candidateID].Events {
+				members[event.EventSeq] = struct{}{}
+			}
+		}
+		addExisting(continuation.TargetID)
+		for _, sourceID := range continuation.SourceIDs {
+			addExisting(sourceID)
+		}
+		for _, assignment := range plan.Candidates {
+			if assignment.CandidateID != continuation.TargetID {
+				continue
+			}
+			for _, seq := range assignment.SelectedSeqs {
+				members[seq] = struct{}{}
+				if capture, ok := captures[seq]; ok {
+					for _, covered := range capture.CoveredEvents {
+						members[covered.Seq] = struct{}{}
+					}
+				}
+			}
+		}
+		if len(members) <= state.IntentCandidateMaxCaptures {
+			continue
+		}
+		continuation.HoldReason = fmt.Sprintf(
+			"hard dependency closure exceeds the durable %d-capture candidate limit",
+			state.IntentCandidateMaxCaptures)
+		for candidateIndex := range plan.Candidates {
+			assignment := &plan.Candidates[candidateIndex]
+			if assignment.CandidateID != continuation.TargetID {
+				continue
+			}
+			assignment.Readiness = ai.IntentCandidateWait
+			assignment.Subject = ""
+			assignment.Body = ""
+			if !containsIntentString(
+				assignment.MissingCompanions, continuation.HoldReason) {
+				assignment.MissingCompanions = append(
+					assignment.MissingCompanions,
+					continuation.HoldReason)
+			}
+			assignment.GroupingReason =
+				"hard dependency closure is retained for bounded review"
+		}
+		needsAttention = true
+	}
+	return needsAttention
+}
+
+func heldIntentCandidateContinuationDecision(
+	assignment ai.IntentCandidateAssignment,
+	continuation intentCandidateContinuation,
+	existing map[string]state.IntentCandidate,
+) (IntentCandidateDecision, error) {
+	candidate, ok := existing[continuation.TargetID]
+	if !ok {
+		return IntentCandidateDecision{}, fmt.Errorf(
+			"daemon: intent candidates: held continuation target %q is missing",
+			continuation.TargetID)
+	}
+	report := ai.NewIntentAtomicityReport(
+		assignment.CandidateID,
+		pendingIntentGate(
+			assignment.CandidateID,
+			ai.IntentAtomicityCompleteness,
+			"candidate_capture_cap_exceeded",
+			continuation.HoldReason),
+		pendingIntentGate(
+			assignment.CandidateID,
+			ai.IntentAtomicityDependency,
+			"hard_dependency_closure_held",
+			"the complete hard dependency closure must remain unpublished"),
+	)
+	if err := ai.ValidateIntentAtomicityReport(report); err != nil {
+		return IntentCandidateDecision{}, err
+	}
+	return IntentCandidateDecision{
+		Candidate: candidate, Assignment: assignment,
+		Atomicity: report, Publishable: false,
+	}, nil
+}
+
+func mergeIntentCandidateContinuationViews(
+	existing map[string]state.IntentCandidate,
+	continuations []intentCandidateContinuation,
+) (map[string]state.IntentCandidate, error) {
+	out := make(map[string]state.IntentCandidate, len(existing))
+	for candidateID, candidate := range existing {
+		candidate.Events = append([]state.IntentCandidateEvent(nil),
+			candidate.Events...)
+		out[candidateID] = candidate
+	}
+	for _, continuation := range continuations {
+		if continuation.HoldReason != "" {
+			continue
+		}
+		target, ok := out[continuation.TargetID]
+		if !ok {
+			return nil, fmt.Errorf(
+				"daemon: intent candidates: continuation target %q is missing",
+				continuation.TargetID)
+		}
+		eventsBySeq := make(map[int64]state.IntentCandidateEvent,
+			len(target.Events))
+		for _, event := range target.Events {
+			eventsBySeq[event.EventSeq] = event
+		}
+		for _, sourceID := range continuation.SourceIDs {
+			source, sourceOK := out[sourceID]
+			if !sourceOK {
+				return nil, fmt.Errorf(
+					"daemon: intent candidates: continuation source %q is missing",
+					sourceID)
+			}
+			if source.BranchRef != target.BranchRef ||
+				source.BranchGeneration != target.BranchGeneration {
+				return nil, fmt.Errorf(
+					"daemon: intent candidates: continuation source %q changed branch pair",
+					sourceID)
+			}
+			if target.CreatedTS == 0 ||
+				(source.CreatedTS > 0 && source.CreatedTS < target.CreatedTS) {
+				target.CreatedTS = source.CreatedTS
+			}
+			for _, event := range source.Events {
+				eventsBySeq[event.EventSeq] = event
+			}
+		}
+		seqs := make([]int64, 0, len(eventsBySeq))
+		for seq := range eventsBySeq {
+			seqs = append(seqs, seq)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		target.Events = make([]state.IntentCandidateEvent, 0, len(seqs))
+		for _, seq := range seqs {
+			event := eventsBySeq[seq]
+			event.CandidateID = target.ID
+			target.Events = append(target.Events, event)
+		}
+		out[target.ID] = target
+	}
+	return out, nil
+}
+
+func intentCandidateContinuationValidationRequest(
+	req ai.IntentPlanRequestV2,
+	continuations []intentCandidateContinuation,
+) ai.IntentPlanRequestV2 {
+	if len(continuations) == 0 {
+		return req
+	}
+	originalCandidates := append([]ai.IntentCandidateSummary(nil),
+		req.Candidates...)
+	targetBySource := make(map[string]string)
+	for _, continuation := range continuations {
+		for _, sourceID := range continuation.SourceIDs {
+			targetBySource[sourceID] = continuation.TargetID
+		}
+	}
+	originalByID := make(map[string]ai.IntentCandidateSummary,
+		len(originalCandidates))
+	for _, candidate := range originalCandidates {
+		originalByID[candidate.CandidateID] = candidate
+	}
+	byID := make(map[string]ai.IntentCandidateSummary, len(req.Candidates))
+	order := make([]string, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		targetID := candidate.CandidateID
+		if replacement := targetBySource[targetID]; replacement != "" {
+			targetID = replacement
+		}
+		target, exists := byID[targetID]
+		if !exists {
+			target = originalByID[targetID]
+			target.CandidateID = targetID
+			target.SelectedSeqs = nil
+			order = append(order, targetID)
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			if !containsIntentSeq(target.SelectedSeqs, seq) {
+				target.SelectedSeqs = append(target.SelectedSeqs, seq)
+			}
+		}
+		byID[targetID] = target
+	}
+	req.Candidates = make([]ai.IntentCandidateSummary, 0, len(byID))
+	seen := make(map[string]struct{}, len(order))
+	for _, candidateID := range order {
+		if _, duplicate := seen[candidateID]; duplicate {
+			continue
+		}
+		seen[candidateID] = struct{}{}
+		candidate := byID[candidateID]
+		sort.Slice(candidate.SelectedSeqs, func(i, j int) bool {
+			return candidate.SelectedSeqs[i] < candidate.SelectedSeqs[j]
+		})
+		req.Candidates = append(req.Candidates, candidate)
+	}
+	seenEdges := make(map[string]struct{}, len(req.Dependencies))
+	for _, edge := range req.Dependencies {
+		seenEdges[fmt.Sprintf("%d\x00%d\x00%s\x00%s",
+			edge.FromSeq, edge.ToSeq, edge.Strength, edge.Kind)] = struct{}{}
+	}
+	for _, candidate := range originalCandidates {
+		seqs := append([]int64(nil), candidate.SelectedSeqs...)
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		for i := 1; i < len(seqs); i++ {
+			edge := ai.IntentCaptureDependency{
+				FromSeq: seqs[i-1], ToSeq: seqs[i],
+				Strength: ai.IntentDependencySoft,
+				Kind:     "persisted_candidate_membership",
+			}
+			key := fmt.Sprintf("%d\x00%d\x00%s\x00%s",
+				edge.FromSeq, edge.ToSeq, edge.Strength, edge.Kind)
+			if _, exists := seenEdges[key]; exists {
+				continue
+			}
+			seenEdges[key] = struct{}{}
+			req.Dependencies = append(req.Dependencies, edge)
+		}
+	}
+	return req
+}
+
+func appendIntentCandidateMembershipDependencies(
+	dependencies []state.IntentCaptureDependency,
+	existing []state.IntentCandidate,
+) []state.IntentCaptureDependency {
+	out := append([]state.IntentCaptureDependency(nil), dependencies...)
+	seen := make(map[string]struct{}, len(out))
+	for _, edge := range out {
+		seen[fmt.Sprintf("%d\x00%d\x00%s\x00%s",
+			edge.PrerequisiteSeq, edge.DependentSeq,
+			edge.Strength, edge.Kind)] = struct{}{}
+	}
+	for _, candidate := range existing {
+		var seqs []int64
+		for _, event := range candidate.Events {
+			if event.EventRole != "coalesced" {
+				seqs = append(seqs, event.EventSeq)
+			}
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		for i := 1; i < len(seqs); i++ {
+			edge := state.IntentCaptureDependency{
+				BranchRef:        candidate.BranchRef,
+				BranchGeneration: candidate.BranchGeneration,
+				PrerequisiteSeq:  seqs[i-1],
+				DependentSeq:     seqs[i],
+				Strength:         state.IntentDependencySoft,
+				Kind:             "persisted_candidate_membership",
+			}
+			key := fmt.Sprintf("%d\x00%d\x00%s\x00%s",
+				edge.PrerequisiteSeq, edge.DependentSeq,
+				edge.Strength, edge.Kind)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+func applyBalancedFallbackBounds(
+	plan *ai.IntentPlanV2,
+	existing map[string]state.IntentCandidate,
+	captures map[int64]IntentCandidateCapture,
+) bool {
+	needsAttention := false
+	for i := range plan.Candidates {
+		assignment := &plan.Candidates[i]
+		selected := make(map[int64]struct{}, len(assignment.SelectedSeqs))
+		paths := make(map[string]struct{})
+		addCapture := func(capture IntentCandidateCapture) {
+			selected[capture.Event.Seq] = struct{}{}
+			for _, covered := range capture.CoveredEvents {
+				selected[covered.Seq] = struct{}{}
+			}
+			for _, capturePath := range intentCapturePaths(capture) {
+				if capturePath != "" {
+					paths[capturePath] = struct{}{}
+				}
+			}
+		}
+		for _, seq := range assignment.SelectedSeqs {
+			if capture, ok := captures[seq]; ok {
+				addCapture(capture)
+			} else {
+				selected[seq] = struct{}{}
+			}
+		}
+		if prior, ok := existing[assignment.CandidateID]; ok {
+			for _, event := range prior.Events {
+				selected[event.EventSeq] = struct{}{}
+				if event.EventRole == "coalesced" {
+					continue
+				}
+				if capture, captureOK := captures[event.EventSeq]; captureOK {
+					addCapture(capture)
+				}
+			}
+		}
+		if len(selected) > intentBalancedFallbackCaptureCap {
+			holdBalancedFallbackAssignment(assignment,
+				fmt.Sprintf("balanced fallback exceeds %d captures",
+					intentBalancedFallbackCaptureCap))
+			needsAttention = true
+		}
+		if len(paths) > intentBalancedFallbackPathCap {
+			holdBalancedFallbackAssignment(assignment,
+				fmt.Sprintf("balanced fallback exceeds %d paths",
+					intentBalancedFallbackPathCap))
+			needsAttention = true
+		}
+	}
+	return needsAttention
+}
+
+func holdBalancedFallbackAssignment(
+	assignment *ai.IntentCandidateAssignment,
+	reason string,
+) {
+	assignment.Readiness = ai.IntentCandidateWait
+	assignment.Subject = ""
+	assignment.Body = ""
+	if !containsIntentString(assignment.MissingCompanions, reason) {
+		assignment.MissingCompanions = append(
+			assignment.MissingCompanions, reason)
+	}
+	assignment.GroupingReason =
+		"bounded fallback requires planner review"
 }
 
 func reuseIntentCandidatePartition(

@@ -78,6 +78,249 @@ WHERE candidate_id=? AND event_seq=?`, candidate.ID, second).Scan(&state); err !
 	}
 }
 
+func TestIntentCandidateMergePreservesMembershipAndLineage(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	const (
+		branch     = "refs/heads/main"
+		generation = int64(17)
+	)
+	targetSeq := appendIntentV2Event(t, d, branch, generation, "target.go")
+	firstSourceSeq := appendIntentV2Event(t, d, branch, generation, "first.go")
+	secondSourceSeq := appendIntentV2Event(t, d, branch, generation, "second.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "target", BranchRef: branch, BranchGeneration: generation,
+		Status: IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "initial target",
+		Events: []IntentCandidateEvent{{
+			EventSeq: targetSeq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []struct {
+		id, oid, pathRole string
+		seq               int64
+	}{
+		{id: "source-a", oid: "commit-a", pathRole: "test", seq: firstSourceSeq},
+		{id: "source-b", oid: "commit-b", pathRole: "migration", seq: secondSourceSeq},
+	} {
+		if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+			ID: source.id, BranchRef: branch, BranchGeneration: generation,
+			Status: IntentCandidateSoftPublished, Readiness: IntentReadinessReady,
+			PublishedCommitOID: sql.NullString{String: source.oid, Valid: true},
+			Events: []IntentCandidateEvent{{
+				EventSeq: source.seq, EventRole: source.pathRole,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := IntentCandidateMergeRequest{
+		Target: IntentCandidate{
+			ID: "target", BranchRef: branch, BranchGeneration: generation,
+			Status: IntentCandidateWaiting, Readiness: IntentReadinessWait,
+			Purpose: "canonical hard dependency component",
+			Events: []IntentCandidateEvent{{
+				EventSeq: targetSeq, EventRole: "implementation",
+			}},
+		},
+		SourceCandidateIDs: []string{"source-b", "source-a", "source-a"},
+		Reason:             "hard_dependency_continuation",
+		MergedTS:           123,
+	}
+	result, err := MergeIntentCandidates(ctx, d, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidate.ID != "target" ||
+		result.Candidate.Purpose != "canonical hard dependency component" ||
+		len(result.Candidate.Events) != 3 ||
+		len(result.Lineage) != 2 {
+		t.Fatalf("merge result=%+v", result)
+	}
+	wantSeqs := []int64{targetSeq, firstSourceSeq, secondSourceSeq}
+	for i, want := range wantSeqs {
+		if result.Candidate.Events[i].EventSeq != want ||
+			result.Candidate.Events[i].Ord != i ||
+			result.Candidate.Events[i].MembershipState != IntentMembershipActive {
+			t.Fatalf("canonical events=%+v", result.Candidate.Events)
+		}
+	}
+	for i, want := range []struct {
+		id, oid string
+	}{
+		{id: "source-a", oid: "commit-a"},
+		{id: "source-b", oid: "commit-b"},
+	} {
+		got := result.Lineage[i]
+		if got.SourceCandidateID != want.id ||
+			got.TargetCandidateID != "target" ||
+			got.SourceStatus != IntentCandidateSoftPublished ||
+			!got.SourcePublishedCommitOID.Valid ||
+			got.SourcePublishedCommitOID.String != want.oid ||
+			got.Reason != request.Reason || got.CreatedTS != 123 {
+			t.Fatalf("lineage[%d]=%+v", i, got)
+		}
+		source, ok, err := IntentCandidateByID(ctx, d, want.id)
+		if err != nil || !ok || source.Status != IntentCandidateSuperseded ||
+			len(source.Events) != 0 ||
+			source.PublishedCommitOID.String != want.oid {
+			t.Fatalf("source %s=%+v ok=%v err=%v", want.id, source, ok, err)
+		}
+		history, err := IntentCandidateEventHistory(ctx, d, want.id)
+		if err != nil || len(history) != 1 ||
+			history[0].MembershipState != IntentMembershipSuperseded {
+			t.Fatalf("source history %s=%+v err=%v", want.id, history, err)
+		}
+	}
+	byTarget, err := IntentCandidateLineageForTarget(
+		ctx, d, branch, generation, "target", 0)
+	if err != nil || len(byTarget) != 2 {
+		t.Fatalf("lineage by target=%+v err=%v", byTarget, err)
+	}
+	bySource, ok, err := IntentCandidateLineageBySource(
+		ctx, d, branch, generation, "source-a")
+	if err != nil || !ok || bySource.TargetCandidateID != "target" {
+		t.Fatalf("lineage by source=%+v ok=%v err=%v", bySource, ok, err)
+	}
+
+	// The same durable request is a no-op: it neither duplicates lineage nor
+	// rewrites the original timestamp.
+	repeated, err := MergeIntentCandidates(ctx, d, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repeated.Lineage) != 2 ||
+		repeated.Candidate.UpdatedTS != 123 {
+		t.Fatalf("idempotent result=%+v", repeated)
+	}
+	var count int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_candidate_lineage`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("lineage rows=%d want=2", count)
+	}
+
+	// Reusing the same lineage is idempotent only for lineage insertion. A
+	// later exact-pair capture and revised target metadata must still advance
+	// the canonical candidate transactionally.
+	lateSeq := appendIntentV2Event(t, d, branch, generation, "late-test.go")
+	advanced := request
+	advanced.Target.Purpose = "canonical component with late companion"
+	advanced.Target.Events = append(
+		append([]IntentCandidateEvent(nil), request.Target.Events...),
+		IntentCandidateEvent{
+			EventSeq: lateSeq, EventRole: "test",
+		},
+	)
+	advanced.MergedTS = 124
+	lateResult, err := MergeIntentCandidates(ctx, d, advanced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lateResult.Candidate.Purpose != advanced.Target.Purpose ||
+		lateResult.Candidate.UpdatedTS != 124 ||
+		len(lateResult.Candidate.Events) != 4 ||
+		lateResult.Candidate.Events[3].EventSeq != lateSeq ||
+		lateResult.Candidate.Events[3].MembershipState !=
+			IntentMembershipActive {
+		t.Fatalf("advanced merge result=%+v", lateResult)
+	}
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_candidate_lineage`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("advanced lineage rows=%d want=2", count)
+	}
+	var lateOwner string
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT candidate_id FROM intent_candidate_events
+WHERE event_seq=? AND membership_state='active'`, lateSeq).Scan(&lateOwner); err != nil {
+		t.Fatal(err)
+	}
+	if lateOwner != "target" {
+		t.Fatalf("late event owner=%q want target", lateOwner)
+	}
+}
+
+func TestIntentCandidateMergeFailsClosedWithoutDroppingMembership(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	targetSeq := appendIntentV2Event(
+		t, d, "refs/heads/main", 18, "target.go")
+	sourceSeq := appendIntentV2Event(
+		t, d, "refs/heads/main", 18, "source.go")
+	foreignSeq := appendIntentV2Event(
+		t, d, "refs/heads/main", 18, "foreign.go")
+	for _, candidate := range []IntentCandidate{
+		{
+			ID: "target", BranchRef: "refs/heads/main", BranchGeneration: 18,
+			Status: IntentCandidateWaiting, Readiness: IntentReadinessWait,
+			Events: []IntentCandidateEvent{{
+				EventSeq: targetSeq, EventRole: "code",
+			}},
+		},
+		{
+			ID: "source", BranchRef: "refs/heads/main", BranchGeneration: 18,
+			Status: IntentCandidateReady, Readiness: IntentReadinessReady,
+			Events: []IntentCandidateEvent{{
+				EventSeq: sourceSeq, EventRole: "test",
+			}},
+		},
+		{
+			ID: "foreign", BranchRef: "refs/heads/main", BranchGeneration: 18,
+			Status: IntentCandidateWaiting, Readiness: IntentReadinessWait,
+			Events: []IntentCandidateEvent{{
+				EventSeq: foreignSeq, EventRole: "docs",
+			}},
+		},
+	} {
+		if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := MergeIntentCandidates(ctx, d, IntentCandidateMergeRequest{
+		Target: IntentCandidate{
+			ID: "target", BranchRef: "refs/heads/main", BranchGeneration: 18,
+			Status: IntentCandidateReady, Readiness: IntentReadinessReady,
+			Events: []IntentCandidateEvent{
+				{EventSeq: targetSeq, EventRole: "code"},
+				{EventSeq: foreignSeq, EventRole: "docs"},
+			},
+		},
+		SourceCandidateIDs: []string{"source"},
+		Reason:             "hard_dependency_continuation",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unlisted candidate") {
+		t.Fatalf("merge error=%v", err)
+	}
+	for id, seq := range map[string]int64{
+		"target": targetSeq, "source": sourceSeq, "foreign": foreignSeq,
+	} {
+		candidate, ok, loadErr := IntentCandidateByID(ctx, d, id)
+		if loadErr != nil || !ok || len(candidate.Events) != 1 ||
+			candidate.Events[0].EventSeq != seq ||
+			candidate.Status == IntentCandidateSuperseded {
+			t.Fatalf("rolled back %s=%+v ok=%v err=%v",
+				id, candidate, ok, loadErr)
+		}
+	}
+	var lineage int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_candidate_lineage`).Scan(&lineage); err != nil {
+		t.Fatal(err)
+	}
+	if lineage != 0 {
+		t.Fatalf("lineage rows=%d want=0", lineage)
+	}
+}
+
 func TestIntentV2CandidateSaveRollsBackOnWrongPair(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -575,6 +818,7 @@ func TestLoadIntentV2StateReadOnlyCurrentProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.Available || got.SchemaVersion != SchemaVersion ||
+		!got.CandidateLineageAvailable || got.CandidateLineageRecords != 0 ||
 		got.OpenCandidates != 1 || got.VerificationAttention != 1 ||
 		got.RecoverableRepairs != 1 || got.LastBoundaryEpoch != 1 {
 		t.Fatalf("projection=%+v", got)
@@ -596,6 +840,110 @@ func TestLoadIntentV2StateReadOnlyCurrentProjection(t *testing.T) {
 	}
 	if got.OpenCandidates != 1 || got.VerificationAttention != 0 {
 		t.Fatalf("superseded failure projection=%+v", got)
+	}
+}
+
+func TestIntentV2SchemaV16ReadOnlyProjectionAndMigration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	d, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := appendIntentV2Event(
+		t, d, "refs/heads/main", 16, "preserved.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "preserved-candidate", BranchRef: "refs/heads/main",
+		BranchGeneration: 16, Status: IntentCandidateWaiting,
+		Readiness: IntentReadinessWait,
+		Events: []IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+DROP TABLE intent_candidate_lineage;
+PRAGMA user_version=16;`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	projection, err := LoadIntentV2StateReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !projection.Available || projection.SchemaVersion != 16 ||
+		projection.CandidateLineageAvailable ||
+		projection.CandidateLineageRecords != 0 ||
+		projection.OpenCandidates != 1 {
+		t.Fatalf("v16 projection=%+v", projection)
+	}
+	check, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version, lineageTables int
+	if err := check.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		_ = check.Close()
+		t.Fatal(err)
+	}
+	if err := check.QueryRow(`
+SELECT COUNT(*) FROM sqlite_master
+WHERE type='table' AND name='intent_candidate_lineage'`,
+	).Scan(&lineageTables); err != nil {
+		_ = check.Close()
+		t.Fatal(err)
+	}
+	if err := check.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if version != 16 || lineageTables != 0 {
+		t.Fatalf("read-only v16 projection mutated db: version=%d lineage_tables=%d",
+			version, lineageTables)
+	}
+
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := migrated.UserVersion(ctx); err != nil ||
+		got != SchemaVersion {
+		_ = migrated.Close()
+		t.Fatalf("migrated version=%d err=%v", got, err)
+	}
+	candidate, ok, err := IntentCandidateByID(
+		ctx, migrated, "preserved-candidate")
+	if err != nil || !ok || len(candidate.Events) != 1 ||
+		candidate.Events[0].EventSeq != seq {
+		_ = migrated.Close()
+		t.Fatalf("preserved candidate=%+v ok=%v err=%v",
+			candidate, ok, err)
+	}
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	projection, err = LoadIntentV2StateReadOnly(ctx, dbPath)
+	if err != nil || !projection.CandidateLineageAvailable ||
+		projection.SchemaVersion != SchemaVersion {
+		t.Fatalf("reopened projection=%+v err=%v", projection, err)
 	}
 }
 
@@ -627,8 +975,10 @@ func TestIntentV2SchemaHasNoRawDiffColumns(t *testing.T) {
 	}
 	for _, index := range []string{
 		"idx_intent_candidates_pair_status_updated",
+		"idx_intent_candidates_id_pair",
 		"idx_intent_candidate_events_candidate_state_ord",
 		"idx_intent_candidate_events_active_seq",
+		"idx_intent_candidate_lineage_target_created",
 		"idx_intent_capture_dependencies_pair_from",
 		"idx_intent_capture_dependencies_pair_to",
 		"idx_intent_activity_boundaries_consumed_epoch",
@@ -659,6 +1009,7 @@ func intentV2TableNames() []string {
 	return []string{
 		"intent_candidates",
 		"intent_candidate_events",
+		"intent_candidate_lineage",
 		"intent_capture_dependencies",
 		"intent_activity_boundaries",
 		"intent_repairs",

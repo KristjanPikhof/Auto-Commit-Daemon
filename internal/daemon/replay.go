@@ -250,6 +250,9 @@ type ReplayOpts struct {
 	// the candidate engine's built-in atomicity and materialization gates.
 	IntentVerificationMode string
 	IntentCandidateVerify  IntentCandidateVerifier
+	// IntentRepairCommitVerify validates exact commit-tree output before an
+	// automatic repair changes the branch ref.
+	IntentRepairCommitVerify git.IntentRepairCommitVerifier
 
 	// IntentRepairEnabled and IntentRepairHorizon control whether a newly
 	// published candidate remains soft-published and eligible for a later
@@ -3489,9 +3492,9 @@ func traceReplayUpdateRef(
 // the helper refuses if the row already moved out of blocked_conflict).
 //
 // Best-effort meta cleanup: once the last blocked row on this
-// (branch_ref, branch_generation) clears, drop the last_replay_conflict /
-// last_replay_conflict_legacy / last_replay_error breadcrumbs so
-// `acd status` reads clean. Multiple still-blocked rows on the same anchor
+// (branch_ref, branch_generation) clears, drop the conflict and complete replay
+// error-observability metadata set so `acd status` reads clean. Multiple
+// still-blocked rows on the same anchor
 // (or any blocked rows on other anchors) keep the breadcrumbs intact.
 //
 // Errors during the per-row probe are logged and skipped — one bad row

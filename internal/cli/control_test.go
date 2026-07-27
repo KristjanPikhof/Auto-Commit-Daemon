@@ -81,6 +81,21 @@ func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
+	status := statusReport{
+		Daemon: "running", PID: os.Getpid(),
+		Replay: replayObservabilityReport{
+			State: "needs_attention", ErrorRepeatCount: 3,
+		},
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+	applyControlStatus(&result, status)
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		!strings.Contains(result.Summary, "repeatedly failing") {
+		t.Fatalf("control result=%+v", result)
+	}
+}
+
 func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -331,6 +332,188 @@ func TestApplyIntentRepairAtomicallyBacksUpAndPreservesLiveState(t *testing.T) {
 		if after := mustReadFile(t, path); string(after) != string(before) {
 			t.Fatalf("%s changed during ref-only repair", path)
 		}
+	}
+}
+
+func TestApplyIntentRepairRepartitionsNonContiguousCommits(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	oldA1 := commitWorktreePath(t, ctx, repo, "a.txt", "a1\n", "a1")
+	oldB1 := commitWorktreePath(t, ctx, repo, "b.txt", "b1\n", "b1")
+	oldA2 := commitWorktreePath(t, ctx, repo, "a.txt", "a2\n", "a2")
+
+	aBlob, err := HashObjectStdin(ctx, repo, []byte("a2\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bBlob, err := HashObjectStdin(ctx, repo, []byte("b1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aTree, err := Mktree(ctx, repo, []MktreeEntry{{
+		Mode: RegularFileMode, Type: "blob", OID: aBlob, Path: "a.txt",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalTree, err := Mktree(ctx, repo, []MktreeEntry{
+		{Mode: RegularFileMode, Type: "blob", OID: aBlob, Path: "a.txt"},
+		{Mode: RegularFileMode, Type: "blob", OID: bBlob, Path: "b.txt"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eligibility := intentRepairEligibility(
+		oldA2,
+		[]string{oldA1, oldB1, oldA2},
+		[]string{"a.txt", "b.txt"},
+	)
+	eligibility.Commits[0].CandidateID = "candidate-a"
+	eligibility.Commits[1].CandidateID = "candidate-b"
+	eligibility.Commits[2].CandidateID = "candidate-a"
+	var verified []string
+	result, err := ApplyIntentRepair(ctx, repo, IntentRepairApplyOptions{
+		Eligibility:      eligibility,
+		RepairID:         "non-contiguous",
+		AllowRepartition: true,
+		VerifyCommit: func(
+			verifyCtx context.Context,
+			commitOID string,
+			index int,
+		) error {
+			resolved, verifyErr := RevParse(
+				verifyCtx, repo, commitOID+"^{commit}")
+			if verifyErr != nil {
+				return verifyErr
+			}
+			if resolved != commitOID || index != len(verified) {
+				return errors.New("unexpected rebuilt commit verification order")
+			}
+			verified = append(verified, commitOID)
+			return nil
+		},
+		Replacements: []IntentRepairReplacement{
+			{
+				Replaces:  []string{oldA1, oldA2},
+				TreeOID:   aTree,
+				Message:   "Complete alpha",
+				AuthorOID: oldA1,
+			},
+			{
+				Replaces:  []string{oldB1},
+				TreeOID:   finalTree,
+				Message:   "Add beta",
+				AuthorOID: oldB1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyIntentRepair: %v", err)
+	}
+	if !result.Eligible || result.NewHead == "" || result.NewHead == oldA2 {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(verified) != 2 || verified[1] != result.NewHead {
+		t.Fatalf("verified=%v result=%+v", verified, result)
+	}
+	if subjects := commitSubjectsNewestFirst(
+		t,
+		ctx,
+		repo,
+		result.NewHead,
+		2,
+	); strings.Join(subjects, ",") != "Add beta,Complete alpha" {
+		t.Fatalf("subjects=%v", subjects)
+	}
+	mapped := make(map[string]string)
+	for _, mapping := range result.CommitMappings {
+		mapped[mapping.OldOID] = mapping.NewOID
+	}
+	if mapped[oldA1] == "" || mapped[oldA1] != mapped[oldA2] ||
+		mapped[oldB1] == "" || mapped[oldB1] == mapped[oldA1] {
+		t.Fatalf("mappings=%+v", result.CommitMappings)
+	}
+	tree, err := commitTreeOID(ctx, repo, result.NewHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree != finalTree {
+		t.Fatalf("final tree=%s want %s", tree, finalTree)
+	}
+}
+
+func TestApplyIntentRepairVerificationFailureLeavesRefsUnchanged(
+	t *testing.T,
+) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	oldHead := commitWorktreePath(
+		t, ctx, repo, "one.txt", "one\n", "one")
+	tree, err := commitTreeOID(ctx, repo, oldHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := IntentRepairApplyOptions{
+		Eligibility: intentRepairEligibility(
+			oldHead, []string{oldHead}, []string{"one.txt"}),
+		RepairID: "verification-failure",
+		Replacements: []IntentRepairReplacement{{
+			Replaces: []string{oldHead},
+			TreeOID:  tree,
+			Message:  "Rewrite one",
+		}},
+		VerifyCommit: func(
+			context.Context,
+			string,
+			int,
+		) error {
+			return errors.New("approved check failed")
+		},
+	}
+	_, err = ApplyIntentRepair(ctx, repo, opts)
+	if err == nil || !strings.Contains(err.Error(), "approved check failed") {
+		t.Fatalf("error=%v", err)
+	}
+	head, resolveErr := RevParse(ctx, repo, "HEAD")
+	if resolveErr != nil || head != oldHead {
+		t.Fatalf("HEAD=%s err=%v want %s", head, resolveErr, oldHead)
+	}
+	backupRef, refErr := IntentRepairBackupRef(
+		opts.Eligibility.BranchRef, opts.RepairID)
+	if refErr != nil {
+		t.Fatal(refErr)
+	}
+	if _, resolveErr = RevParse(ctx, repo, backupRef); !errors.Is(resolveErr, ErrRefNotFound) {
+		t.Fatalf("backup ref exists after failed verification: %v", resolveErr)
+	}
+}
+
+func TestApplyIntentRepairRejectsRepartitionWithoutOptIn(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	oldA1 := commitWorktreePath(t, ctx, repo, "a.txt", "a1\n", "a1")
+	oldB1 := commitWorktreePath(t, ctx, repo, "b.txt", "b1\n", "b1")
+	oldA2 := commitWorktreePath(t, ctx, repo, "a.txt", "a2\n", "a2")
+	tree, err := commitTreeOID(ctx, repo, oldA2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ApplyIntentRepair(ctx, repo, IntentRepairApplyOptions{
+		Eligibility: intentRepairEligibility(
+			oldA2,
+			[]string{oldA1, oldB1, oldA2},
+			[]string{"a.txt", "b.txt"},
+		),
+		RepairID: "non-contiguous-disabled",
+		Replacements: []IntentRepairReplacement{
+			{Replaces: []string{oldA1, oldA2}, TreeOID: tree, Message: "A"},
+			{Replaces: []string{oldB1}, TreeOID: tree, Message: "B"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "preserve old-chain order") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

@@ -25,6 +25,9 @@ const (
 	IntentRepairReasonOwnershipMissing = "ownership_missing"
 )
 
+var ErrIntentRepairVerification = errors.New(
+	"git intent repair apply: rebuilt commit verification failed")
+
 // IntentRepairOwnedCommit is one ACD-owned commit in the contiguous repair
 // range. Commits are supplied oldest-to-newest and the final commit must be
 // ExpectedHead. CandidateID is required so callers cannot accidentally repair
@@ -177,9 +180,10 @@ func CheckIntentRepairEligibility(
 }
 
 // IntentRepairReplacement describes one rebuilt commit. Replaces must be a
-// non-empty, ordered partition of the eligible old chain. Combining adjacent
-// commits is supported; splitting a single old commit into synthetic commits
-// is intentionally unsupported by this Git primitive.
+// non-empty, ordered subset of the eligible old chain. The default requires
+// adjacent ownership; approved semantic repartitioning may use non-contiguous
+// subsets while still accounting for every old commit exactly once. Splitting
+// one old commit into synthetic commits remains unsupported.
 type IntentRepairReplacement struct {
 	Replaces  []string
 	TreeOID   string
@@ -194,8 +198,25 @@ type IntentRepairApplyOptions struct {
 	Eligibility  IntentRepairEligibilityOptions
 	RepairID     string
 	Replacements []IntentRepairReplacement
+	// AllowRepartition permits semantic candidates to claim a non-contiguous
+	// subset of the old first-parent chain. Eligibility.Commits remains the
+	// authoritative oldest-to-newest chain; Replacements controls the new
+	// candidate order.
+	AllowRepartition bool
+	// VerifyCommit checks each exact rebuilt commit after commit-tree and
+	// before the second eligibility check and branch CAS. A failure leaves
+	// only unreachable loose objects and never creates the backup ref.
+	VerifyCommit IntentRepairCommitVerifier
 	DryRun       bool
 }
+
+// IntentRepairCommitVerifier validates one exact rebuilt commit before any
+// reference changes. Index is the zero-based replacement order.
+type IntentRepairCommitVerifier func(
+	context.Context,
+	string,
+	int,
+) error
 
 // IntentRepairCommitMapping records one old-to-new relation. Adjacent old
 // commits may map to one rebuilt candidate commit.
@@ -250,7 +271,13 @@ func ApplyIntentRepair(
 	if !eligibility.Eligible {
 		return result, nil
 	}
-	if err := validateIntentRepairReplacements(ctx, repoDir, opts.Eligibility.Commits, opts.Replacements); err != nil {
+	if err := validateIntentRepairReplacements(
+		ctx,
+		repoDir,
+		opts.Eligibility.Commits,
+		opts.Replacements,
+		opts.AllowRepartition,
+	); err != nil {
 		return result, err
 	}
 	if opts.DryRun {
@@ -262,7 +289,7 @@ func ApplyIntentRepair(
 		return result, fmt.Errorf("git intent repair apply: resolve base parent: %w", err)
 	}
 	newParent := parent
-	for _, replacement := range opts.Replacements {
+	for replacementIndex, replacement := range opts.Replacements {
 		authorOID := replacement.AuthorOID
 		if authorOID == "" {
 			authorOID = replacement.Replaces[0]
@@ -291,6 +318,13 @@ func ApplyIntentRepair(
 				OldOID: oldOID,
 				NewOID: newOID,
 			})
+		}
+		if opts.VerifyCommit != nil {
+			if err := opts.VerifyCommit(
+				ctx, newOID, replacementIndex); err != nil {
+				return IntentRepairApplyResult{}, fmt.Errorf(
+					"git intent repair apply: verify rebuilt commit: %w", err)
+			}
 		}
 		newParent = newOID
 	}
@@ -343,6 +377,7 @@ func validateIntentRepairReplacements(
 	repoDir string,
 	commits []IntentRepairOwnedCommit,
 	replacements []IntentRepairReplacement,
+	allowRepartition bool,
 ) error {
 	var flattened []string
 	for i, replacement := range replacements {
@@ -365,6 +400,35 @@ func validateIntentRepairReplacements(
 	}
 	if len(flattened) != len(commits) {
 		return errors.New("git intent repair apply: replacements must partition the complete old chain")
+	}
+	if allowRepartition {
+		oldPositions := make(map[string]int, len(commits))
+		for i, commit := range commits {
+			if _, duplicate := oldPositions[commit.OID]; duplicate {
+				return fmt.Errorf(
+					"git intent repair apply: duplicate old-chain oid at position %d",
+					i,
+				)
+			}
+			oldPositions[commit.OID] = i
+		}
+		seen := make(map[string]struct{}, len(flattened))
+		for _, oldOID := range flattened {
+			if _, ok := oldPositions[oldOID]; !ok {
+				return fmt.Errorf(
+					"git intent repair apply: replacement contains commit outside old chain %s",
+					shortApplyOID(oldOID),
+				)
+			}
+			if _, duplicate := seen[oldOID]; duplicate {
+				return fmt.Errorf(
+					"git intent repair apply: replacement repeats old commit %s",
+					shortApplyOID(oldOID),
+				)
+			}
+			seen[oldOID] = struct{}{}
+		}
+		return nil
 	}
 	for i, commit := range commits {
 		if flattened[i] != commit.OID {

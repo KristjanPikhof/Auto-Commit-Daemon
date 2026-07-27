@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,5 +88,58 @@ func TestRuntimeIntentVerifierAdvancesTopologicalCandidateParent(t *testing.T) {
 	}
 	if head != startHead {
 		t.Fatalf("verification changed live HEAD: %s -> %s", startHead, head)
+	}
+}
+
+func TestRuntimeIntentRepairVerifierChecksExactCommitWithoutRefChanges(
+	t *testing.T,
+) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	startHead := f.cctx.BaseHead
+	command, err := verification.NewApprovedCommand(
+		f.dir,
+		"repair-verification",
+		verification.ModeFast,
+		`test "$(git rev-parse HEAD)" = "`+startHead+`"`,
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := runtimeIntentRepairCommitVerifier(
+		f.dir, 11, command)
+	if err := verify(ctx, startHead, 0); err != nil {
+		t.Fatalf("verify exact repair commit: %v", err)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil || head != startHead {
+		t.Fatalf("HEAD=%s err=%v want %s", head, err, startHead)
+	}
+}
+
+func TestRuntimeIntentRepairVerifierKeepsCancellationRetryable(
+	t *testing.T,
+) {
+	f := newCaptureFixture(t)
+	command, err := verification.NewApprovedCommand(
+		f.dir,
+		"repair-cancellation",
+		verification.ModeFast,
+		"true",
+		10*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := runtimeIntentRepairCommitVerifier(f.dir, 12, command)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = verify(ctx, f.cctx.BaseHead, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v want context cancellation", err)
+	}
+	if errors.Is(err, git.ErrIntentRepairVerification) {
+		t.Fatalf("cancellation became durable verification failure: %v", err)
 	}
 }

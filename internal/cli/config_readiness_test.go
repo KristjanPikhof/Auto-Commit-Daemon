@@ -136,3 +136,70 @@ func TestConfigurationReadinessSurfacesAndFailureRecovery(t *testing.T) {
 		}
 	}
 }
+
+func TestReplayObservabilitySurfaces(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"last_replay_error":         "candidate planning failed",
+		"replay.error_repeat_count": "4",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var statusOut bytes.Buffer
+	if err := runStatus(ctx, &statusOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var status statusReport
+	if err := json.Unmarshal(statusOut.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+
+	var diagnoseOut bytes.Buffer
+	if err := runDiagnose(ctx, &diagnoseOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var diagnose diagnoseReport
+	if err := json.Unmarshal(diagnoseOut.Bytes(), &diagnose); err != nil {
+		t.Fatal(err)
+	}
+
+	var eventsOut bytes.Buffer
+	if err := runEvents(
+		ctx, &eventsOut, repo, "", 0, 10, false,
+		time.Millisecond, true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var events eventsReport
+	if err := json.Unmarshal(eventsOut.Bytes(), &events); err != nil {
+		t.Fatal(err)
+	}
+
+	var doctorOut bytes.Buffer
+	if err := runDoctor(ctx, &doctorOut, false, "", true); err != nil {
+		t.Fatal(err)
+	}
+	var doctor doctorReport
+	if err := json.Unmarshal(doctorOut.Bytes(), &doctor); err != nil {
+		t.Fatal(err)
+	}
+	if len(doctor.Repos) != 1 {
+		t.Fatalf("doctor repos=%+v", doctor.Repos)
+	}
+	for name, replay := range map[string]replayObservabilityReport{
+		"status":   status.Replay,
+		"diagnose": diagnose.Replay,
+		"events":   events.Replay,
+		"doctor":   doctor.Repos[0].Replay,
+	} {
+		if replay.State != "needs_attention" ||
+			replay.ErrorRepeatCount != 4 ||
+			replay.LastError != "candidate planning failed" {
+			t.Fatalf("%s replay=%+v", name, replay)
+		}
+	}
+}

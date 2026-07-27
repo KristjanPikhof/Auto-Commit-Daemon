@@ -33,12 +33,13 @@ var eventsWatchPollInterval = defaultEventsWatchInterval
 var eventsWatchReadyHook func()
 
 type eventsReport struct {
-	Repo          string                `json:"repo"`
-	Cursor        int64                 `json:"cursor"`
-	Events        []eventEntry          `json:"events"`
-	Message       string                `json:"message,omitempty"`
-	Configuration configReadinessReport `json:"configuration"`
-	IntentV2      intentV2Report        `json:"intent_v2"`
+	Repo          string                    `json:"repo"`
+	Cursor        int64                     `json:"cursor"`
+	Events        []eventEntry              `json:"events"`
+	Message       string                    `json:"message,omitempty"`
+	Configuration configReadinessReport     `json:"configuration"`
+	Replay        replayObservabilityReport `json:"replay"`
+	IntentV2      intentV2Report            `json:"intent_v2"`
 }
 
 type eventEntry struct {
@@ -328,10 +329,14 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 			if err != nil {
 				return fmt.Errorf("acd events: configuration readiness: %w", err)
 			}
+			replay, err := loadReplayObservabilityReport(ctx, db)
+			if err != nil {
+				return fmt.Errorf("acd events: replay observability: %w", err)
+			}
 			enc.SetIndent("", "  ")
 			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor,
 				Events: entries, Message: message, Configuration: readiness,
-				IntentV2: intentV2})
+				Replay: replay, IntentV2: intentV2})
 		}
 		for _, entry := range entries {
 			if err := enc.Encode(entry); err != nil {
@@ -354,6 +359,12 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 			if readiness.Available {
 				fmt.Fprintln(out)
 			}
+		}
+		if replay, err := loadReplayObservabilityReport(ctx, db); err != nil {
+			return fmt.Errorf("acd events: replay observability: %w", err)
+		} else {
+			renderReplayObservabilityHuman(out, replay)
+			fmt.Fprintln(out)
 		}
 		if intentV2, err := loadIntentV2Report(ctx, db); err != nil {
 			return fmt.Errorf("acd events: Intent v2 summary: %w", err)

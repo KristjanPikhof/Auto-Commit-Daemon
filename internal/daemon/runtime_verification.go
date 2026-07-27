@@ -17,6 +17,20 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
+type intentRepairVerificationFailure struct {
+	Status    string
+	Output    string
+	CheckedTS float64
+}
+
+func (e *intentRepairVerificationFailure) Error() string {
+	status := strings.TrimSpace(e.Status)
+	if status == "" {
+		status = "needs_attention"
+	}
+	return "runtime repair verification: exact rebuilt commit check " + status
+}
+
 func runtimeIntentCandidateVerifier(
 	repoRoot string,
 	gitDir string,
@@ -76,6 +90,46 @@ func runtimeIntentCandidateVerifier(
 		currentParent = commitOID
 		return observed, nil
 	}
+}
+
+func runtimeIntentRepairCommitVerifier(
+	repoRoot string,
+	revisionID int64,
+	command verification.ApprovedCommand,
+) git.IntentRepairCommitVerifier {
+	return func(ctx context.Context, commitOID string, index int) error {
+		candidateID := fmt.Sprintf(
+			"repair-%d-%d-%s",
+			revisionID,
+			index,
+			shortRuntimeVerificationOID(commitOID),
+		)
+		result, err := (verification.Runner{}).Run(ctx, verification.Request{
+			RepoPath: repoRoot, CandidateID: candidateID,
+			CommitOID: commitOID, Command: command,
+		})
+		if err != nil {
+			return fmt.Errorf("runtime repair verification: %w", err)
+		}
+		if result.NeedsAttention ||
+			result.Status != verification.StatusPassed {
+			failure := &intentRepairVerificationFailure{
+				Status: string(result.Status), Output: result.Output,
+				CheckedTS: float64(time.Now().UTC().UnixNano()) / 1e9,
+			}
+			return fmt.Errorf("%w: %w",
+				git.ErrIntentRepairVerification, failure)
+		}
+		return nil
+	}
+}
+
+func shortRuntimeVerificationOID(oid string) string {
+	oid = strings.TrimSpace(oid)
+	if len(oid) > 12 {
+		return oid[:12]
+	}
+	return oid
 }
 
 func runtimeVerificationCandidateID(

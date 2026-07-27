@@ -251,6 +251,11 @@ func TestReplay_SelfHealsBlockedWhenHeadAlreadyMatches(t *testing.T) {
 	f.cctx.BaseHead = base
 
 	seq, _, _ := seedBlockedModify(t, ctx, f, "doc.md", beforeBlob, afterBlob, base)
+	for _, key := range replayErrorMetaTestKeys() {
+		if err := state.MetaSet(ctx, f.db, key, "stale"); err != nil {
+			t.Fatalf("seed replay metadata %s: %v", key, err)
+		}
+	}
 
 	// External committer lands the same after-state on top of base.
 	external := commitSingleFileTree(t, ctx, f.dir, "doc.md", afterBlob, "external lands after", base)
@@ -313,11 +318,7 @@ func TestReplay_SelfHealsBlockedWhenHeadAlreadyMatches(t *testing.T) {
 	}
 
 	// Breadcrumb meta keys cleared (no remaining blocked rows on this anchor).
-	for _, key := range []string{
-		"last_replay_conflict",
-		"last_replay_conflict_legacy",
-		"last_replay_error",
-	} {
+	for _, key := range replayErrorMetaTestKeys() {
 		v, ok, err := state.MetaGet(ctx, f.db, key)
 		if err != nil {
 			t.Fatalf("MetaGet %s: %v", key, err)

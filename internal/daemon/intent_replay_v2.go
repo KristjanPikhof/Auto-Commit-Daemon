@@ -3,13 +3,16 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -19,6 +22,13 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+)
+
+const (
+	metaIntentRepairFailedAttempt   = "intent.repair.failed_attempt"
+	metaIntentRepairFailedOutput    = "intent.repair.failed_output"
+	metaIntentRepairFailedStatus    = "intent.repair.failed_status"
+	metaIntentRepairFailedCheckedTS = "intent.repair.failed_checked_ts"
 )
 
 // replayIntentCandidateBatch connects the durable v2 candidate engine to the
@@ -158,6 +168,11 @@ func replayIntentCandidateBatch(
 		itemBySeq[item.event.Seq] = item
 	}
 	publishedCandidates := make(map[string]struct{})
+	visibleCandidateIDs := make(map[string]struct{},
+		len(evaluation.VisibleCandidateIDs))
+	for _, candidateID := range evaluation.VisibleCandidateIDs {
+		visibleCandidateIDs[candidateID] = struct{}{}
+	}
 	currentParent, currentTree := parent, parentTree
 	publishedAny := false
 	for _, decision := range evaluation.Decisions {
@@ -212,13 +227,16 @@ func replayIntentCandidateBatch(
 			}
 			repaired, publishedCount, repairErr := repairIntentCandidateDecision(
 				ctx, repoRoot, opts.GitDir, db, activeCtx, opts, decision,
-				selected, currentParent)
+				selected, currentParent, visibleCandidateIDs)
 			if repairErr != nil {
 				return sum, repairErr
 			}
 			if repaired.Status != state.IntentRepairCompleted {
 				sum.Skipped = true
 				sum.SkippedReason = "intent_v2_repair_" + repaired.Status
+				if repaired.Reason != "" {
+					sum.SkippedReason += "_" + repaired.Reason
+				}
 				return sum, nil
 			}
 			sum.Published += publishedCount
@@ -601,10 +619,23 @@ func repairIntentCandidateDecision(
 	decision IntentCandidateDecision,
 	selected []intentReplayItem,
 	currentParent string,
+	visibleCandidateIDs map[string]struct{},
 ) (IntentRepairResult, int, error) {
-	if !decision.Candidate.PublishedCommitOID.Valid {
-		return IntentRepairResult{}, 0,
-			errors.New("daemon: intent v2 repair: candidate has no published commit")
+	verificationRequired := opts.IntentVerificationMode == "fast" ||
+		opts.IntentVerificationMode == "full"
+	if verificationRequired && opts.IntentRepairCommitVerify == nil {
+		return IntentRepairResult{
+			Status: state.IntentRepairSkipped,
+			Reason: "repair_verification_unavailable",
+		}, 0, nil
+	}
+	sourceCommits, err := intentRepairCandidateSourceCommits(
+		ctx,
+		db,
+		decision.Candidate,
+	)
+	if err != nil {
+		return IntentRepairResult{}, 0, err
 	}
 	if !decision.Candidate.SoftPublicationDeadline.Valid ||
 		decision.Candidate.SoftPublicationDeadline.Float64 <=
@@ -614,7 +645,6 @@ func repairIntentCandidateDecision(
 			Reason: "repair_horizon_expired",
 		}, 0, nil
 	}
-	softCommit := decision.Candidate.PublishedCommitOID.String
 	repairLimit := opts.IntentRepairMaxCommits
 	if repairLimit <= 0 || repairLimit > git.MaxIntentRepairCommits {
 		repairLimit = git.MaxIntentRepairCommits
@@ -627,23 +657,52 @@ func repairIntentCandidateDecision(
 		return IntentRepairResult{}, 0, err
 	}
 	newestFirst := strings.Fields(string(out))
-	softIndex := -1
+	sourceSet := make(map[string]struct{}, len(sourceCommits))
+	for _, oid := range sourceCommits {
+		sourceSet[oid] = struct{}{}
+	}
+	oldestSourceIndex := -1
 	for i, oid := range newestFirst {
-		if oid == softCommit {
-			softIndex = i
-			break
+		if _, ok := sourceSet[oid]; ok && i > oldestSourceIndex {
+			oldestSourceIndex = i
 		}
 	}
-	if softIndex < 0 {
+	if oldestSourceIndex < 0 {
 		return IntentRepairResult{
 			Status: state.IntentRepairSkipped,
 			Reason: "repair_commit_outside_suffix",
 		}, 0, nil
 	}
-	suffix := append([]string(nil), newestFirst[:softIndex+1]...)
+	for oid := range sourceSet {
+		found := false
+		for _, suffixOID := range newestFirst[:oldestSourceIndex+1] {
+			if suffixOID == oid {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return IntentRepairResult{
+				Status: state.IntentRepairSkipped,
+				Reason: "repair_commit_outside_suffix",
+			}, 0, nil
+		}
+	}
+	suffix := append([]string(nil), newestFirst[:oldestSourceIndex+1]...)
 	for left, right := 0, len(suffix)-1; left < right; left, right = left+1, right-1 {
 		suffix[left], suffix[right] = suffix[right], suffix[left]
 	}
+	baseOut, err := git.Run(
+		ctx,
+		git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
+		"rev-parse",
+		suffix[0]+"^",
+	)
+	if err != nil {
+		return IntentRepairResult{}, 0,
+			fmt.Errorf("daemon: intent v2 repair: resolve suffix base: %w", err)
+	}
+	baseParent := strings.TrimSpace(string(baseOut))
 	captures := make([]IntentCandidateCapture, 0, len(selected))
 	paths := make(map[string]struct{})
 	pendingCount := 0
@@ -658,8 +717,14 @@ func repairIntentCandidateDecision(
 			paths[path] = struct{}{}
 		}
 	}
-	tree, err := materializeIntentCandidateTree(ctx, repoRoot, gitDir,
-		softCommit, captures)
+	tree, err := materializeIntentCandidateTreeFromSeed(
+		ctx,
+		repoRoot,
+		gitDir,
+		baseParent,
+		captures,
+		false,
+	)
 	if err != nil {
 		return IntentRepairResult{}, 0, err
 	}
@@ -667,13 +732,26 @@ func repairIntentCandidateDecision(
 	if decision.Assignment.Body != "" {
 		message += "\n\n" + decision.Assignment.Body
 	}
+	mergedReplaces := make([]string, 0, len(sourceSet))
+	for _, oldOID := range suffix {
+		if _, ok := sourceSet[oldOID]; ok {
+			mergedReplaces = append(mergedReplaces, oldOID)
+		}
+	}
 	plans := []IntentRepairCandidatePlan{{
 		CandidateID: decision.Candidate.ID,
-		Replaces:    []string{softCommit},
-		TreeOID:     tree, Message: message, AuthorOID: softCommit,
+		Replaces:    mergedReplaces,
+		TreeOID:     tree, Message: message, AuthorOID: mergedReplaces[0],
 	}}
+	mergedPaths := make(map[string]struct{}, len(paths))
+	for path := range paths {
+		mergedPaths[path] = struct{}{}
+	}
 	seedTree := tree
-	for _, oldOID := range suffix[1:] {
+	for _, oldOID := range suffix {
+		if _, merged := sourceSet[oldOID]; merged {
+			continue
+		}
 		candidate, ok, loadErr := state.IntentCandidateByPublishedCommit(
 			ctx, db, activeCtx.BranchRef, activeCtx.BranchGeneration, oldOID)
 		if loadErr != nil {
@@ -683,6 +761,23 @@ func repairIntentCandidateDecision(
 			return IntentRepairResult{
 				Status: state.IntentRepairSkipped,
 				Reason: "repair_suffix_not_acd_owned",
+			}, 0, nil
+		}
+		if _, visible := visibleCandidateIDs[candidate.ID]; !visible {
+			return IntentRepairResult{
+				Status: state.IntentRepairSkipped,
+				Reason: "repair_repartition_not_proven",
+			}, 0, nil
+		}
+		dependent, dependencyErr := intentRepairCapturesDependOnEachOther(
+			ctx, db, activeCtx, selected, candidate.Events)
+		if dependencyErr != nil {
+			return IntentRepairResult{}, 0, dependencyErr
+		}
+		if dependent {
+			return IntentRepairResult{
+				Status: state.IntentRepairSkipped,
+				Reason: "repair_repartition_dependency",
 			}, 0, nil
 		}
 		laterCaptures := make([]IntentCandidateCapture, 0, len(candidate.Events))
@@ -699,6 +794,12 @@ func repairIntentCandidateDecision(
 				Event: event, Ops: ops,
 			})
 			for _, touched := range touchedPaths(ops) {
+				if _, overlaps := mergedPaths[touched]; overlaps {
+					return IntentRepairResult{
+						Status: state.IntentRepairSkipped,
+						Reason: "repair_repartition_path_overlap",
+					}, 0, nil
+				}
 				paths[touched] = struct{}{}
 			}
 		}
@@ -726,14 +827,62 @@ func repairIntentCandidateDecision(
 		pathList = append(pathList, path)
 	}
 	sort.Strings(pathList)
-	result, err := ApplyIntentRepairTransaction(ctx, repoRoot, gitDir, db,
-		activeCtx, IntentRepairPlan{
-			BranchRef: activeCtx.BranchRef, BranchGeneration: activeCtx.BranchGeneration,
-			ExpectedHead: currentParent, Paths: pathList,
-			MaxCommits: repairLimit,
-			Candidates: plans,
-		})
+	repairPlan := IntentRepairPlan{
+		BranchRef: activeCtx.BranchRef, BranchGeneration: activeCtx.BranchGeneration,
+		ExpectedHead: currentParent, OldChain: suffix, Paths: pathList,
+		MaxCommits:   repairLimit,
+		Candidates:   plans,
+		VerifyCommit: opts.IntentRepairCommitVerify,
+	}
+	repairPlan.PlanDigest, err = intentRepairPlanDigest(
+		ctx, repoRoot, repairPlan)
+	if err != nil {
+		return IntentRepairResult{}, 0, err
+	}
+	attemptFingerprint := intentRepairAttemptFingerprint(
+		repairPlan.PlanDigest,
+		decision.Candidate.ConfigRevisionID,
+		opts.IntentVerificationMode,
+	)
+	if previous, ok, metaErr := state.MetaGet(
+		ctx, db, metaIntentRepairFailedAttempt); metaErr != nil {
+		return IntentRepairResult{}, 0, metaErr
+	} else if ok && previous == attemptFingerprint {
+		if restoreErr := restoreIntentRepairVerificationFailure(
+			ctx, db, decision.Candidate.ID); restoreErr != nil {
+			return IntentRepairResult{}, 0, restoreErr
+		}
+		return IntentRepairResult{
+			Status: state.IntentRepairSkipped,
+			Reason: "repair_verification_needs_attention",
+		}, 0, nil
+	}
+	result, err := ApplyIntentRepairTransaction(
+		ctx, repoRoot, gitDir, db, activeCtx, repairPlan)
+	if err != nil && errors.Is(err, git.ErrIntentRepairVerification) {
+		var verificationFailure *intentRepairVerificationFailure
+		if errors.As(err, &verificationFailure) {
+			if saveErr := saveIntentRepairVerificationFailure(
+				ctx, db, decision.Candidate.ID, verificationFailure); saveErr != nil {
+				return IntentRepairResult{}, 0, errors.Join(err, saveErr)
+			}
+		}
+		if metaErr := persistIntentRepairFailedAttempt(
+			ctx, db, attemptFingerprint, verificationFailure); metaErr != nil {
+			return IntentRepairResult{}, 0, errors.Join(err, metaErr)
+		}
+		return IntentRepairResult{
+			ID: result.ID, Status: state.IntentRepairFailed,
+			Reason: "repair_verification_needs_attention",
+		}, 0, nil
+	}
 	if err == nil && result.Status == state.IntentRepairCompleted {
+		_ = state.MetaSetMany(ctx, db, map[string]string{
+			metaIntentRepairFailedAttempt:   "",
+			metaIntentRepairFailedOutput:    "",
+			metaIntentRepairFailedStatus:    "",
+			metaIntentRepairFailedCheckedTS: "",
+		})
 		repairedCtx := activeCtx
 		repairedCtx.BaseHead = result.NewHead
 		for _, item := range selected {
@@ -742,6 +891,199 @@ func repairIntentCandidateDecision(
 		}
 	}
 	return result, pendingCount, err
+}
+
+func persistIntentRepairFailedAttempt(
+	ctx context.Context,
+	db *state.DB,
+	fingerprint string,
+	failure *intentRepairVerificationFailure,
+) error {
+	pairs := map[string]string{
+		metaIntentRepairFailedAttempt: fingerprint,
+	}
+	if failure != nil {
+		pairs[metaIntentRepairFailedOutput] = failure.Output
+		pairs[metaIntentRepairFailedStatus] = failure.Status
+		pairs[metaIntentRepairFailedCheckedTS] =
+			strconv.FormatFloat(failure.CheckedTS, 'f', -1, 64)
+	}
+	return state.MetaSetMany(ctx, db, pairs)
+}
+
+func restoreIntentRepairVerificationFailure(
+	ctx context.Context,
+	db *state.DB,
+	candidateID string,
+) error {
+	output, _, err := state.MetaGet(
+		ctx, db, metaIntentRepairFailedOutput)
+	if err != nil {
+		return err
+	}
+	status, _, err := state.MetaGet(
+		ctx, db, metaIntentRepairFailedStatus)
+	if err != nil {
+		return err
+	}
+	rawChecked, _, err := state.MetaGet(
+		ctx, db, metaIntentRepairFailedCheckedTS)
+	if err != nil {
+		return err
+	}
+	checkedTS, _ := strconv.ParseFloat(rawChecked, 64)
+	return saveIntentRepairVerificationFailure(
+		ctx, db, candidateID, &intentRepairVerificationFailure{
+			Status: status, Output: output, CheckedTS: checkedTS,
+		})
+}
+
+func intentRepairAttemptFingerprint(
+	planDigest string,
+	revisionID sql.NullInt64,
+	verificationMode string,
+) string {
+	var body strings.Builder
+	body.WriteString(planDigest)
+	body.WriteByte(0)
+	if revisionID.Valid {
+		body.WriteString(strconv.FormatInt(revisionID.Int64, 10))
+	}
+	body.WriteByte(0)
+	body.WriteString(verificationMode)
+	sum := sha256.Sum256([]byte(body.String()))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func saveIntentRepairVerificationFailure(
+	ctx context.Context,
+	db *state.DB,
+	candidateID string,
+	failure *intentRepairVerificationFailure,
+) error {
+	if failure == nil {
+		return nil
+	}
+	status := strings.TrimSpace(failure.Status)
+	if status == "" {
+		status = "needs_attention"
+	}
+	output := failure.Output
+	if len(output) > state.IntentVerificationOutputMaxBytes {
+		output = output[len(output)-state.IntentVerificationOutputMaxBytes:]
+	}
+	_, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='blocked', readiness='wait',
+    verification_status=?, verification_output=?, verification_ts=?,
+    updated_ts=?
+WHERE id=? AND status IN ('open','waiting','ready','soft_published','blocked')`,
+		status, output, failure.CheckedTS, failure.CheckedTS, candidateID)
+	if err != nil {
+		return fmt.Errorf(
+			"daemon: persist repair verification attention: %w", err)
+	}
+	return nil
+}
+
+func intentRepairCapturesDependOnEachOther(
+	ctx context.Context,
+	db *state.DB,
+	cctx CaptureContext,
+	selected []intentReplayItem,
+	otherEvents []state.IntentCandidateEvent,
+) (bool, error) {
+	selectedSeqs := make(map[int64]struct{}, len(selected))
+	for _, item := range selected {
+		selectedSeqs[item.event.Seq] = struct{}{}
+	}
+	otherSeqs := make(map[int64]struct{}, len(otherEvents))
+	for _, event := range otherEvents {
+		otherSeqs[event.EventSeq] = struct{}{}
+	}
+	dependencies, err := state.IntentCaptureDependenciesForPair(
+		ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+	if err != nil {
+		return false, err
+	}
+	for _, dependency := range dependencies {
+		if dependency.Strength != state.IntentDependencyHard {
+			continue
+		}
+		_, fromSelected := selectedSeqs[dependency.PrerequisiteSeq]
+		_, toSelected := selectedSeqs[dependency.DependentSeq]
+		_, fromOther := otherSeqs[dependency.PrerequisiteSeq]
+		_, toOther := otherSeqs[dependency.DependentSeq]
+		if (fromSelected && toOther) || (fromOther && toSelected) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func intentRepairCandidateSourceCommits(
+	ctx context.Context,
+	db *state.DB,
+	candidate state.IntentCandidate,
+) ([]string, error) {
+	seen := make(map[string]struct{})
+	var commits []string
+	add := func(oid string) {
+		oid = strings.TrimSpace(oid)
+		if oid == "" {
+			return
+		}
+		if _, ok := seen[oid]; ok {
+			return
+		}
+		seen[oid] = struct{}{}
+		commits = append(commits, oid)
+	}
+	if candidate.PublishedCommitOID.Valid {
+		add(candidate.PublishedCommitOID.String)
+	}
+	queue := []string{candidate.ID}
+	visited := make(map[string]struct{})
+	traversed := 0
+	for len(queue) > 0 {
+		targetID := queue[0]
+		queue = queue[1:]
+		if _, ok := visited[targetID]; ok {
+			continue
+		}
+		visited[targetID] = struct{}{}
+		lineage, err := state.IntentCandidateLineageForTarget(
+			ctx,
+			db,
+			candidate.BranchRef,
+			candidate.BranchGeneration,
+			targetID,
+			state.IntentCandidateLineageMaxPerPair,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"daemon: intent v2 repair: load candidate lineage: %w",
+				err,
+			)
+		}
+		for _, edge := range lineage {
+			traversed++
+			if traversed > state.IntentCandidateLineageMaxPerPair {
+				return nil, errors.New(
+					"daemon: intent v2 repair: candidate lineage cap exceeded",
+				)
+			}
+			if edge.SourcePublishedCommitOID.Valid {
+				add(edge.SourcePublishedCommitOID.String)
+			}
+			queue = append(queue, edge.SourceCandidateID)
+		}
+	}
+	if len(commits) == 0 {
+		return nil,
+			errors.New("daemon: intent v2 repair: candidate has no published commit lineage")
+	}
+	return commits, nil
 }
 
 func markIntentCandidatePublished(

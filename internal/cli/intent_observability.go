@@ -383,6 +383,19 @@ ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
 		&report.LastBoundaryEpoch); err != nil {
 		return report, errors.New("read Intent v2 boundary summary failed")
 	}
+	if replay, replayErr := loadReplayObservabilityReport(ctx, conn); replayErr == nil {
+		switch replay.State {
+		case "needs_attention":
+			report.ReplayState = "needs_attention"
+			if report.NeedsAttention == "" {
+				report.NeedsAttention = "Repeated replay error: " + replay.LastError
+			}
+		case "degraded":
+			if report.ReplayState == "" || report.ReplayState == "active" {
+				report.ReplayState = "degraded"
+			}
+		}
+	}
 	return report, nil
 }
 

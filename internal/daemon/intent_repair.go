@@ -21,8 +21,9 @@ const (
 	intentRepairBackupCap       = 50
 )
 
-// IntentRepairCandidatePlan is one rebuilt semantic candidate. Replaces must
-// be a consecutive partition of the complete oldest-to-newest repair chain.
+// IntentRepairCandidatePlan is one rebuilt semantic candidate. Replaces may
+// select non-contiguous commits when IntentRepairPlan.OldChain is present,
+// but must preserve their relative order within that old chain.
 type IntentRepairCandidatePlan struct {
 	CandidateID string
 	Replaces    []string
@@ -40,10 +41,16 @@ type IntentRepairPlan struct {
 	BranchRef        string
 	BranchGeneration int64
 	ExpectedHead     string
-	PlanDigest       string
-	Paths            []string
-	MaxCommits       int
-	Candidates       []IntentRepairCandidatePlan
+	// OldChain is the authoritative oldest-to-newest first-parent suffix.
+	// An empty value retains the legacy consecutive-partition contract.
+	OldChain   []string
+	PlanDigest string
+	Paths      []string
+	MaxCommits int
+	Candidates []IntentRepairCandidatePlan
+	// VerifyCommit runs the already-approved repository check against each
+	// exact rebuilt commit before Git changes any refs.
+	VerifyCommit git.IntentRepairCommitVerifier
 }
 
 type IntentRepairResult struct {
@@ -136,9 +143,11 @@ func ApplyIntentRepairTransaction(
 		return result, failPreparedIntentRepair(ctx, db, plan.ID, errors.New(reason))
 	}
 	applied, err := git.ApplyIntentRepair(ctx, repoRoot, git.IntentRepairApplyOptions{
-		Eligibility:  eligibility,
-		RepairID:     plan.ID,
-		Replacements: intentRepairGitReplacements(plan),
+		Eligibility:      eligibility,
+		RepairID:         plan.ID,
+		Replacements:     intentRepairGitReplacements(plan),
+		AllowRepartition: len(plan.OldChain) > 0,
+		VerifyCommit:     plan.VerifyCommit,
 	})
 	if err != nil {
 		return result, failPreparedIntentRepair(ctx, db, plan.ID, err)
@@ -478,15 +487,46 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 	}
 	var count int
 	seen := make(map[string]struct{})
+	oldPositions := make(map[string]int, len(plan.OldChain))
+	for position, oid := range plan.OldChain {
+		if oid == "" {
+			return errors.New("daemon: intent repair: empty old-chain oid")
+		}
+		if _, duplicate := oldPositions[oid]; duplicate {
+			return fmt.Errorf("daemon: intent repair: duplicate old-chain oid %s", oid)
+		}
+		oldPositions[oid] = position
+	}
+	lastCandidatePosition := -1
 	for _, candidate := range plan.Candidates {
 		if strings.TrimSpace(candidate.CandidateID) == "" ||
 			len(candidate.Replaces) == 0 || candidate.TreeOID == "" ||
 			strings.TrimSpace(candidate.Message) == "" {
 			return errors.New("daemon: intent repair: incomplete candidate replacement")
 		}
+		firstPosition := -1
+		previousPosition := -1
 		for _, oid := range candidate.Replaces {
 			if oid == "" {
 				return errors.New("daemon: intent repair: empty replaced oid")
+			}
+			if len(oldPositions) > 0 {
+				position, ok := oldPositions[oid]
+				if !ok {
+					return fmt.Errorf(
+						"daemon: intent repair: replacement %s is outside old chain",
+						oid,
+					)
+				}
+				if previousPosition >= position {
+					return errors.New(
+						"daemon: intent repair: candidate replacements do not preserve old-chain order",
+					)
+				}
+				if firstPosition < 0 {
+					firstPosition = position
+				}
+				previousPosition = position
 			}
 			if _, duplicate := seen[oid]; duplicate {
 				return fmt.Errorf("daemon: intent repair: duplicate replaced oid %s", oid)
@@ -494,9 +534,35 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 			seen[oid] = struct{}{}
 			count++
 		}
+		if firstPosition >= 0 {
+			if firstPosition <= lastCandidatePosition {
+				return errors.New(
+					"daemon: intent repair: candidates are not ordered by their earliest old commit",
+				)
+			}
+			lastCandidatePosition = firstPosition
+		}
 	}
 	if count > limit || count > git.MaxIntentRepairCommits {
 		return fmt.Errorf("daemon: intent repair: %d commits exceed limit %d", count, limit)
+	}
+	if len(plan.OldChain) > 0 {
+		if len(plan.OldChain) != count {
+			return errors.New(
+				"daemon: intent repair: candidates must partition the complete old chain",
+			)
+		}
+		if plan.OldChain[len(plan.OldChain)-1] != plan.ExpectedHead {
+			return errors.New("daemon: intent repair: old chain does not end at expected HEAD")
+		}
+		if _, ok := seen[plan.OldChain[0]]; !ok ||
+			len(plan.Candidates[0].Replaces) == 0 ||
+			plan.Candidates[0].Replaces[0] != plan.OldChain[0] {
+			return errors.New(
+				"daemon: intent repair: first candidate must own the oldest commit",
+			)
+		}
+		return nil
 	}
 	last := plan.Candidates[len(plan.Candidates)-1]
 	if last.Replaces[len(last.Replaces)-1] != plan.ExpectedHead {
@@ -506,13 +572,23 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 }
 
 func intentRepairEligibility(plan IntentRepairPlan) git.IntentRepairEligibilityOptions {
-	var commits []git.IntentRepairOwnedCommit
+	candidateByOID := make(map[string]string)
 	for _, candidate := range plan.Candidates {
 		for _, oid := range candidate.Replaces {
-			commits = append(commits, git.IntentRepairOwnedCommit{
-				OID: oid, CandidateID: candidate.CandidateID,
-			})
+			candidateByOID[oid] = candidate.CandidateID
 		}
+	}
+	chain := plan.OldChain
+	if len(chain) == 0 {
+		for _, candidate := range plan.Candidates {
+			chain = append(chain, candidate.Replaces...)
+		}
+	}
+	commits := make([]git.IntentRepairOwnedCommit, 0, len(chain))
+	for _, oid := range chain {
+		commits = append(commits, git.IntentRepairOwnedCommit{
+			OID: oid, CandidateID: candidateByOID[oid],
+		})
 	}
 	return git.IntentRepairEligibilityOptions{
 		BranchRef: plan.BranchRef, ExpectedHead: plan.ExpectedHead,

@@ -962,6 +962,709 @@ func TestIntentCandidateEngineFastFallbackMergesThroughPersistedCandidate(t *tes
 		t, config.PresetFast)
 }
 
+func TestIntentCandidateEngineFallbackMergesHardBridgeBetweenSoftCandidates(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	setNextIntentCandidateSeq(t, db, 6097)
+	left := appendIntentCandidateCapture(
+		t, db, "internal/left.go", "create", "", "left")
+	bridge := appendIntentCandidateCapture(
+		t, db, "internal/bridge.go", "create", "", "bridge")
+	setNextIntentCandidateSeq(t, db, 6105)
+	right := appendIntentCandidateCapture(
+		t, db, "internal/right.go", "create", "", "right")
+	if left.Event.Seq != 6097 || bridge.Event.Seq != 6098 ||
+		right.Event.Seq != 6105 {
+		t.Fatalf("production sequence fixture=%d,%d,%d",
+			left.Event.Seq, bridge.Event.Seq, right.Event.Seq)
+	}
+	saveSoftPublishedIntentCandidate(
+		t, db, "soft-left", left, "left-commit", 100)
+	saveSoftPublishedIntentCandidate(
+		t, db, "soft-right", right, "right-commit", 110)
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{bridge},
+		Hints: []IntentDependencyHint{
+			{
+				PrerequisiteSeq: left.Event.Seq,
+				DependentSeq:    bridge.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "left to bridge",
+			},
+			{
+				PrerequisiteSeq: bridge.Event.Seq,
+				DependentSeq:    right.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "bridge to right",
+			},
+		},
+		Now: time.Unix(120, 0),
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{6097, 6098, 6105},
+			) {
+				return fmt.Errorf("materialized hard bridge=%v", got)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates hard bridge: %v", err)
+	}
+	if result.Fallback != "verified_dependency_partition" ||
+		result.NeedsAttention || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable {
+		t.Fatalf("hard bridge result=%+v", result)
+	}
+	decision := result.Decisions[0]
+	if decision.Candidate.ID != "soft-left" ||
+		!reflect.DeepEqual(intentCandidateEventSeqs(decision.Candidate.Events),
+			[]int64{6097, 6098, 6105}) {
+		t.Fatalf("canonical hard bridge=%+v", decision.Candidate)
+	}
+	leftCandidate, ok, err := state.IntentCandidateByID(
+		ctx, db, "soft-left")
+	if err != nil || !ok ||
+		!reflect.DeepEqual(intentCandidateEventSeqs(leftCandidate.Events),
+			[]int64{6097, 6098, 6105}) {
+		t.Fatalf("persisted target=%+v ok=%v err=%v",
+			leftCandidate, ok, err)
+	}
+	rightCandidate, ok, err := state.IntentCandidateByID(
+		ctx, db, "soft-right")
+	if err != nil || !ok ||
+		rightCandidate.Status != state.IntentCandidateSuperseded ||
+		len(rightCandidate.Events) != 0 {
+		t.Fatalf("persisted source=%+v ok=%v err=%v",
+			rightCandidate, ok, err)
+	}
+	lineage, err := state.IntentCandidateLineageForTarget(
+		ctx, db, "refs/heads/main", 1, "soft-left", 10)
+	if err != nil || len(lineage) != 1 ||
+		lineage[0].SourceCandidateID != "soft-right" ||
+		lineage[0].SourceStatus != state.IntentCandidateSoftPublished ||
+		!lineage[0].SourcePublishedCommitOID.Valid ||
+		lineage[0].SourcePublishedCommitOID.String != "right-commit" {
+		t.Fatalf("hard bridge lineage=%+v err=%v", lineage, err)
+	}
+}
+
+func TestIntentCandidateEngineNativePlannerMergesHardBridgeBetweenCandidates(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	left := appendIntentCandidateCapture(
+		t, db, "left.go", "create", "", "left")
+	bridge := appendIntentCandidateCapture(
+		t, db, "bridge.go", "create", "", "bridge")
+	right := appendIntentCandidateCapture(
+		t, db, "right.go", "create", "", "right")
+	saveSoftPublishedIntentCandidate(
+		t, db, "native-left", left, "left-commit", 100)
+	saveSoftPublishedIntentCandidate(
+		t, db, "native-right", right, "right-commit", 110)
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "native-left", SelectedSeqs: []int64{bridge.Event.Seq},
+			Purpose: "complete the hard-linked change", Readiness: ai.IntentCandidateReady,
+			Subject:        "Complete hard-linked change",
+			GroupingReason: "hard bridge completes the persisted candidate",
+		}},
+	}}
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{bridge},
+		Hints: []IntentDependencyHint{
+			{
+				PrerequisiteSeq: left.Event.Seq,
+				DependentSeq:    bridge.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "left to bridge",
+			},
+			{
+				PrerequisiteSeq: bridge.Event.Seq,
+				DependentSeq:    right.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "bridge to right",
+			},
+		},
+		Now: time.Unix(120, 0), Planner: planner,
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if len(captures) != 3 {
+				return fmt.Errorf("native bridge materialized %d captures",
+					len(captures))
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates native hard bridge: %v", err)
+	}
+	if result.Fallback != "" || result.NeedsAttention ||
+		len(result.Decisions) != 1 || !result.Decisions[0].Publishable ||
+		result.Decisions[0].Candidate.ID != "native-left" ||
+		len(result.Decisions[0].Candidate.Events) != 3 {
+		t.Fatalf("native hard bridge result=%+v", result)
+	}
+	if len(planner.req.Candidates) != 1 ||
+		planner.req.Candidates[0].CandidateID != "native-left" ||
+		len(planner.req.Candidates[0].SelectedSeqs) != 2 {
+		t.Fatalf("canonical planner request candidates=%+v",
+			planner.req.Candidates)
+	}
+	rightCandidate, ok, err := state.IntentCandidateByID(
+		ctx, db, "native-right")
+	if err != nil || !ok ||
+		rightCandidate.Status != state.IntentCandidateSuperseded {
+		t.Fatalf("native source=%+v ok=%v err=%v",
+			rightCandidate, ok, err)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackKeepsA1B1A2Atomic(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	firstA := appendIntentCandidateCapture(
+		t, db, "internal/a.go", "create", "", "a1")
+	firstB := appendIntentCandidateCapture(
+		t, db, "internal/b.go", "create", "", "b1")
+	secondA := appendIntentCandidateCapture(
+		t, db, "internal/a.go", "modify", "a1", "a2")
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{firstA, firstB, secondA},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Decisions) != 2 {
+		t.Fatalf("fallback decisions=%+v", result.Decisions)
+	}
+	got := make([][]int64, 0, 2)
+	for _, decision := range result.Decisions {
+		if !decision.Publishable {
+			t.Fatalf("fallback decision not publishable=%+v", decision)
+		}
+		got = append(got, decision.Assignment.SelectedSeqs)
+	}
+	want := [][]int64{
+		{firstB.Event.Seq},
+		{firstA.Event.Seq, secondA.Event.Seq},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("A1,B1,A2 fallback=%v want=%v", got, want)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackDoesNotMegaGroupWeakEvidence(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	var captures []IntentCandidateCapture
+	var hints []IntentDependencyHint
+	for i := 0; i < 6; i++ {
+		capture := appendIntentCandidateCapture(
+			t, db, fmt.Sprintf("component-%d.go", i),
+			"create", "", fmt.Sprintf("value-%d", i))
+		captures = append(captures, capture)
+		if i > 0 {
+			hints = append(hints, IntentDependencyHint{
+				PrerequisiteSeq: captures[i-1].Event.Seq,
+				DependentSeq:    capture.Event.Seq,
+				Strength:        ai.IntentDependencySoft,
+				Kind:            "symbol_hash",
+				Evidence:        "shared weak symbol",
+			})
+		}
+	}
+	materializeCalls := 0
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: captures, Hints: hints,
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			materializeCalls++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Decisions) != len(captures) ||
+		materializeCalls != len(captures) ||
+		result.NeedsAttention {
+		t.Fatalf("weak evidence fallback=%+v materialize=%d",
+			result, materializeCalls)
+	}
+	for _, decision := range result.Decisions {
+		if len(decision.Assignment.SelectedSeqs) != 1 ||
+			!decision.Publishable {
+			t.Fatalf("weak evidence created mega-group=%+v", decision)
+		}
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackKeepsImportEvidenceSeparate(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	left := appendIntentCandidateCapture(
+		t, db, "left.go", "create", "", "left")
+	right := appendIntentCandidateCapture(
+		t, db, "right.go", "create", "", "right")
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{left, right},
+		Hints: []IntentDependencyHint{{
+			PrerequisiteSeq: left.Event.Seq,
+			DependentSeq:    right.Event.Seq,
+			Strength:        ai.IntentDependencySoft,
+			Kind:            "import_reference",
+			Evidence:        "reference similarity alone",
+		}},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NeedsAttention || len(result.Decisions) != 2 {
+		t.Fatalf("import-only fallback=%+v", result)
+	}
+	for _, decision := range result.Decisions {
+		if !decision.Publishable ||
+			len(decision.Assignment.SelectedSeqs) != 1 {
+			t.Fatalf("import evidence merged fallback=%+v", decision)
+		}
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackUsesUnambiguousTestCompanion(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	source := appendIntentCandidateCapture(
+		t, db, "feature.go", "create", "", "source")
+	test := appendIntentCandidateCapture(
+		t, db, "feature_test.go", "create", "", "test")
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{source, test},
+		Hints: []IntentDependencyHint{{
+			PrerequisiteSeq: source.Event.Seq,
+			DependentSeq:    test.Event.Seq,
+			Strength:        ai.IntentDependencySoft,
+			Kind:            "test_source",
+			Evidence:        "exact test companion",
+		}},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NeedsAttention || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable ||
+		!reflect.DeepEqual(result.Decisions[0].Assignment.SelectedSeqs,
+			[]int64{source.Event.Seq, test.Event.Seq}) {
+		t.Fatalf("unambiguous test companion=%+v", result)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousCompanions(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	source := appendIntentCandidateCapture(
+		t, db, "source.go", "create", "", "source")
+	first := appendIntentCandidateCapture(
+		t, db, "first_test.go", "create", "", "first")
+	second := appendIntentCandidateCapture(
+		t, db, "second_test.go", "create", "", "second")
+	materializeCalls := 0
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{source, first, second},
+		Hints: []IntentDependencyHint{
+			{
+				PrerequisiteSeq: source.Event.Seq,
+				DependentSeq:    first.Event.Seq,
+				Strength:        ai.IntentDependencySoft,
+				Kind:            "test_source",
+				Evidence:        "first possible companion",
+			},
+			{
+				PrerequisiteSeq: source.Event.Seq,
+				DependentSeq:    second.Event.Seq,
+				Strength:        ai.IntentDependencySoft,
+				Kind:            "test_source",
+				Evidence:        "second possible companion",
+			},
+		},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			materializeCalls++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.NeedsAttention || len(result.Decisions) != 3 ||
+		materializeCalls != 0 {
+		t.Fatalf("ambiguous fallback=%+v materialize=%d",
+			result, materializeCalls)
+	}
+	for _, decision := range result.Decisions {
+		if decision.Publishable ||
+			!strings.Contains(strings.Join(
+				decision.Assignment.MissingCompanions, " "),
+				"ambiguous") {
+			t.Fatalf("ambiguous companion published=%+v", decision)
+		}
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackHoldsOversizedHardComponent(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	captures := make([]IntentCandidateCapture, 0, 33)
+	before := ""
+	for i := 0; i < 33; i++ {
+		operation := "modify"
+		if i == 0 {
+			operation = "create"
+		}
+		after := fmt.Sprintf("version-%d", i)
+		captures = append(captures, appendIntentCandidateCapture(
+			t, db, "oversized.go", operation, before, after))
+		before = after
+	}
+	materializeCalls := 0
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: captures,
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			materializeCalls++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.NeedsAttention || len(result.Decisions) != 1 ||
+		result.Decisions[0].Publishable || materializeCalls != 0 ||
+		!strings.Contains(strings.Join(
+			result.Decisions[0].Assignment.MissingCompanions, " "),
+			"32 captures") {
+		t.Fatalf("oversized hard fallback=%+v materialize=%d",
+			result, materializeCalls)
+	}
+}
+
+func TestIntentCandidateEngineBalancedFallbackHoldsTooManyPaths(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	captures := make([]IntentCandidateCapture, 0, 13)
+	hints := make([]IntentDependencyHint, 0, 12)
+	for i := 0; i < 13; i++ {
+		capture := appendIntentCandidateCapture(
+			t, db, fmt.Sprintf("path-%02d.go", i),
+			"create", "", fmt.Sprintf("value-%d", i))
+		captures = append(captures, capture)
+		if i > 0 {
+			hints = append(hints, IntentDependencyHint{
+				PrerequisiteSeq: captures[i-1].Event.Seq,
+				DependentSeq:    capture.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "hard path chain",
+			})
+		}
+	}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: captures, Hints: hints,
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return errors.New("oversized fallback must not materialize")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.NeedsAttention || len(result.Decisions) != 1 ||
+		result.Decisions[0].Publishable ||
+		!strings.Contains(strings.Join(
+			result.Decisions[0].Assignment.MissingCompanions, " "),
+			"12 paths") {
+		t.Fatalf("path-capped hard fallback=%+v", result)
+	}
+}
+
+func TestIntentCandidateEngineFallbackMergesCrossCandidateHardClosure(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	leftFirst := appendIntentCandidateCapture(
+		t, db, "left-a.go", "create", "", "left-a")
+	leftLinked := appendIntentCandidateCapture(
+		t, db, "left-b.go", "create", "", "left-b")
+	bridge := appendIntentCandidateCapture(
+		t, db, "bridge.go", "create", "", "bridge")
+	rightLinked := appendIntentCandidateCapture(
+		t, db, "right-a.go", "create", "", "right-a")
+	rightLast := appendIntentCandidateCapture(
+		t, db, "right-b.go", "create", "", "right-b")
+	saveWaitingIntentCandidate(
+		t, db, "closure-left", 100, leftFirst, leftLinked)
+	saveWaitingIntentCandidate(
+		t, db, "closure-right", 110, rightLinked, rightLast)
+
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{bridge},
+		Hints: []IntentDependencyHint{
+			{
+				PrerequisiteSeq: leftLinked.Event.Seq,
+				DependentSeq:    bridge.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "left closure",
+			},
+			{
+				PrerequisiteSeq: bridge.Event.Seq,
+				DependentSeq:    rightLinked.Event.Seq,
+				Strength:        ai.IntentDependencyHard,
+				Kind:            "object_reference",
+				Evidence:        "right closure",
+			},
+		},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("provider unavailable"),
+		},
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if len(captures) != 5 {
+				return fmt.Errorf(
+					"materialized cross-candidate closure=%v",
+					intentCandidateCaptureSeqs(captures))
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates hard closure: %v", err)
+	}
+	if len(result.Decisions) != 1 ||
+		result.Decisions[0].Candidate.ID != "closure-left" ||
+		!result.Decisions[0].Publishable ||
+		len(result.Decisions[0].Candidate.Events) != 5 {
+		t.Fatalf("cross-candidate hard closure=%+v", result)
+	}
+}
+
+func TestIntentCandidateEngineHoldsOverCapHardContinuationWithoutErrors(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name   string
+		native bool
+	}{
+		{name: "fallback"},
+		{name: "native", native: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			left := make([]IntentCandidateCapture, 0, 128)
+			for i := 0; i < 128; i++ {
+				left = append(left, appendIntentCandidateCapture(
+					t, db, fmt.Sprintf("left/%03d.go", i),
+					"create", "", fmt.Sprintf("left-%d", i)))
+			}
+			bridge := appendIntentCandidateCapture(
+				t, db, "bridge.go", "create", "", "bridge")
+			right := make([]IntentCandidateCapture, 0, 128)
+			for i := 0; i < 128; i++ {
+				right = append(right, appendIntentCandidateCapture(
+					t, db, fmt.Sprintf("right/%03d.go", i),
+					"create", "", fmt.Sprintf("right-%d", i)))
+			}
+			saveWaitingIntentCandidate(
+				t, db, "cap-left", 100, left...)
+			saveWaitingIntentCandidate(
+				t, db, "cap-right", 110, right...)
+
+			planner := &intentCandidatePlannerStub{
+				err: errors.New("provider unavailable"),
+			}
+			if testCase.native {
+				planner.err = nil
+				planner.plan = ai.IntentPlanV2{
+					ProtocolVersion: ai.IntentPlannerProtocolV2,
+					Candidates: []ai.IntentCandidateAssignment{{
+						CandidateID:    "cap-left",
+						SelectedSeqs:   []int64{bridge.Event.Seq},
+						Purpose:        "complete the hard dependency closure",
+						Readiness:      ai.IntentCandidateReady,
+						Subject:        "Complete hard dependency closure",
+						GroupingReason: "bridge joins durable candidates",
+					}},
+				}
+			}
+			materializeCalls := 0
+			input := IntentCandidateEvaluation{
+				BranchRef: "refs/heads/main", BranchGeneration: 1,
+				Captures: []IntentCandidateCapture{bridge},
+				Hints: []IntentDependencyHint{
+					{
+						PrerequisiteSeq: left[len(left)-1].Event.Seq,
+						DependentSeq:    bridge.Event.Seq,
+						Strength:        ai.IntentDependencyHard,
+						Kind:            "object_reference",
+						Evidence:        "left cap bridge",
+					},
+					{
+						PrerequisiteSeq: bridge.Event.Seq,
+						DependentSeq:    right[0].Event.Seq,
+						Strength:        ai.IntentDependencyHard,
+						Kind:            "object_reference",
+						Evidence:        "right cap bridge",
+					},
+				},
+				Planner: planner, Preset: config.PresetBalanced,
+				VerificationMode: "structural",
+				Materialize: func(
+					context.Context,
+					[]IntentCandidateCapture,
+				) error {
+					materializeCalls++
+					return errors.New("over-cap closure must not materialize")
+				},
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				result, err := EvaluateIntentCandidates(ctx, db, input)
+				if err != nil {
+					t.Fatalf("attempt %d returned replay-loop error: %v",
+						attempt+1, err)
+				}
+				if !result.NeedsAttention ||
+					len(result.Decisions) != 1 ||
+					result.Decisions[0].Publishable ||
+					result.Decisions[0].Assignment.Readiness !=
+						ai.IntentCandidateWait ||
+					!strings.Contains(strings.Join(
+						result.Decisions[0].Assignment.MissingCompanions,
+						" "), "256-capture") {
+					t.Fatalf("attempt %d over-cap hold=%+v",
+						attempt+1, result)
+				}
+			}
+			if materializeCalls != 0 {
+				t.Fatalf("over-cap materialization calls=%d",
+					materializeCalls)
+			}
+			for candidateID, wantEvents := range map[string]int{
+				"cap-left": 128, "cap-right": 128,
+			} {
+				candidate, ok, err := state.IntentCandidateByID(
+					ctx, db, candidateID)
+				if err != nil || !ok ||
+					candidate.Status != state.IntentCandidateWaiting ||
+					len(candidate.Events) != wantEvents {
+					t.Fatalf("candidate %s=%+v ok=%v err=%v",
+						candidateID, candidate, ok, err)
+				}
+			}
+			lineage, err := state.IntentCandidateLineageForTarget(
+				ctx, db, "refs/heads/main", 1, "cap-left", 10)
+			if err != nil || len(lineage) != 0 {
+				t.Fatalf("over-cap lineage=%+v err=%v", lineage, err)
+			}
+		})
+	}
+}
+
 func testIntentCandidateFallbackMergesThroughPersistedCandidate(
 	t *testing.T,
 	preset config.PresetName,
@@ -1423,6 +2126,109 @@ func appendIntentCandidateCapture(
 		fixture.Ops[i].EventSeq = seq
 	}
 	return fixture
+}
+
+func setNextIntentCandidateSeq(t *testing.T, db *state.DB, next int64) {
+	t.Helper()
+	if next <= 0 {
+		t.Fatalf("invalid next capture seq %d", next)
+	}
+	ctx := context.Background()
+	if _, err := db.SQL().ExecContext(
+		ctx, `DELETE FROM sqlite_sequence WHERE name='capture_events'`,
+	); err != nil {
+		t.Fatalf("clear capture sequence: %v", err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO sqlite_sequence(name, seq) VALUES('capture_events', ?)`,
+		next-1,
+	); err != nil {
+		t.Fatalf("set capture sequence: %v", err)
+	}
+}
+
+func saveSoftPublishedIntentCandidate(
+	t *testing.T,
+	db *state.DB,
+	id string,
+	capture IntentCandidateCapture,
+	commitOID string,
+	updated float64,
+) {
+	t.Helper()
+	deadline := updated + 600
+	if err := state.SaveIntentCandidate(
+		context.Background(), db, state.IntentCandidate{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 1,
+			Status:    state.IntentCandidateSoftPublished,
+			Purpose:   "soft-published candidate",
+			CreatedTS: updated, UpdatedTS: updated,
+			Readiness: state.IntentReadinessReady,
+			AtomicityStatus: sql.NullString{
+				String: string(ai.IntentAtomicityPassed), Valid: true,
+			},
+			SoftPublicationDeadline: sql.NullFloat64{
+				Float64: deadline, Valid: true,
+			},
+			PublishedCommitOID: sql.NullString{
+				String: commitOID, Valid: true,
+			},
+			Events: []state.IntentCandidateEvent{{
+				EventSeq:  capture.Event.Seq,
+				EventRole: intentCaptureRole(capture),
+			}},
+		},
+	); err != nil {
+		t.Fatalf("save soft candidate %s: %v", id, err)
+	}
+}
+
+func saveWaitingIntentCandidate(
+	t *testing.T,
+	db *state.DB,
+	id string,
+	updated float64,
+	captures ...IntentCandidateCapture,
+) {
+	t.Helper()
+	events := make([]state.IntentCandidateEvent, 0, len(captures))
+	for _, capture := range captures {
+		events = append(events, state.IntentCandidateEvent{
+			EventSeq:  capture.Event.Seq,
+			EventRole: intentCaptureRole(capture),
+		})
+	}
+	if err := state.SaveIntentCandidate(
+		context.Background(), db, state.IntentCandidate{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 1,
+			Status:    state.IntentCandidateWaiting,
+			Purpose:   "persist hard closure",
+			CreatedTS: updated, UpdatedTS: updated,
+			Readiness: state.IntentReadinessWait, Events: events,
+		},
+	); err != nil {
+		t.Fatalf("save waiting candidate %s: %v", id, err)
+	}
+}
+
+func intentCandidateCaptureSeqs(
+	captures []IntentCandidateCapture,
+) []int64 {
+	out := make([]int64, 0, len(captures))
+	for _, capture := range captures {
+		out = append(out, capture.Event.Seq)
+	}
+	return out
+}
+
+func intentCandidateEventSeqs(
+	events []state.IntentCandidateEvent,
+) []int64 {
+	out := make([]int64, 0, len(events))
+	for _, event := range events {
+		out = append(out, event.EventSeq)
+	}
+	return out
 }
 
 func intentCandidateCaptureFixture(

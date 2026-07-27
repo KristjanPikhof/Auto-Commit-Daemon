@@ -336,7 +336,7 @@ SELECT event_seq, branch_ref, status FROM publish_state WHERE id = 1`).Scan(
 		t.Fatalf("unrelated bookkeeping changed: planner=%d pub=(%d,%q,%q)",
 			plannerCount, pubSeq, pubRef, pubStatus)
 	}
-	for _, key := range []string{"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error"} {
+	for _, key := range replayRecoveryMetaTestKeys() {
 		if value, ok, err := MetaGet(ctx, d, key); err != nil || !ok || value != "stale" {
 			t.Fatalf("unrelated meta %s=(%q,%v,%v), want stale,true,nil", key, value, ok, err)
 		}
@@ -414,7 +414,7 @@ VALUES (?, 1, 1)`, seq); err != nil {
 			t.Fatalf("seed planner state seq=%d: %v", seq, err)
 		}
 	}
-	for _, key := range []string{"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error"} {
+	for _, key := range replayRecoveryMetaTestKeys() {
 		if err := MetaSet(ctx, d, key, "stale"); err != nil {
 			t.Fatalf("seed meta %s: %v", key, err)
 		}
@@ -537,10 +537,20 @@ func assertRecoveryBookkeeping(t *testing.T, d *DB, snapshot RecoverySnapshot, c
 	if status != wantStatus || eventSeq.Valid {
 		t.Fatalf("publish breadcrumb=(%q,%+v) want %s,NULL", status, eventSeq, wantStatus)
 	}
-	for _, key := range []string{"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error"} {
+	for _, key := range replayRecoveryMetaTestKeys() {
 		if _, ok, err := MetaGet(ctx, d, key); err != nil || ok {
 			t.Fatalf("meta %s after transition: ok=%v err=%v want absent", key, ok, err)
 		}
+	}
+}
+
+func replayRecoveryMetaTestKeys() []string {
+	return []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"replay.error_repeat_count",
+		"replay.error_last_seen_ts",
 	}
 }
 
