@@ -3720,6 +3720,157 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	}
 }
 
+// TestRun_SelfPublicationBoundary_MultiGroupHeadAdvanceBeforeTokenAdoption
+// reproduces the liveness window seen when one publication pass advances HEAD
+// more than once while the run loop still holds its pre-pass branch token.
+//
+// The existing beforeBranchTokenCheck seam is the closest production boundary
+// available before journaled publication hooks land. Holding it gives the test
+// a deterministic boundary: no scheduler sleeps are involved, and the daemon
+// cannot sample or adopt either group while the gate is closed. The assertions
+// pin the observable pre-adoption signature (stale durable token and heartbeat,
+// plus a pending flush), then prove the loop converges without an archive or a
+// duplicate commit after the gate opens.
+func TestRun_SelfPublicationBoundary_MultiGroupHeadAdvanceBeforeTokenAdoption(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              manual,
+			BootGrace:              30 * time.Second,
+			MessageFn:              DeterministicMessage,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(seedHead, "refs/heads/main"), 2*time.Second)
+
+	before, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load gated daemon state: ok=%v err=%v", ok, err)
+	}
+	if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false,
+		sql.NullString{String: "self-publication boundary", Valid: true}); err != nil {
+		t.Fatalf("enqueue boundary flush: %v", err)
+	}
+
+	// These two commits model two Intent groups published in one replay pass.
+	// The daemon remains parked before its next token sample throughout.
+	if err := os.WriteFile(filepath.Join(f.dir, "group-one.txt"),
+		[]byte("group one\n"), 0o644); err != nil {
+		t.Fatalf("write group one: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "group-one.txt"); err != nil {
+		t.Fatalf("add group one: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "group one"); err != nil {
+		t.Fatalf("commit group one: %v", err)
+	}
+	groupOneHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse group one: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(f.dir, "group-two.txt"),
+		[]byte("group two\n"), 0o644); err != nil {
+		t.Fatalf("write group two: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "group-two.txt"); err != nil {
+		t.Fatalf("add group two: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "group two"); err != nil {
+		t.Fatalf("commit group two: %v", err)
+	}
+	groupTwoHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse group two: %v", err)
+	}
+	if groupOneHead == seedHead || groupTwoHead == groupOneHead {
+		t.Fatalf("test setup did not produce two HEAD advances: seed=%s group1=%s group2=%s",
+			seedHead, groupOneHead, groupTwoHead)
+	}
+
+	// The closed gate is the synchronization proof: these observations are
+	// made while the run loop cannot possibly have sampled the new HEAD.
+	if got, _, err := state.MetaGet(ctx, f.db, MetaKeyBranchHead); err != nil || got != seedHead {
+		t.Fatalf("gated branch.head=%q err=%v want stale seed %s", got, err, seedHead)
+	}
+	if got := countFlushByStatus(t, f.db, "pending"); got != 1 {
+		t.Fatalf("gated pending flushes=%d want 1", got)
+	}
+	during, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load daemon state during gate: ok=%v err=%v", ok, err)
+	}
+	if during.HeartbeatTS != before.HeartbeatTS {
+		t.Fatalf("heartbeat advanced across closed boundary: before=%f during=%f",
+			before.HeartbeatTS, during.HeartbeatTS)
+	}
+
+	releaseCheck()
+
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, groupTwoHead, 3*time.Second)
+	waitFor(t, 3*time.Second, "boundary flush completes", func() bool {
+		return countFlushByStatus(t, f.db, "completed") == 1
+	})
+
+	if got, _, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration); err != nil || got != "1" {
+		t.Fatalf("branch generation=%q err=%v want stable generation 1", got, err)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0 for the linear two-group advance", archives)
+	}
+	out, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "rev-list", "--count",
+		seedHead+".."+groupTwoHead)
+	if err != nil {
+		t.Fatalf("count publication commits: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "2" {
+		t.Fatalf("publication commit count=%s want exactly 2", got)
+	}
+}
+
 // TestRun_FlushDrainBoundedByLimit pins the regression where the flush
 // drain loop ran without an upper bound. A 1500-row burst would block the
 // rest of the run loop (capture/replay, refcount sweep, heartbeat) until
