@@ -4386,6 +4386,9 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	if got := countFlushByStatus(t, f.db, "pending"); got != 536 {
 		t.Fatalf("after boot iteration: pending=%d want 536", got)
 	}
+	if got := countFlushByStatus(t, f.db, "acknowledged"); got != 0 {
+		t.Fatalf("after boot iteration: acknowledged=%d want 0", got)
+	}
 
 	// Drive a second iteration via wakeCh. Bound still holds → 128/472.
 	wakeCh <- struct{}{}
@@ -4397,6 +4400,19 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	}
 	if got := countFlushByStatus(t, f.db, "pending"); got != 472 {
 		t.Fatalf("after second iteration: pending=%d want 472", got)
+	}
+	if got := countFlushByStatus(t, f.db, "acknowledged"); got != 0 {
+		t.Fatalf("after second iteration: acknowledged=%d want 0", got)
+	}
+	var flushedNotes int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM flush_requests
+WHERE status = 'completed' AND note = 'flushed'`).Scan(&flushedNotes); err != nil {
+		t.Fatalf("count flushed notes: %v", err)
+	}
+	if flushedNotes != 128 {
+		t.Fatalf("completed flushed notes=%d want 128", flushedNotes)
 	}
 }
 
@@ -4501,8 +4517,8 @@ func waitFor(t *testing.T, budget time.Duration, what string, cond func() bool) 
 }
 
 // TestRun_FlushDrainCancelable pins the regression where SIGTERM during a
-// large flush drain was starved until the entire queue drained. The inner
-// loop now checks ctx.Err on every iteration and breaks immediately.
+// large flush drain was starved until the entire queue drained. Each drain is
+// one bounded statement and the run loop checks cancellation around it.
 func TestRun_FlushDrainCancelable(t *testing.T) {
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -4546,8 +4562,8 @@ func TestRun_FlushDrainCancelable(t *testing.T) {
 	// of 1500 rows would dwarf this budget on slow hosts; the bounded +
 	// cancelable drain exits within at most one bounded pass plus
 	// shutdown overhead. The 5s budget accommodates a slow Linux runner
-	// under -race -count=3 finishing the in-progress bounded pass
-	// (DefaultFlushLimit=256 sqlite writes) before the cancel check fires.
+	// under -race -count=3 finishing the in-progress bounded statement
+	// (DefaultFlushLimit=256 rows) before the cancel check fires.
 	start := time.Now()
 	shutdownCh <- struct{}{}
 	select {
@@ -4841,8 +4857,8 @@ func TestRun_GitOperationStatErrorRecovers(t *testing.T) {
 	}
 }
 
-// TestRun_FlushDrainExitsOnShutdownCh pins the fix that adds a non-blocking
-// shutdownCh check to the inner flush-drain loop. A caller using a non-
+// TestRun_FlushDrainExitsOnShutdownCh pins the non-blocking shutdownCh checks
+// around each bounded flush batch. A caller using a non-
 // cancelable ctx (context.Background) and signaling shutdown via the
 // channel must observe the daemon exit promptly — not after the entire
 // bounded drain (~hundreds of rows × per-row claim cost) elapses.
@@ -4862,9 +4878,8 @@ func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
 	shutdownCh := make(chan struct{}, 1)
 
 	// Crucial: use a non-cancelable ctx so the only exit signal is
-	// shutdownCh. Without the new arm in the drain inner loop, the
-	// drain would have to finish (or the bounded pass complete) before
-	// the run loop notices the signal.
+	// shutdownCh. Without the checks around the bounded statement, the
+	// drain would have to finish before the run loop notices the signal.
 	bgCtx := context.Background()
 
 	for i := 0; i < 1500; i++ {
@@ -4910,7 +4925,7 @@ func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
 	case <-exited:
 		elapsed := time.Since(start)
 		// 2s budget tolerates -race + a slow CI runner finishing the
-		// in-flight per-row claim. Pre-fix worst-case was ~7.5s.
+		// in-flight bounded statement. Pre-fix worst-case was ~7.5s.
 		if elapsed > 2*time.Second {
 			t.Fatalf("Run took %v to exit on shutdownCh; want <=2s (drain not shutdown-aware)",
 				elapsed)

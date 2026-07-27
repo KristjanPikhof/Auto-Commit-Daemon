@@ -38,6 +38,7 @@ type SelfPublicationRecoverySummary struct {
 	Inspected      int
 	Completed      int
 	Abandoned      int
+	HasMore        bool
 	FinalTargetOID string
 	Results        []SelfPublicationRecoveryResult
 }
@@ -51,7 +52,7 @@ func RecoverSelfPublications(
 	repoRoot string,
 	db *state.DB,
 	cctx CaptureContext,
-	_ ReplayOpts,
+	opts ReplayOpts,
 ) (SelfPublicationRecoverySummary, error) {
 	var summary SelfPublicationRecoverySummary
 	if ctx == nil {
@@ -69,13 +70,18 @@ func RecoverSelfPublications(
 		return summary, err
 	}
 
-	publications, err := recoverableSelfPublicationsForPair(
+	limit := opts.Limit
+	if limit <= 0 || limit > selfPublicationRecoveryLimit {
+		limit = selfPublicationRecoveryLimit
+	}
+	publications, hasMore, err := recoverableSelfPublicationsForPair(
 		ctx, db, cctx.BranchRef, cctx.BranchGeneration,
-		selfPublicationRecoveryLimit)
+		limit)
 	if err != nil {
 		return summary, fmt.Errorf(
 			"daemon: load recoverable self-publications: %w", err)
 	}
+	summary.HasMore = hasMore
 	for _, publication := range publications {
 		if err := ctx.Err(); err != nil {
 			return summary, err
@@ -104,7 +110,7 @@ func recoverableSelfPublicationsForPair(
 	branchRef string,
 	branchGeneration int64,
 	limit int,
-) ([]state.SelfPublication, error) {
+) ([]state.SelfPublication, bool, error) {
 	if limit <= 0 || limit > selfPublicationRecoveryLimit {
 		limit = selfPublicationRecoveryLimit
 	}
@@ -116,37 +122,54 @@ WHERE branch_ref=? AND branch_generation=?
 ORDER BY created_ts, id
 LIMIT ?`, branchRef, branchGeneration, limit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, false, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return nil, err
+		return nil, false, err
 	}
 	if err := rows.Close(); err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	var hasMore bool
+	if len(ids) == limit {
+		if err := db.SQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+	SELECT 1
+	FROM self_publications
+	WHERE branch_ref=? AND branch_generation=?
+	  AND phase IN ('prepared','git_applied')
+	  AND (created_ts, id) > (
+	      SELECT created_ts, id
+	      FROM self_publications
+	      WHERE id=?
+	  )
+)`, branchRef, branchGeneration, ids[len(ids)-1]).Scan(&hasMore); err != nil {
+			return nil, false, err
+		}
 	}
 	publications := make([]state.SelfPublication, 0, len(ids))
 	for _, id := range ids {
 		publication, ok, err := state.SelfPublicationByID(ctx, db, id)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if !ok {
-			return nil, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"self-publication %s changed during recovery load", id)
 		}
 		publications = append(publications, publication)
 	}
-	return publications, nil
+	return publications, hasMore, nil
 }
 
 func recoverSelfPublication(

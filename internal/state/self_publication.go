@@ -292,59 +292,65 @@ func CompleteSelfPublication(
 		return false, fmt.Errorf("%w: %s -> %s",
 			ErrSelfPublicationPhaseConflict, current.Phase, SelfPublicationCompleted)
 	}
-	if err := validateSelfPublicationOwnership(ctx, tx, current, true); err != nil {
+	if err := validateStoredSelfPublicationOwnership(ctx, tx, current); err != nil {
 		return false, err
 	}
 
-	for _, member := range current.Members {
-		res, err := tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 UPDATE capture_events
 SET state=?, commit_oid=?, error=NULL, message=?, published_ts=?
-WHERE seq=? AND branch_ref=? AND branch_generation=? AND state=?`,
-			EventStatePublished, current.TargetCommitOID, completion.Message,
-			completion.PublishedTS, member.EventSeq, current.BranchRef,
-			current.BranchGeneration, EventStatePending)
-		if err != nil {
-			return false, fmt.Errorf("state: settle self-publication event %d: %w",
-				member.EventSeq, err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return false, fmt.Errorf("state: count settled self-publication event %d: %w",
-				member.EventSeq, err)
-		}
-		if n != 1 {
-			return false, fmt.Errorf("%w: event %d is no longer pending",
-				ErrSelfPublicationOwnershipChanged, member.EventSeq)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM planner_state WHERE event_seq=?`, member.EventSeq); err != nil {
-			return false, fmt.Errorf("state: clear self-publication planner state: %w", err)
-		}
+WHERE seq IN (
+    SELECT event_seq FROM self_publication_members WHERE publication_id=?
+)
+  AND branch_ref=? AND branch_generation=? AND state=?`,
+		EventStatePublished, current.TargetCommitOID, completion.Message,
+		completion.PublishedTS, current.ID, current.BranchRef,
+		current.BranchGeneration, EventStatePending)
+	if err != nil {
+		return false, fmt.Errorf("state: settle self-publication events: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("state: count settled self-publication events: %w", err)
+	}
+	if n != int64(len(current.Members)) {
+		return false, fmt.Errorf("%w: settled events=%d want=%d",
+			ErrSelfPublicationOwnershipChanged, n, len(current.Members))
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM planner_state
+WHERE event_seq IN (
+    SELECT event_seq FROM self_publication_members WHERE publication_id=?
+)`, current.ID); err != nil {
+		return false, fmt.Errorf("state: clear self-publication planner state: %w", err)
 	}
 
 	candidates := distinctSelfPublicationCandidates(current.Members)
-	for _, candidateID := range candidates {
-		res, err := tx.ExecContext(ctx, `
+	if len(candidates) > 0 {
+		res, err = tx.ExecContext(ctx, `
 UPDATE intent_candidates
 SET status=?, published_commit_oid=?, soft_publication_deadline=?,
     updated_ts=?
-WHERE id=? AND branch_ref=? AND branch_generation=? AND status='ready'`,
+WHERE id IN (
+    SELECT DISTINCT candidate_id
+    FROM self_publication_members
+    WHERE publication_id=? AND candidate_id IS NOT NULL
+)
+  AND branch_ref=? AND branch_generation=? AND status='ready'`,
 			completion.CandidateStatus, current.TargetCommitOID,
 			completion.SoftPublicationDeadline, completion.PublishedTS,
-			candidateID, current.BranchRef, current.BranchGeneration)
+			current.ID, current.BranchRef, current.BranchGeneration)
 		if err != nil {
-			return false, fmt.Errorf("state: settle self-publication candidate %s: %w",
-				candidateID, err)
+			return false, fmt.Errorf("state: settle self-publication candidates: %w", err)
 		}
-		n, err := res.RowsAffected()
+		n, err = res.RowsAffected()
 		if err != nil {
-			return false, fmt.Errorf("state: count settled self-publication candidate %s: %w",
-				candidateID, err)
+			return false, fmt.Errorf("state: count settled self-publication candidates: %w",
+				err)
 		}
-		if n != 1 {
-			return false, fmt.Errorf("%w: candidate %s is no longer ready",
-				ErrSelfPublicationOwnershipChanged, candidateID)
+		if n != int64(len(candidates)) {
+			return false, fmt.Errorf("%w: settled candidates=%d want=%d",
+				ErrSelfPublicationOwnershipChanged, n, len(candidates))
 		}
 	}
 
@@ -381,7 +387,7 @@ ON CONFLICT(key) DO UPDATE SET
 			return false, fmt.Errorf("state: settle self-publication meta %s: %w", key, err)
 		}
 	}
-	res, err := tx.ExecContext(ctx, `
+	res, err = tx.ExecContext(ctx, `
 UPDATE self_publications
 SET phase=?, updated_ts=?, completed_ts=?, error=''
 WHERE id=? AND phase=?
@@ -396,7 +402,7 @@ WHERE id=? AND phase=?
 	if err != nil {
 		return false, fmt.Errorf("state: complete self-publication journal: %w", err)
 	}
-	n, err := res.RowsAffected()
+	n, err = res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("state: count completed self-publication: %w", err)
 	}
@@ -789,6 +795,144 @@ WHERE candidate_id=? AND membership_state='active'`,
 			return fmt.Errorf("%w: candidate %s membership count=%d want=%d",
 				ErrSelfPublicationOwnershipChanged, candidateID, activeCount, expected)
 		}
+	}
+	return nil
+}
+
+// validateStoredSelfPublicationOwnership validates a persisted journal with
+// set-based queries. Completion holds SQLite's single writer transaction, so
+// avoiding per-member reads keeps the atomic settlement below the daemon
+// heartbeat interval even at the 256-event/128-candidate caps.
+func validateStoredSelfPublicationOwnership(
+	ctx context.Context,
+	q selfPublicationQueryer,
+	publication SelfPublication,
+) error {
+	var exactPending int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publication_members membership
+JOIN capture_events event
+  ON event.seq=membership.event_seq
+ AND event.branch_ref=?
+ AND event.branch_generation=?
+ AND event.state=?
+WHERE membership.publication_id=?`,
+		publication.BranchRef, publication.BranchGeneration,
+		EventStatePending, publication.ID).Scan(&exactPending); err != nil {
+		return fmt.Errorf("state: inspect stored self-publication events: %w", err)
+	}
+	if exactPending != len(publication.Members) {
+		return fmt.Errorf("%w: exact pending events=%d want=%d",
+			ErrSelfPublicationOwnershipChanged, exactPending,
+			len(publication.Members))
+	}
+
+	var overlapping int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publication_members owned
+JOIN self_publication_members other
+  ON other.event_seq=owned.event_seq
+ AND other.publication_id<>owned.publication_id
+JOIN self_publications publication
+  ON publication.id=other.publication_id
+ AND publication.phase IN ('prepared','git_applied','completed')
+WHERE owned.publication_id=?`, publication.ID).Scan(&overlapping); err != nil {
+		return fmt.Errorf("state: inspect overlapping self-publication ownership: %w", err)
+	}
+	if overlapping != 0 {
+		return fmt.Errorf("%w: %d events have overlapping live publications",
+			ErrSelfPublicationOwnershipChanged, overlapping)
+	}
+
+	var eventOnlyActive int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publication_members owned
+JOIN intent_candidate_events membership
+  ON membership.event_seq=owned.event_seq
+ AND membership.membership_state='active'
+WHERE owned.publication_id=? AND owned.candidate_id IS NULL`,
+		publication.ID).Scan(&eventOnlyActive); err != nil {
+		return fmt.Errorf("state: inspect event-only self-publication ownership: %w", err)
+	}
+	if eventOnlyActive != 0 {
+		return fmt.Errorf("%w: %d event-only members have active candidate ownership",
+			ErrSelfPublicationOwnershipChanged, eventOnlyActive)
+	}
+
+	expectedCandidateMembers := 0
+	for _, member := range publication.Members {
+		if member.CandidateID.Valid {
+			expectedCandidateMembers++
+		}
+	}
+	if expectedCandidateMembers == 0 {
+		return nil
+	}
+	var readyCandidateMembers int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publication_members owned
+JOIN intent_candidates candidate
+  ON candidate.id=owned.candidate_id
+ AND candidate.branch_ref=?
+ AND candidate.branch_generation=?
+ AND candidate.status='ready'
+WHERE owned.publication_id=? AND owned.candidate_id IS NOT NULL`,
+		publication.BranchRef, publication.BranchGeneration,
+		publication.ID).Scan(&readyCandidateMembers); err != nil {
+		return fmt.Errorf("state: inspect self-publication candidates: %w", err)
+	}
+	if readyCandidateMembers != expectedCandidateMembers {
+		return fmt.Errorf("%w: ready candidate members=%d want=%d",
+			ErrSelfPublicationOwnershipChanged, readyCandidateMembers,
+			expectedCandidateMembers)
+	}
+
+	var exactActiveMemberships int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publication_members owned
+JOIN intent_candidate_events membership
+  ON membership.candidate_id=owned.candidate_id
+ AND membership.event_seq=owned.event_seq
+ AND membership.membership_state='active'
+WHERE owned.publication_id=? AND owned.candidate_id IS NOT NULL`,
+		publication.ID).Scan(&exactActiveMemberships); err != nil {
+		return fmt.Errorf("state: inspect self-publication memberships: %w", err)
+	}
+	if exactActiveMemberships != expectedCandidateMembers {
+		return fmt.Errorf("%w: exact active memberships=%d want=%d",
+			ErrSelfPublicationOwnershipChanged, exactActiveMemberships,
+			expectedCandidateMembers)
+	}
+
+	var incompleteCandidates int
+	if err := q.QueryRowContext(ctx, `
+WITH expected AS (
+    SELECT candidate_id, COUNT(*) AS member_count
+    FROM self_publication_members
+    WHERE publication_id=? AND candidate_id IS NOT NULL
+    GROUP BY candidate_id
+),
+active AS (
+    SELECT candidate_id, COUNT(*) AS member_count
+    FROM intent_candidate_events
+    WHERE membership_state='active'
+    GROUP BY candidate_id
+)
+SELECT COUNT(*)
+FROM expected
+LEFT JOIN active USING(candidate_id)
+WHERE COALESCE(active.member_count, 0)<>expected.member_count`,
+		publication.ID).Scan(&incompleteCandidates); err != nil {
+		return fmt.Errorf("state: inspect complete candidate ownership: %w", err)
+	}
+	if incompleteCandidates != 0 {
+		return fmt.Errorf("%w: %d candidates have incomplete membership",
+			ErrSelfPublicationOwnershipChanged, incompleteCandidates)
 	}
 	return nil
 }

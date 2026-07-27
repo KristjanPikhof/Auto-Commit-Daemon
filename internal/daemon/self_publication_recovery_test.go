@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -35,6 +37,189 @@ func TestRecoverSelfPublicationPreparedBeforeCASAbandonsWithoutEventTransition(
 		t, ctx, f.db, seq, state.EventStatePending, "")
 	assertSelfPublicationRecoveryPhase(
 		t, ctx, f.db, publication.ID, state.SelfPublicationAbandoned)
+}
+
+func TestRecoverSelfPublicationsLimitReportsRemainingWork(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	tree, err := resolveTreeOID(ctx, f.dir, f.cctx.BaseHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publications []state.SelfPublication
+	for i := 0; i < 2; i++ {
+		seq := appendSelfPublicationRecoveryEvent(
+			t, ctx, f, fmt.Sprintf("bounded-%d.txt", i))
+		target, err := git.CommitTree(
+			ctx, f.dir, tree, fmt.Sprintf("bounded %d", i),
+			f.cctx.BaseHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publications = append(publications,
+			prepareSelfPublicationRecoveryJournal(
+				t, ctx, f, seq, target, tree))
+	}
+
+	first, err := RecoverSelfPublications(
+		ctx, f.dir, f.db, f.cctx, ReplayOpts{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Inspected != 1 || first.Abandoned != 1 || !first.HasMore {
+		t.Fatalf("first summary=%+v", first)
+	}
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publications[0].ID, state.SelfPublicationAbandoned)
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publications[1].ID, state.SelfPublicationPrepared)
+
+	second, err := RecoverSelfPublications(
+		ctx, f.dir, f.db, f.cctx, ReplayOpts{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Inspected != 1 || second.Abandoned != 1 || second.HasMore {
+		t.Fatalf("second summary=%+v", second)
+	}
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publications[1].ID, state.SelfPublicationAbandoned)
+}
+
+func TestRunRecoveryHasMoreRequestsImmediateFollowup(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tree, err := resolveTreeOID(ctx, f.dir, f.cctx.BaseHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publications := make([]state.SelfPublication, 0, 3)
+	for i := 0; i < 3; i++ {
+		seq := appendSelfPublicationRecoveryEvent(
+			t, ctx, f, fmt.Sprintf("run-loop-bounded-%d.txt", i))
+		target, err := git.CommitTree(
+			ctx, f.dir, tree, fmt.Sprintf("run-loop bounded %d", i),
+			f.cctx.BaseHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		publications = append(publications,
+			prepareSelfPublicationRecoveryJournal(
+				t, ctx, f, seq, target, tree))
+	}
+
+	decisionCh := make(chan struct{}, 1)
+	shutdownCh := make(chan struct{})
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- Run(ctx, Options{
+			RepoPath:  f.dir,
+			GitDir:    f.gitDir,
+			DB:        f.db,
+			MessageFn: DeterministicMessage,
+			Scheduler: Scheduler{
+				Base:         time.Second,
+				IdleCeiling:  5 * time.Second,
+				ErrorCeiling: 5 * time.Second,
+			},
+			BootGrace:     time.Hour,
+			PruneInterval: time.Hour,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			afterRunLoopWorkDecision: func(
+				hadWork, recoveryFollowup bool,
+			) {
+				if hadWork && recoveryFollowup {
+					select {
+					case decisionCh <- struct{}{}:
+					default:
+					}
+				}
+			},
+		})
+	}()
+
+	select {
+	case <-decisionCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery HasMore did not request an immediate scheduler followup")
+	}
+	followupStarted := time.Now()
+	waitFor(t, 1500*time.Millisecond,
+		"next bounded recovery pass abandons the final journal", func() bool {
+			for _, publication := range publications {
+				got, ok, err := state.SelfPublicationByID(
+					ctx, f.db, publication.ID)
+				if err != nil || !ok ||
+					got.Phase != state.SelfPublicationAbandoned {
+					return false
+				}
+			}
+			return true
+		})
+	if elapsed := time.Since(followupStarted); elapsed >= 1500*time.Millisecond {
+		t.Fatalf("recovery followup took %v; idle backoff was not reset", elapsed)
+	}
+	cancel()
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after cancellation")
+	}
+}
+
+func TestRunStartupRecoveryCancelsOnShutdown(t *testing.T) {
+	f := newCaptureFixture(t)
+	shutdownCh := make(chan struct{}, 1)
+	recoveryStarted := make(chan struct{})
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- Run(context.Background(), Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			MessageFn:     DeterministicMessage,
+			BootGrace:     time.Hour,
+			PruneInterval: time.Hour,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			recoverSelfPublications: func(
+				ctx context.Context,
+				_ string,
+				_ *state.DB,
+				_ CaptureContext,
+				_ ReplayOpts,
+			) (SelfPublicationRecoverySummary, error) {
+				close(recoveryStarted)
+				<-ctx.Done()
+				return SelfPublicationRecoverySummary{}, ctx.Err()
+			},
+		})
+	}()
+
+	select {
+	case <-recoveryStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("startup recovery did not begin")
+	}
+	start := time.Now()
+	shutdownCh <- struct{}{}
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("shutdown took %v while recovery was in flight", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after shutdown canceled recovery")
+	}
+	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
 }
 
 func TestRecoverSelfPublicationUnbornSourceConverges(t *testing.T) {
@@ -520,6 +705,194 @@ func TestRecoveryPreservesPendingSiblingsOnPreparedAmbiguity(t *testing.T) {
 		t, ctx, f.db, seq, state.EventStatePending, "")
 	assertSelfPublicationRecoveryEvent(
 		t, ctx, f.db, sibling, state.EventStatePending, "")
+}
+
+func TestRun_RecoversSelfPublicationAtStartupBeforeCaptureReplay(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+	publication, seq, target := seedDaemonRestartSelfPublication(
+		t, ctx, f, state.SelfPublicationPrepared, false)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage,
+			WakeCh:    make(chan struct{}, 1), ShutdownCh: make(chan struct{}, 1),
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 3*time.Second)
+	waitFor(t, 3*time.Second, "startup publication completes", func() bool {
+		got, ok, err := state.SelfPublicationByID(
+			ctx, f.db, publication.ID)
+		return err == nil && ok &&
+			got.Phase == state.SelfPublicationCompleted
+	})
+	assertSelfPublicationRecoveryEvent(
+		t, ctx, f.db, seq, state.EventStatePublished, target)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, target, 3*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(target, "refs/heads/main"), 3*time.Second)
+	if generation, err := LoadBranchGeneration(ctx, f.db); err != nil ||
+		generation != 1 {
+		t.Fatalf("generation=%d err=%v want stable 1", generation, err)
+	}
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+}
+
+func TestRun_AmbiguousSelfPublicationBlocksMutationButServicesFlush(
+	t *testing.T,
+) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+	publication, seq, _ := seedDaemonRestartSelfPublication(
+		t, ctx, f, state.SelfPublicationGitApplied, true)
+	repairID := "repair_blocked_by_publication"
+	if err := state.SaveIntentRepair(ctx, f.db, state.IntentRepair{
+		ID: repairID, BranchRef: "refs/heads/main", BranchGeneration: 1,
+		ExpectedHead: publication.TargetCommitOID,
+		PlanDigest:   "sha256:" + strings.Repeat("0", 64),
+		Commits: []state.IntentRepairCommit{{
+			RepairID: repairID, OldOID: publication.SourceHead,
+		}},
+	}); err != nil {
+		t.Fatalf("seed intent repair: %v", err)
+	}
+	if _, err := state.EnqueueFlushRequest(
+		ctx, f.db, "wake", false,
+		sql.NullString{String: "ambiguous recovery", Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage,
+			WakeCh:    make(chan struct{}, 1), ShutdownCh: make(chan struct{}, 1),
+			SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 3*time.Second)
+	waitFor(t, 3*time.Second, "flush serviced while recovery blocked", func() bool {
+		return countFlushByStatus(t, f.db, "completed") == 1
+	})
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publication.ID, state.SelfPublicationGitApplied)
+	assertSelfPublicationRecoveryEvent(
+		t, ctx, f.db, seq, state.EventStatePending, "")
+	repair, ok, err := state.IntentRepairByID(ctx, f.db, repairID)
+	if err != nil || !ok || repair.Status != state.IntentRepairPrepared {
+		t.Fatalf("intent repair mutated around ambiguous publication: %+v ok=%v err=%v",
+			repair, ok, err)
+	}
+	var snapshots int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", snapshots)
+	}
+	cancel()
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+}
+
+func seedDaemonRestartSelfPublication(
+	t *testing.T,
+	ctx context.Context,
+	f *daemonFixture,
+	phase string,
+	tagTarget bool,
+) (state.SelfPublication, int64, string) {
+	t.Helper()
+	source, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveBranchPublicationToken(
+		ctx, f.db, 1, source,
+		branchTokenRev(source, "refs/heads/main")); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: source, Operation: "update", Path: "restart.txt",
+		Fidelity: "full",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := resolveTreeOID(ctx, f.dir, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := git.CommitTree(
+		ctx, f.dir, tree, "restart publication", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := state.SelfPublication{
+		ID: "sp_daemon_restart", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, SourceHead: source,
+		TargetCommitOID: target, TargetTreeOID: tree,
+		Completion: state.SelfPublicationCompletion{
+			PublishedTS: selfPublicationNow(),
+		},
+		Members: []state.SelfPublicationMember{{EventSeq: seq}},
+	}
+	if created, err := state.PrepareSelfPublication(
+		ctx, f.db, publication); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication=(%v,%v)", created, err)
+	}
+	if err := git.UpdateRef(
+		ctx, f.dir, publication.BranchRef, target, source); err != nil {
+		t.Fatal(err)
+	}
+	if phase == state.SelfPublicationGitApplied {
+		if changed, err := state.MarkSelfPublicationGitApplied(
+			ctx, f.db, publication,
+			selfPublicationNow()); err != nil || !changed {
+			t.Fatalf("MarkSelfPublicationGitApplied=(%v,%v)", changed, err)
+		}
+	}
+	if tagTarget {
+		if err := git.UpdateRef(
+			ctx, f.dir, "refs/tags/ambiguous", target, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return publication, seq, target
 }
 
 func seedRecoverableSelfPublication(

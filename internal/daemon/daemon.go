@@ -247,6 +247,14 @@ type Options struct {
 	// afterSelfPublicationAdoption is a test-only observation point after the
 	// journal-proved target and all in-memory/durable token fields agree.
 	afterSelfPublicationAdoption func(CaptureContext, string, string, string)
+	// afterRunLoopWorkDecision is a test-only observation point for the
+	// scheduler input after one complete pass.
+	afterRunLoopWorkDecision func(hadWork, recoveryFollowup bool)
+	// recoverSelfPublications is a test-only seam for deterministic
+	// cancellation coverage around startup and active recovery passes.
+	recoverSelfPublications func(
+		context.Context, string, *state.DB, CaptureContext, ReplayOpts,
+	) (SelfPublicationRecoverySummary, error)
 	// selfPublicationCheckpoint is the run-loop wiring for Replay's
 	// deterministic publication-boundary fault seam.
 	selfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
@@ -700,6 +708,47 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	heartbeatNow("running", "daemon started")
+	var shutdownCh <-chan struct{}
+	recoveryRootCtx := ctx
+	recoverSelfPublicationsPass := func(
+		recoveryCtx CaptureContext,
+	) (SelfPublicationRecoverySummary, error) {
+		// One journal per invocation keeps the run loop available to drain
+		// flush requests between recovery attempts. The timeout bounds even
+		// a slow Git proof, while the progress heartbeat preserves the
+		// controller's three-second liveness contract during that proof.
+		passCtx, passCancel := context.WithTimeout(
+			recoveryRootCtx, 5*time.Second)
+		defer passCancel()
+		progressDone := make(chan struct{})
+		progressStopped := make(chan struct{})
+		go func() {
+			defer close(progressStopped)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-progressDone:
+					return
+				case <-passCtx.Done():
+					return
+				case <-ticker.C:
+					heartbeatNow("running", "")
+				}
+			}
+		}()
+		recover := RecoverSelfPublications
+		if opts.recoverSelfPublications != nil {
+			recover = opts.recoverSelfPublications
+		}
+		summary, recoverErr := recover(
+			passCtx, opts.RepoPath, opts.DB, recoveryCtx,
+			ReplayOpts{Limit: 1})
+		close(progressDone)
+		<-progressStopped
+		heartbeatNow("running", "")
+		return summary, recoverErr
+	}
 
 	// 3. Install signal handlers (unless tests opt out).
 	var sig *Signals
@@ -712,10 +761,32 @@ func Run(ctx context.Context, opts Options) error {
 	if wakeCh == nil && sig != nil {
 		wakeCh = sig.Wake
 	}
-	shutdownCh := opts.ShutdownCh
-	if shutdownCh == nil && sig != nil {
-		shutdownCh = sig.Shutdown
+	rawShutdownCh := opts.ShutdownCh
+	if rawShutdownCh == nil && sig != nil {
+		rawShutdownCh = sig.Shutdown
 	}
+	recoveryRootCtx, recoveryCancel := context.WithCancel(ctx)
+	shutdownBroadcast := make(chan struct{})
+	shutdownBridgeStop := make(chan struct{})
+	shutdownBridgeDone := make(chan struct{})
+	go func() {
+		defer close(shutdownBridgeDone)
+		select {
+		case <-rawShutdownCh:
+			recoveryCancel()
+			close(shutdownBroadcast)
+		case <-ctx.Done():
+			recoveryCancel()
+			close(shutdownBroadcast)
+		case <-shutdownBridgeStop:
+		}
+	}()
+	defer func() {
+		close(shutdownBridgeStop)
+		recoveryCancel()
+		<-shutdownBridgeDone
+	}()
+	shutdownCh = shutdownBroadcast
 	validationWakeCh := make(chan struct{}, 1)
 
 	// Resolve the active branch ref / generation up-front. The generation
@@ -750,8 +821,51 @@ func Run(ctx context.Context, opts Options) error {
 		branchRef = tokenBranchRef(currentToken)
 		headOID = tokenSHA(currentToken)
 	}
-	startupRepairBlocked := false
+	startupPublicationBlocked := false
 	if branchRef != "" && headOID != "" {
+		if operation, active := gitOperationInProgress(opts.GitDir); active {
+			logger.Info("startup self-publication recovery deferred during git operation",
+				"operation", operation)
+			startupPublicationBlocked = true
+		} else if pauseStatus, pauseErr :=
+			daemonPauseState(ctx, opts.GitDir, opts.DB); pauseErr != nil {
+			logger.Warn("read pause state before startup self-publication recovery",
+				"err", pauseErr.Error())
+			startupPublicationBlocked = true
+		} else if pauseStatus.Active {
+			logger.Info("startup self-publication recovery deferred while paused",
+				"source", pauseStatus.Source, "reason", pauseStatus.Reason)
+			startupPublicationBlocked = true
+		} else {
+			recoveryCtx := CaptureContext{
+				BranchRef: branchRef, BranchGeneration: persistedGen,
+				BaseHead: persistedHead,
+			}
+			recovered, recoverErr := recoverSelfPublicationsPass(recoveryCtx)
+			if recoverErr != nil {
+				logger.Warn("recover self-publications before startup branch transition",
+					"err", recoverErr.Error())
+				startupPublicationBlocked = true
+			} else if recovered.FinalTargetOID != "" {
+				// CompleteSelfPublication already persisted the exact journal
+				// target and branch token in the same SQLite transaction. Seed
+				// startup's previous state from that proved target so any
+				// subsequent external movement is classified from the internal
+				// publication boundary instead of the stale pre-crash head.
+				persistedHead = recovered.FinalTargetOID
+				logger.Info("recovered self-publication at startup",
+					"target", recovered.FinalTargetOID,
+					"completed", recovered.Completed,
+					"abandoned", recovered.Abandoned)
+			}
+			if recovered.HasMore {
+				logger.Info("startup self-publication recovery has more work")
+				startupPublicationBlocked = true
+			}
+		}
+	}
+	startupRepairBlocked := startupPublicationBlocked
+	if !startupPublicationBlocked && branchRef != "" && headOID != "" {
 		recoverable, recoverErr := state.RecoverableIntentRepairs(
 			ctx, opts.DB, intentRepairBackupCap)
 		if recoverErr != nil {
@@ -819,7 +933,9 @@ func Run(ctx context.Context, opts Options) error {
 			currentToken = prevToken
 			branchTransitionBlocked = true
 		} else if transition != TokenTransitionUnchanged {
-			if operation, active := gitOperationInProgress(opts.GitDir); active {
+			if startupPublicationBlocked {
+				logger.Info("startup branch transition deferred for ambiguous self-publication")
+			} else if operation, active := gitOperationInProgress(opts.GitDir); active {
 				logger.Info("startup branch transition deferred during git operation",
 					"operation", operation)
 				branchTransitionBlocked = true
@@ -1280,6 +1396,40 @@ func Run(ctx context.Context, opts Options) error {
 				cctx, currentToken, headOID, lastStampedBranchHead)
 		}
 		return nil
+	}
+
+	recoverActiveSelfPublications := func() (blocked, hasMore bool) {
+		if cctx.BranchRef == "" {
+			return false, false
+		}
+		recovered, recoverErr := recoverSelfPublicationsPass(cctx)
+		if recoverErr != nil {
+			logger.Warn("self-publication recovery needs attention",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", recoverErr.Error())
+			return true, false
+		}
+		if recovered.FinalTargetOID == "" {
+			return recovered.HasMore, recovered.HasMore
+		}
+		targetOID := recovered.FinalTargetOID
+		pendingSelfPublicationTarget = targetOID
+		// Recovery proved and locked the literal branch at target through
+		// SQLite completion. Adopt that exact internal boundary first. A
+		// branch move immediately after lock release remains external and is
+		// classified by the token check that follows this closure.
+		if err := adoptSelfPublicationTarget(
+			targetOID, branchTokenRev(targetOID, cctx.BranchRef)); err != nil {
+			logger.Warn("adopt recovered self-publication target",
+				"target", targetOID, "err", err.Error())
+			return true, false
+		}
+		logger.Info("recovered self-publication during run-loop pass",
+			"target", targetOID,
+			"completed", recovered.Completed,
+			"abandoned", recovered.Abandoned)
+		return recovered.HasMore, recovered.HasMore
 	}
 
 	processBranchTokenChange := func(logPrefix string) bool {
@@ -1843,6 +1993,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	for {
 		branchTransitionBlocked = false
+		recoveryFollowup := false
 
 		// 4a/b. Honor ctx + shutdown signal.
 		if err := ctx.Err(); err != nil {
@@ -2004,22 +2155,35 @@ func Run(ctx context.Context, opts Options) error {
 			})
 		}
 
-		if !operationPaused {
+		if !operationPaused && cctx.BranchRef != "" {
+			if pauseStatus, pauseErr :=
+				daemonPauseState(ctx, opts.GitDir, opts.DB); pauseErr != nil {
+				logger.Warn("read pause state before self-publication recovery",
+					"err", pauseErr.Error())
+				branchTransitionBlocked = true
+			} else if !pauseStatus.Active {
+				branchTransitionBlocked, recoveryFollowup =
+					recoverActiveSelfPublications()
+			}
+		}
+
+		if !operationPaused && !branchTransitionBlocked {
 			if processBranchTokenChange("branch token") {
 				branchTransitionBlocked = true
 			}
 		}
 
-		// 4e. Drain pending flush_requests; each one triggers an immediate
-		// capture+replay cycle. The drain is bounded by flushLimit (default
-		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
-		// rest of the Run loop, and the inner loop checks ctx.Err AND
-		// shutdownCh every iteration so SIGTERM during a large drain still
-		// exits within one claim cycle (~tens of ms). Some callers run the
-		// daemon with a non-cancelable ctx (context.Background) and expect
-		// signal delivery via shutdownCh; without the explicit shutdownCh
-		// arm here the worst-case drain (256 rows × ~30ms claim) would burn
-		// roughly 7.5s before the run loop notices the signal.
+		// 4e. Drain pending flush_requests; each bounded batch triggers one
+		// immediate capture+replay cycle. Claiming and completing each row in
+		// separate transactions made a 5000-wake burst exceed the 60-second
+		// acknowledgement contract under -race. DrainFlushRequests atomically
+		// owns and completes the oldest flushLimit rows in one statement while
+		// returning their commands for logical/wake accounting.
+		//
+		// The batch remains capped at DefaultFlushLimit=256, preserving the
+		// run-loop heartbeat/capture/shutdown budget. Check shutdown before and
+		// after the statement so a non-cancelable ctx controlled only by
+		// shutdownCh waits for at most one bounded SQLite operation.
 		flushLimit := opts.FlushLimit
 		if flushLimit <= 0 {
 			flushLimit = DefaultFlushLimit
@@ -2027,41 +2191,40 @@ func Run(ctx context.Context, opts Options) error {
 		flushedTotal := 0
 		flushedLogical := 0
 		flushedWake := 0
-		for {
-			if err := ctx.Err(); err != nil {
-				break
-			}
+		if ctx.Err() == nil {
 			select {
 			case <-shutdownCh:
 				return gracefulWithSweep("signal shutdown")
 			default:
 			}
-			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
+			flushed, err := state.DrainFlushRequests(
+				ctx,
+				opts.DB,
+				flushLimit,
+				sql.NullString{String: "flushed", Valid: true},
+			)
 			if err != nil {
-				logger.Warn("claim flush request", "err", err.Error())
-				break
+				logger.Warn("drain flush requests", "err", err.Error())
+			} else {
+				flushedTotal = len(flushed)
+				for _, fr := range flushed {
+					if fr.Command == "flush_logical" {
+						flushedLogical++
+					}
+					if fr.Command == "wake" {
+						flushedWake++
+						wakeAckCount++
+						wakeAckLastID = fr.ID
+					}
+					logger.Debug("flush request acked",
+						"id", fr.ID, "command", fr.Command)
+				}
 			}
-			if !ok {
-				break
-			}
-			flushedTotal++
-			if fr.Command == "flush_logical" {
-				flushedLogical++
-			}
-			if fr.Command == "wake" {
-				flushedWake++
-				wakeAckCount++
-				wakeAckLastID = fr.ID
-			}
-			logger.Debug("flush request acked",
-				"id", fr.ID, "command", fr.Command)
-			if err := state.CompleteFlushRequest(ctx, opts.DB, fr.ID, true,
-				sql.NullString{String: "flushed", Valid: true}); err != nil {
-				logger.Warn("complete flush", "err", err.Error())
-			}
-			if flushedTotal >= flushLimit {
-				break
-			}
+		}
+		select {
+		case <-shutdownCh:
+			return gracefulWithSweep("signal shutdown")
+		default:
 		}
 		if flushedWake > 0 && flushedLogical == 0 {
 			recordTrace(tracer, acdtrace.Event{
@@ -2349,7 +2512,11 @@ func Run(ctx context.Context, opts Options) error {
 		// reseed + recapture, just as a bounded replay needs another pass to
 		// drain HasMore. Treat both as work so idle backoff cannot delay
 		// convergence.
-		hadWork := flushedTotal > 0 || capSum.EventsAppended > 0 || replayNeedsImmediateFollowup(repSum)
+		hadWork := recoveryFollowup || flushedTotal > 0 ||
+			capSum.EventsAppended > 0 || replayNeedsImmediateFollowup(repSum)
+		if opts.afterRunLoopWorkDecision != nil {
+			opts.afterRunLoopWorkDecision(hadWork, recoveryFollowup)
+		}
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
