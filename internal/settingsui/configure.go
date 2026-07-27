@@ -277,6 +277,7 @@ type ConfigurePreviewApprovalOptions struct {
 	RepairHorizon       string
 	RepairMaxCommits    string
 	Global              bool
+	Action              string
 }
 
 type ConfigureRecoveryChoice string
@@ -323,6 +324,11 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 	title := "Approve every permission shown above, save this configuration, and enable ACD?"
 	if opts.Global {
 		title = "Approve every permission shown above and save these global defaults?"
+		if opts.Action == "replace_global" {
+			title = "Approve every permission shown above and replace the saved global defaults?"
+		}
+	} else if opts.Action == "inherit_global" {
+		title = "Approve every permission shown above, remove this repository override, and enable ACD?"
 	}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Key("apply").Title(title).

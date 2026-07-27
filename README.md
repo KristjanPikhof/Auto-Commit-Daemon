@@ -119,13 +119,15 @@ behavior, already has an override, or should run Strict Review.
 | What you want | Command | Result |
 |---|---|---|
 | Set defaults for your account and future repositories | `acd configure` | Saves global provider and commit defaults. It does not open repository state, run project tests, or start a daemon. |
+| Replace saved account defaults with current built-ins | `acd configure --replace` | Discards retained global overrides, reviews the current built-in setup, then saves it as the new global layer. |
 | Configure the current repository | `acd configure --repo .` | Saves a repository override, creates its runtime revision, and enables ACD for that repository. |
+| Return the current repository to global defaults | `acd configure --repo . --inherit` | Removes its field and profile overrides, creates an inherited runtime revision, and enables ACD. |
 | Require the repository's full test suite | `acd configure --repo .` and select Strict Review | Detects and displays the exact command, then queues it as a background activation check. |
 
-Global settings do not overwrite existing repository overrides. If a
-repository still uses an old mode or verification command, run
-`acd configure --repo .` inside that repository and select the behavior you
-want.
+Global settings do not overwrite existing repository overrides. Use
+`acd configure --repo . --inherit` when a repository should follow the global
+layer again, or `acd configure --repo .` to retain a repository-specific
+setup.
 
 ### Global setup
 
@@ -177,8 +179,10 @@ writes:
 
 ~~~bash
 acd configure --dry-run
+acd configure --replace --dry-run
 acd configure --strategy intent --preset balanced --dry-run
 acd configure --repo . --dry-run
+acd configure --repo . --inherit --dry-run
 acd configure --repo . --strategy intent --preset quality --dry-run --json
 ~~~
 

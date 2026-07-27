@@ -321,6 +321,63 @@ func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
 	}
 }
 
+func TestGlobalServiceReplaceDropsStaleOverrides(t *testing.T) {
+	svc, roots := testGlobalService(t, nil, nil)
+	timeout := "30s"
+	maxBytes := "1048576"
+	saved, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeGlobal,
+		Values: map[string]*string{
+			config.FieldTimeout:      &timeout,
+			"capture.max_file_bytes": &maxBytes,
+		},
+		ExpectedGeneration: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := preview.Values
+	draft[config.FieldCommitStrategy] = "event"
+	draft[config.FieldCommitPreset] = "fast"
+	draft[config.FieldProvider] = "deterministic"
+	draft[config.FieldIntentVerification] = "none"
+	draft[config.FieldTimeout] = ai.DefaultProviderTimeout.String()
+	validation, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.SaveGlobalSetup(
+		context.Background(),
+		SaveGlobalSetupRequest{
+			Values:             draft,
+			TestedFingerprint:  validation.Fingerprint,
+			ExpectedGeneration: saved.Generation,
+			Replace:            true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Settings.Global["capture.max_file_bytes"]; ok {
+		t.Fatalf("replacement retained restart override: %+v",
+			doc.Settings.Global)
+	}
+	if got := string(doc.Settings.Global[config.FieldTimeout]); got != `"`+ai.DefaultProviderTimeout.String()+`"` {
+		t.Fatalf("replacement timeout = %s", got)
+	}
+	if result.Generation != 2 {
+		t.Fatalf("replacement generation = %d", result.Generation)
+	}
+}
+
 func TestGlobalServiceRejectsRepositoryVerificationApproval(t *testing.T) {
 	svc, _ := testGlobalService(t, nil, nil)
 	draft := map[string]string{
@@ -404,6 +461,52 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 	if doc.Generation != 2 || string(doc.Settings.Repositories[svc.repoHash].Fields[config.FieldModel]) != `"repo-model"` ||
 		string(doc.Settings.Profiles["fast"].Fields[config.FieldIntentWindow]) != `"3"` || len(doc.Settings.Global) != 0 {
 		t.Fatalf("scoped document = %+v", doc.Settings)
+	}
+}
+
+func TestSettingsActionClearsEmptyRepositoryOverride(t *testing.T) {
+	svc, roots := testService(t, nil, nil, nil)
+	model := "repo-model"
+	profile := "strict"
+	window := "20"
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope:   ScopeProfile,
+		Profile: profile,
+		Values: map[string]*string{
+			config.FieldIntentWindow: &window,
+		},
+		ExpectedGeneration: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeRepository,
+		Values: map[string]*string{
+			config.FieldModel: &model,
+		},
+		RepositoryProfile:  &profile,
+		ExpectedGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	empty := ""
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeRepository,
+		Values: map[string]*string{
+			config.FieldModel: nil,
+		},
+		RepositoryProfile:  &empty,
+		ExpectedGeneration: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Settings.Repositories[svc.repoHash]; ok {
+		t.Fatalf("empty repository override was retained: %+v",
+			doc.Settings.Repositories[svc.repoHash])
 	}
 }
 

@@ -227,7 +227,14 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 				repo.Profile = cleanText(*req.RepositoryProfile)
 			}
 			target = repo.Fields
-			defer func() { doc.Settings.Repositories[s.repoHash] = repo }()
+			defer func() {
+				if repo.Profile == "" && len(repo.Fields) == 0 &&
+					len(repo.Extra) == 0 {
+					delete(doc.Settings.Repositories, s.repoHash)
+					return
+				}
+				doc.Settings.Repositories[s.repoHash] = repo
+			}()
 		}
 		for name, value := range req.Values {
 			field, ok := config.LookupField(name)
@@ -269,6 +276,7 @@ type SaveGlobalSetupRequest struct {
 	TestedFingerprint  string
 	Confirmations      []ai.ConfirmationRequirement
 	ExpectedGeneration uint64
+	Replace            bool
 }
 
 type SaveGlobalSetupResult struct {
@@ -285,6 +293,20 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 	}
 	if !s.globalOnly {
 		return SaveGlobalSetupResult{}, errors.New("acd settings: global setup requires a global service")
+	}
+	if req.Replace {
+		for _, field := range config.Catalog() {
+			if field.Boundary != config.ApplyHot ||
+				!field.Persistable || field.Sensitive {
+				continue
+			}
+			if _, ok := req.Values[field.Name]; !ok {
+				return SaveGlobalSetupResult{}, fmt.Errorf(
+					"acd settings: replacement setup is missing field %q",
+					field.Name,
+				)
+			}
+		}
 	}
 	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
 	if err != nil {
@@ -312,6 +334,9 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 		return SaveGlobalSetupResult{}, err
 	}
 	err = s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
+		if req.Replace {
+			doc.Settings.Global = config.Overrides{}
+		}
 		for name, value := range req.Values {
 			field, ok := config.LookupField(name)
 			if !ok {

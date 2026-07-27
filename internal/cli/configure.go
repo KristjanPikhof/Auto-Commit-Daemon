@@ -29,7 +29,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-const configureReportVersion = 4
+const configureReportVersion = 5
 
 type configureOptions struct {
 	Strategy        string
@@ -40,6 +40,8 @@ type configureOptions struct {
 	Wait            bool
 	JSON            bool
 	Repo            string
+	Replace         bool
+	Inherit         bool
 }
 
 type configureVerificationReport struct {
@@ -53,34 +55,35 @@ type configureVerificationReport struct {
 }
 
 type configureReport struct {
-	Version          int                         `json:"version"`
-	DryRun           bool                        `json:"dry_run"`
-	Scope            string                      `json:"scope"`
-	Repo             string                      `json:"repo,omitempty"`
-	Experience       string                      `json:"experience"`
-	Strategy         string                      `json:"strategy"`
-	Preset           string                      `json:"preset"`
-	PresetID         string                      `json:"preset_id"`
-	PresetVersion    int                         `json:"preset_version"`
-	Customized       bool                        `json:"customized"`
-	CommitFormat     string                      `json:"commit_format"`
-	Provider         string                      `json:"provider"`
-	Model            string                      `json:"model,omitempty"`
-	Endpoint         string                      `json:"endpoint,omitempty"`
-	ProviderTimeout  string                      `json:"provider_timeout,omitempty"`
-	CredentialSource credentials.Source          `json:"credential_source"`
-	DiffContext      string                      `json:"diff_context"`
-	Verification     configureVerificationReport `json:"verification"`
-	RepairEnabled    bool                        `json:"repair_enabled"`
-	RepairHorizon    string                      `json:"repair_horizon"`
-	RepairMaxCommits string                      `json:"repair_max_commits"`
-	RuntimeRevision  int64                       `json:"runtime_revision,omitempty"`
-	ExecutionMode    string                      `json:"execution_mode"`
-	Readiness        string                      `json:"readiness"`
-	Daemon           string                      `json:"daemon"`
-	HarnessGuidance  []string                    `json:"harness_guidance"`
-	Risks            []string                    `json:"risks"`
-	Operations       []string                    `json:"operations"`
+	Version             int                         `json:"version"`
+	DryRun              bool                        `json:"dry_run"`
+	Scope               string                      `json:"scope"`
+	Repo                string                      `json:"repo,omitempty"`
+	Experience          string                      `json:"experience"`
+	Strategy            string                      `json:"strategy"`
+	Preset              string                      `json:"preset"`
+	PresetID            string                      `json:"preset_id"`
+	PresetVersion       int                         `json:"preset_version"`
+	Customized          bool                        `json:"customized"`
+	CommitFormat        string                      `json:"commit_format"`
+	Provider            string                      `json:"provider"`
+	Model               string                      `json:"model,omitempty"`
+	Endpoint            string                      `json:"endpoint,omitempty"`
+	ProviderTimeout     string                      `json:"provider_timeout,omitempty"`
+	CredentialSource    credentials.Source          `json:"credential_source"`
+	DiffContext         string                      `json:"diff_context"`
+	Verification        configureVerificationReport `json:"verification"`
+	RepairEnabled       bool                        `json:"repair_enabled"`
+	RepairHorizon       string                      `json:"repair_horizon"`
+	RepairMaxCommits    string                      `json:"repair_max_commits"`
+	RuntimeRevision     int64                       `json:"runtime_revision,omitempty"`
+	ExecutionMode       string                      `json:"execution_mode"`
+	Readiness           string                      `json:"readiness"`
+	Daemon              string                      `json:"daemon"`
+	HarnessGuidance     []string                    `json:"harness_guidance"`
+	Risks               []string                    `json:"risks"`
+	Operations          []string                    `json:"operations"`
+	ConfigurationAction string                      `json:"configuration_action"`
 }
 
 type configureValidationService interface {
@@ -137,18 +140,22 @@ func newConfigureCmd() *cobra.Command {
 Without --repo, configure global defaults that new repositories inherit.
 Global setup offers Everyday work or Maximum speed, tests the provider before
 writing, and never opens repository state, runs project commands, or starts a
-daemon.
+daemon. Use --replace to discard saved global overrides before writing the
+reviewed setup from current built-in defaults.
 
 With an explicit --repo, configure that repository. Strict Review is available
 only in repository setup and gates publishing on an approved full project
 check. Everyday uses ACD's internal structural checks without running project
-tests. Use --wait only with repository Strict Review to follow validation.
+tests. Use --inherit to remove the repository override and activate the global
+defaults. Use --wait only with repository Strict Review to follow validation.
 ACD never edits harness hook files.
 
 --dry-run prints the final projection without provider calls, command
 execution, credential/settings writes, daemon starts, or hook changes.`,
 		Example: `  acd configure
+  acd configure --replace
   acd configure --repo .
+  acd configure --repo . --inherit
   acd configure --repo . --strategy intent --preset quality --wait
   acd configure --accessible
   acd configure --strategy intent --preset balanced
@@ -168,6 +175,8 @@ execution, credential/settings writes, daemon starts, or hook changes.`,
 	cmd.Flags().BoolVar(&opts.CredentialStdin, "credential-stdin", false, "Read the credential from the first standard-input line")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Preview without calls, commands, writes, starts, or hook changes")
 	cmd.Flags().BoolVar(&opts.Wait, "wait", false, "Wait for repository Strict Review validation")
+	cmd.Flags().BoolVar(&opts.Replace, "replace", false, "Replace saved global overrides with the reviewed built-in defaults")
+	cmd.Flags().BoolVar(&opts.Inherit, "inherit", false, "Remove a repository override and activate global defaults")
 	return cmd
 }
 
@@ -182,6 +191,19 @@ func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return errors.New("acd configure: --wait cannot be used with --dry-run")
 	}
 	repositoryScope := cmd.Flags().Changed("repo")
+	if opts.Replace && repositoryScope {
+		return errors.New("acd configure: --replace configures global defaults and conflicts with --repo")
+	}
+	if opts.Inherit && !repositoryScope {
+		return errors.New("acd configure: --inherit requires an explicit --repo")
+	}
+	if opts.Replace && opts.Inherit {
+		return errors.New("acd configure: --replace conflicts with --inherit")
+	}
+	if opts.Inherit && (cmd.Flags().Changed("strategy") ||
+		cmd.Flags().Changed("preset") || opts.CredentialStdin || opts.Wait) {
+		return errors.New("acd configure: --inherit conflicts with --strategy, --preset, --credential-stdin, and --wait")
+	}
 	if opts.Wait && !repositoryScope {
 		return errors.New("acd configure: --wait requires an explicit --repo and Strict Review")
 	}
@@ -214,6 +236,10 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			return reportErr
 		}
 		configureGlobalReport(&report)
+		if opts.Replace {
+			report.ConfigurationAction = "replace_global"
+			report.Operations[2] = "global_settings:replace_with_approval"
+		}
 		return renderConfigureReport(cmd.OutOrStdout(), report, opts.JSON)
 	}
 
@@ -261,6 +287,12 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		)
 	}
 	defaults := authoring.Values
+	if opts.Replace {
+		defaults, err = builtInConfigureValues(strategy, preset)
+		if err != nil {
+			return err
+		}
+	}
 	originalProvider := defaults[config.FieldProvider]
 	defaults[config.FieldCommitStrategy] = strategy
 	defaults[config.FieldCommitPreset] = preset
@@ -270,10 +302,10 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		defaults[config.FieldProvider] == "deterministic" {
 		defaults[config.FieldProvider] = "openai-compat"
 	}
-	providerConfigured := configureSourceIsExplicit(
+	providerConfigured := !opts.Replace && configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
 	) && originalProvider == defaults[config.FieldProvider]
-	openAIConfigured := configureSourceIsExplicit(
+	openAIConfigured := !opts.Replace && configureSourceIsExplicit(
 		authoring.Sources[config.FieldBaseURL],
 	) && configureSourceIsExplicit(
 		authoring.Sources[config.FieldModel],
@@ -335,6 +367,17 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	defer service.Close()
 	draft := selectionDraft(selection)
+	if opts.Replace {
+		draft, err = builtInConfigureValues(
+			selection.Strategy, selection.Preset,
+		)
+		if err != nil {
+			return err
+		}
+		for name, value := range selectionDraft(selection) {
+			draft[name] = value
+		}
+	}
 	providerConfirmations := selectionProviderConfirmations(selection)
 	validation, err := service.Validate(
 		cmd.Context(), draft, providerConfirmations,
@@ -351,6 +394,10 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return err
 	}
 	configureGlobalReport(&report)
+	if opts.Replace {
+		report.ConfigurationAction = "replace_global"
+		report.Operations[2] = "global_settings:replace_with_approval"
+	}
 	if selection.Credential != "" &&
 		source != credentials.SourceEnvironment {
 		report.CredentialSource = credentials.SourceFile
@@ -368,6 +415,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			RepairHorizon:    report.RepairHorizon,
 			RepairMaxCommits: report.RepairMaxCommits,
 			Global:           true,
+			Action:           report.ConfigurationAction,
 		},
 	)
 	if err != nil {
@@ -471,6 +519,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			TestedFingerprint:  tested.Fingerprint,
 			Confirmations:      confirmations,
 			ExpectedGeneration: authoring.Generation,
+			Replace:            opts.Replace,
 		},
 	)
 	if err != nil {
@@ -494,6 +543,12 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		"daemon:not_started",
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Global configuration saved.")
+	if opts.Replace {
+		fmt.Fprintln(
+			cmd.OutOrStdout(),
+			"Previous global overrides: replaced with the reviewed setup",
+		)
+	}
 	fmt.Fprintln(
 		cmd.OutOrStdout(),
 		"Repositories: inherit these defaults unless they have an override",
@@ -534,9 +589,21 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	detected := detectVerificationCommands(repo)
 	if opts.DryRun {
 		selection := dryRunConfigureSelection(strategy, preset, detected)
+		if opts.Inherit {
+			global, previewErr := loadGlobalConfigurePreview(
+				cmd.Context(), roots, nil,
+			)
+			if previewErr != nil {
+				return previewErr
+			}
+			selection = configureSelectionFromValues(global.Values)
+		}
 		report, err := buildConfigureReport(repo, selection, credentials.SourceNone, true)
 		if err != nil {
 			return err
+		}
+		if opts.Inherit {
+			configureInheritedReport(&report)
 		}
 		return renderConfigureReport(cmd.OutOrStdout(), report, opts.JSON)
 	}
@@ -549,7 +616,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	explicitMode := cmd.Flags().Changed("strategy") ||
 		cmd.Flags().Changed("preset")
-	if !explicitMode && !opts.CredentialStdin {
+	if !opts.Inherit && !explicitMode && !opts.CredentialStdin {
 		existing, found, existingErr := existingConfigureValidation(
 			cmd.Context(), repo,
 		)
@@ -663,11 +730,23 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd configure: resolve authoring defaults: %w", err)
 	}
 	defaults := authoring.Values
+	if opts.Inherit {
+		global, previewErr := loadGlobalConfigurePreview(
+			cmd.Context(), roots, lookup,
+		)
+		if previewErr != nil {
+			return previewErr
+		}
+		defaults = global.Values
+	}
 	originalProvider := defaults[config.FieldProvider]
-	defaults[config.FieldCommitStrategy] = strategy
-	defaults[config.FieldCommitPreset] = preset
-	if strategy == "intent" && defaults[config.FieldProvider] == "deterministic" {
-		defaults[config.FieldProvider] = "openai-compat"
+	if !opts.Inherit {
+		defaults[config.FieldCommitStrategy] = strategy
+		defaults[config.FieldCommitPreset] = preset
+		if strategy == "intent" &&
+			defaults[config.FieldProvider] == "deterministic" {
+			defaults[config.FieldProvider] = "openai-compat"
+		}
 	}
 	providerConfigured := configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
@@ -677,22 +756,27 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	) && configureSourceIsExplicit(
 		authoring.Sources[config.FieldModel],
 	)
-	selection, err := runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
-		Input: wizardInput, Output: cmd.OutOrStdout(), Accessible: accessible,
-		Defaults:             defaults,
-		DetectedQuickCommand: detected.QuickCommand,
-		DetectedQuickSource:  detected.QuickSource,
-		DetectedFullCommand:  detected.FullCommand,
-		DetectedFullSource:   detected.FullSource,
-		ExplicitMode:         explicitMode,
-		HasCredential:        hasCredential || len(stagedCredential) > 0,
-		CredentialFromStdin:  opts.CredentialStdin,
-		ProviderConfigured:   providerConfigured,
-		OpenAIConfigured:     openAIConfigured,
-		RepositoryScoped:     true,
-	})
-	if err != nil {
-		return fmt.Errorf("acd configure: wizard: %w", err)
+	var selection settingsui.ConfigureSelection
+	if opts.Inherit {
+		selection = configureSelectionFromValues(defaults)
+	} else {
+		selection, err = runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
+			Input: wizardInput, Output: cmd.OutOrStdout(), Accessible: accessible,
+			Defaults:             defaults,
+			DetectedQuickCommand: detected.QuickCommand,
+			DetectedQuickSource:  detected.QuickSource,
+			DetectedFullCommand:  detected.FullCommand,
+			DetectedFullSource:   detected.FullSource,
+			ExplicitMode:         explicitMode,
+			HasCredential:        hasCredential || len(stagedCredential) > 0,
+			CredentialFromStdin:  opts.CredentialStdin,
+			ProviderConfigured:   providerConfigured,
+			OpenAIConfigured:     openAIConfigured,
+			RepositoryScoped:     true,
+		})
+		if err != nil {
+			return fmt.Errorf("acd configure: wizard: %w", err)
+		}
 	}
 	selection.Strategy, selection.Preset, err = normalizeConfigureMode(selection.Strategy, selection.Preset)
 	if err != nil {
@@ -726,6 +810,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	defer previewService.Close()
 	draft := selectionDraft(selection)
+	if opts.Inherit {
+		draft = cloneConfigureValues(defaults)
+	}
 	providerConfirmations := selectionProviderConfirmations(selection)
 	validation, err := previewService.Validate(cmd.Context(), draft, providerConfirmations)
 	if err != nil {
@@ -738,6 +825,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if selection.Credential != "" && source != credentials.SourceEnvironment {
 		report.CredentialSource = credentials.SourceFile
 	}
+	if opts.Inherit {
+		configureInheritedReport(&report)
+	}
 	if err := renderConfigureReport(cmd.OutOrStdout(), report, false); err != nil {
 		return err
 	}
@@ -746,6 +836,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 			VerificationMode: report.Verification.Mode, VerificationCommand: report.Verification.Command,
 			RepairEnabled: report.RepairEnabled, RepairHorizon: report.RepairHorizon,
 			RepairMaxCommits: report.RepairMaxCommits,
+			Action:           report.ConfigurationAction,
 		})
 	if err != nil {
 		return fmt.Errorf("acd configure: final confirmation: %w", err)
@@ -868,9 +959,18 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		progress.success(3, "Existing credential retained; no credential write required.")
 	}
 	changes := configureSaveValues(selection)
-	progress.begin(4, "Saving repository settings...")
+	var repositoryProfile *string
+	if opts.Inherit {
+		changes = clearRepositoryValues()
+		emptyProfile := ""
+		repositoryProfile = &emptyProfile
+		progress.begin(4, "Removing repository override...")
+	} else {
+		progress.begin(4, "Saving repository settings...")
+	}
 	saved, err := service.Save(cmd.Context(), settings.SaveRequest{
 		Scope: settings.ScopeRepository, Values: changes,
+		RepositoryProfile:  repositoryProfile,
 		ExpectedGeneration: authoring.Generation,
 	})
 	if err != nil {
@@ -879,8 +979,13 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return progress.failWithRollback("save settings", err, rollback,
 			"Settings were not saved; rerun acd configure after resolving the reported conflict.")
 	}
-	progress.complete("settings:saved")
-	progress.success(4, "Repository settings saved.")
+	if opts.Inherit {
+		progress.complete("repository_override:removed")
+		progress.success(4, "Repository override removed.")
+	} else {
+		progress.complete("settings:saved")
+		progress.success(4, "Repository settings saved.")
+	}
 	progress.begin(5, "Creating immutable runtime revision...")
 	applied, err := service.Apply(cmd.Context(), settings.ApplyRequest{
 		Values: draft, TestedFingerprint: tested.Fingerprint, Confirmations: confirmations,
@@ -944,6 +1049,12 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		fmt.Fprintf(cmd.OutOrStdout(),
 			"Configuration ready: %s@%d; runtime revision %d; daemon enabled.\n",
 			report.PresetID, report.PresetVersion, applied.RevisionID)
+		if opts.Inherit {
+			fmt.Fprintln(
+				cmd.OutOrStdout(),
+				"Repository settings: inheriting global defaults",
+			)
+		}
 	}
 	for _, guidance := range report.HarnessGuidance {
 		fmt.Fprintln(cmd.OutOrStdout(), guidance)
@@ -1095,6 +1206,121 @@ func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 	return out
 }
 
+func configureSelectionFromValues(values map[string]string) settingsui.ConfigureSelection {
+	strategy := fallbackConfigureValue(values[config.FieldCommitStrategy], "intent")
+	preset := fallbackConfigureValue(values[config.FieldCommitPreset], "balanced")
+	provider := fallbackConfigureValue(values[config.FieldProvider], "openai-compat")
+	baseURL := fallbackConfigureValue(values[config.FieldBaseURL], ai.DefaultOpenAIBaseURL)
+	verification := fallbackConfigureValue(
+		values[config.FieldIntentVerification],
+		configureSelectionVerificationMode(strategy, preset),
+	)
+	selection := settingsui.ConfigureSelection{
+		Experience:          configureExperienceName(strategy, preset),
+		Strategy:            strategy,
+		Preset:              preset,
+		CommitFormat:        fallbackConfigureValue(values[config.FieldCommitFormat], "imperative"),
+		Provider:            provider,
+		Model:               fallbackConfigureValue(values[config.FieldModel], "gpt-5.4-mini"),
+		BaseURL:             baseURL,
+		ProviderTimeout:     fallbackConfigureValue(values[config.FieldTimeout], ai.DefaultProviderTimeout.String()),
+		VerificationMode:    verification,
+		ExecutionMode:       "immediate",
+		DiffContextApproved: values[config.FieldDiffEgress] == "true",
+	}
+	if verification == "fast" {
+		selection.VerificationCommand =
+			strings.TrimSpace(values[config.FieldVerificationFastCommand])
+	} else if verification == "full" {
+		selection.VerificationCommand =
+			strings.TrimSpace(values[config.FieldVerificationFullCommand])
+	}
+	if selection.VerificationCommand != "" {
+		selection.VerificationSource = "inherited global setting"
+	}
+	selection.EndpointCredentialsApproved = provider == "openai-compat" &&
+		strings.TrimRight(strings.TrimSpace(baseURL), "/") !=
+			strings.TrimRight(ai.DefaultOpenAIBaseURL, "/")
+	selection.SubprocessApproved = strings.HasPrefix(provider, "subprocess:")
+	return selection
+}
+
+func loadGlobalConfigurePreview(
+	ctx context.Context,
+	roots paths.Roots,
+	lookup func(string) (string, bool),
+) (settings.AuthoringPreview, error) {
+	service, err := openConfigureGlobalSettingsService(
+		ctx, settings.Options{Roots: roots, LookupEnv: lookup},
+	)
+	if err != nil {
+		return settings.AuthoringPreview{}, fmt.Errorf(
+			"acd configure: read global defaults: %w", err,
+		)
+	}
+	preview, previewErr := service.AuthoringPreview()
+	closeErr := service.Close()
+	if previewErr != nil {
+		return settings.AuthoringPreview{}, fmt.Errorf(
+			"acd configure: resolve global defaults: %w", previewErr,
+		)
+	}
+	if closeErr != nil {
+		return settings.AuthoringPreview{}, fmt.Errorf(
+			"acd configure: close global preview: %w", closeErr,
+		)
+	}
+	return preview, nil
+}
+
+func fallbackConfigureValue(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func cloneConfigureValues(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for name, value := range values {
+		out[name] = value
+	}
+	return out
+}
+
+func builtInConfigureValues(strategy, preset string) (map[string]string, error) {
+	selection := dryRunConfigureSelection(
+		strategy, preset, configureVerificationDetection{},
+	)
+	overrides := config.Overrides{}
+	for name, value := range selectionDraft(selection) {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"acd configure: encode built-in field %q: %w", name, err,
+			)
+		}
+		overrides[name] = raw
+	}
+	resolved, _, err := config.ResolveAll(
+		config.ResolveInput{Experiment: overrides}, overrides,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"acd configure: resolve built-in defaults: %w", err,
+		)
+	}
+	out := make(map[string]string)
+	for _, field := range config.Catalog() {
+		if field.Boundary != config.ApplyHot ||
+			!field.Persistable || field.Sensitive {
+			continue
+		}
+		out[field.Name] = resolved[field.Name].EffectiveValue()
+	}
+	return out, nil
+}
+
 func configureSaveValues(selection settingsui.ConfigureSelection) map[string]*string {
 	values := map[string]string{
 		config.FieldCommitStrategy:     selection.Strategy,
@@ -1116,6 +1342,16 @@ func configureSaveValues(selection settingsui.ConfigureSelection) map[string]*st
 	for key, value := range values {
 		copyValue := value
 		out[key] = &copyValue
+	}
+	return out
+}
+
+func clearRepositoryValues() map[string]*string {
+	out := make(map[string]*string)
+	for _, field := range config.Catalog() {
+		if field.Persistable && field.Name != config.FieldAPIKey {
+			out[field.Name] = nil
+		}
 	}
 	return out
 }
@@ -1193,6 +1429,7 @@ func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, 
 		ExecutionMode: configureExecutionMode(
 			selection.Strategy, selection.Preset,
 		),
+		ConfigurationAction: "save_repository_override",
 		Readiness: configureInitialReadiness(
 			selection.Strategy, selection.Preset,
 		),
@@ -1228,6 +1465,7 @@ func configureGlobalReport(report *configureReport) {
 	}
 	report.Scope = "global"
 	report.Repo = ""
+	report.ConfigurationAction = "update_global"
 	report.ExecutionMode = "global defaults only"
 	report.Readiness = "saved after provider test"
 	report.Daemon = "not_started"
@@ -1238,6 +1476,23 @@ func configureGlobalReport(report *configureReport) {
 		"global_settings:save_with_approval",
 		"repository_state:not_opened",
 		"daemon:not_started",
+		"harness:report_only",
+	}
+}
+
+func configureInheritedReport(report *configureReport) {
+	if report == nil {
+		return
+	}
+	report.ConfigurationAction = "inherit_global"
+	report.ExecutionMode = "remove repository override and activate inheritance"
+	report.Operations = []string{
+		"provider_test:planned",
+		"credential:unchanged",
+		"repository_override:remove",
+		"runtime_revision:create_one",
+		"validation:not_required",
+		"daemon:enable",
 		"harness:report_only",
 	}
 }
@@ -1302,6 +1557,8 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 	} else {
 		fmt.Fprintf(out, "Repository: %s\n", safeRepoPreview(report.Repo))
 	}
+	fmt.Fprintln(out, "Configuration action:",
+		displayConfigureAction(report.ConfigurationAction))
 	fmt.Fprintf(out, "Experience: %s\n", report.Experience)
 	fmt.Fprintf(out, "Mode: %s %s%s [%s@%d]\n", displayConfigureWord(report.Strategy),
 		displayConfigureWord(report.Preset), customized, report.PresetID, report.PresetVersion)
@@ -1349,6 +1606,19 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 	}
 	fmt.Fprintln(out, "Harness hooks: report only; no external hook file will be edited")
 	return nil
+}
+
+func displayConfigureAction(action string) string {
+	switch action {
+	case "replace_global":
+		return "replace saved global overrides"
+	case "inherit_global":
+		return "remove repository override and inherit global defaults"
+	case "save_repository_override":
+		return "save repository-specific override"
+	default:
+		return "update global defaults"
+	}
 }
 
 type configureVerificationDetection struct {

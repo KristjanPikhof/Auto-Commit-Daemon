@@ -183,6 +183,144 @@ func TestConfigureGlobalDryRunWorksOutsideRepository(t *testing.T) {
 	}
 }
 
+func TestConfigureInheritDryRunUsesSavedGlobalDefaults(t *testing.T) {
+	repo := materializeTestRepo(t, true)
+	roots := withIsolatedHome(t)
+	store := config.NewStore(roots)
+	if err := store.UpdateExpected(0, func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] =
+			json.RawMessage(`"event"`)
+		doc.Settings.Global[config.FieldCommitPreset] =
+			json.RawMessage(`"fast"`)
+		doc.Settings.Global[config.FieldProvider] =
+			json.RawMessage(`"deterministic"`)
+		doc.Settings.Global[config.FieldTimeout] =
+			json.RawMessage(`"5m"`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, err := executeConfigureCommand(
+		t, "", "--repo", repo, "--inherit", "--dry-run", "--json",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report configureReport
+	if err := jsonUnmarshalStrict([]byte(out), &report); err != nil {
+		t.Fatalf("decode report: %v\n%s", err, out)
+	}
+	if report.ConfigurationAction != "inherit_global" ||
+		report.Strategy != "event" || report.Preset != "fast" ||
+		report.Provider != "deterministic" ||
+		report.ProviderTimeout != "5m0s" ||
+		report.ExecutionMode !=
+			"remove repository override and activate inheritance" {
+		t.Fatalf("inherit report=%+v", report)
+	}
+}
+
+func TestConfigureInheritRemovesOverrideAndCreatesRevision(t *testing.T) {
+	repo := materializeTestRepo(t, true)
+	roots := withIsolatedHome(t)
+	restoreConfigureFakes(t)
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewStore(roots)
+	if err := store.UpdateExpected(0, func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] =
+			json.RawMessage(`"event"`)
+		doc.Settings.Global[config.FieldCommitPreset] =
+			json.RawMessage(`"fast"`)
+		doc.Settings.Global[config.FieldProvider] =
+			json.RawMessage(`"deterministic"`)
+		doc.Settings.Global[config.FieldIntentVerification] =
+			json.RawMessage(`"none"`)
+		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldTimeout: json.RawMessage(`"30s"`),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runConfigureWizard = func(
+		context.Context,
+		settingsui.ConfigureWizardOptions,
+	) (settingsui.ConfigureSelection, error) {
+		t.Fatal("inheritance opened the repository setup wizard")
+		return settingsui.ConfigureSelection{}, nil
+	}
+	confirmConfigurePreview = func(
+		context.Context, io.Reader, io.Writer, bool,
+		settingsui.ConfigurePreviewApprovalOptions,
+	) (settingsui.ConfigurePreviewApproval, error) {
+		return settingsui.ConfigurePreviewApproval{Apply: true}, nil
+	}
+	configureCredentialStatus = func(
+		paths.Roots, func(string) (string, bool),
+	) (credentials.Source, bool, error) {
+		return credentials.SourceNone, false, nil
+	}
+	configureEnable = func(
+		context.Context, io.Writer, string, bool,
+	) error {
+		return nil
+	}
+	settingsInputTTY = func(io.Reader) bool { return true }
+	settingsOutputTTY = func(io.Writer) bool { return true }
+
+	out, _, err := executeConfigureCommand(
+		t, "", "--repo", repo, "--inherit",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Settings.Repositories[repoHash]; ok {
+		t.Fatalf("repository override still exists: %+v",
+			doc.Settings.Repositories[repoHash])
+	}
+	db, err := state.Open(
+		context.Background(),
+		state.DBPathFromGitDir(filepath.Join(repo, ".git")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	runtime, err := state.RuntimeConfigActivationState(
+		context.Background(), db,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.DesiredRevisionID.Valid ||
+		!strings.Contains(out, "inheriting global defaults") {
+		t.Fatalf("runtime=%+v output=%s", runtime, out)
+	}
+}
+
+func TestClearRepositoryValuesCoversSensitiveOverrides(t *testing.T) {
+	values := clearRepositoryValues()
+	for _, name := range []string{
+		"capture.sensitive_globs",
+		"trace.prompt",
+	} {
+		if value, ok := values[name]; !ok || value != nil {
+			t.Fatalf("clear value %q = %v, present=%v",
+				name, value, ok)
+		}
+	}
+}
+
 func TestConfigureGlobalSavesOnlyReviewedDefaults(t *testing.T) {
 	t.Chdir(t.TempDir())
 	withIsolatedHome(t)
@@ -1041,7 +1179,8 @@ func TestConfigureHelpAndInvalidFlags(t *testing.T) {
 	help := commandHelp(t, "configure")
 	for _, want := range []string{
 		"--accessible", "--strategy", "--preset", "--credential-stdin",
-		"--dry-run", "--wait", "Everyday work", "repository Strict Review",
+		"--dry-run", "--wait", "--replace", "--inherit", "Everyday work",
+		"repository Strict Review",
 		"edits harness hook",
 	} {
 		if !strings.Contains(help, want) {
@@ -1055,6 +1194,9 @@ func TestConfigureHelpAndInvalidFlags(t *testing.T) {
 		{"--repo", repo, "--json"},
 		{"--repo", repo, "--dry-run", "--credential-stdin"},
 		{"--repo", repo, "--dry-run", "--wait"},
+		{"--replace", "--repo", repo, "--dry-run"},
+		{"--inherit", "--dry-run"},
+		{"--repo", repo, "--inherit", "--strategy", "intent", "--dry-run"},
 	} {
 		if _, _, err := executeConfigureCommand(t, "", args...); err == nil {
 			t.Fatalf("args %v succeeded", args)

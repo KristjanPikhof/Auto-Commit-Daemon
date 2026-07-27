@@ -33,6 +33,10 @@ non-secret values do not require shell sourcing. See the
 [settings guide](settings.md) for source precedence, safe activation, and
 rejected-revision recovery.
 
+Use `acd configure --replace` to replace retained global overrides with the
+reviewed current built-ins. Use `acd configure --repo . --inherit` to remove a
+repository-specific layer and activate the global result again.
+
 Global Everyday setup runs no project test or validation job. Repository Strict
 Review returns after provider testing and durable validation queueing. Capture
 stays active while commit publishing waits. Use

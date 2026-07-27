@@ -6,6 +6,7 @@ provider, and saves global settings without opening repository state.
 
 ~~~bash
 acd configure
+acd configure --replace
 acd configure --strategy intent --preset balanced
 acd configure --accessible
 ~~~
@@ -21,6 +22,7 @@ Strict Review is available only when targeting one repository:
 
 ~~~bash
 acd configure --repo .
+acd configure --repo . --inherit
 acd configure --repo . --strategy intent --preset quality --wait
 ~~~
 
@@ -34,6 +36,12 @@ and model, then asks for a masked API key when neither the environment nor the
 protected file supplies one. Provider timeout, commit format, and custom
 verification commands remain advanced settings. Every effective value is
 visible in the final review.
+
+Use `--replace` when retained global values should not be reused: the wizard
+starts from the current built-ins and replaces the saved global layer after
+review. Use `--repo . --inherit` to remove a repository's fields and profile
+selection and activate the resulting global configuration. Plain
+`--repo .` continues to create or update a repository-specific setup.
 
 Use `acd configure --dry-run` or
 `acd configure --dry-run --json` for a side-effect-free preview. Dry-run does

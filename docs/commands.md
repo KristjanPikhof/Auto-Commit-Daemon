@@ -41,9 +41,11 @@ runs a project command.
 
 ~~~bash
 acd configure
+acd configure --replace
 acd configure --accessible
 acd configure --strategy intent --preset balanced
 acd configure --repo .
+acd configure --repo . --inherit
 acd configure --repo . --strategy intent --preset quality --wait
 acd configure --dry-run --json
 ~~~
@@ -55,12 +57,21 @@ After approval, global configure tests the provider before any write, saves
 global defaults, and does not open repository state or start a daemon. Running
 repositories keep their immutable active revision.
 
+`--replace` starts global setup from the current built-in values and replaces
+the prior global layer after the normal preview and provider test. It does not
+change repositories that still have their own override.
+
 An explicit `--repo` enables repository setup and adds Strict Review.
 Repository Everyday and Maximum Speed run no project tests. Strict Review
 reuses or detects an approved full command, queues a durable background
 validation job, and blocks publication while capture continues. `--wait`
 follows only that strict job. Custom commands remain an advanced
 `acd settings` action.
+
+`acd configure --repo . --inherit` removes the repository field and profile
+overrides, tests the inherited provider, creates one runtime revision from the
+global result, and enables ACD. It conflicts with strategy, preset, credential,
+and wait options because it selects the global result exactly.
 
 `acd settings` opens the advanced terminal settings lab:
 
