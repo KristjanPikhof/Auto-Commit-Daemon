@@ -2931,6 +2931,10 @@ func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
 // prevHead), so the generation must NOT bump even though the token
 // changed.
 func TestRun_BranchGenerationStableOnAcdFastForward(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	ctx := context.Background()
@@ -3869,6 +3873,445 @@ func TestRun_SelfPublicationBoundary_MultiGroupHeadAdvanceBeforeTokenAdoption(t 
 	if got := strings.TrimSpace(string(out)); got != "2" {
 		t.Fatalf("publication commit count=%s want exactly 2", got)
 	}
+}
+
+func TestRun_HeartbeatAndWakeAfterSelfPublication(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-one.txt"),
+		[]byte("one\n"), 0o644); err != nil {
+		t.Fatalf("write publication one: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-two.txt"),
+		[]byte("two\n"), 0o644); err != nil {
+		t.Fatalf("write publication two: %v", err)
+	}
+
+	type adoptionSnapshot struct {
+		cctx        CaptureContext
+		token       string
+		headOID     string
+		stampedHead string
+	}
+	adoptedCh := make(chan adoptionSnapshot, 1)
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	trace := &memoryTraceLogger{}
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     manual,
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			Trace:         trace,
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext,
+				token string,
+				headOID string,
+				stampedHead string,
+			) {
+				select {
+				case adoptedCh <- adoptionSnapshot{
+					cctx:        cctx,
+					token:       token,
+					headOID:     headOID,
+					stampedHead: stampedHead,
+				}:
+				default:
+				}
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var adopted adoptionSnapshot
+	select {
+	case adopted = <-adoptedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run loop did not adopt journaled self-publication")
+	}
+	targetHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse target: %v", err)
+	}
+	if targetHead == seedHead {
+		t.Fatalf("HEAD stayed at seed %s", seedHead)
+	}
+	wantToken := branchTokenRev(targetHead, "refs/heads/main")
+	if adopted.cctx.BaseHead != targetHead ||
+		adopted.token != wantToken ||
+		adopted.headOID != targetHead ||
+		adopted.stampedHead != targetHead {
+		t.Fatalf(
+			"adopted snapshot cctx=%s token=%q headOID=%s stamped=%s want target=%s token=%q",
+			adopted.cctx.BaseHead, adopted.token, adopted.headOID,
+			adopted.stampedHead, targetHead, wantToken)
+	}
+	t.Logf("adopted target=%s token=%q generation=%d",
+		targetHead, wantToken, adopted.cctx.BranchGeneration)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, targetHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken, wantToken, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchGeneration, "1", 2*time.Second)
+
+	var completedPublications int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publications
+WHERE phase = 'completed' AND target_commit_oid = ?`, targetHead).
+		Scan(&completedPublications); err != nil {
+		t.Fatalf("count completed self-publications: %v", err)
+	}
+	if completedPublications != 1 {
+		t.Fatalf("completed publications for target=%d want 1", completedPublications)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", archives)
+	}
+
+	// Wait for the publication iteration's heartbeat, then prove the next
+	// queued wake is both claimed and followed by another heartbeat within
+	// the epic's three-second liveness budget.
+	waitFor(t, 3*time.Second, "publication heartbeat", func() bool {
+		st, ok, loadErr := state.LoadDaemonState(ctx, f.db)
+		return loadErr == nil && ok && st.HeartbeatTS > 0
+	})
+	beforeWake, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load heartbeat before wake: ok=%v err=%v", ok, err)
+	}
+	flushID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false,
+		sql.NullString{String: "post-publication liveness", Valid: true})
+	if err != nil {
+		t.Fatalf("enqueue post-publication wake: %v", err)
+	}
+	wakeStarted := time.Now()
+	wakeCh <- struct{}{}
+	waitFor(t, 3*time.Second, "post-publication wake and heartbeat", func() bool {
+		var status string
+		if scanErr := f.db.SQL().QueryRowContext(ctx,
+			`SELECT status FROM flush_requests WHERE id = ?`, flushID).
+			Scan(&status); scanErr != nil || status != "completed" {
+			return false
+		}
+		st, stateOK, loadErr := state.LoadDaemonState(ctx, f.db)
+		return loadErr == nil && stateOK &&
+			st.HeartbeatTS > beforeWake.HeartbeatTS
+	})
+	if elapsed := time.Since(wakeStarted); elapsed >= 3*time.Second {
+		t.Fatalf("post-publication wake latency=%v want <3s", elapsed)
+	} else {
+		t.Logf("post-publication wake latency=%v", elapsed)
+	}
+	if transitions := traceEventsByClass(
+		trace.Events(), "branch_token.transition"); len(transitions) != 0 {
+		t.Fatalf("journaled target entered external transition path: %+v",
+			transitions)
+	}
+}
+
+func TestRun_SelfPublicationTokenRetryFailsClosed(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-before-retry.txt"),
+		[]byte("publication\n"), 0o644); err != nil {
+		t.Fatalf("write initial publication: %v", err)
+	}
+	var remainingTokenFailures atomic.Int32
+	var injectOnce sync.Once
+	targetCh := make(chan string, 1)
+	adoptedCh := make(chan CaptureContext, 1)
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     fastScheduler(),
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			selfPublicationCheckpoint: func(
+				event SelfPublicationCheckpointEvent,
+			) error {
+				if event.Checkpoint != SelfPublicationAfterCompletion {
+					return nil
+				}
+				var injectErr error
+				injectOnce.Do(func() {
+					if err := os.WriteFile(
+						filepath.Join(f.dir, "captured-after-token-retry.txt"),
+						[]byte("after retry\n"), 0o644); err != nil {
+						injectErr = err
+						return
+					}
+					remainingTokenFailures.Store(2)
+					targetCh <- event.TargetOID
+				})
+				return injectErr
+			},
+			branchGenerationToken: func(
+				resolveCtx context.Context,
+				repoPath string,
+			) (string, error) {
+				for {
+					remaining := remainingTokenFailures.Load()
+					if remaining == 0 {
+						return BranchGenerationToken(resolveCtx, repoPath)
+					}
+					if remainingTokenFailures.CompareAndSwap(
+						remaining, remaining-1) {
+						return "", errors.New(
+							"injected self-publication token read failure")
+					}
+				}
+			},
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext, _, _, _ string,
+			) {
+				select {
+				case adoptedCh <- cctx:
+				default:
+				}
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var targetOID string
+	select {
+	case targetOID = <-targetCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("publication checkpoint did not inject token failures")
+	}
+	var adopted CaptureContext
+	select {
+	case adopted = <-adoptedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pending self-publication target was not retried")
+	}
+	if adopted.BaseHead != targetOID {
+		t.Fatalf("adopted base=%s want journal target %s",
+			adopted.BaseHead, targetOID)
+	}
+	waitFor(t, 5*time.Second, "post-retry capture", func() bool {
+		var baseHead string
+		err := f.db.SQL().QueryRowContext(ctx, `
+SELECT base_head
+FROM capture_events
+WHERE path = ?
+ORDER BY seq DESC
+LIMIT 1`, "captured-after-token-retry.txt").Scan(&baseHead)
+		return err == nil && baseHead == targetOID
+	})
+	var staleCaptures int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE path = ? AND base_head <> ?`,
+		"captured-after-token-retry.txt", targetOID).Scan(&staleCaptures); err != nil {
+		t.Fatalf("count stale captures: %v", err)
+	}
+	if staleCaptures != 0 {
+		t.Fatalf("post-retry stale captures=%d want 0", staleCaptures)
+	}
+	waitFor(t, 5*time.Second, "post-retry capture publishes", func() bool {
+		var eventState string
+		err := f.db.SQL().QueryRowContext(ctx, `
+SELECT state
+FROM capture_events
+WHERE path = ?
+ORDER BY seq DESC
+LIMIT 1`, "captured-after-token-retry.txt").Scan(&eventState)
+		return err == nil && eventState == state.EventStatePublished
+	})
+}
+
+func TestRun_UnknownHeadAfterSelfPublicationUsesTransitionClassifier(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "published-before-external.txt"),
+		[]byte("published\n"), 0o644); err != nil {
+		t.Fatalf("write publication: %v", err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	externalMovedCh := make(chan string, 1)
+	adoptedCh := make(chan struct{}, 1)
+	trace := &memoryTraceLogger{}
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+	var moveOnce sync.Once
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     manual,
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			Trace:         trace,
+			afterSelfPublicationAdoption: func(
+				CaptureContext, string, string, string,
+			) {
+				select {
+				case adoptedCh <- struct{}{}:
+				default:
+				}
+			},
+			selfPublicationCheckpoint: func(
+				event SelfPublicationCheckpointEvent,
+			) error {
+				if event.Checkpoint != SelfPublicationAfterCompletion {
+					return nil
+				}
+				var moveErr error
+				moveOnce.Do(func() {
+					externalHead, err := git.CommitTree(
+						ctx, f.dir, event.TreeOID,
+						"external child after publication", event.TargetOID)
+					if err != nil {
+						moveErr = err
+						return
+					}
+					if err := git.UpdateRef(
+						ctx, f.dir, "refs/heads/main",
+						externalHead, event.TargetOID); err != nil {
+						moveErr = err
+						return
+					}
+					externalMovedCh <- externalHead
+				})
+				return moveErr
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var externalHead string
+	select {
+	case externalHead = <-externalMovedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkpoint did not create external HEAD movement")
+	}
+	// Queue the next iteration while Replay is returning. The live HEAD no
+	// longer equals its completed journal target, so the run loop must not
+	// invoke the self-publication adoption boundary.
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, externalHead, 5*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(externalHead, "refs/heads/main"), 5*time.Second)
+	select {
+	case <-adoptedCh:
+		t.Fatal("external child was incorrectly adopted as self-publication")
+	default:
+	}
+	if got, _, err := state.MetaGet(
+		ctx, f.db, MetaKeyBranchGeneration); err != nil || got != "1" {
+		t.Fatalf("branch generation=%q err=%v want stable fast-forward generation 1",
+			got, err)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", archives)
+	}
+	waitFor(t, 5*time.Second, "external fast-forward trace", func() bool {
+		for _, event := range traceEventsByClass(
+			trace.Events(), "branch_token.transition") {
+			if event.Decision == TokenTransitionFastForward.String() {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestRun_FlushDrainBoundedByLimit pins the regression where the flush

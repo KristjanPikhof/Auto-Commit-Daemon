@@ -295,18 +295,34 @@ func LoadBranchGeneration(ctx context.Context, db *state.DB) (int64, error) {
 }
 
 // SaveBranchGeneration upserts the persisted branch_generation alongside
-// the last-known HEAD OID. Both writes are best-effort from the run loop's
-// perspective — the loop logs a warn but does not abort on failure. We
-// nonetheless surface the underlying error so tests can assert it.
+// the last-known HEAD OID. Both values move in one transaction so readers
+// cannot observe a new generation paired with the prior HEAD (or vice versa).
+// The write is best-effort from the run loop's perspective — the loop logs a
+// warning but does not abort on failure. We nonetheless surface the underlying
+// error so tests can assert it.
 func SaveBranchGeneration(ctx context.Context, db *state.DB, generation int64, head string) error {
-	if err := state.MetaSet(ctx, db, MetaKeyBranchGeneration,
-		strconv.FormatInt(generation, 10)); err != nil {
-		return err
-	}
-	if err := state.MetaSet(ctx, db, MetaKeyBranchHead, head); err != nil {
-		return err
-	}
-	return nil
+	return state.MetaSetMany(ctx, db, map[string]string{
+		MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
+		MetaKeyBranchHead:       head,
+	})
+}
+
+// SaveBranchPublicationToken atomically persists the complete durable branch
+// observation corresponding to a journaled self-publication. Keeping the
+// generation, HEAD, and raw token in one transaction prevents controllers or
+// the next daemon tick from observing a partially adopted publication.
+func SaveBranchPublicationToken(
+	ctx context.Context,
+	db *state.DB,
+	generation int64,
+	head string,
+	token string,
+) error {
+	return state.MetaSetMany(ctx, db, map[string]string{
+		MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
+		MetaKeyBranchHead:       head,
+		MetaKeyBranchToken:      token,
+	})
 }
 
 // LoadBranchHead reads the last-known HEAD OID stored alongside the

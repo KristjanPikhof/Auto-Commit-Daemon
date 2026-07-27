@@ -244,6 +244,15 @@ type Options struct {
 	// beforeBranchTokenCheck is a test-only synchronization point immediately
 	// before the run loop samples the live branch token.
 	beforeBranchTokenCheck func()
+	// afterSelfPublicationAdoption is a test-only observation point after the
+	// journal-proved target and all in-memory/durable token fields agree.
+	afterSelfPublicationAdoption func(CaptureContext, string, string, string)
+	// selfPublicationCheckpoint is the run-loop wiring for Replay's
+	// deterministic publication-boundary fault seam.
+	selfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
+	// branchGenerationToken is a test-only resolver seam for publication
+	// adoption and transition retry coverage.
+	branchGenerationToken func(context.Context, string) (string, error)
 	// beforeStartupDeadBranchPairSafetyCheck is a test-only synchronization
 	// point immediately before a startup dead-branch pair's final safety gate.
 	// The sweep-owned context lets blocking tests release on daemon shutdown.
@@ -725,7 +734,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		logger.Warn("load persisted branch head", "err", err.Error())
 	}
-	currentToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
+	branchGenerationToken := BranchGenerationToken
+	if opts.branchGenerationToken != nil {
+		branchGenerationToken = opts.branchGenerationToken
+	}
+	currentToken, terr := branchGenerationToken(ctx, opts.RepoPath)
 	if terr != nil {
 		logger.Warn("seed branch token", "err", terr.Error())
 		currentToken = ""
@@ -835,7 +848,7 @@ func Run(ctx context.Context, opts Options) error {
 					"recovery_ref", result.RecoveryRef)
 			}
 			if !branchTransitionBlocked {
-				verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+				verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 				if verifyErr != nil {
 					logger.Warn("verify startup branch token after reconciliation; will retry",
 						"err", verifyErr.Error())
@@ -899,7 +912,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	if !branchTransitionBlocked {
-		verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn("verify startup branch token before metadata accept; will retry",
 				"err", verifyErr.Error())
@@ -1236,15 +1249,68 @@ func Run(ctx context.Context, opts Options) error {
 	lastStampedBranchHead := persistedHead
 	var branchTransitionSettleUntil time.Time
 	forceShadowRefresh := startupShadowRefreshRequired
+	pendingSelfPublicationTarget := ""
+
+	adoptSelfPublicationTarget := func(targetOID, observedToken string) error {
+		if targetOID == "" {
+			return fmt.Errorf("daemon: adopt self-publication: empty target OID")
+		}
+		if tokenSHA(observedToken) != targetOID ||
+			tokenBranchRef(observedToken) != cctx.BranchRef {
+			return fmt.Errorf(
+				"daemon: adopt self-publication: observed token %q does not match target %s on %s",
+				observedToken, targetOID, cctx.BranchRef)
+		}
+		nextToken := branchTokenRev(targetOID, cctx.BranchRef)
+		if err := SaveBranchPublicationToken(
+			ctx, opts.DB, cctx.BranchGeneration, targetOID, nextToken); err != nil {
+			return fmt.Errorf("daemon: persist self-publication token: %w", err)
+		}
+
+		// This is one run-loop boundary: no capture, flush, wake, or branch
+		// transition check can run between the durable transaction above and
+		// these in-memory assignments.
+		cctx.BaseHead = targetOID
+		currentToken = nextToken
+		headOID = targetOID
+		lastStampedBranchHead = targetOID
+		pendingSelfPublicationTarget = ""
+		if opts.afterSelfPublicationAdoption != nil {
+			opts.afterSelfPublicationAdoption(
+				cctx, currentToken, headOID, lastStampedBranchHead)
+		}
+		return nil
+	}
 
 	processBranchTokenChange := func(logPrefix string) bool {
 		if opts.beforeBranchTokenCheck != nil {
 			opts.beforeBranchTokenCheck()
 		}
-		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
+		newToken, terr := branchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
 			logger.Warn(logPrefix+" resolve failed", "err", terr.Error())
-			return false
+			// A completed journal target that has not yet been adopted is an
+			// exact internal transition in progress. Fail closed until HEAD
+			// can be sampled again; otherwise capture/replay would run against
+			// the pre-publication cctx and strand new work on a stale base.
+			return pendingSelfPublicationTarget != ""
+		}
+		if pendingSelfPublicationTarget != "" {
+			if tokenSHA(newToken) == pendingSelfPublicationTarget &&
+				tokenBranchRef(newToken) == cctx.BranchRef {
+				if err := adoptSelfPublicationTarget(
+					pendingSelfPublicationTarget, newToken); err != nil {
+					logger.Warn(logPrefix+" retry self-publication adoption",
+						"target", pendingSelfPublicationTarget,
+						"err", err.Error())
+					return true
+				}
+				return false
+			}
+			// HEAD no longer names the completed journal target. It is now an
+			// unknown transition and must retain the existing reconciliation
+			// and generation-classification path below.
+			pendingSelfPublicationTarget = ""
 		}
 		if SameGeneration(currentToken, newToken) {
 			if forceShadowRefresh && cctx.BranchRef != "" {
@@ -1401,7 +1467,7 @@ func Run(ctx context.Context, opts Options) error {
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
 		}
-		verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn(logPrefix+" verify branch token after reconciliation; will retry",
 				"err", verifyErr.Error())
@@ -1476,7 +1542,7 @@ func Run(ctx context.Context, opts Options) error {
 				rollbackTransition()
 				return false
 			}
-			verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+			verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 			if verifyErr != nil {
 				logger.Warn(logPrefix+" verify branch token before metadata accept; will retry",
 					"err", verifyErr.Error())
@@ -2174,47 +2240,67 @@ func Run(ctx context.Context, opts Options) error {
 						passBundle.IntentVerificationCommand)
 				}
 				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-					MessageFn:                passBundle.MessageFn,
-					GitDir:                   opts.GitDir,
-					Trace:                    tracer,
-					PromptTrace:              promptTracer,
-					Limit:                    DefaultReplayLimit,
-					CommitStrategy:           passBundle.CommitStrategy,
-					IntentWindow:             passBundle.IntentWindow,
-					IntentMinPending:         passBundle.IntentMinPending,
-					IntentSettleWindow:       passBundle.IntentSettleWindow,
-					IntentMaxPendingAge:      passBundle.IntentMaxPendingAge,
-					IntentRecentCommits:      passBundle.IntentRecentCommits,
-					IntentDeferLimit:         passBundle.IntentDeferLimit,
-					IntentRetryLimit:         &passBundle.IntentRetryLimit,
-					IntentPathCoalescing:     &passBundle.IntentPathCoalescing,
-					IntentBypassBatchWait:    flushedLogical > 0,
-					IntentPlanner:            passBundle.IntentPlanner,
-					IntentHealth:             passBundle.IntentHealth,
-					IntentPlannerProvider:    passBundle.HealthIdentity.Provider,
-					IntentPlannerModel:       passBundle.Model,
-					IntentIncludeDiffs:       passBundle.IntentIncludeDiffs,
-					IntentPreset:             passBundle.IntentPreset,
-					IntentVerificationMode:   passBundle.IntentVerificationMode,
-					IntentCandidateVerify:    candidateVerify,
-					IntentRepairCommitVerify: repairCommitVerify,
-					IntentRepairEnabled:      passBundle.IntentRepairEnabled,
-					IntentRepairHorizon:      passBundle.IntentRepairHorizon,
-					IntentRepairMaxCommits:   passBundle.IntentRepairMaxCommits,
+					MessageFn:                 passBundle.MessageFn,
+					GitDir:                    opts.GitDir,
+					Trace:                     tracer,
+					PromptTrace:               promptTracer,
+					Limit:                     DefaultReplayLimit,
+					CommitStrategy:            passBundle.CommitStrategy,
+					IntentWindow:              passBundle.IntentWindow,
+					IntentMinPending:          passBundle.IntentMinPending,
+					IntentSettleWindow:        passBundle.IntentSettleWindow,
+					IntentMaxPendingAge:       passBundle.IntentMaxPendingAge,
+					IntentRecentCommits:       passBundle.IntentRecentCommits,
+					IntentDeferLimit:          passBundle.IntentDeferLimit,
+					IntentRetryLimit:          &passBundle.IntentRetryLimit,
+					IntentPathCoalescing:      &passBundle.IntentPathCoalescing,
+					IntentBypassBatchWait:     flushedLogical > 0,
+					IntentPlanner:             passBundle.IntentPlanner,
+					IntentHealth:              passBundle.IntentHealth,
+					IntentPlannerProvider:     passBundle.HealthIdentity.Provider,
+					IntentPlannerModel:        passBundle.Model,
+					IntentIncludeDiffs:        passBundle.IntentIncludeDiffs,
+					IntentPreset:              passBundle.IntentPreset,
+					IntentVerificationMode:    passBundle.IntentVerificationMode,
+					IntentCandidateVerify:     candidateVerify,
+					IntentRepairCommitVerify:  repairCommitVerify,
+					IntentRepairEnabled:       passBundle.IntentRepairEnabled,
+					IntentRepairHorizon:       passBundle.IntentRepairHorizon,
+					IntentRepairMaxCommits:    passBundle.IntentRepairMaxCommits,
+					SelfPublicationCheckpoint: opts.selfPublicationCheckpoint,
 				})
 				_ = updateIntentV2EvaluationMeta(
 					ctx, opts.DB, passBundle, repSum, repErr)
 			}
-			if repErr == nil && repSum.Published > 0 {
-				// Refresh BaseHead to the exact commit replay just wrote.
-				cctx.BaseHead = repSum.BaseHead
-				currentToken = branchTokenRev(cctx.BaseHead, cctx.BranchRef)
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, cctx.BaseHead); err != nil {
-					logger.Warn("persist replay head", "err", err.Error())
-				}
-				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
-					logger.Warn("persist replay branch token", "err", err.Error())
+			if repErr == nil && repSum.SelfPublicationTargetOID != "" {
+				targetOID := repSum.SelfPublicationTargetOID
+				if repSum.BaseHead != targetOID {
+					repErr = fmt.Errorf(
+						"daemon: replay self-publication target %s disagrees with base head %s",
+						targetOID, repSum.BaseHead)
+				} else {
+					pendingSelfPublicationTarget = targetOID
+					observedToken, tokenErr := branchGenerationToken(
+						passCtx, opts.RepoPath)
+					if tokenErr != nil {
+						repErr = fmt.Errorf(
+							"daemon: resolve self-publication target: %w",
+							tokenErr)
+					} else if tokenSHA(observedToken) == targetOID &&
+						tokenBranchRef(observedToken) == cctx.BranchRef {
+						if adoptErr := adoptSelfPublicationTarget(
+							targetOID, observedToken); adoptErr != nil {
+							repErr = adoptErr
+						}
+					} else {
+						// An external writer moved HEAD after the journal
+						// completed. Do not bless that movement as ours; the
+						// next token check must classify it normally.
+						pendingSelfPublicationTarget = ""
+						logger.Info("HEAD moved after self-publication; deferring to transition classifier",
+							"journal_target", targetOID,
+							"observed_token", observedToken)
+					}
 				}
 			}
 		}
