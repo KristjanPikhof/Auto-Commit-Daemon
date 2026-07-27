@@ -26,14 +26,49 @@ import (
 
 func TestMain(m *testing.M) {
 	_ = os.Setenv(ai.EnvProvider, "deterministic")
+	// Ordinary daemon tests exercise run-loop behavior, not host process
+	// discovery. Keep their lock acquisition deterministic and leave the real
+	// and injected owner-probe paths to lock_test.go.
+	daemonLockOwnerProbe = func(context.Context, string, int) ([]int, error) {
+		return nil, nil
+	}
+	runtimeRoot, err := os.MkdirTemp("", "acd-daemon-runtime-*")
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test runtime setup: %v\n", err)
+		os.Exit(1)
+	}
+	for name, path := range map[string]string{
+		"HOME":            filepath.Join(runtimeRoot, "home"),
+		"XDG_CONFIG_HOME": filepath.Join(runtimeRoot, "config"),
+		"XDG_STATE_HOME":  filepath.Join(runtimeRoot, "state"),
+		"XDG_DATA_HOME":   filepath.Join(runtimeRoot, "share"),
+	} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"daemon test runtime directory %s: %v\n", name, err)
+			_ = os.RemoveAll(runtimeRoot)
+			os.Exit(1)
+		}
+		if err := os.Setenv(name, path); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"daemon test runtime environment %s: %v\n", name, err)
+			_ = os.RemoveAll(runtimeRoot)
+			os.Exit(1)
+		}
+	}
 	templateRoot, err := setupDaemonTestRepoTemplates()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "daemon test template setup: %v\n", err)
+		_ = os.RemoveAll(runtimeRoot)
 		os.Exit(1)
 	}
 	code := m.Run()
 	if err := os.RemoveAll(templateRoot); err != nil && code == 0 {
 		_, _ = fmt.Fprintf(os.Stderr, "daemon test template cleanup: %v\n", err)
+		code = 1
+	}
+	if err := os.RemoveAll(runtimeRoot); err != nil && code == 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test runtime cleanup: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
