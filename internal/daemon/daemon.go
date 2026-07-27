@@ -834,18 +834,39 @@ func Run(ctx context.Context, opts Options) error {
 		headOID = tokenSHA(currentToken)
 	}
 	startupPublicationBlocked := false
+	startupReattachedFromDetached := false
 	if branchRef != "" && headOID != "" {
 		// A detached marker alongside an attached current token means HEAD
 		// reattached before startup finished sampling it. In that narrow
 		// case, the rewind-grace row belongs to the stale detached state.
 		// Let exact self-publication proof run, but retain both markers until
 		// the branch transition is accepted below.
-		_, reattachedFromDetached, detachedErr :=
+		_, detachedMarkerExists, detachedErr :=
 			state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused)
 		if detachedErr != nil {
 			logger.Warn("read detached marker before startup self-publication recovery",
 				"err", detachedErr.Error())
 			startupPublicationBlocked = true
+		}
+		if detachedMarkerExists {
+			persistedToken, tokenOK, tokenErr :=
+				state.MetaGet(ctx, opts.DB, MetaKeyBranchToken)
+			if tokenErr != nil {
+				logger.Warn("read branch token before startup self-publication recovery",
+					"err", tokenErr.Error())
+				startupPublicationBlocked = true
+			} else {
+				startupReattachedFromDetached = tokenOK &&
+					tokenBranchRef(persistedToken) == "" &&
+					tokenSHA(persistedToken) != ""
+				if tokenOK && tokenBranchRef(persistedToken) != "" {
+					// An attached durable token proves this marker is stale.
+					// Remove only the detached marker; any active rewind grace
+					// belongs to the attached history and must remain intact.
+					_, _ = state.MetaDelete(
+						ctx, opts.DB, MetaKeyDetachedHeadPaused)
+				}
+			}
 		}
 		if operation, active := gitOperationInProgress(opts.GitDir); active {
 			logger.Info("startup self-publication recovery deferred during git operation",
@@ -857,7 +878,8 @@ func Run(ctx context.Context, opts Options) error {
 				"err", pauseErr.Error())
 			startupPublicationBlocked = true
 		} else if pauseStatus.Active &&
-			!(pauseStatus.Source == "rewind_grace" && reattachedFromDetached) {
+			!(pauseStatus.Source == "rewind_grace" &&
+				startupReattachedFromDetached) {
 			logger.Info("startup self-publication recovery deferred while paused",
 				"source", pauseStatus.Source, "reason", pauseStatus.Reason)
 			startupPublicationBlocked = true
@@ -1144,8 +1166,10 @@ func Run(ctx context.Context, opts Options) error {
 	if !branchTransitionBlocked && cctx.BranchRef != "" {
 		if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-			clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
-				"detached HEAD reattached before startup acceptance")
+			if startupReattachedFromDetached {
+				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+					"detached HEAD reattached before startup acceptance")
+			}
 		}
 	}
 	if !branchTransitionBlocked {

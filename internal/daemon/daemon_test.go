@@ -3346,6 +3346,13 @@ func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
 	if err := state.MetaSet(ctx, f.db, MetaKeyDetachedHeadPaused, "1"); err != nil {
 		t.Fatalf("MetaSet detached: %v", err)
 	}
+	if err := state.MetaSet(
+		ctx, f.db, MetaKeyBranchToken, branchTokenRev(headSHA, "")); err != nil {
+		t.Fatalf("MetaSet detached branch token: %v", err)
+	}
+	if err := state.MetaSet(ctx, f.db, MetaKeyBranchHead, headSHA); err != nil {
+		t.Fatalf("MetaSet detached branch head: %v", err)
+	}
 	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
 	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
 	// our pre-set marker in place; otherwise the clamp normalizes the
@@ -3355,43 +3362,99 @@ func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
 
-	wakeCh := make(chan struct{}, 4)
-	shutdownCh := make(chan struct{}, 1)
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-		})
-	}()
-	t.Cleanup(func() {
-		cancel()
-		wg.Wait()
-	})
-
-	waitForDaemonMode(t, f.db, "running", 2*time.Second)
-
-	// Reattach HEAD onto refs/heads/main.
+	// Reattach before startup samples HEAD. The persisted detached token and
+	// marker must still authorize exact recovery and clear the stale grace
+	// only after the startup transition is accepted.
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "main"); err != nil {
 		t.Fatalf("checkout main: %v", err)
 	}
-	wakeCh <- struct{}{}
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+	if err := Run(ctx, Options{
+		RepoPath:    f.dir,
+		GitDir:      f.gitDir,
+		DB:          f.db,
+		Scheduler:   fastScheduler(),
+		BootGrace:   30 * time.Second,
+		ShutdownCh:  shutdownCh,
+		SkipSignals: true,
+		recoverSelfPublications: func(
+			ctx context.Context, _ string, db *state.DB,
+			_ CaptureContext, _ ReplayOpts,
+		) (SelfPublicationRecoverySummary, error) {
+			// Completion persists the recovered attached publication token
+			// before startup later reloads its previous token.
+			if err := state.MetaSet(ctx, db, MetaKeyBranchToken,
+				branchTokenRev(headSHA, "refs/heads/main")); err != nil {
+				return SelfPublicationRecoverySummary{}, err
+			}
+			return SelfPublicationRecoverySummary{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 
-	// Both the detached-paused marker and the rewind-grace marker must
-	// be cleared once the reattach branch in the run loop fires.
-	waitForMetaDeleted(t, f.db, MetaKeyDetachedHeadPaused, 3*time.Second)
-	waitForMetaDeleted(t, f.db, MetaKeyReplayPausedUntil, 3*time.Second)
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); err != nil {
+		t.Fatalf("MetaGet detached marker: %v", err)
+	} else if ok {
+		t.Fatal("detached marker was not cleared")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet rewind grace: %v", err)
+	} else if ok {
+		t.Fatal("stale detached rewind grace was not cleared")
+	}
+}
+
+func TestRun_StartupStaleDetachedMarkerPreservesAttachedRewindGrace(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headSHA, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyBranchToken:        branchTokenRev(headSHA, "refs/heads/main"),
+		MetaKeyBranchHead:         headSHA,
+		MetaKeyDetachedHeadPaused: "stale",
+		MetaKeyReplayPausedUntil: time.Now().UTC().
+			Add(90 * time.Second).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("MetaSetMany: %v", err)
+	}
+
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+	recoveryCalled := false
+	if err := Run(ctx, Options{
+		RepoPath:    f.dir,
+		GitDir:      f.gitDir,
+		DB:          f.db,
+		BootGrace:   time.Hour,
+		ShutdownCh:  shutdownCh,
+		SkipSignals: true,
+		recoverSelfPublications: func(
+			context.Context, string, *state.DB, CaptureContext, ReplayOpts,
+		) (SelfPublicationRecoverySummary, error) {
+			recoveryCalled = true
+			return SelfPublicationRecoverySummary{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if recoveryCalled {
+		t.Fatal("startup recovery bypassed a genuine attached rewind grace")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet rewind grace: %v", err)
+	} else if !ok {
+		t.Fatal("genuine attached rewind grace was cleared")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); err != nil {
+		t.Fatalf("MetaGet detached marker: %v", err)
+	} else if ok {
+		t.Fatal("stale detached marker was not cleared")
+	}
 }
 
 // TestRun_OperationClearedClearsStaleRewindGrace asserts the symmetric
