@@ -216,14 +216,19 @@ materialization, verification, and revertibility before publication.
 
 Fallback depends on the preset. Fast publishes the smallest materializable
 hard-dependency component. Balanced reuses a valid or deterministic dependency
-partition and applies structural gates. Quality keeps the candidate pending
-when its approved full verification fails and reports `needs_attention`. No
-preset bypasses hard dependencies, scratch materialization, or required
-verification.
+partition and applies structural gates. Its deterministic groups are capped at
+32 captures and 12 paths. Import, symbol, directory, activity, and timing
+similarity do not merge fallback groups by themselves. Quality keeps the
+candidate pending when its approved full verification fails and reports
+`needs_attention`. No preset bypasses hard dependencies, scratch
+materialization, or required verification.
 
 Balanced and Quality may repair a small, recent ACD-only commit chain when a
 late companion capture arrives. Repair runs only while the commits remain
 private to the current HEAD chain and all safety and verification checks pass.
+When a hard dependency joins recent candidates, ACD records their canonical
+lineage before repair. This lets one rebuilt candidate own non-contiguous old
+commits while the old first-parent suffix remains fully accounted for.
 Otherwise ACD records the skip and publishes a new commit.
 
 Message format:

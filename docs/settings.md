@@ -303,9 +303,9 @@ migrate these schemas.
 
 Settings are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/acd/config.json`.
 Runtime revisions and experiments use the repository database at
-`<gitDir>/acd/state.db`. The runtime ledger is SQLite `SchemaVersion=16` and
-stores only canonical, sanitized, non-secret snapshots and bounded validation
-results.
+`<gitDir>/acd/state.db`. The runtime ledger is SQLite `SchemaVersion=17` and
+stores only canonical, sanitized, non-secret snapshots, bounded validation
+results, and privacy-safe candidate lineage.
 
 See [AI providers](ai-providers.md) for the environment reference and provider
 fallback behavior, and [intent commit flow](intent-commit-flow.md) for planner

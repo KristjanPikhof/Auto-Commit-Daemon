@@ -19,6 +19,15 @@
 - Fixed planner fallback repeatedly rejecting hard-linked work from an
   existing candidate. Balanced and Fast now continue or merge the persisted
   candidate without losing dependency order or leaving it permanently waiting.
+- Fixed a hard dependency bridge joining two recent candidates. ACD now keeps
+  one canonical candidate, records the merged lineage, and can rebuild a
+  private suffix when one semantic candidate owns non-contiguous old commits.
+  Reordered candidates must be visible in the current dependency evaluation,
+  remain structurally independent, and pass exact pre-CAS verification.
+- Fixed repeated replay failures appearing as active health. Status, diagnose,
+  doctor, and events now report the bounded error, repeat count, blocked
+  capture, candidate IDs, and fallback size. Identical log lines are rate
+  limited and recovery is reported explicitly.
 
 ### Added
 
@@ -46,6 +55,9 @@
   Repair uses backup refs, atomic ref compare-and-swap, durable old-to-new
   mappings, restart reconciliation, and strict staging and ref-containment
   checks.
+- Added durable candidate lineage for dependency-driven merges. The v17 ledger
+  keeps source candidate status and published commit identity without storing
+  raw diffs.
 - Added native Intent v2 protocols for OpenAI-compatible and capability-aware
   subprocess providers. Legacy subprocess results remain available through
   the reported `v1_compat` adapter.
@@ -67,14 +79,20 @@
   order. Same-path and object dependencies remain ordered, while independent
   `A1, B1, A2` sequences can publish as `A=[1,3]` and `B=[2]` when scratch
   materialization proves independence.
+- Balanced fallback now publishes only bounded hard-dependency components or
+  an unambiguous test/source or migration companion. Known generated-output
+  dependencies remain hard edges. Ambiguous groups, groups above 32 captures,
+  and groups above 12 paths stay pending for planner review. Import, symbol,
+  hunk, module, activity, and time similarity cannot merge fallback components.
 - Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
   hard evaluation boundaries; neither boundary bypasses atomicity,
   verification, branch, pause, Git-operation, conflict, or replay safety.
-- Repository state is now SQLite `SchemaVersion=16`, adding candidate,
+- Repository state is now SQLite `SchemaVersion=17`, adding candidate,
   dependency, activity-boundary, verification, and repair state without
   removing v14 events, decisions, revisions, experiments, or recovery data.
   Version 16 adds durable setup-validation attempts without revalidating
-  existing applied revisions.
+  existing applied revisions. Version 17 adds candidate lineage without
+  rewriting existing candidates.
 
 ## v2026-07-26
 

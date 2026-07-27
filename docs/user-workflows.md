@@ -196,6 +196,7 @@ the final captured state, so they normally need no restore.
 | Queue says `wait` | `acd status` | Intent mode may be waiting for count or age. |
 | Queue says `blk` | `acd diagnose --json` | ACD may be reconciling a complete chain, or proof needs inspection. |
 | Commit message is generic | `acd status --json` | Planner circuit may be using deterministic fallback. |
+| Replay says `needs_attention` | `acd diagnose --json` | Repeated replay failed at the reported capture. Inspect its candidate IDs and bounded error before resuming. |
 | Path under generated tree is ignored | `acd doctor` | Safe-ignore pruned it. |
 | Prompt trace is missing | `acd prompt --last` | Tracing was not enabled before the provider call. |
 | External tool already committed the file | `acd explain --commit HEAD` | Expect `handled_external` or `superseded_external`. |

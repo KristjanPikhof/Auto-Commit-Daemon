@@ -53,6 +53,11 @@ and records:
 - verification and soft-publication state;
 - the published commit OID, when publication succeeds.
 
+When a hard dependency joins persisted candidates, ACD keeps the oldest
+candidate as the canonical target and records the other candidate IDs, status,
+and published commit OIDs in the lineage ledger. Membership moves in one
+transaction. Nested lineage remains traversable for later repair.
+
 Candidate tables store paths, change classes, bounded explanations, and hashes
 of symbol evidence. They do not store raw diffs. A planner request reconstructs
 bounded, redacted diff context from immutable capture operations.
@@ -77,7 +82,9 @@ Hard edges prevent unsafe reordering:
 Soft edges help the planner recognize likely companions. Evidence includes
 package proximity, test/source naming, symbol and hunk hashes,
 import/reference hints, change role, activity epoch, and temporal proximity.
-Time is weak evidence and cannot override a hard edge.
+Time is weak evidence and cannot override a hard edge. During Balanced
+fallback, import/reference, symbol, hunk, module, activity, and time evidence
+cannot merge otherwise independent components by themselves.
 
 Candidate-level topological validation allows non-contiguous groups. For
 example, independent captures `A1, B1, A2` can publish as `A=[1,3]` and
@@ -162,6 +169,15 @@ CAS-updates the literal branch ref. It then reconciles events, decisions,
 candidates, and old-to-new commit mappings before reseeding the exact shadow
 pair. The live index and worktree must remain unchanged.
 
+The old repair range is still one contiguous first-parent suffix. Candidate
+ownership inside that range may be non-contiguous. For example, a rebuilt
+candidate can replace `A1` and `A2` while a second rebuilt candidate replaces
+the independent `B1` between them. Every old commit maps to exactly one rebuilt
+candidate before the ref update. Every reordered candidate must also have been
+visible in the current dependency evaluation, have no hard edge or path overlap
+with the merged candidate, and pass the approved check as an exact rebuilt
+commit before the ref update. Otherwise ACD skips automatic repartitioning.
+
 On restart, ACD completes database reconciliation for a Git-applied repair or
 keeps the backup ref and reports recoverable guidance. Completed repair backups
 are retained for seven days and capped at the newest 50 per repository.
@@ -179,8 +195,13 @@ preset fallback.
 | Preset | Circuit or provider failure |
 |---|---|
 | Fast | Materialize and publish the smallest hard-dependency component |
-| Balanced | Reuse the last valid partition or deterministic dependency components, then run structural verification |
+| Balanced | Reuse the last valid partition or bounded dependency components, then run structural verification |
 | Quality | Keep candidates pending and report `needs_attention` |
+
+Balanced fallback may attach a unique test/source or migration companion.
+Known generated-output relationships remain hard dependencies rather than soft
+guesses. Ambiguous components stay pending. A fallback group also stays pending
+when it exceeds 32 captures or 12 paths.
 
 Circuit bypasses are observability events, not new planner errors. Caller
 cancellation releases a half-open permit without changing circuit health.
@@ -198,8 +219,10 @@ acd status --json
 
 Human output reports migration state, preset and version, customization,
 verification mode, repair policy, candidate counts, verification attention,
-and recoverable repairs. The latest candidate includes planner protocol,
-atomicity, and verification status. JSON output adds the bounded details.
+and recoverable repairs. Repeated replay failures also show the bounded error,
+repeat count, blocked sequence, candidate IDs, and latest fallback size. The
+latest candidate includes planner protocol, atomicity, and verification status.
+JSON output adds the same bounded details.
 
 Useful traces include:
 
