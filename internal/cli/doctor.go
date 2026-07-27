@@ -62,6 +62,7 @@ type doctorRepoReport struct {
 	Configuration          configReadinessReport     `json:"configuration"`
 	Replay                 replayObservabilityReport `json:"replay"`
 	IntentV2               intentV2Report            `json:"intent_v2"`
+	SelfPublication        selfPublicationReport     `json:"self_publication"`
 	LastReplayConflictTS   int64                     `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath string                    `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr  string                    `json:"last_replay_conflict_error,omitempty"`
@@ -1291,6 +1292,17 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 		rr.Notes = append(rr.Notes,
 			"replay observability failed: "+err.Error())
 	}
+	if publication, err := loadSelfPublicationReport(
+		ctx, conn, dbPath, time.Now(), rr.DaemonProcessCount,
+	); err == nil {
+		rr.SelfPublication = publication
+		if publication.Remediation != "" {
+			rr.Notes = append(rr.Notes, publication.Remediation)
+		}
+	} else {
+		rr.Notes = append(rr.Notes,
+			"self-publication observability failed: "+err.Error())
+	}
 	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err == nil {
 		rr.Configuration = readiness
 		if readiness.Configuration == "needs_attention" {
@@ -1564,6 +1576,7 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 			renderConfigReadinessHuman(out, rr.Configuration)
 		}
 		renderReplayObservabilityHuman(out, rr.Replay)
+		renderSelfPublicationHuman(out, rr.SelfPublication, "      ")
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
 				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)

@@ -83,6 +83,7 @@ type diagnoseReport struct {
 	Configuration              configReadinessReport           `json:"configuration"`
 	Replay                     replayObservabilityReport       `json:"replay"`
 	IntentV2                   intentV2Report                  `json:"intent_v2"`
+	SelfPublication            selfPublicationReport           `json:"self_publication"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
@@ -217,6 +218,14 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.Replay = replay
+	}
+	if publication, err := loadSelfPublicationReport(
+		ctx, conn, rec.StateDB, time.Now(),
+		len(findDaemonProcesses(ctx, rec.Path)),
+	); err != nil {
+		return report, err
+	} else {
+		report.SelfPublication = publication
 	}
 	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
 		return report, err
@@ -827,6 +836,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	renderConfigReadinessHuman(out, r.Configuration)
 	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
+	renderSelfPublicationHuman(out, r.SelfPublication, "")
 
 	if r.OperationInProgress != "" {
 		stale := ""

@@ -228,6 +228,172 @@ type intentV2Report struct {
 	LatestRepairError        string `json:"latest_repair_error,omitempty"`
 }
 
+const selfPublicationHeartbeatBudget = 3 * time.Second
+
+// selfPublicationReport is the shared read-only operator projection rendered
+// by status, diagnose, and doctor. Phase describes the operational state while
+// JournalPhase preserves the exact durable boundary when recovery is pending.
+type selfPublicationReport struct {
+	Available           bool   `json:"available"`
+	SchemaVersion       int    `json:"schema_version"`
+	Phase               string `json:"phase"`
+	JournalPhase        string `json:"journal_phase,omitempty"`
+	PublicationID       string `json:"publication_id,omitempty"`
+	SourceHead          string `json:"source_head_short,omitempty"`
+	TargetHead          string `json:"target_head_short,omitempty"`
+	RecoverableCount    int    `json:"recoverable_count"`
+	PreparedCount       int    `json:"prepared_count"`
+	GitAppliedCount     int    `json:"git_applied_count"`
+	CompletedCount      int    `json:"completed_count"`
+	AbandonedCount      int    `json:"abandoned_count"`
+	CanonicalWriters    int    `json:"canonical_writer_count"`
+	DaemonAlive         bool   `json:"daemon_alive"`
+	HeartbeatAgeSeconds int64  `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale      bool   `json:"heartbeat_stale"`
+	PendingWakes        int    `json:"pending_wakes"`
+	AcknowledgedWakes   int    `json:"acknowledged_wakes"`
+	RemediationKind     string `json:"remediation_kind"`
+	Remediation         string `json:"remediation,omitempty"`
+}
+
+// loadSelfPublicationReport keeps all reads migration-free. The journal
+// inventory comes from state's dedicated read-only loader; liveness is
+// enriched from the caller's already read-only connection.
+func loadSelfPublicationReport(
+	ctx context.Context,
+	conn *sql.DB,
+	dbPath string,
+	now time.Time,
+	canonicalWriters int,
+) (selfPublicationReport, error) {
+	projection, err := state.LoadSelfPublicationStateReadOnly(ctx, dbPath)
+	if err != nil {
+		return selfPublicationReport{}, err
+	}
+	report := selfPublicationReport{
+		Available:        projection.Available,
+		SchemaVersion:    projection.SchemaVersion,
+		Phase:            "unavailable",
+		CanonicalWriters: canonicalWriters,
+		RemediationKind:  "none",
+		PreparedCount:    projection.Prepared,
+		GitAppliedCount:  projection.GitApplied,
+		CompletedCount:   projection.Completed,
+		AbandonedCount:   projection.Abandoned,
+		RecoverableCount: len(projection.Recoverable),
+	}
+	if !projection.Available {
+		return report, nil
+	}
+
+	report.Phase = "idle"
+	var pid int
+	var heartbeat sql.NullFloat64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT pid, heartbeat_ts FROM daemon_state WHERE id=1`,
+	).Scan(&pid, &heartbeat); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, fmt.Errorf("read self-publication liveness: %w", err)
+	}
+	report.DaemonAlive = pid > 0 && identity.Alive(pid)
+	if heartbeat.Valid && heartbeat.Float64 > 0 {
+		heartbeatAt := time.Unix(
+			0, int64(heartbeat.Float64*float64(time.Second)))
+		age := now.Sub(heartbeatAt)
+		if age < 0 {
+			age = 0
+		}
+		report.HeartbeatAgeSeconds = int64(age.Seconds())
+		report.HeartbeatStale = report.DaemonAlive &&
+			age > selfPublicationHeartbeatBudget
+	}
+
+	if exists, inspectErr := sqliteTableExists(ctx, conn, "flush_requests"); inspectErr != nil {
+		return report, fmt.Errorf("inspect self-publication wakes: %w", inspectErr)
+	} else if exists {
+		if err := conn.QueryRowContext(ctx, `
+SELECT COALESCE(SUM(status='pending'),0),
+       COALESCE(SUM(status='acknowledged'),0)
+FROM flush_requests WHERE command='wake'`).Scan(
+			&report.PendingWakes, &report.AcknowledgedWakes); err != nil {
+			return report, fmt.Errorf("read self-publication wakes: %w", err)
+		}
+	}
+
+	if len(projection.Recoverable) > 0 {
+		current := projection.Recoverable[0]
+		report.JournalPhase = current.Phase
+		report.PublicationID = shortOID(sanitizeObservabilityText(current.ID), 12)
+		report.SourceHead = shortOID(
+			sanitizeObservabilityText(current.SourceHead), 12)
+		report.TargetHead = shortOID(
+			sanitizeObservabilityText(current.TargetCommitOID), 12)
+		report.Phase = "recoverable"
+		if current.Phase == state.SelfPublicationPrepared &&
+			report.DaemonAlive && !report.HeartbeatStale {
+			report.Phase = "active"
+		}
+	} else if report.DaemonAlive && !report.HeartbeatStale {
+		report.Phase = "active"
+	}
+
+	switch {
+	case report.CanonicalWriters > 1:
+		report.Phase = "stale"
+		report.RemediationKind = "stop_old_owner"
+		report.Remediation = "Stop the older ACD daemon owner; the stable repository lock permits one canonical writer."
+	case report.HeartbeatStale &&
+		(report.PendingWakes > 0 || report.AcknowledgedWakes > 0):
+		report.Phase = "stale"
+		report.RemediationKind = "needs_attention"
+		report.Remediation = "Pending wakes are not advancing; inspect `acd diagnose`, then stop the stale owner and start ACD again."
+	case report.RecoverableCount > 0:
+		report.RemediationKind = "automatic_recovery"
+		report.Remediation = "Automatic recovery will inspect the durable publication on the next daemon start or loop boundary."
+	}
+	return report, nil
+}
+
+func renderSelfPublicationHuman(
+	out io.Writer,
+	report selfPublicationReport,
+	prefix string,
+) {
+	if !report.Available {
+		fmt.Fprintf(out, "%sSelf-publication: unavailable (schema v%d; requires v18+)\n",
+			prefix, report.SchemaVersion)
+		return
+	}
+	fmt.Fprintf(out,
+		"%sSelf-publication: phase=%s journal=%s source=%s target=%s recoverable=%d writers=%d wakes=%d/%d heartbeat=%s\n",
+		prefix,
+		report.Phase,
+		valueOrUnset(report.JournalPhase),
+		valueOrUnset(report.SourceHead),
+		valueOrUnset(report.TargetHead),
+		report.RecoverableCount,
+		report.CanonicalWriters,
+		report.PendingWakes,
+		report.AcknowledgedWakes,
+		selfPublicationHeartbeatLabel(report),
+	)
+	if report.Remediation != "" {
+		fmt.Fprintf(out, "%s  remediation (%s): %s\n",
+			prefix, report.RemediationKind, report.Remediation)
+	}
+}
+
+func selfPublicationHeartbeatLabel(report selfPublicationReport) string {
+	if !report.DaemonAlive {
+		return "stopped"
+	}
+	label := formatDurationCompact(
+		time.Duration(report.HeartbeatAgeSeconds) * time.Second)
+	if report.HeartbeatStale {
+		return label + " stale"
+	}
+	return label
+}
+
 func loadIntentV2Report(ctx context.Context, conn *sql.DB) (intentV2Report, error) {
 	var report intentV2Report
 	if conn == nil {

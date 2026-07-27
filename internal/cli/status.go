@@ -70,6 +70,7 @@ type statusReport struct {
 	Configuration         configReadinessReport     `json:"configuration"`
 	Replay                replayObservabilityReport `json:"replay"`
 	IntentV2              intentV2Report            `json:"intent_v2"`
+	SelfPublication       selfPublicationReport     `json:"self_publication"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -361,6 +362,13 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	} else {
 		report.IntentV2 = intentV2
 	}
+	if publication, err := loadSelfPublicationReport(
+		ctx, conn, rec.StateDB, now, len(findDaemonProcesses(ctx, rec.Path)),
+	); err != nil {
+		return report, fmt.Errorf("self-publication observability: %w", err)
+	} else {
+		report.SelfPublication = publication
+	}
 
 	return report, nil
 }
@@ -511,6 +519,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	renderConfigReadinessHuman(out, r.Configuration)
 	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
+	renderSelfPublicationHuman(out, r.SelfPublication, "")
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))
 	for _, c := range r.Clients {

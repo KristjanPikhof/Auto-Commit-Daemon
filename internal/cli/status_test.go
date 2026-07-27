@@ -201,6 +201,286 @@ func TestReplayObservabilityProjectionHidesOrphanedRepeatMetadata(t *testing.T) 
 	}
 }
 
+func TestStatusSelfPublicationHumanJSONParity(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := strings.Repeat("a", 40)
+	target := strings.Repeat("b", 40)
+	seedCLISelfPublication(t, d, "publication-status", source, target,
+		state.SelfPublicationPrepared, now)
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.SelfPublication.Available ||
+		report.SelfPublication.Phase != "active" ||
+		report.SelfPublication.JournalPhase != state.SelfPublicationPrepared ||
+		report.SelfPublication.SourceHead != source[:12] ||
+		report.SelfPublication.TargetHead != target[:12] {
+		t.Fatalf("self-publication report=%+v", report.SelfPublication)
+	}
+	if strings.Contains(jsonOut.String(), source) ||
+		strings.Contains(jsonOut.String(), target) {
+		t.Fatalf("full publication OID leaked into JSON: %s", jsonOut.String())
+	}
+
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Self-publication: phase=active",
+		"journal=prepared",
+		"source=" + source[:12],
+		"target=" + target[:12],
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human status missing %q:\n%s", want, human.String())
+		}
+	}
+	if strings.Contains(human.String(), source) ||
+		strings.Contains(human.String(), target) {
+		t.Fatalf("full publication OID leaked into human output: %s",
+			human.String())
+	}
+}
+
+func TestDiagnoseWriterSelfPublicationRemediationParity(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedCLISelfPublication(t, d, "publication-writer",
+		strings.Repeat("c", 40), strings.Repeat("d", 40),
+		state.SelfPublicationGitApplied, now)
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" ||
+		report.RemediationKind != "stop_old_owner" ||
+		!strings.Contains(report.Remediation, "stable repository lock") {
+		t.Fatalf("duplicate-writer report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication:         report,
+		StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"Self-publication: phase=stale",
+			"writers=2",
+			"remediation (stop_old_owner)",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s output missing %q:\n%s", name, want, output)
+			}
+		}
+	}
+}
+
+func TestDoctorPublicationStaleWakeDiagnosis(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.Add(-10*time.Second).UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnqueueFlushRequest(ctx, d, "wake", false,
+		sql.NullString{}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" || !report.HeartbeatStale ||
+		report.PendingWakes != 1 ||
+		report.RemediationKind != "needs_attention" {
+		t.Fatalf("stale-wake report=%+v", report)
+	}
+	if strings.Contains(strings.ToLower(report.Remediation), "purge") {
+		t.Fatalf("destructive remediation surfaced: %q", report.Remediation)
+	}
+}
+
+func TestStatusSelfPublicationHeartbeatFractionBelowBudget(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Unix(1000, 200_000_000)
+	heartbeat := now.Add(-2900 * time.Millisecond)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(heartbeat.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HeartbeatStale || report.Phase != "active" {
+		t.Fatalf("fractional heartbeat falsely stale: %+v", report)
+	}
+}
+
+func TestStatusSelfPublicationSanitizesCorruptJournalIDs(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := "\x1b[31mapi_key=sk-private"
+	target := "prompt=private-repository-payload"
+	seedCLISelfPublication(t, d, "publication-corrupt", source, target,
+		state.SelfPublicationPrepared, now)
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var human bytes.Buffer
+	renderSelfPublicationHuman(&human, report, "")
+	combined := string(body) + human.String()
+	for _, forbidden := range []string{
+		"\x1b", "sk-private", "private-repository-payload",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("corrupt journal value leaked %q: %s", forbidden, combined)
+		}
+	}
+	if !strings.Contains(combined, "[redacted") {
+		t.Fatalf("sanitized marker missing: %s", combined)
+	}
+}
+
+func TestPreV18SelfPublicationReadOnlyChecksum(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	if _, err := d.SQL().ExecContext(ctx, `PRAGMA user_version=17`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := openStateDBReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	report, err := loadSelfPublicationReport(ctx, conn, dbPath, time.Now(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Available || report.SchemaVersion != 17 ||
+		report.Phase != "unavailable" {
+		t.Fatalf("pre-v18 report=%+v", report)
+	}
+	if before != after {
+		t.Fatalf("read-only projection changed state.db: before=%s after=%s",
+			before, after)
+	}
+}
+
+func seedCLISelfPublication(
+	t *testing.T,
+	d *state.DB,
+	id, source, target, phase string,
+	now time.Time,
+) {
+	t.Helper()
+	ts := float64(now.UnixNano()) / 1e9
+	digest := "sha256:" + strings.Repeat("0", 64)
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, git_applied_ts, completion_published_ts,
+    completion_candidate_status
+) VALUES (?, 'refs/heads/main', 1, ?, ?, ?, ?, 1, 'prepared', ?, ?,
+          NULL, ?, 'published')`,
+		id, source, target, strings.Repeat("e", 40), digest, ts, ts, ts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publication_members(publication_id, ord, event_seq)
+VALUES (?, 0, 1)`, id); err != nil {
+		t.Fatal(err)
+	}
+	if phase == state.SelfPublicationGitApplied {
+		if _, err := d.SQL().Exec(`
+UPDATE self_publications
+SET phase='git_applied', updated_ts=?, git_applied_ts=?
+WHERE id=?`, ts, ts, id); err != nil {
+			t.Fatal(err)
+		}
+	} else if phase != state.SelfPublicationPrepared {
+		t.Fatalf("unsupported fixture phase %q", phase)
+	}
+}
+
 func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
