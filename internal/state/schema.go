@@ -616,11 +616,13 @@ CREATE TABLE IF NOT EXISTS self_publications(
     CHECK (length(target_commit_oid) BETWEEN 1 AND 128),
     CHECK (length(target_tree_oid) BETWEEN 1 AND 128),
     CHECK (length(membership_digest) = 71
-           AND substr(membership_digest, 1, 7) = 'sha256:')
+           AND substr(membership_digest, 1, 7) = 'sha256:'),
+    CHECK (length(error) <= 2048)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_self_publications_pair_target
-    ON self_publications(branch_ref, branch_generation, target_commit_oid);
+    ON self_publications(branch_ref, branch_generation, target_commit_oid)
+    WHERE phase <> 'abandoned';
 
 CREATE INDEX IF NOT EXISTS idx_self_publications_pair_phase_created
     ON self_publications(
@@ -650,7 +652,15 @@ CREATE INDEX IF NOT EXISTS idx_self_publication_members_candidate
     WHERE candidate_id IS NOT NULL;
 
 -- Defense in depth for callers that bypass package APIs. SQLite triggers
--- reject every attempted change to immutable publication identity.
+-- reject every attempted change to immutable publication identity, illegal
+-- phase movement, or overlapping live ownership.
+CREATE TRIGGER IF NOT EXISTS self_publications_prepare_only
+BEFORE INSERT ON self_publications
+WHEN NEW.phase <> 'prepared'
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication must start prepared');
+END;
+
 CREATE TRIGGER IF NOT EXISTS self_publications_identity_immutable
 BEFORE UPDATE OF branch_ref, branch_generation, source_head,
                  target_commit_oid, target_tree_oid, membership_digest,
@@ -658,6 +668,33 @@ BEFORE UPDATE OF branch_ref, branch_generation, source_head,
 ON self_publications
 BEGIN
     SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS self_publications_phase_monotonic
+BEFORE UPDATE OF phase ON self_publications
+WHEN NOT (
+    OLD.phase = NEW.phase
+    OR (OLD.phase = 'prepared'
+        AND NEW.phase IN ('git_applied','abandoned'))
+    OR (OLD.phase = 'git_applied' AND NEW.phase = 'completed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal self-publication phase transition');
+END;
+
+CREATE TRIGGER IF NOT EXISTS self_publication_members_no_live_overlap
+BEFORE INSERT ON self_publication_members
+WHEN EXISTS (
+    SELECT 1
+    FROM self_publication_members member
+    JOIN self_publications publication
+      ON publication.id = member.publication_id
+    WHERE member.event_seq = NEW.event_seq
+      AND member.publication_id <> NEW.publication_id
+      AND publication.phase IN ('prepared','git_applied','completed')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication event already owned');
 END;
 
 CREATE TRIGGER IF NOT EXISTS self_publication_members_immutable_update
@@ -671,7 +708,6 @@ BEFORE DELETE ON self_publication_members
 WHEN EXISTS (
     SELECT 1 FROM self_publications publication
     WHERE publication.id = OLD.publication_id
-      AND publication.phase <> 'prepared'
 )
 BEGIN
     SELECT RAISE(ABORT, 'self-publication membership is immutable');
