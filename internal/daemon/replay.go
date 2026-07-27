@@ -260,6 +260,10 @@ type ReplayOpts struct {
 	IntentRepairEnabled    bool
 	IntentRepairHorizon    time.Duration
 	IntentRepairMaxCommits int
+
+	// SelfPublicationCheckpoint is a deterministic fault/recovery test seam.
+	// Production callers leave it nil.
+	SelfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -289,6 +293,10 @@ type ReplaySummary struct {
 	// this to schedule an immediate follow-up replay pass without waiting for
 	// the next poll tick. Always false when Limit <= 0 (unbounded drain).
 	HasMore bool
+	// SelfPublicationTargetOID is the final commit whose journal completion
+	// succeeded in this pass. Multi-group Intent publication overwrites it
+	// group-by-group, so it always names the completed chain tip.
+	SelfPublicationTargetOID string
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -331,6 +339,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		sum.Skipped = true
 		traceReplayPaused(opts.Trace, repoRoot, cctx, paused)
 		return sum, nil
+	}
+	if _, err := maintainSelfPublicationJournal(ctx, db); err != nil {
+		slog.Default().Warn("daemon: prune terminal self-publications",
+			"err", err.Error())
 	}
 
 	indexFile := opts.IndexFile
@@ -742,7 +754,25 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+		publication, err := prepareSelfPublication(
+			eventCtx, db, activeCtx, parent, commitOID, treeOID, "event",
+			[]state.SelfPublicationMember{{EventSeq: ev.Seq}},
+			opts.SelfPublicationCheckpoint,
+		)
+		if err != nil {
+			cancelEvent()
+			return sum, err
+		}
+		if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
+			return updateReplayRefWithRetry(
+				eventCtx, repoRoot, "HEAD", commitOID, oldOID,
+				opts.Trace, activeCtx, ev)
+		}); err != nil {
+			if errors.Is(err, errSelfPublicationCASAmbiguous) ||
+				!errors.Is(err, errSelfPublicationCASNotApplied) {
+				cancelEvent()
+				return sum, err
+			}
 			// CAS exhausted. Before declaring conflict, give the
 			// idempotent path one shot: an external committer may have
 			// landed identical content between our write-tree and our
@@ -821,13 +851,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Settle the event row + publish_state.
 		cancelEvent()
-		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID,
-			state.DecisionKindCommitted, "event published",
-		); err != nil {
+		if err := publication.complete(ctx, db, selfPublicationCompletion(
+			opts, ev.Message)); err != nil {
 			return sum, err
 		}
+		recordReplayDecision(ctx, db, ev, activeCtx, selfPublicationNow(),
+			state.DecisionKindCommitted, "event published", commitOID)
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 
 		parent = commitOID
@@ -839,6 +869,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		parentTree = treeOID
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
+		sum.SelfPublicationTargetOID = commitOID
 		sum.Published++
 		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
 			"commit": commitOID,
@@ -1080,6 +1111,9 @@ type intentReplayItem struct {
 	event      state.CaptureEvent
 	ops        []state.CaptureOp
 	deferCount int
+	// candidateID is populated only by the durable Intent v2 path. It binds
+	// every covered event to the exact ready candidate journaled at prepare.
+	candidateID string
 	// coalesce, when non-nil, records the additional capture events folded
 	// into this offer by the same-path coalesce pass. The representative
 	// event lives in `event` above; `coalesce.Covered` carries every other
@@ -2941,6 +2975,10 @@ func publishIntentSelection(
 					state.DecisionKindHandledExternal, "already_published_by_external_committer", groupMessage); err != nil {
 					return sum, err
 				}
+				if err := settleNonJournalIntentCandidates(
+					ctx, db, selected, headOID, opts); err != nil {
+					return sum, err
+				}
 				reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped idempotent publish: %w", err)
@@ -2991,6 +3029,10 @@ func publishIntentSelection(
 					state.DecisionKindSupersededExternal, reason, groupMessage); err != nil {
 					return sum, err
 				}
+				if err := settleNonJournalIntentCandidates(
+					ctx, db, selected, sourceHead, opts); err != nil {
+					return sum, err
+				}
 				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped superseded external: %w", err)
 				}
@@ -3025,6 +3067,10 @@ func publishIntentSelection(
 	if parentTree != "" && treeOID == parentTree {
 		if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, sourceHead,
 			state.DecisionKindHandledExternal, "already_published_no_op_tree", groupMessage); err != nil {
+			return sum, err
+		}
+		if err := settleNonJournalIntentCandidates(
+			ctx, db, selected, sourceHead, opts); err != nil {
 			return sum, err
 		}
 		reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -3062,7 +3108,28 @@ func publishIntentSelection(
 	if activeCtx.BaseHead == "" {
 		oldOID = ""
 	}
-	if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, firstEvent); err != nil {
+	group := "intent"
+	if selected[0].candidateID != "" {
+		group = selected[0].candidateID
+	}
+	publication, err := prepareSelfPublication(
+		eventCtx, db, activeCtx, sourceHead, commitOID, treeOID, group,
+		selfPublicationMembers(selected), opts.SelfPublicationCheckpoint,
+	)
+	if err != nil {
+		cancelEvent()
+		return sum, err
+	}
+	if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
+		return updateReplayRefWithRetry(
+			eventCtx, repoRoot, "HEAD", commitOID, oldOID,
+			opts.Trace, activeCtx, firstEvent)
+	}); err != nil {
+		if errors.Is(err, errSelfPublicationCASAmbiguous) ||
+			!errors.Is(err, errSelfPublicationCASNotApplied) {
+			cancelEvent()
+			return sum, err
+		}
 		headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, sourceHead, allOps)
 		if probeErr != nil {
 			cancelEvent()
@@ -3072,6 +3139,10 @@ func publishIntentSelection(
 			cancelEvent()
 			if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, headOID,
 				state.DecisionKindHandledExternal, "already_published_after_cas_exhaustion", groupMessage); err != nil {
+				return sum, err
+			}
+			if err := settleNonJournalIntentCandidates(
+				ctx, db, selected, headOID, opts); err != nil {
 				return sum, err
 			}
 			reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -3113,14 +3184,18 @@ func publishIntentSelection(
 	}
 	cancelEvent()
 
-	if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, commitOID,
-		state.DecisionKindCommitted, "intent_group: "+plan.GroupingReason, groupMessage); err != nil {
+	if err := publication.complete(ctx, db, selfPublicationCompletion(
+		opts, sql.NullString{String: groupMessage, Valid: groupMessage != ""})); err != nil {
 		return sum, err
 	}
+	recordIntentPublishedDecisions(
+		ctx, db, selected, activeCtx, commitOID,
+		state.DecisionKindCommitted, "intent_group: "+plan.GroupingReason)
 	reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
 	publishedCount := intentSelectionPublishedCount(selected)
 	sum.Published += publishedCount
 	sum.BaseHead = commitOID
+	sum.SelfPublicationTargetOID = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
@@ -3195,6 +3270,52 @@ func settleIntentPublished(ctx context.Context, db *state.DB, items []intentRepl
 			if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
 				slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
 			}
+		}
+	}
+	return nil
+}
+
+func recordIntentPublishedDecisions(
+	ctx context.Context,
+	db *state.DB,
+	items []intentReplayItem,
+	cctx CaptureContext,
+	commitOID, decisionKind, decisionReason string,
+) {
+	nowSec := selfPublicationNow()
+	for _, item := range items {
+		for _, event := range item.allCoveredEvents() {
+			recordReplayDecision(
+				ctx, db, event, cctx, nowSec,
+				decisionKind, decisionReason, commitOID)
+		}
+	}
+}
+
+func settleNonJournalIntentCandidates(
+	ctx context.Context,
+	db *state.DB,
+	items []intentReplayItem,
+	commitOID string,
+	opts ReplayOpts,
+) error {
+	candidates := make(map[string]struct{})
+	for _, item := range items {
+		if item.candidateID != "" {
+			candidates[item.candidateID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(candidates))
+	for candidateID := range candidates {
+		ids = append(ids, candidateID)
+	}
+	sort.Strings(ids)
+	for _, candidateID := range ids {
+		if err := markIntentCandidatePublished(
+			ctx, db, candidateID, commitOID,
+			opts.IntentRepairEnabled, opts.IntentRepairHorizon,
+		); err != nil {
+			return err
 		}
 	}
 	return nil

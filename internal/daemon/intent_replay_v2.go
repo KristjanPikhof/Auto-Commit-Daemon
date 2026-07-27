@@ -208,6 +208,7 @@ func replayIntentCandidateBatch(
 			if item.event.State != state.EventStatePending {
 				hasPublished = true
 			}
+			item.candidateID = decision.Candidate.ID
 			selected = append(selected, item)
 		}
 		sort.Slice(selected, func(i, j int) bool {
@@ -259,10 +260,6 @@ func replayIntentCandidateBatch(
 		if sum.Conflicts > before.Conflicts || sum.Failed > before.Failed ||
 			sum.Published == before.Published {
 			return sum, nil
-		}
-		if err := markIntentCandidatePublished(ctx, db, decision.Candidate.ID,
-			sum.BaseHead, opts.IntentRepairEnabled, opts.IntentRepairHorizon); err != nil {
-			return sum, err
 		}
 		publishedCandidates[decision.Candidate.ID] = struct{}{}
 		publishedAny = true
