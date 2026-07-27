@@ -4127,6 +4127,21 @@ func TestSelfPublicationEventSwitchRetiresCandidateOwnership(t *testing.T) {
 		t.Fatalf("candidate history=(%+v,%v) want superseded membership",
 			history, err)
 	}
+	if candidate.Readiness != state.IntentReadinessWait ||
+		candidate.SoftPublicationDeadline.Valid {
+		t.Fatalf("retired candidate readiness/deadline=%q/%+v",
+			candidate.Readiness, candidate.SoftPublicationDeadline)
+	}
+	firstUpdated := candidate.UpdatedTS
+	if err := retireIntentCandidatesForEventReplay(
+		ctx, f.db, f.cctx); err != nil {
+		t.Fatalf("repeat candidate retirement: %v", err)
+	}
+	candidate, ok, err = state.IntentCandidateByID(ctx, f.db, candidateID)
+	if err != nil || !ok || candidate.UpdatedTS != firstUpdated {
+		t.Fatalf("repeat retirement mutated terminal candidate=(%+v,%v,%v)",
+			candidate, ok, err)
+	}
 	journals := loadSelfPublicationRows(t, ctx, f.db)
 	if len(journals) != 1 ||
 		journals[0].phase != state.SelfPublicationCompleted {
@@ -4162,6 +4177,87 @@ WHERE key=?`, metaSelfPublicationMaintainedTS).Scan(&secondUpdated); err != nil 
 	if secondUpdated != firstUpdated {
 		t.Fatalf("maintenance stamp changed within cadence: %f -> %f",
 			firstUpdated, secondUpdated)
+	}
+}
+
+func TestSelfPublicationEventSwitchPreservesRecoverableCandidate(t *testing.T) {
+	for _, phase := range []string{
+		state.SelfPublicationPrepared,
+		state.SelfPublicationGitApplied,
+	} {
+		t.Run(phase, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+				t.Fatal(err)
+			}
+			captureOnePendingFile(t, ctx, f, "recover-"+phase+".txt", "pending\n")
+			pending, err := state.PendingEvents(ctx, f.db, 0)
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("PendingEvents=(%d,%v)", len(pending), err)
+			}
+			candidateID := "candidate-" + phase
+			if err := state.SaveIntentCandidate(ctx, f.db,
+				state.IntentCandidate{
+					ID: candidateID, BranchRef: f.cctx.BranchRef,
+					BranchGeneration: f.cctx.BranchGeneration,
+					Status:           state.IntentCandidateReady,
+					Purpose:          "preserve recovery ownership",
+					Readiness:        state.IntentReadinessReady,
+					Events: []state.IntentCandidateEvent{{
+						EventSeq: pending[0].Seq, EventRole: "code",
+					}},
+				}); err != nil {
+				t.Fatal(err)
+			}
+			attempt, err := prepareSelfPublication(
+				ctx, f.db, f.cctx, f.cctx.BaseHead,
+				"recover-target-"+phase, "recover-tree-"+phase,
+				candidateID,
+				[]state.SelfPublicationMember{{
+					EventSeq: pending[0].Seq,
+					CandidateID: sql.NullString{
+						String: candidateID, Valid: true,
+					},
+				}}, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if phase == state.SelfPublicationGitApplied {
+				if err := attempt.markGitApplied(ctx, f.db); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+				GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent,
+			})
+			if !errors.Is(err, ErrSelfPublicationRecoveryRequired) {
+				t.Fatalf("Replay error=%v want recovery required", err)
+			}
+			candidate, ok, err := state.IntentCandidateByID(
+				ctx, f.db, candidateID)
+			if err != nil || !ok ||
+				candidate.Status != state.IntentCandidateReady {
+				t.Fatalf("candidate=(%+v,%v,%v) want ready", candidate, ok, err)
+			}
+			history, err := state.IntentCandidateEventHistory(
+				ctx, f.db, candidateID)
+			if err != nil || len(history) != 1 ||
+				history[0].MembershipState != state.IntentMembershipActive {
+				t.Fatalf("history=(%+v,%v) want active", history, err)
+			}
+			var eventState string
+			if err := f.db.SQL().QueryRowContext(ctx,
+				`SELECT state FROM capture_events WHERE seq=?`,
+				pending[0].Seq).Scan(&eventState); err != nil ||
+				eventState != state.EventStatePending {
+				t.Fatalf("event state=(%q,%v) want pending", eventState, err)
+			}
+			if got := revListCount(t, ctx, f.dir, "HEAD"); got != 1 {
+				t.Fatalf("commit count=%d want unchanged HEAD", got)
+			}
+		})
 	}
 }
 

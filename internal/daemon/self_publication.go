@@ -56,6 +56,11 @@ var errSelfPublicationCASAmbiguous = errors.New(
 var errSelfPublicationCASNotApplied = errors.New(
 	"daemon: self-publication CAS was not applied")
 
+// ErrSelfPublicationRecoveryRequired prevents strategy switches from
+// invalidating candidate ownership needed by restart recovery.
+var ErrSelfPublicationRecoveryRequired = errors.New(
+	"daemon: self-publication recovery is required before event replay")
+
 func prepareSelfPublication(
 	ctx context.Context,
 	db *state.DB,
@@ -338,12 +343,42 @@ func retireIntentCandidatesForEventReplay(
 	if cctx.BranchRef == "" {
 		return nil
 	}
+	statuses := `('open','waiting','ready','soft_published','blocked')`
+	var active int
+	if err := db.SQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1
+    FROM intent_candidates candidate
+    JOIN intent_candidate_events member
+      ON member.candidate_id=candidate.id
+    WHERE candidate.branch_ref=? AND candidate.branch_generation=?
+      AND candidate.status IN `+statuses+`
+      AND member.membership_state='active'
+    LIMIT 1
+)`, cctx.BranchRef, cctx.BranchGeneration).Scan(&active); err != nil {
+		return fmt.Errorf("daemon: inspect event-strategy candidate ownership: %w", err)
+	}
+	if active == 0 {
+		return nil
+	}
 	tx, err := db.SQL().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("daemon: begin event-strategy candidate retirement: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	statuses := `('open','waiting','ready','soft_published','blocked')`
+	var recoverable int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+    LIMIT 1
+)`, cctx.BranchRef, cctx.BranchGeneration).Scan(&recoverable); err != nil {
+		return fmt.Errorf("daemon: inspect recoverable self-publications: %w", err)
+	}
+	if recoverable != 0 {
+		return ErrSelfPublicationRecoveryRequired
+	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE intent_candidate_events
 SET membership_state='superseded'
@@ -357,7 +392,8 @@ WHERE membership_state='active'
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE intent_candidates
-SET status='superseded', updated_ts=?
+SET status='superseded', readiness='wait',
+    soft_publication_deadline=NULL, updated_ts=?
 WHERE branch_ref=? AND branch_generation=?
   AND status IN `+statuses,
 		selfPublicationNow(), cctx.BranchRef, cctx.BranchGeneration); err != nil {
