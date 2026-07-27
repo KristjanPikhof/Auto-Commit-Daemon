@@ -135,6 +135,30 @@ No preset bypasses hard dependency or materialization failures. A failed or
 timed-out verification leaves the candidate pending. It never forces
 publication.
 
+## Publish a candidate safely
+
+Intent publication uses the same self-publication journal as Event mode. Before
+the branch compare-and-swap, ACD stores the exact ordered event membership and
+the candidate ID that owns each event. The target commit, target tree, source
+head, branch generation, and membership digest are immutable.
+
+The journal advances through `prepared`, `git_applied`, and `completed`.
+Completion atomically publishes the exact events, advances their ready
+candidates to `published` or `soft_published`, updates publish state, and saves
+the new branch token. If the branch never left the source, recovery marks the
+attempt `abandoned` and leaves those events pending.
+
+Schema v18 introduced the journal and exact membership ledger. Schema v19 also
+persists the candidate completion status, publication timestamp, and soft
+deadline at prepare time. Restart recovery therefore applies the decision made
+for that publication instead of recalculating it from newer runtime settings.
+
+After `completed`, the run loop adopts the exact journal target without a
+branch-generation bump. A later or mismatched `HEAD` movement remains external
+and goes through normal branch reconciliation. See
+[capture-replay.md](capture-replay.md#complete-an-acd-self-publication) for the
+phase and proof rules.
+
 ## Seal candidates at useful boundaries
 
 ACD evaluates candidates when any of these occurs:

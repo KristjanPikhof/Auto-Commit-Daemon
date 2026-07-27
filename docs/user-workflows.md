@@ -143,6 +143,46 @@ If the only problem is a manual pause marker, use:
 acd resume --yes
 ~~~
 
+## Recover an interrupted self-publication
+
+ACD normally recovers its own interrupted branch update without an operator
+command. A durable self-publication appears in `acd status`, `acd diagnose`,
+and `acd doctor` as `prepared` or `git_applied`. Recovery inspects it at daemon
+startup and loop boundaries.
+
+~~~bash
+acd status
+acd diagnose --json
+acd doctor
+~~~
+
+Use the reported remediation kind:
+
+| Remediation | Meaning | Action |
+|---|---|---|
+| `automatic_recovery` | One exact journal target can be inspected by the daemon. | Leave ACD running. Recheck status after the next loop boundary. |
+| `stop_old_owner` | More than one live canonical writer is reported. | Stop the existing ACD owner before starting one from another linked worktree. |
+| `needs_attention` | Heartbeat and pending wake progress are stale. | Inspect `acd diagnose --json` and the daemon log. Stop the stale owner before restarting ACD. |
+
+All linked worktrees contend on
+`<git-common-dir>/acd-daemon.lock`, so only one is the canonical writer for the
+repository. The worktree-local PID and heartbeat are supporting evidence, not
+ownership proof. If `acd start` reports that the stable lock is held, do not
+delete the lock file or move `.git/acd` to force another start. Stop the older
+owner cleanly, then start ACD from the worktree you want to own the repository.
+
+Ambiguous recovery is intentionally non-destructive. Do not delete
+`state.db`, journal rows, recovery refs, or captured events, and do not use a
+purge command to clear the warning. ACD keeps the journal recoverable rather
+than guessing whether Git or SQLite won the interrupted transition, and the
+daemon log records that recovery needs attention. If `automatic_recovery`
+remains unchanged after one clean owner restart, inspect the log and collect a
+support bundle.
+
+Pre-v18 state databases have no self-publication journal. Status, diagnose, and
+doctor report the projection as unavailable through read-only connections
+without creating tables or migrating the database.
+
 ## Recover an interrupted Intent repair
 
 Balanced and Quality may rebuild a recent private ACD-only commit suffix when a
@@ -201,6 +241,8 @@ the final captured state, so they normally need no restore.
 | Queue says `blk` | `acd diagnose --json` | ACD may be reconciling a complete chain, or proof needs inspection. |
 | Commit message is generic | `acd status --json` | Planner circuit may be using deterministic fallback. |
 | Replay says `needs_attention` | `acd diagnose --json` | Repeated replay failed at the reported capture. Inspect its candidate IDs and bounded error before resuming. |
+| Self-publication says `recoverable` | `acd status` | Automatic recovery will inspect the durable `prepared` or `git_applied` journal. |
+| Self-publication says `stale` | `acd diagnose --json` | Stop the older canonical writer or stale owner before restarting ACD. |
 | Path under generated tree is ignored | `acd doctor` | Safe-ignore pruned it. |
 | Prompt trace is missing | `acd prompt --last` | Tracing was not enabled before the provider call. |
 | External tool already committed the file | `acd explain --commit HEAD` | Expect `handled_external` or `superseded_external`. |

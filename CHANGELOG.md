@@ -62,6 +62,13 @@
 - Added durable candidate lineage for dependency-driven merges. The v17 ledger
   keeps source candidate status and published commit identity without storing
   raw diffs.
+- Added a crash-recoverable self-publication journal. ACD records exact event
+  and candidate ownership before changing a branch, then can reconcile the
+  `prepared`, `git_applied`, and `completed` phases after restart.
+- Added one canonical-writer fence under the Git common directory. Linked
+  worktrees and state-directory replacements cannot start a second ACD writer,
+  and status, diagnose, and doctor report ownership, publication phase,
+  heartbeat, wake progress, and non-destructive remediation.
 - Added native Intent v2 protocols for OpenAI-compatible and capability-aware
   subprocess providers. Legacy subprocess results remain available through
   the reported `v1_compat` adapter.
@@ -94,12 +101,12 @@
 - Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
   hard evaluation boundaries; neither boundary bypasses atomicity,
   verification, branch, pause, Git-operation, conflict, or replay safety.
-- Repository state is now SQLite `SchemaVersion=17`, adding candidate,
-  dependency, activity-boundary, verification, and repair state without
-  removing v14 events, decisions, revisions, experiments, or recovery data.
-  Version 16 adds durable setup-validation attempts without revalidating
-  existing applied revisions. Version 17 adds candidate lineage without
-  rewriting existing candidates.
+- Repository state is now SQLite `SchemaVersion=19`. Version 18 adds the
+  immutable self-publication journal without backfilling historical commits.
+  Version 19 persists prepare-time candidate completion semantics so restart
+  recovery does not reinterpret a landed target from current settings.
+  Pre-v18 status, diagnose, and doctor reads report self-publication as
+  unavailable without migrating or writing the database.
 
 ## v2026-07-26
 
