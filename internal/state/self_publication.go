@@ -70,6 +70,7 @@ type SelfPublication struct {
 	AbandonedTS      sql.NullFloat64
 	Error            string
 	Members          []SelfPublicationMember
+	Completion       SelfPublicationCompletion
 }
 
 // SelfPublicationCompletion controls the mutable candidate and user-facing
@@ -171,12 +172,16 @@ func PrepareSelfPublication(ctx context.Context, d *DB, publication SelfPublicat
 INSERT INTO self_publications(
     id, branch_ref, branch_generation, source_head, target_commit_oid,
     target_tree_oid, membership_digest, member_count, phase, created_ts,
-    updated_ts, error
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
+    updated_ts, error, completion_published_ts,
+    completion_candidate_status, completion_soft_deadline
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
 		normalized.ID, normalized.BranchRef, normalized.BranchGeneration,
 		normalized.SourceHead, normalized.TargetCommitOID,
 		normalized.TargetTreeOID, normalized.MembershipDigest,
-		len(normalized.Members), SelfPublicationPrepared, ts, ts); err != nil {
+		len(normalized.Members), SelfPublicationPrepared, ts, ts,
+		normalized.Completion.PublishedTS,
+		normalized.Completion.CandidateStatus,
+		normalized.Completion.SoftPublicationDeadline); err != nil {
 		if strings.Contains(err.Error(), "idx_self_publications_pair_target") ||
 			strings.Contains(err.Error(), "self_publications.branch_ref") {
 			return false, ErrSelfPublicationIdentityMismatch
@@ -232,12 +237,13 @@ func CompleteSelfPublication(
 	if err != nil {
 		return false, err
 	}
-	if completion.PublishedTS <= 0 {
-		completion.PublishedTS = nowSeconds()
-	}
-	if completion.CandidateStatus == "" {
-		completion.CandidateStatus = IntentCandidatePublished
-	}
+	// Publication semantics are immutable prepare-time identity. Recovery must
+	// not extend repair horizons or reinterpret a landed target from current
+	// runtime settings after restart.
+	completion.PublishedTS = normalized.Completion.PublishedTS
+	completion.CandidateStatus = normalized.Completion.CandidateStatus
+	completion.SoftPublicationDeadline =
+		normalized.Completion.SoftPublicationDeadline
 	if completion.CandidateStatus != IntentCandidatePublished &&
 		completion.CandidateStatus != IntentCandidateSoftPublished {
 		return false, fmt.Errorf("state: invalid self-publication candidate status %q",
@@ -537,7 +543,13 @@ SELECT phase, COUNT(*) FROM self_publications GROUP BY phase`)
 		return SelfPublicationReadOnlyProjection{},
 			fmt.Errorf("state: close self-publication phase rows: %w", err)
 	}
-	projection.Recoverable, err = queryRecoverableSelfPublications(ctx, conn, 50)
+	if projection.SchemaVersion >= 19 {
+		projection.Recoverable, err =
+			queryRecoverableSelfPublications(ctx, conn, 50)
+	} else {
+		projection.Recoverable, err =
+			queryRecoverableSelfPublicationsV18(ctx, conn, 50)
+	}
 	if err != nil {
 		return SelfPublicationReadOnlyProjection{}, err
 	}
@@ -652,6 +664,25 @@ func normalizeSelfPublication(publication SelfPublication) (SelfPublication, err
 	}
 	publication.MembershipDigest = digest
 	publication.MemberCount = len(publication.Members)
+	if publication.Completion.CandidateStatus == "" {
+		publication.Completion.CandidateStatus = IntentCandidatePublished
+	}
+	if publication.Completion.CandidateStatus != IntentCandidatePublished &&
+		publication.Completion.CandidateStatus != IntentCandidateSoftPublished {
+		return SelfPublication{}, fmt.Errorf(
+			"state: invalid self-publication completion status %q",
+			publication.Completion.CandidateStatus)
+	}
+	if publication.Completion.CandidateStatus == IntentCandidateSoftPublished {
+		if !publication.Completion.SoftPublicationDeadline.Valid ||
+			publication.Completion.SoftPublicationDeadline.Float64 <=
+				publication.Completion.PublishedTS {
+			return SelfPublication{}, errors.New(
+				"state: soft self-publication completion requires a future deadline")
+		}
+	} else {
+		publication.Completion.SoftPublicationDeadline = sql.NullFloat64{}
+	}
 	return publication, nil
 }
 
@@ -770,6 +801,10 @@ func sameSelfPublicationIdentity(a, b SelfPublication) bool {
 		a.TargetTreeOID != b.TargetTreeOID ||
 		a.MembershipDigest != b.MembershipDigest ||
 		a.MemberCount != b.MemberCount ||
+		a.Completion.PublishedTS != b.Completion.PublishedTS ||
+		a.Completion.CandidateStatus != b.Completion.CandidateStatus ||
+		a.Completion.SoftPublicationDeadline !=
+			b.Completion.SoftPublicationDeadline ||
 		len(a.Members) != len(b.Members) {
 		return false
 	}
@@ -806,7 +841,9 @@ type selfPublicationQueryer interface {
 const selfPublicationSelect = `
 SELECT id, branch_ref, branch_generation, source_head, target_commit_oid,
        target_tree_oid, membership_digest, member_count, phase, created_ts,
-       updated_ts, git_applied_ts, completed_ts, abandoned_ts, error
+       updated_ts, git_applied_ts, completed_ts, abandoned_ts, error,
+       completion_published_ts, completion_candidate_status,
+       completion_soft_deadline
 FROM self_publications`
 
 func selfPublicationByIDQuery(
@@ -822,7 +859,10 @@ func selfPublicationByIDQuery(
 		&publication.MembershipDigest, &publication.MemberCount,
 		&publication.Phase, &publication.CreatedTS, &publication.UpdatedTS,
 		&publication.GitAppliedTS, &publication.CompletedTS,
-		&publication.AbandonedTS, &publication.Error)
+		&publication.AbandonedTS, &publication.Error,
+		&publication.Completion.PublishedTS,
+		&publication.Completion.CandidateStatus,
+		&publication.Completion.SoftPublicationDeadline)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SelfPublication{}, false, nil
 	}
@@ -884,6 +924,9 @@ func queryRecoverableSelfPublications(
 			&publication.Phase, &publication.CreatedTS, &publication.UpdatedTS,
 			&publication.GitAppliedTS, &publication.CompletedTS,
 			&publication.AbandonedTS, &publication.Error,
+			&publication.Completion.PublishedTS,
+			&publication.Completion.CandidateStatus,
+			&publication.Completion.SoftPublicationDeadline,
 		); err != nil {
 			return nil, fmt.Errorf("state: scan recoverable self-publication: %w", err)
 		}
@@ -894,6 +937,62 @@ func queryRecoverableSelfPublications(
 	}
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("state: close recoverable self-publications: %w", err)
+	}
+	for i := range publications {
+		publications[i].Members, err =
+			loadSelfPublicationMembers(ctx, q, publications[i].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return publications, nil
+}
+
+func queryRecoverableSelfPublicationsV18(
+	ctx context.Context,
+	q selfPublicationQueryer,
+	limit int,
+) ([]SelfPublication, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT id, branch_ref, branch_generation, source_head, target_commit_oid,
+       target_tree_oid, membership_digest, member_count, phase, created_ts,
+       updated_ts, git_applied_ts, completed_ts, abandoned_ts, error
+FROM self_publications
+WHERE phase IN ('prepared','git_applied')
+ORDER BY created_ts, id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: query v18 recoverable self-publications: %w", err)
+	}
+	defer rows.Close()
+	var publications []SelfPublication
+	for rows.Next() {
+		var publication SelfPublication
+		if err := rows.Scan(
+			&publication.ID, &publication.BranchRef,
+			&publication.BranchGeneration, &publication.SourceHead,
+			&publication.TargetCommitOID, &publication.TargetTreeOID,
+			&publication.MembershipDigest, &publication.MemberCount,
+			&publication.Phase, &publication.CreatedTS,
+			&publication.UpdatedTS, &publication.GitAppliedTS,
+			&publication.CompletedTS, &publication.AbandonedTS,
+			&publication.Error); err != nil {
+			return nil, fmt.Errorf(
+				"state: scan v18 recoverable self-publication: %w", err)
+		}
+		publication.Completion = SelfPublicationCompletion{
+			PublishedTS:     publication.CreatedTS,
+			CandidateStatus: IntentCandidatePublished,
+		}
+		publications = append(publications, publication)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"state: iterate v18 recoverable self-publications: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf(
+			"state: close v18 recoverable self-publications: %w", err)
 	}
 	for i := range publications {
 		publications[i].Members, err =

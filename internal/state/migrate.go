@@ -71,7 +71,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // validation attempts without backfilling already-applied revisions. v17 adds
 // the candidate-lineage ledger without rewriting existing candidates. v18
 // adds the immutable self-publication journal without backfilling historical
-// publishes. New tables are pure DDL; columns on existing tables are added
+// publishes. v19 persists prepare-time publication completion semantics so
+// restart recovery cannot reinterpret repair state. New tables are pure DDL;
+// columns on existing tables are added
 // explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
@@ -162,6 +164,39 @@ WHERE EXISTS(SELECT 1 FROM capture_events LIMIT 1)
    OR EXISTS(SELECT 1 FROM config_revisions LIMIT 1)
    OR EXISTS(SELECT 1 FROM daemon_meta WHERE key='commit.strategy')`); err != nil {
 			return fmt.Errorf("state: mark Intent v2 cutover: %w", err)
+		}
+	}
+	if cur < 19 {
+		for _, col := range []struct {
+			name string
+			typ  string
+		}{
+			{"completion_published_ts", "REAL NOT NULL DEFAULT 0"},
+			{"completion_candidate_status",
+				"TEXT NOT NULL DEFAULT 'published'"},
+			{"completion_soft_deadline", "REAL"},
+		} {
+			if err := addColumnIfMissing(
+				ctx, tx, "self_publications", col.name, col.typ); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE self_publications
+SET completion_published_ts=created_ts
+WHERE completion_published_ts=0;
+DROP TRIGGER IF EXISTS self_publications_identity_immutable;
+CREATE TRIGGER self_publications_identity_immutable
+BEFORE UPDATE OF branch_ref, branch_generation, source_head,
+                 target_commit_oid, target_tree_oid, membership_digest,
+                 member_count, completion_published_ts,
+                 completion_candidate_status, completion_soft_deadline
+ON self_publications
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;`); err != nil {
+			return fmt.Errorf(
+				"state: migrate self-publication completion identity: %w", err)
 		}
 	}
 	return nil

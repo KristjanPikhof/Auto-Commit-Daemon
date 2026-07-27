@@ -218,7 +218,7 @@ func EnsureRecoveryRef(ctx context.Context, repoDir, ref, commitOID string) (Rec
 // process cannot move or delete it before fn returns and the transaction is
 // committed or aborted.
 func WithLockedRecoveryRef(ctx context.Context, repoDir, ref, expectedOID string, fn func() error) error {
-	return withLockedRecoveryRef(ctx, repoDir, ref, expectedOID, "", fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", true, fn)
 }
 
 // WithLockedRecoveryRefAndAbsentRef verifies and locks both a recovery ref
@@ -240,32 +240,78 @@ func WithLockedRecoveryRefAndAbsentRef(
 	if expectedAbsentRef == ref {
 		return fmt.Errorf("git: expected-absent ref must differ from recovery ref %q", ref)
 	}
-	return withLockedRecoveryRef(ctx, repoDir, ref, expectedOID, expectedAbsentRef, fn)
+	return withLockedExpectedRef(
+		ctx, repoDir, ref, expectedOID, expectedAbsentRef, true, fn)
 }
 
-func withLockedRecoveryRef(
+// WithLockedExpectedRef verifies and locks one literal full ref at an exact
+// object ID while fn performs a cross-store mutation. It is intentionally
+// narrower than a general ref transaction: it cannot create, delete, or move
+// refs, and the callback runs only after Git has prepared the verification.
+func WithLockedExpectedRef(
+	ctx context.Context,
+	repoDir string,
+	ref string,
+	expectedOID string,
+	fn func() error,
+) error {
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", false, fn)
+}
+
+// WithLockedAbsentRef verifies and locks one literal full ref while it is
+// absent. The callback can safely update a second store knowing another Git
+// process cannot create the ref until the transaction finishes.
+func WithLockedAbsentRef(
+	ctx context.Context,
+	repoDir string,
+	ref string,
+	fn func() error,
+) error {
+	zeroOID, err := zeroOIDForRepo(ctx, repoDir)
+	if err != nil {
+		return err
+	}
+	return withLockedExpectedRef(ctx, repoDir, ref, zeroOID, "", false, fn)
+}
+
+func withLockedExpectedRef(
 	ctx context.Context,
 	repoDir string,
 	ref string,
 	expectedOID string,
 	expectedAbsentRef string,
+	requireRecoveryNamespace bool,
 	fn func() error,
 ) error {
 	if repoDir == "" {
-		return fmt.Errorf("git: WithLockedRecoveryRef called with empty repoDir")
+		return fmt.Errorf("git: locked ref verification called with empty repoDir")
 	}
-	if !strings.HasPrefix(ref, RecoveryRefPrefix) || len(ref) == len(RecoveryRefPrefix) ||
+	if !strings.HasPrefix(ref, "refs/") || len(ref) == len("refs/") ||
 		strings.ContainsAny(ref, " \t\r\n\x00") {
-		return fmt.Errorf("git: recovery ref %q must be a valid name below %s", ref, RecoveryRefPrefix)
+		return fmt.Errorf("git: locked ref %q must be a valid full ref name", ref)
+	}
+	if requireRecoveryNamespace &&
+		(!strings.HasPrefix(ref, RecoveryRefPrefix) ||
+			len(ref) == len(RecoveryRefPrefix)) {
+		return fmt.Errorf(
+			"git: recovery ref %q must be below %s", ref, RecoveryRefPrefix)
 	}
 	if expectedOID == "" || strings.ContainsAny(expectedOID, " \t\r\n\x00") {
-		return fmt.Errorf("git: WithLockedRecoveryRef called with invalid expected OID")
+		return fmt.Errorf("git: locked ref verification called with invalid expected OID")
 	}
 	if fn == nil {
-		return fmt.Errorf("git: WithLockedRecoveryRef called with nil callback")
+		return fmt.Errorf("git: locked ref verification called with nil callback")
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	zeroOID := ""
+	if expectedAbsentRef != "" {
+		var err error
+		zeroOID, err = zeroOIDForRepo(ctx, repoDir)
+		if err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, DefaultWriteTimeout)
 	defer cancel()
@@ -337,7 +383,6 @@ func withLockedRecoveryRef(
 		// Git's all-zero expected value means the ref must not exist. Preparing
 		// the transaction acquires both locks before the callback can mutate
 		// cross-store state.
-		const zeroOID = "0000000000000000000000000000000000000000"
 		if err := write("verify " + expectedAbsentRef + " " + zeroOID); err != nil {
 			return fail("verify absent", err)
 		}
@@ -381,6 +426,24 @@ func withLockedRecoveryRef(
 		return fail("wait", waitErr)
 	}
 	return nil
+}
+
+func zeroOIDForRepo(ctx context.Context, repoDir string) (string, error) {
+	out, err := Run(ctx, RunOpts{
+		Dir: repoDir, Timeout: DefaultReadTimeout,
+	}, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", fmt.Errorf("git: resolve repository object format: %w", err)
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "sha1":
+		return strings.Repeat("0", 40), nil
+	case "sha256":
+		return strings.Repeat("0", 64), nil
+	default:
+		return "", fmt.Errorf("git: unsupported repository object format %q",
+			strings.TrimSpace(string(out)))
+	}
 }
 
 // RunBranchRef returns the symbolic ref the worktree's HEAD points at,

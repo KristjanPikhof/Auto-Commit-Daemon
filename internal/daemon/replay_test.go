@@ -4055,6 +4055,7 @@ func TestSelfPublicationInitialSourceCompletesJournal(t *testing.T) {
 	attempt, err := prepareSelfPublication(
 		ctx, f.db, initialCtx, "", "initial-target", "initial-tree",
 		"event", []state.SelfPublicationMember{{EventSeq: pending[0].Seq}},
+		state.SelfPublicationCompletion{},
 		nil,
 	)
 	if err != nil {
@@ -4219,7 +4220,7 @@ func TestSelfPublicationEventSwitchPreservesRecoverableCandidate(t *testing.T) {
 					CandidateID: sql.NullString{
 						String: candidateID, Valid: true,
 					},
-				}}, nil,
+				}}, state.SelfPublicationCompletion{}, nil,
 			)
 			if err != nil {
 				t.Fatal(err)

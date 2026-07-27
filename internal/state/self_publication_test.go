@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestSelfPublicationSchemaV18MigrationAndIdempotentReopen(t *testing.T) {
+func TestSelfPublicationSchemaMigrationAndIdempotentReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	d, err := Open(ctx, dbPath)
@@ -29,8 +29,10 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 	if err != nil {
 		t.Fatalf("Open migrated v17: %v", err)
 	}
-	if version, err := migrated.UserVersion(ctx); err != nil || version != 18 {
-		t.Fatalf("migrated user_version=(%d,%v), want (18,nil)", version, err)
+	if version, err := migrated.UserVersion(ctx); err != nil ||
+		version != SchemaVersion {
+		t.Fatalf("migrated user_version=(%d,%v), want (%d,nil)",
+			version, err, SchemaVersion)
 	}
 	var keep string
 	if err := migrated.SQL().QueryRowContext(ctx,
@@ -68,6 +70,78 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 	}
 	defer reopened.Close()
 	assertSelfPublicationSchema(t, reopened.SQL())
+}
+
+func TestSelfPublicationV18CompletionMigrationIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+CREATE TABLE self_publications(
+    id TEXT PRIMARY KEY,
+    branch_ref TEXT NOT NULL,
+    branch_generation INTEGER NOT NULL,
+    source_head TEXT NOT NULL,
+    target_commit_oid TEXT NOT NULL,
+    target_tree_oid TEXT NOT NULL,
+    membership_digest TEXT NOT NULL,
+    member_count INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL,
+    git_applied_ts REAL,
+    completed_ts REAL,
+    abandoned_ts REAL,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE self_publication_members(
+    publication_id TEXT NOT NULL,
+    ord INTEGER NOT NULL,
+    event_seq INTEGER NOT NULL,
+    candidate_id TEXT,
+    PRIMARY KEY (publication_id, ord)
+);
+CREATE TRIGGER self_publications_identity_immutable
+BEFORE UPDATE OF branch_ref, branch_generation, source_head,
+                 target_commit_oid, target_tree_oid, membership_digest,
+                 member_count
+ON self_publications
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;
+PRAGMA user_version=18;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := LoadSelfPublicationStateReadOnly(ctx, dbPath)
+	if err != nil || !projection.Available ||
+		projection.SchemaVersion != 18 {
+		t.Fatalf("v18 read-only projection=%+v err=%v", projection, err)
+	}
+
+	migrated, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open v18 fixture: %v", err)
+	}
+	assertSelfPublicationCompletionColumns(t, migrated.SQL())
+	if version, err := migrated.UserVersion(ctx); err != nil ||
+		version != SchemaVersion {
+		t.Fatalf("version=(%d,%v), want %d", version, err, SchemaVersion)
+	}
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("idempotent reopen: %v", err)
+	}
+	defer reopened.Close()
+	assertSelfPublicationCompletionColumns(t, reopened.SQL())
 }
 
 func TestReadOnlySelfPublicationV17DoesNotMigrate(t *testing.T) {
@@ -259,6 +333,11 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 			SourceHead:       "source-9",
 			TargetCommitOID:  "target-9",
 			TargetTreeOID:    "tree-9",
+			Completion: SelfPublicationCompletion{
+				PublishedTS:             11,
+				CandidateStatus:         IntentCandidateSoftPublished,
+				SoftPublicationDeadline: sql.NullFloat64{Float64: 20, Valid: true},
+			},
 			Members: []SelfPublicationMember{
 				{EventSeq: seq1, CandidateID: sql.NullString{String: "candidate", Valid: true}},
 				{EventSeq: seq2, CandidateID: sql.NullString{String: "candidate", Valid: true}},
@@ -568,6 +647,26 @@ SELECT COUNT(*) FROM sqlite_master WHERE name=?`, name).Scan(&count); err != nil
 		}
 		if count != 1 {
 			t.Fatalf("schema object %s count=%d", name, count)
+		}
+	}
+	assertSelfPublicationCompletionColumns(t, db)
+}
+
+func assertSelfPublicationCompletionColumns(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, column := range []string{
+		"completion_published_ts",
+		"completion_candidate_status",
+		"completion_soft_deadline",
+	} {
+		var count int
+		if err := db.QueryRow(`
+SELECT COUNT(*) FROM pragma_table_info('self_publications')
+WHERE name=?`, column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("self_publications column %s count=%d", column, count)
 		}
 	}
 }

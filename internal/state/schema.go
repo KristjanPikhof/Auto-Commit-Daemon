@@ -31,8 +31,9 @@ package state
 // durable background setup-validation attempts without backfilling existing
 // applied revisions; v17 adds durable candidate lineage for dependency-driven
 // canonical merges; v18 adds an immutable, crash-recoverable self-publication
-// journal spanning the Git-applied and SQLite-completed boundary.
-const SchemaVersion = 18
+// journal spanning the Git-applied and SQLite-completed boundary; v19 makes
+// prepare-time publication completion semantics immutable across restart.
+const SchemaVersion = 19
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -610,6 +611,11 @@ CREATE TABLE IF NOT EXISTS self_publications(
     completed_ts        REAL,
     abandoned_ts        REAL,
     error               TEXT NOT NULL DEFAULT '',
+    completion_published_ts REAL NOT NULL,
+    completion_candidate_status TEXT NOT NULL CHECK (
+                        completion_candidate_status IN
+                        ('published','soft_published')),
+    completion_soft_deadline REAL,
     CHECK (length(id) BETWEEN 1 AND 128),
     CHECK (length(branch_ref) BETWEEN 1 AND 1024),
     -- Empty source_head is the exact identity for an unborn branch whose
@@ -619,6 +625,13 @@ CREATE TABLE IF NOT EXISTS self_publications(
     CHECK (length(target_tree_oid) BETWEEN 1 AND 128),
     CHECK (length(membership_digest) = 71
            AND substr(membership_digest, 1, 7) = 'sha256:'),
+    CHECK (
+        (completion_candidate_status = 'published'
+         AND completion_soft_deadline IS NULL)
+        OR
+        (completion_candidate_status = 'soft_published'
+         AND completion_soft_deadline > completion_published_ts)
+    ),
     CHECK (length(error) <= 2048)
 );
 
@@ -666,7 +679,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS self_publications_identity_immutable
 BEFORE UPDATE OF branch_ref, branch_generation, source_head,
                  target_commit_oid, target_tree_oid, membership_digest,
-                 member_count
+                 member_count, completion_published_ts,
+                 completion_candidate_status, completion_soft_deadline
 ON self_publications
 BEGIN
     SELECT RAISE(ABORT, 'self-publication identity is immutable');

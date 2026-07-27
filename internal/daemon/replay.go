@@ -760,9 +760,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
+		publicationCompletion := selfPublicationCompletion(opts, ev.Message)
 		publication, err := prepareSelfPublication(
 			eventCtx, db, activeCtx, parent, commitOID, treeOID, "event",
 			[]state.SelfPublicationMember{{EventSeq: ev.Seq}},
+			publicationCompletion,
 			opts.SelfPublicationCheckpoint,
 		)
 		if err != nil {
@@ -858,8 +860,8 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		cancelEvent()
-		if err := publication.complete(ctx, db, selfPublicationCompletion(
-			opts, ev.Message)); err != nil {
+		if err := publication.complete(
+			ctx, db, publicationCompletion); err != nil {
 			return sum, err
 		}
 		recordReplayDecision(ctx, db, ev, activeCtx, selfPublicationNow(),
@@ -3118,9 +3120,14 @@ func publishIntentSelection(
 	if selected[0].candidateID != "" {
 		group = selected[0].candidateID
 	}
+	publicationCompletion := selfPublicationCompletion(
+		opts, sql.NullString{
+			String: groupMessage, Valid: groupMessage != "",
+		})
 	publication, err := prepareSelfPublication(
 		eventCtx, db, activeCtx, sourceHead, commitOID, treeOID, group,
-		selfPublicationMembers(selected), opts.SelfPublicationCheckpoint,
+		selfPublicationMembers(selected), publicationCompletion,
+		opts.SelfPublicationCheckpoint,
 	)
 	if err != nil {
 		cancelEvent()
@@ -3190,8 +3197,8 @@ func publishIntentSelection(
 	}
 	cancelEvent()
 
-	if err := publication.complete(ctx, db, selfPublicationCompletion(
-		opts, sql.NullString{String: groupMessage, Valid: groupMessage != ""})); err != nil {
+	if err := publication.complete(
+		ctx, db, publicationCompletion); err != nil {
 		return sum, err
 	}
 	recordIntentPublishedDecisions(

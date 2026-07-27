@@ -67,6 +67,7 @@ func prepareSelfPublication(
 	cctx CaptureContext,
 	sourceHead, targetOID, treeOID, group string,
 	members []state.SelfPublicationMember,
+	completion state.SelfPublicationCompletion,
 	hook func(SelfPublicationCheckpointEvent) error,
 ) (selfPublicationAttempt, error) {
 	id, err := newSelfPublicationAttemptID()
@@ -85,6 +86,7 @@ func prepareSelfPublication(
 		TargetCommitOID:  targetOID,
 		TargetTreeOID:    treeOID,
 		Members:          ordered,
+		Completion:       completion,
 	}
 	if _, err := state.PrepareSelfPublication(ctx, db, journal); err != nil {
 		return selfPublicationAttempt{},
