@@ -351,6 +351,26 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		}
 	}
 
+	// A PID and heartbeat live in the movable state directory, so neither can
+	// prove repository ownership by itself. The stable common-directory flock
+	// is the authority: it rejects a recycled/stale PID when no writer owns the
+	// repo and detects an owner whose state directory was moved, replaced, or
+	// belongs to another linked worktree.
+	writerHeld, err := daemonWriterLockHeld(gitDir)
+	if err != nil {
+		return fmt.Errorf("acd start: verify canonical repository writer: %w", err)
+	}
+	if daemonAlive && !writerHeld {
+		daemonAlive = false
+		daemonPID = 0
+	}
+	if !daemonAlive && writerHeld {
+		return fmt.Errorf(
+			"acd start: %w; the canonical repository writer lock is held but %s does not identify that owner; another ACD version, linked worktree, or daemon with moved state may be active; run `acd status --repo %s` and stop the existing daemon before retrying",
+			daemon.ErrDaemonLockHeld, dbPath, repo,
+		)
+	}
+
 	started := false
 	if !daemonAlive {
 		// Spawn detached. Drop the control lock first — the daemon will
@@ -472,6 +492,25 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			sessionID, daemonPID)
 	}
 	return nil
+}
+
+// daemonWriterLockHeld probes both the stable common-repository lock and the
+// legacy per-worktree lock through the same acquisition path used by the
+// daemon. A successful acquisition is released immediately and means there is
+// no current writer. ErrDaemonLockHeld is kernel-backed ownership evidence,
+// independent of movable SQLite/cache state and PID reuse.
+func daemonWriterLockHeld(gitDir string) (bool, error) {
+	lock, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return true, nil
+		}
+		return false, err
+	}
+	if err := lock.Release(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func humanStartSessionID(repoHash string) string {

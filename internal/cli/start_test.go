@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +12,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -86,6 +89,141 @@ func openStartDB(t *testing.T, repoDir string) *state.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestStartCanonicalWriterStateMoveRefusesUnknownOwner(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	gitDir := filepath.Join(repoDir, ".git")
+
+	owner, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		t.Fatalf("AcquireDaemonLock owner: %v", err)
+	}
+	defer owner.Release() //nolint:errcheck
+	if err := os.Rename(filepath.Join(gitDir, "acd"), filepath.Join(gitDir, "acd-moved")); err != nil {
+		t.Fatalf("rename state dir: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	err = runStart(ctx, &stdout, repoDir, "state-move-session", "codex", 0, true)
+	if !errors.Is(err, daemon.ErrDaemonLockHeld) {
+		t.Fatalf("runStart error = %v, want ErrDaemonLockHeld", err)
+	}
+	if !strings.Contains(err.Error(), "moved state") || !strings.Contains(err.Error(), "acd status --repo") {
+		t.Fatalf("runStart error is not actionable: %v", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count = %d, want 0 while canonical owner lives", count.Load())
+	}
+}
+
+func TestStartLinkedWorktreeOwnerRefusesSecondWriter(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	mainRepo := makeStartRepo(t)
+	commitStartRepoSeed(t, mainRepo)
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-owner", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	mainWT, err := git.ResolveWorktree(ctx, mainRepo)
+	if err != nil {
+		t.Fatalf("resolve main worktree: %v", err)
+	}
+	owner, err := daemon.AcquireDaemonLock(mainWT.GitDir)
+	if err != nil {
+		t.Fatalf("AcquireDaemonLock main owner: %v", err)
+	}
+	defer owner.Release() //nolint:errcheck
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	err = runStart(ctx, &stdout, linked, "linked-owner-session", "codex", 0, true)
+	if !errors.Is(err, daemon.ErrDaemonLockHeld) {
+		t.Fatalf("runStart linked error = %v, want ErrDaemonLockHeld", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count = %d, want 0 for linked worktree contention", count.Load())
+	}
+}
+
+func TestStartLinkedWorktreeStalePIDDoesNotClaimOwner(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	mainRepo := makeStartRepo(t)
+	commitStartRepoSeed(t, mainRepo)
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-stale-pid", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	linkedWT, err := git.ResolveWorktree(ctx, linked)
+	if err != nil {
+		t.Fatalf("resolve linked worktree: %v", err)
+	}
+	db, err := state.Open(ctx, state.DBPathFromGitDir(linkedWT.GitDir))
+	if err != nil {
+		t.Fatalf("open linked state: %v", err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID:         os.Getpid(),
+		Mode:        "running",
+		HeartbeatTS: nowFloat(),
+		UpdatedTS:   nowFloat(),
+	}); err != nil {
+		_ = db.Close()
+		t.Fatalf("save stale daemon state: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close linked state: %v", err)
+	}
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	if err := runStart(ctx, &stdout, linked, "linked-stale-session", "codex", 0, true); err != nil {
+		t.Fatalf("runStart linked stale PID: %v", err)
+	}
+	if count.Load() != 1 {
+		t.Fatalf("spawn count = %d, want 1 because PID without a writer lock is stale", count.Load())
+	}
+}
+
+func TestStartDaemonLockMixedVersionRefusalIsActionable(t *testing.T) {
+	_ = withIsolatedHome(t)
+	ctx := context.Background()
+	repoDir := makeStartRepo(t)
+	legacyDir := filepath.Join(repoDir, ".git", "acd")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy lock dir: %v", err)
+	}
+	legacy, err := os.OpenFile(filepath.Join(legacyDir, "daemon.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open legacy lock: %v", err)
+	}
+	defer legacy.Close()
+	if err := syscall.Flock(int(legacy.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock legacy lock: %v", err)
+	}
+	defer syscall.Flock(int(legacy.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	count, restore := installFakeSpawn(t, os.Getpid())
+	defer restore()
+	var stdout bytes.Buffer
+	err = runStart(ctx, &stdout, repoDir, "mixed-version-session", "codex", 0, true)
+	if !errors.Is(err, daemon.ErrDaemonLockHeld) {
+		t.Fatalf("runStart error = %v, want ErrDaemonLockHeld", err)
+	}
+	if !strings.Contains(err.Error(), "another ACD version") || !strings.Contains(err.Error(), "stop the existing daemon") {
+		t.Fatalf("mixed-version refusal is not actionable: %v", err)
+	}
+	if count.Load() != 0 {
+		t.Fatalf("spawn count = %d, want 0 while legacy owner lives", count.Load())
+	}
 }
 
 func commitStartRepoSeed(t *testing.T, repoDir string) string {
