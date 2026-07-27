@@ -711,6 +711,7 @@ func Run(ctx context.Context, opts Options) error {
 	var shutdownCh <-chan struct{}
 	recoveryRootCtx := ctx
 	recoverSelfPublicationsPass := func(
+		rootCtx context.Context,
 		recoveryCtx CaptureContext,
 	) (SelfPublicationRecoverySummary, error) {
 		// One journal per invocation keeps the run loop available to drain
@@ -718,7 +719,7 @@ func Run(ctx context.Context, opts Options) error {
 		// a slow Git proof, while the progress heartbeat preserves the
 		// controller's three-second liveness contract during that proof.
 		passCtx, passCancel := context.WithTimeout(
-			recoveryRootCtx, 5*time.Second)
+			rootCtx, 5*time.Second)
 		defer passCancel()
 		progressDone := make(chan struct{})
 		progressStopped := make(chan struct{})
@@ -765,12 +766,23 @@ func Run(ctx context.Context, opts Options) error {
 	if rawShutdownCh == nil && sig != nil {
 		rawShutdownCh = sig.Shutdown
 	}
+	shutdownPendingAtStart := false
+	select {
+	case <-rawShutdownCh:
+		shutdownPendingAtStart = true
+	default:
+	}
 	recoveryRootCtx, recoveryCancel := context.WithCancel(ctx)
 	shutdownBroadcast := make(chan struct{})
 	shutdownBridgeStop := make(chan struct{})
 	shutdownBridgeDone := make(chan struct{})
 	go func() {
 		defer close(shutdownBridgeDone)
+		if shutdownPendingAtStart {
+			recoveryCancel()
+			close(shutdownBroadcast)
+			return
+		}
 		select {
 		case <-rawShutdownCh:
 			recoveryCancel()
@@ -823,6 +835,18 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	startupPublicationBlocked := false
 	if branchRef != "" && headOID != "" {
+		// A detached marker alongside an attached current token means HEAD
+		// reattached before startup finished sampling it. In that narrow
+		// case, the rewind-grace row belongs to the stale detached state.
+		// Let exact self-publication proof run, but retain both markers until
+		// the branch transition is accepted below.
+		_, reattachedFromDetached, detachedErr :=
+			state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+		if detachedErr != nil {
+			logger.Warn("read detached marker before startup self-publication recovery",
+				"err", detachedErr.Error())
+			startupPublicationBlocked = true
+		}
 		if operation, active := gitOperationInProgress(opts.GitDir); active {
 			logger.Info("startup self-publication recovery deferred during git operation",
 				"operation", operation)
@@ -832,16 +856,25 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("read pause state before startup self-publication recovery",
 				"err", pauseErr.Error())
 			startupPublicationBlocked = true
-		} else if pauseStatus.Active {
+		} else if pauseStatus.Active &&
+			!(pauseStatus.Source == "rewind_grace" && reattachedFromDetached) {
 			logger.Info("startup self-publication recovery deferred while paused",
 				"source", pauseStatus.Source, "reason", pauseStatus.Reason)
 			startupPublicationBlocked = true
-		} else {
+		} else if !startupPublicationBlocked {
 			recoveryCtx := CaptureContext{
 				BranchRef: branchRef, BranchGeneration: persistedGen,
 				BaseHead: persistedHead,
 			}
-			recovered, recoverErr := recoverSelfPublicationsPass(recoveryCtx)
+			// A shutdown already pending before startup still permits crash
+			// convergence. A shutdown arriving during this proof cancels it
+			// promptly through recoveryRootCtx.
+			startupRecoveryRootCtx := recoveryRootCtx
+			if shutdownPendingAtStart {
+				startupRecoveryRootCtx = ctx
+			}
+			recovered, recoverErr := recoverSelfPublicationsPass(
+				startupRecoveryRootCtx, recoveryCtx)
 			if recoverErr != nil {
 				logger.Warn("recover self-publications before startup branch transition",
 					"err", recoverErr.Error())
@@ -1402,7 +1435,7 @@ func Run(ctx context.Context, opts Options) error {
 		if cctx.BranchRef == "" {
 			return false, false
 		}
-		recovered, recoverErr := recoverSelfPublicationsPass(cctx)
+		recovered, recoverErr := recoverSelfPublicationsPass(recoveryRootCtx, cctx)
 		if recoverErr != nil {
 			logger.Warn("self-publication recovery needs attention",
 				"branch_ref", cctx.BranchRef,
