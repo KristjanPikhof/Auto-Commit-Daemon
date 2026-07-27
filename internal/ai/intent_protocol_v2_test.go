@@ -125,6 +125,31 @@ func TestValidateIntentPlanV2RejectsReadyCandidateWithMissingCompanion(t *testin
 	}
 }
 
+func TestValidateIntentPlanV2RejectsDeferredForcedCapture(t *testing.T) {
+	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
+		OfferedCaptures: []OfferedCapture{{
+			Seq: 1, Path: "a.go", Op: "modify",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequestV2: %v", err)
+	}
+	candidate := readyCandidate("forced", []int64{1})
+	candidate.Readiness = IntentCandidateWait
+	candidate.MissingCompanions = []string{"a companion outside the forced window"}
+
+	err = ValidateIntentPlanV2(req, IntentPlanV2{
+		ProtocolVersion: IntentPlannerProtocolV2,
+		Candidates:      []IntentCandidateAssignment{candidate},
+	})
+	var validationErr *IntentPlanV2ValidationError
+	if !errors.As(err, &validationErr) ||
+		validationErr.Findings[0].Code != "forced_capture_deferred" {
+		t.Fatalf("error = %T %v", err, err)
+	}
+}
+
 func TestValidateIntentPlanV2RequiresDeclaredHardDependency(t *testing.T) {
 	req := mustIntentPlanRequestV2(t,
 		[]OfferedCapture{
