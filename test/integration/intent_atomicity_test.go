@@ -76,12 +76,15 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 4 {
 			http.Error(w, "expected at least four offered captures", http.StatusBadRequest)
@@ -213,12 +216,15 @@ func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 3 {
 			http.Error(w, "expected three offered captures", http.StatusBadRequest)
@@ -339,12 +345,15 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		captures := offeredIntentCaptures(t, req)
 		if len(captures) != 5 {
 			http.Error(w, "expected five offered captures", http.StatusBadRequest)

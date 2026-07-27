@@ -57,6 +57,8 @@ func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
 }
 
 func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
+	t.Parallel()
+
 	repo := tempRepo(t)
 	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
 	bin := buildAcdBinary(t)
@@ -127,6 +129,8 @@ func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 }
 
 func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
+	t.Parallel()
+
 	repo := tempRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
 		[]byte("test:\n\t@true\n"), 0o600); err != nil {

@@ -145,6 +145,9 @@ func TestSettingsExperimentProviderErrorPolicyRevertsAndKeepsCommit(t *testing.T
 	env := withIsolatedHome(t)
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := decodeSettingsPlannerRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req.intentChatRequest) {
+			return
+		}
 		if req.Model == "error-candidate" {
 			http.Error(w, `{"error":{"message":"synthetic failure"}}`, http.StatusInternalServerError)
 			return

@@ -36,12 +36,15 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -146,12 +149,15 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -251,6 +257,10 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
 			return
 		}
 		plannerHits.Add(1)

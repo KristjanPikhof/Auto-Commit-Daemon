@@ -32,6 +32,8 @@ const selfPublicationMatrixSeed int64 = 0xACD18
 // is that ownership remains fenced by the stable Git common directory even
 // while the legacy state path moves.
 func TestCanonicalWriterAfterStateMove(t *testing.T) {
+	t.Parallel()
+
 	repo := tempRepo(t)
 	gitDir := filepath.Join(repo, ".git")
 	stateDir := filepath.Join(gitDir, "acd")
@@ -76,6 +78,8 @@ func TestCanonicalWriterAfterStateMove(t *testing.T) {
 }
 
 func TestCanonicalWriterAcrossLinkedWorktree(t *testing.T) {
+	t.Parallel()
+
 	repo := tempRepo(t)
 	linked := filepath.Join(t.TempDir(), "linked")
 	runGitOK(t, repo, "worktree", "add", "-q", "-b", "linked", linked)
@@ -100,6 +104,8 @@ func TestCanonicalWriterAcrossLinkedWorktree(t *testing.T) {
 }
 
 func TestSelfPublicationCrashRestartMatrix(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name        string
 		phase       string
@@ -290,6 +296,8 @@ SELECT value FROM daemon_meta WHERE key=?`,
 }
 
 func TestSelfPublicationIntentCapacityOracle(t *testing.T) {
+	t.Parallel()
+
 	repo, db, cctx, publication := seedSelfPublicationWorkload(
 		t,
 		state.IntentCandidateMaxCaptures,
@@ -347,6 +355,8 @@ SELECT COUNT(*) FROM intent_capture_dependencies`,
 }
 
 func TestSelfPublicationSixtyFourCommitChain(t *testing.T) {
+	t.Parallel()
+
 	const commitCount = 64
 	repo := tempRepo(t)
 	ctx := context.Background()
@@ -434,6 +444,8 @@ func TestSelfPublicationSixtyFourCommitChain(t *testing.T) {
 
 func TestSelfPublicationExternalGitInterleavings(t *testing.T) {
 	t.Run("external-fast-forward", func(t *testing.T) {
+		t.Parallel()
+
 		repo, db, cctx, publication := seedSelfPublicationWorkload(
 			t, 1, 0, 0, "external-fast-forward")
 		runGitOK(t, repo, "update-ref", cctx.BranchRef,
@@ -458,6 +470,8 @@ func TestSelfPublicationExternalGitInterleavings(t *testing.T) {
 	})
 
 	t.Run("reset-rewind", func(t *testing.T) {
+		t.Parallel()
+
 		repo, db, cctx, publication := seedSelfPublicationWorkload(
 			t, 1, 0, 0, "reset-rewind")
 		runGitOK(t, repo, "update-ref", cctx.BranchRef,
@@ -556,6 +570,8 @@ SELECT phase FROM self_publications WHERE id=?`,
 	})
 
 	t.Run("branch-switch", func(t *testing.T) {
+		t.Parallel()
+
 		repo, db, _, publication := seedSelfPublicationWorkload(
 			t, 1, 0, 0, "branch-switch")
 		runGitOK(t, repo, "switch", "-q", "-c", "other")

@@ -27,12 +27,15 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -119,12 +122,15 @@ func TestIntentStrategy_RapidFiveCapturesOfferedThenSeparated(t *testing.T) {
 	var hits atomic.Int32
 	var firstOffered atomic.Value
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if firstOffered.Load() == nil {
 			copied := append([]int64(nil), seqs...)
@@ -274,6 +280,11 @@ type intentChatRequest struct {
 	Messages []struct {
 		Content string `json:"content"`
 	} `json:"messages"`
+	ToolChoice struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	} `json:"tool_choice"`
 }
 
 type intentPlanPromptPayload struct {
@@ -290,6 +301,51 @@ func decodeIntentChatRequest(t *testing.T, r *http.Request) intentChatRequest {
 		t.Fatalf("decode OpenAI request: %v", err)
 	}
 	return req
+}
+
+// writeIntentMessageRewriteResponse handles the locked message-only second
+// round trip used when an otherwise accepted intent plan has a low-quality
+// commit message. Returning only commit_message output mirrors the provider
+// protocol without changing the plan's accepted grouping.
+func writeIntentMessageRewriteResponse(t *testing.T, w http.ResponseWriter, req intentChatRequest) bool {
+	t.Helper()
+	if req.ToolChoice.Function.Name != "commit_message" {
+		return false
+	}
+	args, err := json.Marshal(map[string]string{
+		"subject": "Apply selected intent change",
+		"body":    "- Preserve the accepted capture grouping.",
+	})
+	if err != nil {
+		t.Fatalf("marshal intent message rewrite: %v", err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"id":     "chatcmpl-intent-message-rewrite",
+		"object": "chat.completion",
+		"model":  "gpt-5.4-mini",
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []map[string]any{{
+					"id":   "call_intent_message_rewrite",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "commit_message",
+						"arguments": string(args),
+					},
+				}},
+			},
+			"finish_reason": "tool_calls",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal intent message rewrite response: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+	return true
 }
 
 func offeredIntentSeqs(t *testing.T, req intentChatRequest) []int64 {
