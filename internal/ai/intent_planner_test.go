@@ -1264,6 +1264,52 @@ func TestComposedPlanIntentRewritesGenericMessageOnly(t *testing.T) {
 	}
 }
 
+func TestCandidateFallbackRewritesGenericMessageOnly(t *testing.T) {
+	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
+		OfferedCaptures: []OfferedCapture{{
+			Seq: 101, Path: "analysis-panel.tsx", Op: "modify",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatalf("NewIntentPlanRequestV2: %v", err)
+	}
+	plan := IntentPlanV2{
+		ProtocolVersion: IntentPlannerProtocolV2,
+		Candidates: []IntentCandidateAssignment{{
+			CandidateID:    "forced-analysis",
+			SelectedSeqs:   []int64{101},
+			Purpose:        "continue verified analysis in chat",
+			Readiness:      IntentCandidateReady,
+			Subject:        "Update analysis-panel.tsx",
+			GroupingReason: "bounded deterministic dependency component",
+		}},
+	}
+	primary := &scriptedIntentPlanner{
+		name: "scripted-primary",
+		rewrites: []Result{{
+			Subject: "Connect verified analysis to chat",
+		}},
+	}
+	provider := Compose(primary, DeterministicProvider{})
+
+	got, err := ApplyIntentV2MessageQuality(
+		context.Background(), provider, req, plan)
+	if err != nil {
+		t.Fatalf("ApplyIntentV2MessageQuality: %v", err)
+	}
+	if primary.rewriteCalls != 1 {
+		t.Fatalf("rewriteCalls=%d want 1", primary.rewriteCalls)
+	}
+	if got.Candidates[0].Subject != "Connect verified analysis to chat" {
+		t.Fatalf("subject=%q", got.Candidates[0].Subject)
+	}
+	if len(got.Candidates[0].SelectedSeqs) != 1 ||
+		got.Candidates[0].SelectedSeqs[0] != 101 {
+		t.Fatalf("selected changed: %v", got.Candidates[0].SelectedSeqs)
+	}
+}
+
 func TestComposedPlanIntentRejectsStillGenericRewrite(t *testing.T) {
 	req := sampleIntentPlanRequest(t)
 	plan := IntentPlan{

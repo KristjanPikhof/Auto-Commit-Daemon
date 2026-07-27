@@ -15,6 +15,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -78,6 +79,22 @@ type composed struct {
 
 func (c *composed) Name() string {
 	return c.primary.Name() + "+" + c.fallback.Name()
+}
+
+// RewriteIntentMessage exposes the primary provider's locked message-only
+// rewrite capability to fallback paths without allowing the deterministic
+// provider to alter a validated grouping.
+func (c *composed) RewriteIntentMessage(
+	ctx context.Context,
+	req IntentMessageRewriteRequest,
+) (Result, error) {
+	rewriter, ok := c.primary.(IntentMessageRewriter)
+	if !ok {
+		return Result{}, fmt.Errorf(
+			"ai: composed primary %q does not rewrite intent messages",
+			c.primary.Name())
+	}
+	return rewriter.RewriteIntentMessage(ctx, req)
 }
 
 // PrimaryProviderName returns the provider that receives the first request in a
@@ -227,7 +244,11 @@ func (c *composed) PlanIntentV2(ctx context.Context, req IntentPlanRequestV2) (I
 	return applyIntentV2MessageQuality(ctx, c.primary, req, plan)
 }
 
-func applyIntentV2MessageQuality(ctx context.Context, provider Provider, req IntentPlanRequestV2, plan IntentPlanV2) (IntentPlanV2, error) {
+// ApplyIntentV2MessageQuality applies the locked message-only quality policy
+// to a structurally valid v2 plan. Candidate fallback paths call this after
+// choosing a safe deterministic partition so a filename-only fallback subject
+// cannot bypass the same rewrite gate used by primary planner responses.
+func ApplyIntentV2MessageQuality(ctx context.Context, provider interface{ Name() string }, req IntentPlanRequestV2, plan IntentPlanV2) (IntentPlanV2, error) {
 	legacyReq := LegacyIntentPlanRequest(req)
 	out := plan
 	for i, candidate := range plan.Candidates {
@@ -252,6 +273,10 @@ func applyIntentV2MessageQuality(ctx context.Context, provider Provider, req Int
 		return IntentPlanV2{}, err
 	}
 	return out, nil
+}
+
+func applyIntentV2MessageQuality(ctx context.Context, provider Provider, req IntentPlanRequestV2, plan IntentPlanV2) (IntentPlanV2, error) {
+	return ApplyIntentV2MessageQuality(ctx, provider, req, plan)
 }
 
 // logIntentPlanNormalization emits a single deterministic slog.Warn naming
@@ -350,7 +375,7 @@ func (c *composed) runPrimaryWithRetry(ctx context.Context, primary IntentPlanne
 	return IntentPlan{}, lastErr
 }
 
-func applyIntentMessageQuality(ctx context.Context, provider Provider, req IntentPlanRequest, plan IntentPlan) (IntentPlan, error) {
+func applyIntentMessageQuality(ctx context.Context, provider interface{ Name() string }, req IntentPlanRequest, plan IntentPlan) (IntentPlan, error) {
 	if len(plan.CommitGroups) > 0 {
 		out := plan
 		for i, group := range plan.CommitGroups {

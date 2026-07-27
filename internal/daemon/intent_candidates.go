@@ -726,6 +726,15 @@ func chooseIntentCandidatePlan(
 	switch preset {
 	case config.PresetFast:
 		plan := deterministicIntentCandidatePlan(req, false, true)
+		if _, ok := planner.(ai.IntentMessageRewriter); ok {
+			rewritten, rewriteErr := ai.ApplyIntentV2MessageQuality(
+				ctx, planner, req, plan)
+			if rewriteErr != nil {
+				return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
+					false, nil, rewriteErr
+			}
+			plan = rewritten
+		}
 		continuations, _, err := continuePersistedIntentCandidates(
 			req, &plan, intentCandidateContinuationOptions{
 				RewriteDeterministicMessage: true,
@@ -743,6 +752,15 @@ func chooseIntentCandidatePlan(
 			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil, nil
 		}
 		plan, fallbackNeedsAttention := balancedIntentCandidatePlan(req)
+		if _, ok := planner.(ai.IntentMessageRewriter); ok {
+			rewritten, rewriteErr := ai.ApplyIntentV2MessageQuality(
+				ctx, planner, req, plan)
+			if rewriteErr != nil {
+				return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
+					false, nil, rewriteErr
+			}
+			plan = rewritten
+		}
 		continuations, companionNeedsAttention, err :=
 			continuePersistedIntentCandidates(
 				req, &plan, intentCandidateContinuationOptions{
