@@ -432,6 +432,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			sum.RecaptureRequired = true
 		}
 	}
+	if !intentCfg.enabled {
+		if err := retireIntentCandidatesForEventReplay(
+			ctx, db, cctx); err != nil {
+			return sum, err
+		}
+	}
 
 	// Per-pass batch budget. When bounded, query one extra row so the "is
 	// there more queued behind this batch?" question can be answered without a

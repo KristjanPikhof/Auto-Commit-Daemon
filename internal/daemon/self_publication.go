@@ -8,13 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-const selfPublicationTerminalRetention = 7 * 24 * time.Hour
+const (
+	selfPublicationTerminalRetention  = 7 * 24 * time.Hour
+	selfPublicationMaintenanceCadence = time.Hour
+	metaSelfPublicationMaintainedTS   = "self_publication.maintained_ts"
+)
 
 // SelfPublicationCheckpoint identifies a deterministic publication boundary
 // exposed to fault-injection and recovery tests.
@@ -295,11 +300,73 @@ func maintainSelfPublicationJournal(
 	ctx context.Context,
 	db *state.DB,
 ) (int64, error) {
-	return state.PruneTerminalSelfPublicationsBefore(
+	now := selfPublicationNow()
+	if raw, ok, err := state.MetaGet(
+		ctx, db, metaSelfPublicationMaintainedTS); err != nil {
+		return 0, fmt.Errorf("daemon: read self-publication maintenance cadence: %w", err)
+	} else if ok {
+		last, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr == nil &&
+			now-last < selfPublicationMaintenanceCadence.Seconds() {
+			return 0, nil
+		}
+	}
+	pruned, err := state.PruneTerminalSelfPublicationsBefore(
 		ctx, db,
-		selfPublicationNow()-selfPublicationTerminalRetention.Seconds(),
+		now-selfPublicationTerminalRetention.Seconds(),
 		state.SelfPublicationMaxPruneBatch,
 	)
+	if err != nil {
+		return 0, err
+	}
+	if err := state.MetaSet(
+		ctx, db, metaSelfPublicationMaintainedTS,
+		strconv.FormatFloat(now, 'f', 9, 64)); err != nil {
+		return 0, fmt.Errorf("daemon: stamp self-publication maintenance: %w", err)
+	}
+	return pruned, nil
+}
+
+// retireIntentCandidatesForEventReplay preserves candidate history while
+// releasing exact active ownership before the operator-selected event
+// strategy publishes individual captures.
+func retireIntentCandidatesForEventReplay(
+	ctx context.Context,
+	db *state.DB,
+	cctx CaptureContext,
+) error {
+	if cctx.BranchRef == "" {
+		return nil
+	}
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("daemon: begin event-strategy candidate retirement: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	statuses := `('open','waiting','ready','soft_published','blocked')`
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events
+SET membership_state='superseded'
+WHERE membership_state='active'
+  AND candidate_id IN (
+      SELECT id FROM intent_candidates
+      WHERE branch_ref=? AND branch_generation=?
+        AND status IN `+statuses+`
+  )`, cctx.BranchRef, cctx.BranchGeneration); err != nil {
+		return fmt.Errorf("daemon: retire event-strategy candidate membership: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded', updated_ts=?
+WHERE branch_ref=? AND branch_generation=?
+  AND status IN `+statuses,
+		selfPublicationNow(), cctx.BranchRef, cctx.BranchGeneration); err != nil {
+		return fmt.Errorf("daemon: retire event-strategy candidates: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("daemon: commit event-strategy candidate retirement: %w", err)
+	}
+	return nil
 }
 
 func newSelfPublicationAttemptID() (string, error) {

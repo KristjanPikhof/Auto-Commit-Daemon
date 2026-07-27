@@ -3969,13 +3969,30 @@ func TestSelfPublicationCancellationAtCompletionBoundaries(t *testing.T) {
 			if len(journals) != 1 || journals[0].phase != tc.wantPhase {
 				t.Fatalf("journals=%+v want phase %s", journals, tc.wantPhase)
 			}
-			var eventState string
+			var (
+				eventSeq   int64
+				eventState string
+			)
 			if err := f.db.SQL().QueryRowContext(ctx,
-				`SELECT state FROM capture_events WHERE path=?`,
-				"completion-"+tc.name+".txt").Scan(&eventState); err != nil ||
+				`SELECT seq, state FROM capture_events WHERE path=?`,
+				"completion-"+tc.name+".txt",
+			).Scan(&eventSeq, &eventState); err != nil ||
 				eventState != tc.wantEvent {
 				t.Fatalf("event state=(%q,%v) want %q",
 					eventState, err, tc.wantEvent)
+			}
+			if tc.checkpoint == SelfPublicationAfterCompletion {
+				decisions, err := state.DecisionsForEvent(
+					ctx, f.db, eventSeq, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, decision := range decisions {
+					if decision.Kind == state.DecisionKindCommitted {
+						t.Fatalf("derived decision crossed injected completion crash: %+v",
+							decisions)
+					}
+				}
 			}
 			if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
 				t.Fatalf("commit count=%d want exactly one target", got)
@@ -4062,6 +4079,89 @@ func TestSelfPublicationInitialSourceCompletesJournal(t *testing.T) {
 	if len(journals) != 1 || journals[0].source != "" ||
 		journals[0].phase != state.SelfPublicationCompleted {
 		t.Fatalf("initial journals=%+v", journals)
+	}
+}
+
+func TestSelfPublicationEventSwitchRetiresCandidateOwnership(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "switch-to-event.txt", "event\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("PendingEvents=(%d,%v) want (1,nil)", len(pending), err)
+	}
+	const candidateID = "candidate-before-event-switch"
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID: candidateID, BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateReady,
+		Purpose:          "candidate retired by event strategy",
+		Readiness:        state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: pending[0].Seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent,
+	})
+	if err != nil {
+		t.Fatalf("Replay event switch: %v", err)
+	}
+	if sum.Published != 1 || sum.SelfPublicationTargetOID == "" {
+		t.Fatalf("summary=%+v want one event publication", sum)
+	}
+	candidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidateID)
+	if err != nil || !ok ||
+		candidate.Status != state.IntentCandidateSuperseded {
+		t.Fatalf("candidate=(%+v,%v,%v) want superseded",
+			candidate, ok, err)
+	}
+	history, err := state.IntentCandidateEventHistory(ctx, f.db, candidateID)
+	if err != nil || len(history) != 1 ||
+		history[0].MembershipState != state.IntentMembershipSuperseded {
+		t.Fatalf("candidate history=(%+v,%v) want superseded membership",
+			history, err)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 ||
+		journals[0].phase != state.SelfPublicationCompleted {
+		t.Fatalf("event-switch journals=%+v", journals)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+		t.Fatalf("event-switch commit count=%d want seed+1", got)
+	}
+}
+
+func TestSelfPublicationMaintenanceUsesDurableCadence(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := maintainSelfPublicationJournal(ctx, f.db); err != nil {
+		t.Fatalf("first maintenance: %v", err)
+	}
+	var firstUpdated float64
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT updated_ts FROM daemon_meta
+WHERE key=?`, metaSelfPublicationMaintainedTS).Scan(&firstUpdated); err != nil {
+		t.Fatalf("query first maintenance stamp: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := maintainSelfPublicationJournal(ctx, f.db); err != nil {
+		t.Fatalf("second maintenance: %v", err)
+	}
+	var secondUpdated float64
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT updated_ts FROM daemon_meta
+WHERE key=?`, metaSelfPublicationMaintainedTS).Scan(&secondUpdated); err != nil {
+		t.Fatalf("query second maintenance stamp: %v", err)
+	}
+	if secondUpdated != firstUpdated {
+		t.Fatalf("maintenance stamp changed within cadence: %f -> %f",
+			firstUpdated, secondUpdated)
 	}
 }
 
