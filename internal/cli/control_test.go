@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -246,6 +247,29 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close state DB: %v", err)
 	}
+	previousSpawn := spawnDaemon
+	spawnCount := 0
+	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
+		spawnCount++
+		spawnDB, err := state.Open(
+			ctx, state.DBPathFromGitDir(filepath.Join(repoAbs, ".git")))
+		if err != nil {
+			return 0, err
+		}
+		defer spawnDB.Close()
+		if err := state.SaveDaemonState(ctx, spawnDB, state.DaemonState{
+			PID:              os.Getpid(),
+			Mode:             "running",
+			HeartbeatTS:      nowFloat(),
+			BranchRef:        sqlNullStr("refs/heads/main"),
+			BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+			UpdatedTS:        nowFloat(),
+		}); err != nil {
+			return 0, err
+		}
+		return os.Getpid(), nil
+	}
+	t.Cleanup(func() { spawnDaemon = previousSpawn })
 
 	var out bytes.Buffer
 	err = runControlOn(ctx, &out, repo, true)
@@ -255,6 +279,9 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	got := decodeControlResult(t, out.Bytes())
 	if got.OK || got.Command != "on" || got.Health != controlHealthNeedsAttention {
 		t.Fatalf("unhealthy diagnostic was not rendered: %+v", got)
+	}
+	if spawnCount != 1 {
+		t.Fatalf("spawn_count=%d want=1", spawnCount)
 	}
 }
 
@@ -498,6 +525,13 @@ func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 	}
 
 	previousStop := repoDisableStopOneRepo
+	var respawnCount *atomic.Int32
+	var restoreRespawn func()
+	t.Cleanup(func() {
+		if restoreRespawn != nil {
+			restoreRespawn()
+		}
+	})
 	repoDisableStopOneRepo = func(ctx context.Context, repoPath, sessionID string, force bool) (stopRepoResult, error) {
 		db, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repoPath, ".git")))
 		if err != nil {
@@ -507,6 +541,10 @@ func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 		if err := state.SaveDaemonState(ctx, db, state.DaemonState{Mode: "stopped", UpdatedTS: nowFloat()}); err != nil {
 			return stopRepoResult{}, err
 		}
+		// A stopped daemon releases its canonical writer lock. Replace the
+		// first fake owner with a fresh fake spawn for the later re-enable.
+		restoreSpawn()
+		respawnCount, restoreRespawn = installFakeSpawn(t, os.Getpid())
 		return stopRepoResult{Repo: repoPath, Stopped: true, Force: force, DaemonPID: os.Getpid()}, nil
 	}
 	t.Cleanup(func() { repoDisableStopOneRepo = previousStop })
@@ -551,8 +589,10 @@ func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 	if want := []string{"enabled", "started"}; !reflect.DeepEqual(on.Actions, want) {
 		t.Fatalf("on actions=%v want=%v", on.Actions, want)
 	}
-	if !on.Enabled || on.Health != controlHealthHealthy || spawnCount.Load() != 2 {
-		t.Fatalf("unexpected re-enabled result=%+v spawn_count=%d", on, spawnCount.Load())
+	if !on.Enabled || on.Health != controlHealthHealthy ||
+		spawnCount.Load() != 1 || respawnCount == nil || respawnCount.Load() != 1 {
+		t.Fatalf("unexpected re-enabled result=%+v initial_spawns=%d respawns=%v",
+			on, spawnCount.Load(), respawnCount)
 	}
 }
 
