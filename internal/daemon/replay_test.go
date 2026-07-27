@@ -6350,6 +6350,63 @@ func TestReplay_PerEventTimeout(t *testing.T) {
 	}
 }
 
+func TestReplay_PrepareSelfPublicationTimeoutSettlesEvent(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(f.dir, "prepare-timeout.txt"), []byte("v1\n"), 0o644,
+	); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	previousPrepare := prepareSelfPublicationState
+	prepareSelfPublicationState = func(
+		context.Context, *state.DB, state.SelfPublication,
+	) (bool, error) {
+		return false, fmt.Errorf(
+			"injected self-publication preparation timeout: %w",
+			context.DeadlineExceeded)
+	}
+	t.Cleanup(func() { prepareSelfPublicationState = previousPrepare })
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("Replay returned err=%v; preparation timeout must settle in-loop", err)
+	}
+	if sum.Failed != 1 {
+		t.Fatalf("Failed=%d want 1; sum=%+v", sum.Failed, sum)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d after preparation timeout; want 0", len(pending))
+	}
+	recoverable, err := state.RecoverableSelfPublications(ctx, f.db, 10)
+	if err != nil {
+		t.Fatalf("RecoverableSelfPublications: %v", err)
+	}
+	if len(recoverable) != 0 {
+		t.Fatalf("recoverable self-publications=%d after rolled-back preparation; want 0",
+			len(recoverable))
+	}
+}
+
 // TestRun_PauseStateReadFailClosed pins the daemon-side fail-CLOSED behavior
 // for SQLite/state read errors on the pause gate. When daemonPauseState
 // returns a non-nil error (e.g. a transient SQLite read failure on

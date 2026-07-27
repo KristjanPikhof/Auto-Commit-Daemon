@@ -769,6 +769,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		)
 		if err != nil {
 			cancelEvent()
+			if handled, handleErr := settleReplayContextFailure(
+				ctx, db, opts.Trace, repoRoot, activeCtx, ev, err, &sum,
+			); handled {
+				if handleErr != nil {
+					return sum, handleErr
+				}
+				return sum, nil
+			}
 			return sum, err
 		}
 		if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
@@ -3131,6 +3139,14 @@ func publishIntentSelection(
 	)
 	if err != nil {
 		cancelEvent()
+		if handled, handleErr := settleReplayContextFailure(
+			ctx, db, opts.Trace, repoRoot, activeCtx, firstEvent, err, &sum,
+		); handled {
+			if handleErr != nil {
+				return sum, handleErr
+			}
+			return sum, nil
+		}
 		return sum, err
 	}
 	if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
@@ -4480,6 +4496,34 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue 
 	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
 	return nil
+}
+
+func settleReplayContextFailure(
+	ctx context.Context,
+	db *state.DB,
+	logger acdtrace.Logger,
+	repoRoot string,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+	cause error,
+	sum *ReplaySummary,
+) (bool, error) {
+	if !errors.Is(cause, context.DeadlineExceeded) &&
+		!errors.Is(cause, context.Canceled) {
+		return false, nil
+	}
+	if err := markFailed(ctx, db, ev, replayIssue{
+		ErrorClass: replayErrorCommitBuildFailure,
+		Message:    cause.Error(),
+		Ref:        cctx.BranchRef,
+		Path:       ev.Path,
+	}); err != nil {
+		return true, err
+	}
+	traceReplay(logger, repoRoot, cctx, ev,
+		"replay.failed", state.EventStateFailed, cause.Error(), nil)
+	sum.Failed++
+	return true, nil
 }
 
 // recordConflict terminally settles the event in

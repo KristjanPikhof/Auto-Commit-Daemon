@@ -56,6 +56,8 @@ var errSelfPublicationCASAmbiguous = errors.New(
 var errSelfPublicationCASNotApplied = errors.New(
 	"daemon: self-publication CAS was not applied")
 
+var prepareSelfPublicationState = state.PrepareSelfPublication
+
 // ErrSelfPublicationRecoveryRequired prevents strategy switches from
 // invalidating candidate ownership needed by restart recovery.
 var ErrSelfPublicationRecoveryRequired = errors.New(
@@ -88,7 +90,7 @@ func prepareSelfPublication(
 		Members:          ordered,
 		Completion:       completion,
 	}
-	if _, err := state.PrepareSelfPublication(ctx, db, journal); err != nil {
+	if _, err := prepareSelfPublicationState(ctx, db, journal); err != nil {
 		return selfPublicationAttempt{},
 			fmt.Errorf("daemon: prepare self-publication: %w", err)
 	}
