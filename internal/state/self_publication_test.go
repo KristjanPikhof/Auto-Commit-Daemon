@@ -38,6 +38,26 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 		t.Fatalf("preserved v17 row=%q err=%v", keep, err)
 	}
 	assertSelfPublicationSchema(t, migrated.SQL())
+	migratedSeq := appendSelfPublicationEvent(
+		t, migrated, "refs/heads/unborn-migrated", 0, "initial.go")
+	migratedUnborn := SelfPublication{
+		ID:               "migrated-unborn",
+		BranchRef:        "refs/heads/unborn-migrated",
+		BranchGeneration: 0,
+		SourceHead:       "",
+		TargetCommitOID:  "initial-target",
+		TargetTreeOID:    "initial-tree",
+		Members:          []SelfPublicationMember{{EventSeq: migratedSeq}},
+	}
+	if created, err := PrepareSelfPublication(
+		ctx, migrated, migratedUnborn); err != nil || !created {
+		t.Fatalf("prepare migrated unborn publication=(%v,%v)", created, err)
+	}
+	if got, ok, err := SelfPublicationByID(
+		ctx, migrated, migratedUnborn.ID); err != nil || !ok ||
+		got.SourceHead != "" {
+		t.Fatalf("migrated unborn publication=%+v ok=%v err=%v", got, ok, err)
+	}
 	if err := migrated.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +188,49 @@ func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
 		publish.Status != "published" {
 		t.Fatalf("publish_state=%+v ok=%v err=%v", publish, ok, err)
 	}
+}
+
+func TestSelfPublicationUnbornSourceFreshSchemaPrepareAndComplete(t *testing.T) {
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	seq := appendSelfPublicationEvent(
+		t, d, "refs/heads/unborn", 0, "initial.go")
+	publication := SelfPublication{
+		ID:               "unborn-publication",
+		BranchRef:        "refs/heads/unborn",
+		BranchGeneration: 0,
+		SourceHead:       "",
+		TargetCommitOID:  "initial-commit",
+		TargetTreeOID:    "initial-tree",
+		Members:          []SelfPublicationMember{{EventSeq: seq}},
+	}
+	if created, err := PrepareSelfPublication(
+		ctx, d, publication); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication unborn=(%v,%v)", created, err)
+	}
+	if applied, err := MarkSelfPublicationGitApplied(
+		ctx, d, publication, 2); err != nil || !applied {
+		t.Fatalf("MarkSelfPublicationGitApplied unborn=(%v,%v)", applied, err)
+	}
+	if completed, err := CompleteSelfPublication(
+		ctx, d, publication,
+		SelfPublicationCompletion{PublishedTS: 3},
+	); err != nil || !completed {
+		t.Fatalf("CompleteSelfPublication unborn=(%v,%v)", completed, err)
+	}
+	got, ok, err := SelfPublicationByID(ctx, d, publication.ID)
+	if err != nil || !ok || got.SourceHead != "" ||
+		got.Phase != SelfPublicationCompleted {
+		t.Fatalf("unborn journal=%+v ok=%v err=%v", got, ok, err)
+	}
+	publish, ok, err := LoadPublishState(ctx, d)
+	if err != nil || !ok || !publish.SourceHead.Valid ||
+		publish.SourceHead.String != "" ||
+		publish.TargetCommitOID.String != publication.TargetCommitOID {
+		t.Fatalf("unborn publish_state=%+v ok=%v err=%v", publish, ok, err)
+	}
+	assertSelfPublicationCompletedEvent(
+		t, d, seq, publication.TargetCommitOID)
 }
 
 func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {

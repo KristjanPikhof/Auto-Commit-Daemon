@@ -612,7 +612,9 @@ CREATE TABLE IF NOT EXISTS self_publications(
     error               TEXT NOT NULL DEFAULT '',
     CHECK (length(id) BETWEEN 1 AND 128),
     CHECK (length(branch_ref) BETWEEN 1 AND 1024),
-    CHECK (length(source_head) BETWEEN 1 AND 128),
+    -- Empty source_head is the exact identity for an unborn branch whose
+    -- publication creates the initial commit.
+    CHECK (length(source_head) BETWEEN 0 AND 128),
     CHECK (length(target_commit_oid) BETWEEN 1 AND 128),
     CHECK (length(target_tree_oid) BETWEEN 1 AND 128),
     CHECK (length(membership_digest) = 71

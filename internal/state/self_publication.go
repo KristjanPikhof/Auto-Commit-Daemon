@@ -631,7 +631,7 @@ func normalizeSelfPublication(publication SelfPublication) (SelfPublication, err
 	if publication.ID == "" || len(publication.ID) > 128 ||
 		publication.BranchRef == "" || len(publication.BranchRef) > 1024 ||
 		publication.BranchGeneration < 0 ||
-		publication.SourceHead == "" || len(publication.SourceHead) > 128 ||
+		len(publication.SourceHead) > 128 ||
 		publication.TargetCommitOID == "" || len(publication.TargetCommitOID) > 128 ||
 		publication.TargetTreeOID == "" || len(publication.TargetTreeOID) > 128 {
 		return SelfPublication{}, errors.New("state: self-publication identity is incomplete or overlong")
