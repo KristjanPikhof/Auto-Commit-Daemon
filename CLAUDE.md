@@ -18,7 +18,14 @@ make fmt        # gofmt -w .
 make tidy       # go mod tidy
 ~~~
 
-Pre-PR gate:
+Verification cadence:
+
+- Group implementation into coherent milestones. Do not run builds, tests, or linters after every file or small edit.
+- During a milestone, run only the cheapest focused check for the code being changed, such as one package, one test, or `make build` when compilation is the risk.
+- Run the full pre-PR gate once when the complete change is ready for handoff or review. Rerun only checks invalidated by later edits.
+- For docs-only or agent-guidance changes, use `git diff --check` plus targeted link, command, or symlink checks. Do not build or run Go tests unless the documentation changes generated output or an executable contract.
+
+Full pre-PR gate:
 
 ~~~bash
 cleanenv() { env -u ACD_INTENT_MIN_PENDING -u ACD_INTENT_MAX_PENDING_AGE -u ACD_INTENT_SETTLE_WINDOW -u ACD_INTENT_WINDOW -u ACD_INTENT_RECENT_COMMITS -u ACD_INTENT_DEFER_LIMIT ACD_COMMIT_STRATEGY=event "$@"; }
@@ -65,7 +72,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 ## Workflow and test traps
 
 - Scope changes; prefer `rg`; preserve unrelated work. Investigate before retrying: races, panics, ordering failures, flakes, and read-only migrations are bugs.
-- ACD self-hosts this repo. Normal edits may auto-publish. Pause before manual history shaping, branch surgery, recovery/DB mutation, or tests targeting this checkout: `acd pause --repo . --reason "..." --yes`; always finish with `acd resume --repo . --yes`.
+- ACD self-hosts this repo. Do not pause it for ordinary edits, builds, lint, or tests that use isolated repositories. Pause only before manual history shaping, branch surgery, recovery/DB mutation, or a test deliberately exercising capture/replay against this checkout: `acd pause --repo . --reason "..." --yes`; always finish with `acd resume --repo . --yes`.
 - Source edits do not update the running daemon. For runtime/provider behavior, build and invoke `bin/acd`, or install/restart only with authorization.
 - After test `git.Init`/`git init`, run `git symbolic-ref HEAD refs/heads/main`. HEAD-transition tests use `waitForMetaValue(MetaKeyBranchHead, <sha>, 3s)`.
 - Broad-run-sensitive coverage includes fsnotify wake, lifecycle, wake coalescing, real SIGUSR1, repeated edits, external FF reseed, FF-in-rewind-grace, and `TestSquashBacklogRecovery_PreservesSixtyCapturesAndControls`.
