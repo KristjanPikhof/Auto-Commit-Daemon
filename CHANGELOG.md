@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Fixed `acd rewrite-commits` ignoring saved repository, profile, and global
+  settings. Plan generation now uses the effective configured strategy,
+  provider, model, format, timeout, and protected credential instead of reading
+  only compatibility environment variables.
 - Isolated verification subprocess environment directories from repository and
   Git ancestry. Temporary Git-negative tests can no longer discover the
   candidate repository through `TMPDIR`.

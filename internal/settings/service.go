@@ -174,6 +174,18 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	}, nil
 }
 
+// AuthoringProviderConfig resolves the provider configuration currently
+// authored for this repository, including the protected credential. Callers
+// must use the returned value only for provider construction and must never
+// log or serialize it.
+func (s *Service) AuthoringProviderConfig() (ai.ProviderConfig, error) {
+	preview, err := s.AuthoringPreview()
+	if err != nil {
+		return ai.ProviderConfig{}, err
+	}
+	return s.providerConfig(preview.Values)
+}
+
 func (s *Service) Close() error {
 	if s == nil || s.db == nil {
 		return nil

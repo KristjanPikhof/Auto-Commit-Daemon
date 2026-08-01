@@ -15,6 +15,8 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -73,11 +75,14 @@ parseable. Use --progress json for JSONL progress events, --progress plain for
 stable text progress, --progress off to disable progress, or --quiet to suppress
 non-essential output.
 
-Plan generation is intentionally gated: ACD_COMMIT_STRATEGY must resolve to
-intent and ACD_AI_PROVIDER must name a usable non-deterministic planner provider
-(openai-compat with ACD_AI_API_KEY, or subprocess:<name>). Deterministic fallback
-is not enough for rewrite planning. Showing, editing, or applying a previously
-saved plan may bypass the provider gate because no new plan is generated.
+Plan generation uses the repository's effective ACD settings. The commit
+strategy must resolve to intent and the provider must resolve to a usable
+non-deterministic planner (openai-compat with a configured credential, or
+subprocess:<name>). Environment variables remain compatibility overrides when
+no higher-priority saved setting exists; ACD_COMMIT_STRATEGY and
+ACD_AI_PROVIDER retain their existing names. Deterministic fallback is not
+enough for rewrite planning. Showing, editing, or applying a previously saved
+plan may bypass the provider gate because no new plan is generated.
 
 Use --edit <plan-id-or-file> to reopen a saved rewrite plan in $EDITOR. The
 editor uses --format text by default, or --format json. Edit only the proposed
@@ -90,7 +95,8 @@ validates/previews apply without rewriting commits.
 
 v1 scope: current branch linear ranges only; merge commit rewrites are refused;
 there is no daemon automation.`,
-		Example: `  ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
+		Example: `  acd configure
+  acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
   acd rewrite-commits --from-nr 5 --plan-only
   acd rewrite-commits --range-nr 5-12 --review --format text
   acd rewrite-commits --range-sha main~12..main~4 --format json
@@ -193,7 +199,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
 	printRewriteSelectionSummary(out, report)
 
-	cfg := ai.LoadProviderConfigFromEnv()
+	cfg, err := resolveRewriteProviderConfig(ctx, repo)
+	if err != nil {
+		return err
+	}
 	provider, closer, err := ai.BuildProvider(cfg)
 	if err != nil {
 		return fmt.Errorf("acd rewrite-commits: build provider: %w", err)
@@ -296,6 +305,25 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	applyOpts.applyPlan = plan.ID
 	applyOpts.yes = true
 	return applySavedRewritePlan(ctx, out, repoFlag, applyOpts)
+}
+
+func resolveRewriteProviderConfig(ctx context.Context, repo string) (ai.ProviderConfig, error) {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve config paths: %w", err)
+	}
+	service, err := settings.NewValidationService(ctx, settings.Options{
+		Roots:    roots,
+		RepoPath: repo,
+	})
+	if err != nil {
+		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve settings: %w", err)
+	}
+	cfg, err := service.AuthoringProviderConfig()
+	if err != nil {
+		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve settings: %w", err)
+	}
+	return cfg, nil
 }
 
 func finishRewritePlanOnly(out io.Writer, planRef string) {
