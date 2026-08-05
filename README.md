@@ -111,77 +111,129 @@ acd doctor
 
 `doctor` checks that the installed snippet still matches the current template.
 
-## Configure commit behavior
+## Configure ACD
 
-Start with the Go-native settings lab. It shows active and draft values, their
-source, and whether each change activates at the next safe work boundary or
-requires a restart.
+Start with global setup. Use repository setup when one project needs different
+behavior, already has an override, or should run Strict Review.
+
+| What you want | Command | Result |
+|---|---|---|
+| Set defaults for your account and future repositories | `acd configure` | Saves global provider and commit defaults. It does not open repository state, run project tests, or start a daemon. |
+| Replace saved account defaults with current built-ins | `acd configure --replace` | Discards retained global overrides, reviews the current built-in setup, then saves it as the new global layer. |
+| Configure the current repository | `acd configure --repo .` | Saves a repository override, creates its runtime revision, and enables ACD for that repository. |
+| Return the current repository to global defaults | `acd configure --repo . --inherit` | Removes its field and profile overrides, creates an inherited runtime revision, and enables ACD. |
+| Require the repository's full test suite | `acd configure --repo .` and select Strict Review | Detects and displays the exact command, then queues it as a background activation check. |
+
+Global settings do not overwrite existing repository overrides. Use
+`acd configure --repo . --inherit` when a repository should follow the global
+layer again, or `acd configure --repo .` to retain a repository-specific
+setup.
+
+### Global setup
+
+Run this once, from any directory:
 
 ~~~bash
-acd settings
+acd configure
 ~~~
 
-Choose **Test current settings** first. It validates the current provider with
-one synthetic request and does not send repository content. Use **Quick
-provider setup** for provider essentials or **Advanced settings** for the full
-non-sensitive catalog. The terminal UI is keyboard-only, and required risk
-confirmations happen inside the session.
+1. Choose Everyday work or Maximum speed. Everyday work is the recommended
+   default.
+2. Enter the provider, endpoint, model, or API key if ACD does not already have
+   valid values.
+3. Review the endpoint, diff context, and repair permissions.
+4. Approve the preview to save the global defaults.
 
-Once an explicit value is saved, you do not need to export it or source it from
-your shell. Existing environment variables remain compatible, and API keys
-remain environment only. Diff egress is confirmed separately when applying a
-configuration; it does not block the synthetic test. See the [settings
-guide](docs/settings.md) for scopes, profiles, testing, activation,
-experiments, and recovery.
+Everyday work uses Intent Balanced with ACD's structural and materialization
+checks. It does not detect or run project tests. Global setup tests the
+provider with synthetic content before it writes the credential or settings.
+
+### Repository setup
+
+Run this from the repository you want to configure:
+
+~~~bash
+acd configure --repo .
+~~~
+
+Choose one of these options:
+
+| Experience | Behavior |
+|---|---|
+| Everyday work | Intent Balanced with internal structural checks. No project test command runs. |
+| Maximum speed | Event Fast with immediate commits and no project checks. |
+| Strict Review | Intent Quality. ACD displays the detected full test command and asks for approval before queueing it. |
+
+Strict Review keeps capture active while the test runs. A failed test leaves
+the candidate pending and does not change the live worktree, index, or HEAD.
+Use `--wait` if you want the terminal to follow the queued test:
+
+~~~bash
+acd configure --repo . --strategy intent --preset quality --wait
+~~~
+
+### Preview setup
+
+Preview the defaults or a selected mode without provider calls, commands, or
+writes:
+
+~~~bash
+acd configure --dry-run
+acd configure --replace --dry-run
+acd configure --strategy intent --preset balanced --dry-run
+acd configure --repo . --dry-run
+acd configure --repo . --inherit --dry-run
+acd configure --repo . --strategy intent --preset quality --dry-run --json
+~~~
+
+Use `acd settings` after onboarding for profiles, experiments, and advanced
+field overrides. See the [settings guide](docs/settings.md) for authoring
+scopes, preset customization, testing, and activation.
 
 | Strategy | What happens | Best for |
 |---|---|---|
-| `event` | One captured edit becomes one commit. This is the default. | Offline use, CI, shared branches, strict traceability. |
-| `intent` | An AI planner groups related captures before replay writes a commit. | Local work where reviewable commits matter more than one-edit history. |
+| `event` | One captured edit becomes one commit. New Event repositories use Fast unless another preset is selected. | Offline use, CI, shared branches, strict traceability. |
+| `intent` | Durable semantic candidates group related captures, validate atomicity, and publish in dependency order. | Local work where reviewable, reversible commits matter more than one-edit history. |
 
-Offline default:
-
-~~~bash
-export ACD_AI_PROVIDER=deterministic
-export ACD_COMMIT_STRATEGY=event
-~~~
-
-AI grouping:
+Fast global setup:
 
 ~~~bash
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=$YOUR_API_KEY
-export ACD_AI_BASE_URL=https://your-endpoint/v1
-export ACD_AI_MODEL=gpt-5.4-mini
-export ACD_AI_DIFF_EGRESS=1
-
-export ACD_COMMIT_STRATEGY=intent
-export ACD_INTENT_WINDOW=10
-export ACD_INTENT_MIN_PENDING=4
-export ACD_INTENT_SETTLE_WINDOW=10s
-export ACD_INTENT_MAX_PENDING_AGE=5m
-export ACD_INTENT_DEFER_LIMIT=1
+acd configure --strategy event --preset fast
 ~~~
 
-`ACD_AI_DIFF_EGRESS=1` lets the planner see redacted captured diffs. Leave it
-unset when the endpoint should receive metadata only.
+Everyday global semantic commits:
 
-Intent mode waits briefly after the pending-count gate before planning. This
-settle window lets a burst of related edits reach one planner-visible window,
-while `acd flush --logical` still drains the current visible batch from an
-active harness session.
+~~~bash
+acd configure --strategy intent --preset balanced
+~~~
 
-If the configured planner times out or returns unsafe output, ACD commits with
-the deterministic planner instead of stalling the queue. A persisted circuit
-breaker pauses repeated provider calls for 30 seconds, then 2 minutes, then 10
-minutes. One probe is allowed after each cooldown, and a successful validated
-plan closes the circuit. Bare `acd` reports degraded fallback health;
-`acd status` and `acd diagnose` show the circuit state, failure count, bypass
-count, and next probe time.
+All regular Intent presets use redacted captured diffs. A network provider
+needs explicit diff-egress approval. A local subprocess may receive the same
+bounded context without network egress. Metadata-only Intent v2 is not a
+supported regular configuration.
 
-When one visible window contains separate intents, the planner prompt asks for
-ordered `commit_groups` so replay can publish atomic commits instead of forcing
-the whole window into one commit.
+Intent candidates survive planner windows. Hard dependencies keep same-path,
+rename, create/modify, and before/after chains ordered. Soft evidence connects
+likely code, tests, documentation, configuration, and migrations. An atomicity
+gate then checks cohesion, completeness, separation, dependencies,
+materialization, verification, and revertibility before publication.
+
+Fallback depends on the preset. Fast publishes the smallest materializable
+hard-dependency component. Balanced reuses a valid or deterministic dependency
+partition and applies structural gates. Its deterministic groups are capped at
+32 captures and 12 paths. Import, symbol, directory, activity, and timing
+similarity do not merge fallback groups by themselves. Quality keeps the
+candidate pending when its approved full verification fails and reports
+`needs_attention`. No preset bypasses hard dependencies, scratch
+materialization, or required verification.
+
+Balanced and Quality may repair a small, recent ACD-only commit chain when a
+late companion capture arrives. Repair runs only while the commits remain
+private to the current HEAD chain and all safety and verification checks pass.
+When a hard dependency joins recent candidates, ACD records their canonical
+lineage before repair. This lets one rebuilt candidate own non-contiguous old
+commits while the old first-parent suffix remains fully accounted for.
+Otherwise ACD records the skip and publishes a new commit.
 
 Message format:
 
@@ -363,8 +415,9 @@ ACD_REPO_AUTODISCOVERY=enabled acd start
 
 ## Rewrite commit messages
 
-The daemon never rewrites history on its own. Use `rewrite-commits` only for an
-explicit local cleanup before sharing a branch:
+`rewrite-commits` is an explicit, message-only cleanup tool. It is separate
+from Intent Balanced and Quality's bounded automatic repair, which may replace
+recent private ACD-owned commits to attach a late semantic companion:
 
 ~~~bash
 acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
@@ -391,9 +444,10 @@ git reset --hard <backup-ref-or-sha>
 | Variable | Default | Use |
 |---|---:|---|
 | `ACD_COMMIT_STRATEGY` | `event` | `event` for one capture per commit, `intent` for AI grouping. |
+| `ACD_COMMIT_PRESET` | strategy default | `fast`, `balanced`, or `quality`. Intent defaults to Balanced; Event defaults to Fast. |
 | `ACD_COMMIT_FORMAT` | `imperative` | `imperative` keeps the current subject rules; `conventional` opts into scope-less Conventional Commit subjects. |
 | `ACD_AI_PROVIDER` | `deterministic` | `deterministic`, `openai-compat`, or `subprocess:<name>`. |
-| `ACD_AI_API_KEY` | unset | Required by `openai-compat`. |
+| `ACD_AI_API_KEY` | unset | Overrides the protected credential file for `openai-compat`. |
 | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
 | `ACD_AI_MODEL` | `gpt-5.4-mini` | Model passed to the provider. |
 | `ACD_AI_DIFF_EGRESS` | off | Truthy sends redacted captured diffs to providers that ask for diffs. |
@@ -403,6 +457,12 @@ git reset --hard <backup-ref-or-sha>
 | `ACD_INTENT_MAX_PENDING_AGE` | `5m` | Age escape hatch for sparse queues. |
 | `ACD_INTENT_DEFER_LIMIT` | `1` | Deferrals before ACD forces a one-capture window. |
 | `ACD_INTENT_RETRY_ON_INVALID` | `2` | Max correction retries after invalid planner output. |
+| `ACD_INTENT_VERIFICATION` | `none` | `none`, `fast`, or `full`; presets provide the regular defaults. |
+| `ACD_VERIFICATION_FAST_COMMAND` | unset | Approved repository command for Balanced verification. |
+| `ACD_VERIFICATION_FULL_COMMAND` | unset | Approved repository command for Quality verification. |
+| `ACD_INTENT_REPAIR_ENABLED` | off | Enables bounded repair of eligible recent ACD commits. |
+| `ACD_INTENT_REPAIR_HORIZON` | `10m` | Maximum age of the repair chain. |
+| `ACD_INTENT_REPAIR_MAX_COMMITS` | `3` | Maximum repair chain, capped at five. |
 | `ACD_SAFE_IGNORE` | enabled | Set false-like value to stop pruning generated trees. |
 | `ACD_SAFE_IGNORE_EXTRA` | unset | Extra generated trees, such as `dist/,build/`. |
 | `ACD_SENSITIVE_GLOBS` | built in | Non-empty values replace the protected path globs. Unset or empty uses the defaults. |
@@ -420,6 +480,7 @@ Restart a running daemon after changing daemon runtime environment.
 | [docs/user-workflows.md](docs/user-workflows.md) | Daily status, recovery, support bundles, and `commit-all`. |
 | [docs/capture-replay.md](docs/capture-replay.md) | Storage, replay, branch safety, blockers, and trace classes. |
 | [docs/intent-commit-flow.md](docs/intent-commit-flow.md) | Intent grouping behavior and planner observability. |
+| [docs/intent-v2-migration.md](docs/intent-v2-migration.md) | Upgrade rules and remediation for existing repositories. |
 | [docs/intent-commit-rewrite-flow.md](docs/intent-commit-rewrite-flow.md) | Safe history rewrite workflow. |
 | [docs/rewrite-commits.md](docs/rewrite-commits.md) | `rewrite-commits` command grammar. |
 | [docs/ai-providers.md](docs/ai-providers.md) | Provider setup, diff privacy, prompt tracing, and plugin protocol. |

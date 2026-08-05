@@ -29,26 +29,27 @@ const defaultListWatchInterval = 2 * time.Second
 // listEntry is one row in the `acd list` output. JSON marshal tags match
 // the §7.7 example shape.
 type listEntry struct {
-	Path                 string     `json:"path"`
-	RepoHash             string     `json:"repo_hash"`
-	LifecycleState       string     `json:"lifecycle_state"`
-	Daemon               string     `json:"daemon"`
-	PID                  int        `json:"pid,omitempty"`
-	Clients              int        `json:"clients"`
-	LastSeq              int64      `json:"last_seq"`
-	LastCommitOID        string     `json:"last_commit_oid,omitempty"`
-	HeartbeatAgeSecs     float64    `json:"heartbeat_age_seconds,omitempty"`
-	PendingEvents        int        `json:"pending_events"`
-	BlockedConflicts     int        `json:"blocked_conflicts"`
-	ActiveBarriers       int        `json:"active_barriers,omitempty"`
-	IntentWaitSeconds    int64      `json:"intent_wait_seconds,omitempty"`
-	IntentVisiblePending int        `json:"intent_visible_pending,omitempty"`
-	IntentMinPending     int        `json:"intent_min_pending,omitempty"`
-	Status               string     `json:"status"`
-	StatusNote           string     `json:"status_note,omitempty"`
-	Paused               bool       `json:"paused,omitempty"`
-	StaleHeartbeat       bool       `json:"stale_heartbeat,omitempty"`
-	Pause                *pauseInfo `json:"pause,omitempty"`
+	Path                 string         `json:"path"`
+	RepoHash             string         `json:"repo_hash"`
+	LifecycleState       string         `json:"lifecycle_state"`
+	Daemon               string         `json:"daemon"`
+	PID                  int            `json:"pid,omitempty"`
+	Clients              int            `json:"clients"`
+	LastSeq              int64          `json:"last_seq"`
+	LastCommitOID        string         `json:"last_commit_oid,omitempty"`
+	HeartbeatAgeSecs     float64        `json:"heartbeat_age_seconds,omitempty"`
+	PendingEvents        int            `json:"pending_events"`
+	BlockedConflicts     int            `json:"blocked_conflicts"`
+	ActiveBarriers       int            `json:"active_barriers,omitempty"`
+	IntentWaitSeconds    int64          `json:"intent_wait_seconds,omitempty"`
+	IntentVisiblePending int            `json:"intent_visible_pending,omitempty"`
+	IntentMinPending     int            `json:"intent_min_pending,omitempty"`
+	Status               string         `json:"status"`
+	StatusNote           string         `json:"status_note,omitempty"`
+	Paused               bool           `json:"paused,omitempty"`
+	StaleHeartbeat       bool           `json:"stale_heartbeat,omitempty"`
+	Pause                *pauseInfo     `json:"pause,omitempty"`
+	IntentV2             intentV2Report `json:"intent_v2"`
 }
 
 func newListCmd() *cobra.Command {
@@ -242,10 +243,16 @@ func collectListSnapshot(ctx context.Context, errOut io.Writer) (listSnapshot, e
 		e.PendingEvents = summary.pendingEvents
 		e.BlockedConflicts = summary.blockedConflicts
 		e.ActiveBarriers = summary.activeBarriers
-		if summary.blockedConflicts > 0 || summary.activeBarriers > 0 {
+		e.IntentV2 = summary.intentV2
+		if summary.intentV2.NeedsAttention != "" {
+			e.Status = "needs_attention"
+			e.StatusNote = summary.intentV2.NeedsAttention
+		}
+		if e.Status != "needs_attention" &&
+			(summary.blockedConflicts > 0 || summary.activeBarriers > 0) {
 			e.Status = "blocked"
 			e.StatusNote = blockedListStatusNote(summary.blockedConflicts, summary.activeBarriers)
-		} else if summary.pendingEvents > 0 {
+		} else if e.Status != "needs_attention" && summary.pendingEvents > 0 {
 			e.Status = "waiting"
 			e.StatusNote = "pending captures queued; no recovery blockers"
 			if summary.intentWait != nil {
@@ -404,6 +411,7 @@ type repoSummary struct {
 	activeBarriers   int
 	pause            *pauseInfo
 	intentWait       *listIntentWaitSummary
+	intentV2         intentV2Report
 }
 
 type listIntentWaitSummary struct {
@@ -515,6 +523,9 @@ func summarizeRepo(ctx context.Context, dbPath string, now time.Time, ttl time.D
 	}
 	s.blockedConflicts = blockers.TotalBlockedConflicts
 	s.activeBarriers = blockers.ActiveBlockedBarriersWithSuccessors
+	if s.intentV2, err = loadIntentV2Report(ctx, conn); err != nil {
+		return repoSummary{}, fmt.Errorf("Intent v2 summary: %w", err)
+	}
 	if s.pendingEvents > 0 && s.blockedConflicts == 0 && s.activeBarriers == 0 {
 		if intentWait, err := loadListIntentWaitSummary(ctx, conn); err != nil {
 			return repoSummary{}, fmt.Errorf("intent wait summary: %w", err)

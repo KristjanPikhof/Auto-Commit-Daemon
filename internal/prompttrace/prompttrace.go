@@ -33,15 +33,19 @@ type Logger interface {
 }
 
 type Metadata struct {
-	Strategy     string
-	Provider     string
-	Model        string
-	Seq          int64
-	OfferedSeqs  []int64
-	BranchRef    string
-	Generation   int64
-	DiffIncluded bool
-	DiffCap      int
+	Strategy         string
+	Protocol         string
+	Provider         string
+	Model            string
+	Seq              int64
+	OfferedSeqs      []int64
+	BranchRef        string
+	Generation       int64
+	DiffIncluded     bool
+	DiffCap          int
+	ConfigRevisionID int64
+	ConfigProfile    string
+	RetryCount       int
 }
 
 type TransformMetadata struct {
@@ -70,6 +74,7 @@ type Record struct {
 	Repo               string            `json:"repo,omitempty"`
 	Stage              string            `json:"stage"`
 	Strategy           string            `json:"strategy,omitempty"`
+	Protocol           string            `json:"protocol,omitempty"`
 	Provider           string            `json:"provider,omitempty"`
 	Model              string            `json:"model,omitempty"`
 	Seq                int64             `json:"seq,omitempty"`
@@ -78,6 +83,9 @@ type Record struct {
 	Generation         int64             `json:"generation,omitempty"`
 	DiffIncluded       bool              `json:"diff_included"`
 	DiffCap            int               `json:"diff_cap,omitempty"`
+	ConfigRevisionID   int64             `json:"config_revision_id,omitempty"`
+	ConfigProfile      string            `json:"config_profile,omitempty"`
+	RetryCount         int               `json:"retry_count,omitempty"`
 	Transform          TransformMetadata `json:"transform,omitempty"`
 	SystemMessage      string            `json:"system_message,omitempty"`
 	UserMessage        string            `json:"user_message,omitempty"`
@@ -353,6 +361,7 @@ type jsonRecord struct {
 	Repo               string            `json:"repo,omitempty"`
 	Stage              string            `json:"stage"`
 	Strategy           string            `json:"strategy,omitempty"`
+	Protocol           string            `json:"protocol,omitempty"`
 	Provider           string            `json:"provider,omitempty"`
 	Model              string            `json:"model,omitempty"`
 	Seq                int64             `json:"seq,omitempty"`
@@ -361,6 +370,9 @@ type jsonRecord struct {
 	Generation         int64             `json:"generation,omitempty"`
 	DiffIncluded       bool              `json:"diff_included"`
 	DiffCap            int               `json:"diff_cap,omitempty"`
+	ConfigRevisionID   int64             `json:"config_revision_id,omitempty"`
+	ConfigProfile      string            `json:"config_profile,omitempty"`
+	RetryCount         int               `json:"retry_count,omitempty"`
 	Transform          TransformMetadata `json:"transform,omitempty"`
 	SystemMessage      string            `json:"system_message,omitempty"`
 	UserMessage        string            `json:"user_message,omitempty"`
@@ -380,6 +392,7 @@ func marshalRecord(rec Record) ([]byte, error) {
 		Repo:               rec.Repo,
 		Stage:              rec.Stage,
 		Strategy:           rec.Strategy,
+		Protocol:           rec.Protocol,
 		Provider:           rec.Provider,
 		Model:              rec.Model,
 		Seq:                rec.Seq,
@@ -388,6 +401,9 @@ func marshalRecord(rec Record) ([]byte, error) {
 		Generation:         rec.Generation,
 		DiffIncluded:       rec.DiffIncluded,
 		DiffCap:            rec.DiffCap,
+		ConfigRevisionID:   rec.ConfigRevisionID,
+		ConfigProfile:      rec.ConfigProfile,
+		RetryCount:         rec.RetryCount,
 		Transform:          rec.Transform,
 		SystemMessage:      rec.SystemMessage,
 		UserMessage:        rec.UserMessage,
@@ -411,6 +427,20 @@ func With(ctx context.Context, logger Logger, meta Metadata) context.Context {
 		return ctx
 	}
 	return context.WithValue(ctx, contextKey{}, Context{Logger: logger, Meta: meta})
+}
+
+// WithRetryCount preserves the active prompt logger and annotates one
+// correction attempt without changing any other immutable replay metadata.
+func WithRetryCount(ctx context.Context, retryCount int) context.Context {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	current, ok := ctx.Value(contextKey{}).(Context)
+	if !ok || loggerDisabled(current.Logger) {
+		return ctx
+	}
+	current.Meta.RetryCount = retryCount
+	return context.WithValue(ctx, contextKey{}, current)
 }
 
 func From(ctx context.Context) (Logger, Metadata, bool) {

@@ -52,8 +52,10 @@ User-facing commands show these as `handled_external`,
 | Both tools race on different content | ACD may produce `blocked_conflict`. |
 | Codex ACD hook plus another auto-commit plugin | Same settle behavior; watch `acd events`. |
 
-Codex `Stop` calls `acd touch`, not logical flush. Claude Code, OpenCode, and Pi
+Codex `Stop` calls `acd touch --soft-boundary`. Claude Code, OpenCode, and Pi
 snippets use `acd flush --logical` at their natural idle or stop boundary.
+Both trigger Intent evaluation, but neither bypasses atomicity, verification,
+or replay safety.
 
 If repo autodiscovery is disabled, hook-driven starts manage only repos that
 were registered with `acd repo init`.
@@ -108,4 +110,4 @@ grep already_published .git/acd/trace/*.jsonl | python3 -c \
 |---|---|
 | [user-workflows.md](user-workflows.md) | Daily status, explain, fix, and support flows. |
 | [capture-replay.md](capture-replay.md) | Scratch-index replay and conflict probes. |
-| [intent-commit-flow.md](intent-commit-flow.md) | Intent batch waits and logical flush. |
+| [intent-commit-flow.md](intent-commit-flow.md) | Durable candidates, activity boundaries, verification, and repair. |

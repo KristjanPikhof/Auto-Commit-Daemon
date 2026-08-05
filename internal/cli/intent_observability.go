@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -195,6 +196,484 @@ type runtimeConfigReport struct {
 	Failure                 string                   `json:"failure,omitempty"`
 	ApplyBoundary           string                   `json:"apply_boundary"`
 	Experiment              *runtimeExperimentReport `json:"experiment,omitempty"`
+}
+
+type intentV2Report struct {
+	Available                bool   `json:"available"`
+	SchemaVersion            int    `json:"schema_version"`
+	MigrationState           string `json:"migration_state,omitempty"`
+	ReplayState              string `json:"replay_state,omitempty"`
+	NeedsAttention           string `json:"needs_attention,omitempty"`
+	PresetID                 string `json:"preset_id,omitempty"`
+	PresetVersion            int    `json:"preset_version,omitempty"`
+	Customized               bool   `json:"customized,omitempty"`
+	VerificationMode         string `json:"verification_mode,omitempty"`
+	RepairEnabled            bool   `json:"repair_enabled,omitempty"`
+	RepairHorizon            string `json:"repair_horizon,omitempty"`
+	RepairMaxCommits         int    `json:"repair_max_commits,omitempty"`
+	OpenCandidates           int    `json:"open_candidates,omitempty"`
+	ReadyCandidates          int    `json:"ready_candidates,omitempty"`
+	WaitingCandidates        int    `json:"waiting_candidates,omitempty"`
+	BlockedCandidates        int    `json:"blocked_candidates,omitempty"`
+	SoftPublishedCandidates  int    `json:"soft_published_candidates,omitempty"`
+	VerificationAttention    int    `json:"verification_attention,omitempty"`
+	RecoverableRepairs       int    `json:"recoverable_repairs,omitempty"`
+	LastBoundaryEpoch        int64  `json:"last_boundary_epoch,omitempty"`
+	LatestCandidateStatus    string `json:"latest_candidate_status,omitempty"`
+	LatestPlannerProtocol    string `json:"latest_planner_protocol,omitempty"`
+	LatestAtomicityStatus    string `json:"latest_atomicity_status,omitempty"`
+	LatestAtomicitySummary   string `json:"latest_atomicity_summary,omitempty"`
+	LatestVerificationStatus string `json:"latest_verification_status,omitempty"`
+	LatestRepairStatus       string `json:"latest_repair_status,omitempty"`
+	LatestRepairError        string `json:"latest_repair_error,omitempty"`
+}
+
+const selfPublicationHeartbeatBudget = 3 * time.Second
+
+// selfPublicationReport is the shared read-only operator projection rendered
+// by status, diagnose, and doctor. Phase describes the operational state while
+// JournalPhase preserves the exact durable boundary when recovery is pending.
+type selfPublicationReport struct {
+	Available           bool   `json:"available"`
+	SchemaVersion       int    `json:"schema_version"`
+	Phase               string `json:"phase"`
+	JournalPhase        string `json:"journal_phase,omitempty"`
+	PublicationID       string `json:"publication_id,omitempty"`
+	SourceHead          string `json:"source_head_short,omitempty"`
+	TargetHead          string `json:"target_head_short,omitempty"`
+	RecoverableCount    int    `json:"recoverable_count"`
+	PreparedCount       int    `json:"prepared_count"`
+	GitAppliedCount     int    `json:"git_applied_count"`
+	CompletedCount      int    `json:"completed_count"`
+	AbandonedCount      int    `json:"abandoned_count"`
+	CanonicalWriters    int    `json:"canonical_writer_count"`
+	DaemonAlive         bool   `json:"daemon_alive"`
+	HeartbeatAgeSeconds int64  `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale      bool   `json:"heartbeat_stale"`
+	PendingWakes        int    `json:"pending_wakes"`
+	AcknowledgedWakes   int    `json:"acknowledged_wakes"`
+	NeedsAttention      string `json:"needs_attention,omitempty"`
+	RemediationKind     string `json:"remediation_kind"`
+	Remediation         string `json:"remediation,omitempty"`
+}
+
+// loadSelfPublicationReport keeps all reads migration-free. The journal
+// inventory comes from state's dedicated read-only loader; liveness is
+// enriched from the caller's already read-only connection.
+func loadSelfPublicationReport(
+	ctx context.Context,
+	conn *sql.DB,
+	dbPath string,
+	now time.Time,
+	canonicalWriters int,
+) (selfPublicationReport, error) {
+	projection, err := state.LoadSelfPublicationStateReadOnly(ctx, dbPath)
+	if err != nil {
+		return selfPublicationReport{}, err
+	}
+	report := selfPublicationReport{
+		Available:        projection.Available,
+		SchemaVersion:    projection.SchemaVersion,
+		Phase:            "unavailable",
+		CanonicalWriters: canonicalWriters,
+		RemediationKind:  "none",
+		PreparedCount:    projection.Prepared,
+		GitAppliedCount:  projection.GitApplied,
+		CompletedCount:   projection.Completed,
+		AbandonedCount:   projection.Abandoned,
+		RecoverableCount: len(projection.Recoverable),
+		NeedsAttention: sanitizeObservabilityText(
+			projection.NeedsAttention),
+	}
+	if !projection.Available {
+		return report, nil
+	}
+
+	report.Phase = "idle"
+	var pid int
+	var heartbeat sql.NullFloat64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT pid, heartbeat_ts FROM daemon_state WHERE id=1`,
+	).Scan(&pid, &heartbeat); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, fmt.Errorf("read self-publication liveness: %w", err)
+	}
+	report.DaemonAlive = pid > 0 && identity.Alive(pid)
+	if heartbeat.Valid && heartbeat.Float64 > 0 {
+		heartbeatAt := time.Unix(
+			0, int64(heartbeat.Float64*float64(time.Second)))
+		age := now.Sub(heartbeatAt)
+		if age < 0 {
+			age = 0
+		}
+		report.HeartbeatAgeSeconds = int64(age.Seconds())
+		report.HeartbeatStale = report.DaemonAlive &&
+			age > selfPublicationHeartbeatBudget
+	}
+
+	if exists, inspectErr := sqliteTableExists(ctx, conn, "flush_requests"); inspectErr != nil {
+		return report, fmt.Errorf("inspect self-publication wakes: %w", inspectErr)
+	} else if exists {
+		if err := conn.QueryRowContext(ctx, `
+SELECT COALESCE(SUM(status='pending'),0),
+       COALESCE(SUM(status='acknowledged'),0)
+FROM flush_requests WHERE command='wake'`).Scan(
+			&report.PendingWakes, &report.AcknowledgedWakes); err != nil {
+			return report, fmt.Errorf("read self-publication wakes: %w", err)
+		}
+	}
+
+	if len(projection.Recoverable) > 0 {
+		current := projection.Recoverable[0]
+		report.JournalPhase = current.Phase
+		report.PublicationID = shortOID(sanitizeObservabilityText(current.ID), 12)
+		report.SourceHead = shortOID(
+			sanitizeObservabilityText(current.SourceHead), 12)
+		report.TargetHead = shortOID(
+			sanitizeObservabilityText(current.TargetCommitOID), 12)
+		report.Phase = "recoverable"
+		if current.Phase == state.SelfPublicationPrepared &&
+			report.DaemonAlive && !report.HeartbeatStale {
+			report.Phase = "active"
+		}
+	} else if report.DaemonAlive && !report.HeartbeatStale {
+		report.Phase = "active"
+	}
+	if projection.UnknownRecoverable != nil {
+		unknown := projection.UnknownRecoverable
+		report.JournalPhase = unknown.Phase
+		report.PublicationID = shortOID(
+			sanitizeObservabilityText(unknown.ID), 12)
+		report.SourceHead = shortOID(
+			sanitizeObservabilityText(unknown.SourceHead), 12)
+		report.TargetHead = shortOID(
+			sanitizeObservabilityText(unknown.TargetCommitOID), 12)
+		report.NeedsAttention = fmt.Sprintf(
+			"Automatic recovery is blocked: publication=%s has unknown completion semantics after a v18 upgrade",
+			valueOrUnset(report.PublicationID))
+	}
+
+	switch {
+	case report.CanonicalWriters > 1:
+		report.Phase = "stale"
+		report.RemediationKind = "stop_old_owner"
+		report.Remediation = "Stop the older ACD daemon owner; the stable repository lock permits one canonical writer."
+	case report.NeedsAttention != "":
+		report.Phase = "needs_attention"
+		report.RemediationKind = "needs_attention"
+		report.Remediation = report.NeedsAttention
+	case report.HeartbeatStale &&
+		(report.PendingWakes > 0 || report.AcknowledgedWakes > 0):
+		report.Phase = "stale"
+		report.RemediationKind = "needs_attention"
+		report.Remediation = "Pending wakes are not advancing; inspect `acd diagnose`, then stop the stale owner and start ACD again."
+	case report.RecoverableCount > 0:
+		report.RemediationKind = "automatic_recovery"
+		report.Remediation = "Automatic recovery will inspect the durable publication on the next daemon start or loop boundary."
+	}
+	return report, nil
+}
+
+func renderSelfPublicationHuman(
+	out io.Writer,
+	report selfPublicationReport,
+	prefix string,
+) {
+	if !report.Available {
+		fmt.Fprintf(out, "%sSelf-publication: unavailable (schema v%d; requires v18+)\n",
+			prefix, report.SchemaVersion)
+		return
+	}
+	fmt.Fprintf(out,
+		"%sSelf-publication: phase=%s journal=%s source=%s target=%s recoverable=%d writers=%d wakes=%d/%d heartbeat=%s\n",
+		prefix,
+		report.Phase,
+		valueOrUnset(report.JournalPhase),
+		valueOrUnset(report.SourceHead),
+		valueOrUnset(report.TargetHead),
+		report.RecoverableCount,
+		report.CanonicalWriters,
+		report.PendingWakes,
+		report.AcknowledgedWakes,
+		selfPublicationHeartbeatLabel(report),
+	)
+	if report.Remediation != "" {
+		fmt.Fprintf(out, "%s  remediation (%s): %s\n",
+			prefix, report.RemediationKind, report.Remediation)
+	}
+}
+
+func selfPublicationHeartbeatLabel(report selfPublicationReport) string {
+	if !report.DaemonAlive {
+		return "stopped"
+	}
+	label := formatDurationCompact(
+		time.Duration(report.HeartbeatAgeSeconds) * time.Second)
+	if report.HeartbeatStale {
+		return label + " stale"
+	}
+	return label
+}
+
+func loadIntentV2Report(ctx context.Context, conn *sql.DB) (intentV2Report, error) {
+	var report intentV2Report
+	if conn == nil {
+		return report, nil
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&report.SchemaVersion); err != nil {
+		return report, errors.New("read Intent v2 schema version failed")
+	}
+	if report.SchemaVersion < 15 {
+		return report, nil
+	}
+	for _, table := range []string{
+		"intent_candidates", "intent_candidate_events",
+		"intent_capture_dependencies", "intent_activity_boundaries",
+		"intent_repairs", "intent_repair_commits",
+	} {
+		exists, err := sqliteTableExists(ctx, conn, table)
+		if err != nil {
+			return report, errors.New("inspect Intent v2 tables failed")
+		}
+		if !exists {
+			return report, nil
+		}
+	}
+	report.Available = true
+	if value, ok, _ := metaLookup(ctx, conn, "intent.v2.migration_state"); ok {
+		report.MigrationState = sanitizeObservabilityText(value)
+	}
+	if value, ok, _ := metaLookup(ctx, conn, "intent.v2.needs_attention"); ok {
+		report.NeedsAttention = sanitizeObservabilityText(value)
+	}
+	if value, ok, _ := metaLookup(ctx, conn,
+		"intent.v2.cutover_required"); ok && parseIntentV2MetaBool(value) {
+		report.NeedsAttention = "Intent v2 cutover is required; run acd configure"
+		report.ReplayState = "needs_attention"
+	}
+	if strings.HasPrefix(strings.ToLower(report.MigrationState),
+		"needs_attention") && report.NeedsAttention == "" {
+		report.NeedsAttention = "Intent v2 migration needs attention; run acd configure"
+	}
+	if report.NeedsAttention != "" {
+		report.ReplayState = "needs_attention"
+	} else {
+		report.ReplayState = "active"
+	}
+
+	var revisionID, desiredRevision, appliedRevision sql.NullInt64
+	var runtimeFailure sql.NullString
+	if exists, _ := sqliteTableExists(ctx, conn, "runtime_config_state"); exists {
+		_ = conn.QueryRowContext(ctx, `
+SELECT COALESCE(desired_revision_id, applied_revision_id,
+                last_known_good_revision_id),
+       desired_revision_id, applied_revision_id, last_error
+FROM runtime_config_state WHERE id=1`).Scan(
+			&revisionID, &desiredRevision, &appliedRevision, &runtimeFailure)
+	}
+	if revisionID.Valid {
+		var snapshot string
+		if err := conn.QueryRowContext(ctx,
+			`SELECT snapshot_json FROM config_revisions WHERE id=?`,
+			revisionID.Int64).Scan(&snapshot); err == nil {
+			decodeIntentV2Snapshot(snapshot, &report)
+		}
+	}
+	if report.PresetID == "" {
+		if value, ok, _ := metaLookup(ctx, conn, "intent.v2.preset_id"); ok {
+			report.PresetID = sanitizeObservabilityText(value)
+		}
+	}
+	if report.PresetVersion == 0 {
+		if value, ok, _ := metaLookup(ctx, conn, "intent.v2.preset_version"); ok {
+			report.PresetVersion, _ = strconv.Atoi(strings.TrimSpace(value))
+		}
+	}
+	if report.NeedsAttention == "" && runtimeFailure.Valid &&
+		strings.TrimSpace(runtimeFailure.String) != "" {
+		report.NeedsAttention = sanitizeObservabilityText(runtimeFailure.String)
+		report.ReplayState = "needs_attention"
+	} else if report.NeedsAttention == "" && desiredRevision.Valid &&
+		(!appliedRevision.Valid ||
+			desiredRevision.Int64 != appliedRevision.Int64) {
+		report.ReplayState = "pending"
+	}
+
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(status='ready'),0),
+       COALESCE(SUM(status IN ('open','waiting')),0),
+       COALESCE(SUM(status='blocked'),0),
+       COALESCE(SUM(status='soft_published'),0),
+       COALESCE(SUM(
+           (status='blocked'
+            OR verification_status IN
+               ('failed','timed_out','needs_attention'))
+           AND EXISTS (
+               SELECT 1
+               FROM intent_candidate_events pending_membership
+               JOIN capture_events pending_event
+                 ON pending_event.seq=pending_membership.event_seq
+                AND pending_event.state='pending'
+               WHERE pending_membership.candidate_id=intent_candidates.id
+                 AND pending_membership.membership_state='active'
+           )
+       ),0)
+FROM intent_candidates
+WHERE status IN ('open','waiting','ready','soft_published','blocked')
+  AND EXISTS (
+      SELECT 1 FROM intent_candidate_events active_membership
+      WHERE active_membership.candidate_id=intent_candidates.id
+        AND active_membership.membership_state='active'
+  )`).Scan(
+		&report.OpenCandidates, &report.ReadyCandidates,
+		&report.WaitingCandidates, &report.BlockedCandidates,
+		&report.SoftPublishedCandidates, &report.VerificationAttention,
+	); err != nil {
+		return report, errors.New("read Intent v2 candidate summary failed")
+	}
+	var candidateStatus, protocol, atomicity, atomicitySummary, verificationStatus sql.NullString
+	err := conn.QueryRowContext(ctx, `
+SELECT status, planner_protocol, atomicity_status, atomicity_summary,
+       verification_status
+FROM intent_candidates
+ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
+		&candidateStatus, &protocol, &atomicity, &atomicitySummary,
+		&verificationStatus)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, errors.New("read latest Intent v2 candidate failed")
+	}
+	report.LatestCandidateStatus = sanitizeObservabilityText(candidateStatus.String)
+	report.LatestPlannerProtocol = sanitizeObservabilityText(protocol.String)
+	report.LatestAtomicityStatus = sanitizeObservabilityText(atomicity.String)
+	report.LatestAtomicitySummary = sanitizeObservabilityText(atomicitySummary.String)
+	report.LatestVerificationStatus = sanitizeObservabilityText(verificationStatus.String)
+
+	if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_repairs
+WHERE status IN ('prepared','git_applied')`).Scan(
+		&report.RecoverableRepairs); err != nil {
+		return report, errors.New("read Intent v2 repair summary failed")
+	}
+	var repairStatus, repairError sql.NullString
+	err = conn.QueryRowContext(ctx, `
+SELECT status, error FROM intent_repairs
+ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
+		&repairStatus, &repairError)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return report, errors.New("read latest Intent v2 repair failed")
+	}
+	report.LatestRepairStatus = sanitizeObservabilityText(repairStatus.String)
+	report.LatestRepairError = sanitizeObservabilityText(repairError.String)
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(epoch),0) FROM intent_activity_boundaries`).Scan(
+		&report.LastBoundaryEpoch); err != nil {
+		return report, errors.New("read Intent v2 boundary summary failed")
+	}
+	if replay, replayErr := loadReplayObservabilityReport(ctx, conn); replayErr == nil {
+		switch replay.State {
+		case "needs_attention":
+			report.ReplayState = "needs_attention"
+			if report.NeedsAttention == "" {
+				report.NeedsAttention = "Repeated replay error: " + replay.LastError
+			}
+		case "degraded":
+			if report.ReplayState == "" || report.ReplayState == "active" {
+				report.ReplayState = "degraded"
+			}
+		}
+	}
+	return report, nil
+}
+
+func parseIntentV2MetaBool(value string) bool {
+	parsed, _ := strconv.ParseBool(strings.TrimSpace(value))
+	return parsed
+}
+
+func decodeIntentV2Snapshot(snapshot string, report *intentV2Report) {
+	if report == nil {
+		return
+	}
+	var values map[string]json.RawMessage
+	if json.Unmarshal([]byte(snapshot), &values) != nil {
+		return
+	}
+	_ = json.Unmarshal(values["preset_id"], &report.PresetID)
+	_ = json.Unmarshal(values["preset_version"], &report.PresetVersion)
+	report.Customized = decodeIntentV2SnapshotBool(values["customized"])
+	_ = json.Unmarshal(values[config.FieldIntentVerification],
+		&report.VerificationMode)
+	report.RepairEnabled = decodeIntentV2SnapshotBool(
+		values[config.FieldIntentRepairEnabled])
+	if report.RepairHorizon == "" {
+		_ = json.Unmarshal(values[config.FieldIntentRepairHorizon],
+			&report.RepairHorizon)
+	}
+	var maxCommits string
+	if json.Unmarshal(values[config.FieldIntentRepairMaxCommits],
+		&maxCommits) == nil {
+		report.RepairMaxCommits, _ = strconv.Atoi(maxCommits)
+	} else {
+		_ = json.Unmarshal(values[config.FieldIntentRepairMaxCommits],
+			&report.RepairMaxCommits)
+	}
+	report.PresetID = sanitizeObservabilityText(report.PresetID)
+	report.VerificationMode = sanitizeObservabilityText(report.VerificationMode)
+	report.RepairHorizon = sanitizeObservabilityText(report.RepairHorizon)
+}
+
+func decodeIntentV2SnapshotBool(raw json.RawMessage) bool {
+	var direct bool
+	if json.Unmarshal(raw, &direct) == nil {
+		return direct
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		value, _ := strconv.ParseBool(strings.TrimSpace(text))
+		return value
+	}
+	return false
+}
+
+func renderIntentV2Human(out io.Writer, report intentV2Report) {
+	if !report.Available {
+		fmt.Fprintf(out, "Intent v2: unavailable (schema v%d; read-only compatibility mode)\n",
+			report.SchemaVersion)
+		return
+	}
+	customized := ""
+	if report.Customized {
+		customized = " customized"
+	}
+	fmt.Fprintf(out,
+		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_attention=%d recoverable_repairs=%d\n",
+		valueOrUnset(report.ReplayState), valueOrUnset(report.MigrationState),
+		valueOrUnset(report.PresetID), report.PresetVersion, customized,
+		valueOrUnset(report.VerificationMode), report.RepairEnabled,
+		valueOrUnset(report.RepairHorizon), report.RepairMaxCommits,
+		report.OpenCandidates,
+		report.ReadyCandidates, report.WaitingCandidates,
+		report.BlockedCandidates, report.SoftPublishedCandidates,
+		report.VerificationAttention,
+		report.RecoverableRepairs)
+	if report.NeedsAttention != "" {
+		fmt.Fprintf(out, "  Replay attention: %s\n", report.NeedsAttention)
+	}
+	if report.LatestCandidateStatus != "" {
+		fmt.Fprintf(out,
+			"  Latest candidate: status=%s protocol=%s atomicity=%s verification=%s\n",
+			report.LatestCandidateStatus,
+			valueOrUnset(report.LatestPlannerProtocol),
+			valueOrUnset(report.LatestAtomicityStatus),
+			valueOrUnset(report.LatestVerificationStatus))
+	}
+	if report.LatestRepairStatus != "" {
+		fmt.Fprintf(out, "  Latest repair: %s", report.LatestRepairStatus)
+		if report.LatestRepairError != "" {
+			fmt.Fprintf(out, " (%s)", report.LatestRepairError)
+		}
+		fmt.Fprintln(out)
+	}
 }
 
 func loadRuntimeConfigReport(ctx context.Context, conn *sql.DB, repoHash string, now time.Time) (runtimeConfigReport, error) {

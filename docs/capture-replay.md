@@ -10,7 +10,8 @@ ACD stores metadata and content separately.
 
 | Store | Contents |
 |---|---|
-| `<repo>/.git/acd/state.db` | Capture events, ops, blob OIDs, branch generation, daemon state, clients, decisions. |
+| `<git-dir>/acd/state.db` | Capture events, ops, blob OIDs, branch generation, daemon state, clients, decisions. Linked worktrees have distinct Git directories. |
+| `<git-common-dir>/acd-daemon.lock` | Stable canonical-writer lock shared by every linked worktree. |
 | `.git/objects/` | File contents written with `git hash-object -w` at capture time. |
 
 SQLite does not store file contents. It stores `before_oid` and `after_oid`.
@@ -102,6 +103,38 @@ After a publish, ACD may repair the live index for the event paths only. It
 skips anything that looks like user staging, conflict stages, intent-to-add, or
 malformed index state.
 
+## Complete an ACD self-publication
+
+ACD records its own branch update before running `git update-ref`. This
+self-publication journal lets the daemon distinguish its commit from an
+external fast-forward and finish SQLite bookkeeping after a process stop.
+
+| Journal phase | Durable meaning | Next safe action |
+|---|---|---|
+| `prepared` | The source, target commit and tree, ordered event membership, and candidate ownership were saved before the branch compare-and-swap. | If the branch still names the source, mark the attempt `abandoned`. If it names the exact target, prove the target and continue recovery. |
+| `git_applied` | ACD observed the branch compare-and-swap at the exact target, but event and candidate settlement may still be pending. | Re-prove the branch ref, commit, parent, tree, ref ownership, and journal membership, then complete SQLite state. |
+| `completed` | Event and candidate settlement, publish state, and durable branch metadata committed in one SQLite transaction. | Adopt the journal target as the run loop's current base without changing branch generation. |
+| `abandoned` | Recovery proved that the branch never left the source ref. | Release the attempt's journal ownership. Captured events remain pending. |
+
+`abandoned` does not discard or archive captured work. It only closes a
+definitely unapplied branch-update attempt. A `git_applied` row cannot be
+abandoned because the target may already be reachable.
+
+Self-publication and external transitions use different paths:
+
+| Transition | Classification |
+|---|---|
+| Journal target still matches the literal branch ref | Internal self-publication. The run loop adopts the target and keeps the same branch generation. |
+| Branch moves after journal completion | External transition. The normal branch-token classifier decides whether it is a fast-forward or divergence. |
+| Branch, target, tree, parent, ref ownership, or event membership is ambiguous | No event or candidate settlement. The journal remains recoverable and the daemon log records that recovery needs attention. |
+
+Recovery runs automatically at daemon startup and later loop boundaries. Each
+pass is bounded and keeps heartbeat and wake handling active. ACD completes
+only an exact single-parent target (or an exact parentless initial commit) that
+has no other local branch, remote-tracking ref, or tag pointing to it. It fails
+closed on merges, unexpected branch or tag ownership, missing objects, changed
+membership, and concurrent branch movement.
+
 ## Branch-generation safety
 
 Every capture records `(branch_ref, branch_generation)`. This protects queued
@@ -148,7 +181,7 @@ rewrite diffs are capped at 16000 bytes.
 | Strategy | Replay behavior |
 |---|---|
 | `event` | FIFO replay. One capture can become one commit. |
-| `intent` | A bounded pending window goes to the planner. Selected groups publish sequentially; deferred seqs stay pending. |
+| `intent` | Bounded evaluations revise durable candidates. Atomic candidates publish in dependency order; waiting candidates stay pending. |
 
 Intent waits for one of these:
 
@@ -157,25 +190,27 @@ Intent waits for one of these:
 | `ACD_INTENT_MIN_PENDING` | Enough visible pending captures exist. |
 | `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait briefly for bursty edits to stop arriving. |
 | `ACD_INTENT_MAX_PENDING_AGE` | Oldest visible capture reached the age escape hatch. |
+| `acd touch --soft-boundary --session-id <active-session>` | A harness records the end of one activity epoch. |
 | `acd flush --logical --session-id <active-session>` | A registered harness session asks to drain the visible batch now. |
-| Forced aging | A repeatedly deferred capture reached `ACD_INTENT_DEFER_LIMIT`. |
+| Full evaluation capacity | The preset capture window is full. |
 
 Plain `acd wake` nudges capture and replay. It does not bypass intent batch
 gates.
 
-Planner-window records are stored separately from raw prompt traces. They show
-which seqs were offered, selected, deferred, forced, or hidden by optional
-same-path coalescing. Prompt traces remain the opt-in source for exact provider
+Planner-window records are stored separately from candidate and raw prompt
+records. Candidates may survive many windows, and one candidate can contain
+non-contiguous captures when its dependency graph and scratch materialization
+prove the grouping. Prompt traces remain the opt-in source for exact provider
 requests and may contain source text.
 
 ### Planner circuit breaker
 
 | Condition | Circuit action | Replay action |
 |---|---|---|
-| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure, use deterministic planning. |
-| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan, use deterministic planning. |
+| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure and apply the preset policy. |
+| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan and apply the preset policy. |
 | Circuit open | Wait 30 seconds, then 2 minutes, then 10 minutes after repeated probe failures. | Bypass the provider without adding repeated planner-error rows. |
-| Cooldown expired | Allow one half-open provider probe. | Other windows keep using deterministic planning. |
+| Cooldown expired | Allow one half-open provider probe. | Other evaluations apply the preset policy. |
 | Validated probe succeeds | Close and reset the backoff. | Resume configured provider planning. |
 
 Circuit health survives daemon restarts in `daemon_meta`. Bare `acd` reports
@@ -396,5 +431,12 @@ sensitive because they can contain source text.
 If another committer lands the same captured state first, ACD marks its queued
 event as published at the external `HEAD` instead of making a duplicate commit.
 Real mismatches still become `blocked_conflict`.
+
+One ACD process is the canonical writer for a repository, including all linked
+worktrees. The daemon holds `<git-common-dir>/acd-daemon.lock` for its lifetime,
+then also holds the worktree-local legacy lock for mixed-version compatibility.
+Moving or replacing one worktree's `<git-dir>/acd` directory does not create a
+second writer. If the common lock is held but the local PID and heartbeat do not
+identify that owner, `acd start` refuses instead of guessing.
 
 See [multi-tool.md](multi-tool.md).

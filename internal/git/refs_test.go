@@ -184,6 +184,139 @@ func TestWithLockedRecoveryRefBlocksConcurrentMutation(t *testing.T) {
 	}
 }
 
+func TestWithLockedExpectedRefBlocksConcurrentBranchMutation(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/heads/main"
+	if err := UpdateRef(ctx, dir, ref, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- WithLockedExpectedRef(ctx, dir, ref, first, func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch ref lock was not acquired")
+	}
+
+	mutationCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := UpdateRef(mutationCtx, dir, ref, second, first)
+	cancel()
+	if err == nil {
+		t.Fatal("concurrent branch mutation succeeded while lock was held")
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WithLockedExpectedRef: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch ref lock was not released")
+	}
+
+	if err := UpdateRef(ctx, dir, ref, second, first); err != nil {
+		t.Fatalf("mutation after lock release: %v", err)
+	}
+}
+
+func TestWithLockedExpectedRefRejectsMismatchBeforeCallback(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const ref = "refs/heads/main"
+	if err := UpdateRef(ctx, dir, ref, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	called := false
+	err := WithLockedExpectedRef(ctx, dir, ref, second, func() error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("mismatched branch ref unexpectedly verified")
+	}
+	if called {
+		t.Fatal("callback ran without an exact branch-ref match")
+	}
+}
+
+func TestWithLockedAbsentRefBlocksConcurrentCreation(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	commit := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	const ref = "refs/heads/unborn"
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- WithLockedAbsentRef(ctx, dir, ref, func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("absent ref lock was not acquired")
+	}
+
+	mutationCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err := UpdateRef(mutationCtx, dir, ref, commit, "")
+	cancel()
+	if err == nil {
+		t.Fatal("concurrent ref creation succeeded while absence lock was held")
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WithLockedAbsentRef: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("absent ref lock was not released")
+	}
+
+	if err := UpdateRef(ctx, dir, ref, commit, ""); err != nil {
+		t.Fatalf("creation after lock release: %v", err)
+	}
+}
+
+func TestWithLockedAbsentRefSupportsSHA256Repository(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	if _, err := Run(ctx, RunOpts{Dir: dir},
+		"init", "--object-format=sha256"); err != nil {
+		t.Skipf("git does not support sha256 repositories: %v", err)
+	}
+	called := false
+	if err := WithLockedAbsentRef(
+		ctx, dir, "refs/heads/main", func() error {
+			called = true
+			return nil
+		}); err != nil {
+		t.Fatalf("WithLockedAbsentRef sha256: %v", err)
+	}
+	if !called {
+		t.Fatal("callback did not run for absent sha256 ref")
+	}
+}
+
 func TestWithLockedRecoveryRefFailsBeforeCallbackOnMismatch(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()

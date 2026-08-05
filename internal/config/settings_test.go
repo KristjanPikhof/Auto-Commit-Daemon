@@ -50,6 +50,66 @@ func TestConfigDocumentRejectsMalformedAndNewerVersion(t *testing.T) {
 	}
 }
 
+func TestGlobalSetupApprovalRoundTripsAcrossUnrelatedGenerations(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	doc, err := ParseDocument([]byte(fmt.Sprintf(`{
+  "version":1,
+  "generation":4,
+  "settings":{
+    "global":{},
+    "global_setup_approval":{
+      "generation":4,
+      "fingerprint":%q,
+      "confirmations":["diff_egress","endpoint_credentials"]
+    }
+  }
+}`, fingerprint)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, ok := ActiveGlobalSetupApproval(doc)
+	if !ok || approval.Generation != 4 || approval.Fingerprint != fingerprint ||
+		len(approval.Confirmations) != 2 {
+		t.Fatalf("active approval = %+v ok=%v", approval, ok)
+	}
+	approval.Confirmations[0] = "changed"
+	if doc.Settings.GlobalSetupApproval.Confirmations[0] == "changed" {
+		t.Fatal("active approval returned mutable document storage")
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := ParseDocument(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ActiveGlobalSetupApproval(roundTrip); !ok {
+		t.Fatalf("round-trip approval inactive: %s", body)
+	}
+	roundTrip.Generation++
+	if _, ok := ActiveGlobalSetupApproval(roundTrip); !ok {
+		t.Fatal("unrelated document generation invalidated fingerprint-bound approval")
+	}
+}
+
+func TestGlobalSetupApprovalRejectsRepositoryCommandConsent(t *testing.T) {
+	doc := NewDocument()
+	doc.Generation = 1
+	doc.Settings.GlobalSetupApproval = &GlobalSetupApproval{
+		Generation:    1,
+		Fingerprint:   strings.Repeat("b", 64),
+		Confirmations: []string{"verification_command"},
+	}
+	if err := ValidateDocument(doc); err == nil ||
+		!strings.Contains(err.Error(), "unsupported confirmation") {
+		t.Fatalf("verification approval error = %v", err)
+	}
+	if _, ok := ActiveGlobalSetupApproval(doc); ok {
+		t.Fatal("unsafe approval was exposed as active")
+	}
+}
+
 func TestConfigStoreConcurrentWritersPreserveUpdatesAndPermissions(t *testing.T) {
 	roots := testConfigRoots(t)
 	store := NewStore(roots)
@@ -298,6 +358,9 @@ func TestFieldCatalogClassifiesHotRestartAndValidates(t *testing.T) {
 		t.Fatal("invalid strategy accepted")
 	}
 	timeout, _ := LookupField(FieldTimeout)
+	if timeout.Default != "5m" {
+		t.Fatalf("AI timeout default = %q, want 5m", timeout.Default)
+	}
 	for _, value := range []string{"1e20", "Inf", "NaN"} {
 		if _, err := normalizeValue(timeout, value); err == nil {
 			t.Fatalf("overflowing timeout %q accepted", value)

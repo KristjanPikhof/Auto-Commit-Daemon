@@ -128,6 +128,57 @@ func TestFix_ClearPauseRemovesActiveMarkerOnlyWhenRequested(t *testing.T) {
 	}
 }
 
+func TestClearPublishBarrierClearsReplayErrorMetadata(t *testing.T) {
+	_, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	for _, key := range []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"replay.error_repeat_count",
+		"replay.error_last_seen_ts",
+	} {
+		if err := state.MetaSet(ctx, db, key, "stale"); err != nil {
+			t.Fatalf("seed replay metadata %s: %v", key, err)
+		}
+	}
+	if err := state.SavePublishState(ctx, db, state.Publish{
+		Status: "blocked_conflict",
+		Error:  sql.NullString{String: "stale replay failure", Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearPublishBarrierIfSafe(ctx, tx, nowFloat()); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	publish, ok, err := state.LoadPublishState(ctx, db)
+	if err != nil || !ok || publish.Status != "ok" || publish.Error.Valid {
+		t.Fatalf("publish state=%+v ok=%v err=%v", publish, ok, err)
+	}
+	for _, key := range []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"replay.error_repeat_count",
+		"replay.error_last_seen_ts",
+	} {
+		if value, ok, err := state.MetaGet(ctx, db, key); err != nil || ok {
+			t.Fatalf("replay metadata %s=(%q,%v,%v), want absent",
+				key, value, ok, err)
+		}
+	}
+}
+
 func TestFix_CommitFailureDoesNotReportTransactionalActionApplied(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()

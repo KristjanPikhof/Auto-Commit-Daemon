@@ -30,6 +30,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -86,7 +87,8 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 		// failed validation" block. Detect that suffix so we can prove the
 		// retry path actually fired.
 		for _, msg := range req.Messages {
-			if strings.Contains(msg.Content, "previous capture_intent_plan tool call failed validation") {
+			if strings.Contains(msg.Content,
+				"previous candidate plan failed atomicity validation") {
 				sawRetryCorrection.Store(true)
 			}
 		}
@@ -118,37 +120,12 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 				"deferred_reasons": []map[string]any{},
 			}
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
+		if call == 1 {
+			writeNativeIntentCandidatesResponse(
+				t, w, "call_recovery", []map[string]any{})
+		} else {
+			writeIntentPlanResponse(t, w, "call_recovery", plan)
 		}
-		resp := map[string]any{
-			"id":     "chatcmpl-recovery",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_recovery",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
 	}))
 	defer server.Close()
 
@@ -164,6 +141,7 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-recovery-retry", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
@@ -174,8 +152,10 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	writeFile(t, filepath.Join(repo, "recovery-one.txt"), "one\n")
-	writeFile(t, filepath.Join(repo, "recovery-two.txt"), "two\n")
+	writeFile(t, filepath.Join(repo, "internal/recovery/one.go"),
+		"package recovery\n\nfunc One() {}\n")
+	writeFile(t, filepath.Join(repo, "internal/recovery/two.go"),
+		"package recovery\n\nfunc Two() {}\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
@@ -188,16 +168,16 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "recovery-one.txt", "published", 15*time.Second)
-	waitForEventState(t, dbPath, "recovery-two.txt", "published", 15*time.Second)
+	waitForEventState(t, dbPath, "internal/recovery/one.go", "published", 15*time.Second)
+	waitForEventState(t, dbPath, "internal/recovery/two.go", "published", 15*time.Second)
 
 	// Same commit on both captures = grouped publish from the second
 	// (valid) plan. If the retry had failed we would expect either two
 	// separate deterministic commits OR an intent_planner_error decision.
 	oidOne := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='recovery-one.txt' ORDER BY seq DESC LIMIT 1")
+		"SELECT commit_oid FROM capture_events WHERE path='internal/recovery/one.go' ORDER BY seq DESC LIMIT 1")
 	oidTwo := sqliteScalar(t, dbPath,
-		"SELECT commit_oid FROM capture_events WHERE path='recovery-two.txt' ORDER BY seq DESC LIMIT 1")
+		"SELECT commit_oid FROM capture_events WHERE path='internal/recovery/two.go' ORDER BY seq DESC LIMIT 1")
 	if oidOne == "" || oidOne != oidTwo {
 		t.Fatalf("grouped commit oids one=%q two=%q (expected retry to land both as one commit)", oidOne, oidTwo)
 	}
@@ -217,6 +197,11 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 		"SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'")
 	if plannerErrors != "0" {
 		t.Fatalf("intent_planner_error decisions=%s want 0 (composed retry must absorb the first-attempt failure)", plannerErrors)
+	}
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates
+WHERE planner_protocol='v2' AND status='published'`); got != "1" {
+		t.Fatalf("native v2 recovery candidates=%s want 1", got)
 	}
 }
 
@@ -316,6 +301,7 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-recovery-singleton", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
@@ -342,15 +328,16 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 
-	// Wait for warm.txt to land (selected) and overdue.go to gather a
-	// defer (defer_count >= 1).
+	// Wait for warm.txt to land and verify overdue.go remains a durable
+	// waiting candidate.
 	waitForEventState(t, dbPath, "warm.txt", "published", 15*time.Second)
-	waitFor(t, "planner deferred overdue.go (defer_count>=1)", 15*time.Second, func() bool {
+	waitFor(t, "planner retained overdue.go as waiting candidate", 15*time.Second, func() bool {
 		got := sqliteScalar(t, dbPath,
-			"SELECT IFNULL(MAX(defer_count), 0) FROM planner_state ps "+
-				"JOIN capture_events ce ON ce.seq = ps.event_seq "+
-				"WHERE ce.path='overdue.go'")
-		return got != "" && got != "0"
+			"SELECT COUNT(*) FROM intent_candidates candidate "+
+				"JOIN intent_candidate_events member ON member.candidate_id=candidate.id "+
+				"JOIN capture_events capture ON capture.seq=member.event_seq "+
+				"WHERE capture.path='overdue.go' AND candidate.status='waiting'")
+		return got == "1"
 	})
 	// Capture how many hits the deferral pass cost. Must be at least 1
 	// (the defer call); subsequent tick must add one forced-singleton call.
@@ -386,11 +373,31 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 	if subj != "Add overdue capture handler" {
 		t.Fatalf("HEAD subject=%q want semantic provider subject", subj)
 	}
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates
+WHERE planner_protocol='v2'`); got == "0" {
+		t.Fatal("forced singleton did not retain native v2 candidate protocol")
+	}
 }
 
 func writeIntentPlanResponse(t *testing.T, w http.ResponseWriter, callID string, plan map[string]any) {
 	t.Helper()
-	args, err := json.Marshal(plan)
+	writeNativeIntentCandidatesResponse(
+		t, w, callID, nativeIntentCandidatesFromLegacyPlan(plan))
+}
+
+func writeNativeIntentCandidatesResponse(
+	t *testing.T,
+	w http.ResponseWriter,
+	callID string,
+	candidates []map[string]any,
+) {
+	t.Helper()
+	native := map[string]any{
+		"protocol_version": "v2",
+		"candidates":       candidates,
+	}
+	args, err := json.Marshal(native)
 	if err != nil {
 		t.Fatalf("marshal intent plan: %v", err)
 	}
@@ -407,7 +414,7 @@ func writeIntentPlanResponse(t *testing.T, w http.ResponseWriter, callID string,
 					"id":   callID,
 					"type": "function",
 					"function": map[string]any{
-						"name":      "capture_intent_plan",
+						"name":      "capture_intent_plan_v2",
 						"arguments": string(args),
 					},
 				}},
@@ -421,6 +428,71 @@ func writeIntentPlanResponse(t *testing.T, w http.ResponseWriter, callID string,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body)
+}
+
+func nativeIntentCandidatesFromLegacyPlan(plan map[string]any) []map[string]any {
+	var candidates []map[string]any
+	if groups, ok := plan["commit_groups"].([]map[string]any); ok {
+		for i, group := range groups {
+			candidates = append(candidates, nativeReadyIntentCandidate(
+				fmt.Sprintf("native-group-%d", i+1),
+				group["selected_seqs"].([]int64),
+				stringValue(group["subject"]), stringValue(group["body"]),
+				stringValue(group["grouping_reason"])))
+		}
+	} else if selected, ok := plan["selected_seqs"].([]int64); ok &&
+		len(selected) > 0 {
+		candidates = append(candidates, nativeReadyIntentCandidate(
+			"native-selected", selected,
+			stringValue(plan["subject"]), stringValue(plan["body"]),
+			stringValue(plan["grouping_reason"])))
+	}
+	reasons := map[int64]string{}
+	if entries, ok := plan["deferred_reasons"].([]map[string]any); ok {
+		for _, entry := range entries {
+			seq, _ := entry["seq"].(int64)
+			reasons[seq] = stringValue(entry["reason"])
+		}
+	}
+	if deferred, ok := plan["deferred_seqs"].([]int64); ok {
+		for _, seq := range deferred {
+			reason := reasons[seq]
+			if reason == "" {
+				reason = "waiting for a required companion"
+			}
+			candidates = append(candidates, map[string]any{
+				"candidate_id":  fmt.Sprintf("native-wait-%d", seq),
+				"selected_seqs": []int64{seq},
+				"purpose":       "retain deferred capture", "readiness": "wait",
+				"missing_companions":    []string{reason},
+				"depends_on_candidates": []string{},
+				"subject":               "", "body": "",
+				"grouping_reason": "planner deferred this capture",
+			})
+		}
+	}
+	return candidates
+}
+
+func nativeReadyIntentCandidate(
+	id string,
+	seqs []int64,
+	subject string,
+	body string,
+	reason string,
+) map[string]any {
+	return map[string]any{
+		"candidate_id": id, "selected_seqs": seqs,
+		"purpose": reason, "readiness": "ready",
+		"missing_companions":    []string{},
+		"depends_on_candidates": []string{},
+		"subject":               subject, "body": body, "grouping_reason": reason,
+	}
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 // buildDeferredReasons emits the deferred_reasons array OpenAI-style for the
@@ -465,12 +537,21 @@ type offeredIntentCapture struct {
 // non-JSON content (e.g. composed retry's Correction: block).
 func offeredIntentCaptures(t *testing.T, req intentChatRequest) []offeredIntentCapture {
 	t.Helper()
-	const marker = "Plan the next commit intent for these offered captures:\n"
+	markers := []string{
+		"Plan durable semantic commit candidates for these offered captures:\n",
+		"Plan the next commit intent for these offered captures:\n",
+	}
 	for _, msg := range req.Messages {
-		if !strings.HasPrefix(msg.Content, marker) {
+		body := ""
+		for _, marker := range markers {
+			if strings.HasPrefix(msg.Content, marker) {
+				body = strings.TrimPrefix(msg.Content, marker)
+				break
+			}
+		}
+		if body == "" {
 			continue
 		}
-		body := strings.TrimPrefix(msg.Content, marker)
 		dec := json.NewDecoder(strings.NewReader(body))
 		var payload struct {
 			OfferedCaptures []struct {

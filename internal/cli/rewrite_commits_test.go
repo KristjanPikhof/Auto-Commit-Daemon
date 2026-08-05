@@ -14,7 +14,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -82,6 +84,7 @@ func TestRewriteCommitsAliasHelpIncludesEditContract(t *testing.T) {
 }
 
 func TestRewriteCommitsPlanGenerationRequiresIntentStrategy(t *testing.T) {
+	withIsolatedHome(t)
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "openai-compat")
 	t.Setenv(ai.EnvAPIKey, "test-key")
@@ -95,6 +98,7 @@ func TestRewriteCommitsPlanGenerationRequiresIntentStrategy(t *testing.T) {
 }
 
 func TestRewriteCommitsPlanGenerationRequiresUsableAIProvider(t *testing.T) {
+	withIsolatedHome(t)
 	t.Setenv(ai.EnvCommitStrategy, "intent")
 	t.Setenv(ai.EnvProvider, "openai-compat")
 	t.Setenv(ai.EnvAPIKey, "")
@@ -104,6 +108,47 @@ func TestRewriteCommitsPlanGenerationRequiresUsableAIProvider(t *testing.T) {
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}}, false)
 	if !errors.Is(err, ai.ErrRewriteRequiresAIProvider) {
 		t.Fatalf("runRewriteCommits error = %v, want provider gate", err)
+	}
+}
+
+func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	if err := os.WriteFile(provider, []byte("#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    json.loads(line)\n    print(json.dumps({'version': 1, 'subject': 'configured subject', 'body': ''}), flush=True)\n"), 0o755); err != nil {
+		t.Fatalf("write provider: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "event")
+	t.Setenv(ai.EnvProvider, "deterministic")
+
+	repoHash, err := paths.RepoHash(repo)
+	if err != nil {
+		t.Fatalf("repo hash: %v", err)
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldCommitStrategy: json.RawMessage(`"intent"`),
+				config.FieldProvider:       json.RawMessage(`"subprocess:rewrite-test"`),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("save repository settings: %v", err)
+	}
+
+	var out bytes.Buffer
+	err = runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+		selection: git.RewriteSelectionOptions{Last: 1},
+		planOnly:  true,
+	}, false)
+	if err != nil {
+		t.Fatalf("plan generation with persisted settings: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Generated valid rewrite plan") {
+		t.Fatalf("persisted settings did not generate a plan:\n%s", out.String())
 	}
 }
 
@@ -152,6 +197,7 @@ func TestRewritePlanRefArg(t *testing.T) {
 }
 
 func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
+	withIsolatedHome(t)
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
 	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
@@ -201,6 +247,7 @@ func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
 }
 
 func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
+	withIsolatedHome(t)
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
 	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
@@ -220,6 +267,7 @@ func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
 }
 
 func TestRewriteCommitsGenerationProgressEvents(t *testing.T) {
+	withIsolatedHome(t)
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
 	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
@@ -386,6 +434,7 @@ func TestRewriteCommitsEditStandaloneFilePersistsBackToFile(t *testing.T) {
 }
 
 func TestRewriteCommitsGenerationReviewPrintsEditedRevisionID(t *testing.T) {
+	withIsolatedHome(t)
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
 	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")

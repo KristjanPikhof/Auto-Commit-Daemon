@@ -360,6 +360,16 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD capture is paused by durable backpressure."
 		res.NextAction = "Run `acd diagnose` before clearing backpressure."
+	case status.Configuration.Configuration == "needs_attention":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "Configuration validation needs attention; capture remains active."
+		res.NextAction = "Run `acd configure` to retry validation or select another experience."
+	case status.Replay.State == "needs_attention":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "Replay is repeatedly failing; capture remains active."
+		res.NextAction = "Run `acd diagnose` to inspect the blocked sequence and candidate context."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -373,6 +383,10 @@ func applyControlStatus(res *controlResult, status statusReport) {
 				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
 		}
 		res.NextAction = "No action needed; capture and replay resume automatically."
+	case status.Configuration.Configuration == "validating":
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD capture is active while configuration validation runs."
+		res.NextAction = "No action needed; commit publishing activates after validation passes."
 	case status.IntentStrategy.PlannerHealth != nil &&
 		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
@@ -387,6 +401,10 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running, but persisted intent planner health metadata could not be read safely."
 		res.NextAction = "Run `acd diagnose` for the safe metadata warning."
+	case status.Replay.State == "degraded":
+		res.Health = controlHealthDegraded
+		res.Summary = "Replay encountered an error and remains retryable."
+		res.NextAction = "Run `acd diagnose` if the error repeats."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."

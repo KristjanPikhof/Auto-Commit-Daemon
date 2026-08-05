@@ -26,10 +26,22 @@ appear, or how to recover a stuck queue.
 `acd events --watch` starts at the current ledger tail unless you pass
 `--since <cursor>`.
 
-Use `acd settings` when you need to change providers, models, commit strategy,
-or intent tuning. Saved explicit values do not require shell sourcing. See the
-[settings guide](settings.md) for profiles, source precedence, safe activation,
-and rejected-revision recovery.
+Use bare `acd configure` for global provider and everyday defaults. Use
+`acd configure --repo .` for a repository override or Strict Review, and
+`acd settings` for advanced overrides, profiles, and experiments. Saved
+non-secret values do not require shell sourcing. See the
+[settings guide](settings.md) for source precedence, safe activation, and
+rejected-revision recovery.
+
+Use `acd configure --replace` to replace retained global overrides with the
+reviewed current built-ins. Use `acd configure --repo . --inherit` to remove a
+repository-specific layer and activate the global result again.
+
+Global Everyday setup runs no project test or validation job. Repository Strict
+Review returns after provider testing and durable validation queueing. Capture
+stays active while commit publishing waits. Use
+`acd configure --repo . --wait` to follow the strict job, or close the terminal
+and inspect it later with `acd status`.
 
 See [commands.md](commands.md) for the complete public command reference,
 including repo administration, maintenance, and the hook protocol.
@@ -131,6 +143,71 @@ If the only problem is a manual pause marker, use:
 acd resume --yes
 ~~~
 
+## Recover an interrupted self-publication
+
+ACD normally recovers its own interrupted branch update without an operator
+command. A durable self-publication appears in `acd status`, `acd diagnose`,
+and `acd doctor` as `prepared` or `git_applied`. Recovery inspects it at daemon
+startup and loop boundaries.
+
+~~~bash
+acd status
+acd diagnose --json
+acd doctor
+~~~
+
+Use the reported remediation kind:
+
+| Remediation | Meaning | Action |
+|---|---|---|
+| `automatic_recovery` | One exact journal target can be inspected by the daemon. | Leave ACD running. Recheck status after the next loop boundary. |
+| `stop_old_owner` | More than one live canonical writer is reported. | Stop the existing ACD owner before starting one from another linked worktree. |
+| `needs_attention` | Heartbeat and pending wake progress are stale. | Inspect `acd diagnose --json` and the daemon log. Stop the stale owner before restarting ACD. |
+
+All linked worktrees contend on
+`<git-common-dir>/acd-daemon.lock`, so only one is the canonical writer for the
+repository. The worktree-local PID and heartbeat are supporting evidence, not
+ownership proof. If `acd start` reports that the stable lock is held, do not
+delete the lock file or move `.git/acd` to force another start. Stop the older
+owner cleanly, then start ACD from the worktree you want to own the repository.
+
+Ambiguous recovery is intentionally non-destructive. Do not delete
+`state.db`, journal rows, recovery refs, or captured events, and do not use a
+purge command to clear the warning. ACD keeps the journal recoverable rather
+than guessing whether Git or SQLite won the interrupted transition, and the
+daemon log records that recovery needs attention. If `automatic_recovery`
+remains unchanged after one clean owner restart, inspect the log and collect a
+support bundle.
+
+Pre-v18 state databases have no self-publication journal. Status, diagnose, and
+doctor report the projection as unavailable through read-only connections
+without creating tables or migrating the database.
+
+## Recover an interrupted Intent repair
+
+Balanced and Quality may rebuild a recent private ACD-only commit suffix when a
+late companion capture belongs to a soft-published candidate. ACD first creates
+an `refs/acd/intent-repair/.../backup` ref and stores every old-to-new commit
+mapping.
+
+If the process stops after the Git ref update, restart the same v2 binary:
+
+~~~bash
+acd on
+acd status
+acd doctor
+~~~
+
+The daemon completes database reconciliation when the persisted mapping and Git
+state agree. Otherwise it retains the backup and reports recoverable guidance.
+Do not delete the backup ref or reset the branch while that recovery is
+pending.
+
+Repair is skipped, without changing staged content, when staging overlaps the
+candidate. It is also skipped if a merge, tag, another local branch, or a
+remote-tracking ref contains a rewritten commit. A skipped repair becomes a
+new candidate and commit.
+
 ## Inspect or restore archived work
 
 Recovery decisions name the exact hidden ref. Find recent archive decisions and
@@ -163,6 +240,9 @@ the final captured state, so they normally need no restore.
 | Queue says `wait` | `acd status` | Intent mode may be waiting for count or age. |
 | Queue says `blk` | `acd diagnose --json` | ACD may be reconciling a complete chain, or proof needs inspection. |
 | Commit message is generic | `acd status --json` | Planner circuit may be using deterministic fallback. |
+| Replay says `needs_attention` | `acd diagnose --json` | Repeated replay failed at the reported capture. Inspect its candidate IDs and bounded error before resuming. |
+| Self-publication says `recoverable` | `acd status` | Automatic recovery will inspect the durable `prepared` or `git_applied` journal. |
+| Self-publication says `stale` | `acd diagnose --json` | Stop the older canonical writer or stale owner before restarting ACD. |
 | Path under generated tree is ignored | `acd doctor` | Safe-ignore pruned it. |
 | Prompt trace is missing | `acd prompt --last` | Tracing was not enabled before the provider call. |
 | External tool already committed the file | `acd explain --commit HEAD` | Expect `handled_external` or `superseded_external`. |
@@ -212,17 +292,17 @@ acd explain --commit HEAD
 No action is needed when `explain` says `HEAD` contains the change. If the queue
 stays blocked, go through the recovery ladder.
 
-## Intent grouping waits
+## Intent candidate waits
 
-Intent mode may wait before asking the planner.
+Intent mode may wait for a candidate boundary or a missing prerequisite.
 
 | Gate | Meaning |
 |---|---|
-| `ACD_INTENT_MIN_PENDING` | Wait for this many visible pending captures. |
+| `ACD_INTENT_MIN_PENDING` | Prefer this many visible captures before evaluation. |
 | `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait for a quiet burst boundary before planning. |
-| `ACD_INTENT_MAX_PENDING_AGE` | Publish when the oldest visible capture reaches this age. |
+| `ACD_INTENT_MAX_PENDING_AGE` | Evaluate when the oldest visible capture reaches this age. |
 | `ACD_INTENT_WINDOW` | Offer at most this many captures to the planner. |
-| `ACD_INTENT_DEFER_LIMIT` | Force a capture after this many deferrals. |
+| Soft or logical boundary | Evaluate the current activity epoch without bypassing safety gates. |
 
 Inspect:
 
@@ -241,21 +321,33 @@ acd flush --repo . --session-id "$ACD_SESSION_ID" --logical
 
 Plain `acd wake` does not bypass intent batch gates.
 
-Planner failure does not block intent replay. Transport failures open a
-persisted circuit immediately; three consecutive invalid or unsafe plans also
-open it. During the 30-second, 2-minute, and 10-minute cooldowns ACD uses the
-deterministic planner, then sends one automatic probe. Inspect
+Planner failure behavior is preset-specific. Fast uses the smallest valid
+hard-dependency component. Balanced uses a valid or deterministic dependency
+partition and runs structural verification. Quality keeps candidates pending
+and reports `needs_attention`. During the 30-second, 2-minute, and 10-minute
+cooldowns ACD applies that policy, then sends one automatic probe. Inspect
 `intent_strategy.planner_health` in status or diagnose JSON for the circuit
 state, failure class, bypass count, and next probe time.
+
+Missing Intent v2 prerequisites always block replay, not capture. Run bare
+`acd configure` for missing inherited provider, credential, or diff consent.
+Run `acd configure --repo .` for repository-specific settings or Strict Review
+approval. ACD does not fall back to v1 or metadata-only planning.
+
+Configuration validation uses the same capture-only safety state. A queued or
+running job needs no action. A failed or timed-out job preserves the desired
+revision and last-known-good runtime. Re-run `acd configure --repo .` to retry
+the exact strict check or switch experience.
 
 To check whether work was captured, planner-visible, and committed as intended:
 
 | Question | Command |
 |---|---|
 | Which captures are still waiting? | `acd status --json` |
-| What did the last planner window contain? | `acd status --json` and inspect `intent_strategy.last_planner_window` |
-| Was one seq offered, selected, deferred, or hidden? | `acd events --json --since <cursor>` and inspect `planner_window` |
-| Why is the planner waiting? | `acd diagnose --json` and inspect `batch_wait_reason` plus settle fields |
+| What did the last planner evaluation contain? | `acd status --json` and inspect `intent_strategy.last_planner_window` |
+| What is waiting or ready? | Inspect `intent_v2` candidate, verification, and repair fields in status JSON |
+| Was one seq offered or assigned? | `acd events --json --since <cursor>` and inspect planner and candidate data |
+| Why is replay waiting? | `acd diagnose --json` and inspect migration, prerequisite, batch wait, and verification fields |
 
 ## Inspect an AI prompt
 

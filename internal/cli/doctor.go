@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,6 +25,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	daemonpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -32,40 +35,44 @@ import (
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
-	Path                   string               `json:"path"`
-	RepoHash               string               `json:"repo_hash"`
-	StateDB                string               `json:"state_db"`
-	StateDBReadable        bool                 `json:"state_db_readable"`
-	DaemonPID              int                  `json:"daemon_pid"`
-	DaemonAlive            bool                 `json:"daemon_alive"`
-	DaemonProcessCount     int                  `json:"daemon_process_count,omitempty"`
-	DaemonProcessPIDs      []int                `json:"daemon_process_pids,omitempty"`
-	DaemonMode             string               `json:"daemon_mode"`
-	HeartbeatTS            int64                `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeS          int64                `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale         bool                 `json:"heartbeat_stale"`
-	Clients                int                  `json:"client_count"`
-	Harnesses              []string             `json:"harnesses,omitempty"`
-	LogPath                string               `json:"log_path"`
-	LogLines               []string             `json:"log_tail,omitempty"`
-	FsnotifyMode           string               `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches        int                  `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped        int                  `json:"fsnotify_dropped,omitempty"`
-	FsnotifyFallbackReason string               `json:"fsnotify_fallback_reason,omitempty"`
-	LastCaptureError       string               `json:"last_capture_error,omitempty"`
-	PendingEvents          int                  `json:"pending_events"`
-	BlockedConflicts       int                  `json:"blocked_conflicts"`
-	FailedEvents           int                  `json:"failed_events"`
-	FailedBlockingPending  int                  `json:"failed_blocking_pending"`
-	IntentStrategy         intentStrategyReport `json:"intent_strategy"`
-	LastReplayConflictTS   int64                `json:"last_replay_conflict_ts,omitempty"`
-	LastReplayConflictPath string               `json:"last_replay_conflict_path,omitempty"`
-	LastReplayConflictErr  string               `json:"last_replay_conflict_error,omitempty"`
-	LastReplayFailureTS    int64                `json:"last_replay_failure_ts,omitempty"`
-	LastReplayFailurePath  string               `json:"last_replay_failure_path,omitempty"`
-	LastReplayFailureErr   string               `json:"last_replay_failure_error,omitempty"`
-	Notes                  []string             `json:"notes,omitempty"`
-	FlushSessionID         string               `json:"-"`
+	Path                   string                    `json:"path"`
+	RepoHash               string                    `json:"repo_hash"`
+	StateDB                string                    `json:"state_db"`
+	StateDBReadable        bool                      `json:"state_db_readable"`
+	DaemonPID              int                       `json:"daemon_pid"`
+	DaemonAlive            bool                      `json:"daemon_alive"`
+	DaemonProcessCount     int                       `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs      []int                     `json:"daemon_process_pids,omitempty"`
+	DaemonMode             string                    `json:"daemon_mode"`
+	HeartbeatTS            int64                     `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeS          int64                     `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale         bool                      `json:"heartbeat_stale"`
+	Clients                int                       `json:"client_count"`
+	Harnesses              []string                  `json:"harnesses,omitempty"`
+	LogPath                string                    `json:"log_path"`
+	LogLines               []string                  `json:"log_tail,omitempty"`
+	FsnotifyMode           string                    `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches        int                       `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped        int                       `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason string                    `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError       string                    `json:"last_capture_error,omitempty"`
+	PendingEvents          int                       `json:"pending_events"`
+	BlockedConflicts       int                       `json:"blocked_conflicts"`
+	FailedEvents           int                       `json:"failed_events"`
+	FailedBlockingPending  int                       `json:"failed_blocking_pending"`
+	IntentStrategy         intentStrategyReport      `json:"intent_strategy"`
+	Configuration          configReadinessReport     `json:"configuration"`
+	Replay                 replayObservabilityReport `json:"replay"`
+	IntentV2               intentV2Report            `json:"intent_v2"`
+	SelfPublication        selfPublicationReport     `json:"self_publication"`
+	LastReplayConflictTS   int64                     `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath string                    `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr  string                    `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS    int64                     `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath  string                    `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr   string                    `json:"last_replay_failure_error,omitempty"`
+	Notes                  []string                  `json:"notes,omitempty"`
+	FlushSessionID         string                    `json:"-"`
 }
 
 type doctorHarnessReport struct {
@@ -420,8 +427,8 @@ var driftRemediationCommands = map[string]string{
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
-// and returns a non-empty note when one or more active-hook command bodies
-// are missing the canonical `acd start` + `acd wake` pair. Active hooks are:
+// and returns a non-empty note when one or more lifecycle command bodies are
+// missing their canonical command. Active hooks are:
 //
 //   - claude-code, codex : PreToolUse + PostToolUse entries inside nested JSON
 //     "hooks" map (PascalCase event keys)
@@ -468,13 +475,13 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 		// Marker lives on a non-canonical (legacy) path. Recommend a merge
 		// into the matched file only — never an overwrite that could blow
 		// away a user's canonical config they have not migrated yet.
-		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake' at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
+		return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command at %s; reinstall via acd setup %s and merge output into %s", stale, matchedPath, name, matchedPath)
 	}
 	cmd, ok := driftRemediationCommands[name]
 	if !ok {
-		return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via acd setup %s --raw", stale, name)
+		return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command; reinstall via acd setup %s --raw", stale, name)
 	}
-	return fmt.Sprintf("installed snippet drift: %d active hook(s) missing 'acd start'+'acd wake'; reinstall via %s", stale, cmd)
+	return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command; reinstall via %s", stale, cmd)
 }
 
 // cursorLifecycleSubcommands maps wired Cursor hook events to the acd command
@@ -517,7 +524,35 @@ func countJSONActiveHookDrift(name string, body []byte) int {
 			}
 		}
 	}
+	if name == "codex" {
+		cmds := byEvent["Stop"]
+		if len(cmds) == 0 {
+			stale++
+		}
+		for _, cmd := range cmds {
+			if !codexStopHasSoftBoundary(cmd) ||
+				strings.Contains(cmd, "acd flush --logical") {
+				stale++
+			}
+		}
+	}
 	return stale
+}
+
+var codexTouchInvocation = regexp.MustCompile(
+	`(?:^|[;&|({][[:space:]]*)acd[[:space:]]+touch(?:[[:space:]]+[^;&|\n]*)?`,
+)
+
+func codexStopHasSoftBoundary(command string) bool {
+	for _, invocation := range codexTouchInvocation.FindAllString(command, -1) {
+		for _, field := range strings.Fields(invocation) {
+			field = strings.Trim(field, `'"(){}[]`)
+			if field == "--soft-boundary" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func countCursorStaleLifecycleCommands(body []byte) int {
@@ -1098,6 +1133,7 @@ func collectDoctorAI() doctorAIReport {
 }
 
 var doctorProcessList = defaultDoctorProcessList
+var doctorRepoIdentityResolver = doctorRepoIdentity
 
 type doctorProcess struct {
 	PID     int
@@ -1105,7 +1141,14 @@ type doctorProcess struct {
 }
 
 func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
-	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	psPath := "ps"
+	switch runtime.GOOS {
+	case "darwin":
+		psPath = "/bin/ps"
+	case "linux":
+		psPath = "/usr/bin/ps"
+	}
+	out, err := exec.CommandContext(ctx, psPath, "-axo", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -1133,20 +1176,70 @@ func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
 }
 
 func findDaemonProcesses(ctx context.Context, repo string) []int {
-	processes, err := doctorProcessList(ctx)
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	processes, err := doctorProcessList(probeCtx)
 	if err != nil {
 		return nil
 	}
+	target, err := doctorRepoIdentityResolver(probeCtx, repo)
+	if err != nil {
+		return nil
+	}
+	identities := map[string]string{repo: target}
 	var pids []int
 	for _, proc := range processes {
-		cmd := proc.Command
-		if strings.Contains(cmd, "acd daemon run") &&
-			strings.Contains(cmd, "--repo") &&
-			strings.Contains(cmd, repo) {
+		repoArg, ok := daemonRepoArg(proc.Command)
+		if !ok {
+			continue
+		}
+		identity, cached := identities[repoArg]
+		if !cached {
+			identity, err = doctorRepoIdentityResolver(probeCtx, repoArg)
+			if err != nil {
+				identities[repoArg] = ""
+				continue
+			}
+			identities[repoArg] = identity
+		}
+		if identity == target {
 			pids = append(pids, proc.PID)
 		}
 	}
 	return pids
+}
+
+// daemonRepoArg delegates to the daemon's direct production-command parser so
+// ownership fencing and diagnostics cannot drift.
+func daemonRepoArg(command string) (string, bool) {
+	return daemonpkg.ParseDaemonRunRepoArg(command)
+}
+
+func doctorRepoIdentity(ctx context.Context, repo string) (string, error) {
+	wt, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	commonDir := wt.GitDir
+	body, err := os.ReadFile(filepath.Join(wt.GitDir, "commondir"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err == nil {
+		value := strings.TrimSpace(string(body))
+		if value == "" {
+			return "", errors.New("empty Git commondir")
+		}
+		if filepath.IsAbs(value) {
+			commonDir = filepath.Clean(value)
+		} else {
+			commonDir = filepath.Clean(filepath.Join(wt.GitDir, value))
+		}
+	}
+	if real, err := filepath.EvalSymlinks(commonDir); err == nil {
+		commonDir = filepath.Clean(real)
+	}
+	return commonDir, nil
 }
 
 // readRepoState opens the per-repo DB read-only and fills the report fields
@@ -1239,6 +1332,46 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy, repoPath, rr.FlushSessionID)...)
 	} else {
 		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
+	}
+	if intentV2, err := loadIntentV2Report(ctx, conn); err == nil {
+		rr.IntentV2 = intentV2
+		if intentV2.NeedsAttention != "" {
+			rr.Notes = append(rr.Notes,
+				"Intent v2 replay stopped; capture remains durable; run acd configure")
+		}
+	} else {
+		rr.Notes = append(rr.Notes, "Intent v2 summary failed: "+err.Error())
+	}
+	if replay, err := loadReplayObservabilityReport(ctx, conn); err == nil {
+		rr.Replay = replay
+		if replay.State == "needs_attention" {
+			rr.Notes = append(rr.Notes,
+				"replay is repeatedly failing; inspect acd diagnose")
+		}
+	} else {
+		rr.Notes = append(rr.Notes,
+			"replay observability failed: "+err.Error())
+	}
+	if publication, err := loadSelfPublicationReport(
+		ctx, conn, dbPath, time.Now(), rr.DaemonProcessCount,
+	); err == nil {
+		rr.SelfPublication = publication
+		if publication.Remediation != "" {
+			rr.Notes = append(rr.Notes, publication.Remediation)
+		}
+	} else {
+		rr.Notes = append(rr.Notes,
+			"self-publication observability failed: "+err.Error())
+	}
+	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err == nil {
+		rr.Configuration = readiness
+		if readiness.Configuration == "needs_attention" {
+			rr.Notes = append(rr.Notes,
+				"configuration validation needs attention; run acd configure")
+		}
+	} else {
+		rr.Notes = append(rr.Notes,
+			"configuration readiness failed: "+err.Error())
 	}
 
 	// Most recent terminal blocked_conflict event — gives the operator a
@@ -1496,6 +1629,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
 			}
 		}
+		if rr.IntentV2.Available {
+			renderIntentV2Human(out, rr.IntentV2)
+		}
+		if rr.Configuration.Available {
+			renderConfigReadinessHuman(out, rr.Configuration)
+		}
+		renderReplayObservabilityHuman(out, rr.Replay)
+		renderSelfPublicationHuman(out, rr.SelfPublication, "      ")
 		if rr.FsnotifyMode != "" {
 			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
 				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
@@ -1832,6 +1973,10 @@ func sanitizeReport(r doctorReport) doctorReport {
 		}
 		if rr.LastCaptureError != "" {
 			c.LastCaptureError = string(sanitizeBytes([]byte(rr.LastCaptureError)))
+		}
+		if rr.Replay.LastError != "" {
+			c.Replay.LastError = string(
+				sanitizeBytes([]byte(rr.Replay.LastError)))
 		}
 		repos = append(repos, c)
 	}

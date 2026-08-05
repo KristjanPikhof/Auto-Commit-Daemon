@@ -154,7 +154,7 @@ func TestSettingsTerminalRunnerErrorIsReturned(t *testing.T) {
 
 func TestSettingsHelpDescribesScopesRisksAndSyntheticPrivacy(t *testing.T) {
 	help := commandHelp(t, "settings")
-	for _, want := range []string{"--profile", "--global", "--accessible", "--confirm-endpoint-credentials", "--confirm-subprocess", "--confirm-diff-egress", "synthetic content only", "set or unset", "next safe work boundary", "without changing running repositories"} {
+	for _, want := range []string{"--profile", "--global", "--accessible", "--confirm-endpoint-credentials", "--confirm-subprocess", "--confirm-diff-egress", "synthetic content only", "protected file", "never value", "next safe work boundary", "without changing running repositories"} {
 		if !bytes.Contains([]byte(help), []byte(want)) {
 			t.Errorf("help missing %q", want)
 		}

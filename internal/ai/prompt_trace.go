@@ -44,6 +44,34 @@ func intentDiffIncluded(req IntentPlanRequest) bool {
 	return false
 }
 
+func offeredSeqsV2(req IntentPlanRequestV2) []int64 {
+	if len(req.OfferedCaptures) == 0 {
+		return nil
+	}
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return seqs
+}
+
+func intentDiffIncludedV2(req IntentPlanRequestV2) bool {
+	for _, capture := range req.OfferedCaptures {
+		if capture.CapturedDiff != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func candidatePlanSeqs(plan IntentPlanV2) []int64 {
+	var seqs []int64
+	for _, candidate := range plan.Candidates {
+		seqs = append(seqs, candidate.SelectedSeqs...)
+	}
+	return seqs
+}
+
 func openAITraceRequest(body []byte, transform prompttrace.TransformMetadata) (prompttrace.Record, error) {
 	var decoded struct {
 		Messages []struct {

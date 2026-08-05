@@ -8,8 +8,8 @@ import (
 
 var (
 	// ErrRewriteRequiresIntentStrategy is returned when rewrite plan generation is
-	// requested while ACD_COMMIT_STRATEGY is not intent.
-	ErrRewriteRequiresIntentStrategy = errors.New("rewrite commits requires ACD_COMMIT_STRATEGY=intent")
+	// requested while the effective commit strategy is not intent.
+	ErrRewriteRequiresIntentStrategy = errors.New("rewrite commits requires commit strategy intent")
 
 	// ErrRewriteRequiresAIProvider is returned when rewrite plan generation is
 	// requested without an explicitly configured non-deterministic AI provider.
@@ -29,7 +29,7 @@ func CheckRewritePlanGenerationGate(cfg ProviderConfig, provider Provider) error
 	}
 	mode := strings.TrimSpace(strings.ToLower(cfg.Mode))
 	if mode == "" || mode == "deterministic" || PrimaryProviderName(provider) == "deterministic" {
-		return fmt.Errorf("%w: set %s=openai-compat with %s, or %s=subprocess:<name>", ErrRewriteRequiresAIProvider, EnvProvider, EnvAPIKey, EnvProvider)
+		return fmt.Errorf("%w: configure openai-compat with a credential, or subprocess:<name>", ErrRewriteRequiresAIProvider)
 	}
 	if _, ok := provider.(IntentPlanner); !ok {
 		return fmt.Errorf("%w: %s", ErrRewriteProviderCannotPlan, PrimaryProviderName(provider))

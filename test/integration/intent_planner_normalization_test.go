@@ -36,12 +36,15 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -62,37 +65,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 				"reason": "spurious entry referencing selected seq",
 			}},
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-bad-deferred-reason",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_intent_plan_bad",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_intent_plan_bad", plan)
 	}))
 	defer server.Close()
 
@@ -111,6 +84,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-normalize", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 
@@ -160,7 +134,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 		t.Fatalf("read planner rejects log: %v", err)
 	}
 	if !strings.Contains(string(rawRejects), `"provider":"openai-compat"`) ||
-		!strings.Contains(string(rawRejects), `appears in selected and deferred`) {
+		!strings.Contains(string(rawRejects), `capture_assigned_twice`) {
 		t.Fatalf("planner rejects log missing overlap record:\n%s", rawRejects)
 	}
 }
@@ -175,12 +149,15 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -194,37 +171,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 			"grouping_reason":  "intentional validation failure",
 			"deferred_reasons": buildDeferredReasons(seqs),
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-rejects-log",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_intent_plan_reject",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_intent_plan_reject", plan)
 	}))
 	defer server.Close()
 
@@ -243,6 +190,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-rejects-log", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 
@@ -289,7 +237,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 		t.Fatalf("read planner rejects log: %v", err)
 	}
 	if !strings.Contains(string(rawRejects), `"provider":"openai-compat"`) ||
-		!strings.Contains(string(rawRejects), `selected seq 999999 outside offered window`) {
+		!strings.Contains(string(rawRejects), `capture_outside_window`) {
 		t.Fatalf("planner rejects log missing expected record:\n%s", rawRejects)
 	}
 	if hits.Load() == 0 {
@@ -309,6 +257,10 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
 			return
 		}
 		plannerHits.Add(1)
@@ -332,6 +284,7 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-singleton-circuit", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 
@@ -359,7 +312,7 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
 	}
 	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'"); got != "1" {
-		t.Fatalf("planner error decisions=%s want 1 after circuit bypass", got)
+		t.Fatalf("planner error decisions=%s want only the originating provider failure", got)
 	}
 	waitFor(t, "persisted planner circuit bypass", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")

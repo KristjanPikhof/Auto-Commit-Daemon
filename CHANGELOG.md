@@ -2,6 +2,116 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fixed `acd rewrite-commits` ignoring saved repository, profile, and global
+  settings. Plan generation now uses the effective configured strategy,
+  provider, model, format, timeout, and protected credential instead of reading
+  only compatibility environment variables.
+- Isolated verification subprocess environment directories from repository and
+  Git ancestry. Temporary Git-negative tests can no longer discover the
+  candidate repository through `TMPDIR`.
+- Fixed `acd configure` appearing blocked after final approval. It now reports
+  numbered progress, exposes sanitized verification failure output, and avoids
+  delayed terminal capability replies corrupting short-terminal shell prompts.
+- Removed the regular wizard's free-form verification command question.
+  Everyday runs no project command; repository Strict Review detects a full
+  command and asks only for exact approval in the final preview.
+- Fixed Intent Everyday getting stuck in `needs_attention` after successful
+  setup. Structural verification now relies on ACD's atomicity and
+  materialization gates instead of waiting for a repository command.
+- Fixed planner fallback repeatedly rejecting hard-linked work from an
+  existing candidate. Balanced and Fast now continue or merge the persisted
+  candidate without losing dependency order or leaving it permanently waiting.
+- Fixed a hard dependency bridge joining two recent candidates. ACD now keeps
+  one canonical candidate, records the merged lineage, and can rebuild a
+  private suffix when one semantic candidate owns non-contiguous old commits.
+  Reordered candidates must be visible in the current dependency evaluation,
+  remain structurally independent, and pass exact pre-CAS verification.
+- Fixed repeated replay failures appearing as active health. Status, diagnose,
+  doctor, and events now report the bounded error, repeat count, blocked
+  capture, candidate IDs, and fallback size. Identical log lines are rate
+  limited and recovery is reported explicitly.
+- Fixed Balanced fallback splitting a source change from its exact test or
+  migration companion when the planner window ended between them. One-to-one
+  persisted companions now rejoin the candidate and use bounded repair;
+  ambiguous matches stay pending for planner review.
+
+### Added
+
+- Added global Everyday work and Maximum speed setup experiences with adaptive
+  provider reuse, first-time endpoint and model prompts, and one
+  fingerprint-bound approval. Repository setup additionally offers Strict
+  Review and `--wait`.
+- Added durable background configuration validation. Capture remains active
+  while replay and repair wait, and failed checks preserve the desired
+  revision, last-known-good runtime, sanitized output, and retry state.
+- Added Intent v2 semantic candidates, dependency-aware non-contiguous
+  grouping, explicit atomicity gates, exact candidate-tree verification, and
+  preset-aware planner fallback.
+- Added versioned Fast, Balanced, and Quality presets for Event and Intent
+  strategies. Runtime revisions retain preset identity, version, and
+  customization state.
+- Added `acd configure` for guided strategy, preset, provider, credential,
+  diff-consent, verification, repair, and activation setup. Dry-run previews
+  the complete transaction without calls, commands, writes, starts, or hook
+  changes.
+- Added protected XDG credential storage and `acd auth set|status|remove`.
+  `ACD_AI_API_KEY` remains higher priority, and secrets stay out of settings,
+  SQLite, logs, traces, status, diagnostics, and fingerprints.
+- Added bounded automatic repair for eligible private ACD commit suffixes.
+  Repair uses backup refs, atomic ref compare-and-swap, durable old-to-new
+  mappings, restart reconciliation, and strict staging and ref-containment
+  checks.
+- Added durable candidate lineage for dependency-driven merges. The v17 ledger
+  keeps source candidate status and published commit identity without storing
+  raw diffs.
+- Added a crash-recoverable self-publication journal. ACD records exact event
+  and candidate ownership before changing a branch, then can reconcile the
+  `prepared`, `git_applied`, and `completed` phases after restart.
+- Added one canonical-writer fence under the Git common directory. Linked
+  worktrees and state-directory replacements cannot start a second ACD writer,
+  and status, diagnose, and doctor report ownership, publication phase,
+  heartbeat, wake progress, and non-destructive remediation.
+- Added native Intent v2 protocols for OpenAI-compatible and capability-aware
+  subprocess providers. Legacy subprocess results remain available through
+  the reported `v1_compat` adapter.
+
+### Changed
+
+- Made bare `acd configure` a one-time global setup with Everyday and Maximum
+  Speed only. Everyday uses internal structural gates and never detects or
+  runs project tests; Strict Review and full command validation require an
+  explicit `--repo`.
+- Added fingerprint-bound global setup approvals so untouched repositories can
+  inherit reviewed provider, diff-egress, and repair permissions without
+  globally authorizing repository-controlled shell commands.
+- Existing Intent repositories migrate to `intent.balanced@3`. Missing
+  provider, diff-context, credential, or approved verification prerequisites
+  now stop replay with `needs_attention` while capture continues. ACD no longer
+  silently resumes v1 or metadata-only Intent planning.
+- Intent candidates now survive planner windows and publish in dependency
+  order. Same-path and object dependencies remain ordered, while independent
+  `A1, B1, A2` sequences can publish as `A=[1,3]` and `B=[2]` when scratch
+  materialization proves independence.
+- Balanced fallback now publishes only bounded hard-dependency components or
+  an unambiguous test/source or migration companion. Known generated-output
+  dependencies remain hard edges. Ambiguous groups, groups above 32 captures,
+  and groups above 12 paths stay pending for planner review. Import, symbol,
+  hunk, module, activity, and time similarity cannot merge fallback components.
+- Increased the default per-request AI provider timeout from 30 seconds to
+  5 minutes for slower approved endpoints. Correction retries remain bounded
+  by `intent.retry_on_invalid`.
+- Codex Stop now records `acd touch --soft-boundary`. Logical flushes remain
+  hard evaluation boundaries; neither boundary bypasses atomicity,
+  verification, branch, pause, Git-operation, conflict, or replay safety.
+- Repository state is now SQLite `SchemaVersion=19`. Version 18 adds the
+  immutable self-publication journal without backfilling historical commits.
+  Version 19 persists prepare-time candidate completion semantics so restart
+  recovery does not reinterpret a landed target from current settings.
+  Pre-v18 status, diagnose, and doctor reads report self-publication as
+  unavailable without migrating or writing the database.
+
 ## v2026-07-26
 
 ### Changed

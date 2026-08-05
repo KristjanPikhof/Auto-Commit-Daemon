@@ -345,6 +345,102 @@ func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanR
 	}
 }
 
+// LogRejectedIntentPlanV2 applies the same redaction, fingerprint, rotation,
+// and best-effort policy to native candidate-plan failures. The legacy numeric
+// code remains "unknown"; the bounded v2 finding code is retained in Message.
+func LogRejectedIntentPlanV2(ctx context.Context, provider string, req IntentPlanRequestV2, raw string, valErr error) {
+	_ = ctx
+	if valErr == nil {
+		return
+	}
+	intentRejectsMu.RLock()
+	w := intentRejectsWriter
+	intentRejectsMu.RUnlock()
+	if w == nil {
+		return
+	}
+	verbatim := intentRejectsRawVerbatim()
+	notifyIntentRejectsRawOptIn(verbatim)
+	rec := IntentRejectedPlan{
+		Provider:    provider,
+		OfferedSeqs: offeredSeqsV2(req),
+		Code:        IntentPlanValidationUnknown,
+		Message:     SanitizePlannerError(valErr.Error()),
+	}
+	rec.RawResponseSizeBytes = len(raw)
+	if raw != "" {
+		sum := sha256.Sum256([]byte(raw))
+		rec.RawResponseSHA256 = hex.EncodeToString(sum[:])
+	}
+	rec.ParsedPlanSummary = parsedPlanV2SummaryFromRaw(raw)
+	if verbatim {
+		rec.RawResponse = raw
+	} else {
+		rec.RawResponseRedacted = true
+	}
+	if _, err := w.Append(rec); err != nil {
+		slog.Warn("intent planner v2: rejects log write failed",
+			slog.String("provider", provider),
+			slog.String("path", w.Path()),
+			slog.String("err", err.Error()),
+		)
+	}
+}
+
+func parsedPlanV2SummaryFromRaw(raw string) *IntentRejectedPlanPlanSummary {
+	if raw == "" {
+		return nil
+	}
+	var plan IntentPlanV2
+	var envelope struct {
+		IntentPlanV2 json.RawMessage `json:"intent_plan_v2"`
+		Choices      []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+				FunctionCall *struct {
+					Arguments string `json:"arguments"`
+				} `json:"function_call"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err == nil {
+		switch {
+		case len(envelope.IntentPlanV2) > 0:
+			_ = json.Unmarshal(envelope.IntentPlanV2, &plan)
+		case len(envelope.Choices) > 0 &&
+			len(envelope.Choices[0].Message.ToolCalls) > 0:
+			_ = json.Unmarshal(
+				[]byte(envelope.Choices[0].Message.ToolCalls[0].Function.Arguments),
+				&plan,
+			)
+		case len(envelope.Choices) > 0 &&
+			envelope.Choices[0].Message.FunctionCall != nil:
+			_ = json.Unmarshal(
+				[]byte(envelope.Choices[0].Message.FunctionCall.Arguments),
+				&plan,
+			)
+		default:
+			_ = json.Unmarshal([]byte(raw), &plan)
+		}
+	}
+	if len(plan.Candidates) == 0 {
+		return nil
+	}
+	summary := &IntentRejectedPlanPlanSummary{}
+	for _, candidate := range plan.Candidates {
+		if candidate.Readiness == IntentCandidateReady {
+			summary.SelectedCount += len(candidate.SelectedSeqs)
+		} else {
+			summary.DeferredCount += len(candidate.SelectedSeqs)
+		}
+	}
+	return summary
+}
+
 // intentRejectsRawVerbatim reports whether the operator opted in to
 // persisting the verbatim model RawResponse in the rejects log via
 // ACD_INTENT_REJECTS_RAW. The default (unset / 0 / false / no / off) keeps

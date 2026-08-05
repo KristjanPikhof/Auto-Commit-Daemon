@@ -568,6 +568,8 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 			"last_replay_conflict",
 			"last_replay_conflict_legacy",
 			"last_replay_error",
+			"replay.error_repeat_count",
+			"replay.error_last_seen_ts",
 		} {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
 				return zero, fmt.Errorf("state: clear recovery meta %s: %w", key, err)

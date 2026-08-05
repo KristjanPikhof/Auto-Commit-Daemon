@@ -85,6 +85,11 @@ func runAccessibleBackend(ctx context.Context, backend Backend, opts Options) er
 	values := finalizeAccessibleValues(newAccessibleValues(draft))
 	values.Action = action
 	switch action {
+	case "mode":
+		values, err = runAccessibleMode(ctx, draft, snapshot.Fields, in, out)
+		if err == nil {
+			values.Confirm, err = ConfirmAccessibleAction(ctx, action, in, out)
+		}
 	case "quick":
 		values, err = RunAccessibleQuick(ctx, draft, in, out)
 		if err == nil {
@@ -103,7 +108,7 @@ func runAccessibleBackend(ctx context.Context, backend Backend, opts Options) er
 	if err != nil {
 		return fmt.Errorf("settings accessible: %s", safeText(err.Error()))
 	}
-	if action != "quick" && action != "advanced" {
+	if action != "mode" && action != "quick" && action != "advanced" {
 		values.Confirm, err = ConfirmAccessibleAction(ctx, action, in, out)
 	}
 	if err != nil {
@@ -246,7 +251,7 @@ func accessibleWithConfirmations[T any](ctx context.Context, backend Backend, in
 func actionableSettingsError(err error) string {
 	clean := safeText(err.Error())
 	if strings.Contains(strings.ToLower(clean), "missing api key") {
-		return "API key is not set; set ACD_AI_API_KEY in the environment, then rerun acd settings (the value is never stored)"
+		return "API key is not set; run acd auth set, or set ACD_AI_API_KEY (environment values are never stored), then rerun acd settings"
 	}
 	return clean
 }

@@ -222,6 +222,221 @@ func TestReplay_ReconcilesLiveIndexForTrackedChanges(t *testing.T) {
 	}
 }
 
+func TestSelectIntentWindowV2ActivityBoundaryTriggersEvaluation(t *testing.T) {
+	now := time.Now()
+	pending := []state.CaptureEvent{{
+		Seq:        1,
+		CapturedTS: float64(now.UnixNano()) / 1e9,
+	}}
+	baseConfig := intentReplayConfig{
+		window:          20,
+		minPending:      20,
+		settleWindow:    30 * time.Second,
+		maxPendingAge:   3 * time.Minute,
+		deferLimit:      2,
+		candidateMode:   true,
+		bypassBatchWait: false,
+	}
+
+	for _, kind := range []string{state.IntentBoundarySoft, state.IntentBoundaryHard} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			if _, err := state.AppendIntentActivityBoundary(
+				context.Background(), f.db, state.IntentActivityBoundary{
+					Kind: kind, Source: "test_" + kind,
+				},
+			); err != nil {
+				t.Fatalf("append boundary: %v", err)
+			}
+
+			window, forced, reason, err := selectIntentWindow(
+				context.Background(), f.db, pending, baseConfig)
+			if err != nil {
+				t.Fatalf("selectIntentWindow: %v", err)
+			}
+			if len(window) != 1 || forced || reason != "" {
+				t.Fatalf("boundary window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+
+			legacy := baseConfig
+			legacy.candidateMode = false
+			window, forced, reason, err = selectIntentWindow(
+				context.Background(), f.db, pending, legacy)
+			if err != nil {
+				t.Fatalf("legacy selectIntentWindow: %v", err)
+			}
+			if len(window) != 0 || forced ||
+				reason != "skipped_due_intent_batch_wait" {
+				t.Fatalf("legacy window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+		})
+	}
+}
+
+func TestReplayV2ConsumesBoundaryWhenBoundaryPassHasNoWork(t *testing.T) {
+	for _, kind := range []string{state.IntentBoundarySoft, state.IntentBoundaryHard} {
+		t.Run(kind, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			if _, err := state.AppendIntentActivityBoundary(
+				ctx, f.db, state.IntentActivityBoundary{
+					Kind: kind, Source: "empty_pass_" + kind,
+				},
+			); err != nil {
+				t.Fatalf("append boundary: %v", err)
+			}
+
+			if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+				GitDir:         f.gitDir,
+				CommitStrategy: ai.CommitStrategyIntent,
+				IntentPreset:   "balanced",
+			}); err != nil {
+				t.Fatalf("empty Replay: %v", err)
+			}
+			boundaries, err := state.PendingIntentActivityBoundaries(ctx, f.db, 0, 10)
+			if err != nil {
+				t.Fatalf("pending boundaries: %v", err)
+			}
+			if len(boundaries) != 0 {
+				t.Fatalf("empty pass left stale boundaries: %+v", boundaries)
+			}
+
+			now := time.Now()
+			window, forced, reason, err := selectIntentWindow(
+				ctx, f.db,
+				[]state.CaptureEvent{{
+					Seq:        1,
+					CapturedTS: float64(now.UnixNano()) / 1e9,
+				}},
+				intentReplayConfig{
+					window: 20, minPending: 20,
+					settleWindow:  30 * time.Second,
+					maxPendingAge: 3 * time.Minute,
+					deferLimit:    2,
+					candidateMode: true,
+				},
+			)
+			if err != nil {
+				t.Fatalf("later selectIntentWindow: %v", err)
+			}
+			if len(window) != 0 || forced ||
+				reason != "skipped_due_intent_batch_wait" {
+				t.Fatalf("later window=%+v forced=%v reason=%q",
+					window, forced, reason)
+			}
+		})
+	}
+}
+
+func TestSelectIntentWindowIgnoresBoundaryOlderThanCaptures(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	boundary, err := state.AppendIntentActivityBoundary(
+		ctx, f.db, state.IntentActivityBoundary{
+			Kind: state.IntentBoundarySoft, Source: "stopped_daemon",
+		},
+	)
+	if err != nil {
+		t.Fatalf("append boundary: %v", err)
+	}
+	pending := []state.CaptureEvent{{
+		Seq:        1,
+		CapturedTS: boundary.CreatedTS + 1,
+	}}
+	cfg := intentReplayConfig{
+		window: 20, minPending: 20,
+		settleWindow:  30 * time.Second,
+		maxPendingAge: 3 * time.Minute,
+		deferLimit:    2,
+		candidateMode: true,
+	}
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending, cfg)
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if len(window) != 0 || forced ||
+		reason != "skipped_due_intent_batch_wait" {
+		t.Fatalf("window=%+v forced=%v reason=%q", window, forced, reason)
+	}
+	boundaries, err := state.PendingIntentActivityBoundaries(ctx, f.db, 0, 10)
+	if err != nil {
+		t.Fatalf("pending boundaries: %v", err)
+	}
+	if len(boundaries) != 0 {
+		t.Fatalf("stale boundary remains pending: %+v", boundaries)
+	}
+}
+
+func TestSelectIntentWindowBoundaryExcludesLaterCaptures(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	boundary, err := state.AppendIntentActivityBoundary(
+		ctx, f.db, state.IntentActivityBoundary{
+			Kind: state.IntentBoundarySoft, Source: "turn_end",
+		},
+	)
+	if err != nil {
+		t.Fatalf("append boundary: %v", err)
+	}
+	pending := []state.CaptureEvent{
+		{Seq: 1, CapturedTS: boundary.CreatedTS - 1},
+		{Seq: 2, CapturedTS: boundary.CreatedTS + 1},
+	}
+	window, forced, reason, err := selectIntentWindow(
+		ctx, f.db, pending, intentReplayConfig{
+			window: 20, minPending: 20,
+			settleWindow:  30 * time.Second,
+			maxPendingAge: 3 * time.Minute,
+			deferLimit:    2,
+			candidateMode: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if len(window) != 1 || window[0].Seq != 1 || forced || reason != "" {
+		t.Fatalf("window=%+v forced=%v reason=%q", window, forced, reason)
+	}
+}
+
+func TestPruneConsumedIntentActivityBoundariesKeepsBoundedTail(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	var lastEpoch int64
+	total := retainedConsumedIntentActivityBoundaries + 17
+	for i := 0; i < total; i++ {
+		boundary, err := state.AppendIntentActivityBoundary(
+			ctx, f.db, state.IntentActivityBoundary{
+				Kind: state.IntentBoundarySoft, Source: "prune_test",
+			},
+		)
+		if err != nil {
+			t.Fatalf("append boundary %d: %v", i, err)
+		}
+		lastEpoch = boundary.Epoch
+	}
+	if _, err := state.ConsumeIntentActivityBoundaries(
+		ctx, f.db, lastEpoch, float64(time.Now().UnixNano())/1e9,
+	); err != nil {
+		t.Fatalf("consume boundaries: %v", err)
+	}
+	if err := pruneConsumedIntentActivityBoundaries(ctx, f.db); err != nil {
+		t.Fatalf("prune boundaries: %v", err)
+	}
+	var got int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM intent_activity_boundaries`,
+	).Scan(&got); err != nil {
+		t.Fatalf("count boundaries: %v", err)
+	}
+	if got != retainedConsumedIntentActivityBoundaries {
+		t.Fatalf("retained boundaries=%d want %d",
+			got, retainedConsumedIntentActivityBoundaries)
+	}
+}
+
 func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -1442,6 +1657,9 @@ func TestReplay_ParallelCreate_NoEmptyCommit(t *testing.T) {
 			t.Fatalf("no idempotent publish trace decision fired; events=%+v", trace.Events())
 		}
 	}
+	if journals := loadSelfPublicationRows(t, ctx, f.db); len(journals) != 0 {
+		t.Fatalf("handled-external path created self-publication: %+v", journals)
+	}
 }
 
 func TestReplay_NoOpTreeRecordsHandledExternalDecision(t *testing.T) {
@@ -1492,6 +1710,9 @@ func TestReplay_NoOpTreeRecordsHandledExternalDecision(t *testing.T) {
 		t.Fatalf("commit count changed from %d to %d; no-op tree should not create a commit", beforeCount, got)
 	}
 	assertReplayDecision(t, ctx, f.db, seq, state.DecisionKindHandledExternal, "already_published_no_op_tree")
+	if journals := loadSelfPublicationRows(t, ctx, f.db); len(journals) != 0 {
+		t.Fatalf("no-op tree created self-publication: %+v", journals)
+	}
 }
 
 // TestReplay_DeleteIdempotent_PathReplacedByDirectory_StillBlocks
@@ -3049,6 +3270,31 @@ func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
 	if !hasFallback {
 		t.Fatalf("message_quality_fallback decision missing: %+v", decisions)
 	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 ||
+		journals[0].phase != state.SelfPublicationCompleted ||
+		journals[0].target != sum.SelfPublicationTargetOID {
+		t.Fatalf("message-quality journals=%+v summary=%+v", journals, sum)
+	}
+	commits := revListCount(t, ctx, f.dir, "HEAD")
+	f.cctx.BaseHead = sum.BaseHead
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        10,
+		IntentMinPending:    3,
+		IntentMaxPendingAge: time.Hour,
+		IntentDeferLimit:    1,
+	}); err != nil {
+		t.Fatalf("second Replay: %v", err)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != commits {
+		t.Fatalf("message-quality retry commits=%d want %d", got, commits)
+	}
+	if got := loadSelfPublicationRows(t, ctx, f.db); len(got) != 1 {
+		t.Fatalf("message-quality retry journals=%+v want one", got)
+	}
 }
 
 func TestReplay_IntentStrategyBatchWaitSeesOnlyBarrierVisiblePending(t *testing.T) {
@@ -3249,6 +3495,834 @@ func TestReplay_IntentStrategyPublishesPartitionGroupsSequentially(t *testing.T)
 	}
 	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: first capture is one intent")
 	assertReplayDecision(t, ctx, f.db, pending[1].Seq, state.DecisionKindCommitted, "intent_group: second capture is independent")
+}
+
+func TestPublishIntentJournalCompletesExactMembership(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "journal-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "journal-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("PendingEvents=(%d,%v) want (2,nil)", len(pending), err)
+	}
+	planner := &recordingIntentPlanner{plan: ai.IntentPlan{
+		SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+		Subject:        "Publish journal members",
+		GroupingReason: "exact journal membership",
+	}}
+	var checkpoints []SelfPublicationCheckpointEvent
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 2,
+		SelfPublicationCheckpoint: func(
+			event SelfPublicationCheckpointEvent,
+		) error {
+			checkpoints = append(checkpoints, event)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || sum.SelfPublicationTargetOID == "" {
+		t.Fatalf("summary=%+v want exact journal target and 2 events", sum)
+	}
+	assertSelfPublicationCheckpoints(t, checkpoints,
+		SelfPublicationBeforeCAS, SelfPublicationAfterCAS,
+		SelfPublicationBeforeCompletion, SelfPublicationAfterCompletion)
+	if got := selfPublicationEventSeqs(checkpoints[0].Members); !reflect.DeepEqual(
+		got, []int64{pending[0].Seq, pending[1].Seq}) {
+		t.Fatalf("journal members=%v want exact pending events", got)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 || journals[0].phase != state.SelfPublicationCompleted ||
+		journals[0].source != f.cctx.BaseHead ||
+		journals[0].target != sum.SelfPublicationTargetOID ||
+		journals[0].members != 2 {
+		t.Fatalf("journals=%+v summary=%+v", journals, sum)
+	}
+	for _, event := range pending {
+		assertReplayDecision(t, ctx, f.db, event.Seq,
+			state.DecisionKindCommitted,
+			"intent_group: exact journal membership")
+	}
+}
+
+func TestPublishIntentV2JournalCompletesCandidateOwnership(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "candidate-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "candidate-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("PendingEvents=(%d,%v) want (2,nil)", len(pending), err)
+	}
+	const candidateID = "journal-candidate"
+	candidateEvents := make([]state.IntentCandidateEvent, 0, len(pending))
+	items := make([]intentReplayItem, 0, len(pending))
+	for _, event := range pending {
+		ops, err := state.LoadCaptureOps(ctx, f.db, event.Seq)
+		if err != nil {
+			t.Fatalf("LoadCaptureOps(%d): %v", event.Seq, err)
+		}
+		items = append(items, intentReplayItem{
+			event: event, ops: ops, candidateID: candidateID,
+		})
+		candidateEvents = append(candidateEvents, state.IntentCandidateEvent{
+			EventSeq: event.Seq, EventRole: "code",
+		})
+	}
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID: candidateID, BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateReady,
+		Purpose:          "journal exact candidate ownership",
+		Readiness:        state.IntentReadinessReady,
+		Events:           candidateEvents,
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+	indexFile := filepath.Join(t.TempDir(), "candidate-index")
+	if err := git.ReadTree(ctx, f.dir, indexFile, f.cctx.BaseHead); err != nil {
+		t.Fatalf("ReadTree: %v", err)
+	}
+	parentTree, err := resolveTreeOID(ctx, f.dir, f.cctx.BaseHead)
+	if err != nil {
+		t.Fatalf("resolveTreeOID: %v", err)
+	}
+	plan := ai.IntentPlan{
+		SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
+		Subject:        "Publish exact candidate",
+		GroupingReason: "candidate ownership is journaled atomically",
+	}
+	sum, err := publishIntentSelection(
+		ctx, f.dir, f.db, f.cctx,
+		ReplayOpts{
+			GitDir: f.gitDir, IntentRepairEnabled: true,
+			IntentRepairHorizon: time.Hour,
+		},
+		indexFile, items, plan, f.cctx.BaseHead, parentTree, ReplaySummary{},
+	)
+	if err != nil {
+		t.Fatalf("publishIntentSelection: %v", err)
+	}
+	candidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidateID)
+	if err != nil || !ok {
+		t.Fatalf("IntentCandidateByID=(%+v,%v,%v)", candidate, ok, err)
+	}
+	if candidate.Status != state.IntentCandidateSoftPublished ||
+		!candidate.PublishedCommitOID.Valid ||
+		candidate.PublishedCommitOID.String != sum.SelfPublicationTargetOID ||
+		!candidate.SoftPublicationDeadline.Valid {
+		t.Fatalf("candidate=%+v summary=%+v", candidate, sum)
+	}
+	rows, err := f.db.SQL().QueryContext(ctx, `
+SELECT event_seq, candidate_id
+FROM self_publication_members
+ORDER BY ord`)
+	if err != nil {
+		t.Fatalf("query self-publication members: %v", err)
+	}
+	defer rows.Close()
+	var gotSeqs []int64
+	for rows.Next() {
+		var seq int64
+		var gotCandidate sql.NullString
+		if err := rows.Scan(&seq, &gotCandidate); err != nil {
+			t.Fatalf("scan member: %v", err)
+		}
+		if !gotCandidate.Valid || gotCandidate.String != candidateID {
+			t.Fatalf("candidate ownership=%+v want %q",
+				gotCandidate, candidateID)
+		}
+		gotSeqs = append(gotSeqs, seq)
+	}
+	if want := []int64{pending[0].Seq, pending[1].Seq}; !reflect.DeepEqual(gotSeqs, want) {
+		t.Fatalf("member seqs=%v want %v", gotSeqs, want)
+	}
+}
+
+func TestPublishIntentV2JournalSkippedForHandledExternalAndNoOp(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		external bool
+	}{
+		{name: "no_op_tree"},
+		{name: "handled_external", external: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			base := f.cctx.BaseHead
+			blob, err := git.HashObjectStdin(ctx, f.dir, []byte("same\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := state.CaptureEvent{
+				BranchRef: f.cctx.BranchRef, BranchGeneration: 1,
+				BaseHead: base, Operation: "create", Path: "external.txt",
+				Fidelity: "rescan",
+			}
+			op := state.CaptureOp{
+				Op: "create", Path: "external.txt",
+				AfterOID: sql.NullString{String: blob, Valid: true},
+				AfterMode: sql.NullString{
+					String: git.RegularFileMode, Valid: true,
+				},
+				Fidelity: "rescan",
+			}
+			if !tc.external {
+				base = commitSingleFileTree(
+					t, ctx, f.dir, "external.txt", blob, "seed no-op")
+				if err := git.UpdateRef(
+					ctx, f.dir, f.cctx.BranchRef, base, "",
+				); err != nil {
+					t.Fatal(err)
+				}
+				event.BaseHead = base
+				event.Operation = "modify"
+				op.Op = "modify"
+				op.BeforeOID = op.AfterOID
+				op.BeforeMode = op.AfterMode
+			}
+			seq, err := state.AppendCaptureEvent(
+				ctx, f.db, event, []state.CaptureOp{op})
+			if err != nil {
+				t.Fatalf("AppendCaptureEvent: %v", err)
+			}
+			event.Seq = seq
+			candidateID := "candidate-" + tc.name
+			if err := state.SaveIntentCandidate(ctx, f.db,
+				state.IntentCandidate{
+					ID: candidateID, BranchRef: f.cctx.BranchRef,
+					BranchGeneration: 1, Status: state.IntentCandidateReady,
+					Purpose:   "handled without self publication",
+					Readiness: state.IntentReadinessReady,
+					Events: []state.IntentCandidateEvent{{
+						EventSeq: seq, EventRole: "code",
+					}},
+				}); err != nil {
+				t.Fatalf("SaveIntentCandidate: %v", err)
+			}
+			parent := base
+			if tc.external {
+				externalIndex := filepath.Join(t.TempDir(), "external-index")
+				if err := git.ReadTree(
+					ctx, f.dir, externalIndex, base); err != nil {
+					t.Fatal(err)
+				}
+				tree, err := applyOpsAndWriteTree(
+					ctx, f.dir, externalIndex, []state.CaptureOp{op})
+				if err != nil {
+					t.Fatal(err)
+				}
+				parent, err = git.CommitTree(
+					ctx, f.dir, tree, "external publish", base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := git.UpdateRef(
+					ctx, f.dir, f.cctx.BranchRef, parent, base,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			activeCtx := f.cctx
+			activeCtx.BaseHead = parent
+			indexFile := filepath.Join(t.TempDir(), "publish-index")
+			if err := git.ReadTree(
+				ctx, f.dir, indexFile, parent); err != nil {
+				t.Fatal(err)
+			}
+			parentTree, err := resolveTreeOID(ctx, f.dir, parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum, err := publishIntentSelection(
+				ctx, f.dir, f.db, activeCtx, ReplayOpts{}, indexFile,
+				[]intentReplayItem{{
+					event: event, ops: []state.CaptureOp{op},
+					candidateID: candidateID,
+				}},
+				ai.IntentPlan{
+					SelectedSeqs: []int64{seq}, Subject: "Handled externally",
+					GroupingReason: tc.name,
+				},
+				parent, parentTree, ReplaySummary{},
+			)
+			if err != nil {
+				t.Fatalf("publishIntentSelection: %v", err)
+			}
+			candidate, ok, err := state.IntentCandidateByID(
+				ctx, f.db, candidateID)
+			if err != nil || !ok ||
+				candidate.Status != state.IntentCandidatePublished ||
+				!candidate.PublishedCommitOID.Valid ||
+				candidate.PublishedCommitOID.String != parent {
+				t.Fatalf("candidate=(%+v,%v,%v) parent=%s",
+					candidate, ok, err, parent)
+			}
+			if sum.SelfPublicationTargetOID != "" ||
+				len(loadSelfPublicationRows(t, ctx, f.db)) != 0 {
+				t.Fatalf("non-self publication created journal: %+v", sum)
+			}
+			wantCommits := 1
+			if tc.external {
+				wantCommits = 2
+			}
+			if got := revListCount(t, ctx, f.dir, "HEAD"); got != wantCommits {
+				t.Fatalf("commit count=%d want %d existing commits",
+					got, wantCommits)
+			}
+		})
+	}
+}
+
+func TestMultiGroupIntentPublicationChainsJournalTargets(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "group-a.txt", "a\n")
+	captureOnePendingFile(t, ctx, f, "group-b.txt", "b\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("PendingEvents=(%d,%v) want (2,nil)", len(pending), err)
+	}
+	planner := &recordingIntentPlanner{plan: ai.IntentPlan{
+		CommitGroups: []ai.IntentCommitGroup{
+			{
+				SelectedSeqs: []int64{pending[0].Seq},
+				Subject:      "Publish first group", GroupingReason: "first group",
+			},
+			{
+				SelectedSeqs: []int64{pending[1].Seq},
+				Subject:      "Publish second group", GroupingReason: "second group",
+			},
+		},
+	}}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:           f.gitDir,
+		CommitStrategy:   ai.CommitStrategyIntent,
+		IntentPlanner:    planner,
+		IntentWindow:     10,
+		IntentMinPending: 2,
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 2 {
+		t.Fatalf("journals=%+v want two completed groups", journals)
+	}
+	if journals[0].phase != state.SelfPublicationCompleted ||
+		journals[1].phase != state.SelfPublicationCompleted ||
+		journals[0].source != f.cctx.BaseHead ||
+		journals[1].source != journals[0].target ||
+		sum.SelfPublicationTargetOID != journals[1].target {
+		t.Fatalf("non-linear journal chain=%+v summary=%+v", journals, sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 3 {
+		t.Fatalf("commit count=%d want seed+2 journaled groups", got)
+	}
+}
+
+func TestSelfPublicationCASReportedCancellationAfterAppliedCompletes(t *testing.T) {
+	restoreReplayRefSeams(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "applied-cancel.txt", "landed\n")
+	original := replayUpdateRef
+	replayUpdateRef = func(
+		ctx context.Context,
+		repoRoot, ref, newOID, oldOID string,
+	) error {
+		if err := original(ctx, repoRoot, ref, newOID, oldOID); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	var checkpoints []SelfPublicationCheckpointEvent
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir,
+		SelfPublicationCheckpoint: func(
+			event SelfPublicationCheckpointEvent,
+		) error {
+			checkpoints = append(checkpoints, event)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Replay must prove applied target after CAS error: %v", err)
+	}
+	assertSelfPublicationCheckpoints(t, checkpoints,
+		SelfPublicationBeforeCAS, SelfPublicationAfterCAS,
+		SelfPublicationBeforeCompletion, SelfPublicationAfterCompletion)
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 || journals[0].phase != state.SelfPublicationCompleted ||
+		journals[0].target != sum.SelfPublicationTargetOID {
+		t.Fatalf("journals=%+v summary=%+v", journals, sum)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+		t.Fatalf("commit count=%d want no duplicate after reported cancellation", got)
+	}
+}
+
+func TestSelfPublicationCancellationAfterCASLeavesRecoverableJournal(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "recoverable-cancel.txt", "landed\n")
+	injected := errors.New("cancel after literal HEAD CAS")
+	var checkpoints []SelfPublicationCheckpointEvent
+	_, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir,
+		SelfPublicationCheckpoint: func(
+			event SelfPublicationCheckpointEvent,
+		) error {
+			checkpoints = append(checkpoints, event)
+			if event.Checkpoint == SelfPublicationAfterCAS {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("Replay error=%v want injected post-CAS cancellation", err)
+	}
+	assertSelfPublicationCheckpoints(t, checkpoints,
+		SelfPublicationBeforeCAS, SelfPublicationAfterCAS)
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 ||
+		journals[0].phase != state.SelfPublicationPrepared {
+		t.Fatalf("journals=%+v want prepared target after raw CAS crash", journals)
+	}
+	var eventState string
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE path='recoverable-cancel.txt'`,
+	).Scan(&eventState); err != nil || eventState != state.EventStatePending {
+		t.Fatalf("event state=(%q,%v) want pending recovery owner",
+			eventState, err)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+		t.Fatalf("commit count=%d want exactly one applied target", got)
+	}
+}
+
+func TestSelfPublicationCancellationAtCompletionBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		checkpoint SelfPublicationCheckpoint
+		wantPhase  string
+		wantEvent  string
+	}{
+		{
+			name: "before_completion", checkpoint: SelfPublicationBeforeCompletion,
+			wantPhase: state.SelfPublicationGitApplied,
+			wantEvent: state.EventStatePending,
+		},
+		{
+			name: "after_completion", checkpoint: SelfPublicationAfterCompletion,
+			wantPhase: state.SelfPublicationCompleted,
+			wantEvent: state.EventStatePublished,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+				t.Fatalf("BootstrapShadow: %v", err)
+			}
+			captureOnePendingFile(t, ctx, f, "completion-"+tc.name+".txt", "landed\n")
+			injected := fmt.Errorf("cancel at %s", tc.checkpoint)
+			_, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+				GitDir: f.gitDir,
+				SelfPublicationCheckpoint: func(
+					event SelfPublicationCheckpointEvent,
+				) error {
+					if event.Checkpoint == tc.checkpoint {
+						return injected
+					}
+					return nil
+				},
+			})
+			if !errors.Is(err, injected) {
+				t.Fatalf("Replay error=%v want %v", err, injected)
+			}
+			journals := loadSelfPublicationRows(t, ctx, f.db)
+			if len(journals) != 1 || journals[0].phase != tc.wantPhase {
+				t.Fatalf("journals=%+v want phase %s", journals, tc.wantPhase)
+			}
+			var (
+				eventSeq   int64
+				eventState string
+			)
+			if err := f.db.SQL().QueryRowContext(ctx,
+				`SELECT seq, state FROM capture_events WHERE path=?`,
+				"completion-"+tc.name+".txt",
+			).Scan(&eventSeq, &eventState); err != nil ||
+				eventState != tc.wantEvent {
+				t.Fatalf("event state=(%q,%v) want %q",
+					eventState, err, tc.wantEvent)
+			}
+			if tc.checkpoint == SelfPublicationAfterCompletion {
+				decisions, err := state.DecisionsForEvent(
+					ctx, f.db, eventSeq, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, decision := range decisions {
+					if decision.Kind == state.DecisionKindCommitted {
+						t.Fatalf("derived decision crossed injected completion crash: %+v",
+							decisions)
+					}
+				}
+			}
+			if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+				t.Fatalf("commit count=%d want exactly one target", got)
+			}
+		})
+	}
+}
+
+func TestSelfPublicationCASExhaustionAbandonsAttempt(t *testing.T) {
+	restoreReplayRefSeams(t)
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "cas-exhausted.txt", "not landed\n")
+	replayUpdateRef = func(
+		context.Context, string, string, string, string,
+	) error {
+		return errors.New("reference is at unchanged but expected stale")
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx,
+		ReplayOpts{GitDir: f.gitDir})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Conflicts != 1 || sum.Published != 0 {
+		t.Fatalf("summary=%+v want terminal CAS conflict", sum)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 ||
+		journals[0].phase != state.SelfPublicationAbandoned {
+		t.Fatalf("journals=%+v want abandoned non-applied attempt", journals)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 1 {
+		t.Fatalf("commit count=%d want unchanged HEAD", got)
+	}
+	if _, err := Replay(ctx, f.dir, f.db, f.cctx,
+		ReplayOpts{GitDir: f.gitDir}); err != nil {
+		t.Fatalf("second Replay: %v", err)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 1 {
+		t.Fatalf("second replay commit count=%d want no duplicate", got)
+	}
+}
+
+func TestSelfPublicationInitialSourceCompletesJournal(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "initial-source.txt", "initial\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("PendingEvents=(%d,%v) want (1,nil)", len(pending), err)
+	}
+	initialCtx := f.cctx
+	initialCtx.BaseHead = ""
+	attempt, err := prepareSelfPublication(
+		ctx, f.db, initialCtx, "", "initial-target", "initial-tree",
+		"event", []state.SelfPublicationMember{{EventSeq: pending[0].Seq}},
+		state.SelfPublicationCompletion{},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("prepareSelfPublication empty source: %v", err)
+	}
+	if attempt.journal.SourceHead != "" {
+		t.Fatalf("source head=%q want empty initial identity",
+			attempt.journal.SourceHead)
+	}
+	if err := attempt.markGitApplied(ctx, f.db); err != nil {
+		t.Fatalf("markGitApplied: %v", err)
+	}
+	if err := attempt.complete(ctx, f.db, state.SelfPublicationCompletion{
+		PublishedTS:     selfPublicationNow(),
+		CandidateStatus: state.IntentCandidatePublished,
+		BranchToken: "rev:initial-target " +
+			f.cctx.BranchRef,
+	}); err != nil {
+		t.Fatalf("complete initial self-publication: %v", err)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 || journals[0].source != "" ||
+		journals[0].phase != state.SelfPublicationCompleted {
+		t.Fatalf("initial journals=%+v", journals)
+	}
+}
+
+func TestSelfPublicationEventSwitchRetiresCandidateOwnership(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	captureOnePendingFile(t, ctx, f, "switch-to-event.txt", "event\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("PendingEvents=(%d,%v) want (1,nil)", len(pending), err)
+	}
+	const candidateID = "candidate-before-event-switch"
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID: candidateID, BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateReady,
+		Purpose:          "candidate retired by event strategy",
+		Readiness:        state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: pending[0].Seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent,
+	})
+	if err != nil {
+		t.Fatalf("Replay event switch: %v", err)
+	}
+	if sum.Published != 1 || sum.SelfPublicationTargetOID == "" {
+		t.Fatalf("summary=%+v want one event publication", sum)
+	}
+	candidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidateID)
+	if err != nil || !ok ||
+		candidate.Status != state.IntentCandidateSuperseded {
+		t.Fatalf("candidate=(%+v,%v,%v) want superseded",
+			candidate, ok, err)
+	}
+	history, err := state.IntentCandidateEventHistory(ctx, f.db, candidateID)
+	if err != nil || len(history) != 1 ||
+		history[0].MembershipState != state.IntentMembershipSuperseded {
+		t.Fatalf("candidate history=(%+v,%v) want superseded membership",
+			history, err)
+	}
+	if candidate.Readiness != state.IntentReadinessWait ||
+		candidate.SoftPublicationDeadline.Valid {
+		t.Fatalf("retired candidate readiness/deadline=%q/%+v",
+			candidate.Readiness, candidate.SoftPublicationDeadline)
+	}
+	firstUpdated := candidate.UpdatedTS
+	if err := retireIntentCandidatesForEventReplay(
+		ctx, f.db, f.cctx); err != nil {
+		t.Fatalf("repeat candidate retirement: %v", err)
+	}
+	candidate, ok, err = state.IntentCandidateByID(ctx, f.db, candidateID)
+	if err != nil || !ok || candidate.UpdatedTS != firstUpdated {
+		t.Fatalf("repeat retirement mutated terminal candidate=(%+v,%v,%v)",
+			candidate, ok, err)
+	}
+	journals := loadSelfPublicationRows(t, ctx, f.db)
+	if len(journals) != 1 ||
+		journals[0].phase != state.SelfPublicationCompleted {
+		t.Fatalf("event-switch journals=%+v", journals)
+	}
+	if got := revListCount(t, ctx, f.dir, "HEAD"); got != 2 {
+		t.Fatalf("event-switch commit count=%d want seed+1", got)
+	}
+}
+
+func TestSelfPublicationMaintenanceUsesDurableCadence(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := maintainSelfPublicationJournal(ctx, f.db); err != nil {
+		t.Fatalf("first maintenance: %v", err)
+	}
+	var firstUpdated float64
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT updated_ts FROM daemon_meta
+WHERE key=?`, metaSelfPublicationMaintainedTS).Scan(&firstUpdated); err != nil {
+		t.Fatalf("query first maintenance stamp: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := maintainSelfPublicationJournal(ctx, f.db); err != nil {
+		t.Fatalf("second maintenance: %v", err)
+	}
+	var secondUpdated float64
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT updated_ts FROM daemon_meta
+WHERE key=?`, metaSelfPublicationMaintainedTS).Scan(&secondUpdated); err != nil {
+		t.Fatalf("query second maintenance stamp: %v", err)
+	}
+	if secondUpdated != firstUpdated {
+		t.Fatalf("maintenance stamp changed within cadence: %f -> %f",
+			firstUpdated, secondUpdated)
+	}
+}
+
+func TestSelfPublicationEventSwitchPreservesRecoverableCandidate(t *testing.T) {
+	for _, phase := range []string{
+		state.SelfPublicationPrepared,
+		state.SelfPublicationGitApplied,
+	} {
+		t.Run(phase, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+				t.Fatal(err)
+			}
+			captureOnePendingFile(t, ctx, f, "recover-"+phase+".txt", "pending\n")
+			pending, err := state.PendingEvents(ctx, f.db, 0)
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("PendingEvents=(%d,%v)", len(pending), err)
+			}
+			candidateID := "candidate-" + phase
+			if err := state.SaveIntentCandidate(ctx, f.db,
+				state.IntentCandidate{
+					ID: candidateID, BranchRef: f.cctx.BranchRef,
+					BranchGeneration: f.cctx.BranchGeneration,
+					Status:           state.IntentCandidateReady,
+					Purpose:          "preserve recovery ownership",
+					Readiness:        state.IntentReadinessReady,
+					Events: []state.IntentCandidateEvent{{
+						EventSeq: pending[0].Seq, EventRole: "code",
+					}},
+				}); err != nil {
+				t.Fatal(err)
+			}
+			attempt, err := prepareSelfPublication(
+				ctx, f.db, f.cctx, f.cctx.BaseHead,
+				"recover-target-"+phase, "recover-tree-"+phase,
+				candidateID,
+				[]state.SelfPublicationMember{{
+					EventSeq: pending[0].Seq,
+					CandidateID: sql.NullString{
+						String: candidateID, Valid: true,
+					},
+				}}, state.SelfPublicationCompletion{}, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if phase == state.SelfPublicationGitApplied {
+				if err := attempt.markGitApplied(ctx, f.db); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+				GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent,
+			})
+			if !errors.Is(err, ErrSelfPublicationRecoveryRequired) {
+				t.Fatalf("Replay error=%v want recovery required", err)
+			}
+			candidate, ok, err := state.IntentCandidateByID(
+				ctx, f.db, candidateID)
+			if err != nil || !ok ||
+				candidate.Status != state.IntentCandidateReady {
+				t.Fatalf("candidate=(%+v,%v,%v) want ready", candidate, ok, err)
+			}
+			history, err := state.IntentCandidateEventHistory(
+				ctx, f.db, candidateID)
+			if err != nil || len(history) != 1 ||
+				history[0].MembershipState != state.IntentMembershipActive {
+				t.Fatalf("history=(%+v,%v) want active", history, err)
+			}
+			var eventState string
+			if err := f.db.SQL().QueryRowContext(ctx,
+				`SELECT state FROM capture_events WHERE seq=?`,
+				pending[0].Seq).Scan(&eventState); err != nil ||
+				eventState != state.EventStatePending {
+				t.Fatalf("event state=(%q,%v) want pending", eventState, err)
+			}
+			if got := revListCount(t, ctx, f.dir, "HEAD"); got != 1 {
+				t.Fatalf("commit count=%d want unchanged HEAD", got)
+			}
+		})
+	}
+}
+
+type selfPublicationRow struct {
+	id      string
+	source  string
+	target  string
+	phase   string
+	members int
+}
+
+func loadSelfPublicationRows(
+	t *testing.T,
+	ctx context.Context,
+	db *state.DB,
+) []selfPublicationRow {
+	t.Helper()
+	rows, err := db.SQL().QueryContext(ctx, `
+SELECT id, source_head, target_commit_oid, phase, member_count
+FROM self_publications
+ORDER BY created_ts, id`)
+	if err != nil {
+		t.Fatalf("query self-publications: %v", err)
+	}
+	defer rows.Close()
+	var out []selfPublicationRow
+	for rows.Next() {
+		var row selfPublicationRow
+		if err := rows.Scan(
+			&row.id, &row.source, &row.target, &row.phase, &row.members,
+		); err != nil {
+			t.Fatalf("scan self-publication: %v", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate self-publications: %v", err)
+	}
+	return out
+}
+
+func assertSelfPublicationCheckpoints(
+	t *testing.T,
+	events []SelfPublicationCheckpointEvent,
+	want ...SelfPublicationCheckpoint,
+) {
+	t.Helper()
+	got := make([]SelfPublicationCheckpoint, 0, len(events))
+	for _, event := range events {
+		got = append(got, event.Checkpoint)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("self-publication checkpoints=%v want %v", got, want)
+	}
+}
+
+func selfPublicationEventSeqs(
+	members []state.SelfPublicationMember,
+) []int64 {
+	seqs := make([]int64, 0, len(members))
+	for _, member := range members {
+		seqs = append(seqs, member.EventSeq)
+	}
+	return seqs
 }
 
 func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) {
@@ -5273,6 +6347,63 @@ func TestReplay_PerEventTimeout(t *testing.T) {
 	}
 	if len(pending) != 0 {
 		t.Fatalf("pending=%d after timeout; want 0 (event must be in a terminal state)", len(pending))
+	}
+}
+
+func TestReplay_PrepareSelfPublicationTimeoutSettlesEvent(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(f.dir, "prepare-timeout.txt"), []byte("v1\n"), 0o644,
+	); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	previousPrepare := prepareSelfPublicationState
+	prepareSelfPublicationState = func(
+		context.Context, *state.DB, state.SelfPublication,
+	) (bool, error) {
+		return false, fmt.Errorf(
+			"injected self-publication preparation timeout: %w",
+			context.DeadlineExceeded)
+	}
+	t.Cleanup(func() { prepareSelfPublicationState = previousPrepare })
+
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		MessageFn: DeterministicMessage,
+		GitDir:    f.gitDir,
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatalf("Replay returned err=%v; preparation timeout must settle in-loop", err)
+	}
+	if sum.Failed != 1 {
+		t.Fatalf("Failed=%d want 1; sum=%+v", sum.Failed, sum)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d after preparation timeout; want 0", len(pending))
+	}
+	recoverable, err := state.RecoverableSelfPublications(ctx, f.db, 10)
+	if err != nil {
+		t.Fatalf("RecoverableSelfPublications: %v", err)
+	}
+	if len(recoverable) != 0 {
+		t.Fatalf("recoverable self-publications=%d after rolled-back preparation; want 0",
+			len(recoverable))
 	}
 }
 

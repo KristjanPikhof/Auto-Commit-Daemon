@@ -1063,7 +1063,13 @@ SET status = CASE WHEN status = 'blocked_conflict' THEN 'ok' ELSE status END,
 WHERE id = 1`, nowSec); err != nil {
 		return fmt.Errorf("acd fix: clear publish_state barrier: %w", err)
 	}
-	for _, key := range []string{"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error"} {
+	for _, key := range []string{
+		"last_replay_conflict",
+		"last_replay_conflict_legacy",
+		"last_replay_error",
+		"replay.error_repeat_count",
+		"replay.error_last_seen_ts",
+	} {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
 			return fmt.Errorf("acd fix: clear daemon_meta %s: %w", key, err)
 		}

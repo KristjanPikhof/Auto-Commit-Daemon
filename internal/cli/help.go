@@ -10,6 +10,7 @@ Primary controls:
   acd              Show one read-only health classification and next action
   acd on           Enable this repo and ensure its daemon is running
   acd off          Durably disable this repo while preserving state
+  acd configure    Guided strategy, preset, provider, and safety setup
   acd settings     Inspect, test, and safely activate configuration
   acd status       Show the detailed current-repo snapshot
   acd setup        Print the one-time harness install snippet
@@ -25,6 +26,7 @@ Support and recovery:
   acd fix          Preview or apply advanced recovery actions
 
 Advanced:
+  acd auth         Manage the protected provider credential
   acd repo         Manage explicit registration and lifecycle details
   acd logs         Read raw daemon logs
   acd pause        Pause capture and replay for repository surgery

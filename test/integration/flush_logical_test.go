@@ -35,12 +35,14 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 	// Force intent strategy with a min_pending high enough that a single
 	// edit cannot trip the count gate — the only path to a commit is via
 	// the bypass that flush --logical enqueues.
-	env = envWith(env,
+	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_MIN_PENDING=10",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_WINDOW=10",
-	)
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	env = envWith(env, extra...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

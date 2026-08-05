@@ -101,7 +101,7 @@ func (b *ServiceBackend) confirmationError(values []ai.ConfirmationRequirement, 
 	b.mu.Lock()
 	b.pendingConfirmDraft = draftIdentity(clean)
 	b.mu.Unlock()
-	return newConfirmationRequiredError(values)
+	return newConfirmationRequiredError(values, clean)
 }
 
 func (b *ServiceBackend) projectConfirmationError(err error, clean map[string]string) error {
@@ -335,7 +335,9 @@ func (b *ServiceBackend) SelectProfile(ctx context.Context, profile string) (App
 func projectSnapshot(s settings.Snapshot) Snapshot {
 	out := Snapshot{ActiveRevision: s.AppliedRevisionID, DesiredRevision: s.DesiredRevisionID,
 		AppliedRevision: s.AppliedRevisionID, LastKnownGood: s.LastKnownGoodRevisionID,
-		PendingSince: s.PendingSince, PendingError: safeText(s.PendingError), DaemonRunning: s.DaemonRunning,
+		PresetID: safeText(s.PresetID), PresetVersion: s.PresetVersion,
+		PresetCustomized: s.PresetCustomized,
+		PendingSince:     s.PendingSince, PendingError: safeText(s.PendingError), DaemonRunning: s.DaemonRunning,
 		PendingStatus:   safeText(s.PendingStatus),
 		SavedGeneration: s.SavedGeneration, Profile: safeText(s.Profile)}
 	for _, profile := range s.Profiles {
@@ -432,15 +434,17 @@ func draftIdentity(draft map[string]string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func newConfirmationRequiredError(values []ai.ConfirmationRequirement) *ConfirmationRequiredError {
+func newConfirmationRequiredError(values []ai.ConfirmationRequirement, draft map[string]string) *ConfirmationRequiredError {
 	missing := make([]ConfirmationRequirement, 0, len(values))
 	for _, value := range values {
-		missing = append(missing, ConfirmationRequirement{ID: string(value), Label: confirmationLabel(value)})
+		missing = append(missing, ConfirmationRequirement{
+			ID: string(value), Label: confirmationLabel(value, draft),
+		})
 	}
 	return &ConfirmationRequiredError{Missing: missing}
 }
 
-func confirmationLabel(value ai.ConfirmationRequirement) string {
+func confirmationLabel(value ai.ConfirmationRequirement, draft map[string]string) string {
 	switch value {
 	case ai.ConfirmationEndpointCredentials:
 		return "send credentials to a non-default endpoint"
@@ -448,6 +452,20 @@ func confirmationLabel(value ai.ConfirmationRequirement) string {
 		return "execute the configured provider subprocess"
 	case ai.ConfirmationDiffEgress:
 		return "allow redacted repository diff egress"
+	case ai.ConfirmationVerificationCommand:
+		mode := draft[config.FieldIntentVerification]
+		command := draft[config.FieldVerificationFastCommand]
+		if mode == "full" {
+			command = draft[config.FieldVerificationFullCommand]
+		}
+		return "run the exact " + safeText(mode) + " verification command: " +
+			safePreviewValue(command, 256)
+	case ai.ConfirmationIntentRepair:
+		return "automatically repair eligible recent ACD commits within " +
+			safePreviewValue(draft[config.FieldIntentRepairHorizon], 32) +
+			" and at most " +
+			safePreviewValue(draft[config.FieldIntentRepairMaxCommits], 8) +
+			" commits"
 	default:
 		return "approve an unknown provider risk"
 	}
@@ -456,7 +474,9 @@ func confirmationLabel(value ai.ConfirmationRequirement) string {
 func aiConfirmation(id string) (ai.ConfirmationRequirement, bool) {
 	value := ai.ConfirmationRequirement(safeText(id))
 	switch value {
-	case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress:
+	case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution,
+		ai.ConfirmationDiffEgress, ai.ConfirmationVerificationCommand,
+		ai.ConfirmationIntentRepair:
 		return value, true
 	default:
 		return "", false

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -88,6 +89,606 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 	}
 }
 
+func TestStatus_RepeatedReplayErrorIsNotActive(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "same.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"candidate-a", "candidate-b"} {
+		if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 1,
+			Status: state.IntentCandidateWaiting, Purpose: "retain work",
+			Readiness: state.IntentReadinessWait,
+			Events: []state.IntentCandidateEvent{{
+				EventSeq: seq, EventRole: "code",
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastError := fmt.Sprintf(
+		`fallback capture %d connects persisted candidates "candidate-a" and "candidate-b"`,
+		seq)
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"last_replay_error":         lastError,
+		"replay.error_repeat_count": "3",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendIntentPlannerWindow(ctx, d,
+		state.IntentPlannerWindow{
+			PlannedTS: nowFloat(), BranchRef: "refs/heads/main",
+			BranchGeneration: 1, OfferedSeqs: []int64{seq, seq + 1},
+			VisibleOriginalSeqs: []int64{seq, seq + 1},
+			SelectedGroups: []state.IntentPlannerWindowGroup{{
+				SelectedSeqs: []int64{seq, seq + 1},
+			}},
+			FallbackUsed: true,
+			Outcome: sql.NullString{
+				String: "provider_error_fallback_selected", Valid: true,
+			},
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runStatus(ctx, &out, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Replay.State != "needs_attention" ||
+		report.Replay.ErrorRepeatCount != 3 ||
+		report.Replay.BlockedSeq != seq ||
+		report.Replay.LastFallbackMode != "provider_error_fallback_selected" ||
+		report.Replay.LastFallbackSize != 2 {
+		t.Fatalf("replay report=%+v", report.Replay)
+	}
+	if report.IntentV2.ReplayState == "active" {
+		t.Fatalf("Intent v2 falsely active: %+v", report.IntentV2)
+	}
+	if len(report.Replay.CandidateIDs) != 2 {
+		t.Fatalf("candidate IDs=%v", report.Replay.CandidateIDs)
+	}
+
+	out.Reset()
+	if err := runStatus(ctx, &out, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Replay: needs_attention", "repeats=3",
+		fmt.Sprintf("blocked_seq=%d", seq),
+		"candidate-a", "candidate-b",
+		"fallback=provider_error_fallback_selected size=2",
+		"Last replay error:",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("status output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestReplayObservabilityProjectionHidesOrphanedRepeatMetadata(t *testing.T) {
+	_, _, d := makeRepoStateDB(t)
+	ctx := context.Background()
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"last_replay_error":         "",
+		"replay.error_repeat_count": "19",
+		"replay.error_last_seen_ts": "123456",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadReplayObservabilityReport(ctx, d.SQL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.State != "active" || report.LastError != "" ||
+		report.ErrorRepeatCount != 0 || report.BlockedSeq != 0 ||
+		len(report.CandidateIDs) != 0 {
+		t.Fatalf("orphaned repeat metadata leaked into projection: %+v", report)
+	}
+}
+
+func TestStatusSelfPublicationHumanJSONParity(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := strings.Repeat("a", 40)
+	target := strings.Repeat("b", 40)
+	seedCLISelfPublication(t, d, "publication-status", source, target,
+		state.SelfPublicationPrepared, now)
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.SelfPublication.Available ||
+		report.SelfPublication.Phase != "active" ||
+		report.SelfPublication.JournalPhase != state.SelfPublicationPrepared ||
+		report.SelfPublication.SourceHead != source[:12] ||
+		report.SelfPublication.TargetHead != target[:12] {
+		t.Fatalf("self-publication report=%+v", report.SelfPublication)
+	}
+	if strings.Contains(jsonOut.String(), source) ||
+		strings.Contains(jsonOut.String(), target) {
+		t.Fatalf("full publication OID leaked into JSON: %s", jsonOut.String())
+	}
+
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Self-publication: phase=active",
+		"journal=prepared",
+		"source=" + source[:12],
+		"target=" + target[:12],
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human status missing %q:\n%s", want, human.String())
+		}
+	}
+	if strings.Contains(human.String(), source) ||
+		strings.Contains(human.String(), target) {
+		t.Fatalf("full publication OID leaked into human output: %s",
+			human.String())
+	}
+}
+
+func TestDiagnoseWriterSelfPublicationRemediationParity(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedCLISelfPublication(t, d, "publication-writer",
+		strings.Repeat("c", 40), strings.Repeat("d", 40),
+		state.SelfPublicationGitApplied, now)
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" ||
+		report.RemediationKind != "stop_old_owner" ||
+		!strings.Contains(report.Remediation, "stable repository lock") {
+		t.Fatalf("duplicate-writer report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication:         report,
+		StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"Self-publication: phase=stale",
+			"writers=2",
+			"remediation (stop_old_owner)",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s output missing %q:\n%s", name, want, output)
+			}
+		}
+	}
+}
+
+func TestSelfPublicationDurableAttentionStatusDiagnoseDoctorParity(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLISelfPublication(t, d, "publication-attention",
+		strings.Repeat("a", 40), strings.Repeat("b", 40),
+		state.SelfPublicationGitApplied, now)
+	unsafe := "Automatic recovery is blocked: api_key=sk-private prompt=repository_diff=secret\x1b[31m"
+	if err := state.SetSelfPublicationRecoveryAttention(
+		ctx, d, "publication-attention", unsafe); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "needs_attention" ||
+		report.RemediationKind != "needs_attention" ||
+		report.NeedsAttention == "" ||
+		report.Remediation != report.NeedsAttention {
+		t.Fatalf("durable-attention report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonBody, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := string(jsonBody) + statusOut.String() +
+		diagnoseOut.String() + doctorOut.String()
+	for _, want := range []string{
+		"phase=needs_attention", "remediation (needs_attention)",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("shared projection missing %q: %s", want, combined)
+		}
+	}
+	for _, forbidden := range []string{
+		"sk-private", "repository_diff=secret", "\x1b",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("shared projection leaked %q: %s", forbidden, combined)
+		}
+	}
+}
+
+func TestSelfPublicationWriterWinsOverRecoveryAttentionParity(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLISelfPublication(t, d, "publication-writer-attention",
+		strings.Repeat("a", 40), strings.Repeat("b", 40),
+		state.SelfPublicationGitApplied, now)
+	if err := state.SetSelfPublicationRecoveryAttention(
+		ctx, d, "publication-writer-attention",
+		"Automatic recovery is blocked"); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" ||
+		report.RemediationKind != "stop_old_owner" ||
+		report.NeedsAttention == "" {
+		t.Fatalf("writer-attention report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonBody, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(jsonBody), `"phase":"stale"`) ||
+		!strings.Contains(
+			string(jsonBody), `"remediation_kind":"stop_old_owner"`) {
+		t.Fatalf("JSON masks split-brain remediation: %s", jsonBody)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"Self-publication: phase=stale",
+			"writers=2",
+			"remediation (stop_old_owner)",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s missing %q: %s", name, want, output)
+			}
+		}
+	}
+}
+
+func TestSelfPublicationUnknownPreMarkerStatusDiagnoseDoctorParity(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	seedCLIUnknownSelfPublication(t, d, "unknown-pre-marker", now)
+	if _, ok, err := state.MetaGet(
+		ctx, d, state.SelfPublicationNeedsAttentionMetaKey); err != nil || ok {
+		t.Fatalf("unexpected preexisting attention ok=%v err=%v", ok, err)
+	}
+
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "needs_attention" ||
+		report.JournalPhase != state.SelfPublicationPrepared ||
+		report.RemediationKind != "needs_attention" ||
+		!strings.Contains(report.NeedsAttention, "unknown completion") {
+		t.Fatalf("unknown pre-marker report=%+v", report)
+	}
+
+	var statusOut, diagnoseOut, doctorOut bytes.Buffer
+	if err := renderStatusHuman(&statusOut,
+		statusReport{SelfPublication: report}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDiagnoseHuman(&diagnoseOut, diagnoseReport{
+		SelfPublication: report, StateDBChecksumVerified: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderDoctorHuman(&doctorOut, doctorReport{
+		Repos: []doctorRepoReport{{SelfPublication: report}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{
+		"status": statusOut.String(), "diagnose": diagnoseOut.String(),
+		"doctor": doctorOut.String(),
+	} {
+		for _, want := range []string{
+			"phase=needs_attention", "remediation (needs_attention)",
+			"unknown completion",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s missing %q: %s", name, want, output)
+			}
+		}
+	}
+}
+
+func TestDoctorPublicationStaleWakeDiagnosis(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.Add(-10*time.Second).UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.EnqueueFlushRequest(ctx, d, "wake", false,
+		sql.NullString{}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Phase != "stale" || !report.HeartbeatStale ||
+		report.PendingWakes != 1 ||
+		report.RemediationKind != "needs_attention" {
+		t.Fatalf("stale-wake report=%+v", report)
+	}
+	if strings.Contains(strings.ToLower(report.Remediation), "purge") {
+		t.Fatalf("destructive remediation surfaced: %q", report.Remediation)
+	}
+}
+
+func TestStatusSelfPublicationHeartbeatFractionBelowBudget(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Unix(1000, 200_000_000)
+	heartbeat := now.Add(-2900 * time.Millisecond)
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(heartbeat.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HeartbeatStale || report.Phase != "active" {
+		t.Fatalf("fractional heartbeat falsely stale: %+v", report)
+	}
+}
+
+func TestStatusSelfPublicationSanitizesCorruptJournalIDs(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	now := time.Now()
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running",
+		HeartbeatTS: float64(now.UnixNano()) / 1e9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := "\x1b[31mapi_key=sk-private"
+	target := "prompt=private-repository-payload"
+	seedCLISelfPublication(t, d, "publication-corrupt", source, target,
+		state.SelfPublicationPrepared, now)
+	report, err := loadSelfPublicationReport(
+		ctx, d.SQL(), dbPath, now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var human bytes.Buffer
+	renderSelfPublicationHuman(&human, report, "")
+	combined := string(body) + human.String()
+	for _, forbidden := range []string{
+		"\x1b", "sk-private", "private-repository-payload",
+	} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("corrupt journal value leaked %q: %s", forbidden, combined)
+		}
+	}
+	if !strings.Contains(combined, "[redacted") {
+		t.Fatalf("sanitized marker missing: %s", combined)
+	}
+}
+
+func TestPreV18SelfPublicationReadOnlyChecksum(t *testing.T) {
+	ctx := context.Background()
+	_, dbPath, d := makeRepoStateDB(t)
+	if _, err := d.SQL().ExecContext(ctx, `PRAGMA user_version=17`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := openStateDBReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	report, err := loadSelfPublicationReport(ctx, conn, dbPath, time.Now(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Available || report.SchemaVersion != 17 ||
+		report.Phase != "unavailable" {
+		t.Fatalf("pre-v18 report=%+v", report)
+	}
+	if before != after {
+		t.Fatalf("read-only projection changed state.db: before=%s after=%s",
+			before, after)
+	}
+}
+
+func seedCLISelfPublication(
+	t *testing.T,
+	d *state.DB,
+	id, source, target, phase string,
+	now time.Time,
+) {
+	t.Helper()
+	ts := float64(now.UnixNano()) / 1e9
+	digest := "sha256:" + strings.Repeat("0", 64)
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, git_applied_ts, completion_published_ts,
+    completion_candidate_status
+) VALUES (?, 'refs/heads/main', 1, ?, ?, ?, ?, 1, 'prepared', ?, ?,
+          NULL, ?, 'published')`,
+		id, source, target, strings.Repeat("e", 40), digest, ts, ts, ts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publication_members(publication_id, ord, event_seq)
+VALUES (?, 0, 1)`, id); err != nil {
+		t.Fatal(err)
+	}
+	if phase == state.SelfPublicationGitApplied {
+		if _, err := d.SQL().Exec(`
+UPDATE self_publications
+SET phase='git_applied', updated_ts=?, git_applied_ts=?
+WHERE id=?`, ts, ts, id); err != nil {
+			t.Fatal(err)
+		}
+	} else if phase != state.SelfPublicationPrepared {
+		t.Fatalf("unsupported fixture phase %q", phase)
+	}
+}
+
+func seedCLIUnknownSelfPublication(
+	t *testing.T,
+	d *state.DB,
+	id string,
+	now time.Time,
+) {
+	t.Helper()
+	ts := float64(now.UnixNano()) / 1e9
+	digest := "sha256:" + strings.Repeat("1", 64)
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publications(
+    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    target_tree_oid, membership_digest, member_count, phase, created_ts,
+    updated_ts, completion_published_ts, completion_candidate_status
+) VALUES (?, 'refs/heads/migrated', 2, 'old-source', 'old-target',
+          'old-tree', ?, 1, 'prepared', ?, ?, 0, 'unknown')`,
+		id, digest, ts, ts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SQL().Exec(`
+INSERT INTO self_publication_members(publication_id, ord, event_seq)
+VALUES (?, 0, 1)`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -157,12 +758,159 @@ func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 	}
 }
 
+func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	snapshot, err := json.Marshal(map[string]any{
+		"preset_id":                        "intent.balanced",
+		"preset_version":                   config.PresetCatalogVersion,
+		"customized":                       true,
+		config.FieldIntentVerification:     "fast",
+		config.FieldIntentRepairEnabled:    "true",
+		config.FieldIntentRepairHorizon:    "10m",
+		config.FieldIntentRepairMaxCommits: "3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(ctx, d,
+		state.ConfigRevisionInput{
+			Snapshot: snapshot, Profile: "intent-v2", Scope: "repository",
+			SourceGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, ok, err := state.RequestConfigActivation(ctx, d, revision.ID,
+		sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request activation: ok=%v err=%v", ok, err)
+	}
+	_, _ = state.AcknowledgeConfigActivation(ctx, d, request.ID, revision.ID)
+	_, _ = state.ApplyConfigActivation(ctx, d, request.ID, revision.ID)
+
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		BaseHead: "base", Operation: "modify", Path: "service.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+		ID: "candidate-observable", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Status: state.IntentCandidateBlocked,
+		Readiness: state.IntentReadinessWait, Purpose: "one purpose",
+		PlannerProtocol:  sql.NullString{String: "v2", Valid: true},
+		AtomicityStatus:  sql.NullString{String: "invalid", Valid: true},
+		AtomicitySummary: "api_key=sk-hidden disconnected components",
+		VerificationStatus: sql.NullString{
+			String: "needs_attention", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendIntentActivityBoundary(ctx, d,
+		state.IntentActivityBoundary{
+			Kind: state.IntentBoundaryHard, Source: "logical_flush",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentRepair(ctx, d, state.IntentRepair{
+		ID: "repair-observable", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Status: state.IntentRepairPrepared,
+		ExpectedHead: "old-head",
+		PlanDigest:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Error:        "prompt=private",
+		Commits:      []state.IntentRepairCommit{{OldOID: "old-head"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"intent.v2.migration_state": "active",
+		"intent.v2.needs_attention": "run acd configure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var jsonOut bytes.Buffer
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	var report statusReport
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	got := report.IntentV2
+	if !got.Available || got.SchemaVersion != state.SchemaVersion ||
+		got.ReplayState != "needs_attention" ||
+		got.PresetID != "intent.balanced" ||
+		got.PresetVersion != config.PresetCatalogVersion ||
+		!got.Customized || got.VerificationMode != "fast" ||
+		!got.RepairEnabled || got.RepairHorizon != "10m" ||
+		got.RepairMaxCommits != 3 || got.OpenCandidates != 1 ||
+		got.BlockedCandidates != 1 || got.VerificationAttention != 1 ||
+		got.RecoverableRepairs != 1 || got.LastBoundaryEpoch != 1 ||
+		got.LatestPlannerProtocol != "v2" ||
+		got.LatestAtomicityStatus != "invalid" ||
+		got.LatestVerificationStatus != "needs_attention" ||
+		got.LatestRepairStatus != state.IntentRepairPrepared {
+		t.Fatalf("Intent v2 projection=%+v", got)
+	}
+	var human bytes.Buffer
+	if err := runStatus(ctx, &human, repo, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Intent v2: needs_attention", "intent.balanced@3 customized",
+		"verification=fast", "recoverable_repairs=1",
+		"Latest candidate: status=blocked protocol=v2",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("human Intent v2 output missing %q:\n%s",
+				want, human.String())
+		}
+	}
+	combined := jsonOut.String() + human.String()
+	for _, forbidden := range []string{"sk-hidden", "prompt=private"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("Intent v2 observability leaked %q:\n%s",
+				forbidden, combined)
+		}
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"intent.v2.cutover_required": "true",
+		"intent.v2.migration_state":  "needs_attention",
+		"intent.v2.needs_attention":  "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	jsonOut.Reset()
+	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.IntentV2.ReplayState != "needs_attention" ||
+		!strings.Contains(report.IntentV2.NeedsAttention, "cutover") {
+		t.Fatalf("required cutover reported healthy: %+v", report.IntentV2)
+	}
+}
+
 func TestStatusRuntimeConfigPreV14MissingTablesReadOnly(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
 	registerRepo(t, roots, repo, dbPath, "codex")
 	if _, err := d.SQL().Exec(`
+DROP TABLE config_validation_runs;
 DROP TABLE config_experiments;
 DROP TABLE config_activation_requests;
 DROP TABLE runtime_config_state;
@@ -191,6 +939,9 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 	if report.RuntimeConfig.ApplyState != "unset" || report.RuntimeConfig.DesiredRevisionID != 0 {
 		t.Fatalf("old schema runtime projection = %+v", report.RuntimeConfig)
 	}
+	if report.IntentV2.Available || report.IntentV2.SchemaVersion != 13 {
+		t.Fatalf("old schema Intent v2 projection = %+v", report.IntentV2)
+	}
 	after, _ := fileSHA256(dbPath)
 	if before != after {
 		t.Fatalf("status mutated pre-v14 DB: %s -> %s", before, after)
@@ -205,6 +956,10 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 	}
 	if diagnose.RuntimeConfig.ApplyState != "unset" || diagnose.RuntimeConfig.DesiredRevisionID != 0 {
 		t.Fatalf("old schema diagnose projection = %+v", diagnose.RuntimeConfig)
+	}
+	if diagnose.IntentV2.Available || diagnose.IntentV2.SchemaVersion != 13 {
+		t.Fatalf("old schema diagnose Intent v2 projection = %+v",
+			diagnose.IntentV2)
 	}
 	afterDiagnose, _ := fileSHA256(dbPath)
 	if before != afterDiagnose {

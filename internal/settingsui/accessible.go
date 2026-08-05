@@ -38,6 +38,7 @@ func AccessibleActionForm(input io.Reader, output io.Writer) (*huh.Form, *Access
 		huh.NewSelect[string]().Key("action").Title("What do you want to do?").Options(
 			huh.NewOption("Test current settings (recommended)", "test"),
 			huh.NewOption("Apply current settings at the next safe boundary", "apply"),
+			huh.NewOption("Change strategy or preset", "mode"),
 			huh.NewOption("Quick provider setup", "quick"),
 			huh.NewOption("Advanced settings", "advanced"),
 			huh.NewOption("Revert to last known good", "revert"),
@@ -84,6 +85,8 @@ func accessibleActionConfirmation(action string) string {
 		return "Run one strict synthetic provider test? A network provider may charge for one request."
 	case "apply":
 		return "Run one strict synthetic provider test and apply current settings at the next safe boundary?"
+	case "mode":
+		return "Save the selected strategy and preset, run a strict synthetic test, and apply them?"
 	case "revert":
 		return "Revert to the last-known-good settings revision?"
 	case "profile":
@@ -97,6 +100,43 @@ func accessibleActionConfirmation(action string) string {
 	default:
 		return "Confirm selected action?"
 	}
+}
+
+// RunAccessibleMode presents strategy and preset as one first-class product
+// choice. Advanced intent knobs remain in Advanced settings.
+func RunAccessibleMode(ctx context.Context, draft map[string]string, input io.Reader, output io.Writer) (AccessibleValues, error) {
+	return runAccessibleMode(ctx, draft, nil, input, output)
+}
+
+func runAccessibleMode(ctx context.Context, draft map[string]string, fields []FieldValue, input io.Reader, output io.Writer) (AccessibleValues, error) {
+	values := finalizeAccessibleValues(newAccessibleValues(draft))
+	strategy := fallback(values.Values["commit.strategy"], "intent")
+	preset := fallback(values.Values["commit.preset"], "balanced")
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Key("commit.strategy").Title(
+			accessibleRetainedValueTitle("Commit strategy", strategy)).Options(
+			huh.NewOption("Intent — semantic atomic commits", "intent"),
+			huh.NewOption("Event — one capture per commit", "event"),
+		).Value(&strategy),
+		huh.NewSelect[string]().Key("commit.preset").Title(
+			accessibleRetainedValueTitle("Preset", preset)).Options(
+			huh.NewOption("Balanced (recommended)", "balanced"),
+			huh.NewOption("Fast", "fast"),
+			huh.NewOption("Quality", "quality"),
+		).Value(&preset),
+	)).WithAccessible(true).WithInput(input).WithOutput(output).WithShowHelp(true)
+	if err := form.RunWithContext(ctx); err != nil {
+		return AccessibleValues{}, err
+	}
+	strategy = safeText(strings.ToLower(strategy))
+	preset = safeText(strings.ToLower(preset))
+	applyAccessibleModeSelection(&values, fields, strategy, preset)
+	values.Action = "apply"
+	return values, nil
+}
+
+func applyAccessibleModeSelection(values *AccessibleValues, fields []FieldValue, strategy, preset string) {
+	applyPresetSwitch(values.Values, fields, strategy, preset)
 }
 
 func RunAccessibleProfile(ctx context.Context, input io.Reader, output io.Writer) (string, error) {
@@ -237,8 +277,8 @@ func AccessibleStartTranscript(draft map[string]string) string {
 	}
 	lines = append(lines,
 		"Choose Test current settings to skip editing and run one strict synthetic probe.",
-		"Quick provider setup edits only provider essentials. Advanced settings opens the full catalog.",
-		"Credentials remain environment-only; repository content is never included in the synthetic test.",
+		"Change strategy or preset is the first-class mode setup. Quick provider follows it; Advanced settings opens the full catalog.",
+		"Credentials come from ACD_AI_API_KEY or the protected file managed by acd auth; repository content is never included in the synthetic test.",
 	)
 	return strings.Join(lines, "\n")
 }

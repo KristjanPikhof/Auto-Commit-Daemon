@@ -62,6 +62,7 @@ type flushResult struct {
 	LastSeenTS       float64 `json:"last_seen_ts,omitempty"`
 	Logical          bool    `json:"logical,omitempty"`
 	FlushRequestID   int64   `json:"flush_request_id,omitempty"`
+	BoundaryEpoch    int64   `json:"boundary_epoch,omitempty"`
 	DaemonPID        int     `json:"daemon_pid,omitempty"`
 	SentSignal       bool    `json:"sent_signal,omitempty"`
 	Skipped          bool    `json:"skipped,omitempty"`
@@ -268,9 +269,24 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: refused (manual pause marker at %s); heartbeat refreshed for session %s", pausepkg.Path(gitDir), sessionID))
 	}
 
-	// Enqueue the labeled flush request. The daemon's drain path treats any
-	// non-empty drain as age-trigger-now (IntentBypassBatchWait=true), which
-	// is the bypass semantic the task requires.
+	// Persist the hard evaluation epoch before enqueueing the labeled flush
+	// request. Intent v2 consumes this through its candidate boundary API;
+	// legacy intent replay continues to use the explicit bypass bit below.
+	// The boundary itself never bypasses atomicity or any safety gate.
+	st, _, err := state.LoadDaemonState(ctx, db)
+	if err != nil {
+		return fmt.Errorf("acd flush: load daemon state: %w", err)
+	}
+	boundary, err := state.AppendIntentActivityBoundary(ctx, db,
+		newIntentActivityBoundary(state.IntentBoundaryHard, "flush_logical"))
+	if err != nil {
+		return fmt.Errorf("acd flush: record hard boundary: %w", err)
+	}
+	res.BoundaryEpoch = boundary.Epoch
+
+	// Enqueue the labeled flush request. The v1 daemon drain path treats any
+	// non-empty logical drain as age-trigger-now
+	// (IntentBypassBatchWait=true).
 	frID, err := state.EnqueueFlushRequest(ctx, db, "flush_logical", true,
 		sql.NullString{String: sessionID, Valid: true})
 	if err != nil {
@@ -281,10 +297,6 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 
 	// Signal the daemon if alive so it picks the request up on the next
 	// tick instead of waiting for the poll interval. SIGUSR1 mirrors wake.
-	st, _, err := state.LoadDaemonState(ctx, db)
-	if err != nil {
-		return fmt.Errorf("acd flush: load daemon state: %w", err)
-	}
 	if st.PID > 0 && identity.Alive(st.PID) {
 		res.DaemonPID = st.PID
 		if err := signalProcess(st.PID, syscall.SIGUSR1, daemonFingerprintToken(st)); err == nil {

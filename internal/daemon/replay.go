@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
@@ -237,6 +238,32 @@ type ReplayOpts struct {
 	// visible pending window without waiting for IntentMinPending or
 	// IntentMaxPendingAge.
 	IntentBypassBatchWait bool
+
+	// IntentPreset enables the durable v2 candidate path. Empty preserves the
+	// v1 compatibility path for old runtime revisions and direct tests; v2
+	// runtime revisions always materialize one of the versioned preset names.
+	IntentPreset config.PresetName
+
+	// IntentCandidateVerify executes the already-approved repository-scoped
+	// command against an exact ephemeral candidate tree. Fast/full modes stay
+	// pending when this callback is unavailable or fails; structural mode uses
+	// the candidate engine's built-in atomicity and materialization gates.
+	IntentVerificationMode string
+	IntentCandidateVerify  IntentCandidateVerifier
+	// IntentRepairCommitVerify validates exact commit-tree output before an
+	// automatic repair changes the branch ref.
+	IntentRepairCommitVerify git.IntentRepairCommitVerifier
+
+	// IntentRepairEnabled and IntentRepairHorizon control whether a newly
+	// published candidate remains soft-published and eligible for a later
+	// strict automatic repair transaction.
+	IntentRepairEnabled    bool
+	IntentRepairHorizon    time.Duration
+	IntentRepairMaxCommits int
+
+	// SelfPublicationCheckpoint is a deterministic fault/recovery test seam.
+	// Production callers leave it nil.
+	SelfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -266,6 +293,10 @@ type ReplaySummary struct {
 	// this to schedule an immediate follow-up replay pass without waiting for
 	// the next poll tick. Always false when Limit <= 0 (unbounded drain).
 	HasMore bool
+	// SelfPublicationTargetOID is the final commit whose journal completion
+	// succeeded in this pass. Multi-group Intent publication overwrites it
+	// group-by-group, so it always names the completed chain tip.
+	SelfPublicationTargetOID string
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -308,6 +339,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		sum.Skipped = true
 		traceReplayPaused(opts.Trace, repoRoot, cctx, paused)
 		return sum, nil
+	}
+	if _, err := maintainSelfPublicationJournal(ctx, db); err != nil {
+		slog.Default().Warn("daemon: prune terminal self-publications",
+			"err", err.Error())
 	}
 
 	indexFile := opts.IndexFile
@@ -397,6 +432,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			sum.RecaptureRequired = true
 		}
 	}
+	if !intentCfg.enabled {
+		if err := retireIntentCandidatesForEventReplay(
+			ctx, db, cctx); err != nil {
+			return sum, err
+		}
+	}
 
 	// Per-pass batch budget. When bounded, query one extra row so the "is
 	// there more queued behind this batch?" question can be answered without a
@@ -415,6 +456,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if batchLimit > 0 && len(pending) > batchLimit {
 		pending = pending[:batchLimit]
 		sum.HasMore = true
+	}
+	if !intentCfg.candidateMode || len(pending) == 0 {
+		if err := consumeInactiveIntentActivityBoundaries(ctx, db); err != nil {
+			return sum, err
+		}
 	}
 	if len(pending) == 0 {
 		return sum, nil
@@ -714,7 +760,35 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			// Initial commit case (no prior parent) -> non-CAS update.
 			oldOID = ""
 		}
-		if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, ev); err != nil {
+		publicationCompletion := selfPublicationCompletion(opts, ev.Message)
+		publication, err := prepareSelfPublication(
+			eventCtx, db, activeCtx, parent, commitOID, treeOID, "event",
+			[]state.SelfPublicationMember{{EventSeq: ev.Seq}},
+			publicationCompletion,
+			opts.SelfPublicationCheckpoint,
+		)
+		if err != nil {
+			cancelEvent()
+			if handled, handleErr := settleReplayContextFailure(
+				ctx, db, opts.Trace, repoRoot, activeCtx, ev, err, &sum,
+			); handled {
+				if handleErr != nil {
+					return sum, handleErr
+				}
+				return sum, nil
+			}
+			return sum, err
+		}
+		if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
+			return updateReplayRefWithRetry(
+				eventCtx, repoRoot, "HEAD", commitOID, oldOID,
+				opts.Trace, activeCtx, ev)
+		}); err != nil {
+			if errors.Is(err, errSelfPublicationCASAmbiguous) ||
+				!errors.Is(err, errSelfPublicationCASNotApplied) {
+				cancelEvent()
+				return sum, err
+			}
 			// CAS exhausted. Before declaring conflict, give the
 			// idempotent path one shot: an external committer may have
 			// landed identical content between our write-tree and our
@@ -793,13 +867,13 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		// Settle the event row + publish_state.
 		cancelEvent()
-		if err := settlePublishedEvent(ctx, db, ev, activeCtx, parent, commitOID,
-			state.DecisionKindCommitted, "event published",
-		); err != nil {
+		if err := publication.complete(
+			ctx, db, publicationCompletion); err != nil {
 			return sum, err
 		}
+		recordReplayDecision(ctx, db, ev, activeCtx, selfPublicationNow(),
+			state.DecisionKindCommitted, "event published", commitOID)
 		reconcileLiveIndexAfterPublish(ctx, repoRoot, opts.Trace, activeCtx, ev, ops)
 
 		parent = commitOID
@@ -811,6 +885,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		parentTree = treeOID
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
+		sum.SelfPublicationTargetOID = commitOID
 		sum.Published++
 		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
 			"commit": commitOID,
@@ -819,6 +894,56 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	return sum, nil
+}
+
+func consumeInactiveIntentActivityBoundaries(
+	ctx context.Context,
+	db *state.DB,
+) error {
+	for {
+		boundaries, err := state.PendingIntentActivityBoundaries(
+			ctx, db, 0, ai.IntentActivityBoundaryCap)
+		if err != nil {
+			return fmt.Errorf("daemon: replay: load inactive intent boundaries: %w", err)
+		}
+		var through int64
+		for _, boundary := range boundaries {
+			through = boundary.Epoch
+		}
+		if through == 0 {
+			return pruneConsumedIntentActivityBoundaries(ctx, db)
+		}
+		if _, err := state.ConsumeIntentActivityBoundaries(
+			ctx, db, through, float64(time.Now().UnixNano())/1e9,
+		); err != nil {
+			return fmt.Errorf("daemon: replay: consume inactive intent boundaries: %w", err)
+		}
+		if len(boundaries) < ai.IntentActivityBoundaryCap {
+			return pruneConsumedIntentActivityBoundaries(ctx, db)
+		}
+	}
+}
+
+const retainedConsumedIntentActivityBoundaries = 256
+
+func pruneConsumedIntentActivityBoundaries(
+	ctx context.Context,
+	db *state.DB,
+) error {
+	_, err := db.SQL().ExecContext(ctx, `
+DELETE FROM intent_activity_boundaries
+WHERE consumed_ts IS NOT NULL
+  AND id NOT IN (
+      SELECT id
+      FROM intent_activity_boundaries
+      WHERE consumed_ts IS NOT NULL
+      ORDER BY epoch DESC
+      LIMIT ?
+  )`, retainedConsumedIntentActivityBoundaries)
+	if err != nil {
+		return fmt.Errorf("daemon: replay: prune consumed intent boundaries: %w", err)
+	}
+	return nil
 }
 
 func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
@@ -844,9 +969,15 @@ type intentReplayConfig struct {
 	deferLimit      int
 	retryLimit      *int
 	retryCount      int
+	fallbackUsed    bool
 	pathCoalescing  bool
 	includeDiffs    bool
 	bypassBatchWait bool
+	// candidateMode enables durable Intent v2 candidate semantics. A pending
+	// activity boundary may trigger evaluation before the legacy min-pending
+	// and quiet-time gate, but never before path quiescence or replay safety
+	// gates.
+	candidateMode bool
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -890,6 +1021,7 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		pathCoalescing:       pathCoalesceEnabled(),
 		includeDiffs:         opts.IntentIncludeDiffs,
 		bypassBatchWait:      opts.IntentBypassBatchWait,
+		candidateMode:        opts.IntentPreset != "",
 		pathQuiescence:       resolvePathQuiescenceSeconds(),
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 		commitFormat:         cfg.CommitFormat,
@@ -995,6 +1127,9 @@ type intentReplayItem struct {
 	event      state.CaptureEvent
 	ops        []state.CaptureOp
 	deferCount int
+	// candidateID is populated only by the durable Intent v2 path. It binds
+	// every covered event to the exact ready candidate journaled at prepare.
+	candidateID string
 	// coalesce, when non-nil, records the additional capture events folded
 	// into this offer by the same-path coalesce pass. The representative
 	// event lives in `event` above; `coalesce.Covered` carries every other
@@ -1105,6 +1240,10 @@ func replayIntentBatch(
 		if err := state.RecordPlannerOffer(ctx, db, item.event.Seq, nowSec); err != nil {
 			return sum, err
 		}
+	}
+	if opts.IntentPreset != "" {
+		return replayIntentCandidateBatch(ctx, repoRoot, db, activeCtx, opts, cfg,
+			indexFile, items, req, parent, parentTree, forced, sum)
 	}
 
 	// Forced-aging singleton deterministic fast path: when intent mode is
@@ -1342,7 +1481,17 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return []state.CaptureEvent{forcedEvent}, true, "", nil
 	}
-	if !cfg.bypassBatchWait {
+	boundaryTriggered := false
+	boundaryCaptureLimit := 0
+	if cfg.candidateMode && !cfg.bypassBatchWait {
+		var boundaryErr error
+		boundaryCaptureLimit, boundaryTriggered, boundaryErr =
+			intentActivityBoundaryCaptureLimit(ctx, db, pending)
+		if boundaryErr != nil {
+			return nil, false, "", boundaryErr
+		}
+	}
+	if !cfg.bypassBatchWait && !boundaryTriggered {
 		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
 			return nil, false, waitReason, nil
 		}
@@ -1351,7 +1500,45 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if n > len(pending) {
 		n = len(pending)
 	}
+	if boundaryTriggered && boundaryCaptureLimit < n {
+		n = boundaryCaptureLimit
+	}
 	return pending[:n], false, "", nil
+}
+
+func intentActivityBoundaryCaptureLimit(
+	ctx context.Context,
+	db *state.DB,
+	pending []state.CaptureEvent,
+) (int, bool, error) {
+	boundaries, err := state.PendingIntentActivityBoundaries(
+		ctx, db, 0, ai.IntentActivityBoundaryCap)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(boundaries) == 0 {
+		return 0, false, nil
+	}
+	latest := boundaries[len(boundaries)-1]
+	limit := 0
+	for _, event := range pending {
+		if event.CapturedTS > latest.CreatedTS {
+			break
+		}
+		limit++
+	}
+	if limit > 0 {
+		return limit, true, nil
+	}
+	if _, err := state.ConsumeIntentActivityBoundaries(
+		ctx, db, latest.Epoch, float64(time.Now().UnixNano())/1e9,
+	); err != nil {
+		return 0, false, err
+	}
+	if err := pruneConsumedIntentActivityBoundaries(ctx, db); err != nil {
+		return 0, false, err
+	}
+	return 0, false, nil
 }
 
 // MetaKeyPathQuiescenceGatedCount surfaces the most recent count of pending
@@ -2100,6 +2287,10 @@ func classifyIntentPlannerHealthFailure(err error, plannerCallFailed bool) error
 	if errors.As(err, &validationErr) {
 		return &IntentPlannerValidationFailure{Err: err}
 	}
+	var validationV2Err *ai.IntentPlanV2ValidationError
+	if errors.As(err, &validationV2Err) {
+		return &IntentPlannerValidationFailure{Err: err}
+	}
 	return &IntentPlannerTransportFailure{Err: err}
 }
 
@@ -2164,9 +2355,13 @@ func recordIntentPromptFallback(ctx context.Context, planner ai.IntentPlanner, r
 
 func validateIntentSelectionSafety(items []intentReplayItem, plan ai.IntentPlan) error {
 	selected := map[int64]struct{}{}
-	groups, err := ai.IntentPlanCommitGroups(plan)
-	if err != nil {
-		return err
+	var groups []ai.IntentCommitGroup
+	if len(plan.SelectedSeqs) > 0 || len(plan.CommitGroups) > 0 {
+		var err error
+		groups, err = ai.IntentPlanCommitGroups(plan)
+		if err != nil {
+			return err
+		}
 	}
 	for _, group := range groups {
 		for _, seq := range group.SelectedSeqs {
@@ -2288,9 +2483,13 @@ func recordIntentPlannerWindow(
 	forced bool,
 	validationFailure string,
 ) error {
-	groups, err := ai.IntentPlanCommitGroups(plan)
-	if err != nil {
-		return err
+	var groups []ai.IntentCommitGroup
+	if len(plan.SelectedSeqs) > 0 || len(plan.CommitGroups) > 0 {
+		var err error
+		groups, err = ai.IntentPlanCommitGroups(plan)
+		if err != nil {
+			return err
+		}
 	}
 	itemBySeq := make(map[int64]intentReplayItem, len(items))
 	eventRows := make(map[int64]*state.IntentPlannerWindowEvent, len(items))
@@ -2381,7 +2580,7 @@ func recordIntentPlannerWindow(
 		forcedReason = "defer_limit"
 	}
 	telemetry := runtimeTelemetryFromContext(ctx)
-	fallbackUsed := validationFailure != ""
+	fallbackUsed := cfg.fallbackUsed || validationFailure != ""
 	if !fallbackUsed && provider != "" && provider != (ai.DeterministicProvider{}).Name() && strings.TrimSpace(plan.Source) == (ai.DeterministicProvider{}).Name() {
 		fallbackUsed = true
 	}
@@ -2394,7 +2593,7 @@ func recordIntentPlannerWindow(
 	if validationFailure != "" {
 		outcome = "provider_error_fallback_" + outcome
 	}
-	_, err = state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+	_, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
 		PlannedTS:           ts,
 		Provider:            nullString(provider),
 		Model:               nullString(model),
@@ -2792,6 +2991,10 @@ func publishIntentSelection(
 					state.DecisionKindHandledExternal, "already_published_by_external_committer", groupMessage); err != nil {
 					return sum, err
 				}
+				if err := settleNonJournalIntentCandidates(
+					ctx, db, selected, headOID, opts); err != nil {
+					return sum, err
+				}
 				reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
 				if err := git.ReadTree(ctx, repoRoot, indexFile, headOID); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped idempotent publish: %w", err)
@@ -2842,6 +3045,10 @@ func publishIntentSelection(
 					state.DecisionKindSupersededExternal, reason, groupMessage); err != nil {
 					return sum, err
 				}
+				if err := settleNonJournalIntentCandidates(
+					ctx, db, selected, sourceHead, opts); err != nil {
+					return sum, err
+				}
 				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
 					return sum, fmt.Errorf("daemon: replay reseed index after grouped superseded external: %w", err)
 				}
@@ -2876,6 +3083,10 @@ func publishIntentSelection(
 	if parentTree != "" && treeOID == parentTree {
 		if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, sourceHead,
 			state.DecisionKindHandledExternal, "already_published_no_op_tree", groupMessage); err != nil {
+			return sum, err
+		}
+		if err := settleNonJournalIntentCandidates(
+			ctx, db, selected, sourceHead, opts); err != nil {
 			return sum, err
 		}
 		reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -2913,7 +3124,41 @@ func publishIntentSelection(
 	if activeCtx.BaseHead == "" {
 		oldOID = ""
 	}
-	if err := updateReplayRefWithRetry(eventCtx, repoRoot, "HEAD", commitOID, oldOID, opts.Trace, activeCtx, firstEvent); err != nil {
+	group := "intent"
+	if selected[0].candidateID != "" {
+		group = selected[0].candidateID
+	}
+	publicationCompletion := selfPublicationCompletion(
+		opts, sql.NullString{
+			String: groupMessage, Valid: groupMessage != "",
+		})
+	publication, err := prepareSelfPublication(
+		eventCtx, db, activeCtx, sourceHead, commitOID, treeOID, group,
+		selfPublicationMembers(selected), publicationCompletion,
+		opts.SelfPublicationCheckpoint,
+	)
+	if err != nil {
+		cancelEvent()
+		if handled, handleErr := settleReplayContextFailure(
+			ctx, db, opts.Trace, repoRoot, activeCtx, firstEvent, err, &sum,
+		); handled {
+			if handleErr != nil {
+				return sum, handleErr
+			}
+			return sum, nil
+		}
+		return sum, err
+	}
+	if err := publication.applyCAS(eventCtx, repoRoot, oldOID, db, func() error {
+		return updateReplayRefWithRetry(
+			eventCtx, repoRoot, "HEAD", commitOID, oldOID,
+			opts.Trace, activeCtx, firstEvent)
+	}); err != nil {
+		if errors.Is(err, errSelfPublicationCASAmbiguous) ||
+			!errors.Is(err, errSelfPublicationCASNotApplied) {
+			cancelEvent()
+			return sum, err
+		}
 		headOID, alreadyPublished, probeErr := alreadyPublishedAtHEAD(ctx, repoRoot, sourceHead, allOps)
 		if probeErr != nil {
 			cancelEvent()
@@ -2923,6 +3168,10 @@ func publishIntentSelection(
 			cancelEvent()
 			if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, headOID,
 				state.DecisionKindHandledExternal, "already_published_after_cas_exhaustion", groupMessage); err != nil {
+				return sum, err
+			}
+			if err := settleNonJournalIntentCandidates(
+				ctx, db, selected, headOID, opts); err != nil {
 				return sum, err
 			}
 			reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -2964,14 +3213,18 @@ func publishIntentSelection(
 	}
 	cancelEvent()
 
-	if err := settleIntentPublished(ctx, db, selected, activeCtx, sourceHead, commitOID,
-		state.DecisionKindCommitted, "intent_group: "+plan.GroupingReason, groupMessage); err != nil {
+	if err := publication.complete(
+		ctx, db, publicationCompletion); err != nil {
 		return sum, err
 	}
+	recordIntentPublishedDecisions(
+		ctx, db, selected, activeCtx, commitOID,
+		state.DecisionKindCommitted, "intent_group: "+plan.GroupingReason)
 	reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
 	publishedCount := intentSelectionPublishedCount(selected)
 	sum.Published += publishedCount
 	sum.BaseHead = commitOID
+	sum.SelfPublicationTargetOID = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
@@ -3046,6 +3299,52 @@ func settleIntentPublished(ctx context.Context, db *state.DB, items []intentRepl
 			if err := state.ClearPlannerState(ctx, db, ev.Seq); err != nil {
 				slog.Default().Warn("clear planner state after publish", "seq", ev.Seq, "err", err.Error())
 			}
+		}
+	}
+	return nil
+}
+
+func recordIntentPublishedDecisions(
+	ctx context.Context,
+	db *state.DB,
+	items []intentReplayItem,
+	cctx CaptureContext,
+	commitOID, decisionKind, decisionReason string,
+) {
+	nowSec := selfPublicationNow()
+	for _, item := range items {
+		for _, event := range item.allCoveredEvents() {
+			recordReplayDecision(
+				ctx, db, event, cctx, nowSec,
+				decisionKind, decisionReason, commitOID)
+		}
+	}
+}
+
+func settleNonJournalIntentCandidates(
+	ctx context.Context,
+	db *state.DB,
+	items []intentReplayItem,
+	commitOID string,
+	opts ReplayOpts,
+) error {
+	candidates := make(map[string]struct{})
+	for _, item := range items {
+		if item.candidateID != "" {
+			candidates[item.candidateID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(candidates))
+	for candidateID := range candidates {
+		ids = append(ids, candidateID)
+	}
+	sort.Strings(ids)
+	for _, candidateID := range ids {
+		if err := markIntentCandidatePublished(
+			ctx, db, candidateID, commitOID,
+			opts.IntentRepairEnabled, opts.IntentRepairHorizon,
+		); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -3343,9 +3642,9 @@ func traceReplayUpdateRef(
 // the helper refuses if the row already moved out of blocked_conflict).
 //
 // Best-effort meta cleanup: once the last blocked row on this
-// (branch_ref, branch_generation) clears, drop the last_replay_conflict /
-// last_replay_conflict_legacy / last_replay_error breadcrumbs so
-// `acd status` reads clean. Multiple still-blocked rows on the same anchor
+// (branch_ref, branch_generation) clears, drop the conflict and complete replay
+// error-observability metadata set so `acd status` reads clean. Multiple
+// still-blocked rows on the same anchor
 // (or any blocked rows on other anchors) keep the breadcrumbs intact.
 //
 // Errors during the per-row probe are logged and skipped — one bad row
@@ -4197,6 +4496,34 @@ func markFailed(ctx context.Context, db *state.DB, ev state.CaptureEvent, issue 
 	}
 	recordReplayIssue(ctx, db, ev, issue, nowSec)
 	return nil
+}
+
+func settleReplayContextFailure(
+	ctx context.Context,
+	db *state.DB,
+	logger acdtrace.Logger,
+	repoRoot string,
+	cctx CaptureContext,
+	ev state.CaptureEvent,
+	cause error,
+	sum *ReplaySummary,
+) (bool, error) {
+	if !errors.Is(cause, context.DeadlineExceeded) &&
+		!errors.Is(cause, context.Canceled) {
+		return false, nil
+	}
+	if err := markFailed(ctx, db, ev, replayIssue{
+		ErrorClass: replayErrorCommitBuildFailure,
+		Message:    cause.Error(),
+		Ref:        cctx.BranchRef,
+		Path:       ev.Path,
+	}); err != nil {
+		return true, err
+	}
+	traceReplay(logger, repoRoot, cctx, ev,
+		"replay.failed", state.EventStateFailed, cause.Error(), nil)
+	sum.Failed++
+	return true, nil
 }
 
 // recordConflict terminally settles the event in

@@ -1,8 +1,10 @@
 # acd overview
 
 `acd` captures worktree changes, stores durable metadata in the repo, and
-replays those captures as Git commits. The default strategy commits one capture
-at a time. Intent mode lets an AI planner group pending captures first.
+replays those captures as Git commits. Event mode commits one capture at a
+time. Intent v2 maintains semantic candidates across evaluations and publishes
+them only after dependency, atomicity, materialization, and preset verification
+checks pass.
 
 ~~~mermaid
 flowchart LR
@@ -47,15 +49,15 @@ flowchart LR
 | Strategy | Behavior |
 |---|---|
 | `event` | FIFO replay. One capture can produce one commit. This is the default. |
-| `intent` | A bounded window goes to the planner. It can split selected captures into ordered groups, and replay publishes one commit per group. Deferred captures stay pending. |
+| `intent` | Bounded evaluations revise durable semantic candidates. Ready candidates publish in topological order after the atomicity gate. |
 
 Both strategies use the same capture rows and replay safety checks. Intent mode
 changes grouping, not durability.
 
-Intent mode also has a persisted provider circuit breaker. A planner outage or
-repeated unsafe output switches planning to the deterministic provider during a
-bounded cooldown, so capture and replay keep moving without repeated network
-failures.
+Intent mode also has a persisted provider circuit breaker. Fast and Balanced
+apply bounded dependency-aware fallback policies during a provider outage.
+Quality retains candidates and reports `needs_attention`. Capture continues in
+all three cases.
 
 ## Data boundaries
 
@@ -66,6 +68,8 @@ failures.
 | Commit-message metadata | AI provider request | Only when a non-deterministic provider is configured |
 | Captured diffs | Rebuilt from captured blobs | Only when the provider needs diffs and `ACD_AI_DIFF_EGRESS=1` is set |
 | Prompt traces | `<gitDir>/acd/prompt-trace/` | No automatic upload, but the files may contain source text |
+| Provider credential | `${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json` | Only to the configured provider; environment wins over this file |
+| Candidate verification | Ephemeral detached worktree | No, unless the approved command itself performs network access |
 
 ## Start here
 
@@ -77,4 +81,5 @@ failures.
 | Understand replay safety | [capture-replay.md](capture-replay.md) |
 | Configure AI providers | [ai-providers.md](ai-providers.md) |
 | Use intent grouping | [intent-commit-flow.md](intent-commit-flow.md) |
+| Migrate an existing Intent repo | [intent-v2-migration.md](intent-v2-migration.md) |
 | Rewrite local commit messages | [intent-commit-rewrite-flow.md](intent-commit-rewrite-flow.md) |

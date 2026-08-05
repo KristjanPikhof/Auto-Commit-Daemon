@@ -17,7 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 )
 
-func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
+func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -27,12 +27,15 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 
 	var hits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "need at least two offered captures", http.StatusBadRequest)
@@ -46,37 +49,7 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 			"grouping_reason":  "same integration test intent",
 			"deferred_reasons": []map[string]any{},
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-intent",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_1",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_1", plan)
 	}))
 	defer server.Close()
 
@@ -92,8 +65,10 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	startSession(t, ctx, env, repo, "intent-group", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
+	assertIntentV2RuntimeActive(t, repo)
 
 	paused := runAcd(t, ctx, envWith(env, extra...), "pause", "--repo", repo, "--reason", "batch intent test", "--yes", "--json")
 	if paused.ExitCode != 0 {
@@ -114,25 +89,29 @@ func TestIntentStrategy_OpenAIPlannerGroupsTwoCaptures(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "intent-one.txt", "published", 10*time.Second)
+	flushed = runAcd(t, ctx, envWith(env, extra...), "flush", "--repo", repo,
+		"--session-id", "intent-group", "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("second acd flush exit=%d\nstdout=%s\nstderr=%s",
+			flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+	}
 	waitForEventState(t, dbPath, "intent-two.txt", "published", 10*time.Second)
 
 	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-one.txt' ORDER BY seq DESC LIMIT 1")
 	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-two.txt' ORDER BY seq DESC LIMIT 1")
-	if oidOne == "" || oidOne != oidTwo {
-		t.Fatalf("grouped commit oids one=%q two=%q", oidOne, oidTwo)
+	if oidOne == "" || oidTwo == "" || oidOne == oidTwo {
+		t.Fatalf("disconnected commit oids one=%q two=%q", oidOne, oidTwo)
 	}
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d (one grouped intent commit)", got, startCount+1)
-	}
-	if subj := headSubject(t, repo); subj != "Intent grouped files" {
-		t.Fatalf("subject=%q want grouped planner subject", subj)
+	if got := commitCount(t, repo); got != startCount+2 {
+		t.Fatalf("commit count=%d want %d (two atomic intent commits)",
+			got, startCount+2)
 	}
 	if hits.Load() == 0 {
 		t.Fatal("mock planner was not called")
 	}
 }
 
-func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
+func TestIntentStrategy_RapidFiveCapturesOfferedThenSeparated(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -143,12 +122,15 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 	var hits atomic.Int32
 	var firstOffered atomic.Value
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if writeIntentMessageRewriteResponse(t, w, req) {
+			return
+		}
+		hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
 		if firstOffered.Load() == nil {
 			copied := append([]int64(nil), seqs...)
@@ -166,37 +148,7 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 			"grouping_reason":  "settle window collected the rapid burst",
 			"deferred_reasons": []map[string]any{},
 		}
-		args, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatalf("marshal intent plan: %v", err)
-		}
-		resp := map[string]any{
-			"id":     "chatcmpl-rapid-five",
-			"object": "chat.completion",
-			"model":  "gpt-5.4-mini",
-			"choices": []map[string]any{{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "",
-					"tool_calls": []map[string]any{{
-						"id":   "call_rapid_five",
-						"type": "function",
-						"function": map[string]any{
-							"name":      "capture_intent_plan",
-							"arguments": string(args),
-						},
-					}},
-				},
-				"finish_reason": "tool_calls",
-			}},
-		}
-		body, err := json.Marshal(resp)
-		if err != nil {
-			t.Fatalf("marshal response: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(body)
+		writeIntentPlanResponse(t, w, "call_rapid_five", plan)
 	}))
 	defer server.Close()
 
@@ -215,12 +167,19 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 		"ACD_AI_MODEL=gpt-5.4-mini",
 		trustEnv,
 	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	sessionID := "intent-rapid-five"
 	startSession(t, ctx, env, repo, sessionID, "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
 
-	files := []string{"rapid-one.txt", "rapid-two.txt", "rapid-three.txt", "rapid-four.txt", "rapid-five.txt"}
+	files := []string{
+		"rapid/one.go",
+		"rapid/two.go",
+		"rapid/three.go",
+		"rapid/four.go",
+		"rapid/five.go",
+	}
 	startCount := commitCount(t, repo)
 	for _, name := range files {
 		writeFile(t, filepath.Join(repo, name), "rapid content for "+name+"\n")
@@ -231,28 +190,89 @@ func TestIntentStrategy_RapidFiveCapturesOfferedTogether(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	for attempt := 0; attempt < len(files)+1; attempt++ {
+		allPublished := true
+		for _, name := range files {
+			if sqliteScalar(t, dbPath,
+				"SELECT state FROM capture_events WHERE path='"+name+
+					"' ORDER BY seq DESC LIMIT 1") != "published" {
+				allPublished = false
+				break
+			}
+		}
+		if allPublished {
+			break
+		}
+		flushed := runAcd(t, ctx, fullEnv, "flush", "--repo", repo,
+			"--session-id", sessionID, "--logical", "--json")
+		if flushed.ExitCode != 0 {
+			t.Fatalf("acd flush exit=%d\nstdout=%s\nstderr=%s",
+				flushed.ExitCode, flushed.Stdout, flushed.Stderr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 	for _, name := range files {
 		waitForEventState(t, dbPath, name, "published", 25*time.Second)
 	}
-	if hits.Load() != 1 {
-		t.Fatalf("planner hits=%d want 1", hits.Load())
+	if hits.Load() < 1 {
+		t.Fatal("planner was not called")
 	}
 	seqs, ok := firstOffered.Load().([]int64)
 	if !ok || len(seqs) != 5 {
 		t.Fatalf("first offered seqs=%v want 5 seqs", firstOffered.Load())
 	}
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d (one grouped rapid-five commit)", got, startCount+1)
+	if got := commitCount(t, repo); got != startCount+len(files) {
+		t.Fatalf("commit count=%d want %d (five independent commits)",
+			got, startCount+len(files))
 	}
-	if subj := headSubject(t, repo); subj != "Group rapid five" {
-		t.Fatalf("subject=%q want grouped rapid-five subject", subj)
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates
+WHERE planner_protocol='v2' AND status IN ('published','soft_published')`); got != "5" {
+		t.Fatalf("native v2 rapid candidates=%s want 5", got)
 	}
-	win := loadLastPlannerWindowRow(t, dbPath)
-	if len(win.OfferedSeqs) != 5 || len(win.VisibleOriginalSeqs) != 5 || len(win.HiddenSeqs) != 0 {
-		t.Fatalf("rapid-five planner window = %+v, want five offered/visible seqs and no hidden coalesce", win)
+}
+
+func TestIntentV2MigrationMissingPrerequisitesKeepsCapturePending(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
 	}
-	if len(win.SelectedGroups) != 1 || len(win.SelectedGroups[0].OriginalSeqs) != 5 {
-		t.Fatalf("rapid-five selected groups = %+v, want one five-seq group", win.SelectedGroups)
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_API_KEY=",
+		"ACD_AI_DIFF_EGRESS=0",
+	}
+	t.Cleanup(func() { stopSessionForce(t, envWith(env, extra...), repo) })
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	sessionID := "intent-v2-missing-prerequisites"
+	startSession(t, ctx, env, repo, sessionID, "shell", extra...)
+	waitMode(t, repo, "running", 5*time.Second)
+
+	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	writeFile(t, filepath.Join(repo, "captured-while-blocked.txt"),
+		"capture remains durable\n")
+	wakeSession(t, ctx, envWith(env, extra...), repo, sessionID)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitForEventState(t, dbPath, "captured-while-blocked.txt", "pending",
+		10*time.Second)
+	if headAfter := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
+		t.Fatalf("blocked Intent v2 replay advanced HEAD: before=%s after=%s",
+			headBefore, headAfter)
+	}
+	status := runAcd(t, ctx, envWith(env, extra...),
+		"status", "--repo", repo, "--json")
+	if !strings.Contains(status.Stdout, `"replay_state": "needs_attention"`) ||
+		!strings.Contains(status.Stdout, "acd configure") {
+		t.Fatalf("status missing safe migration remediation:\n%s\n%s",
+			status.Stdout, status.Stderr)
+	}
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM intent_candidates`); got != "0" {
+		t.Fatalf("blocked migration invoked candidate planning: candidates=%s",
+			got)
 	}
 }
 
@@ -260,6 +280,11 @@ type intentChatRequest struct {
 	Messages []struct {
 		Content string `json:"content"`
 	} `json:"messages"`
+	ToolChoice struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	} `json:"tool_choice"`
 }
 
 type intentPlanPromptPayload struct {
@@ -278,25 +303,59 @@ func decodeIntentChatRequest(t *testing.T, r *http.Request) intentChatRequest {
 	return req
 }
 
+// writeIntentMessageRewriteResponse handles the locked message-only second
+// round trip used when an otherwise accepted intent plan has a low-quality
+// commit message. Returning only commit_message output mirrors the provider
+// protocol without changing the plan's accepted grouping.
+func writeIntentMessageRewriteResponse(t *testing.T, w http.ResponseWriter, req intentChatRequest) bool {
+	t.Helper()
+	if req.ToolChoice.Function.Name != "commit_message" {
+		return false
+	}
+	args, err := json.Marshal(map[string]string{
+		"subject": "Apply selected intent change",
+		"body":    "- Preserve the accepted capture grouping.",
+	})
+	if err != nil {
+		t.Fatalf("marshal intent message rewrite: %v", err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"id":     "chatcmpl-intent-message-rewrite",
+		"object": "chat.completion",
+		"model":  "gpt-5.4-mini",
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []map[string]any{{
+					"id":   "call_intent_message_rewrite",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "commit_message",
+						"arguments": string(args),
+					},
+				}},
+			},
+			"finish_reason": "tool_calls",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal intent message rewrite response: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+	return true
+}
+
 func offeredIntentSeqs(t *testing.T, req intentChatRequest) []int64 {
 	t.Helper()
-	for _, msg := range req.Messages {
-		const marker = "Plan the next commit intent for these offered captures:\n"
-		if !strings.HasPrefix(msg.Content, marker) {
-			continue
-		}
-		var payload intentPlanPromptPayload
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(msg.Content, marker)), &payload); err != nil {
-			t.Fatalf("decode intent prompt payload: %v", err)
-		}
-		seqs := make([]int64, 0, len(payload.OfferedCaptures))
-		for _, capture := range payload.OfferedCaptures {
-			seqs = append(seqs, capture.Seq)
-		}
-		return seqs
+	captures := offeredIntentCaptures(t, req)
+	seqs := make([]int64, 0, len(captures))
+	for _, capture := range captures {
+		seqs = append(seqs, capture.Seq)
 	}
-	t.Fatalf("intent planner user prompt not found in request: %+v", req)
-	return nil
+	return seqs
 }
 
 func TestIntentStrategy_InvalidEnvFallsBackToEventDefaults(t *testing.T) {

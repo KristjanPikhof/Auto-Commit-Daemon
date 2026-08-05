@@ -51,6 +51,7 @@ const defaultDaemonSpawnPollTimeout = 3 * time.Second
 var daemonSpawnPollTimeout = defaultDaemonSpawnPollTimeout
 var daemonSpawnPollInterval = 50 * time.Millisecond
 var afterDaemonSpawnPollDeadline func(context.Context, *state.DB)
+var beforeCanonicalWriterStateWait func()
 var startControlLockTimeout = 5 * time.Second
 var startControlLockRetryInterval = 10 * time.Millisecond
 
@@ -343,11 +344,61 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 	}
 	daemonPID := 0
 	daemonAlive := false
-	if st.PID > 0 && identity.AliveContext(ctx, st.PID) {
-		hbAge := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
-		if hbAge < clientTTL() && st.Mode != "stopped" {
-			daemonAlive = true
-			daemonPID = st.PID
+	daemonPID, daemonAlive = liveDaemonState(ctx, st)
+
+	// A PID and heartbeat live in the movable state directory, so neither can
+	// prove repository ownership by itself. The stable common-directory flock
+	// is the authority: it rejects a recycled/stale PID when no writer owns the
+	// repo and detects an owner whose state directory was moved, replaced, or
+	// belongs to another linked worktree.
+	writerHeld, err := daemonWriterLockHeld(gitDir)
+	if err != nil {
+		return fmt.Errorf("acd start: verify canonical repository writer: %w", err)
+	}
+	if daemonAlive && !writerHeld {
+		daemonAlive = false
+		daemonPID = 0
+	}
+	if !daemonAlive && writerHeld {
+		// A newly spawned daemon acquires the canonical lock before Run stamps
+		// daemon_state. Concurrent starts can observe that narrow startup
+		// window, so wait for the existing owner to identify itself instead of
+		// treating a healthy in-flight startup as split brain.
+		//
+		// Registration is already durable. Release the short-lived control
+		// lock before waiting so the other concurrent starts can register their
+		// clients and converge on the same canonical writer in parallel.
+		if err := clock.Release(); err != nil {
+			return fmt.Errorf(
+				"acd start: release control.lock before writer convergence: %w",
+				err)
+		}
+		if beforeCanonicalWriterStateWait != nil {
+			beforeCanonicalWriterStateWait()
+		}
+		daemonPID, daemonAlive, err = waitForLiveDaemonState(
+			ctx, db, daemonStartPollTimeout(registeredClients))
+		if err != nil {
+			return fmt.Errorf(
+				"acd start: wait for canonical repository writer state: %w", err)
+		}
+		// Re-probe the lock after waiting. State without the canonical lock is
+		// still stale, while a released lock means the prior startup died and
+		// this caller may safely spawn a replacement.
+		writerHeld, err = daemonWriterLockHeld(gitDir)
+		if err != nil {
+			return fmt.Errorf(
+				"acd start: recheck canonical repository writer: %w", err)
+		}
+		if daemonAlive && !writerHeld {
+			daemonAlive = false
+			daemonPID = 0
+		}
+		if !daemonAlive && writerHeld {
+			return fmt.Errorf(
+				"acd start: %w; the canonical repository writer lock is held but %s does not identify that owner; another ACD version, linked worktree, or daemon with moved state may be active; run `acd status --repo %s` and stop the existing daemon before retrying",
+				daemon.ErrDaemonLockHeld, dbPath, repo,
+			)
 		}
 	}
 
@@ -367,10 +418,7 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 		// Poll daemon_state.pid for up to ~3s. Tests inject a stub
 		// spawnDaemon that stamps the row synchronously, so the loop
 		// usually exits on the first iteration.
-		pollTimeout := daemonSpawnPollTimeout
-		if registeredClients > 1 && pollTimeout == defaultDaemonSpawnPollTimeout {
-			pollTimeout = 5 * time.Second
-		}
+		pollTimeout := daemonStartPollTimeout(registeredClients)
 		deadline := time.Now().Add(pollTimeout)
 		for time.Now().Before(deadline) {
 			st, _, _ = state.LoadDaemonState(ctx, db)
@@ -472,6 +520,82 @@ func runStart(ctx context.Context, out io.Writer, repoFlag, sessionID, harness s
 			sessionID, daemonPID)
 	}
 	return nil
+}
+
+// daemonWriterLockHeld probes both the stable common-repository lock and the
+// legacy per-worktree lock through the same acquisition path used by the
+// daemon. A successful acquisition is released immediately and means there is
+// no current writer. ErrDaemonLockHeld is kernel-backed ownership evidence,
+// independent of movable SQLite/cache state and PID reuse.
+func daemonWriterLockHeld(gitDir string) (bool, error) {
+	lock, err := daemon.AcquireDaemonLock(gitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return true, nil
+		}
+		return false, err
+	}
+	if err := lock.Release(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func daemonStartPollTimeout(registeredClients int) time.Duration {
+	pollTimeout := daemonSpawnPollTimeout
+	if registeredClients > 1 && pollTimeout == defaultDaemonSpawnPollTimeout {
+		pollTimeout = 5 * time.Second
+	}
+	return pollTimeout
+}
+
+func liveDaemonState(
+	ctx context.Context,
+	st state.DaemonState,
+) (int, bool) {
+	if st.PID <= 0 || st.Mode == "stopped" ||
+		!identity.AliveContext(ctx, st.PID) {
+		return 0, false
+	}
+	hbAge := time.Since(time.Unix(int64(st.HeartbeatTS), 0))
+	if hbAge >= clientTTL() {
+		return 0, false
+	}
+	return st.PID, true
+}
+
+func waitForLiveDaemonState(
+	ctx context.Context,
+	db *state.DB,
+	timeout time.Duration,
+) (int, bool, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		st, _, err := state.LoadDaemonState(ctx, db)
+		if err != nil {
+			return 0, false, err
+		}
+		if pid, live := liveDaemonState(ctx, st); live {
+			return pid, true, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, false, nil
+		}
+		wait := daemonSpawnPollInterval
+		if wait <= 0 || wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return 0, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func humanStartSessionID(repoHash string) string {

@@ -463,6 +463,11 @@ func TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier(t *testing.T) {
 	); err != nil {
 		t.Fatalf("MarkEventBlocked: %v", err)
 	}
+	for _, key := range replayErrorMetaTestKeys() {
+		if err := state.MetaSet(ctx, f.db, key, "stale"); err != nil {
+			t.Fatalf("seed replay metadata %s: %v", key, err)
+		}
+	}
 
 	cctx := CaptureContext{
 		BranchRef:        "refs/heads/main",
@@ -515,9 +520,7 @@ func TestDeadBranchSweep_RegressionPendingDoesNotLeakBarrier(t *testing.T) {
 	}
 
 	// Breadcrumb meta keys must be cleared.
-	for _, key := range []string{
-		"last_replay_conflict", "last_replay_conflict_legacy", "last_replay_error",
-	} {
+	for _, key := range replayErrorMetaTestKeys() {
 		if _, ok, err := state.MetaGet(ctx, f.db, key); err != nil {
 			t.Fatalf("MetaGet %q: %v", key, err)
 		} else if ok {

@@ -18,17 +18,18 @@ import (
 const defaultExplainLimit = 10
 
 type explainReport struct {
-	Repo                    string       `json:"repo"`
-	Mode                    string       `json:"mode"`
-	Path                    string       `json:"path,omitempty"`
-	Commit                  string       `json:"commit,omitempty"`
-	CurrentState            string       `json:"current_state,omitempty"`
-	PendingEvents           int          `json:"pending_events,omitempty"`
-	Explanation             string       `json:"explanation"`
-	Recommended             string       `json:"recommended_next_step"`
-	DecisionCursor          int64        `json:"decision_cursor,omitempty"`
-	DecisionLedgerAvailable bool         `json:"decision_ledger_available"`
-	Decisions               []eventEntry `json:"decisions"`
+	Repo                    string         `json:"repo"`
+	Mode                    string         `json:"mode"`
+	Path                    string         `json:"path,omitempty"`
+	Commit                  string         `json:"commit,omitempty"`
+	CurrentState            string         `json:"current_state,omitempty"`
+	PendingEvents           int            `json:"pending_events,omitempty"`
+	Explanation             string         `json:"explanation"`
+	Recommended             string         `json:"recommended_next_step"`
+	DecisionCursor          int64          `json:"decision_cursor,omitempty"`
+	DecisionLedgerAvailable bool           `json:"decision_ledger_available"`
+	Decisions               []eventEntry   `json:"decisions"`
+	IntentV2                intentV2Report `json:"intent_v2"`
 }
 
 func newExplainCmd() *cobra.Command {
@@ -108,8 +109,12 @@ func runExplain(ctx context.Context, out io.Writer, repo, path, commit string, l
 
 func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, commit string, last bool, since int64, limit int) (explainReport, error) {
 	report := explainReport{Repo: repo}
+	intentV2, err := loadIntentV2Report(ctx, db)
+	if err != nil {
+		return report, fmt.Errorf("acd explain: Intent v2 summary: %w", err)
+	}
+	report.IntentV2 = intentV2
 	var rows []state.DecisionRecord
-	var err error
 	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
 		return report, fmt.Errorf("acd explain: decision table check: %w", err)
@@ -308,6 +313,7 @@ func renderExplainHuman(out io.Writer, report explainReport) error {
 	}
 	fmt.Fprintf(out, "Explanation: %s\n", report.Explanation)
 	fmt.Fprintf(out, "Next: %s\n", report.Recommended)
+	renderIntentV2Human(out, report.IntentV2)
 	if len(report.Decisions) > 0 {
 		fmt.Fprintln(out, "\nRecent decisions:")
 		return renderEventsTable(out, report.Decisions)

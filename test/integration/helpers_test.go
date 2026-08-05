@@ -13,6 +13,8 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +27,123 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// activateIntentV2Runtime installs an explicit, already-applied Intent Fast v2
+// revision before daemon startup. Integration tests may still use environment
+// variables to customize provider and timing fields, but never rely on the
+// unsupported env-only v1 startup path.
+func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []string {
+	t.Helper()
+	values := make(map[string]string, len(extra))
+	cleaned := make([]string, 0, len(extra))
+	for _, item := range extra {
+		name, value, ok := strings.Cut(item, "=")
+		if !ok {
+			cleaned = append(cleaned, item)
+			continue
+		}
+		values[name] = value
+		if name != ai.EnvCommitStrategy && name != "ACD_COMMIT_PRESET" {
+			cleaned = append(cleaned, item)
+		}
+	}
+	lookup := func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	}
+	overrides := config.Overrides{}
+	overrides[config.FieldCommitStrategy], _ = json.Marshal("intent")
+	overrides[config.FieldCommitPreset], _ = json.Marshal("fast")
+	if _, configured := values[ai.EnvProvider]; !configured {
+		overrides[config.FieldProvider], _ =
+			json.Marshal("subprocess:missing-integration")
+	}
+	resolved, preset, err := config.ResolveAll(config.ResolveInput{
+		Repository: overrides, LookupEnv: lookup,
+	}, overrides)
+	if err != nil {
+		t.Fatalf("resolve Intent v2 integration revision: %v", err)
+	}
+	snapshot := map[string]any{
+		"preset_id": preset.ID(), "preset_version": preset.Version(),
+		"customized": preset.Customized,
+	}
+	for _, field := range config.Catalog() {
+		if field.Boundary == config.ApplyHot && field.Persistable &&
+			!field.Sensitive {
+			snapshot[field.Name] = resolved[field.Name].EffectiveValue()
+		}
+	}
+	provider := resolved[config.FieldProvider].EffectiveValue()
+	confirmations := []string{string(ai.ConfirmationDiffEgress)}
+	if strings.HasPrefix(provider, "subprocess:") {
+		confirmations = append(confirmations,
+			string(ai.ConfirmationSubprocessExecution))
+	}
+	if provider == "openai-compat" &&
+		strings.TrimRight(resolved[config.FieldBaseURL].EffectiveValue(), "/") !=
+			strings.TrimRight(ai.DefaultOpenAIBaseURL, "/") {
+		confirmations = append(confirmations,
+			string(ai.ConfirmationEndpointCredentials))
+	}
+	snapshot["confirmations"] = confirmations
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode Intent v2 integration revision: %v", err)
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("open Intent v2 integration state: %v", err)
+	}
+	defer db.Close()
+	revision, err := state.InsertConfigRevision(context.Background(), db,
+		state.ConfigRevisionInput{
+			Snapshot: body, Profile: "integration", Scope: "repository",
+			SourceGeneration: 0, Reason: "integration Intent v2 fixture",
+		})
+	if err != nil {
+		t.Fatalf("insert Intent v2 integration revision: %v", err)
+	}
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	if ok, err := state.AcknowledgeConfigActivation(
+		context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("acknowledge Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	if ok, err := state.ApplyConfigActivation(
+		context.Background(), db, request.ID, revision.ID); err != nil || !ok {
+		t.Fatalf("apply Intent v2 integration revision: ok=%v err=%v",
+			ok, err)
+	}
+	return cleaned
+}
+
+func assertIntentV2RuntimeActive(t *testing.T, repo string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	got := sqliteScalar(t, dbPath, `
+SELECT COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.migration_state'), '') || '|' ||
+       COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.preset_id'), '') || '|' ||
+       COALESCE((SELECT value FROM daemon_meta
+                 WHERE key='intent.v2.needs_attention'), '')`)
+	if !strings.HasPrefix(got, "active|intent.fast|") ||
+		strings.TrimPrefix(got, "active|intent.fast|") != "" {
+		t.Fatalf("Intent v2 runtime is not active: %q", got)
+	}
+}
 
 // acdBinaryPath is the per-process build cache. We compile the `acd` binary
 // once and reuse it across every integration scenario. The directory is
@@ -344,7 +462,9 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 		t.Fatalf("start PTY command: %v", err)
 	}
 	readyDeadline := time.Now().Add(5 * time.Second)
-	for !output.contains("ACD SETTINGS") && time.Now().Before(readyDeadline) && ctx.Err() == nil {
+	for !output.contains("ACD SETTINGS") &&
+		!output.contains("Commit strategy") &&
+		time.Now().Before(readyDeadline) && ctx.Err() == nil {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if remaining := minInputDelay - time.Since(startedAt); remaining > 0 {
@@ -512,6 +632,165 @@ func waitForMetaCleared(t *testing.T, dbPath, key string, timeout time.Duration)
 // sqliteLiteral returns a single-quoted SQLite string literal for key.
 func sqliteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// selfPublicationOracle captures the cross-store invariants every transition
+// row must prove. Durations are measured by the caller around the real
+// operation; keeping them in the proof makes liveness a required assertion
+// instead of an informational log line.
+type selfPublicationOracle struct {
+	SourceHead       string
+	TargetHead       string
+	EventCount       int
+	BranchGeneration int64
+	HeartbeatGap     time.Duration
+	WakeLatency      time.Duration
+	WantCleanQueue   bool
+}
+
+func assertSelfPublicationOracle(
+	t *testing.T,
+	repo string,
+	db *state.DB,
+	proof selfPublicationOracle,
+) {
+	t.Helper()
+	ctx := context.Background()
+
+	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	if head != proof.TargetHead {
+		t.Fatalf("HEAD=%s want target=%s", head, proof.TargetHead)
+	}
+	headTree := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD^{tree}"))
+	indexTree := strings.TrimSpace(runGitOK(t, repo, "write-tree"))
+	if headTree != indexTree {
+		t.Fatalf("final tree=%s want worktree/index tree=%s", headTree, indexTree)
+	}
+
+	var total, published, uniqueOwners int
+	if err := db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*),
+       SUM(CASE WHEN state='published' THEN 1 ELSE 0 END),
+       COUNT(DISTINCT CASE WHEN state='published' THEN seq END)
+FROM capture_events`).Scan(&total, &published, &uniqueOwners); err != nil {
+		t.Fatalf("query event ownership oracle: %v", err)
+	}
+	if total != proof.EventCount || published != proof.EventCount ||
+		uniqueOwners != proof.EventCount {
+		t.Fatalf(
+			"event ownership total=%d published=%d unique=%d want=%d",
+			total, published, uniqueOwners, proof.EventCount)
+	}
+	rows, err := db.SQL().QueryContext(ctx, `
+SELECT e.seq, e.operation, o.path, o.after_oid
+FROM capture_events e
+JOIN capture_ops o ON o.event_seq=e.seq
+WHERE e.state='published'
+ORDER BY e.seq, o.ord`)
+	if err != nil {
+		t.Fatalf("query published capture operations: %v", err)
+	}
+	defer rows.Close()
+	eventsWithOps := make(map[int64]struct{}, proof.EventCount)
+	for rows.Next() {
+		var (
+			seq       int64
+			operation string
+			path      string
+			afterOID  sql.NullString
+		)
+		if err := rows.Scan(&seq, &operation, &path, &afterOID); err != nil {
+			t.Fatalf("scan published capture operation: %v", err)
+		}
+		eventsWithOps[seq] = struct{}{}
+		if operation == "create" && !afterOID.Valid {
+			t.Fatalf("published create event %d path=%s has no after object",
+				seq, path)
+		}
+		if !afterOID.Valid {
+			continue
+		}
+		gotOID := strings.TrimSpace(runGitOK(
+			t, repo, "rev-parse", proof.TargetHead+":"+path))
+		if gotOID != afterOID.String {
+			t.Fatalf(
+				"published event %d path=%s object=%s want captured=%s",
+				seq, path, gotOID, afterOID.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate published capture operations: %v", err)
+	}
+	if len(eventsWithOps) != proof.EventCount {
+		t.Fatalf("published events with operations=%d want=%d",
+			len(eventsWithOps), proof.EventCount)
+	}
+
+	chain := strings.Fields(runGitOK(
+		t, repo, "rev-list", "--first-parent", "--reverse",
+		proof.SourceHead+".."+proof.TargetHead))
+	parent := proof.SourceHead
+	for i, commit := range chain {
+		gotParent := strings.TrimSpace(runGitOK(
+			t, repo, "rev-parse", commit+"^"))
+		if gotParent != parent {
+			t.Fatalf("commit[%d]=%s parent=%s want=%s",
+				i, commit, gotParent, parent)
+		}
+		parent = commit
+	}
+	if len(chain) == 0 || parent != proof.TargetHead {
+		t.Fatalf("linear publication chain=%v target=%s", chain, proof.TargetHead)
+	}
+
+	var generation string
+	if err := db.SQL().QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key='branch.generation'`,
+	).Scan(&generation); err != nil {
+		t.Fatalf("query branch generation: %v", err)
+	}
+	if generation != strconv.FormatInt(proof.BranchGeneration, 10) {
+		t.Fatalf("branch generation=%s want=%d",
+			generation, proof.BranchGeneration)
+	}
+	for name, query := range map[string]string{
+		"recovery snapshots": `SELECT COUNT(*) FROM recovery_snapshots`,
+		"recoverable journals": `SELECT COUNT(*) FROM self_publications
+			WHERE phase IN ('prepared','git_applied')`,
+		"multiply owned events": `SELECT COUNT(*) FROM (
+			SELECT event_seq FROM self_publication_members
+			GROUP BY event_seq HAVING COUNT(*) > 1)`,
+	} {
+		var count int
+		if err := db.SQL().QueryRowContext(ctx, query).Scan(&count); err != nil {
+			t.Fatalf("query %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s=%d want 0", name, count)
+		}
+	}
+	if proof.WantCleanQueue {
+		var pending int
+		if err := db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM capture_events
+WHERE state NOT IN ('published','superseded_external')`,
+		).Scan(&pending); err != nil {
+			t.Fatalf("query clean queue: %v", err)
+		}
+		if pending != 0 {
+			t.Fatalf("unsettled event queue=%d want 0", pending)
+		}
+	}
+	if status := strings.TrimSpace(runGitOK(
+		t, repo, "status", "--porcelain")); status != "" {
+		t.Fatalf("worktree not clean:\n%s", status)
+	}
+	if proof.HeartbeatGap > 3*time.Second {
+		t.Fatalf("heartbeat gap=%s exceeds 3s", proof.HeartbeatGap)
+	}
+	if proof.WakeLatency > 60*time.Second {
+		t.Fatalf("wake acknowledgement=%s exceeds 60s", proof.WakeLatency)
+	}
 }
 
 // SeedFlushRequests inserts n flush_requests rows in 'pending' status using a

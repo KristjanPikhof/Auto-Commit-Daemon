@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -48,6 +49,7 @@ func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
 	defer server.Close()
 
 	extra := settingsRuntimeEnv(server.URL, trustEnv)
+	extra = activateIntentV2Runtime(t, repo, extra...)
 	fullEnv := envWith(env, extra...)
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
@@ -237,13 +239,7 @@ func decodeSettingsPlannerRequest(t *testing.T, r *http.Request) settingsIntentR
 func writeSettingsPlannerResponse(t *testing.T, w http.ResponseWriter, model string, seqs []int64) {
 	t.Helper()
 	plan := map[string]any{"selected_seqs": seqs, "deferred_seqs": []int64{}, "subject": "Apply " + model + " settings", "body": "- Prove one complete runtime revision", "grouping_reason": "settings integration", "deferred_reasons": []map[string]any{}}
-	args, err := json.Marshal(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response := map[string]any{"id": "chatcmpl-settings", "object": "chat.completion", "model": model, "choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "call-settings", "type": "function", "function": map[string]any{"name": "capture_intent_plan", "arguments": string(args)}}}}, "finish_reason": "tool_calls"}}}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
+	writeIntentPlanResponse(t, w, "call-settings", plan)
 }
 
 func settingsRuntimeEnv(url, trustEnv string) []string {
@@ -263,7 +259,31 @@ func openSettingsRuntimeDB(t *testing.T, repo string) *state.DB {
 func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, model string, generation int64, values map[string]any) (state.ConfigRevision, state.ConfigActivationRequest) {
 	t.Helper()
 	if values == nil {
-		values = map[string]any{"ai.provider": "openai-compat", "ai.model": model, "commit.strategy": "intent", "intent.window": 1, "intent.min_pending": 1, "intent.settle_window": "0s", "intent.max_pending_age": "30s", "confirmations": []string{"endpoint_credentials"}}
+		values = map[string]any{
+			"ai.provider": "openai-compat", "ai.model": model,
+			"ai.diff_egress": "true", "commit.strategy": "intent",
+			"commit.preset": "fast", "commit.format": "imperative",
+			"intent.window": "1", "intent.min_pending": "1",
+			"intent.settle_window": "0s", "intent.max_pending_age": "30s",
+			"intent.verification": "none", "intent.repair.enabled": "false",
+			"preset_id":      "intent.fast",
+			"preset_version": config.PresetCatalogVersion,
+			"customized":     true,
+			"confirmations": []string{
+				"endpoint_credentials", "diff_egress",
+			},
+		}
+	}
+	strategy, _ := values["commit.strategy"].(string)
+	if strategy == "" {
+		strategy = "event"
+		values["commit.strategy"] = strategy
+	}
+	if _, ok := values["preset_id"]; !ok {
+		values["commit.preset"] = "fast"
+		values["preset_id"] = strategy + ".fast"
+		values["preset_version"] = config.PresetCatalogVersion
+		values["customized"] = true
 	}
 	body, err := json.Marshal(values)
 	if err != nil {
@@ -272,6 +292,14 @@ func queueSettingsRevision(t *testing.T, db *state.DB, expected sql.NullInt64, m
 	revision, err := state.InsertConfigRevision(context.Background(), db, state.ConfigRevisionInput{Snapshot: body, Profile: "integration", Scope: "repository", SourceGeneration: generation, Reason: "integration fixture"})
 	if err != nil {
 		t.Fatalf("insert settings revision: %v", err)
+	}
+	if !expected.Valid {
+		projection, projectionErr := state.RuntimeConfigActivationState(
+			context.Background(), db)
+		if projectionErr != nil {
+			t.Fatalf("load current settings revision: %v", projectionErr)
+		}
+		expected = projection.DesiredRevisionID
 	}
 	request, ok, err := state.RequestConfigActivation(context.Background(), db, revision.ID, expected)
 	if err != nil || !ok {

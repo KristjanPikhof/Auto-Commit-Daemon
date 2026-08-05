@@ -35,13 +35,13 @@ import (
 	"time"
 )
 
-// TestFlush_LogicalCommitsSingleEditWithDeterministicProvider exercises the
-// d1 bypass on the simplest possible intent-strategy config: deterministic
-// provider, no openai-compat plumbing. A single edit followed by `acd flush
+// TestFlush_LogicalCommitsSingleEditWithUnavailableProvider exercises the
+// d1 bypass on Intent Fast with an unavailable local provider. A single edit
+// followed by `acd flush
 // --logical` must land within the 2s budget the d1 spec asserts. This
 // catches a regression where the bypass plumbing depends on a network
 // provider being configured (it must not).
-func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
+func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -51,14 +51,14 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	repo := tempRepo(t)
 	sessionID := "intent-flush-deterministic"
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
-	env = envWith(env,
+	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_MIN_PENDING=10",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_WINDOW=10",
-		// No ACD_AI_PROVIDER — defaults to deterministic, exercising the
-		// fallback chain end-to-end through the flush bypass.
-	)
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	env = envWith(env, extra...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -76,6 +76,7 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	waitFor(t, "daemon mode==running", 10*time.Second, func() bool {
 		return readDaemonStateMode(repo) == "running"
 	})
+	assertIntentV2RuntimeActive(t, repo)
 
 	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	target := filepath.Join(repo, "deterministic-flush.txt")
@@ -162,7 +163,7 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 	gitCommitAll(t, repo, "seed quiet.txt", "quiet.txt")
 
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
-	env = envWith(env,
+	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=1",
@@ -170,7 +171,9 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_PATH_COALESCE=1",
 		"ACD_PATH_QUIESCENCE_SECONDS=2",
-	)
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	env = envWith(env, extra...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -259,5 +262,22 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 		"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='published'")
 	if rows != "2" {
 		t.Fatalf("published rows for quiet.txt=%s want 2", rows)
+	}
+	members := sqliteScalar(t, dbPath, `
+SELECT COUNT(*)
+FROM intent_candidate_events member
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE capture.path='quiet.txt' AND member.membership_state='active'`)
+	if members != "2" {
+		t.Fatalf("active candidate members for quiet.txt=%s want 2", members)
+	}
+	coalesced := sqliteScalar(t, dbPath, `
+SELECT COUNT(*)
+FROM intent_candidate_events member
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE capture.path='quiet.txt' AND member.event_role='coalesced'
+  AND member.membership_state='active'`)
+	if coalesced != "1" {
+		t.Fatalf("coalesced candidate members for quiet.txt=%s want 1", coalesced)
 	}
 }

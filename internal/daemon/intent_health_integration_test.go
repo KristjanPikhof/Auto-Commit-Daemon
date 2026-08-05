@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -402,14 +404,32 @@ func TestReplay_IntentHealthSelectionSafetyFailureIsValidation(t *testing.T) {
 	}
 }
 
-func TestRun_IntentHealthReusesInjectedProvider(t *testing.T) {
+func TestRun_IntentV2HealthReusesRevisionedProvider(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
 	t.Setenv(ai.EnvIntentMinPending, "1")
 	t.Setenv(ai.EnvIntentSettleWindow, "0")
 	t.Setenv("ACD_AI_DIFF_EGRESS", "1")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
 
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
+	revision := runtimeRevision(t, f.db, "health-reuse", 1,
+		map[string]any{
+			"ai.provider":          "subprocess:runtime-health",
+			"commit.strategy":      "intent",
+			"intent.min_pending":   1,
+			"intent.settle_window": "0s",
+			"confirmations": []string{
+				string(ai.ConfirmationSubprocessExecution),
+				string(ai.ConfirmationDiffEgress),
+			},
+		})
+	if _, ok, err := state.RequestConfigActivation(context.Background(), f.db,
+		revision.ID, sql.NullInt64{}); err != nil || !ok {
+		t.Fatalf("request runtime activation: ok=%v err=%v", ok, err)
+	}
 	if err := os.WriteFile(filepath.Join(f.dir, "provider-reuse.txt"), []byte("reuse\n"), 0o644); err != nil {
 		t.Fatalf("write provider-reuse.txt: %v", err)
 	}
@@ -425,23 +445,23 @@ func TestRun_IntentHealthReusesInjectedProvider(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		_ = Run(runCtx, Options{
-			RepoPath:              f.dir,
-			GitDir:                f.gitDir,
-			DB:                    f.db,
-			Scheduler:             manual,
-			BootGrace:             30 * time.Second,
-			MessageProvider:       provider,
-			MessageProviderCloser: closer,
-			WakeCh:                wakeCh,
-			ShutdownCh:            shutdownCh,
-			SkipSignals:           true,
+			RepoPath:    f.dir,
+			GitDir:      f.gitDir,
+			DB:          f.db,
+			Scheduler:   manual,
+			BootGrace:   30 * time.Second,
+			WakeCh:      wakeCh,
+			ShutdownCh:  shutdownCh,
+			SkipSignals: true,
+			runtimeBuildProvider: func(ai.ProviderConfig) (ai.Provider, io.Closer, error) {
+				return provider, closer, nil
+			},
 		})
 	}()
 	t.Cleanup(func() {
 		cancel()
 		wg.Wait()
 	})
-
 	waitFor(t, 5*time.Second, "run-scoped intent planner call", func() bool {
 		calls, _ := provider.snapshot()
 		return calls >= 1
@@ -449,12 +469,14 @@ func TestRun_IntentHealthReusesInjectedProvider(t *testing.T) {
 	waitFor(t, 5*time.Second, "provider-reuse capture published", func() bool {
 		var count int
 		if err := f.db.ReadSQL().QueryRowContext(context.Background(),
-			`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state.EventStatePublished).Scan(&count); err != nil {
+			`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+			state.EventStatePublished).Scan(&count); err != nil {
 			return false
 		}
 		return count >= 1
 	})
-	if err := os.WriteFile(filepath.Join(f.dir, "provider-reuse-second.txt"), []byte("reuse again\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(f.dir, "provider-reuse-second.txt"),
+		[]byte("reuse again\n"), 0o644); err != nil {
 		t.Fatalf("write provider-reuse-second.txt: %v", err)
 	}
 	wakeCh <- struct{}{}
@@ -465,7 +487,17 @@ func TestRun_IntentHealthReusesInjectedProvider(t *testing.T) {
 	waitFor(t, 5*time.Second, "second provider-reuse capture published", func() bool {
 		var count int
 		if err := f.db.ReadSQL().QueryRowContext(context.Background(),
-			`SELECT COUNT(*) FROM capture_events WHERE state = ?`, state.EventStatePublished).Scan(&count); err != nil {
+			`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
+			state.EventStatePublished).Scan(&count); err != nil {
+			return false
+		}
+		return count >= 2
+	})
+	waitFor(t, 5*time.Second, "second Intent v2 candidate settled", func() bool {
+		var count int
+		if err := f.db.ReadSQL().QueryRowContext(context.Background(),
+			`SELECT COUNT(*) FROM intent_candidates WHERE status = 'published'`,
+		).Scan(&count); err != nil {
 			return false
 		}
 		return count >= 2
@@ -474,25 +506,27 @@ func TestRun_IntentHealthReusesInjectedProvider(t *testing.T) {
 	wg.Wait()
 
 	calls, requests := provider.snapshot()
-	if calls != 2 {
-		t.Fatalf("PlanIntent calls=%d want two calls on one reused provider", calls)
-	}
-	if len(requests) != 2 {
-		t.Fatalf("planner requests=%d want 2", len(requests))
+	if calls != 2 || len(requests) != 2 {
+		t.Fatalf("revisioned provider calls=%d requests=%d want 2/2",
+			calls, len(requests))
 	}
 	for i, request := range requests {
-		if len(request.OfferedCaptures) == 0 || request.OfferedCaptures[0].CapturedDiff == "" {
-			t.Fatalf("planner request %d=%+v want diff-bearing request", i, request)
+		if len(request.OfferedCaptures) == 0 ||
+			request.OfferedCaptures[0].CapturedDiff == "" {
+			t.Fatalf("planner request %d=%+v want diff-bearing request",
+				i, request)
 		}
 	}
 	if got := closer.calls.Load(); got != 1 {
 		t.Fatalf("provider Close calls=%d want 1", got)
 	}
 	var persisted intentPlannerHealthRecord
-	if ok, err := state.MetaGetJSON(context.Background(), f.db, MetaKeyIntentPlannerHealth, &persisted); err != nil || !ok {
+	if ok, err := state.MetaGetJSON(context.Background(), f.db,
+		MetaKeyIntentPlannerHealth, &persisted); err != nil || !ok {
 		t.Fatalf("load persisted intent health ok=%v err=%v", ok, err)
 	}
-	if persisted.State != IntentPlannerCircuitClosed || persisted.ProviderFingerprint == "" {
+	if persisted.State != IntentPlannerCircuitClosed ||
+		persisted.ProviderFingerprint == "" {
 		t.Fatalf("persisted health=%+v", persisted)
 	}
 }

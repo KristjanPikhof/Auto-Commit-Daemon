@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -25,14 +26,49 @@ import (
 
 func TestMain(m *testing.M) {
 	_ = os.Setenv(ai.EnvProvider, "deterministic")
+	// Ordinary daemon tests exercise run-loop behavior, not host process
+	// discovery. Keep their lock acquisition deterministic and leave the real
+	// and injected owner-probe paths to lock_test.go.
+	daemonLockOwnerProbe = func(context.Context, string, int) ([]int, error) {
+		return nil, nil
+	}
+	runtimeRoot, err := os.MkdirTemp("", "acd-daemon-runtime-*")
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test runtime setup: %v\n", err)
+		os.Exit(1)
+	}
+	for name, path := range map[string]string{
+		"HOME":            filepath.Join(runtimeRoot, "home"),
+		"XDG_CONFIG_HOME": filepath.Join(runtimeRoot, "config"),
+		"XDG_STATE_HOME":  filepath.Join(runtimeRoot, "state"),
+		"XDG_DATA_HOME":   filepath.Join(runtimeRoot, "share"),
+	} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"daemon test runtime directory %s: %v\n", name, err)
+			_ = os.RemoveAll(runtimeRoot)
+			os.Exit(1)
+		}
+		if err := os.Setenv(name, path); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"daemon test runtime environment %s: %v\n", name, err)
+			_ = os.RemoveAll(runtimeRoot)
+			os.Exit(1)
+		}
+	}
 	templateRoot, err := setupDaemonTestRepoTemplates()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "daemon test template setup: %v\n", err)
+		_ = os.RemoveAll(runtimeRoot)
 		os.Exit(1)
 	}
 	code := m.Run()
 	if err := os.RemoveAll(templateRoot); err != nil && code == 0 {
 		_, _ = fmt.Fprintf(os.Stderr, "daemon test template cleanup: %v\n", err)
+		code = 1
+	}
+	if err := os.RemoveAll(runtimeRoot); err != nil && code == 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test runtime cleanup: %v\n", err)
 		code = 1
 	}
 	os.Exit(code)
@@ -342,6 +378,253 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	// handle to mirror an external controller and avoid stale read-pool
 	// snapshots from the long-lived fixture handle under macOS broad runs.
 	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
+}
+
+func TestRun_IntentV2MissingPrerequisitesCapturesWithoutReplay(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvDiffEgress, "false")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: wakeCh,
+			ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	if err := os.WriteFile(filepath.Join(f.dir, "blocked-intent.txt"),
+		[]byte("durable capture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	waitForCaptureEventCount(t, f.db, 1, 3*time.Second)
+	waitForMetaValue(t, f.db, metaIntentV2MigrationState,
+		"needs_attention", 2*time.Second)
+
+	var eventState string
+	if err := f.db.SQL().QueryRow(
+		`SELECT state FROM capture_events ORDER BY seq DESC LIMIT 1`,
+	).Scan(&eventState); err != nil {
+		t.Fatal(err)
+	}
+	if eventState != "pending" {
+		t.Fatalf("captured event state=%q want pending", eventState)
+	}
+	time.Sleep(100 * time.Millisecond)
+	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("blocked Intent v2 replay advanced HEAD: %s -> %s",
+			startHead, head)
+	}
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("needs-attention guidance=%q ok=%v err=%v",
+			attention, ok, err)
+	}
+}
+
+func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv(ai.EnvProvider, "deterministic")
+	configPath := filepath.Join(t.TempDir(), "config-is-a-file")
+	if err := os.WriteFile(configPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configPath)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	if err := state.MetaSetMany(context.Background(), f.db,
+		map[string]string{
+			metaIntentV2CutoverRequired: "true",
+			"commit.strategy":           "intent",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	passDone := make(chan struct{}, 1)
+	passRelease := make(chan struct{})
+	waitForPass := func(label string) {
+		t.Helper()
+		select {
+		case <-passDone:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s pass", label)
+		}
+	}
+	releasePass := func(label string) {
+		t.Helper()
+		select {
+		case passRelease <- struct{}{}:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out releasing %s pass", label)
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: wakeCh,
+			ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+			runtimeBuildProvider: func(
+				cfg ai.ProviderConfig,
+			) (ai.Provider, io.Closer, error) {
+				return &runtimeTestProvider{name: cfg.Mode}, nil, nil
+			},
+			afterRunLoopWorkDecision: func(_, _ bool) {
+				select {
+				case passDone <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				select {
+				case <-passRelease:
+				case <-ctx.Done():
+				}
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForPass("startup cutover failure")
+	if err := os.WriteFile(filepath.Join(f.dir, "cutover-error.txt"),
+		[]byte("captured\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	releasePass("capture")
+	waitForPass("capture")
+	waitForCaptureEventCount(t, f.db, 1, 3*time.Second)
+	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("cutover failure replay advanced HEAD: %s -> %s",
+			startHead, head)
+	}
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("cutover attention=%q ok=%v err=%v", attention, ok, err)
+	}
+
+	revision := runtimeRevision(t, f.db, "configured", 1,
+		map[string]any{
+			"commit.strategy": "intent",
+			"intent.window":   10,
+		})
+	if _, activated, err := state.RequestConfigActivation(
+		context.Background(), f.db, revision.ID, sql.NullInt64{},
+	); err != nil || !activated {
+		t.Fatalf("request configured revision: activated=%v err=%v",
+			activated, err)
+	}
+	flushID, err := state.EnqueueFlushRequest(context.Background(), f.db,
+		"flush_logical", true,
+		sql.NullString{String: "test-session", Valid: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force one complete pass while configuration storage is still unusable.
+	// The pass must acknowledge the only logical flush without consuming its
+	// batch-wait bypass through the blocked replay path.
+	wakeCh <- struct{}{}
+	releasePass("blocked logical flush")
+	waitForPass("blocked logical flush")
+	var flushStatus string
+	if err := f.db.SQL().QueryRow(
+		`SELECT status FROM flush_requests WHERE id=?`, flushID,
+	).Scan(&flushStatus); err != nil {
+		t.Fatal(err)
+	}
+	if flushStatus != "completed" {
+		t.Fatalf("logical flush status=%q want completed before activation", flushStatus)
+	}
+	var logicalFlushes int
+	if err := f.db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM flush_requests WHERE command='flush_logical'`,
+	).Scan(&logicalFlushes); err != nil {
+		t.Fatal(err)
+	}
+	if logicalFlushes != 1 {
+		t.Fatalf("logical flush rows=%d want exactly 1", logicalFlushes)
+	}
+	head, err = git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("blocked logical flush advanced HEAD: %s -> %s", startHead, head)
+	}
+
+	// Make configuration usable only after the flush row is completed, then
+	// drive a pass with a plain wake. The retained bypass must publish without
+	// enqueueing a second logical flush.
+	if err := os.Remove(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(configPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wakeCh <- struct{}{}
+	releasePass("configuration recovery")
+	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
+	if newHead == startHead {
+		t.Fatal("configured v2 revision did not resume replay")
+	}
+	waitForPass("configuration recovery")
+	t.Logf("retained logical flush advanced HEAD after activation: %s -> %s",
+		startHead, newHead)
+	if err := f.db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM flush_requests WHERE command='flush_logical'`,
+	).Scan(&logicalFlushes); err != nil {
+		t.Fatal(err)
+	}
+	if logicalFlushes != 1 {
+		t.Fatalf("logical flush rows after replay=%d want exactly 1", logicalFlushes)
+	}
+	waitForMetaValue(t, f.db, metaIntentV2MigrationState,
+		"active", 2*time.Second)
 }
 
 // TestRun_StampedFingerprintIsSymmetricWithVerifier pins the regression
@@ -2762,6 +3045,10 @@ func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
 // prevHead), so the generation must NOT bump even though the token
 // changed.
 func TestRun_BranchGenerationStableOnAcdFastForward(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	ctx := context.Background()
@@ -3138,6 +3425,13 @@ func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
 	if err := state.MetaSet(ctx, f.db, MetaKeyDetachedHeadPaused, "1"); err != nil {
 		t.Fatalf("MetaSet detached: %v", err)
 	}
+	if err := state.MetaSet(
+		ctx, f.db, MetaKeyBranchToken, branchTokenRev(headSHA, "")); err != nil {
+		t.Fatalf("MetaSet detached branch token: %v", err)
+	}
+	if err := state.MetaSet(ctx, f.db, MetaKeyBranchHead, headSHA); err != nil {
+		t.Fatalf("MetaSet detached branch head: %v", err)
+	}
 	// 90s into the future stays within ClampRewindGraceAtStartup's tolerance
 	// (2 * defaultRewindGrace = 120s) so the daemon's startup clamp leaves
 	// our pre-set marker in place; otherwise the clamp normalizes the
@@ -3147,43 +3441,99 @@ func TestRun_ReattachClearsStaleRewindGrace(t *testing.T) {
 		t.Fatalf("MetaSet paused_until: %v", err)
 	}
 
-	wakeCh := make(chan struct{}, 4)
-	shutdownCh := make(chan struct{}, 1)
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-		})
-	}()
-	t.Cleanup(func() {
-		cancel()
-		wg.Wait()
-	})
-
-	waitForDaemonMode(t, f.db, "running", 2*time.Second)
-
-	// Reattach HEAD onto refs/heads/main.
+	// Reattach before startup samples HEAD. The persisted detached token and
+	// marker must still authorize exact recovery and clear the stale grace
+	// only after the startup transition is accepted.
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "main"); err != nil {
 		t.Fatalf("checkout main: %v", err)
 	}
-	wakeCh <- struct{}{}
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+	if err := Run(ctx, Options{
+		RepoPath:    f.dir,
+		GitDir:      f.gitDir,
+		DB:          f.db,
+		Scheduler:   fastScheduler(),
+		BootGrace:   30 * time.Second,
+		ShutdownCh:  shutdownCh,
+		SkipSignals: true,
+		recoverSelfPublications: func(
+			ctx context.Context, _ string, db *state.DB,
+			_ CaptureContext, _ ReplayOpts,
+		) (SelfPublicationRecoverySummary, error) {
+			// Completion persists the recovered attached publication token
+			// before startup later reloads its previous token.
+			if err := state.MetaSet(ctx, db, MetaKeyBranchToken,
+				branchTokenRev(headSHA, "refs/heads/main")); err != nil {
+				return SelfPublicationRecoverySummary{}, err
+			}
+			return SelfPublicationRecoverySummary{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 
-	// Both the detached-paused marker and the rewind-grace marker must
-	// be cleared once the reattach branch in the run loop fires.
-	waitForMetaDeleted(t, f.db, MetaKeyDetachedHeadPaused, 3*time.Second)
-	waitForMetaDeleted(t, f.db, MetaKeyReplayPausedUntil, 3*time.Second)
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); err != nil {
+		t.Fatalf("MetaGet detached marker: %v", err)
+	} else if ok {
+		t.Fatal("detached marker was not cleared")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet rewind grace: %v", err)
+	} else if ok {
+		t.Fatal("stale detached rewind grace was not cleared")
+	}
+}
+
+func TestRun_StartupStaleDetachedMarkerPreservesAttachedRewindGrace(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	headSHA, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyBranchToken:        branchTokenRev(headSHA, "refs/heads/main"),
+		MetaKeyBranchHead:         headSHA,
+		MetaKeyDetachedHeadPaused: "stale",
+		MetaKeyReplayPausedUntil: time.Now().UTC().
+			Add(90 * time.Second).Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("MetaSetMany: %v", err)
+	}
+
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+	recoveryCalled := false
+	if err := Run(ctx, Options{
+		RepoPath:    f.dir,
+		GitDir:      f.gitDir,
+		DB:          f.db,
+		BootGrace:   time.Hour,
+		ShutdownCh:  shutdownCh,
+		SkipSignals: true,
+		recoverSelfPublications: func(
+			context.Context, string, *state.DB, CaptureContext, ReplayOpts,
+		) (SelfPublicationRecoverySummary, error) {
+			recoveryCalled = true
+			return SelfPublicationRecoverySummary{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if recoveryCalled {
+		t.Fatal("startup recovery bypassed a genuine attached rewind grace")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyReplayPausedUntil); err != nil {
+		t.Fatalf("MetaGet rewind grace: %v", err)
+	} else if !ok {
+		t.Fatal("genuine attached rewind grace was cleared")
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); err != nil {
+		t.Fatalf("MetaGet detached marker: %v", err)
+	} else if ok {
+		t.Fatal("stale detached marker was not cleared")
+	}
 }
 
 // TestRun_OperationClearedClearsStaleRewindGrace asserts the symmetric
@@ -3551,6 +3901,596 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	}
 }
 
+// TestRun_SelfPublicationBoundary_MultiGroupHeadAdvanceBeforeTokenAdoption
+// reproduces the liveness window seen when one publication pass advances HEAD
+// more than once while the run loop still holds its pre-pass branch token.
+//
+// The existing beforeBranchTokenCheck seam is the closest production boundary
+// available before journaled publication hooks land. Holding it gives the test
+// a deterministic boundary: no scheduler sleeps are involved, and the daemon
+// cannot sample or adopt either group while the gate is closed. The assertions
+// pin the observable pre-adoption signature (stale durable token and heartbeat,
+// plus a pending flush), then prove the loop converges without an archive or a
+// duplicate commit after the gate opens.
+func TestRun_SelfPublicationBoundary_MultiGroupHeadAdvanceBeforeTokenAdoption(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = Run(ctx, Options{
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              manual,
+			BootGrace:              30 * time.Second,
+			MessageFn:              DeterministicMessage,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			beforeBranchTokenCheck: checkHook,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(seedHead, "refs/heads/main"), 2*time.Second)
+
+	before, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load gated daemon state: ok=%v err=%v", ok, err)
+	}
+	if _, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false,
+		sql.NullString{String: "self-publication boundary", Valid: true}); err != nil {
+		t.Fatalf("enqueue boundary flush: %v", err)
+	}
+
+	// These two commits model two Intent groups published in one replay pass.
+	// The daemon remains parked before its next token sample throughout.
+	if err := os.WriteFile(filepath.Join(f.dir, "group-one.txt"),
+		[]byte("group one\n"), 0o644); err != nil {
+		t.Fatalf("write group one: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "group-one.txt"); err != nil {
+		t.Fatalf("add group one: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "group one"); err != nil {
+		t.Fatalf("commit group one: %v", err)
+	}
+	groupOneHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse group one: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(f.dir, "group-two.txt"),
+		[]byte("group two\n"), 0o644); err != nil {
+		t.Fatalf("write group two: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "group-two.txt"); err != nil {
+		t.Fatalf("add group two: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "commit", "-q", "-m", "group two"); err != nil {
+		t.Fatalf("commit group two: %v", err)
+	}
+	groupTwoHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse group two: %v", err)
+	}
+	if groupOneHead == seedHead || groupTwoHead == groupOneHead {
+		t.Fatalf("test setup did not produce two HEAD advances: seed=%s group1=%s group2=%s",
+			seedHead, groupOneHead, groupTwoHead)
+	}
+
+	// The closed gate is the synchronization proof: these observations are
+	// made while the run loop cannot possibly have sampled the new HEAD.
+	if got, _, err := state.MetaGet(ctx, f.db, MetaKeyBranchHead); err != nil || got != seedHead {
+		t.Fatalf("gated branch.head=%q err=%v want stale seed %s", got, err, seedHead)
+	}
+	if got := countFlushByStatus(t, f.db, "pending"); got != 1 {
+		t.Fatalf("gated pending flushes=%d want 1", got)
+	}
+	during, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load daemon state during gate: ok=%v err=%v", ok, err)
+	}
+	if during.HeartbeatTS != before.HeartbeatTS {
+		t.Fatalf("heartbeat advanced across closed boundary: before=%f during=%f",
+			before.HeartbeatTS, during.HeartbeatTS)
+	}
+
+	releaseCheck()
+
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, groupTwoHead, 3*time.Second)
+	waitFor(t, 3*time.Second, "boundary flush completes", func() bool {
+		return countFlushByStatus(t, f.db, "completed") == 1
+	})
+
+	if got, _, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration); err != nil || got != "1" {
+		t.Fatalf("branch generation=%q err=%v want stable generation 1", got, err)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0 for the linear two-group advance", archives)
+	}
+	out, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "rev-list", "--count",
+		seedHead+".."+groupTwoHead)
+	if err != nil {
+		t.Fatalf("count publication commits: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "2" {
+		t.Fatalf("publication commit count=%s want exactly 2", got)
+	}
+}
+
+func TestRun_HeartbeatAndWakeAfterSelfPublication(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse seed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-one.txt"),
+		[]byte("one\n"), 0o644); err != nil {
+		t.Fatalf("write publication one: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-two.txt"),
+		[]byte("two\n"), 0o644); err != nil {
+		t.Fatalf("write publication two: %v", err)
+	}
+
+	type adoptionSnapshot struct {
+		cctx        CaptureContext
+		token       string
+		headOID     string
+		stampedHead string
+	}
+	adoptedCh := make(chan adoptionSnapshot, 1)
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	trace := &memoryTraceLogger{}
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     manual,
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			Trace:         trace,
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext,
+				token string,
+				headOID string,
+				stampedHead string,
+			) {
+				select {
+				case adoptedCh <- adoptionSnapshot{
+					cctx:        cctx,
+					token:       token,
+					headOID:     headOID,
+					stampedHead: stampedHead,
+				}:
+				default:
+				}
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var adopted adoptionSnapshot
+	select {
+	case adopted = <-adoptedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run loop did not adopt journaled self-publication")
+	}
+	targetHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse target: %v", err)
+	}
+	if targetHead == seedHead {
+		t.Fatalf("HEAD stayed at seed %s", seedHead)
+	}
+	wantToken := branchTokenRev(targetHead, "refs/heads/main")
+	if adopted.cctx.BaseHead != targetHead ||
+		adopted.token != wantToken ||
+		adopted.headOID != targetHead ||
+		adopted.stampedHead != targetHead {
+		t.Fatalf(
+			"adopted snapshot cctx=%s token=%q headOID=%s stamped=%s want target=%s token=%q",
+			adopted.cctx.BaseHead, adopted.token, adopted.headOID,
+			adopted.stampedHead, targetHead, wantToken)
+	}
+	t.Logf("adopted target=%s token=%q generation=%d",
+		targetHead, wantToken, adopted.cctx.BranchGeneration)
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, targetHead, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken, wantToken, 2*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchGeneration, "1", 2*time.Second)
+
+	var completedPublications int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM self_publications
+WHERE phase = 'completed' AND target_commit_oid = ?`, targetHead).
+		Scan(&completedPublications); err != nil {
+		t.Fatalf("count completed self-publications: %v", err)
+	}
+	if completedPublications != 1 {
+		t.Fatalf("completed publications for target=%d want 1", completedPublications)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", archives)
+	}
+
+	// Wait for the publication iteration's heartbeat, then prove the next
+	// queued wake is both claimed and followed by another heartbeat within
+	// the epic's three-second liveness budget.
+	waitFor(t, 3*time.Second, "publication heartbeat", func() bool {
+		st, ok, loadErr := state.LoadDaemonState(ctx, f.db)
+		return loadErr == nil && ok && st.HeartbeatTS > 0
+	})
+	beforeWake, ok, err := state.LoadDaemonState(ctx, f.db)
+	if err != nil || !ok {
+		t.Fatalf("load heartbeat before wake: ok=%v err=%v", ok, err)
+	}
+	flushID, err := state.EnqueueFlushRequest(ctx, f.db, "wake", false,
+		sql.NullString{String: "post-publication liveness", Valid: true})
+	if err != nil {
+		t.Fatalf("enqueue post-publication wake: %v", err)
+	}
+	wakeStarted := time.Now()
+	wakeCh <- struct{}{}
+	waitFor(t, 3*time.Second, "post-publication wake and heartbeat", func() bool {
+		var status string
+		if scanErr := f.db.SQL().QueryRowContext(ctx,
+			`SELECT status FROM flush_requests WHERE id = ?`, flushID).
+			Scan(&status); scanErr != nil || status != "completed" {
+			return false
+		}
+		st, stateOK, loadErr := state.LoadDaemonState(ctx, f.db)
+		return loadErr == nil && stateOK &&
+			st.HeartbeatTS > beforeWake.HeartbeatTS
+	})
+	if elapsed := time.Since(wakeStarted); elapsed >= 3*time.Second {
+		t.Fatalf("post-publication wake latency=%v want <3s", elapsed)
+	} else {
+		t.Logf("post-publication wake latency=%v", elapsed)
+	}
+	if transitions := traceEventsByClass(
+		trace.Events(), "branch_token.transition"); len(transitions) != 0 {
+		t.Fatalf("journaled target entered external transition path: %+v",
+			transitions)
+	}
+}
+
+func TestRun_SelfPublicationTokenRetryFailsClosed(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "publication-before-retry.txt"),
+		[]byte("publication\n"), 0o644); err != nil {
+		t.Fatalf("write initial publication: %v", err)
+	}
+	var remainingTokenFailures atomic.Int32
+	var injectOnce sync.Once
+	targetCh := make(chan string, 1)
+	adoptedCh := make(chan CaptureContext, 1)
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     fastScheduler(),
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			selfPublicationCheckpoint: func(
+				event SelfPublicationCheckpointEvent,
+			) error {
+				if event.Checkpoint != SelfPublicationAfterCompletion {
+					return nil
+				}
+				var injectErr error
+				injectOnce.Do(func() {
+					if err := os.WriteFile(
+						filepath.Join(f.dir, "captured-after-token-retry.txt"),
+						[]byte("after retry\n"), 0o644); err != nil {
+						injectErr = err
+						return
+					}
+					remainingTokenFailures.Store(2)
+					targetCh <- event.TargetOID
+				})
+				return injectErr
+			},
+			branchGenerationToken: func(
+				resolveCtx context.Context,
+				repoPath string,
+			) (string, error) {
+				for {
+					remaining := remainingTokenFailures.Load()
+					if remaining == 0 {
+						return BranchGenerationToken(resolveCtx, repoPath)
+					}
+					if remainingTokenFailures.CompareAndSwap(
+						remaining, remaining-1) {
+						return "", errors.New(
+							"injected self-publication token read failure")
+					}
+				}
+			},
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext, _, _, _ string,
+			) {
+				select {
+				case adoptedCh <- cctx:
+				default:
+				}
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var targetOID string
+	select {
+	case targetOID = <-targetCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("publication checkpoint did not inject token failures")
+	}
+	var adopted CaptureContext
+	select {
+	case adopted = <-adoptedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pending self-publication target was not retried")
+	}
+	if adopted.BaseHead != targetOID {
+		t.Fatalf("adopted base=%s want journal target %s",
+			adopted.BaseHead, targetOID)
+	}
+	waitFor(t, 5*time.Second, "post-retry capture", func() bool {
+		var baseHead string
+		err := f.db.SQL().QueryRowContext(ctx, `
+SELECT base_head
+FROM capture_events
+WHERE path = ?
+ORDER BY seq DESC
+LIMIT 1`, "captured-after-token-retry.txt").Scan(&baseHead)
+		return err == nil && baseHead == targetOID
+	})
+	var staleCaptures int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM capture_events
+WHERE path = ? AND base_head <> ?`,
+		"captured-after-token-retry.txt", targetOID).Scan(&staleCaptures); err != nil {
+		t.Fatalf("count stale captures: %v", err)
+	}
+	if staleCaptures != 0 {
+		t.Fatalf("post-retry stale captures=%d want 0", staleCaptures)
+	}
+	waitFor(t, 5*time.Second, "post-retry capture publishes", func() bool {
+		var eventState string
+		err := f.db.SQL().QueryRowContext(ctx, `
+SELECT state
+FROM capture_events
+WHERE path = ?
+ORDER BY seq DESC
+LIMIT 1`, "captured-after-token-retry.txt").Scan(&eventState)
+		return err == nil && eventState == state.EventStatePublished
+	})
+}
+
+func TestRun_UnknownHeadAfterSelfPublicationUsesTransitionClassifier(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := os.WriteFile(filepath.Join(f.dir, "published-before-external.txt"),
+		[]byte("published\n"), 0o644); err != nil {
+		t.Fatalf("write publication: %v", err)
+	}
+	wakeCh := make(chan struct{}, 4)
+	shutdownCh := make(chan struct{}, 1)
+	externalMovedCh := make(chan string, 1)
+	adoptedCh := make(chan struct{}, 1)
+	trace := &memoryTraceLogger{}
+	manual := Scheduler{
+		Base:         time.Hour,
+		IdleCeiling:  time.Hour,
+		ErrorCeiling: time.Hour,
+	}
+	var moveOnce sync.Once
+
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(ctx, Options{
+			RepoPath:      f.dir,
+			GitDir:        f.gitDir,
+			DB:            f.db,
+			Scheduler:     manual,
+			BootGrace:     30 * time.Second,
+			MessageFn:     DeterministicMessage,
+			WakeCh:        wakeCh,
+			ShutdownCh:    shutdownCh,
+			SkipSignals:   true,
+			PruneInterval: time.Hour,
+			Trace:         trace,
+			afterSelfPublicationAdoption: func(
+				CaptureContext, string, string, string,
+			) {
+				select {
+				case adoptedCh <- struct{}{}:
+				default:
+				}
+			},
+			selfPublicationCheckpoint: func(
+				event SelfPublicationCheckpointEvent,
+			) error {
+				if event.Checkpoint != SelfPublicationAfterCompletion {
+					return nil
+				}
+				var moveErr error
+				moveOnce.Do(func() {
+					externalHead, err := git.CommitTree(
+						ctx, f.dir, event.TreeOID,
+						"external child after publication", event.TargetOID)
+					if err != nil {
+						moveErr = err
+						return
+					}
+					if err := git.UpdateRef(
+						ctx, f.dir, "refs/heads/main",
+						externalHead, event.TargetOID); err != nil {
+						moveErr = err
+						return
+					}
+					externalMovedCh <- externalHead
+				})
+				return moveErr
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	var externalHead string
+	select {
+	case externalHead = <-externalMovedCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkpoint did not create external HEAD movement")
+	}
+	// Queue the next iteration while Replay is returning. The live HEAD no
+	// longer equals its completed journal target, so the run loop must not
+	// invoke the self-publication adoption boundary.
+	wakeCh <- struct{}{}
+	waitForMetaValue(t, f.db, MetaKeyBranchHead, externalHead, 5*time.Second)
+	waitForMetaValue(t, f.db, MetaKeyBranchToken,
+		branchTokenRev(externalHead, "refs/heads/main"), 5*time.Second)
+	select {
+	case <-adoptedCh:
+		t.Fatal("external child was incorrectly adopted as self-publication")
+	default:
+	}
+	if got, _, err := state.MetaGet(
+		ctx, f.db, MetaKeyBranchGeneration); err != nil || got != "1" {
+		t.Fatalf("branch generation=%q err=%v want stable fast-forward generation 1",
+			got, err)
+	}
+	var archives int
+	if err := f.db.SQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&archives); err != nil {
+		t.Fatalf("count recovery snapshots: %v", err)
+	}
+	if archives != 0 {
+		t.Fatalf("recovery snapshots=%d want 0", archives)
+	}
+	waitFor(t, 5*time.Second, "external fast-forward trace", func() bool {
+		for _, event := range traceEventsByClass(
+			trace.Events(), "branch_token.transition") {
+			if event.Decision == TokenTransitionFastForward.String() {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // TestRun_FlushDrainBoundedByLimit pins the regression where the flush
 // drain loop ran without an upper bound. A 1500-row burst would block the
 // rest of the run loop (capture/replay, refcount sweep, heartbeat) until
@@ -3623,6 +4563,9 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	if got := countFlushByStatus(t, f.db, "pending"); got != 536 {
 		t.Fatalf("after boot iteration: pending=%d want 536", got)
 	}
+	if got := countFlushByStatus(t, f.db, "acknowledged"); got != 0 {
+		t.Fatalf("after boot iteration: acknowledged=%d want 0", got)
+	}
 
 	// Drive a second iteration via wakeCh. Bound still holds → 128/472.
 	wakeCh <- struct{}{}
@@ -3635,12 +4578,28 @@ func TestRun_FlushDrainBoundedByLimit(t *testing.T) {
 	if got := countFlushByStatus(t, f.db, "pending"); got != 472 {
 		t.Fatalf("after second iteration: pending=%d want 472", got)
 	}
+	if got := countFlushByStatus(t, f.db, "acknowledged"); got != 0 {
+		t.Fatalf("after second iteration: acknowledged=%d want 0", got)
+	}
+	var flushedNotes int
+	if err := f.db.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM flush_requests
+WHERE status = 'completed' AND note = 'flushed'`).Scan(&flushedNotes); err != nil {
+		t.Fatalf("count flushed notes: %v", err)
+	}
+	if flushedNotes != 128 {
+		t.Fatalf("completed flushed notes=%d want 128", flushedNotes)
+	}
 }
 
-func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
+func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
 	t.Setenv(ai.EnvIntentMinPending, "4")
 	t.Setenv(ai.EnvIntentMaxPendingAge, "1h")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "share"))
 
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -3660,7 +4619,6 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 		ErrorCeiling: time.Hour,
 	}
 	planner := &recordingIntentPlanner{}
-	trace := &memoryTraceLogger{}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -3676,7 +4634,6 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 			WakeCh:        wakeCh,
 			ShutdownCh:    shutdownCh,
 			SkipSignals:   true,
-			Trace:         trace,
 			IntentPlanner: planner,
 		})
 	}()
@@ -3701,11 +4658,9 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 		pending, err := state.PendingEvents(context.Background(), f.db, 0)
 		return err == nil && len(pending) == 1
 	})
-	waitFor(t, 2*time.Second, "intent batch wait trace", func() bool {
-		return len(traceEventsByClass(trace.Events(), "intent.batch_wait")) == 1
-	})
 	if planner.calls != 0 {
-		t.Fatalf("planner calls=%d want 0 for wake-only drain below MinPending", planner.calls)
+		t.Fatalf("planner calls=%d want 0 before immutable v2 activation",
+			planner.calls)
 	}
 	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
 	if err != nil {
@@ -3714,11 +4669,11 @@ func TestRun_WakeOnlyFlushDoesNotBypassIntentBatchGate(t *testing.T) {
 	if head != startHead {
 		t.Fatalf("HEAD advanced on wake-only drain below MinPending: got %s want %s", head, startHead)
 	}
-	if events := traceEventsByClass(trace.Events(), "replay.intent.wake_drained"); len(events) != 1 {
-		t.Fatalf("wake_drained trace=%+v want exactly one event", events)
-	}
-	if events := traceEventsByClass(trace.Events(), "intent.batch_wait"); len(events) != 1 {
-		t.Fatalf("intent.batch_wait trace=%+v want exactly one event", events)
+	attention, ok, err := state.MetaGet(context.Background(), f.db,
+		"intent.v2.needs_attention")
+	if err != nil || !ok || !strings.Contains(attention, "acd configure") {
+		t.Fatalf("needs-attention guidance=%q ok=%v err=%v",
+			attention, ok, err)
 	}
 }
 
@@ -3739,8 +4694,8 @@ func waitFor(t *testing.T, budget time.Duration, what string, cond func() bool) 
 }
 
 // TestRun_FlushDrainCancelable pins the regression where SIGTERM during a
-// large flush drain was starved until the entire queue drained. The inner
-// loop now checks ctx.Err on every iteration and breaks immediately.
+// large flush drain was starved until the entire queue drained. Each drain is
+// one bounded statement and the run loop checks cancellation around it.
 func TestRun_FlushDrainCancelable(t *testing.T) {
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
@@ -3784,8 +4739,8 @@ func TestRun_FlushDrainCancelable(t *testing.T) {
 	// of 1500 rows would dwarf this budget on slow hosts; the bounded +
 	// cancelable drain exits within at most one bounded pass plus
 	// shutdown overhead. The 5s budget accommodates a slow Linux runner
-	// under -race -count=3 finishing the in-progress bounded pass
-	// (DefaultFlushLimit=256 sqlite writes) before the cancel check fires.
+	// under -race -count=3 finishing the in-progress bounded statement
+	// (DefaultFlushLimit=256 rows) before the cancel check fires.
 	start := time.Now()
 	shutdownCh <- struct{}{}
 	select {
@@ -4079,8 +5034,8 @@ func TestRun_GitOperationStatErrorRecovers(t *testing.T) {
 	}
 }
 
-// TestRun_FlushDrainExitsOnShutdownCh pins the fix that adds a non-blocking
-// shutdownCh check to the inner flush-drain loop. A caller using a non-
+// TestRun_FlushDrainExitsOnShutdownCh pins the non-blocking shutdownCh checks
+// around each bounded flush batch. A caller using a non-
 // cancelable ctx (context.Background) and signaling shutdown via the
 // channel must observe the daemon exit promptly — not after the entire
 // bounded drain (~hundreds of rows × per-row claim cost) elapses.
@@ -4100,9 +5055,8 @@ func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
 	shutdownCh := make(chan struct{}, 1)
 
 	// Crucial: use a non-cancelable ctx so the only exit signal is
-	// shutdownCh. Without the new arm in the drain inner loop, the
-	// drain would have to finish (or the bounded pass complete) before
-	// the run loop notices the signal.
+	// shutdownCh. Without the checks around the bounded statement, the
+	// drain would have to finish before the run loop notices the signal.
 	bgCtx := context.Background()
 
 	for i := 0; i < 1500; i++ {
@@ -4148,7 +5102,7 @@ func TestRun_FlushDrainExitsOnShutdownCh(t *testing.T) {
 	case <-exited:
 		elapsed := time.Since(start)
 		// 2s budget tolerates -race + a slow CI runner finishing the
-		// in-flight per-row claim. Pre-fix worst-case was ~7.5s.
+		// in-flight bounded statement. Pre-fix worst-case was ~7.5s.
 		if elapsed > 2*time.Second {
 			t.Fatalf("Run took %v to exit on shutdownCh; want <=2s (drain not shutdown-aware)",
 				elapsed)

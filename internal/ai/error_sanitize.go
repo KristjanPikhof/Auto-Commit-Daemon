@@ -15,7 +15,7 @@ var (
 	plannerErrorAuthPattern       = regexp.MustCompile(`(?i)(["']?authorization["']?\s*:\s*["']?(?:bearer|basic)\s+)[^\s,;"'}]+`)
 	plannerErrorCredentialPattern = regexp.MustCompile(`(?i)(["']?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|secret|password)["']?\s*(?:[=:]|\s)\s*["']?)[^\s,;"'}]+`)
 	plannerErrorBearerPattern     = regexp.MustCompile(`(?i)\bbearer\s+[^\s,;"'}]+`)
-	plannerErrorOpenAIKeyPattern  = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}\b`)
+	plannerErrorOpenAIKeyPattern  = regexp.MustCompile(`\bsk-[A-Za-z0-9_*_-]{8,}\b`)
 )
 
 // SanitizePlannerError returns a bounded, single-line planner error suitable

@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -42,6 +44,31 @@ func (c *runtimeTestCloser) Close() error {
 
 func runtimeRevision(t *testing.T, db *state.DB, profile string, generation int64, values map[string]any) state.ConfigRevision {
 	t.Helper()
+	strategy, _ := values[config.FieldCommitStrategy].(string)
+	if strategy == "" {
+		strategy = string(ai.CommitStrategyEvent)
+		values[config.FieldCommitStrategy] = strategy
+	}
+	preset := config.PresetFast
+	presetID := "event.fast"
+	if strategy == string(ai.CommitStrategyIntent) {
+		presetID = "intent.fast"
+		values[config.FieldCommitPreset] = string(preset)
+		values[config.FieldDiffEgress] = true
+		provider, _ := values[config.FieldProvider].(string)
+		confirmations := []string{string(ai.ConfirmationDiffEgress)}
+		if provider == "" || provider == "deterministic" {
+			values[config.FieldProvider] = "subprocess:runtime-test"
+			confirmations = append(confirmations,
+				string(ai.ConfirmationSubprocessExecution))
+		}
+		if _, exists := values["confirmations"]; !exists {
+			values["confirmations"] = confirmations
+		}
+	}
+	values["preset_id"] = presetID
+	values["preset_version"] = config.PresetCatalogVersion
+	values["customized"] = true
 	body, err := json.Marshal(values)
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +159,141 @@ func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
 	manager.Close()
 }
 
+func TestRuntimeBundleAllowsApprovedLocalSubprocessDiffContext(t *testing.T) {
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	body, err := json.Marshal(map[string]any{
+		config.FieldProvider:       "subprocess:local-planner",
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitPreset:   "fast",
+		config.FieldDiffEgress:     false,
+		"preset_id":                "intent.fast",
+		"preset_version":           config.PresetCatalogVersion,
+		"customized":               true,
+		"confirmations": []string{
+			string(ai.ConfirmationSubprocessExecution),
+			string(ai.ConfirmationDiffEgress),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(context.Background(), db,
+		state.ConfigRevisionInput{
+			Snapshot: body, Profile: "local", Scope: "repo",
+			SourceGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := runtimeBuilder(db, map[string]*runtimeTestCloser{}).
+		BuildRevision(context.Background(), revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.ReplayBlockedReason != "" || !bundle.IntentIncludeDiffs ||
+		bundle.DiffEgress {
+		t.Fatalf("local subprocess diff policy=%+v", bundle)
+	}
+}
+
+func TestRuntimeBundleProviderFailureUsesPresetPolicy(t *testing.T) {
+	db := openTestDB(t)
+	for _, tc := range []struct {
+		name             string
+		preset           config.PresetName
+		verificationMode string
+		commandField     string
+		wantBlocked      bool
+		wantVerification bool
+	}{
+		{
+			name:   "fast falls back to hard dependency planning",
+			preset: config.PresetFast, verificationMode: "none",
+		},
+		{
+			name:   "balanced falls back through approved verification",
+			preset: config.PresetBalanced, verificationMode: "fast",
+			commandField:     config.FieldVerificationFastCommand,
+			wantVerification: true,
+		},
+		{
+			name:   "quality remains fail closed",
+			preset: config.PresetQuality, verificationMode: "full",
+			commandField: config.FieldVerificationFullCommand,
+			wantBlocked:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			values := map[string]any{
+				config.FieldProvider:            "subprocess:unavailable",
+				config.FieldCommitStrategy:      "intent",
+				config.FieldCommitPreset:        string(tc.preset),
+				config.FieldDiffEgress:          false,
+				config.FieldIntentVerification:  tc.verificationMode,
+				config.FieldIntentRepairEnabled: false,
+				"preset_id":                     "intent." + string(tc.preset),
+				"preset_version":                config.PresetCatalogVersion,
+				"customized":                    true,
+				"confirmations": []string{
+					string(ai.ConfirmationSubprocessExecution),
+					string(ai.ConfirmationDiffEgress),
+				},
+			}
+			if tc.commandField != "" {
+				values[tc.commandField] = "true"
+				if tc.verificationMode == "full" {
+					values[config.FieldVerificationFullTimeout] = "10m"
+				} else {
+					values[config.FieldVerificationFastTimeout] = "2m"
+				}
+				values["confirmations"] = append(
+					values["confirmations"].([]string),
+					string(ai.ConfirmationVerificationCommand))
+			}
+			body, err := json.Marshal(values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			revision, err := state.InsertConfigRevision(context.Background(), db,
+				state.ConfigRevisionInput{
+					Snapshot: body, Profile: string(tc.preset), Scope: "repo",
+					SourceGeneration: 1,
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			builder := RuntimeBundleBuilder{
+				DB: db, RepoRoot: t.TempDir(),
+				BuildProvider: func(ai.ProviderConfig) (ai.Provider, io.Closer, error) {
+					return nil, nil, errors.New("provider unavailable")
+				},
+			}
+			bundle, err := builder.BuildRevision(
+				context.Background(), revision, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (bundle.ReplayBlockedReason != "") != tc.wantBlocked {
+				t.Fatalf("blocked=%q wantBlocked=%t",
+					bundle.ReplayBlockedReason, tc.wantBlocked)
+			}
+			if bundle.IntentPlanner != nil {
+				t.Fatalf("unavailable provider became planner: %T",
+					bundle.IntentPlanner)
+			}
+			if bundle.IntentVerificationReady != tc.wantVerification {
+				t.Fatalf("verificationReady=%t want=%t",
+					bundle.IntentVerificationReady, tc.wantVerification)
+			}
+			if tc.wantBlocked &&
+				!strings.Contains(bundle.ReplayBlockedReason, "provider is unavailable") {
+				t.Fatalf("blocked reason=%q", bundle.ReplayBlockedReason)
+			}
+		})
+	}
+}
+
 func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "test-only-key")
 	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
@@ -196,6 +358,55 @@ func TestRuntimeConfigProviderReloadConvergesABCAndRetainsKnownGood(t *testing.T
 	}
 	if got := restarted.Current(); got.RevisionID != latest.ID || got.Model != "model-c" {
 		t.Fatalf("restart bundle=%+v want last-known-good revision %d", got, latest.ID)
+	}
+}
+
+func TestFirstEventRuntimeActivationFailureKeepsReplayBlocked(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvDiffEgress, "false")
+	db := openTestDB(t)
+	revision := runtimeRevision(t, db, "global", 1, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldBaseURL:        "https://repo-override.example/v1",
+		config.FieldModel:          "repo-model",
+		config.FieldCommitStrategy: "event",
+	})
+	request, ok, err := state.RequestConfigActivation(
+		context.Background(), db, revision.ID, sql.NullInt64{})
+	if err != nil || !ok {
+		t.Fatalf("request activation: ok=%v err=%v", ok, err)
+	}
+	blockedReason := configuredRuntimeReplayBlock(context.Background(), db)
+	if blockedReason == "" {
+		t.Fatal("persisted desired revision did not block startup replay")
+	}
+	initial := &RuntimeBundle{
+		Provider:            &runtimeTestProvider{name: "deterministic"},
+		MessageFn:           DeterministicMessage,
+		CommitStrategy:      ai.CommitStrategyEvent,
+		PresetID:            "event.fast",
+		PresetVersion:       config.PresetCatalogVersion,
+		ReplayBlockedReason: blockedReason,
+	}
+	manager := NewRuntimeBundleManager(
+		initial, runtimeBuilder(db, map[string]*runtimeTestCloser{}),
+		time.Second,
+	)
+	defer manager.Close()
+	if err := manager.ActivateDesired(context.Background()); err == nil {
+		t.Fatal("drifted Event activation unexpectedly succeeded")
+	}
+	current := manager.Current()
+	if current.RevisionID != 0 || current.ReplayBlockedReason == "" {
+		t.Fatalf("unsafe startup fallback became publishable: %+v", current)
+	}
+	gotRequest, err := state.ActivationRequestByID(
+		context.Background(), db, request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRequest.Status != state.ActivationRejected {
+		t.Fatalf("activation request status=%q", gotRequest.Status)
 	}
 }
 
@@ -444,9 +655,16 @@ func TestConfigRevisionStampsDecisionsAndPlannerWindows(t *testing.T) {
 	db := openTestDB(t)
 	revision := runtimeRevision(t, db, "candidate", 1, map[string]any{"ai.provider": "deterministic"})
 	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{
-		RevisionID: revision.ID,
-		Profile:    revision.Profile,
+		RevisionID:    revision.ID,
+		Profile:       revision.Profile,
+		PresetID:      "intent.balanced",
+		PresetVersion: config.PresetCatalogVersion,
 	})
+	telemetry := runtimeTelemetryFromContext(ctx)
+	if telemetry.presetID != "intent.balanced" ||
+		telemetry.presetVersion != config.PresetCatalogVersion {
+		t.Fatalf("runtime preset telemetry=%+v", telemetry)
+	}
 	cctx := CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 3, BaseHead: "abc123"}
 	ev := state.CaptureEvent{
 		BranchRef:        cctx.BranchRef,
@@ -528,5 +746,58 @@ func TestConfigRevisionPlannerFallbackTelemetryIsDescriptive(t *testing.T) {
 	}
 	if window.ValidationFailure.String == "" || window.ConfigRevisionID.Int64 != revision.ID {
 		t.Fatalf("missing safe fallback provenance: %+v", window)
+	}
+}
+
+func TestCandidateWaitingPlannerWindowRecordsDeferredFallback(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	cctx := CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "abc123",
+	}
+	ev := state.CaptureEvent{
+		BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration,
+		BaseHead: cctx.BaseHead, Operation: "modify", Path: "pending.go",
+		Fidelity: "exact",
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, ev, []state.CaptureOp{{
+		Op: "modify", Path: ev.Path, Fidelity: ev.Fidelity,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev.Seq = seq
+	req := ai.IntentPlanRequest{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: seq, Path: ev.Path, Op: ev.Operation, Fidelity: ev.Fidelity,
+		}},
+		CommitFormat: ai.CommitFormatImperative,
+	}
+	plan := ai.IntentPlan{
+		DeferredSeqs: []int64{seq},
+		DeferredReasons: []ai.DeferredReason{{
+			Seq: seq, Reason: "quality candidate requires attention",
+		}},
+		Source: ai.IntentPlannerProtocolV2,
+	}
+	cfg := intentReplayConfig{
+		plannerProvider: "openai-compat", plannerModel: "synthetic",
+		fallbackUsed: true,
+	}
+	if err := recordIntentPlannerWindow(
+		ctx, db, cfg, req, plan, []intentReplayItem{{event: ev}}, cctx,
+		float64(time.Now().UnixNano())/float64(time.Second), false, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	windows, err := state.RecentIntentPlannerWindows(ctx, db, 1)
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("windows=%+v err=%v", windows, err)
+	}
+	window := windows[0]
+	if !window.FallbackUsed || window.Outcome.String != "deferred" ||
+		len(window.SelectedGroups) != 0 ||
+		len(window.DeferredSeqs) != 1 || window.DeferredSeqs[0] != seq {
+		t.Fatalf("waiting fallback telemetry=%+v", window)
 	}
 }

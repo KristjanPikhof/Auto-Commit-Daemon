@@ -4,9 +4,7 @@ package settings
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +18,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
@@ -48,17 +47,46 @@ type Options struct {
 }
 
 type Service struct {
-	store     *config.Store
-	db        *state.DB
-	worktree  gitpkg.Worktree
-	repoHash  string
-	lookupEnv func(string) (string, bool)
-	probe     ProbeFunc
-	nudge     NudgeFunc
-	now       func() time.Time
+	store       *config.Store
+	db          *state.DB
+	worktree    gitpkg.Worktree
+	repoHash    string
+	globalOnly  bool
+	lookupEnv   func(string) (string, bool)
+	probe       ProbeFunc
+	nudge       NudgeFunc
+	now         func() time.Time
+	credentials credentials.Store
 }
 
 func NewService(ctx context.Context, opts Options) (*Service, error) {
+	return newService(ctx, opts, true)
+}
+
+// NewValidationService resolves and validates authoring drafts without opening
+// or migrating repository state. Callers must not use mutation/runtime methods
+// on the returned service.
+func NewValidationService(ctx context.Context, opts Options) (*Service, error) {
+	return newService(ctx, opts, false)
+}
+
+// NewGlobalService creates an authoring service without resolving a Git
+// repository or opening repository state. Only global authoring operations are
+// available on the returned service.
+func NewGlobalService(_ context.Context, opts Options) (*Service, error) {
+	lookup, probe, nudge, now := serviceDefaults(opts)
+	return &Service{
+		store:       config.NewStore(opts.Roots),
+		globalOnly:  true,
+		lookupEnv:   lookup,
+		probe:       probe,
+		nudge:       nudge,
+		now:         now,
+		credentials: credentials.NewStore(opts.Roots),
+	}, nil
+}
+
+func newService(ctx context.Context, opts Options, openState bool) (*Service, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -70,10 +98,20 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("acd settings: repository identity: %w", err)
 	}
-	db, err := state.Open(ctx, state.DBPathFromGitDir(wt.GitDir))
-	if err != nil {
-		return nil, fmt.Errorf("acd settings: open state: %w", err)
+	var db *state.DB
+	if openState {
+		db, err = state.Open(ctx, state.DBPathFromGitDir(wt.GitDir))
+		if err != nil {
+			return nil, fmt.Errorf("acd settings: open state: %w", err)
+		}
 	}
+	lookup, probe, nudge, now := serviceDefaults(opts)
+	return &Service{store: config.NewStore(opts.Roots), db: db, worktree: wt,
+		repoHash: repoHash, lookupEnv: lookup, probe: probe, nudge: nudge, now: now,
+		credentials: credentials.NewStore(opts.Roots)}, nil
+}
+
+func serviceDefaults(opts Options) (func(string) (string, bool), ProbeFunc, NudgeFunc, func() time.Time) {
 	lookup := opts.LookupEnv
 	if lookup == nil {
 		lookup = os.LookupEnv
@@ -90,8 +128,62 @@ func NewService(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{store: config.NewStore(opts.Roots), db: db, worktree: wt,
-		repoHash: repoHash, lookupEnv: lookup, probe: probe, nudge: nudge, now: now}, nil
+	return lookup, probe, nudge, now
+}
+
+type AuthoringPreview struct {
+	Values     map[string]string
+	Sources    map[string]config.Source
+	Generation uint64
+	Preset     config.PresetResolution
+}
+
+// AuthoringPreview returns presentation-safe effective authoring values. It is
+// safe on a validation-only service and never reads or writes repository state.
+func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
+	if s == nil || s.store == nil {
+		return AuthoringPreview{}, errors.New("acd settings: service unavailable")
+	}
+	doc, err := s.store.Load()
+	if err != nil {
+		return AuthoringPreview{}, sanitizeError(err)
+	}
+	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+	selected := doc.Settings.Global
+	if !s.globalOnly {
+		repo := doc.Settings.Repositories[s.repoHash]
+		profile := doc.Settings.Profiles[repo.Profile]
+		input.Repository = repo.Fields
+		input.Profile = profile.Fields
+		selected = repo.Fields
+	}
+	fields, preset, err := config.ResolveAll(input, selected)
+	if err != nil {
+		return AuthoringPreview{}, sanitizeError(err)
+	}
+	values := make(map[string]string, len(fields))
+	sources := make(map[string]config.Source, len(fields))
+	for _, definition := range config.Catalog() {
+		field := fields[definition.Name]
+		values[definition.Name] = field.EffectiveValue()
+		sources[definition.Name] = field.Source
+	}
+	return AuthoringPreview{
+		Values: hotValues(values), Sources: sources,
+		Generation: doc.Generation, Preset: preset,
+	}, nil
+}
+
+// AuthoringProviderConfig resolves the provider configuration currently
+// authored for this repository, including the protected credential. Callers
+// must use the returned value only for provider construction and must never
+// log or serialize it.
+func (s *Service) AuthoringProviderConfig() (ai.ProviderConfig, error) {
+	preview, err := s.AuthoringPreview()
+	if err != nil {
+		return ai.ProviderConfig{}, err
+	}
+	return s.providerConfig(preview.Values)
 }
 
 func (s *Service) Close() error {
@@ -123,6 +215,9 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 	if err := validateScope(req.Scope, req.Profile); err != nil {
 		return SaveResult{}, err
 	}
+	if s.globalOnly && req.Scope != ScopeGlobal {
+		return SaveResult{}, s.requireRepository("save non-global scope")
+	}
 	err := s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
 		var target config.Overrides
 		switch req.Scope {
@@ -144,7 +239,14 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 				repo.Profile = cleanText(*req.RepositoryProfile)
 			}
 			target = repo.Fields
-			defer func() { doc.Settings.Repositories[s.repoHash] = repo }()
+			defer func() {
+				if repo.Profile == "" && len(repo.Fields) == 0 &&
+					len(repo.Extra) == 0 {
+					delete(doc.Settings.Repositories, s.repoHash)
+					return
+				}
+				doc.Settings.Repositories[s.repoHash] = repo
+			}()
 		}
 		for name, value := range req.Values {
 			field, ok := config.LookupField(name)
@@ -178,6 +280,133 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 	return SaveResult{Generation: req.ExpectedGeneration + 1, Scope: req.Scope}, nil
 }
 
+// SaveGlobalSetupRequest is the reviewed global setup draft. Values must be
+// persistable non-secret fields; the fingerprint and confirmations must match
+// a fresh validation of this exact draft.
+type SaveGlobalSetupRequest struct {
+	Values             map[string]string
+	TestedFingerprint  string
+	Confirmations      []ai.ConfirmationRequirement
+	ExpectedGeneration uint64
+	Replace            bool
+}
+
+type SaveGlobalSetupResult struct {
+	Generation  uint64
+	Fingerprint string
+}
+
+// SaveGlobalSetup atomically stores global authoring values and their exact
+// fingerprint-bound approval. The generation records its originating CAS
+// write. Repository shell commands cannot be approved or activated here.
+func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupRequest) (SaveGlobalSetupResult, error) {
+	if s == nil || s.store == nil {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: service unavailable")
+	}
+	if !s.globalOnly {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: global setup requires a global service")
+	}
+	if req.Replace {
+		for _, field := range config.Catalog() {
+			if field.Boundary != config.ApplyHot ||
+				!field.Persistable || field.Sensitive {
+				continue
+			}
+			if _, ok := req.Values[field.Name]; !ok {
+				return SaveGlobalSetupResult{}, fmt.Errorf(
+					"acd settings: replacement setup is missing field %q",
+					field.Name,
+				)
+			}
+		}
+	}
+	validation, err := s.Validate(ctx, req.Values, req.Confirmations)
+	if err != nil {
+		return SaveGlobalSetupResult{}, err
+	}
+	if validation.SourceGeneration != req.ExpectedGeneration {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: stale saved generation; refresh before saving")
+	}
+	if req.TestedFingerprint == "" || req.TestedFingerprint != validation.Fingerprint {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: tested settings are stale; test the current draft again")
+	}
+	if len(validation.Missing) > 0 {
+		return SaveGlobalSetupResult{}, &ConfirmationRequiredError{Missing: validation.Missing}
+	}
+	if mode := validation.ResolvedHot[config.FieldIntentVerification]; mode != "none" && mode != "structural" {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: project verification is configured per repository")
+	}
+	for _, field := range []string{config.FieldVerificationFastCommand, config.FieldVerificationFullCommand} {
+		if strings.TrimSpace(req.Values[field]) != "" {
+			return SaveGlobalSetupResult{}, errors.New("acd settings: project verification commands cannot be saved by global setup")
+		}
+	}
+	confirmations, err := globalSetupConfirmations(req.Confirmations)
+	if err != nil {
+		return SaveGlobalSetupResult{}, err
+	}
+	err = s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
+		if req.Replace {
+			doc.Settings.Global = config.Overrides{}
+		}
+		for name, value := range req.Values {
+			field, ok := config.LookupField(name)
+			if !ok {
+				return fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
+			}
+			if !field.Persistable || field.Sensitive && name == config.FieldAPIKey {
+				return fmt.Errorf("acd settings: field %q is environment-only", field.Name)
+			}
+			if hasUnsafeText(value) {
+				return fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
+			}
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("acd settings: encode field %q: %w", field.Name, err)
+			}
+			doc.Settings.Global[name] = raw
+		}
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation:    req.ExpectedGeneration + 1,
+			Fingerprint:   validation.Fingerprint,
+			Confirmations: confirmations,
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, config.ErrStaleGeneration) {
+			return SaveGlobalSetupResult{}, fmt.Errorf("acd settings: stale saved generation: %w", err)
+		}
+		return SaveGlobalSetupResult{}, sanitizeError(err)
+	}
+	return SaveGlobalSetupResult{
+		Generation:  req.ExpectedGeneration + 1,
+		Fingerprint: validation.Fingerprint,
+	}, nil
+}
+
+func globalSetupConfirmations(values []ai.ConfirmationRequirement) ([]string, error) {
+	seen := make(map[ai.ConfirmationRequirement]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == ai.ConfirmationVerificationCommand {
+			return nil, errors.New("acd settings: project verification command approval cannot be global")
+		}
+		switch value {
+		case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution,
+			ai.ConfirmationDiffEgress, ai.ConfirmationIntentRepair:
+		default:
+			return nil, fmt.Errorf("acd settings: unsupported global confirmation %q", cleanText(string(value)))
+		}
+		if !seen[value] {
+			seen[value] = true
+			out = append(out, string(value))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 type Validation struct {
 	Fingerprint      string
 	Confirmations    []ai.ConfirmationRequirement
@@ -185,6 +414,7 @@ type Validation struct {
 	RestartChanged   []string
 	ResolvedHot      map[string]string
 	ProviderConfig   ai.ProviderConfig
+	Preset           config.PresetResolution
 	SourceGeneration uint64
 }
 
@@ -203,7 +433,7 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	if err != nil {
 		return Validation{}, sanitizeError(err)
 	}
-	resolved, restartChanged, err := s.resolveDraft(doc, draft)
+	resolved, restartChanged, preset, err := s.resolveDraft(doc, draft)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -215,23 +445,47 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	if err != nil {
 		return Validation{}, sanitizeError(err)
 	}
+	if resolved[config.FieldProvider] == "deterministic" &&
+		(resolved[config.FieldCommitStrategy] != "event" ||
+			resolved[config.FieldCommitPreset] != "fast") {
+		return Validation{}, errors.New("acd settings: deterministic provider is supported only by Event Fast")
+	}
+	verificationMode := resolved[config.FieldIntentVerification]
+	verificationCommand := ""
+	switch verificationMode {
+	case "fast":
+		verificationCommand = resolved[config.FieldVerificationFastCommand]
+	case "full":
+		verificationCommand = resolved[config.FieldVerificationFullCommand]
+	}
+	if (verificationMode == "fast" || verificationMode == "full") &&
+		strings.TrimSpace(verificationCommand) == "" {
+		return Validation{}, errors.New("acd settings: preset-required verification command is not configured")
+	}
+	required := append([]ai.ConfirmationRequirement(nil), providerValidation.Confirmations...)
+	if verificationMode == "fast" || verificationMode == "full" {
+		required = append(required, ai.ConfirmationVerificationCommand)
+	}
+	if resolved[config.FieldIntentRepairEnabled] == "true" {
+		required = append(required, ai.ConfirmationIntentRepair)
+	}
 	confirmedSet := make(map[ai.ConfirmationRequirement]bool, len(confirmed))
 	for _, item := range confirmed {
 		confirmedSet[item] = true
 	}
 	var missing []ai.ConfirmationRequirement
-	for _, item := range providerValidation.Confirmations {
+	for _, item := range required {
 		if !confirmedSet[item] {
 			missing = append(missing, item)
 		}
 	}
-	fingerprint, err := settingsFingerprint(resolved)
+	fingerprint, err := config.SettingsFingerprint(resolved, preset)
 	if err != nil {
 		return Validation{}, err
 	}
-	return Validation{Fingerprint: fingerprint, Confirmations: providerValidation.Confirmations,
+	return Validation{Fingerprint: fingerprint, Confirmations: required,
 		Missing: missing, RestartChanged: restartChanged, ResolvedHot: hotValues(resolved),
-		ProviderConfig: cfg, SourceGeneration: doc.Generation}, nil
+		ProviderConfig: cfg, Preset: preset, SourceGeneration: doc.Generation}, nil
 }
 
 type ProviderTestResult struct {
@@ -265,7 +519,9 @@ func (s *Service) TestProvider(ctx context.Context, draft map[string]string, con
 func providerTestConfirmations(confirmations []ai.ConfirmationRequirement) []ai.ConfirmationRequirement {
 	out := make([]ai.ConfirmationRequirement, 0, len(confirmations))
 	for _, confirmation := range confirmations {
-		if confirmation != ai.ConfirmationDiffEgress {
+		if confirmation != ai.ConfirmationDiffEgress &&
+			confirmation != ai.ConfirmationVerificationCommand &&
+			confirmation != ai.ConfirmationIntentRepair {
 			out = append(out, confirmation)
 		}
 	}
@@ -286,43 +542,66 @@ func missingConfirmations(required, confirmed []ai.ConfirmationRequirement) []ai
 	return missing
 }
 
-func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, error) {
-	repo := doc.Settings.Repositories[s.repoHash]
-	profile := doc.Settings.Profiles[repo.Profile]
-	resolved := make(map[string]string, len(config.Catalog()))
-	for _, field := range config.Catalog() {
-		value, err := config.ResolveField(field.Name, config.ResolveInput{
-			Repository: repo.Fields, Profile: profile.Fields, Global: doc.Settings.Global,
-			LookupEnv: s.lookupEnv,
-		})
-		if err != nil {
-			return nil, nil, sanitizeError(err)
-		}
-		resolved[field.Name] = value.EffectiveValue()
+func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, config.PresetResolution, error) {
+	baseInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+	var selected config.Overrides
+	if s.globalOnly {
+		selected = doc.Settings.Global
+	} else {
+		repo := doc.Settings.Repositories[s.repoHash]
+		profile := doc.Settings.Profiles[repo.Profile]
+		baseInput.Repository = repo.Fields
+		baseInput.Profile = profile.Fields
+		selected = repo.Fields
 	}
+	baseFields, _, err := config.ResolveAll(baseInput, selected)
+	if err != nil {
+		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+	}
+	draftOverrides := config.Overrides{}
 	var restartChanged []string
 	for name, raw := range draft {
 		field, ok := config.LookupField(name)
 		if !ok {
-			return nil, nil, fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
+			return nil, nil, config.PresetResolution{}, fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
 		}
 		if field.Sensitive || !field.Persistable {
 			continue
 		}
 		if hasUnsafeText(raw) {
-			return nil, nil, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
+			return nil, nil, config.PresetResolution{}, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
 		}
 		normalized, err := normalizeDraftValue(field, raw)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, config.PresetResolution{}, err
 		}
-		if field.Boundary == config.ApplyRestart && normalized != resolved[name] {
-			restartChanged = append(restartChanged, name)
+		draftOverrides[name], _ = json.Marshal(normalized)
+	}
+	draftInput := baseInput
+	draftInput.Experiment = draftOverrides
+	resolvedFields, preset, err := config.ResolveAll(draftInput, draftOverrides)
+	if err != nil {
+		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+	}
+	resolved := make(map[string]string, len(resolvedFields))
+	for _, field := range config.Catalog() {
+		value := resolvedFields[field.Name].EffectiveValue()
+		resolved[field.Name] = value
+		if field.Boundary == config.ApplyRestart && value != baseFields[field.Name].EffectiveValue() {
+			restartChanged = append(restartChanged, field.Name)
 		}
-		resolved[name] = normalized
 	}
 	sort.Strings(restartChanged)
-	return resolved, restartChanged, nil
+	return resolved, restartChanged, preset, nil
+}
+
+var errRepositoryRequired = errors.New("acd settings: repository runtime service required")
+
+func (s *Service) requireRepository(operation string) error {
+	if s != nil && s.db != nil {
+		return nil
+	}
+	return fmt.Errorf("acd settings: %s: %w", operation, errRepositoryRequired)
 }
 
 func normalizeDraftValue(field config.FieldDefinition, value string) (string, error) {
@@ -360,10 +639,11 @@ func (s *Service) providerConfig(values map[string]string) (ai.ProviderConfig, e
 	base.IntentMaxPendingAge, _ = time.ParseDuration(values[config.FieldIntentMaxPendingAge])
 	base.IntentRecentCommits, _ = strconv.Atoi(values[config.FieldIntentRecentCommits])
 	base.IntentDeferLimit, _ = strconv.Atoi(values[config.FieldIntentDeferLimit])
-	base.APIKey = ""
-	if key, ok := s.lookupEnv(ai.EnvAPIKey); ok {
-		base.APIKey = strings.TrimSpace(key)
+	key, _, err := credentials.Resolve(s.credentials, s.lookupEnv)
+	if err != nil {
+		return ai.ProviderConfig{}, sanitizeError(err)
 	}
+	base.APIKey = key
 	return base, nil
 }
 
@@ -375,19 +655,6 @@ func hotValues(values map[string]string) map[string]string {
 		}
 	}
 	return out
-}
-
-func settingsFingerprint(values map[string]string) (string, error) {
-	payload := map[string]any{}
-	for key, value := range hotValues(values) {
-		payload[key] = value
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("acd settings: fingerprint: %w", err)
-	}
-	sum := sha256.Sum256(body)
-	return hex.EncodeToString(sum[:]), nil
 }
 
 func validateScope(scope Scope, profile string) error {
@@ -461,6 +728,7 @@ func sanitizeErrorWithSecrets(err error, secrets ...string) error {
 			message = strings.ReplaceAll(message, secret, "[redacted]")
 		}
 	}
+	message = ai.SanitizePlannerError(message)
 	return sanitizeError(errors.New(message))
 }
 

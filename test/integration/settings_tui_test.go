@@ -56,6 +56,135 @@ func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
 	assertAltScreenRestored(t, resized.Stdout)
 }
 
+func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
+	t.Parallel()
+
+	repo := tempRepo(t)
+	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+
+	for _, tc := range []struct {
+		name       string
+		env        []string
+		cols, rows int
+		args       []string
+		input      string
+	}{
+		{name: "narrow", env: baseEnv, cols: 52, rows: 18, input: "\x03"},
+		{name: "accessible", env: baseEnv, cols: 58, rows: 20,
+			args: []string{"--accessible"}, input: "1\n\x00\x03"},
+		{name: "no_color", env: envWith(baseEnv, "NO_COLOR=1"),
+			cols: 72, rows: 24, input: "\x03"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			args := append([]string{"configure", "--repo", repo}, tc.args...)
+			command := append([]string{bin}, args...)
+			result := runPTYCommand(t, ctx, tc.env, tc.cols, tc.rows, 0, 0,
+				tc.input, command...)
+			if result.ExitCode == 0 {
+				t.Fatalf("cancelled configure unexpectedly succeeded\n%s",
+					result.Stdout)
+			}
+			if !strings.Contains(result.Stdout, "How should ACD work?") ||
+				!strings.Contains(result.Stdout, "Everyday work") {
+				t.Fatalf("configure choices unreadable at %dx%d\n%s",
+					tc.cols, tc.rows, result.Stdout)
+			}
+			if tc.name == "no_color" &&
+				!strings.Contains(result.Stdout, "Strict review") {
+				t.Fatalf("rich configure omitted experiences at %dx%d\n%s",
+					tc.cols, tc.rows, result.Stdout)
+			}
+			if (tc.name == "narrow" || tc.name == "accessible") &&
+				strings.Contains(result.Stdout, "\x1b[?1049h") {
+				t.Fatalf("linear configure entered alternate screen\n%q",
+					result.Stdout)
+			}
+			if (tc.name == "narrow" || tc.name == "accessible") &&
+				(strings.Contains(result.Stdout, "\x1b[?2026") ||
+					strings.Contains(result.Stdout, "\x1b[?2027")) {
+				t.Fatalf("linear configure queried terminal capabilities\n%q",
+					result.Stdout)
+			}
+			if tc.name == "no_color" &&
+				(strings.Contains(result.Stdout, "\x1b[38;") ||
+					strings.Contains(result.Stdout, "\x1b[48;")) {
+				t.Fatalf("NO_COLOR configure emitted color SGR\n%q",
+					result.Stdout)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resized := runPTYCommand(t, ctx, baseEnv, 100, 32, 52, 18,
+		"\x03", bin, "configure", "--repo", repo)
+	if resized.ExitCode == 0 ||
+		!strings.Contains(resized.Stdout, "How should ACD work?") ||
+		!strings.Contains(resized.Stdout, "Everyday work") {
+		t.Fatalf("resized configure transcript incomplete\n%s", resized.Stdout)
+	}
+}
+
+func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
+	t.Parallel()
+
+	repo := tempRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
+		[]byte("test:\n\t@true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := envWith(withIsolatedHome(t),
+		"TERM=xterm-256color",
+		"ACD_AI_API_KEY=configure-test-key",
+		"ACD_AI_BASE_URL=https://provider.example.invalid/v1",
+	)
+	bin := buildAcdBinary(t)
+
+	// A short terminal selects the linear renderer for the whole wizard.
+	// Approve only the preview prerequisites, then cancel when the final
+	// approval is visible.
+	input := strings.Join([]string{
+		"1\n",      // OpenAI-compatible provider
+		"\n", "\n", // keep environment endpoint and default model
+	}, "") + "\x00\x03" // cancel the one approval before calls or writes
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, input,
+		bin, "configure", "--repo", repo,
+		"--strategy", "intent", "--preset", "quality")
+	if result.ExitCode == 0 {
+		t.Fatalf("cancelled configure unexpectedly succeeded\n%s", result.Stdout)
+	}
+	previewAt := strings.Index(result.Stdout, "ACD CONFIGURE PREVIEW")
+	if previewAt < 0 {
+		t.Fatalf("configure never reached final preview\n%s", result.Stdout)
+	}
+	final := result.Stdout[previewAt:]
+	for _, want := range []string{
+		"Verification: full",
+		"repository command will run in an ephemeral worktree: make test",
+		"eligible recent ACD-owned commits may be repaired automatically",
+		"Approve every permission shown above",
+	} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final approval missing %q\n%s", want, final)
+		}
+	}
+	for _, rawMode := range []string{"\x1b[?25l", "\x1b[?2004h", "\x1b[?1004h"} {
+		if strings.Contains(final, rawMode) {
+			t.Errorf("final approval entered rich raw mode %q\n%q", rawMode, final)
+		}
+	}
+	for _, query := range []string{"\x1b[?2026", "\x1b[?2027"} {
+		if strings.Contains(result.Stdout, query) {
+			t.Errorf("linear configure queried terminal capability %q\n%q", query, result.Stdout)
+		}
+	}
+}
+
 func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 	repo := tempRepo(t)
 	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")

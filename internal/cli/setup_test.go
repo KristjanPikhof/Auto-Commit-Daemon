@@ -108,7 +108,7 @@ func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
 		},
 		{
 			path: "codex/uninstall.md",
-			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd touch"},
+			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd touch --soft-boundary"},
 		},
 		{
 			path: "cursor/uninstall.md",
@@ -621,10 +621,15 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 			}
 		}
 	}
-	// Stop must call acd touch (mirrors claude-code).
+	// Stop must record a soft boundary; unlike Claude's logical flush this
+	// requests evaluation without bypassing Intent v2 safety gates.
 	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
-		if !strings.Contains(stop[0].Hooks[0].Command, "acd touch") {
-			t.Errorf("Stop hook must call acd touch: %s", stop[0].Hooks[0].Command)
+		command := stop[0].Hooks[0].Command
+		if !strings.Contains(command, "acd touch --soft-boundary") {
+			t.Errorf("Stop hook must call acd touch --soft-boundary: %s", command)
+		}
+		if strings.Contains(command, "acd flush --logical") {
+			t.Errorf("Codex Stop must remain a soft boundary, got hard flush: %s", command)
 		}
 	}
 }
@@ -683,7 +688,8 @@ func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
 				// before printf reads it. SessionStart, UserPromptSubmit,
 				// PreToolUse, PostToolUse have two failure branches (helper
 				// + start/wake); Stop has one (helper only) because the
-				// trailing `acd touch` is best-effort with no log line.
+				// trailing `acd touch --soft-boundary` is best-effort with
+				// no log line.
 				wantRC := 2
 				if ev == "Stop" {
 					wantRC = 1

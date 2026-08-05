@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
@@ -1033,6 +1034,155 @@ func TestDoctor_RepoWarnsOnMultipleDaemonProcesses(t *testing.T) {
 	}
 }
 
+func TestFindDaemonProcessesMatchesLinkedWorktreeIdentity(t *testing.T) {
+	ctx := context.Background()
+	repo, _, d := makeRepoStateDB(t)
+	_ = d.Close()
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"config", "user.name", "ACD Test"); err != nil {
+		t.Fatalf("git config user.name: %v", err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"config", "user.email", "acd@example.invalid"); err != nil {
+		t.Fatalf("git config user.email: %v", err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"commit", "--allow-empty", "-m", "initial"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"worktree", "add", "-q", "-b", "doctor-linked", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+
+	old := doctorProcessList
+	doctorProcessList = func(context.Context) ([]doctorProcess, error) {
+		return []doctorProcess{
+			{PID: 2001, Command: "/usr/local/bin/acd daemon run --repo " + repo},
+			{PID: 2002, Command: "/usr/local/bin/acd daemon run --repo=" + linked},
+		}, nil
+	}
+	t.Cleanup(func() { doctorProcessList = old })
+
+	got := findDaemonProcesses(ctx, repo)
+	if fmt.Sprint(got) != "[2001 2002]" {
+		t.Fatalf("findDaemonProcesses=%v want [2001 2002]", got)
+	}
+}
+
+func TestFindDaemonProcessesRejectsPathSubstringCollisions(t *testing.T) {
+	ctx := context.Background()
+	repo, _, d := makeRepoStateDB(t)
+	_ = d.Close()
+	collision := repo + "-collision"
+	if err := os.MkdirAll(collision, 0o700); err != nil {
+		t.Fatalf("mkdir collision repo: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(collision) })
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: collision}, "init", "-q", "-b", "main"); err != nil {
+		t.Fatalf("git init collision repo: %v", err)
+	}
+
+	old := doctorProcessList
+	doctorProcessList = func(context.Context) ([]doctorProcess, error) {
+		return []doctorProcess{
+			{PID: 3001, Command: "/usr/local/bin/acd daemon run --repo " + collision},
+			{PID: 3002, Command: "/usr/local/bin/acd daemon run --repo " + repo},
+			{PID: 3003, Command: "/bin/sh -c 'acd daemon run --repo " + repo + "'"},
+			{PID: 3004, Command: "/usr/local/bin/acd daemon runner --repo " + repo},
+		}, nil
+	}
+	t.Cleanup(func() { doctorProcessList = old })
+
+	got := findDaemonProcesses(ctx, repo)
+	if fmt.Sprint(got) != "[3002]" {
+		t.Fatalf("findDaemonProcesses=%v want [3002]", got)
+	}
+}
+
+func TestDaemonRepoArgPreservesRepositoryPathsWithSpaces(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{`/usr/local/bin/acd daemon run --repo /tmp/repo with spaces`,
+			`/tmp/repo with spaces`},
+		{`/usr/local/bin/acd daemon run --repo=/tmp/repo with spaces`,
+			`/tmp/repo with spaces`},
+		{`/usr/local/bin/acd daemon run --repo "/tmp/repo unmatched`,
+			`"/tmp/repo unmatched`},
+		{`/usr/local/bin/acd daemon run --repo /tmp/repo\backslash`,
+			`/tmp/repo\backslash`},
+		{`/usr/local/bin/acd daemon run --repo /tmp/repo - archive`,
+			`/tmp/repo - archive`},
+	} {
+		got, ok := daemonRepoArg(tc.command)
+		if !ok || got != tc.want {
+			t.Fatalf("daemonRepoArg(%q)=(%q, %t), want %q",
+				tc.command, got, ok, tc.want)
+		}
+	}
+	for _, wrapper := range []string{
+		`/bin/sh -c 'acd daemon run --repo /tmp/repo'`,
+		`env acd daemon run --repo /tmp/repo`,
+		`wrapper /usr/local/bin/acd daemon run --repo /tmp/repo`,
+	} {
+		if got, ok := daemonRepoArg(wrapper); ok {
+			t.Fatalf("daemonRepoArg wrapper %q=(%q,true), want rejected",
+				wrapper, got)
+		}
+	}
+}
+
+func TestFindDaemonProcessesBoundsCanonicalResolution(t *testing.T) {
+	oldList := doctorProcessList
+	oldResolver := doctorRepoIdentityResolver
+	var processes []doctorProcess
+	for i := 0; i < 32; i++ {
+		processes = append(processes, doctorProcess{
+			PID: 4000 + i,
+			Command: fmt.Sprintf(
+				"/usr/local/bin/acd daemon run --repo /tmp/repo-%02d", i),
+		})
+	}
+	processes = append(processes, doctorProcess{
+		PID:     4999,
+		Command: "/usr/local/bin/acd daemon run --repo /tmp/target",
+	})
+	doctorProcessList = func(ctx context.Context) ([]doctorProcess, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("process list context has no overall deadline")
+		}
+		return processes, nil
+	}
+	resolveCalls := 0
+	doctorRepoIdentityResolver = func(
+		ctx context.Context, repo string,
+	) (string, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("repo resolver context has no overall deadline")
+		}
+		resolveCalls++
+		if repo == "/tmp/target" {
+			return "/git/target", nil
+		}
+		return "/git/" + filepath.Base(repo), nil
+	}
+	t.Cleanup(func() {
+		doctorProcessList = oldList
+		doctorRepoIdentityResolver = oldResolver
+	})
+
+	if got := findDaemonProcesses(
+		context.Background(), "/tmp/target"); fmt.Sprint(got) != "[4999]" {
+		t.Fatalf("findDaemonProcesses=%v want [4999]", got)
+	}
+	if resolveCalls != 33 {
+		t.Fatalf("repo identity calls=%d want target plus 32 unrelated candidates", resolveCalls)
+	}
+}
+
 // TestDoctor_DriftWarningClaudeCodeWakeOnly seeds a Claude Code settings.json
 // whose PreToolUse body only calls `acd wake` (missing `acd start`) and
 // asserts the doctor report flags the drift with a copy/pasteable
@@ -1091,13 +1241,15 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 
 func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 	cases := []struct {
-		name string
-		path string
-		body string
+		name        string
+		path        string
+		body        string
+		wantMissing int
 	}{
 		{
-			name: "claude-code",
-			path: filepath.Join(".claude", "settings.json"),
+			name:        "claude-code",
+			path:        filepath.Join(".claude", "settings.json"),
+			wantMissing: 2,
 			body: `{
 				"hooks": {
 					"SessionStart": [
@@ -1109,8 +1261,9 @@ func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 			}`,
 		},
 		{
-			name: "codex",
-			path: filepath.Join(".codex", "hooks.json"),
+			name:        "codex",
+			path:        filepath.Join(".codex", "hooks.json"),
+			wantMissing: 3,
 			body: `{
 				"hooks": {
 					"SessionStart": [
@@ -1154,10 +1307,69 @@ func TestDoctor_DriftWarningJSONHarnessMissingActiveHooks(t *testing.T) {
 			if !strings.Contains(notes, "installed snippet drift") {
 				t.Fatalf("%s missing active hooks should report drift, got notes=%v", tc.name, h.Notes)
 			}
-			if !strings.Contains(notes, "2 active hook(s)") {
-				t.Fatalf("%s should count missing PreToolUse/PostToolUse hooks, got notes=%v", tc.name, h.Notes)
+			wantCount := fmt.Sprintf("%d lifecycle hook(s)", tc.wantMissing)
+			if !strings.Contains(notes, wantCount) {
+				t.Fatalf("%s should count missing lifecycle hooks as %q, got notes=%v",
+					tc.name, wantCount, h.Notes)
 			}
 		})
+	}
+}
+
+func TestDoctor_CodexStopRequiresSoftBoundary(t *testing.T) {
+	canonical := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", canonical); got != 0 {
+		t.Fatalf("canonical Codex lifecycle drift=%d want 0", got)
+	}
+
+	legacy := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", legacy); got != 1 {
+		t.Fatalf("legacy Codex Stop drift=%d want 1", got)
+	}
+
+	hard := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary; acd flush --logical"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", hard); got != 1 {
+		t.Fatalf("hard Codex Stop drift=%d want 1", got)
+	}
+
+	falseValue := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "acd touch --soft-boundary=false"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", falseValue); got != 1 {
+		t.Fatalf("false-valued Codex Stop drift=%d want 1", got)
+	}
+
+	echoed := []byte(`{
+		"hooks": {
+			"PreToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"PostToolUse": [{"hooks": [{"command": "acd start && acd wake"}]}],
+			"Stop": [{"hooks": [{"command": "echo acd touch --soft-boundary"}]}]
+		}
+	}`)
+	if got := countJSONActiveHookDrift("codex", echoed); got != 1 {
+		t.Fatalf("echo-only Codex Stop drift=%d want 1", got)
 	}
 }
 
@@ -1643,7 +1855,7 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 	if note == "" {
 		t.Fatalf("empty cursor hooks should report drift")
 	}
-	if !strings.Contains(note, "5 active hook(s)") {
+	if !strings.Contains(note, "5 lifecycle hook(s)") {
 		t.Fatalf("empty cursor hooks should count five missing lifecycle hooks, got %q", note)
 	}
 }

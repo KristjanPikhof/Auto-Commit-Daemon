@@ -16,6 +16,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -43,6 +44,29 @@ func testService(t *testing.T, lookup func(string) (string, bool), probe ProbeFu
 		LookupEnv: lookup, Probe: probe, Nudge: nudge, Now: func() time.Time { return time.Unix(200, 0) }})
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+	return svc, roots
+}
+
+func testGlobalService(t *testing.T, lookup func(string) (string, bool), probe ProbeFunc) (*Service, paths.Roots) {
+	t.Helper()
+	base := t.TempDir()
+	roots := paths.Roots{
+		State:  filepath.Join(base, "state"),
+		Share:  filepath.Join(base, "share"),
+		Config: filepath.Join(base, "config"),
+	}
+	if lookup == nil {
+		lookup = func(string) (string, bool) { return "", false }
+	}
+	svc, err := NewGlobalService(context.Background(), Options{
+		Roots: roots, RepoPath: filepath.Join(base, "not-a-repository"),
+		LookupEnv: lookup, Probe: probe,
+		Now: func() time.Time { return time.Unix(200, 0) },
+	})
+	if err != nil {
+		t.Fatalf("NewGlobalService: %v", err)
 	}
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc, roots
@@ -132,6 +156,249 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	}
 }
 
+func TestAuthoringPreviewReportsProviderSources(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvProvider {
+			return "openai-compat", true
+		}
+		return "", false
+	}
+	svc, roots := testService(t, lookup, nil, nil)
+	store := config.NewStore(roots)
+	if err := store.Update(func(doc *config.Document) error {
+		doc.Settings.Repositories[svc.repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldBaseURL: json.RawMessage(
+					`"https://gateway.example/v1"`,
+				),
+				config.FieldModel: json.RawMessage(`"gateway-model"`),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Sources[config.FieldProvider] != config.SourceEnvironment ||
+		preview.Sources[config.FieldBaseURL] != config.SourceRepository ||
+		preview.Sources[config.FieldModel] != config.SourceRepository {
+		t.Fatalf("sources=%+v", preview.Sources)
+	}
+}
+
+func TestGlobalServiceAuthorsWithoutRepository(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvProvider {
+			return "openai-compat", true
+		}
+		return "", false
+	}
+	svc, roots := testGlobalService(t, lookup, nil)
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"global-model"`)
+		doc.Settings.Repositories["unrelated"] = config.RepositorySettings{
+			Fields: config.Overrides{config.FieldModel: json.RawMessage(`"repository-model"`)},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Generation != 1 ||
+		preview.Values[config.FieldModel] != "global-model" ||
+		preview.Sources[config.FieldModel] != config.SourceGlobal ||
+		preview.Sources[config.FieldProvider] != config.SourceEnvironment ||
+		preview.Sources[config.FieldBaseURL] != config.SourceDefault {
+		t.Fatalf("global preview = %+v", preview)
+	}
+	value := "changed"
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeRepository, Values: map[string]*string{config.FieldModel: &value},
+		ExpectedGeneration: preview.Generation,
+	}); err == nil || !strings.Contains(err.Error(), "repository runtime service required") {
+		t.Fatalf("repository save error = %v", err)
+	}
+	if _, err := svc.Snapshot(context.Background(), ScopeGlobal, ""); err == nil ||
+		!strings.Contains(err.Error(), "repository runtime service required") {
+		t.Fatalf("runtime snapshot error = %v", err)
+	}
+	if _, err := svc.Apply(context.Background(), ApplyRequest{}); err == nil ||
+		!strings.Contains(err.Error(), "repository runtime service required") {
+		t.Fatalf("runtime apply error = %v", err)
+	}
+}
+
+func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
+	var probes atomic.Int32
+	svc, roots := testGlobalService(t, nil, func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		probes.Add(1)
+		if cfg.APIKey != "protected-key" || cfg.BaseURL != "https://gateway.example/v1" {
+			t.Fatalf("probe config = %+v", cfg)
+		}
+		return ai.ProviderProbeResult{Provider: cfg.Mode, Success: true}, nil
+	})
+	if err := credentials.NewStore(roots).Set("protected-key"); err != nil {
+		t.Fatal(err)
+	}
+	draft := map[string]string{
+		config.FieldCommitStrategy:      "intent",
+		config.FieldCommitPreset:        "balanced",
+		config.FieldProvider:            "openai-compat",
+		config.FieldBaseURL:             "https://gateway.example/v1",
+		config.FieldModel:               "gateway-model",
+		config.FieldDiffEgress:          "true",
+		config.FieldIntentVerification:  "structural",
+		config.FieldIntentRepairEnabled: "true",
+	}
+	confirmed := []ai.ConfirmationRequirement{
+		ai.ConfirmationEndpointCredentials,
+		ai.ConfirmationDiffEgress,
+		ai.ConfirmationIntentRepair,
+	}
+	validation, err := svc.Validate(context.Background(), draft, confirmed)
+	if err != nil || len(validation.Missing) != 0 {
+		t.Fatalf("Validate = %+v err=%v", validation, err)
+	}
+	tested, err := svc.TestProvider(context.Background(), draft, confirmed)
+	if err != nil || !tested.Success || probes.Load() != 1 {
+		t.Fatalf("TestProvider = %+v err=%v probes=%d", tested, err, probes.Load())
+	}
+	result, err := svc.SaveGlobalSetup(context.Background(), SaveGlobalSetupRequest{
+		Values: draft, TestedFingerprint: tested.Fingerprint,
+		Confirmations: confirmed, ExpectedGeneration: validation.SourceGeneration,
+	})
+	if err != nil || result.Generation != 1 || result.Fingerprint != tested.Fingerprint {
+		t.Fatalf("SaveGlobalSetup = %+v err=%v", result, err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, ok := config.ActiveGlobalSetupApproval(doc)
+	if !ok || approval.Generation != 1 ||
+		!reflect.DeepEqual(approval.Confirmations,
+			[]string{"diff_egress", "endpoint_credentials", "intent_repair"}) {
+		t.Fatalf("approval = %+v ok=%v", approval, ok)
+	}
+	if string(doc.Settings.Global[config.FieldModel]) != `"gateway-model"` ||
+		string(doc.Settings.Global[config.FieldIntentVerification]) != `"structural"` {
+		t.Fatalf("saved globals = %+v", doc.Settings.Global)
+	}
+
+	changed := "new-model"
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeGlobal, Values: map[string]*string{config.FieldModel: &changed},
+		ExpectedGeneration: result.Generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err = config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, ok = config.ActiveGlobalSetupApproval(doc)
+	if !ok {
+		t.Fatal("later write removed auditable global approval")
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentFingerprint, err := config.SettingsFingerprint(
+		preview.Values, preview.Preset,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentFingerprint == approval.Fingerprint {
+		t.Fatal("changed global settings still matched prior approval")
+	}
+}
+
+func TestGlobalServiceReplaceDropsStaleOverrides(t *testing.T) {
+	svc, roots := testGlobalService(t, nil, nil)
+	timeout := "30s"
+	maxBytes := "1048576"
+	saved, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeGlobal,
+		Values: map[string]*string{
+			config.FieldTimeout:      &timeout,
+			"capture.max_file_bytes": &maxBytes,
+		},
+		ExpectedGeneration: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := svc.AuthoringPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := preview.Values
+	draft[config.FieldCommitStrategy] = "event"
+	draft[config.FieldCommitPreset] = "fast"
+	draft[config.FieldProvider] = "deterministic"
+	draft[config.FieldIntentVerification] = "none"
+	draft[config.FieldTimeout] = ai.DefaultProviderTimeout.String()
+	validation, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.SaveGlobalSetup(
+		context.Background(),
+		SaveGlobalSetupRequest{
+			Values:             draft,
+			TestedFingerprint:  validation.Fingerprint,
+			ExpectedGeneration: saved.Generation,
+			Replace:            true,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Settings.Global["capture.max_file_bytes"]; ok {
+		t.Fatalf("replacement retained restart override: %+v",
+			doc.Settings.Global)
+	}
+	if got := string(doc.Settings.Global[config.FieldTimeout]); got != `"`+ai.DefaultProviderTimeout.String()+`"` {
+		t.Fatalf("replacement timeout = %s", got)
+	}
+	if result.Generation != 2 {
+		t.Fatalf("replacement generation = %d", result.Generation)
+	}
+}
+
+func TestGlobalServiceRejectsRepositoryVerificationApproval(t *testing.T) {
+	svc, _ := testGlobalService(t, nil, nil)
+	draft := map[string]string{
+		config.FieldCommitStrategy:     "event",
+		config.FieldCommitPreset:       "fast",
+		config.FieldIntentVerification: "structural",
+	}
+	validation, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.SaveGlobalSetup(context.Background(), SaveGlobalSetupRequest{
+		Values: draft, TestedFingerprint: validation.Fingerprint,
+		Confirmations:      []ai.ConfirmationRequirement{ai.ConfirmationVerificationCommand},
+		ExpectedGeneration: validation.SourceGeneration,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be global") {
+		t.Fatalf("verification approval error = %v", err)
+	}
+}
+
 func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {
 	svc, _ := testService(t, nil, nil, nil)
 	ctx := context.Background()
@@ -197,6 +464,52 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 	}
 }
 
+func TestSettingsActionClearsEmptyRepositoryOverride(t *testing.T) {
+	svc, roots := testService(t, nil, nil, nil)
+	model := "repo-model"
+	profile := "strict"
+	window := "20"
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope:   ScopeProfile,
+		Profile: profile,
+		Values: map[string]*string{
+			config.FieldIntentWindow: &window,
+		},
+		ExpectedGeneration: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeRepository,
+		Values: map[string]*string{
+			config.FieldModel: &model,
+		},
+		RepositoryProfile:  &profile,
+		ExpectedGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	empty := ""
+	if _, err := svc.Save(context.Background(), SaveRequest{
+		Scope: ScopeRepository,
+		Values: map[string]*string{
+			config.FieldModel: nil,
+		},
+		RepositoryProfile:  &empty,
+		ExpectedGeneration: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Settings.Repositories[svc.repoHash]; ok {
+		t.Fatalf("empty repository override was retained: %+v",
+			doc.Settings.Repositories[svc.repoHash])
+	}
+}
+
 func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *testing.T) {
 	var probes atomic.Int32
 	lookup := func(name string) (string, bool) {
@@ -227,6 +540,86 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 	validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials})
 	if err != nil || validation.Fingerprint == result.Fingerprint {
 		t.Fatalf("provider edit did not invalidate fingerprint: %+v %v", validation, err)
+	}
+}
+
+func TestSettingsIntentPresetMaterializesRevisionMetadata(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return "hidden", true
+		}
+		return "", false
+	}
+	svc, _ := testService(t, lookup, nil, nil)
+	draft := map[string]string{
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitPreset:   "balanced",
+		config.FieldProvider:       "openai-compat",
+	}
+	validation, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.Preset.Reference() != "intent.balanced@3" || validation.Preset.Customized {
+		t.Fatalf("preset = %+v", validation.Preset)
+	}
+	if validation.ResolvedHot[config.FieldIntentWindow] != "20" ||
+		validation.ResolvedHot[config.FieldIntentVerification] != "structural" ||
+		validation.ResolvedHot[config.FieldIntentRepairEnabled] != "true" ||
+		validation.ResolvedHot[config.FieldDiffEgress] != "true" {
+		t.Fatalf("balanced values = %#v", validation.ResolvedHot)
+	}
+	body, err := revisionSnapshotJSON(validation.ResolvedHot, nil, validation.Preset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["preset_id"] != "intent.balanced" ||
+		payload["preset_version"] != float64(3) || payload["customized"] != false {
+		t.Fatalf("revision metadata = %#v", payload)
+	}
+
+	draft[config.FieldIntentWindow] = "21"
+	custom, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !custom.Preset.Customized || custom.Fingerprint == validation.Fingerprint {
+		t.Fatalf("custom preset = %+v fingerprints=%q/%q",
+			custom.Preset, validation.Fingerprint, custom.Fingerprint)
+	}
+}
+
+func TestSettingsProviderUsesProtectedCredentialBelowEnvironment(t *testing.T) {
+	var gotKeys []string
+	probe := func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		gotKeys = append(gotKeys, cfg.APIKey)
+		return ai.ProviderProbeResult{Provider: cfg.Mode, Success: true}, nil
+	}
+	environmentKey := ""
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey && environmentKey != "" {
+			return environmentKey, true
+		}
+		return "", false
+	}
+	svc, roots := testService(t, lookup, probe, nil)
+	if err := credentials.NewStore(roots).Set("sk-protected"); err != nil {
+		t.Fatal(err)
+	}
+	draft := map[string]string{config.FieldProvider: "openai-compat"}
+	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
+		t.Fatal(err)
+	}
+	environmentKey = "sk-environment"
+	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotKeys, []string{"sk-protected", "sk-environment"}) {
+		t.Fatalf("provider keys = %v", gotKeys)
 	}
 }
 
@@ -277,12 +670,16 @@ func TestSettingsActionProviderTestRedactsProbeError(t *testing.T) {
 		return "", false
 	}
 	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-		return ai.ProviderProbeResult{Provider: "openai-compat"}, errors.New("hidden-key\x1b[2J upstream failure")
+		return ai.ProviderProbeResult{Provider: "openai-compat"},
+			errors.New("hidden-key\x1b[2J upstream rejected sk-HCKZa********UC3m")
 	}, nil)
 	_, err := svc.TestProvider(context.Background(), map[string]string{
 		config.FieldProvider: "openai-compat", config.FieldModel: "model",
 	}, nil)
-	if err == nil || strings.Contains(err.Error(), "hidden-key") || strings.Contains(err.Error(), "\x1b") {
+	if err == nil || strings.Contains(err.Error(), "hidden-key") ||
+		strings.Contains(err.Error(), "HCKZa") ||
+		strings.Contains(err.Error(), "UC3m") ||
+		strings.Contains(err.Error(), "\x1b") {
 		t.Fatalf("probe error leaked unsafe content: %v", err)
 	}
 }

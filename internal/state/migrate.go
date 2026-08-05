@@ -66,8 +66,15 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // privacy-safe planner-window observability. v12 adds recovery_snapshots and
 // recovery_snapshot_events. v13 adds idx_capture_events_recovery_prefix for
 // bounded published-prefix pruning. v14 adds the runtime settings ledger and
-// additive planner/decision metadata. New tables are pure DDL; columns on
-// existing tables are added explicitly for upgraded databases.
+// additive planner/decision metadata. v15 adds the durable Intent v2
+// candidate, dependency, boundary, and repair ledgers. v16 adds durable setup
+// validation attempts without backfilling already-applied revisions. v17 adds
+// the candidate-lineage ledger without rewriting existing candidates. v18
+// adds the immutable self-publication journal without backfilling historical
+// publishes. v19 persists prepare-time publication completion semantics so
+// restart recovery cannot reinterpret repair state. New tables are pure DDL;
+// columns on existing tables are added
+// explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
 // ADD COLUMN. Schema-changing helpers belong here, not in db.go.
 //
@@ -77,8 +84,11 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // migrations (such as v2→v3). v6 uses an explicit table rebuild for only
 // pre-v6 databases whose decision_records table still has the old event_seq
 // foreign key. v7, v8, v11, v12, and v13 are pure DDL migrations through schemaDDL.
+// v15, v16, v17, and v18 are additive and deliberately have no data backfill:
+// existing intent repositories are cut over by runtime configuration
+// orchestration, not by mutating their capture ledger during schema bootstrap.
 // Migrate is wired now so future phases requiring separate data backfill have
-// a single entry point to extend.
+// one entry point.
 func (d *DB) Migrate(ctx context.Context) error {
 	cur, err := d.UserVersion(ctx)
 	if err != nil {
@@ -139,6 +149,51 @@ func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 		}
 		if _, err := tx.ExecContext(ctx, runtimeConfigV14IndexesDDL); err != nil {
 			return fmt.Errorf("state: add v14 runtime config indexes: %w", err)
+		}
+	}
+	if cur < 15 {
+		// Only repositories with pre-existing runtime/capture evidence need
+		// the one-time Intent v2 cutover. A brand-new v15 database must not
+		// synthesize legacy configuration merely because its initial
+		// user_version is zero.
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO daemon_meta(key, value, updated_ts)
+SELECT 'intent.v2.cutover_required', 'true',
+       CAST(strftime('%s','now') AS REAL)
+WHERE EXISTS(SELECT 1 FROM capture_events LIMIT 1)
+   OR EXISTS(SELECT 1 FROM config_revisions LIMIT 1)
+   OR EXISTS(SELECT 1 FROM daemon_meta WHERE key='commit.strategy')`); err != nil {
+			return fmt.Errorf("state: mark Intent v2 cutover: %w", err)
+		}
+	}
+	if cur < 19 {
+		for _, col := range []struct {
+			name string
+			typ  string
+		}{
+			{"completion_published_ts", "REAL NOT NULL DEFAULT 0"},
+			{"completion_candidate_status",
+				"TEXT NOT NULL DEFAULT 'unknown'"},
+			{"completion_soft_deadline", "REAL"},
+		} {
+			if err := addColumnIfMissing(
+				ctx, tx, "self_publications", col.name, col.typ); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+DROP TRIGGER IF EXISTS self_publications_identity_immutable;
+CREATE TRIGGER self_publications_identity_immutable
+BEFORE UPDATE OF branch_ref, branch_generation, source_head,
+                 target_commit_oid, target_tree_oid, membership_digest,
+                 member_count, completion_published_ts,
+                 completion_candidate_status, completion_soft_deadline
+ON self_publications
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;`); err != nil {
+			return fmt.Errorf(
+				"state: migrate self-publication completion identity: %w", err)
 		}
 	}
 	return nil

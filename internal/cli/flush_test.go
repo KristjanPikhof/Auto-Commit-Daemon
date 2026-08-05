@@ -132,12 +132,25 @@ func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 	if !fr.NonBlocking {
 		t.Fatalf("logical flush request must be non_blocking=true, got %+v", fr)
 	}
+	boundaries, err := state.PendingIntentActivityBoundaries(ctx, d3, 0, 10)
+	if err != nil {
+		t.Fatalf("pending boundaries: %v", err)
+	}
+	if len(boundaries) != 1 ||
+		boundaries[0].Kind != state.IntentBoundaryHard ||
+		boundaries[0].Source != "flush_logical" ||
+		boundaries[0].BranchRef.Valid ||
+		boundaries[0].BranchGeneration.Valid {
+		t.Fatalf("repo-wide hard boundary=%+v", boundaries)
+	}
 
 	var got flushResult
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if !got.OK || !got.Logical || !got.SentSignal || got.FlushRequestID == 0 || !got.BypassMinPending {
+	if !got.OK || !got.Logical || !got.SentSignal ||
+		got.FlushRequestID == 0 || got.BoundaryEpoch != 1 ||
+		!got.BypassMinPending {
 		t.Fatalf("expected ok+logical+sent+request_id+bypass, got %+v", got)
 	}
 }

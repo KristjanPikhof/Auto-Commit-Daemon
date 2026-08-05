@@ -9,8 +9,8 @@ The daemon never starts this command automatically.
 ## Safe path
 
 ~~~bash
-ACD_COMMIT_STRATEGY=intent ACD_AI_PROVIDER=openai-compat ACD_AI_API_KEY=... \
-  acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
+acd configure
+acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
 
 acd rewrite-commits --show-plan rewrite.json
 acd rewrite-commits --apply-plan rewrite.json --dry-run
@@ -34,21 +34,25 @@ git reset --hard <backup-sha>
 | Saved-plan show, edit, dry-run, and apply | Applying while the daemon is running |
 | Saved-plan reuse without an AI provider | Applying while ACD has pending captures |
 
-Plan generation requires working intent mode with a non-deterministic planner:
+Plan generation uses the repository's effective saved settings. Configure
+Intent mode with a non-deterministic planner before generating a plan:
 
 ~~~bash
-export ACD_COMMIT_STRATEGY=intent
-export ACD_AI_PROVIDER=openai-compat
-export ACD_AI_API_KEY=...
+acd configure
 ~~~
+
+Repository settings override profile settings, which override global settings
+and compatibility environment variables. A protected credential saved with
+`acd auth set` is used when `ACD_AI_API_KEY` is not set.
 
 `deterministic` fallback is not enough to generate a new rewrite plan. It is
 fine for showing or applying an existing saved plan.
 
-Rewrite plans use the active `ACD_COMMIT_FORMAT` when they are generated. The
-default is `imperative`. Set
-`ACD_COMMIT_FORMAT=conventional` to request scope-less Conventional Commit
-subjects such as `fix: preserve rewrite plan format`. Accepted conventional
+Rewrite plans use the effective `commit.format` setting when they are
+generated. The default is `imperative`. Select `conventional` in settings (or
+set the compatibility `ACD_COMMIT_FORMAT=conventional` environment variable)
+to request scope-less Conventional Commit subjects such as
+`fix: preserve rewrite plan format`. Accepted conventional
 types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, `chore`,
 `perf`, `style`, and `revert`; scopes and breaking markers are rejected. Body
 bullets keep the same `- ` prefix and wrapping rules in both modes.

@@ -26,8 +26,11 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
@@ -226,6 +229,11 @@ type Options struct {
 	// leaves this nil; tests inject a recorder to assert run-loop gate
 	// behavior without involving network or subprocess providers.
 	IntentPlanner ai.IntentPlanner
+	// runtimeBuildProvider is a test-only seam for constructing providers
+	// from immutable runtime revisions. It preserves the production cutover
+	// contract while letting run-loop tests assert provider reuse and health
+	// continuity without executing a real subprocess or network request.
+	runtimeBuildProvider runtimeBundleBuildFunc
 
 	// beforeBranchTransitionAccept is a test-only synchronization point after
 	// prospective shadow preparation and before the final token/pause CAS.
@@ -236,6 +244,23 @@ type Options struct {
 	// beforeBranchTokenCheck is a test-only synchronization point immediately
 	// before the run loop samples the live branch token.
 	beforeBranchTokenCheck func()
+	// afterSelfPublicationAdoption is a test-only observation point after the
+	// journal-proved target and all in-memory/durable token fields agree.
+	afterSelfPublicationAdoption func(CaptureContext, string, string, string)
+	// afterRunLoopWorkDecision is a test-only observation point for the
+	// scheduler input after one complete pass.
+	afterRunLoopWorkDecision func(hadWork, recoveryFollowup bool)
+	// recoverSelfPublications is a test-only seam for deterministic
+	// cancellation coverage around startup and active recovery passes.
+	recoverSelfPublications func(
+		context.Context, string, *state.DB, CaptureContext, ReplayOpts,
+	) (SelfPublicationRecoverySummary, error)
+	// selfPublicationCheckpoint is the run-loop wiring for Replay's
+	// deterministic publication-boundary fault seam.
+	selfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
+	// branchGenerationToken is a test-only resolver seam for publication
+	// adoption and transition retry coverage.
+	branchGenerationToken func(context.Context, string) (string, error)
 	// beforeStartupDeadBranchPairSafetyCheck is a test-only synchronization
 	// point immediately before a startup dead-branch pair's final safety gate.
 	// The sweep-owned context lets blocking tests release on daemon shutdown.
@@ -370,6 +395,22 @@ func Run(ctx context.Context, opts Options) error {
 
 	providerCfg := ai.LoadProviderConfigFromEnv()
 	providerCfg.Logger = logger
+	var runtimeCredentialStore *credentials.Store
+	runtimeRoots, rootsErr := paths.Resolve()
+	if rootsErr != nil {
+		logger.Warn("resolve runtime configuration roots",
+			"err", ai.SanitizePlannerError(rootsErr.Error()))
+	} else {
+		store := credentials.NewStore(runtimeRoots)
+		runtimeCredentialStore = &store
+		key, _, credentialErr := credentials.Resolve(store, os.LookupEnv)
+		if credentialErr != nil {
+			logger.Warn("load protected provider credential",
+				"err", ai.SanitizePlannerError(credentialErr.Error()))
+		} else {
+			providerCfg.APIKey = key
+		}
+	}
 	// Install the package-level rejects logger before any planner call can
 	// fire. The logger is best-effort: any write failure surfaces as a
 	// slog.Warn rather than blocking replay. ConfigureIntentRejectsLogger
@@ -382,7 +423,6 @@ func Run(ctx context.Context, opts Options) error {
 	// where capture skips the stamp before the first replay tick.
 	_ = resolvePathQuiescenceSeconds()
 	if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
-		"commit.strategy":        string(providerCfg.CommitStrategy),
 		"commit.format":          string(providerCfg.CommitFormat),
 		"intent.window":          strconv.Itoa(providerCfg.IntentWindow),
 		"intent.min_pending":     strconv.Itoa(providerCfg.IntentMinPending),
@@ -506,11 +546,54 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
 	}
 	defer func() { _ = dlock.Release() }()
+	cutoverBlock := ""
+	if rootsErr == nil {
+		if cutover, cutoverErr := EnsureIntentV2RuntimeCutover(
+			ctx, opts.DB, opts.RepoPath, runtimeRoots, os.LookupEnv); cutoverErr != nil {
+			cutoverBlock = runtimeConfigureReason(
+				"the Intent v2 runtime cutover could not be completed")
+			logger.Warn("Intent v2 runtime cutover needs attention",
+				"err", ai.SanitizePlannerError(cutoverErr.Error()))
+			_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+				metaIntentV2MigrationState:  "needs_attention",
+				"intent.v2.needs_attention": cutoverBlock,
+			})
+		} else if cutover.Migrated {
+			logger.Info("materialized Intent v2 runtime revision",
+				"revision_id", cutover.RevisionID,
+				"preset_id", cutover.PresetID,
+				"preset_version", cutover.PresetVersion,
+				"customized", cutover.Customized)
+		}
+	} else if required, ok, metaErr := state.MetaGet(
+		ctx, opts.DB, metaIntentV2CutoverRequired,
+	); metaErr != nil || ok && parseRuntimeBool(required) {
+		cutoverBlock = runtimeConfigureReason(
+			"the Intent v2 runtime cutover could not resolve configuration storage")
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			metaIntentV2MigrationState:  "needs_attention",
+			"intent.v2.needs_attention": cutoverBlock,
+		})
+	}
 	if runIntentPlanner != nil {
 		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
 	}
 	initialIdentity := intentHealthOptions.Provider
 	initialFingerprint := IntentPlannerProviderFingerprint(initialIdentity)
+	initialPreset := config.PresetFast
+	initialPresetID := "event.fast"
+	initialReplayBlock := configuredRuntimeReplayBlock(ctx, opts.DB)
+	if providerCfg.CommitStrategy == ai.CommitStrategyIntent {
+		initialPreset = config.PresetBalanced
+		initialPresetID = "intent.balanced"
+		if initialReplayBlock == "" {
+			initialReplayBlock = runtimeConfigureReason(
+				"an immutable Intent v2 runtime revision is not active")
+		}
+	}
+	if cutoverBlock != "" {
+		initialReplayBlock = cutoverBlock
+	}
 	initialBundle := &RuntimeBundle{
 		Provider: provider, ProviderCloser: providerCloser, MessageFn: msgFn,
 		IntentPlanner: runIntentPlanner, IntentHealth: intentHealth,
@@ -518,6 +601,10 @@ func Run(ctx context.Context, opts Options) error {
 		Model: intentPlannerModel, DiffEgress: providerCfg.DiffEgress,
 		CommitStrategy:       providerCfg.CommitStrategy,
 		CommitFormat:         providerCfg.CommitFormat,
+		PresetID:             initialPresetID,
+		PresetVersion:        config.PresetCatalogVersion,
+		IntentPreset:         initialPreset,
+		ReplayBlockedReason:  initialReplayBlock,
 		IntentRetryLimit:     resolvedIntentRetryLimit(),
 		IntentWindow:         providerCfg.IntentWindow,
 		IntentMinPending:     providerCfg.IntentMinPending,
@@ -530,12 +617,36 @@ func Run(ctx context.Context, opts Options) error {
 	runtimeBundles := NewRuntimeBundleManager(initialBundle, RuntimeBundleBuilder{
 		DB: opts.DB, RepoRoot: opts.RepoPath, PromptTrace: promptTracer,
 		Logger: logger, Now: now,
+		BuildProvider:   opts.runtimeBuildProvider,
+		CredentialStore: runtimeCredentialStore, LookupEnv: os.LookupEnv,
 	}, closeTimeout)
 	// RuntimeBundleManager now owns the initial closer. Leave the legacy
 	// deferred guard installed with a nil target for compatibility with early
 	// returns above this point.
 	providerCloser = nil
 	defer runtimeBundles.Close()
+	if cutoverBlock == "" {
+		if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+			logger.Warn("activate Intent v2 runtime revision",
+				"err", ai.SanitizePlannerError(err.Error()))
+		}
+	}
+	currentRuntime := runtimeBundles.Current()
+	if currentRuntime != nil && currentRuntime.ReplayBlockedReason != "" {
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"intent.v2.needs_attention": currentRuntime.ReplayBlockedReason,
+			metaIntentV2MigrationState:  "needs_attention",
+			"intent.v2.preset_id":       currentRuntime.PresetID,
+			"intent.v2.preset_version":  strconv.Itoa(currentRuntime.PresetVersion),
+		})
+	} else if currentRuntime != nil && currentRuntime.RevisionID > 0 {
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"intent.v2.needs_attention": "",
+			metaIntentV2MigrationState:  "active",
+			"intent.v2.preset_id":       currentRuntime.PresetID,
+			"intent.v2.preset_version":  strconv.Itoa(currentRuntime.PresetVersion),
+		})
+	}
 
 	// 1a. Orphan flush_request sweep. Rows that sat in "acknowledged" past
 	// OrphanFlushAckThreshold are presumed orphans from a previous daemon
@@ -597,6 +708,48 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	heartbeatNow("running", "daemon started")
+	var shutdownCh <-chan struct{}
+	recoveryRootCtx := ctx
+	recoverSelfPublicationsPass := func(
+		rootCtx context.Context,
+		recoveryCtx CaptureContext,
+	) (SelfPublicationRecoverySummary, error) {
+		// One journal per invocation keeps the run loop available to drain
+		// flush requests between recovery attempts. The timeout bounds even
+		// a slow Git proof, while the progress heartbeat preserves the
+		// controller's three-second liveness contract during that proof.
+		passCtx, passCancel := context.WithTimeout(
+			rootCtx, 5*time.Second)
+		defer passCancel()
+		progressDone := make(chan struct{})
+		progressStopped := make(chan struct{})
+		go func() {
+			defer close(progressStopped)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-progressDone:
+					return
+				case <-passCtx.Done():
+					return
+				case <-ticker.C:
+					heartbeatNow("running", "")
+				}
+			}
+		}()
+		recover := RecoverSelfPublications
+		if opts.recoverSelfPublications != nil {
+			recover = opts.recoverSelfPublications
+		}
+		summary, recoverErr := recover(
+			passCtx, opts.RepoPath, opts.DB, recoveryCtx,
+			ReplayOpts{Limit: 1})
+		close(progressDone)
+		<-progressStopped
+		heartbeatNow("running", "")
+		return summary, recoverErr
+	}
 
 	// 3. Install signal handlers (unless tests opt out).
 	var sig *Signals
@@ -609,10 +762,44 @@ func Run(ctx context.Context, opts Options) error {
 	if wakeCh == nil && sig != nil {
 		wakeCh = sig.Wake
 	}
-	shutdownCh := opts.ShutdownCh
-	if shutdownCh == nil && sig != nil {
-		shutdownCh = sig.Shutdown
+	rawShutdownCh := opts.ShutdownCh
+	if rawShutdownCh == nil && sig != nil {
+		rawShutdownCh = sig.Shutdown
 	}
+	shutdownPendingAtStart := false
+	select {
+	case <-rawShutdownCh:
+		shutdownPendingAtStart = true
+	default:
+	}
+	recoveryRootCtx, recoveryCancel := context.WithCancel(ctx)
+	shutdownBroadcast := make(chan struct{})
+	shutdownBridgeStop := make(chan struct{})
+	shutdownBridgeDone := make(chan struct{})
+	go func() {
+		defer close(shutdownBridgeDone)
+		if shutdownPendingAtStart {
+			recoveryCancel()
+			close(shutdownBroadcast)
+			return
+		}
+		select {
+		case <-rawShutdownCh:
+			recoveryCancel()
+			close(shutdownBroadcast)
+		case <-ctx.Done():
+			recoveryCancel()
+			close(shutdownBroadcast)
+		case <-shutdownBridgeStop:
+		}
+	}()
+	defer func() {
+		close(shutdownBridgeStop)
+		recoveryCancel()
+		<-shutdownBridgeDone
+	}()
+	shutdownCh = shutdownBroadcast
+	validationWakeCh := make(chan struct{}, 1)
 
 	// Resolve the active branch ref / generation up-front. The generation
 	// counter is loaded from daemon_meta so a daemon restart preserves the
@@ -630,7 +817,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		logger.Warn("load persisted branch head", "err", err.Error())
 	}
-	currentToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
+	branchGenerationToken := BranchGenerationToken
+	if opts.branchGenerationToken != nil {
+		branchGenerationToken = opts.branchGenerationToken
+	}
+	currentToken, terr := branchGenerationToken(ctx, opts.RepoPath)
 	if terr != nil {
 		logger.Warn("seed branch token", "err", terr.Error())
 		currentToken = ""
@@ -642,7 +833,136 @@ func Run(ctx context.Context, opts Options) error {
 		branchRef = tokenBranchRef(currentToken)
 		headOID = tokenSHA(currentToken)
 	}
-	branchTransitionBlocked := false
+	startupPublicationBlocked := false
+	startupReattachedFromDetached := false
+	if branchRef != "" && headOID != "" {
+		// A detached marker alongside an attached current token means HEAD
+		// reattached before startup finished sampling it. In that narrow
+		// case, the rewind-grace row belongs to the stale detached state.
+		// Let exact self-publication proof run, but retain both markers until
+		// the branch transition is accepted below.
+		_, detachedMarkerExists, detachedErr :=
+			state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+		if detachedErr != nil {
+			logger.Warn("read detached marker before startup self-publication recovery",
+				"err", detachedErr.Error())
+			startupPublicationBlocked = true
+		}
+		if detachedMarkerExists {
+			persistedToken, tokenOK, tokenErr :=
+				state.MetaGet(ctx, opts.DB, MetaKeyBranchToken)
+			if tokenErr != nil {
+				logger.Warn("read branch token before startup self-publication recovery",
+					"err", tokenErr.Error())
+				startupPublicationBlocked = true
+			} else {
+				startupReattachedFromDetached = tokenOK &&
+					tokenBranchRef(persistedToken) == "" &&
+					tokenSHA(persistedToken) != ""
+				if tokenOK && tokenBranchRef(persistedToken) != "" {
+					// An attached durable token proves this marker is stale.
+					// Remove only the detached marker; any active rewind grace
+					// belongs to the attached history and must remain intact.
+					_, _ = state.MetaDelete(
+						ctx, opts.DB, MetaKeyDetachedHeadPaused)
+				}
+			}
+		}
+		if operation, active := gitOperationInProgress(opts.GitDir); active {
+			logger.Info("startup self-publication recovery deferred during git operation",
+				"operation", operation)
+			startupPublicationBlocked = true
+		} else if pauseStatus, pauseErr :=
+			daemonPauseState(ctx, opts.GitDir, opts.DB); pauseErr != nil {
+			logger.Warn("read pause state before startup self-publication recovery",
+				"err", pauseErr.Error())
+			startupPublicationBlocked = true
+		} else if pauseStatus.Active &&
+			!(pauseStatus.Source == "rewind_grace" &&
+				startupReattachedFromDetached) {
+			logger.Info("startup self-publication recovery deferred while paused",
+				"source", pauseStatus.Source, "reason", pauseStatus.Reason)
+			startupPublicationBlocked = true
+		} else if !startupPublicationBlocked {
+			recoveryCtx := CaptureContext{
+				BranchRef: branchRef, BranchGeneration: persistedGen,
+				BaseHead: persistedHead,
+			}
+			// A shutdown already pending before startup still permits crash
+			// convergence. A shutdown arriving during this proof cancels it
+			// promptly through recoveryRootCtx.
+			startupRecoveryRootCtx := recoveryRootCtx
+			if shutdownPendingAtStart {
+				startupRecoveryRootCtx = ctx
+			}
+			recovered, recoverErr := recoverSelfPublicationsPass(
+				startupRecoveryRootCtx, recoveryCtx)
+			if recoverErr != nil {
+				logger.Warn("recover self-publications before startup branch transition",
+					"err", recoverErr.Error())
+				startupPublicationBlocked = true
+			} else if recovered.FinalTargetOID != "" {
+				// CompleteSelfPublication already persisted the exact journal
+				// target and branch token in the same SQLite transaction. Seed
+				// startup's previous state from that proved target so any
+				// subsequent external movement is classified from the internal
+				// publication boundary instead of the stale pre-crash head.
+				persistedHead = recovered.FinalTargetOID
+				logger.Info("recovered self-publication at startup",
+					"target", recovered.FinalTargetOID,
+					"completed", recovered.Completed,
+					"abandoned", recovered.Abandoned)
+			}
+			if recovered.HasMore {
+				logger.Info("startup self-publication recovery has more work")
+				startupPublicationBlocked = true
+			}
+		}
+	}
+	startupRepairBlocked := startupPublicationBlocked
+	if !startupPublicationBlocked && branchRef != "" && headOID != "" {
+		recoverable, recoverErr := state.RecoverableIntentRepairs(
+			ctx, opts.DB, intentRepairBackupCap)
+		if recoverErr != nil {
+			logger.Warn("inspect recoverable intent repairs at startup",
+				"err", recoverErr.Error())
+			startupRepairBlocked = true
+		} else if len(recoverable) > 0 {
+			recoveryCtx := CaptureContext{
+				BranchRef: branchRef, BranchGeneration: persistedGen,
+				BaseHead: headOID,
+			}
+			recovered, recoverErr := RecoverIntentRepairs(
+				ctx, opts.RepoPath, opts.GitDir, opts.DB, recoveryCtx)
+			if recoverErr != nil {
+				logger.Warn("recover intent repairs before branch transition",
+					"err", recoverErr.Error())
+				startupRepairBlocked = true
+			} else {
+				completed := false
+				for _, repair := range recovered {
+					if repair.Status == state.IntentRepairCompleted {
+						completed = true
+						logger.Info("recovered intent repair at startup",
+							"repair_id", repair.ID, "new_head", repair.NewHead)
+					}
+				}
+				if completed {
+					persistedHead = headOID
+					if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
+						MetaKeyBranchGeneration: strconv.FormatInt(persistedGen, 10),
+						MetaKeyBranchHead:       headOID,
+						MetaKeyBranchToken:      currentToken,
+					}); err != nil {
+						logger.Warn("accept recovered intent repair metadata",
+							"err", err.Error())
+						startupRepairBlocked = true
+					}
+				}
+			}
+		}
+	}
+	branchTransitionBlocked := startupRepairBlocked
 	startupPreviousToken := currentToken
 	startupPreviousGeneration := persistedGen
 	startupTokenChanged := false
@@ -668,7 +988,9 @@ func Run(ctx context.Context, opts Options) error {
 			currentToken = prevToken
 			branchTransitionBlocked = true
 		} else if transition != TokenTransitionUnchanged {
-			if operation, active := gitOperationInProgress(opts.GitDir); active {
+			if startupPublicationBlocked {
+				logger.Info("startup branch transition deferred for ambiguous self-publication")
+			} else if operation, active := gitOperationInProgress(opts.GitDir); active {
 				logger.Info("startup branch transition deferred during git operation",
 					"operation", operation)
 				branchTransitionBlocked = true
@@ -697,7 +1019,7 @@ func Run(ctx context.Context, opts Options) error {
 					"recovery_ref", result.RecoveryRef)
 			}
 			if !branchTransitionBlocked {
-				verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+				verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 				if verifyErr != nil {
 					logger.Warn("verify startup branch token after reconciliation; will retry",
 						"err", verifyErr.Error())
@@ -761,7 +1083,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	if !branchTransitionBlocked {
-		verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn("verify startup branch token before metadata accept; will retry",
 				"err", verifyErr.Error())
@@ -844,8 +1166,10 @@ func Run(ctx context.Context, opts Options) error {
 	if !branchTransitionBlocked && cctx.BranchRef != "" {
 		if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-			clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
-				"detached HEAD reattached before startup acceptance")
+			if startupReattachedFromDetached {
+				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
+					"detached HEAD reattached before startup acceptance")
+			}
 		}
 	}
 	if !branchTransitionBlocked {
@@ -982,6 +1306,7 @@ func Run(ctx context.Context, opts Options) error {
 		lastRollup        = time.Time{}
 		lastRollupUTCDay  = ""
 		stopped           bool
+		replayErrorLogs   replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker
@@ -1097,15 +1422,102 @@ func Run(ctx context.Context, opts Options) error {
 	lastStampedBranchHead := persistedHead
 	var branchTransitionSettleUntil time.Time
 	forceShadowRefresh := startupShadowRefreshRequired
+	pendingSelfPublicationTarget := ""
+
+	adoptSelfPublicationTarget := func(targetOID, observedToken string) error {
+		if targetOID == "" {
+			return fmt.Errorf("daemon: adopt self-publication: empty target OID")
+		}
+		if tokenSHA(observedToken) != targetOID ||
+			tokenBranchRef(observedToken) != cctx.BranchRef {
+			return fmt.Errorf(
+				"daemon: adopt self-publication: observed token %q does not match target %s on %s",
+				observedToken, targetOID, cctx.BranchRef)
+		}
+		nextToken := branchTokenRev(targetOID, cctx.BranchRef)
+		if err := SaveBranchPublicationToken(
+			ctx, opts.DB, cctx.BranchGeneration, targetOID, nextToken); err != nil {
+			return fmt.Errorf("daemon: persist self-publication token: %w", err)
+		}
+
+		// This is one run-loop boundary: no capture, flush, wake, or branch
+		// transition check can run between the durable transaction above and
+		// these in-memory assignments.
+		cctx.BaseHead = targetOID
+		currentToken = nextToken
+		headOID = targetOID
+		lastStampedBranchHead = targetOID
+		pendingSelfPublicationTarget = ""
+		if opts.afterSelfPublicationAdoption != nil {
+			opts.afterSelfPublicationAdoption(
+				cctx, currentToken, headOID, lastStampedBranchHead)
+		}
+		return nil
+	}
+
+	recoverActiveSelfPublications := func() (blocked, hasMore bool) {
+		if cctx.BranchRef == "" {
+			return false, false
+		}
+		recovered, recoverErr := recoverSelfPublicationsPass(recoveryRootCtx, cctx)
+		if recoverErr != nil {
+			logger.Warn("self-publication recovery needs attention",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", recoverErr.Error())
+			return true, false
+		}
+		if recovered.FinalTargetOID == "" {
+			return recovered.HasMore, recovered.HasMore
+		}
+		targetOID := recovered.FinalTargetOID
+		pendingSelfPublicationTarget = targetOID
+		// Recovery proved and locked the literal branch at target through
+		// SQLite completion. Adopt that exact internal boundary first. A
+		// branch move immediately after lock release remains external and is
+		// classified by the token check that follows this closure.
+		if err := adoptSelfPublicationTarget(
+			targetOID, branchTokenRev(targetOID, cctx.BranchRef)); err != nil {
+			logger.Warn("adopt recovered self-publication target",
+				"target", targetOID, "err", err.Error())
+			return true, false
+		}
+		logger.Info("recovered self-publication during run-loop pass",
+			"target", targetOID,
+			"completed", recovered.Completed,
+			"abandoned", recovered.Abandoned)
+		return recovered.HasMore, recovered.HasMore
+	}
 
 	processBranchTokenChange := func(logPrefix string) bool {
 		if opts.beforeBranchTokenCheck != nil {
 			opts.beforeBranchTokenCheck()
 		}
-		newToken, terr := BranchGenerationToken(ctx, opts.RepoPath)
+		newToken, terr := branchGenerationToken(ctx, opts.RepoPath)
 		if terr != nil {
 			logger.Warn(logPrefix+" resolve failed", "err", terr.Error())
-			return false
+			// A completed journal target that has not yet been adopted is an
+			// exact internal transition in progress. Fail closed until HEAD
+			// can be sampled again; otherwise capture/replay would run against
+			// the pre-publication cctx and strand new work on a stale base.
+			return pendingSelfPublicationTarget != ""
+		}
+		if pendingSelfPublicationTarget != "" {
+			if tokenSHA(newToken) == pendingSelfPublicationTarget &&
+				tokenBranchRef(newToken) == cctx.BranchRef {
+				if err := adoptSelfPublicationTarget(
+					pendingSelfPublicationTarget, newToken); err != nil {
+					logger.Warn(logPrefix+" retry self-publication adoption",
+						"target", pendingSelfPublicationTarget,
+						"err", err.Error())
+					return true
+				}
+				return false
+			}
+			// HEAD no longer names the completed journal target. It is now an
+			// unknown transition and must retain the existing reconciliation
+			// and generation-classification path below.
+			pendingSelfPublicationTarget = ""
 		}
 		if SameGeneration(currentToken, newToken) {
 			if forceShadowRefresh && cctx.BranchRef != "" {
@@ -1262,7 +1674,7 @@ func Run(ctx context.Context, opts Options) error {
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
 		}
-		verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn(logPrefix+" verify branch token after reconciliation; will retry",
 				"err", verifyErr.Error())
@@ -1337,7 +1749,7 @@ func Run(ctx context.Context, opts Options) error {
 				rollbackTransition()
 				return false
 			}
-			verifiedToken, verifyErr := BranchGenerationToken(ctx, opts.RepoPath)
+			verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 			if verifyErr != nil {
 				logger.Warn(logPrefix+" verify branch token before metadata accept; will retry",
 					"err", verifyErr.Error())
@@ -1631,9 +2043,19 @@ func Run(ctx context.Context, opts Options) error {
 	wakeAckLogNext := now().Add(time.Minute)
 	var wakeAckCount int
 	var wakeAckLastID int64
+	// A logical flush is acknowledged when its durable queue row is drained,
+	// but its intent batch-wait bypass is consumed only by a replay-eligible
+	// pass. Keep the signal sticky across activation/validation gates and other
+	// skipped passes so configuration convergence cannot silently discard it.
+	logicalFlushPending := false
+
+	// Start setup validation only after startup branch reconciliation has
+	// established the exact branch generation recorded by configure.
+	runtimeBundles.StartValidationWorker(ctx, validationWakeCh)
 
 	for {
 		branchTransitionBlocked = false
+		recoveryFollowup := false
 
 		// 4a/b. Honor ctx + shutdown signal.
 		if err := ctx.Err(); err != nil {
@@ -1646,15 +2068,37 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		// The prior capture/replay pass has fully returned. Converge desired
 		// runtime revisions before any new pass can obtain a lease.
-		if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-			logger.Warn("activate desired runtime config; retaining last-known-good",
-				"err", ai.SanitizePlannerError(err.Error()))
+		if cutoverBlock != "" {
+			retryRoots, retryRootsErr := paths.Resolve()
+			if retryRootsErr == nil {
+				if cutover, retryErr := EnsureIntentV2RuntimeCutover(
+					ctx, opts.DB, opts.RepoPath, retryRoots,
+					os.LookupEnv); retryErr == nil {
+					runtimeRoots = retryRoots
+					if runtimeCredentialStore == nil {
+						store := credentials.NewStore(runtimeRoots)
+						runtimeCredentialStore = &store
+						runtimeBundles.SetCredentialStore(
+							runtimeCredentialStore)
+					}
+					cutoverBlock = ""
+					logger.Info("Intent v2 runtime cutover recovered",
+						"revision_id", cutover.RevisionID,
+						"preset_id", cutover.PresetID)
+				}
+			}
 		}
-		if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
-			logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
-		} else if queued {
+		if cutoverBlock == "" {
 			if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-				logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+				logger.Warn("activate desired runtime config; retaining last-known-good",
+					"err", ai.SanitizePlannerError(err.Error()))
+			}
+			if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
+				logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+			} else if queued {
+				if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+					logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+				}
 			}
 		}
 
@@ -1665,6 +2109,10 @@ func Run(ctx context.Context, opts Options) error {
 		// before the previous tick doesn't double-fire.
 		select {
 		case <-wakeCh:
+		default:
+		}
+		select {
+		case <-validationWakeCh:
 		default:
 		}
 		if fsWakeReader != nil {
@@ -1700,7 +2148,7 @@ func Run(ctx context.Context, opts Options) error {
 				stamp := strconv.FormatFloat(float64(nowTS.UnixNano())/1e9, 'f', -1, 64)
 				// First-observation transition: stamp marker name +
 				// set_at + head_at atomically.
-				_ = state.MetaSetMany(ctx, opts.DB, map[string]string{
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
 					MetaKeyOperationInProgress:      operationName,
 					MetaKeyOperationInProgressSetAt: stamp,
 					MetaKeyOperationInProgressHead:  currentHead,
@@ -1769,22 +2217,35 @@ func Run(ctx context.Context, opts Options) error {
 			})
 		}
 
-		if !operationPaused {
+		if !operationPaused && cctx.BranchRef != "" {
+			if pauseStatus, pauseErr :=
+				daemonPauseState(ctx, opts.GitDir, opts.DB); pauseErr != nil {
+				logger.Warn("read pause state before self-publication recovery",
+					"err", pauseErr.Error())
+				branchTransitionBlocked = true
+			} else if !pauseStatus.Active {
+				branchTransitionBlocked, recoveryFollowup =
+					recoverActiveSelfPublications()
+			}
+		}
+
+		if !operationPaused && !branchTransitionBlocked {
 			if processBranchTokenChange("branch token") {
 				branchTransitionBlocked = true
 			}
 		}
 
-		// 4e. Drain pending flush_requests; each one triggers an immediate
-		// capture+replay cycle. The drain is bounded by flushLimit (default
-		// DefaultFlushLimit = 256) so a bursty enqueue cannot starve the
-		// rest of the Run loop, and the inner loop checks ctx.Err AND
-		// shutdownCh every iteration so SIGTERM during a large drain still
-		// exits within one claim cycle (~tens of ms). Some callers run the
-		// daemon with a non-cancelable ctx (context.Background) and expect
-		// signal delivery via shutdownCh; without the explicit shutdownCh
-		// arm here the worst-case drain (256 rows × ~30ms claim) would burn
-		// roughly 7.5s before the run loop notices the signal.
+		// 4e. Drain pending flush_requests; each bounded batch triggers one
+		// immediate capture+replay cycle. Claiming and completing each row in
+		// separate transactions made a 5000-wake burst exceed the 60-second
+		// acknowledgement contract under -race. DrainFlushRequests atomically
+		// owns and completes the oldest flushLimit rows in one statement while
+		// returning their commands for logical/wake accounting.
+		//
+		// The batch remains capped at DefaultFlushLimit=256, preserving the
+		// run-loop heartbeat/capture/shutdown budget. Check shutdown before and
+		// after the statement so a non-cancelable ctx controlled only by
+		// shutdownCh waits for at most one bounded SQLite operation.
 		flushLimit := opts.FlushLimit
 		if flushLimit <= 0 {
 			flushLimit = DefaultFlushLimit
@@ -1792,41 +2253,41 @@ func Run(ctx context.Context, opts Options) error {
 		flushedTotal := 0
 		flushedLogical := 0
 		flushedWake := 0
-		for {
-			if err := ctx.Err(); err != nil {
-				break
-			}
+		if ctx.Err() == nil {
 			select {
 			case <-shutdownCh:
 				return gracefulWithSweep("signal shutdown")
 			default:
 			}
-			fr, ok, err := state.ClaimNextFlushRequest(ctx, opts.DB)
+			flushed, err := state.DrainFlushRequests(
+				ctx,
+				opts.DB,
+				flushLimit,
+				sql.NullString{String: "flushed", Valid: true},
+			)
 			if err != nil {
-				logger.Warn("claim flush request", "err", err.Error())
-				break
+				logger.Warn("drain flush requests", "err", err.Error())
+			} else {
+				flushedTotal = len(flushed)
+				for _, fr := range flushed {
+					if fr.Command == "flush_logical" {
+						flushedLogical++
+					}
+					if fr.Command == "wake" {
+						flushedWake++
+						wakeAckCount++
+						wakeAckLastID = fr.ID
+					}
+					logger.Debug("flush request acked",
+						"id", fr.ID, "command", fr.Command)
+				}
+				logicalFlushPending = logicalFlushPending || flushedLogical > 0
 			}
-			if !ok {
-				break
-			}
-			flushedTotal++
-			if fr.Command == "flush_logical" {
-				flushedLogical++
-			}
-			if fr.Command == "wake" {
-				flushedWake++
-				wakeAckCount++
-				wakeAckLastID = fr.ID
-			}
-			logger.Debug("flush request acked",
-				"id", fr.ID, "command", fr.Command)
-			if err := state.CompleteFlushRequest(ctx, opts.DB, fr.ID, true,
-				sql.NullString{String: "flushed", Valid: true}); err != nil {
-				logger.Warn("complete flush", "err", err.Error())
-			}
-			if flushedTotal >= flushLimit {
-				break
-			}
+		}
+		select {
+		case <-shutdownCh:
+			return gracefulWithSweep("signal shutdown")
+		default:
 		}
 		if flushedWake > 0 && flushedLogical == 0 {
 			recordTrace(tracer, acdtrace.Event{
@@ -1887,6 +2348,9 @@ func Run(ctx context.Context, opts Options) error {
 		// its own dedicated gate above.
 		runtimeLease := runtimeBundles.Lease()
 		passBundle := runtimeLease.Bundle()
+		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+			"commit.strategy": string(passBundle.CommitStrategy),
+		})
 		passCtx := withRuntimeTelemetry(ctx, passBundle)
 		var (
 			capSum     CaptureSummary
@@ -1949,48 +2413,123 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		var (
-			repSum ReplaySummary
-			repErr error
+			repSum        ReplaySummary
+			repErr        error
+			replayChecked bool
 		)
 		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
+			replayChecked = true
 			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
 			// pending queue cannot starve flush_request claims, heartbeat
 			// refresh, or shutdown observation. ReplaySummary.HasMore is
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
-			repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-				MessageFn:             passBundle.MessageFn,
-				GitDir:                opts.GitDir,
-				Trace:                 tracer,
-				PromptTrace:           promptTracer,
-				Limit:                 DefaultReplayLimit,
-				CommitStrategy:        passBundle.CommitStrategy,
-				IntentWindow:          passBundle.IntentWindow,
-				IntentMinPending:      passBundle.IntentMinPending,
-				IntentSettleWindow:    passBundle.IntentSettleWindow,
-				IntentMaxPendingAge:   passBundle.IntentMaxPendingAge,
-				IntentRecentCommits:   passBundle.IntentRecentCommits,
-				IntentDeferLimit:      passBundle.IntentDeferLimit,
-				IntentRetryLimit:      &passBundle.IntentRetryLimit,
-				IntentPathCoalescing:  &passBundle.IntentPathCoalescing,
-				IntentBypassBatchWait: flushedLogical > 0,
-				IntentPlanner:         passBundle.IntentPlanner,
-				IntentHealth:          passBundle.IntentHealth,
-				IntentPlannerProvider: passBundle.HealthIdentity.Provider,
-				IntentPlannerModel:    passBundle.Model,
-				IntentIncludeDiffs:    passBundle.DiffEgress && ai.ProviderNeedsDiff(passBundle.Provider),
-			})
-			if repErr == nil && repSum.Published > 0 {
-				// Refresh BaseHead to the exact commit replay just wrote.
-				cctx.BaseHead = repSum.BaseHead
-				currentToken = branchTokenRev(cctx.BaseHead, cctx.BranchRef)
-				if err := SaveBranchGeneration(ctx, opts.DB,
-					cctx.BranchGeneration, cctx.BaseHead); err != nil {
-					logger.Warn("persist replay head", "err", err.Error())
+			setupValidation, validationPending, validationErr :=
+				state.DesiredConfigValidation(ctx, opts.DB)
+			if validationErr != nil {
+				repErr = validationErr
+			} else if validationPending &&
+				setupValidation.Status != state.ConfigValidationPassed {
+				repSum = ReplaySummary{
+					Skipped: true,
+					SkippedReason: "configuration_validation_" +
+						setupValidation.Status,
+					BaseHead: cctx.BaseHead,
 				}
-				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchToken, currentToken); err != nil {
-					logger.Warn("persist replay branch token", "err", err.Error())
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+					"config.validation.status": setupValidation.Status,
+					"config.validation.attempt": strconv.Itoa(
+						setupValidation.Attempt),
+				})
+			} else if passBundle.ReplayBlockedReason != "" {
+				repSum = ReplaySummary{
+					Skipped: true, SkippedReason: "intent_v2_needs_attention",
+					BaseHead: cctx.BaseHead,
+				}
+				_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
+					"intent.v2.needs_attention": passBundle.ReplayBlockedReason,
+					metaIntentV2MigrationState:  "needs_attention",
+					"intent.v2.preset_id":       passBundle.PresetID,
+					"intent.v2.preset_version":  strconv.Itoa(passBundle.PresetVersion),
+				})
+			} else {
+				var candidateVerify IntentCandidateVerifier
+				var repairCommitVerify git.IntentRepairCommitVerifier
+				if passBundle.IntentVerificationReady {
+					candidateVerify = runtimeIntentCandidateVerifier(
+						opts.RepoPath, opts.GitDir, cctx.BaseHead,
+						passBundle.RevisionID,
+						passBundle.IntentVerificationCommand)
+					repairCommitVerify = runtimeIntentRepairCommitVerifier(
+						opts.RepoPath, passBundle.RevisionID,
+						passBundle.IntentVerificationCommand)
+				}
+				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+					MessageFn:                 passBundle.MessageFn,
+					GitDir:                    opts.GitDir,
+					Trace:                     tracer,
+					PromptTrace:               promptTracer,
+					Limit:                     DefaultReplayLimit,
+					CommitStrategy:            passBundle.CommitStrategy,
+					IntentWindow:              passBundle.IntentWindow,
+					IntentMinPending:          passBundle.IntentMinPending,
+					IntentSettleWindow:        passBundle.IntentSettleWindow,
+					IntentMaxPendingAge:       passBundle.IntentMaxPendingAge,
+					IntentRecentCommits:       passBundle.IntentRecentCommits,
+					IntentDeferLimit:          passBundle.IntentDeferLimit,
+					IntentRetryLimit:          &passBundle.IntentRetryLimit,
+					IntentPathCoalescing:      &passBundle.IntentPathCoalescing,
+					IntentBypassBatchWait:     logicalFlushPending,
+					IntentPlanner:             passBundle.IntentPlanner,
+					IntentHealth:              passBundle.IntentHealth,
+					IntentPlannerProvider:     passBundle.HealthIdentity.Provider,
+					IntentPlannerModel:        passBundle.Model,
+					IntentIncludeDiffs:        passBundle.IntentIncludeDiffs,
+					IntentPreset:              passBundle.IntentPreset,
+					IntentVerificationMode:    passBundle.IntentVerificationMode,
+					IntentCandidateVerify:     candidateVerify,
+					IntentRepairCommitVerify:  repairCommitVerify,
+					IntentRepairEnabled:       passBundle.IntentRepairEnabled,
+					IntentRepairHorizon:       passBundle.IntentRepairHorizon,
+					IntentRepairMaxCommits:    passBundle.IntentRepairMaxCommits,
+					SelfPublicationCheckpoint: opts.selfPublicationCheckpoint,
+				})
+				if logicalFlushPending && repErr == nil && !repSum.Skipped {
+					logicalFlushPending = false
+				}
+				_ = updateIntentV2EvaluationMeta(
+					ctx, opts.DB, passBundle, repSum, repErr)
+			}
+			if repErr == nil && repSum.SelfPublicationTargetOID != "" {
+				targetOID := repSum.SelfPublicationTargetOID
+				if repSum.BaseHead != targetOID {
+					repErr = fmt.Errorf(
+						"daemon: replay self-publication target %s disagrees with base head %s",
+						targetOID, repSum.BaseHead)
+				} else {
+					pendingSelfPublicationTarget = targetOID
+					observedToken, tokenErr := branchGenerationToken(
+						passCtx, opts.RepoPath)
+					if tokenErr != nil {
+						repErr = fmt.Errorf(
+							"daemon: resolve self-publication target: %w",
+							tokenErr)
+					} else if tokenSHA(observedToken) == targetOID &&
+						tokenBranchRef(observedToken) == cctx.BranchRef {
+						if adoptErr := adoptSelfPublicationTarget(
+							targetOID, observedToken); adoptErr != nil {
+							repErr = adoptErr
+						}
+					} else {
+						// An external writer moved HEAD after the journal
+						// completed. Do not bless that movement as ours; the
+						// next token check must classify it normally.
+						pendingSelfPublicationTarget = ""
+						logger.Info("HEAD moved after self-publication; deferring to transition classifier",
+							"journal_target", targetOID,
+							"observed_token", observedToken)
+					}
 				}
 			}
 		}
@@ -2006,18 +2545,44 @@ func Run(ctx context.Context, opts Options) error {
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", capErr.Error())
 		} else if repErr != nil {
 			consecutiveErrors++
-			logger.Warn("replay error", "n", consecutiveErrors, "err", repErr.Error())
-			_ = state.MetaSet(ctx, opts.DB, "last_replay_error", repErr.Error())
+			clean, repeats, metaErr := recordReplayErrorObservability(
+				ctx, opts.DB, repErr, now())
+			if metaErr != nil {
+				logger.Warn("persist replay error observability",
+					"err", metaErr.Error())
+			}
+			if emit, suppressed := replayErrorLogs.observe(clean, now()); emit {
+				logger.Warn("replay error", "n", repeats, "err", clean,
+					"suppressed", suppressed)
+			}
 		} else {
 			consecutiveErrors = 0
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
+			if replayChecked {
+				previous, repeats, metaErr := clearReplayErrorObservability(
+					ctx, opts.DB)
+				if metaErr != nil {
+					logger.Warn("clear replay error observability",
+						"err", metaErr.Error())
+				} else if previous != "" {
+					_, suppressed := replayErrorLogs.recover()
+					logger.Info("replay recovered", "previous_err", previous,
+						"repeats", repeats, "suppressed", suppressed)
+				} else {
+					replayErrorLogs.recover()
+				}
+			}
 		}
 
 		// A recovered active chain invalidates shadow and needs another pass to
 		// reseed + recapture, just as a bounded replay needs another pass to
 		// drain HasMore. Treat both as work so idle backoff cannot delay
 		// convergence.
-		hadWork := flushedTotal > 0 || capSum.EventsAppended > 0 || replayNeedsImmediateFollowup(repSum)
+		hadWork := recoveryFollowup || flushedTotal > 0 ||
+			capSum.EventsAppended > 0 || replayNeedsImmediateFollowup(repSum)
+		if opts.afterRunLoopWorkDecision != nil {
+			opts.afterRunLoopWorkDecision(hadWork, recoveryFollowup)
+		}
 
 		// Heartbeat refresh — visible to controllers between iterations.
 		heartbeatNow("running", "")
@@ -2121,6 +2686,9 @@ func Run(ctx context.Context, opts Options) error {
 			timer.Stop()
 			return gracefulWithSweep("signal shutdown")
 		case <-wakeCh:
+			timer.Stop()
+			currentDelay = opts.Scheduler.Reset()
+		case <-validationWakeCh:
 			timer.Stop()
 			currentDelay = opts.Scheduler.Reset()
 		case <-fsWakeReader:

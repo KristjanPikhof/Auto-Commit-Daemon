@@ -4,13 +4,15 @@
 asks the same intent planner family to improve commit messages, saves a plan,
 lets you review or edit that plan, and applies it only when you say yes.
 
-The daemon never rewrites commits automatically.
+This command never runs automatically. Intent Balanced and Quality have a
+separate bounded repair path for recent private ACD-owned commits when a late
+capture completes a soft-published candidate.
 
 ## Boundaries
 
 | Rule | Meaning |
 |---|---|
-| Plan generation needs working intent mode | Set `ACD_COMMIT_STRATEGY=intent` and a non-deterministic provider. |
+| Plan generation needs working intent mode | Effective repository settings must select Intent and a non-deterministic provider. |
 | Saved plan show/edit/apply does not need the provider | No new AI call is made. |
 | v1 rewrites linear ranges on the current branch | Merge commit rewrites are refused. |
 | Apply is message-only | File contents stay the same. |

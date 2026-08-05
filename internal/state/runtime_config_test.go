@@ -243,8 +243,8 @@ PRAGMA user_version=13;`)
 		t.Fatalf("Open migrated v13: %v", err)
 	}
 	defer d.Close()
-	if got, _ := d.UserVersion(context.Background()); got != 14 {
-		t.Fatalf("user_version=%d", got)
+	if got, _ := d.UserVersion(context.Background()); got != SchemaVersion {
+		t.Fatalf("user_version=%d want=%d", got, SchemaVersion)
 	}
 	var reason string
 	if err := d.SQL().QueryRow(`SELECT reason FROM decision_records WHERE id=1`).Scan(&reason); err != nil || reason != "keep" {
@@ -254,7 +254,7 @@ PRAGMA user_version=13;`)
 	if err := d.SQL().QueryRow(`SELECT events_total FROM daily_rollups WHERE day='2026-07-13'`).Scan(&events); err != nil || events != 9 {
 		t.Fatalf("daily rollup preserved=%d err=%v", events, err)
 	}
-	for _, table := range []string{"config_revisions", "runtime_config_state", "config_activation_requests", "config_experiments"} {
+	for _, table := range []string{"config_revisions", "runtime_config_state", "config_activation_requests", "config_validation_runs", "config_experiments"} {
 		var found string
 		if err := d.SQL().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil {
 			t.Fatalf("v14 table %s: %v", table, err)

@@ -48,20 +48,23 @@ type ExperimentOptions struct {
 }
 
 type Snapshot struct {
-	Fields          []FieldValue
-	ActiveRevision  int64
-	DesiredRevision int64
-	AppliedRevision int64
-	LastKnownGood   int64
-	PendingSince    time.Time
-	PendingError    string
-	PendingStatus   string
-	DaemonRunning   bool
-	Experiment      Experiment
-	SavedGeneration uint64
-	Profile         string
-	Comparison      string
-	Profiles        []string
+	Fields           []FieldValue
+	PresetID         string
+	PresetVersion    int
+	PresetCustomized bool
+	ActiveRevision   int64
+	DesiredRevision  int64
+	AppliedRevision  int64
+	LastKnownGood    int64
+	PendingSince     time.Time
+	PendingError     string
+	PendingStatus    string
+	DaemonRunning    bool
+	Experiment       Experiment
+	SavedGeneration  uint64
+	Profile          string
+	Comparison       string
+	Profiles         []string
 }
 
 type FieldValue struct {
