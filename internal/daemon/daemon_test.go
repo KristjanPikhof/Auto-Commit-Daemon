@@ -474,6 +474,24 @@ func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
 	}
 	wakeCh := make(chan struct{}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
+	passDone := make(chan struct{}, 1)
+	passRelease := make(chan struct{})
+	waitForPass := func(label string) {
+		t.Helper()
+		select {
+		case <-passDone:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s pass", label)
+		}
+	}
+	releasePass := func(label string) {
+		t.Helper()
+		select {
+		case passRelease <- struct{}{}:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out releasing %s pass", label)
+		}
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -488,6 +506,17 @@ func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
 			) (ai.Provider, io.Closer, error) {
 				return &runtimeTestProvider{name: cfg.Mode}, nil, nil
 			},
+			afterRunLoopWorkDecision: func(_, _ bool) {
+				select {
+				case passDone <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				select {
+				case <-passRelease:
+				case <-ctx.Done():
+				}
+			},
 		})
 	}()
 	t.Cleanup(func() {
@@ -495,13 +524,15 @@ func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
 		wg.Wait()
 	})
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	waitForPass("startup cutover failure")
 	if err := os.WriteFile(filepath.Join(f.dir, "cutover-error.txt"),
 		[]byte("captured\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	wakeCh <- struct{}{}
+	releasePass("capture")
+	waitForPass("capture")
 	waitForCaptureEventCount(t, f.db, 1, 3*time.Second)
-	time.Sleep(100 * time.Millisecond)
 	head, err := git.RevParse(context.Background(), f.dir, "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -527,22 +558,70 @@ func TestRun_IntentV2CutoverFailureRecoversAfterConfigure(t *testing.T) {
 		t.Fatalf("request configured revision: activated=%v err=%v",
 			activated, err)
 	}
+	flushID, err := state.EnqueueFlushRequest(context.Background(), f.db,
+		"flush_logical", true,
+		sql.NullString{String: "test-session", Valid: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force one complete pass while configuration storage is still unusable.
+	// The pass must acknowledge the only logical flush without consuming its
+	// batch-wait bypass through the blocked replay path.
+	wakeCh <- struct{}{}
+	releasePass("blocked logical flush")
+	waitForPass("blocked logical flush")
+	var flushStatus string
+	if err := f.db.SQL().QueryRow(
+		`SELECT status FROM flush_requests WHERE id=?`, flushID,
+	).Scan(&flushStatus); err != nil {
+		t.Fatal(err)
+	}
+	if flushStatus != "completed" {
+		t.Fatalf("logical flush status=%q want completed before activation", flushStatus)
+	}
+	var logicalFlushes int
+	if err := f.db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM flush_requests WHERE command='flush_logical'`,
+	).Scan(&logicalFlushes); err != nil {
+		t.Fatal(err)
+	}
+	if logicalFlushes != 1 {
+		t.Fatalf("logical flush rows=%d want exactly 1", logicalFlushes)
+	}
+	head, err = git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != startHead {
+		t.Fatalf("blocked logical flush advanced HEAD: %s -> %s", startHead, head)
+	}
+
+	// Make configuration usable only after the flush row is completed, then
+	// drive a pass with a plain wake. The retained bypass must publish without
+	// enqueueing a second logical flush.
 	if err := os.Remove(configPath); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(configPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.EnqueueFlushRequest(context.Background(), f.db,
-		"flush_logical", true,
-		sql.NullString{String: "test-session", Valid: true},
-	); err != nil {
-		t.Fatal(err)
-	}
 	wakeCh <- struct{}{}
+	releasePass("configuration recovery")
 	newHead := waitForCommit(t, f.dir, startHead, 5*time.Second)
 	if newHead == startHead {
 		t.Fatal("configured v2 revision did not resume replay")
+	}
+	waitForPass("configuration recovery")
+	t.Logf("retained logical flush advanced HEAD after activation: %s -> %s",
+		startHead, newHead)
+	if err := f.db.SQL().QueryRow(
+		`SELECT COUNT(*) FROM flush_requests WHERE command='flush_logical'`,
+	).Scan(&logicalFlushes); err != nil {
+		t.Fatal(err)
+	}
+	if logicalFlushes != 1 {
+		t.Fatalf("logical flush rows after replay=%d want exactly 1", logicalFlushes)
 	}
 	waitForMetaValue(t, f.db, metaIntentV2MigrationState,
 		"active", 2*time.Second)

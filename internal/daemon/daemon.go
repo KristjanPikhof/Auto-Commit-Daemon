@@ -2043,6 +2043,11 @@ func Run(ctx context.Context, opts Options) error {
 	wakeAckLogNext := now().Add(time.Minute)
 	var wakeAckCount int
 	var wakeAckLastID int64
+	// A logical flush is acknowledged when its durable queue row is drained,
+	// but its intent batch-wait bypass is consumed only by a replay-eligible
+	// pass. Keep the signal sticky across activation/validation gates and other
+	// skipped passes so configuration convergence cannot silently discard it.
+	logicalFlushPending := false
 
 	// Start setup validation only after startup branch reconciliation has
 	// established the exact branch generation recorded by configure.
@@ -2276,6 +2281,7 @@ func Run(ctx context.Context, opts Options) error {
 					logger.Debug("flush request acked",
 						"id", fr.ID, "command", fr.Command)
 				}
+				logicalFlushPending = logicalFlushPending || flushedLogical > 0
 			}
 		}
 		select {
@@ -2474,7 +2480,7 @@ func Run(ctx context.Context, opts Options) error {
 					IntentDeferLimit:          passBundle.IntentDeferLimit,
 					IntentRetryLimit:          &passBundle.IntentRetryLimit,
 					IntentPathCoalescing:      &passBundle.IntentPathCoalescing,
-					IntentBypassBatchWait:     flushedLogical > 0,
+					IntentBypassBatchWait:     logicalFlushPending,
 					IntentPlanner:             passBundle.IntentPlanner,
 					IntentHealth:              passBundle.IntentHealth,
 					IntentPlannerProvider:     passBundle.HealthIdentity.Provider,
@@ -2489,6 +2495,9 @@ func Run(ctx context.Context, opts Options) error {
 					IntentRepairMaxCommits:    passBundle.IntentRepairMaxCommits,
 					SelfPublicationCheckpoint: opts.selfPublicationCheckpoint,
 				})
+				if logicalFlushPending && repErr == nil && !repSum.Skipped {
+					logicalFlushPending = false
+				}
 				_ = updateIntentV2EvaluationMeta(
 					ctx, opts.DB, passBundle, repSum, repErr)
 			}

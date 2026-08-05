@@ -174,6 +174,11 @@ and Pi retain their logical flush boundaries. A soft or hard boundary triggers
 evaluation, but it cannot bypass atomicity, verification, pause, Git operation,
 branch generation, conflict, or other replay safety checks.
 
+After the daemon acknowledges a logical flush, it retains that evaluation
+request across temporary configuration-validation blocks and replay errors.
+The first successful replay-eligible pass consumes it; no second flush is
+required after configuration becomes ready.
+
 Plain `acd wake` only nudges the daemon. It does not create an activity boundary.
 
 ## Repair a recent private commit
