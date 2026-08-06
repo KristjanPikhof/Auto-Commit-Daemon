@@ -212,6 +212,25 @@ WHERE state = ?`, EventStatePending).Scan(&summary.Count, &summary.OldestSeq); e
 }
 
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
+	return pendingEvents(ctx, d, limit, false)
+}
+
+// PublishableEvents returns only pending capture rows owned by a completed
+// checkpoint. Protection may append rows before private-ref completion, but
+// publication must never observe that cross-store prepared window.
+func PublishableEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
+	return pendingEvents(ctx, d, limit, true)
+}
+
+func pendingEvents(ctx context.Context, d *DB, limit int, checkpointOnly bool) ([]CaptureEvent, error) {
+	checkpointJoin := ""
+	checkpointWhere := ""
+	if checkpointOnly {
+		checkpointJoin = `
+JOIN checkpoint_events ce ON ce.event_seq = e.seq
+JOIN checkpoints cp ON cp.id = ce.checkpoint_id`
+		checkpointWhere = "\n  AND cp.phase = 'completed'"
+	}
 	q := `
 WITH barriers AS (
     SELECT branch_ref, branch_generation, MIN(seq) AS first_seq
@@ -222,10 +241,11 @@ WITH barriers AS (
 SELECT e.seq, e.branch_ref, e.branch_generation, e.base_head, e.operation, e.path, e.old_path,
        e.fidelity, e.captured_ts, e.published_ts, e.state, e.commit_oid, e.error, e.message
 FROM capture_events e
+` + checkpointJoin + `
 LEFT JOIN barriers b
        ON b.branch_ref = e.branch_ref
       AND b.branch_generation = e.branch_generation
-WHERE e.state = 'pending'
+WHERE e.state = 'pending'` + checkpointWhere + `
   AND (b.first_seq IS NULL OR e.seq < b.first_seq)
 ORDER BY e.seq ASC`
 	args := []any{}

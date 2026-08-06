@@ -19,7 +19,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
@@ -94,6 +97,14 @@ const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
 // --json` so operators can detect silent loss without scraping logs.
 const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
 
+const (
+	MetaKeyProtectionObservationEpoch = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch     = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID     = "protection.checkpoint_id"
+	MetaKeyProtectionComplete         = "protection.complete"
+	MetaKeyProtectionTreeDigest       = "protection.tree_digest"
+)
+
 // CaptureBackpressureClearRatio is the high-water fraction of
 // ACD_MAX_PENDING_EVENTS at which capture lifts the durable backpressure
 // pause. Pending must drop strictly below cap*ratio before
@@ -148,6 +159,12 @@ type CaptureSummary struct {
 	// EventsDroppedTotal mirrors daemon_meta.capture.events_dropped_total
 	// after this pass. 0 when the cumulative counter has never advanced.
 	EventsDroppedTotal int64
+	// CheckpointID is populated only after the full live tree and all newly
+	// appended event membership are reachable through a completed private ref.
+	CheckpointID string
+	// Protected means this complete scan covers ObservationEpoch. An unchanged
+	// tree may reuse the prior checkpoint while still advancing covered_epoch.
+	Protected bool
 }
 
 // CaptureContext carries the per-pass repository identity that the legacy
@@ -176,6 +193,13 @@ type CaptureOpts struct {
 	// ACD skips internally even when they are not gitignored. Nil falls
 	// back to a fresh matcher per pass.
 	SafeIgnoreMatcher *state.SafeIgnoreMatcher
+	// CheckpointStore enables the v20 protection plane. When present, capture
+	// never applies the legacy pending-event drop gate and does not report a
+	// successful pass until the full eligible tree is durably protected.
+	CheckpointStore  *checkpoint.Store
+	WorktreeID       string
+	ObservationEpoch int64
+	CheckpointReason string
 	// SubmodulePaths is the set of repo-relative paths that are submodules
 	// (mode 160000 in HEAD's tree). Capture must not descend into them.
 	SubmodulePaths map[string]bool
@@ -513,6 +537,11 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	// CaptureBackpressureClearRatio*cap, or the operator explicitly
 	// accepts the loss via `acd resume --accept-overflow`.
 	pendingCap := resolveCaptureMaxPending(opts)
+	if opts.CheckpointStore != nil {
+		// v20 protection is never capped or dropped. The compatibility knob is
+		// consumed later by publication-window scheduling only.
+		pendingCap = 0
+	}
 	var summary CaptureSummary
 	pending := -1
 	if pendingCap > 0 {
@@ -674,6 +703,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		submodules:    opts.SubmodulePaths,
 		maxBytes:      maxBytes,
 		db:            db,
+		durable:       opts.CheckpointStore != nil,
 	})
 	if err != nil {
 		// walkLive populates Errors/Oversize/WalkedFiles in its own summary;
@@ -729,6 +759,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	// child. Atomic-per-file commits (§8.3) means one event = one op. We do
 	// NOT batch multiple ops into a single event in v1 — keeping the schema
 	// flexible is fine, but the replay invariant is "1 commit per event".
+	checkpointEventSeqs := make([]int64, 0, len(ops))
 	for _, op := range ops {
 		if err := ctx.Err(); err != nil {
 			return summary, err
@@ -828,6 +859,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			}
 		}
 		summary.EventsAppended++
+		checkpointEventSeqs = append(checkpointEventSeqs, seq)
 		if pendingCap > 0 {
 			pending++
 		}
@@ -876,7 +908,193 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		summary.EventsDroppedTotal = total
 	}
 
+	if opts.CheckpointStore != nil {
+		if err := completeProtectionCheckpoint(ctx, repoRoot, db, cctx, opts,
+			live, protectedSkips, checkpointEventSeqs, &summary); err != nil {
+			_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+			return summary, err
+		}
+	}
+
 	return summary, nil
+}
+
+// ProtectWorktree runs the universal safety path without classifying or
+// publishing capture events. Workers use it while Git state is unsafe for
+// publication (detached HEAD, conflicts, active operations, branch settle,
+// or a manual publication pause). It leaves shadow state untouched so the
+// next safe Capture pass can derive publication events normally.
+func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts CaptureOpts) (CaptureSummary, error) {
+	if repoRoot == "" || db == nil || opts.CheckpointStore == nil {
+		return CaptureSummary{}, errors.New("daemon: ProtectWorktree requires repo, db, and checkpoint store")
+	}
+	matcher := opts.SensitiveMatcher
+	if matcher == nil {
+		matcher = state.NewSensitiveMatcher()
+	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
+	live, protected, summary, err := walkLive(ctx, repoRoot, walkOpts{
+		matcher:       matcher,
+		safeIgnore:    safeIgnore,
+		ignoreChecker: opts.IgnoreChecker,
+		submodules:    opts.SubmodulePaths,
+		maxBytes:      resolveMaxFileBytes(opts.MaxFileBytes),
+		db:            db,
+		durable:       true,
+	})
+	if err != nil {
+		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+		return summary, err
+	}
+	if err := completeProtectionCheckpoint(ctx, repoRoot, db, cctx, opts,
+		live, protected, nil, &summary); err != nil {
+		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+		return summary, err
+	}
+	return summary, nil
+}
+
+func completeProtectionCheckpoint(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	cctx CaptureContext,
+	opts CaptureOpts,
+	live map[string]LiveEntry,
+	protectedSkips map[string]skippedPresent,
+	eventSeqs []int64,
+	summary *CaptureSummary,
+) error {
+	epoch := opts.ObservationEpoch
+	if epoch <= 0 {
+		epoch = nextProtectionObservationEpoch(ctx, db)
+	}
+	if err := state.MetaSet(ctx, db, MetaKeyProtectionObservationEpoch,
+		strconv.FormatInt(epoch, 10)); err != nil {
+		return fmt.Errorf("daemon: persist protection observation epoch: %w", err)
+	}
+	if summary.Errors > 0 || summary.Oversize > 0 {
+		return fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)",
+			summary.Errors, summary.Oversize)
+	}
+
+	entries, liveDigest := checkpointEntries(live)
+	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
+	if err != nil {
+		return fmt.Errorf("daemon: read checkpoint projection: %w", err)
+	}
+	priorDigest, digestOK, digestErr := state.MetaGet(ctx, db, MetaKeyProtectionTreeDigest)
+	if digestErr != nil {
+		return fmt.Errorf("daemon: read protection tree digest: %w", digestErr)
+	}
+	if len(eventSeqs) == 0 && projection.Latest != nil &&
+		projection.Latest.Phase == state.CheckpointCompleted &&
+		digestOK && priorDigest == liveDigest {
+		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
+			return err
+		}
+		summary.CheckpointID = projection.Latest.ID
+		summary.Protected = true
+		return nil
+	}
+
+	exclusions := checkpointExclusions(protectedSkips)
+	reason := opts.CheckpointReason
+	if reason == "" {
+		reason = state.CheckpointReasonPoll
+	}
+	worktreeID := opts.WorktreeID
+	if worktreeID == "" {
+		worktreeID = checkpoint.WorktreeID(repoRoot)
+	}
+	result, err := opts.CheckpointStore.Create(ctx, checkpoint.Request{
+		RepoRoot:         repoRoot,
+		WorktreeID:       worktreeID,
+		Reason:           reason,
+		ObservationEpoch: epoch,
+		CoverageEpoch:    epoch,
+		ObservedHead:     cctx.BaseHead,
+		ObservedRef:      cctx.BranchRef,
+		Entries:          entries,
+		EventSeqs:        eventSeqs,
+		Exclusions:       exclusions,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: complete protection checkpoint: %w", err)
+	}
+	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
+		return err
+	}
+	summary.CheckpointID = result.Checkpoint.ID
+	summary.Protected = true
+	return nil
+}
+
+func nextProtectionObservationEpoch(ctx context.Context, db *state.DB) int64 {
+	if raw, ok, err := state.MetaGet(ctx, db, MetaKeyProtectionObservationEpoch); err == nil && ok {
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch >= 0 {
+			return epoch + 1
+		}
+	}
+	return 1
+}
+
+func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{MetaKeyProtectionCoveredEpoch, strconv.FormatInt(epoch, 10)},
+		{MetaKeyProtectionCheckpointID, checkpointID},
+		{MetaKeyProtectionTreeDigest, liveDigest},
+		{MetaKeyProtectionComplete, "true"},
+	}
+	for _, value := range values {
+		if err := state.MetaSet(ctx, db, value.key, value.value); err != nil {
+			return fmt.Errorf("daemon: persist %s: %w", value.key, err)
+		}
+	}
+	return nil
+}
+
+func checkpointEntries(live map[string]LiveEntry) ([]checkpoint.Entry, string) {
+	entries := make([]checkpoint.Entry, 0, len(live))
+	for _, entry := range live {
+		entries = append(entries, checkpoint.Entry{Path: entry.Path, Mode: entry.Mode, OID: entry.OID})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	hash := sha256.New()
+	for _, entry := range entries {
+		hash.Write([]byte(entry.Path))
+		hash.Write([]byte{0})
+		hash.Write([]byte(entry.Mode))
+		hash.Write([]byte{0})
+		hash.Write([]byte(entry.OID))
+		hash.Write([]byte{0})
+	}
+	return entries, "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func checkpointExclusions(protectedSkips map[string]skippedPresent) []state.CheckpointExclusion {
+	counts := make(map[string]int64)
+	for _, skipped := range protectedSkips {
+		if skipped.Reason != "" {
+			counts[skipped.Reason]++
+		}
+	}
+	categories := make([]string, 0, len(counts))
+	for category := range counts {
+		categories = append(categories, category)
+	}
+	sort.Strings(categories)
+	exclusions := make([]state.CheckpointExclusion, 0, len(categories))
+	for _, category := range categories {
+		exclusions = append(exclusions, state.CheckpointExclusion{Category: category, Count: counts[category]})
+	}
+	return exclusions
 }
 
 func protectSafeIgnoreDeleteOps(ctx context.Context, db *state.DB, cctx CaptureContext, safeIgnore *state.SafeIgnoreMatcher, ops []ClassifiedOp) ([]ClassifiedOp, int, error) {
@@ -1070,6 +1288,7 @@ type walkOpts struct {
 	submodules    map[string]bool
 	maxBytes      int64
 	db            *state.DB
+	durable       bool
 }
 
 type skippedPresent struct {
@@ -1376,7 +1595,13 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		if rerr != nil {
 			return LiveEntry{}, false, "", rerr
 		}
-		oid, _, herr := git.HashSymlinkBlob(ctx, repoRoot, target)
+		var oid string
+		var herr error
+		if opts.durable {
+			oid, herr = git.HashObjectStdinDurable(ctx, repoRoot, []byte(target))
+		} else {
+			oid, _, herr = git.HashSymlinkBlob(ctx, repoRoot, target)
+		}
 		if herr != nil {
 			return LiveEntry{}, false, "", herr
 		}
@@ -1416,7 +1641,13 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
 		return LiveEntry{}, false, "oversize", nil
 	}
-	oid, herr := git.HashObjectStdin(ctx, repoRoot, buf)
+	var oid string
+	var herr error
+	if opts.durable {
+		oid, herr = git.HashObjectStdinDurable(ctx, repoRoot, buf)
+	} else {
+		oid, herr = git.HashObjectStdin(ctx, repoRoot, buf)
+	}
 	if herr != nil {
 		return LiveEntry{}, false, "", herr
 	}

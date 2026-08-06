@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -1592,6 +1593,64 @@ func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
 	}
 	if sum.EventsAppended < 12 {
 		t.Fatalf("EventsAppended=%d, want >=12 with DisablePendingCap=true; summary=%+v", sum.EventsAppended, sum)
+	}
+}
+
+func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "1")
+	f := newCaptureFixture(t)
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := checkpointpkg.Store{DB: f.db}
+	summary, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		CheckpointStore:  &store,
+		WorktreeID:       checkpointpkg.WorktreeID(f.dir),
+		ObservationEpoch: 11,
+		CheckpointReason: state.CheckpointReasonPoll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Protected || summary.CheckpointID == "" {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if summary.EventsDropped != 0 || summary.BackpressurePaused {
+		t.Fatalf("checkpoint capture applied publication cap: %+v", summary)
+	}
+	projection, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Completed != 1 || projection.Prepared != 0 || projection.Latest == nil {
+		t.Fatalf("projection=%+v", projection)
+	}
+	publishable, err := state.PublishableEvents(context.Background(), f.db, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publishable) != summary.EventsAppended || len(publishable) < 3 {
+		t.Fatalf("publishable=%d appended=%d", len(publishable), summary.EventsAppended)
+	}
+	entries, err := git.LsTree(context.Background(), f.dir,
+		projection.Latest.CommitOID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"one.txt": false, "two.txt": false, "three.txt": false}
+	for _, entry := range entries {
+		if _, ok := want[entry.Path]; ok {
+			want[entry.Path] = true
+		}
+	}
+	for path, found := range want {
+		if !found {
+			t.Fatalf("checkpoint tree missing %s: %+v", path, entries)
+		}
 	}
 }
 

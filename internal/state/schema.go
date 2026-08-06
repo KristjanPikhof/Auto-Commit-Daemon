@@ -713,6 +713,24 @@ CREATE TABLE IF NOT EXISTS checkpoint_publications(
 CREATE INDEX IF NOT EXISTS idx_checkpoint_publications_commit
     ON checkpoint_publications(commit_oid, checkpoint_id);
 
+CREATE TRIGGER IF NOT EXISTS checkpoint_publications_track_event
+AFTER UPDATE OF state, commit_oid, published_ts ON capture_events
+WHEN NEW.state = 'published'
+ AND NEW.commit_oid IS NOT NULL
+ AND EXISTS (SELECT 1 FROM checkpoint_events WHERE event_seq = NEW.seq)
+BEGIN
+    INSERT INTO checkpoint_publications(
+        checkpoint_id, event_seq, commit_oid, published_ts
+    )
+    SELECT checkpoint_id, NEW.seq, NEW.commit_oid,
+           COALESCE(NEW.published_ts, CAST(strftime('%s','now') AS REAL))
+    FROM checkpoint_events
+    WHERE event_seq = NEW.seq
+    ON CONFLICT(checkpoint_id, event_seq) DO UPDATE SET
+        commit_oid = excluded.commit_oid,
+        published_ts = excluded.published_ts;
+END;
+
 CREATE TABLE IF NOT EXISTS restore_operations(
     operation_id        TEXT PRIMARY KEY,
     target_checkpoint_id TEXT NOT NULL,

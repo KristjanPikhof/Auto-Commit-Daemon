@@ -26,6 +26,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -708,6 +709,10 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	heartbeatNow("running", "daemon started")
+	checkpointStore := checkpointpkg.Store{DB: opts.DB}
+	if err := checkpointStore.RecoverPrepared(ctx, opts.RepoPath); err != nil {
+		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
+	}
 	var shutdownCh <-chan struct{}
 	recoveryRootCtx := ctx
 	recoverSelfPublicationsPass := func(
@@ -2409,6 +2414,9 @@ func Run(ctx context.Context, opts Options) error {
 				Trace:             tracer,
 				GitDir:            opts.GitDir,
 				SkipPauseCheck:    true,
+				CheckpointStore:   &checkpointStore,
+				WorktreeID:        checkpointpkg.WorktreeID(opts.RepoPath),
+				CheckpointReason:  state.CheckpointReasonPoll,
 			})
 		}
 
@@ -2466,34 +2474,35 @@ func Run(ctx context.Context, opts Options) error {
 						passBundle.IntentVerificationCommand)
 				}
 				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-					MessageFn:                 passBundle.MessageFn,
-					GitDir:                    opts.GitDir,
-					Trace:                     tracer,
-					PromptTrace:               promptTracer,
-					Limit:                     DefaultReplayLimit,
-					CommitStrategy:            passBundle.CommitStrategy,
-					IntentWindow:              passBundle.IntentWindow,
-					IntentMinPending:          passBundle.IntentMinPending,
-					IntentSettleWindow:        passBundle.IntentSettleWindow,
-					IntentMaxPendingAge:       passBundle.IntentMaxPendingAge,
-					IntentRecentCommits:       passBundle.IntentRecentCommits,
-					IntentDeferLimit:          passBundle.IntentDeferLimit,
-					IntentRetryLimit:          &passBundle.IntentRetryLimit,
-					IntentPathCoalescing:      &passBundle.IntentPathCoalescing,
-					IntentBypassBatchWait:     logicalFlushPending,
-					IntentPlanner:             passBundle.IntentPlanner,
-					IntentHealth:              passBundle.IntentHealth,
-					IntentPlannerProvider:     passBundle.HealthIdentity.Provider,
-					IntentPlannerModel:        passBundle.Model,
-					IntentIncludeDiffs:        passBundle.IntentIncludeDiffs,
-					IntentPreset:              passBundle.IntentPreset,
-					IntentVerificationMode:    passBundle.IntentVerificationMode,
-					IntentCandidateVerify:     candidateVerify,
-					IntentRepairCommitVerify:  repairCommitVerify,
-					IntentRepairEnabled:       passBundle.IntentRepairEnabled,
-					IntentRepairHorizon:       passBundle.IntentRepairHorizon,
-					IntentRepairMaxCommits:    passBundle.IntentRepairMaxCommits,
-					SelfPublicationCheckpoint: opts.selfPublicationCheckpoint,
+					MessageFn:                  passBundle.MessageFn,
+					GitDir:                     opts.GitDir,
+					Trace:                      tracer,
+					PromptTrace:                promptTracer,
+					Limit:                      DefaultReplayLimit,
+					CommitStrategy:             passBundle.CommitStrategy,
+					IntentWindow:               passBundle.IntentWindow,
+					IntentMinPending:           passBundle.IntentMinPending,
+					IntentSettleWindow:         passBundle.IntentSettleWindow,
+					IntentMaxPendingAge:        passBundle.IntentMaxPendingAge,
+					IntentRecentCommits:        passBundle.IntentRecentCommits,
+					IntentDeferLimit:           passBundle.IntentDeferLimit,
+					IntentRetryLimit:           &passBundle.IntentRetryLimit,
+					IntentPathCoalescing:       &passBundle.IntentPathCoalescing,
+					IntentBypassBatchWait:      logicalFlushPending,
+					IntentPlanner:              passBundle.IntentPlanner,
+					IntentHealth:               passBundle.IntentHealth,
+					IntentPlannerProvider:      passBundle.HealthIdentity.Provider,
+					IntentPlannerModel:         passBundle.Model,
+					IntentIncludeDiffs:         passBundle.IntentIncludeDiffs,
+					IntentPreset:               passBundle.IntentPreset,
+					IntentVerificationMode:     passBundle.IntentVerificationMode,
+					IntentCandidateVerify:      candidateVerify,
+					IntentRepairCommitVerify:   repairCommitVerify,
+					IntentRepairEnabled:        passBundle.IntentRepairEnabled,
+					IntentRepairHorizon:        passBundle.IntentRepairHorizon,
+					IntentRepairMaxCommits:     passBundle.IntentRepairMaxCommits,
+					SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
+					RequireCompletedCheckpoint: true,
 				})
 				if logicalFlushPending && repErr == nil && !repSum.Skipped {
 					logicalFlushPending = false
