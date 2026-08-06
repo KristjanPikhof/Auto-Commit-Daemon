@@ -75,13 +75,9 @@ func RecoverSelfPublications(
 		return summary, err
 	}
 
-	limit := opts.Limit
-	if limit <= 0 || limit > selfPublicationRecoveryLimit {
-		limit = selfPublicationRecoveryLimit
-	}
 	publications, hasMore, err := recoverableSelfPublicationsForPair(
 		ctx, db, cctx.BranchRef, cctx.BranchGeneration,
-		limit)
+		opts.Limit)
 	if err != nil {
 		return summary, fmt.Errorf(
 			"daemon: load recoverable self-publications: %w", err)
