@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-08-07
+
 ### Fixed
 
 - Fixed settings authoring and previews resolving repository, profile, and
