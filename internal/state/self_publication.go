@@ -273,10 +273,10 @@ func CompleteSelfPublication(
 	if completion.CandidateStatus == IntentCandidatePublished {
 		completion.SoftPublicationDeadline = sql.NullFloat64{}
 	}
-	if completion.BranchToken == "" {
-		completion.BranchToken = "rev:" + normalized.TargetCommitOID + " " + normalized.BranchRef
-	}
 	canonicalBranchToken := "rev:" + normalized.TargetCommitOID + " " + normalized.BranchRef
+	if completion.BranchToken == "" {
+		completion.BranchToken = canonicalBranchToken
+	}
 	if completion.BranchToken != canonicalBranchToken {
 		return false, errors.New("state: self-publication branch token does not match identity")
 	}
@@ -494,8 +494,7 @@ func SelfPublicationAttentionBlocker(
 	if err != nil || !ok {
 		return blockerID, SelfPublication{}, false, err
 	}
-	recoverable = publication.Phase == SelfPublicationPrepared ||
-		publication.Phase == SelfPublicationGitApplied
+	recoverable = selfPublicationPhaseRecoverable(publication.Phase)
 	return blockerID, publication, recoverable, nil
 }
 
@@ -712,8 +711,7 @@ SELECT phase, COUNT(*) FROM self_publications GROUP BY phase`)
 		if blockerErr != nil {
 			return SelfPublicationReadOnlyProjection{}, blockerErr
 		}
-		if ok && (blocker.Phase == SelfPublicationPrepared ||
-			blocker.Phase == SelfPublicationGitApplied) {
+		if ok && selfPublicationPhaseRecoverable(blocker.Phase) {
 			projection.AttentionBlockerID = persistedBlocker
 			projection.NeedsAttention = persistedAttention
 		}
@@ -730,6 +728,10 @@ SELECT phase, COUNT(*) FROM self_publications GROUP BY phase`)
 		}
 	}
 	return projection, nil
+}
+
+func selfPublicationPhaseRecoverable(phase string) bool {
+	return phase == SelfPublicationPrepared || phase == SelfPublicationGitApplied
 }
 
 func transitionSelfPublication(
