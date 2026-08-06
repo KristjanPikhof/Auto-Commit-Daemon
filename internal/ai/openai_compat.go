@@ -818,6 +818,72 @@ func truncateForError(s string) string {
 	return s
 }
 
+type openAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type openAIFunctionDeclaration struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type openAITool struct {
+	Type     string                    `json:"type"`
+	Function openAIFunctionDeclaration `json:"function"`
+}
+
+type openAIFunctionChoice struct {
+	Name string `json:"name"`
+}
+
+type openAIToolChoice struct {
+	Type     string               `json:"type"`
+	Function openAIFunctionChoice `json:"function"`
+}
+
+type openAIToolRequest struct {
+	Model       string           `json:"model"`
+	Messages    []openAIMessage  `json:"messages"`
+	Tools       []openAITool     `json:"tools"`
+	ToolChoice  openAIToolChoice `json:"tool_choice"`
+	Temperature float64          `json:"temperature"`
+}
+
+type openAIToolRequestOptions struct {
+	Model           string
+	SystemPrompt    string
+	UserPrompt      string
+	ToolName        string
+	ToolDescription string
+	Parameters      map[string]any
+	Temperature     float64
+}
+
+func marshalOpenAIToolRequest(opts openAIToolRequestOptions) ([]byte, error) {
+	return json.Marshal(openAIToolRequest{
+		Model: opts.Model,
+		Messages: []openAIMessage{
+			{Role: "system", Content: opts.SystemPrompt},
+			{Role: "user", Content: opts.UserPrompt},
+		},
+		Tools: []openAITool{{
+			Type: "function",
+			Function: openAIFunctionDeclaration{
+				Name:        opts.ToolName,
+				Description: opts.ToolDescription,
+				Parameters:  opts.Parameters,
+			},
+		}},
+		ToolChoice: openAIToolChoice{
+			Type:     "function",
+			Function: openAIFunctionChoice{Name: opts.ToolName},
+		},
+		Temperature: opts.Temperature,
+	})
+}
+
 // buildOpenAIRequest serializes the chat-completion payload. Keeping
 // this in its own function makes the test-mode "capture the JSON the
 // provider sent" assertion straightforward. DiffText is redacted before
@@ -867,55 +933,15 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 		return nil, prompttrace.TransformMetadata{}, err
 	}
 
-	type message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type funcDecl struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description,omitempty"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	type tool struct {
-		Type     string   `json:"type"`
-		Function funcDecl `json:"function"`
-	}
-	type toolChoiceFn struct {
-		Name string `json:"name"`
-	}
-	type toolChoice struct {
-		Type     string       `json:"type"`
-		Function toolChoiceFn `json:"function"`
-	}
-	type req struct {
-		Model       string     `json:"model"`
-		Messages    []message  `json:"messages"`
-		Tools       []tool     `json:"tools"`
-		ToolChoice  toolChoice `json:"tool_choice"`
-		Temperature float64    `json:"temperature"`
-	}
-
-	body := req{
-		Model: model,
-		Messages: []message{
-			{Role: "system", Content: openAISystemPrompt(cc.CommitFormat)},
-			{Role: "user", Content: "Generate a commit message for this change:\n" + string(userJSON)},
-		},
-		Tools: []tool{{
-			Type: "function",
-			Function: funcDecl{
-				Name:        "commit_message",
-				Description: "Emit a single commit message for the change described.",
-				Parameters:  openAICommitMessageParameters(cc.CommitFormat),
-			},
-		}},
-		ToolChoice: toolChoice{
-			Type:     "function",
-			Function: toolChoiceFn{Name: "commit_message"},
-		},
-		Temperature: 0.3,
-	}
-	raw, err := json.Marshal(body)
+	raw, err := marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    openAISystemPrompt(cc.CommitFormat),
+		UserPrompt:      "Generate a commit message for this change:\n" + string(userJSON),
+		ToolName:        "commit_message",
+		ToolDescription: "Emit a single commit message for the change described.",
+		Parameters:      openAICommitMessageParameters(cc.CommitFormat),
+		Temperature:     0.3,
+	})
 	return raw, transform, err
 }
 
@@ -931,55 +957,15 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 		return nil, prompttrace.TransformMetadata{}, err
 	}
 
-	type message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type funcDecl struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description,omitempty"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	type tool struct {
-		Type     string   `json:"type"`
-		Function funcDecl `json:"function"`
-	}
-	type toolChoiceFn struct {
-		Name string `json:"name"`
-	}
-	type toolChoice struct {
-		Type     string       `json:"type"`
-		Function toolChoiceFn `json:"function"`
-	}
-	type req struct {
-		Model       string     `json:"model"`
-		Messages    []message  `json:"messages"`
-		Tools       []tool     `json:"tools"`
-		ToolChoice  toolChoice `json:"tool_choice"`
-		Temperature float64    `json:"temperature"`
-	}
-
-	body := req{
-		Model: model,
-		Messages: []message{
-			{Role: "system", Content: IntentPlannerSystemPrompt(plannerReq.CommitFormat)},
-			{Role: "user", Content: userPrompt},
-		},
-		Tools: []tool{{
-			Type: "function",
-			Function: funcDecl{
-				Name:        "capture_intent_plan",
-				Description: "Select or defer every offered capture for the next commit.",
-				Parameters:  openAIIntentPlanParameters(plannerReq.CommitFormat),
-			},
-		}},
-		ToolChoice: toolChoice{
-			Type:     "function",
-			Function: toolChoiceFn{Name: "capture_intent_plan"},
-		},
-		Temperature: 0.2,
-	}
-	raw, err := json.Marshal(body)
+	raw, err := marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    IntentPlannerSystemPrompt(plannerReq.CommitFormat),
+		UserPrompt:      userPrompt,
+		ToolName:        "capture_intent_plan",
+		ToolDescription: "Select or defer every offered capture for the next commit.",
+		Parameters:      openAIIntentPlanParameters(plannerReq.CommitFormat),
+		Temperature:     0.2,
+	})
 	return raw, plannerReq.CapturedDiffTransform, err
 }
 
@@ -995,55 +981,15 @@ func buildOpenAIIntentPlanV2RequestWithTrace(model string, plannerReq IntentPlan
 		return nil, prompttrace.TransformMetadata{}, err
 	}
 
-	type message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type funcDecl struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description,omitempty"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	type tool struct {
-		Type     string   `json:"type"`
-		Function funcDecl `json:"function"`
-	}
-	type toolChoiceFn struct {
-		Name string `json:"name"`
-	}
-	type toolChoice struct {
-		Type     string       `json:"type"`
-		Function toolChoiceFn `json:"function"`
-	}
-	type req struct {
-		Model       string     `json:"model"`
-		Messages    []message  `json:"messages"`
-		Tools       []tool     `json:"tools"`
-		ToolChoice  toolChoice `json:"tool_choice"`
-		Temperature float64    `json:"temperature"`
-	}
-
-	body := req{
-		Model: model,
-		Messages: []message{
-			{Role: "system", Content: IntentPlannerV2SystemPrompt(plannerReq.CommitFormat)},
-			{Role: "user", Content: userPrompt},
-		},
-		Tools: []tool{{
-			Type: "function",
-			Function: funcDecl{
-				Name:        "capture_intent_plan_v2",
-				Description: "Assign every offered capture to a durable semantic candidate.",
-				Parameters:  openAIIntentPlanV2Parameters(plannerReq.CommitFormat),
-			},
-		}},
-		ToolChoice: toolChoice{
-			Type:     "function",
-			Function: toolChoiceFn{Name: "capture_intent_plan_v2"},
-		},
-		Temperature: 0.2,
-	}
-	raw, err := json.Marshal(body)
+	raw, err := marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    IntentPlannerV2SystemPrompt(plannerReq.CommitFormat),
+		UserPrompt:      userPrompt,
+		ToolName:        "capture_intent_plan_v2",
+		ToolDescription: "Assign every offered capture to a durable semantic candidate.",
+		Parameters:      openAIIntentPlanV2Parameters(plannerReq.CommitFormat),
+		Temperature:     0.2,
+	})
 	return raw, plannerReq.CapturedDiffTransform, err
 }
 
@@ -1117,41 +1063,15 @@ func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteReque
 	if err != nil {
 		return nil, err
 	}
-	type message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type funcDecl struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description,omitempty"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	type tool struct {
-		Type     string   `json:"type"`
-		Function funcDecl `json:"function"`
-	}
-	type toolChoiceFn struct {
-		Name string `json:"name"`
-	}
-	type toolChoice struct {
-		Type     string       `json:"type"`
-		Function toolChoiceFn `json:"function"`
-	}
-	type req struct {
-		Model       string     `json:"model"`
-		Messages    []message  `json:"messages"`
-		Tools       []tool     `json:"tools"`
-		ToolChoice  toolChoice `json:"tool_choice"`
-		Temperature float64    `json:"temperature"`
-	}
-	body := req{
-		Model:       model,
-		Messages:    []message{{Role: "system", Content: "You rewrite existing git commit messages. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)}, {Role: "user", Content: userPrompt}},
-		Tools:       []tool{{Type: "function", Function: funcDecl{Name: "commit_message", Description: "Emit only the replacement commit message subject and body.", Parameters: openAICommitMessageParameters(rewriteReq.CommitFormat)}}},
-		ToolChoice:  toolChoice{Type: "function", Function: toolChoiceFn{Name: "commit_message"}},
-		Temperature: 0.2,
-	}
-	return json.Marshal(body)
+	return marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    "You rewrite existing git commit messages. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat),
+		UserPrompt:      userPrompt,
+		ToolName:        "commit_message",
+		ToolDescription: "Emit only the replacement commit message subject and body.",
+		Parameters:      openAICommitMessageParameters(rewriteReq.CommitFormat),
+		Temperature:     0.2,
+	})
 }
 
 func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, prompttrace.TransformMetadata, error) {
@@ -1161,55 +1081,15 @@ func buildOpenAIIntentMessageRewriteRequestWithTrace(model string, rewriteReq In
 		return nil, prompttrace.TransformMetadata{}, err
 	}
 
-	type message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type funcDecl struct {
-		Name        string         `json:"name"`
-		Description string         `json:"description,omitempty"`
-		Parameters  map[string]any `json:"parameters"`
-	}
-	type tool struct {
-		Type     string   `json:"type"`
-		Function funcDecl `json:"function"`
-	}
-	type toolChoiceFn struct {
-		Name string `json:"name"`
-	}
-	type toolChoice struct {
-		Type     string       `json:"type"`
-		Function toolChoiceFn `json:"function"`
-	}
-	type req struct {
-		Model       string     `json:"model"`
-		Messages    []message  `json:"messages"`
-		Tools       []tool     `json:"tools"`
-		ToolChoice  toolChoice `json:"tool_choice"`
-		Temperature float64    `json:"temperature"`
-	}
-
-	body := req{
-		Model: model,
-		Messages: []message{
-			{Role: "system", Content: "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat)},
-			{Role: "user", Content: userPrompt},
-		},
-		Tools: []tool{{
-			Type: "function",
-			Function: funcDecl{
-				Name:        "commit_message",
-				Description: "Emit only the replacement commit message subject and body.",
-				Parameters:  openAICommitMessageParameters(rewriteReq.CommitFormat),
-			},
-		}},
-		ToolChoice: toolChoice{
-			Type:     "function",
-			Function: toolChoiceFn{Name: "commit_message"},
-		},
-		Temperature: 0.2,
-	}
-	raw, err := json.Marshal(body)
+	raw, err := marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    "You rewrite git commit messages for already accepted intent plans. Always call the commit_message function. " + CommitMessageFormatInstructions(rewriteReq.CommitFormat),
+		UserPrompt:      userPrompt,
+		ToolName:        "commit_message",
+		ToolDescription: "Emit only the replacement commit message subject and body.",
+		Parameters:      openAICommitMessageParameters(rewriteReq.CommitFormat),
+		Temperature:     0.2,
+	})
 	return raw, rewriteReq.PlannerRequest.CapturedDiffTransform, err
 }
 
