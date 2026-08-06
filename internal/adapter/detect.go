@@ -52,16 +52,6 @@ func (h knownHarness) HasMarker() bool {
 	return matched
 }
 
-// allPaths returns every candidate path for this harness with `~` expanded.
-func (h knownHarness) allPaths() []string {
-	candidates := h.candidatePaths()
-	paths := make([]string, 0, len(candidates))
-	for _, p := range candidates {
-		paths = append(paths, p.path)
-	}
-	return paths
-}
-
 // MatchedPath returns the expanded candidate path that currently carries an
 // acd marker on disk. Iteration follows pathSpec slice order, so the
 // canonical primary is preferred over legacy fallbacks when both carry the
