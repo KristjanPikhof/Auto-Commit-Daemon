@@ -256,19 +256,7 @@ func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, e
 	if !ok {
 		return ApplyResult{}, errors.New("acd settings: desired revision changed; refresh before reverting")
 	}
-	daemonState, _, err := state.LoadDaemonState(ctx, s.db)
-	if err != nil {
-		return ApplyResult{}, sanitizeError(err)
-	}
-	result := ApplyResult{RevisionID: revision.ID, RequestID: activation.ID,
-		Queued: true, DaemonMode: cleanText(daemonState.Mode), SnapshotHash: revision.SnapshotHash}
-	if daemonState.PID > 0 && daemonState.Mode != "stopped" {
-		if err := s.nudge(ctx, daemonState); err != nil {
-			return result, sanitizeError(err)
-		}
-		result.Signaled = true
-	}
-	return result, nil
+	return s.finishApply(ctx, revision, activation, true)
 }
 
 func (s *Service) rejectWhileExperimentActive(ctx context.Context) error {
