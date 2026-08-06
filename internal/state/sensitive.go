@@ -102,21 +102,13 @@ func expandGlobs(patterns []string) []string {
 }
 
 func sensitiveGlobConfigFromEnv() sensitiveGlobConfig {
-	override := os.Getenv(EnvSensitiveGlobs)
-	if strings.TrimSpace(override) == "" {
-		return sensitiveGlobConfig{
-			deny:  expandGlobs(DefaultSensitiveGlobs),
-			allow: expandGlobs(DefaultSensitiveAllowGlobs),
-		}
+	if parsed := splitAndTrim(os.Getenv(EnvSensitiveGlobs)); len(parsed) > 0 {
+		return sensitiveGlobConfig{deny: expandGlobs(parsed)}
 	}
-	parsed := splitAndTrim(override)
-	if len(parsed) == 0 {
-		return sensitiveGlobConfig{
-			deny:  expandGlobs(DefaultSensitiveGlobs),
-			allow: expandGlobs(DefaultSensitiveAllowGlobs),
-		}
+	return sensitiveGlobConfig{
+		deny:  expandGlobs(DefaultSensitiveGlobs),
+		allow: expandGlobs(DefaultSensitiveAllowGlobs),
 	}
-	return sensitiveGlobConfig{deny: expandGlobs(parsed)}
 }
 
 // SensitivePatterns returns the active sensitive-path glob list, applying the
@@ -151,19 +143,7 @@ func splitAndTrim(s string) []string {
 // Python. We deliberately do not use filepath.Match here because it splits on
 // the OS separator and would mismatch Windows-style "\" on darwin/linux.
 func IsSensitivePath(rel string) bool {
-	rel = filepath.ToSlash(rel)
-	cfg := sensitiveGlobConfigFromEnv()
-	for _, pattern := range cfg.allow {
-		if matchGlob(pattern, rel) {
-			return false
-		}
-	}
-	for _, pattern := range cfg.deny {
-		if matchGlob(pattern, rel) {
-			return true
-		}
-	}
-	return false
+	return newSensitiveMatcher(sensitiveGlobConfigFromEnv()).Match(rel)
 }
 
 // SensitiveMatcher is a precomputed sensitivity check. The daemon's hot path
@@ -176,7 +156,10 @@ type SensitiveMatcher struct {
 
 // NewSensitiveMatcher snapshots SensitivePatterns() once.
 func NewSensitiveMatcher() *SensitiveMatcher {
-	cfg := sensitiveGlobConfigFromEnv()
+	return newSensitiveMatcher(sensitiveGlobConfigFromEnv())
+}
+
+func newSensitiveMatcher(cfg sensitiveGlobConfig) *SensitiveMatcher {
 	return &SensitiveMatcher{patterns: cfg.deny, allow: cfg.allow}
 }
 
