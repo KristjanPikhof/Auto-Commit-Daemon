@@ -148,15 +148,7 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
-	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
-	selected := doc.Settings.Global
-	if !s.globalOnly {
-		repo := doc.Settings.Repositories[s.repoHash]
-		profile := doc.Settings.Profiles[repo.Profile]
-		input.Repository = repo.Fields
-		input.Profile = profile.Fields
-		selected = repo.Fields
-	}
+	input, selected := s.authoringResolutionInput(doc)
 	fields, preset, err := config.ResolveAll(input, selected)
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
@@ -249,23 +241,17 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 			}()
 		}
 		for name, value := range req.Values {
-			field, ok := config.LookupField(name)
-			if !ok {
-				return fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
-			}
-			if !field.Persistable || field.Sensitive && name == config.FieldAPIKey {
-				return fmt.Errorf("acd settings: field %q is environment-only", field.Name)
+			field, err := persistedField(name)
+			if err != nil {
+				return err
 			}
 			if value == nil {
 				delete(target, name)
 				continue
 			}
-			if hasUnsafeText(*value) {
-				return fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
-			}
-			raw, err := json.Marshal(*value)
+			raw, err := encodePersistedField(field, *value)
 			if err != nil {
-				return fmt.Errorf("acd settings: encode field %q: %w", field.Name, err)
+				return err
 			}
 			target[name] = raw
 		}
@@ -350,19 +336,13 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 			doc.Settings.Global = config.Overrides{}
 		}
 		for name, value := range req.Values {
-			field, ok := config.LookupField(name)
-			if !ok {
-				return fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
-			}
-			if !field.Persistable || field.Sensitive && name == config.FieldAPIKey {
-				return fmt.Errorf("acd settings: field %q is environment-only", field.Name)
-			}
-			if hasUnsafeText(value) {
-				return fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
-			}
-			raw, err := json.Marshal(value)
+			field, err := persistedField(name)
 			if err != nil {
-				return fmt.Errorf("acd settings: encode field %q: %w", field.Name, err)
+				return err
+			}
+			raw, err := encodePersistedField(field, value)
+			if err != nil {
+				return err
 			}
 			doc.Settings.Global[name] = raw
 		}
@@ -543,17 +523,7 @@ func missingConfirmations(required, confirmed []ai.ConfirmationRequirement) []ai
 }
 
 func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, config.PresetResolution, error) {
-	baseInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
-	var selected config.Overrides
-	if s.globalOnly {
-		selected = doc.Settings.Global
-	} else {
-		repo := doc.Settings.Repositories[s.repoHash]
-		profile := doc.Settings.Profiles[repo.Profile]
-		baseInput.Repository = repo.Fields
-		baseInput.Profile = profile.Fields
-		selected = repo.Fields
-	}
+	baseInput, selected := s.authoringResolutionInput(doc)
 	baseFields, _, err := config.ResolveAll(baseInput, selected)
 	if err != nil {
 		return nil, nil, config.PresetResolution{}, sanitizeError(err)
@@ -593,6 +563,39 @@ func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (m
 	}
 	sort.Strings(restartChanged)
 	return resolved, restartChanged, preset, nil
+}
+
+func (s *Service) authoringResolutionInput(doc *config.Document) (config.ResolveInput, config.Overrides) {
+	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+	if s.globalOnly {
+		return input, doc.Settings.Global
+	}
+	repository := doc.Settings.Repositories[s.repoHash]
+	input.Repository = repository.Fields
+	input.Profile = doc.Settings.Profiles[repository.Profile].Fields
+	return input, repository.Fields
+}
+
+func persistedField(name string) (config.FieldDefinition, error) {
+	field, ok := config.LookupField(name)
+	if !ok {
+		return config.FieldDefinition{}, fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
+	}
+	if !field.Persistable || (field.Sensitive && name == config.FieldAPIKey) {
+		return config.FieldDefinition{}, fmt.Errorf("acd settings: field %q is environment-only", field.Name)
+	}
+	return field, nil
+}
+
+func encodePersistedField(field config.FieldDefinition, value string) (json.RawMessage, error) {
+	if hasUnsafeText(value) {
+		return nil, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("acd settings: encode field %q: %w", field.Name, err)
+	}
+	return raw, nil
 }
 
 var errRepositoryRequired = errors.New("acd settings: repository runtime service required")

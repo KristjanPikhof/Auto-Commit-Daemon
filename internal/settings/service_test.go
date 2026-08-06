@@ -692,6 +692,16 @@ func TestSettingsActionRejectsSecretAndControlPersistence(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("secret persistence error = %v", err)
 	}
+	_, err = svc.Save(context.Background(), SaveRequest{Scope: ScopeGlobal,
+		Values: map[string]*string{config.FieldAPIKey: nil}, ExpectedGeneration: 0})
+	if err == nil {
+		t.Fatal("clearing an environment-only field succeeded")
+	}
+	_, err = svc.Save(context.Background(), SaveRequest{Scope: ScopeGlobal,
+		Values: map[string]*string{"unknown.field": nil}, ExpectedGeneration: 0})
+	if err == nil {
+		t.Fatal("clearing an unsupported field succeeded")
+	}
 	unsafe := "model\x1b[2J"
 	_, err = svc.Save(context.Background(), SaveRequest{Scope: ScopeGlobal,
 		Values: map[string]*string{config.FieldModel: &unsafe}, ExpectedGeneration: 0})
