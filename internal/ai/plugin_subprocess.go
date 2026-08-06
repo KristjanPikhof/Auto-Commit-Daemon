@@ -382,14 +382,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
-	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
-	parts := strings.SplitN(cleaned, "\n\n", 2)
-	plan.Subject = parts[0]
-	if len(parts) == 2 {
-		plan.Body = parts[1]
-	} else {
-		plan.Body = ""
-	}
+	plan.Subject, plan.Body = sanitizeSubjectBody(plan.Subject, plan.Body)
 	plan = NormalizeIntentPlanReasons(plan)
 	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) > 0 || len(synthesized) > 0 || len(overlapRemoved) > 0 {
