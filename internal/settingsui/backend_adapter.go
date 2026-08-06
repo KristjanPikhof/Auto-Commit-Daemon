@@ -167,14 +167,8 @@ func (b *ServiceBackend) Save(ctx context.Context, draft map[string]string) (App
 	b.mu.Lock()
 	b.last.SavedGeneration = saved.Generation
 	b.mu.Unlock()
-	summary := "draft saved; test and apply explicitly"
-	if b.opts.Scope == settings.ScopeGlobal {
-		summary = "global defaults saved; running repositories were not changed"
-	} else if b.opts.Scope == settings.ScopeProfile {
-		summary = "profile saved; select it for a repository to activate"
-	}
 	return ApplyResult{DesiredRevision: last.DesiredRevisionID, AppliedRevision: last.AppliedRevisionID,
-		SavedOnly: true, Summary: summary}, nil
+		SavedOnly: true, Summary: savedOnlySummary(b.opts.Scope)}, nil
 }
 
 func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ string) (ApplyResult, error) {
@@ -193,12 +187,9 @@ func (b *ServiceBackend) Apply(ctx context.Context, draft map[string]string, _ s
 		if err != nil {
 			return ApplyResult{}, sanitizeAdapterError(err)
 		}
-		summary := "profile saved; select it for a repository to activate"
-		if b.opts.Scope == settings.ScopeGlobal {
-			summary = "global defaults saved; running repositories were not changed"
-		}
 		return ApplyResult{DesiredRevision: last.DesiredRevisionID,
-			AppliedRevision: last.AppliedRevisionID, SavedOnly: true, Summary: summary}, nil
+			AppliedRevision: last.AppliedRevisionID, SavedOnly: true,
+			Summary: savedOnlySummary(b.opts.Scope)}, nil
 	}
 	confirmations := b.currentConfirmations(effective)
 	validation, err := b.service.Validate(ctx, effective, confirmations)
@@ -378,6 +369,17 @@ func projectExperimentApply(result settings.ExperimentResult, applied int64, sum
 	desired := result.Revert.RevisionID
 	return ApplyResult{DesiredRevision: desired, AppliedRevision: applied,
 		Queued: result.Revert.Queued || desired != 0 && desired != applied, Summary: summary}
+}
+
+func savedOnlySummary(scope settings.Scope) string {
+	switch scope {
+	case settings.ScopeGlobal:
+		return "global defaults saved; running repositories were not changed"
+	case settings.ScopeProfile:
+		return "profile saved; select it for a repository to activate"
+	default:
+		return "draft saved; test and apply explicitly"
+	}
 }
 
 func changedValues(last settings.Snapshot, draft map[string]string) map[string]*string {
