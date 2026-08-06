@@ -1322,22 +1322,7 @@ func builtInConfigureValues(strategy, preset string) (map[string]string, error) 
 }
 
 func configureSaveValues(selection settingsui.ConfigureSelection) map[string]*string {
-	values := map[string]string{
-		config.FieldCommitStrategy:     selection.Strategy,
-		config.FieldCommitPreset:       selection.Preset,
-		config.FieldCommitFormat:       selection.CommitFormat,
-		config.FieldProvider:           selection.Provider,
-		config.FieldModel:              selection.Model,
-		config.FieldBaseURL:            selection.BaseURL,
-		config.FieldTimeout:            selection.ProviderTimeout,
-		config.FieldDiffEgress:         fmt.Sprintf("%t", selection.DiffContextApproved),
-		config.FieldIntentVerification: selection.VerificationMode,
-	}
-	if selection.VerificationMode == "fast" {
-		values[config.FieldVerificationFastCommand] = selection.VerificationCommand
-	} else if selection.VerificationMode == "full" {
-		values[config.FieldVerificationFullCommand] = selection.VerificationCommand
-	}
+	values := selectionDraft(selection)
 	out := make(map[string]*string, len(values))
 	for key, value := range values {
 		copyValue := value

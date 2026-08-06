@@ -36,7 +36,6 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -45,19 +44,6 @@ import (
 	"testing"
 	"time"
 )
-
-type plannerWindowRow struct {
-	OfferedSeqs         []int64 `json:"offered_seqs"`
-	VisibleOriginalSeqs []int64 `json:"visible_original_seqs"`
-	HiddenSeqs          []int64 `json:"hidden_seqs"`
-	SelectedGroups      []struct {
-		SelectedSeqs   []int64 `json:"selected_seqs"`
-		OriginalSeqs   []int64 `json:"original_seqs"`
-		Subject        string  `json:"subject"`
-		GroupingReason string  `json:"grouping_reason"`
-	} `json:"selected_groups"`
-	DeferredSeqs []int64 `json:"deferred_seqs"`
-}
 
 // TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit drives four
 // distinct creates through the real daemon under intent strategy. The
@@ -512,27 +498,4 @@ WHERE planner_protocol='v2'`); got != "3" {
 	if !strings.Contains(events.Stdout, `"candidate_id"`) {
 		t.Fatalf("events JSON missing candidate decisions:\n%s", events.Stdout)
 	}
-}
-
-func loadLastPlannerWindowRow(t *testing.T, dbPath string) plannerWindowRow {
-	t.Helper()
-	raw := sqliteScalar(t, dbPath, `
-SELECT json_object(
-  'offered_seqs', json(offered_seqs),
-  'visible_original_seqs', json(visible_original_seqs),
-  'hidden_seqs', json(hidden_seqs),
-  'selected_groups', json(selected_groups),
-  'deferred_seqs', json(deferred_seqs)
-)
-FROM intent_planner_windows
-ORDER BY id DESC
-LIMIT 1`)
-	if raw == "" {
-		t.Fatalf("missing intent_planner_windows row")
-	}
-	var row plannerWindowRow
-	if err := json.Unmarshal([]byte(raw), &row); err != nil {
-		t.Fatalf("decode planner window row: %v\n%s", err, raw)
-	}
-	return row
 }

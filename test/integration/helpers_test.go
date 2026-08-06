@@ -565,31 +565,27 @@ func envWith(base []string, kvs ...string) []string {
 // using the sqlite3 binary. Falls back to "" if anything goes wrong (caller
 // is expected to use waitFor + retry).
 func readDaemonStateMode(repoDir string) string {
-	dbPath := filepath.Join(repoDir, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return ""
-	}
-	out, err := exec.Command("sqlite3", dbPath, "SELECT mode FROM daemon_state WHERE id = 1").CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return readDaemonStateScalar(repoDir, "SELECT mode FROM daemon_state WHERE id = 1")
 }
 
 // readDaemonStatePID returns daemon_state.pid (or 0).
 func readDaemonStatePID(repoDir string) int {
-	dbPath := filepath.Join(repoDir, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return 0
-	}
-	out, err := exec.Command("sqlite3", dbPath, "SELECT pid FROM daemon_state WHERE id = 1").CombinedOutput()
-	if err != nil {
-		return 0
-	}
-	v := strings.TrimSpace(string(out))
+	v := readDaemonStateScalar(repoDir, "SELECT pid FROM daemon_state WHERE id = 1")
 	pid := 0
 	fmt.Sscanf(v, "%d", &pid)
 	return pid
+}
+
+func readDaemonStateScalar(repoDir, query string) string {
+	dbPath := filepath.Join(repoDir, ".git", "acd", "state.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return ""
+	}
+	out, err := exec.Command("sqlite3", dbPath, query).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // writeFile is shorthand for os.WriteFile + t.Fatalf.
@@ -892,15 +888,7 @@ func SeedShadowGenerations(t *testing.T, dbPath, branchRef string, generations, 
 
 // readHeartbeatTs reads daemon_state.heartbeat_ts (or 0).
 func readHeartbeatTs(repoDir string) float64 {
-	dbPath := filepath.Join(repoDir, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return 0
-	}
-	out, err := exec.Command("sqlite3", dbPath, "SELECT heartbeat_ts FROM daemon_state WHERE id = 1").CombinedOutput()
-	if err != nil {
-		return 0
-	}
-	v := strings.TrimSpace(string(out))
+	v := readDaemonStateScalar(repoDir, "SELECT heartbeat_ts FROM daemon_state WHERE id = 1")
 	var f float64
 	fmt.Sscanf(v, "%f", &f)
 	return f

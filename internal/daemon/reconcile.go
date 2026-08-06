@@ -182,10 +182,9 @@ func ReconcileUnpublishedChain(
 	if err != nil {
 		return result, err
 	}
-	if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
-		return result, err
-	}
-	if err := requireRecoveryRefMissing(ctx, repoRoot, opts.ExpectedMissingRef); err != nil {
+	if err := requireRecoveryInputsUnchanged(
+		ctx, repoRoot, live, opts.ExpectedMissingRef,
+	); err != nil {
 		return result, err
 	}
 
@@ -231,19 +230,17 @@ func ReconcileUnpublishedChain(
 	if opts.beforeFinalHeadCheck != nil {
 		opts.beforeFinalHeadCheck()
 	}
-	if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
-		return result, err
-	}
-	if err := requireRecoveryRefMissing(ctx, repoRoot, opts.ExpectedMissingRef); err != nil {
+	if err := requireRecoveryInputsUnchanged(
+		ctx, repoRoot, live, opts.ExpectedMissingRef,
+	); err != nil {
 		return result, err
 	}
 	if opts.beforeStateTransition != nil {
 		opts.beforeStateTransition()
 	}
-	if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
-		return result, err
-	}
-	if err := requireRecoveryRefMissing(ctx, repoRoot, opts.ExpectedMissingRef); err != nil {
+	if err := requireRecoveryInputsUnchanged(
+		ctx, repoRoot, live, opts.ExpectedMissingRef,
+	); err != nil {
 		return result, err
 	}
 	var snapshot state.RecoverySnapshot
@@ -1420,6 +1417,18 @@ func requireStableRecoveryLiveState(ctx context.Context, repoRoot string, expect
 		return fmt.Errorf("daemon: reconcile recovery chain: branch token moved from %q to %q", expected.token, actual)
 	}
 	return nil
+}
+
+func requireRecoveryInputsUnchanged(
+	ctx context.Context,
+	repoRoot string,
+	expected recoveryLiveState,
+	expectedMissingRef string,
+) error {
+	if err := requireStableRecoveryLiveState(ctx, repoRoot, expected); err != nil {
+		return err
+	}
+	return requireRecoveryRefMissing(ctx, repoRoot, expectedMissingRef)
 }
 
 func requireRecoveryRefMissing(ctx context.Context, repoRoot, ref string) error {

@@ -39,15 +39,15 @@ func (s Scheduler) resolved() (time.Duration, time.Duration, time.Duration) {
 	if base <= 0 {
 		base = DefaultSchedulerBase
 	}
-	idle := s.IdleCeiling
-	if idle <= 0 {
-		idle = DefaultSchedulerIdleCeiling
+	idleCeiling := s.IdleCeiling
+	if idleCeiling <= 0 {
+		idleCeiling = DefaultSchedulerIdleCeiling
 	}
-	errC := s.ErrorCeiling
-	if errC <= 0 {
-		errC = DefaultSchedulerErrorCeiling
+	errorCeiling := s.ErrorCeiling
+	if errorCeiling <= 0 {
+		errorCeiling = DefaultSchedulerErrorCeiling
 	}
-	return base, idle, errC
+	return base, idleCeiling, errorCeiling
 }
 
 // Reset returns the base interval. Used after a successful loop body or a
@@ -61,30 +61,24 @@ func (s Scheduler) Reset() time.Duration {
 // NextIdle doubles the current delay, capped at IdleCeiling. A current
 // delay <= 0 starts from Base.
 func (s Scheduler) NextIdle(current time.Duration) time.Duration {
-	base, idle, _ := s.resolved()
-	if current <= 0 {
-		return base
-	}
-	next := current * 2
-	if next > idle {
-		next = idle
-	}
-	if next < base {
-		next = base
-	}
-	return next
+	base, idleCeiling, _ := s.resolved()
+	return nextSchedulerDelay(current, base, idleCeiling)
 }
 
 // NextError doubles the current delay, capped at ErrorCeiling. A current
 // delay <= 0 starts from Base.
 func (s Scheduler) NextError(current time.Duration) time.Duration {
-	base, _, errC := s.resolved()
+	base, _, errorCeiling := s.resolved()
+	return nextSchedulerDelay(current, base, errorCeiling)
+}
+
+func nextSchedulerDelay(current, base, ceiling time.Duration) time.Duration {
 	if current <= 0 {
 		return base
 	}
 	next := current * 2
-	if next > errC {
-		next = errC
+	if next > ceiling {
+		next = ceiling
 	}
 	if next < base {
 		next = base

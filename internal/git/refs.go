@@ -233,8 +233,7 @@ func WithLockedRecoveryRefAndAbsentRef(
 	expectedAbsentRef string,
 	fn func() error,
 ) error {
-	if !strings.HasPrefix(expectedAbsentRef, "refs/") || len(expectedAbsentRef) == len("refs/") ||
-		strings.ContainsAny(expectedAbsentRef, " \t\r\n\x00") {
+	if !isValidFullRef(expectedAbsentRef) {
 		return fmt.Errorf("git: expected-absent ref %q must be a valid full ref name", expectedAbsentRef)
 	}
 	if expectedAbsentRef == ref {
@@ -286,8 +285,7 @@ func withLockedExpectedRef(
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
 	}
-	if !strings.HasPrefix(ref, "refs/") || len(ref) == len("refs/") ||
-		strings.ContainsAny(ref, " \t\r\n\x00") {
+	if !isValidFullRef(ref) {
 		return fmt.Errorf("git: locked ref %q must be a valid full ref name", ref)
 	}
 	if requireRecoveryNamespace &&
@@ -426,6 +424,11 @@ func withLockedExpectedRef(
 		return fail("wait", waitErr)
 	}
 	return nil
+}
+
+func isValidFullRef(ref string) bool {
+	return strings.HasPrefix(ref, "refs/") && len(ref) > len("refs/") &&
+		!strings.ContainsAny(ref, " \t\r\n\x00")
 }
 
 func zeroOIDForRepo(ctx context.Context, repoDir string) (string, error) {

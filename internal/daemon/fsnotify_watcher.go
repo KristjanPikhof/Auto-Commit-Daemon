@@ -628,7 +628,6 @@ func (w *FsnotifyWatcher) Diagnostics() WatcherDiagnostics {
 // watcher has already fallen back to poll mode. Subsequent calls beyond
 // the first are no-ops too.
 func (w *FsnotifyWatcher) Start(ctx context.Context) error {
-	var startErr error
 	w.startOnce.Do(func() {
 		w.mu.Lock()
 		mode := w.mode
@@ -661,7 +660,13 @@ func (w *FsnotifyWatcher) Start(ctx context.Context) error {
 			w.dispatch(ctx)
 		}()
 	})
-	return startErr
+	return nil
+}
+
+func (w *FsnotifyWatcher) wake() {
+	if w.opts.WakeFn != nil {
+		w.opts.WakeFn()
+	}
 }
 
 // dispatch runs the leading-edge wake plus trailing-edge debounce loop.
@@ -760,9 +765,7 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 			// Leading-edge wake fires the moment we exit a quiet window.
 			if !burstActive {
 				burstActive = true
-				if w.opts.WakeFn != nil {
-					w.opts.WakeFn()
-				}
+				w.wake()
 				armTail()
 			}
 			resetDebounce()
@@ -789,9 +792,7 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 			// wake), and the tail clamp is no longer needed.
 			stopTail()
 			burstActive = false
-			if w.opts.WakeFn != nil {
-				w.opts.WakeFn()
-			}
+			w.wake()
 		case <-tailC:
 			tailC = nil
 			tailTimer = nil
@@ -799,9 +800,7 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 			// Fire WakeFn so consumers see activity even though no quiet
 			// window ever materialized. Re-arm tail so the next clamp
 			// is honored if the stream keeps going.
-			if w.opts.WakeFn != nil {
-				w.opts.WakeFn()
-			}
+			w.wake()
 			armTail()
 		}
 	}

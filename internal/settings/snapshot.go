@@ -74,21 +74,27 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		return Snapshot{}, sanitizeError(err)
 	}
 	repo := doc.Settings.Repositories[s.repoHash]
-	activeProfile := repo.Profile
-	if scope == ScopeProfile {
-		activeProfile = profileName
-	} else if scope == ScopeGlobal {
-		activeProfile = ""
-	}
-	profile := doc.Settings.Profiles[activeProfile]
-	repositoryFields := repo.Fields
-	profileFields := profile.Fields
+	activeProfile := ""
+	currentInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+	inheritedInput := currentInput
+	var selectedScope config.Overrides
 	switch scope {
-	case ScopeGlobal:
-		repositoryFields = nil
-		profileFields = nil
+	case ScopeRepository:
+		activeProfile = repo.Profile
+		currentInput.Repository = repo.Fields
+		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
+		selectedScope = currentInput.Repository
+		inheritedInput = currentInput
+		inheritedInput.Repository = nil
 	case ScopeProfile:
-		repositoryFields = nil
+		activeProfile = profileName
+		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
+		selectedScope = currentInput.Profile
+		inheritedInput = currentInput
+		inheritedInput.Profile = nil
+	case ScopeGlobal:
+		selectedScope = currentInput.Global
+		inheritedInput.Global = nil
 	}
 	runtimeState, err := state.RuntimeConfigActivationState(ctx, s.db)
 	if err != nil {
@@ -115,31 +121,9 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 			}
 		}
 	}
-	currentInput := config.ResolveInput{
-		Repository: repositoryFields, Profile: profileFields, Global: doc.Settings.Global,
-		LookupEnv: s.lookupEnv,
-	}
-	var selectedScope config.Overrides
-	switch scope {
-	case ScopeRepository:
-		selectedScope = repositoryFields
-	case ScopeProfile:
-		selectedScope = profileFields
-	case ScopeGlobal:
-		selectedScope = doc.Settings.Global
-	}
 	resolvedFields, preset, err := config.ResolveAll(currentInput, selectedScope)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
-	}
-	inheritedInput := currentInput
-	switch scope {
-	case ScopeRepository:
-		inheritedInput.Repository = nil
-	case ScopeProfile:
-		inheritedInput.Profile = nil
-	case ScopeGlobal:
-		inheritedInput.Global = nil
 	}
 	inheritedFields, _, err := config.ResolveAll(inheritedInput, nil)
 	if err != nil {

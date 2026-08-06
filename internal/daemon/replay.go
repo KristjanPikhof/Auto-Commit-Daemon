@@ -647,17 +647,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 
 		if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, parent, ev, ops); err != nil {
 			cancelEvent()
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				if markErr := markFailed(ctx, db, ev, replayIssue{
-					ErrorClass: replayErrorCommitBuildFailure,
-					Message:    err.Error(),
-					Ref:        activeCtx.BranchRef,
-					Path:       ev.Path,
-				}); markErr != nil {
-					return sum, markErr
+			if handled, handleErr := settleReplayContextFailure(
+				ctx, db, opts.Trace, repoRoot, activeCtx, ev, err, &sum,
+			); handled {
+				if handleErr != nil {
+					return sum, handleErr
 				}
-				traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
-				sum.Failed++
 				return sum, nil
 			}
 			return sum, err
@@ -3025,17 +3020,12 @@ func publishIntentSelection(
 		if len(selected) == 1 {
 			if superseded, reason, err := supersededByExternalHistory(eventCtx, repoRoot, sourceHead, ev, item.ops); err != nil {
 				cancelEvent()
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-					if markErr := markFailed(ctx, db, ev, replayIssue{
-						ErrorClass: replayErrorCommitBuildFailure,
-						Message:    err.Error(),
-						Ref:        activeCtx.BranchRef,
-						Path:       ev.Path,
-					}); markErr != nil {
-						return sum, markErr
+				if handled, handleErr := settleReplayContextFailure(
+					ctx, db, opts.Trace, repoRoot, activeCtx, ev, err, &sum,
+				); handled {
+					if handleErr != nil {
+						return sum, handleErr
 					}
-					traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.failed", state.EventStateFailed, err.Error(), nil)
-					sum.Failed++
 					return sum, nil
 				}
 				return sum, err

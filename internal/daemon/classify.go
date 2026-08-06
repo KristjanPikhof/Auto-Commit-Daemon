@@ -77,7 +77,7 @@ func Classify(shadow map[string]ShadowEntry, live map[string]LiveEntry) []Classi
 		createsBySig[key] = append(createsBySig[key], i)
 	}
 
-	pairedCreates := make(map[int]bool, len(creates))
+	pairedCreatePaths := make(map[string]struct{}, len(creates))
 	pairedDeletes := make(map[string]bool, len(deletes))
 
 	var out []ClassifiedOp
@@ -90,11 +90,11 @@ func Classify(shadow map[string]ShadowEntry, live map[string]LiveEntry) []Classi
 			continue
 		}
 		ci := matches[0]
-		if pairedCreates[ci] {
+		c := creates[ci]
+		if _, paired := pairedCreatePaths[c.Path]; paired {
 			continue
 		}
-		c := creates[ci]
-		pairedCreates[ci] = true
+		pairedCreatePaths[c.Path] = struct{}{}
 		pairedDeletes[d.Path] = true
 		out = append(out, ClassifiedOp{
 			Op:         "rename",
@@ -120,14 +120,7 @@ func Classify(shadow map[string]ShadowEntry, live map[string]LiveEntry) []Classi
 		s, hadShadow := shadow[path]
 		if !hadShadow {
 			// New path. Only emit create when not paired off as a rename.
-			alreadyPaired := false
-			for ci, c := range creates {
-				if c.Path == path && pairedCreates[ci] {
-					alreadyPaired = true
-					break
-				}
-			}
-			if alreadyPaired {
+			if _, paired := pairedCreatePaths[path]; paired {
 				continue
 			}
 			out = append(out, ClassifiedOp{

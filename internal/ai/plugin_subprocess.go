@@ -224,35 +224,7 @@ func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Re
 		DiffCap:      DiffCap,
 	})
 
-	// Per-request timeout layered on top of the caller's ctx.
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-
-	// Two-attempt loop: an exited-but-not-yet-detected plugin produces
-	// EPIPE / EOF on the first I/O; we mark crashed, respawn, and retry
-	// exactly once. A second crash on the fresh process surfaces as an
-	// error so Compose() falls back to deterministic.
-	var resp subprocessResponse
-	for attempt := 0; attempt < 2; attempt++ {
-		var session *pluginSession
-		session, err = p.acquire()
-		if err != nil {
-			p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
-			return Result{}, err
-		}
-		resp, err = session.exchangeBytes(reqCtx, requestBody)
-		if err == nil {
-			break
-		}
-		// Context errors are not the plugin's fault; never retry.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			p.markCrashed(session)
-			p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
-			return Result{}, err
-		}
-		p.markCrashed(session)
-		// Loop and retry once with a fresh process.
-	}
+	resp, err := p.exchangeBytesWithRetry(ctx, requestBody)
 	if err != nil {
 		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
 		return Result{}, err
@@ -325,28 +297,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		DiffCap: IntentStageDiffCap,
 	})
 
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-
-	var resp subprocessResponse
-	for attempt := 0; attempt < 2; attempt++ {
-		var session *pluginSession
-		session, err = p.acquire()
-		if err != nil {
-			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
-			return IntentPlan{}, err
-		}
-		resp, err = session.exchangeBytes(reqCtx, body)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			p.markCrashed(session)
-			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
-			return IntentPlan{}, err
-		}
-		p.markCrashed(session)
-	}
+	resp, err := p.exchangeBytesWithRetry(ctx, body)
 	if err != nil {
 		var decodeErr *subprocessResponseDecodeError
 		if errors.As(err, &decodeErr) {
@@ -382,14 +333,7 @@ func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPl
 		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
 		return IntentPlan{}, err
 	}
-	cleaned := SanitizeMessage(plan.Subject + "\n\n" + plan.Body)
-	parts := strings.SplitN(cleaned, "\n\n", 2)
-	plan.Subject = parts[0]
-	if len(parts) == 2 {
-		plan.Body = parts[1]
-	} else {
-		plan.Body = ""
-	}
+	plan.Subject, plan.Body = sanitizeSubjectBody(plan.Subject, plan.Body)
 	plan = NormalizeIntentPlanReasons(plan)
 	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
 	if len(dropped) > 0 || len(synthesized) > 0 || len(overlapRemoved) > 0 {
@@ -545,26 +489,7 @@ func (p *SubprocessProvider) exchangeIntentV2Envelope(
 		DiffIncluded: intentDiffIncludedV2(plannerReq),
 		DiffCap:      IntentStageDiffCap,
 	})
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-	var resp subprocessResponse
-	for attempt := 0; attempt < 2; attempt++ {
-		session, acquireErr := p.acquire()
-		if acquireErr != nil {
-			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: acquireErr.Error()})
-			return subprocessResponse{}, acquireErr
-		}
-		resp, err = session.exchangeBytes(reqCtx, body)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			p.markCrashed(session)
-			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
-			return subprocessResponse{}, err
-		}
-		p.markCrashed(session)
-	}
+	resp, err := p.exchangeBytesWithRetry(ctx, body)
 	if err != nil {
 		var decodeErr *subprocessResponseDecodeError
 		if errors.As(err, &decodeErr) {
@@ -672,28 +597,7 @@ func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteRe
 		DiffCap:      IntentStageDiffCap,
 	})
 
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-
-	var resp subprocessResponse
-	for attempt := 0; attempt < 2; attempt++ {
-		var session *pluginSession
-		session, err = p.acquire()
-		if err != nil {
-			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
-			return Result{}, err
-		}
-		resp, err = session.exchangeBytes(reqCtx, body)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			p.markCrashed(session)
-			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
-			return Result{}, err
-		}
-		p.markCrashed(session)
-	}
+	resp, err := p.exchangeBytesWithRetry(ctx, body)
 	if err != nil {
 		var decodeErr *subprocessResponseDecodeError
 		if errors.As(err, &decodeErr) {
@@ -750,24 +654,7 @@ func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteRe
 	if err != nil {
 		return Result{}, err
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-	var resp subprocessResponse
-	for attempt := 0; attempt < 2; attempt++ {
-		session, err := p.acquire()
-		if err != nil {
-			return Result{}, err
-		}
-		resp, err = session.exchangeBytes(reqCtx, body)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			p.markCrashed(session)
-			return Result{}, err
-		}
-		p.markCrashed(session)
-	}
+	resp, err := p.exchangeBytesWithRetry(ctx, body)
 	if err != nil {
 		return Result{}, err
 	}
@@ -832,6 +719,32 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 	p.intentV2Capability.Store(intentV2CapabilityUnknown)
 	// shutdown is safe to call multiple times.
 	_ = session.shutdown(0)
+}
+
+// exchangeBytesWithRetry applies the subprocess lifecycle contract shared by
+// every request type: one bounded request, one retry after a process failure,
+// and no retry after cancellation or timeout.
+func (p *SubprocessProvider) exchangeBytesWithRetry(ctx context.Context, body []byte) (subprocessResponse, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	var resp subprocessResponse
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		session, acquireErr := p.acquire()
+		if acquireErr != nil {
+			return subprocessResponse{}, acquireErr
+		}
+		resp, err = session.exchangeBytes(reqCtx, body)
+		if err == nil {
+			return resp, nil
+		}
+		p.markCrashed(session)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return subprocessResponse{}, err
+		}
+	}
+	return subprocessResponse{}, err
 }
 
 func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {

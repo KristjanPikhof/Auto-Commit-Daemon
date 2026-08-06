@@ -48,22 +48,8 @@ func (h knownHarness) IsInstalled() bool {
 // detector registered for that path. Detectors are checked per-path so JSON
 // files do not match TOML markers and vice versa.
 func (h knownHarness) HasMarker() bool {
-	for _, p := range h.candidatePaths() {
-		if textFileContains(p.path, p.detector) {
-			return true
-		}
-	}
-	return false
-}
-
-// allPaths returns every candidate path for this harness with `~` expanded.
-func (h knownHarness) allPaths() []string {
-	candidates := h.candidatePaths()
-	paths := make([]string, 0, len(candidates))
-	for _, p := range candidates {
-		paths = append(paths, p.path)
-	}
-	return paths
+	_, matched := h.MatchedPath()
+	return matched
 }
 
 // MatchedPath returns the expanded candidate path that currently carries an

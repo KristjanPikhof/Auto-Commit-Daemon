@@ -1235,12 +1235,8 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 				// Symlinks: capture as 120000 candidate, never descend.
 				if mode&os.ModeSymlink != 0 {
-					if opts.matcher != nil && opts.matcher.Match(childRel) {
-						markProtected(childRel, "sensitive", false)
-						continue
-					}
-					if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
-						markProtected(childRel, "safe_ignore", false)
+					if reason := protectedFileReason(childRel, opts); reason != "" {
+						markProtected(childRel, reason, false)
 						continue
 					}
 					fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -1272,12 +1268,8 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				if !mode.IsRegular() {
 					continue
 				}
-				if opts.matcher != nil && opts.matcher.Match(childRel) {
-					markProtected(childRel, "sensitive", false)
-					continue
-				}
-				if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(childRel) {
-					markProtected(childRel, "safe_ignore", false)
+				if reason := protectedFileReason(childRel, opts); reason != "" {
+					markProtected(childRel, reason, false)
 					continue
 				}
 				fileCands = append(fileCands, candidate{rel: childRel, full: childFull, fi: fi})
@@ -1356,6 +1348,16 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	}
 
 	return live, protected, summary, nil
+}
+
+func protectedFileReason(path string, opts walkOpts) string {
+	if opts.matcher != nil && opts.matcher.Match(path) {
+		return "sensitive"
+	}
+	if opts.safeIgnore != nil && opts.safeIgnore.MatchFile(path) {
+		return "safe_ignore"
+	}
+	return ""
 }
 
 // hashCandidate hashes one candidate path into the git object store. For
@@ -1661,17 +1663,13 @@ func IsPathQuiescent(path string, quiescence time.Duration, now time.Time) bool 
 // tests that toggle the env mid-suite see the corresponding behavior
 // flip on the next replay-config resolve.
 func resolvePathQuiescenceSeconds() time.Duration {
-	env := os.Getenv(EnvPathQuiescenceSeconds)
-	if env == "" {
-		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
-		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
+	seconds := DefaultPathQuiescenceSeconds
+	if env := os.Getenv(EnvPathQuiescenceSeconds); env != "" {
+		if configured, err := strconv.Atoi(env); err == nil && configured >= 0 {
+			seconds = configured
+		}
 	}
-	n, err := strconv.Atoi(env)
-	if err != nil || n < 0 {
-		applyPathQuiescenceWindow(time.Duration(DefaultPathQuiescenceSeconds) * time.Second)
-		return time.Duration(DefaultPathQuiescenceSeconds) * time.Second
-	}
-	d := time.Duration(n) * time.Second
+	d := time.Duration(seconds) * time.Second
 	applyPathQuiescenceWindow(d)
 	return d
 }

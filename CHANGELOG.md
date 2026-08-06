@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- Fixed settings authoring and previews resolving repository, profile, and
+  global scopes against the wrong lower-precedence layers. Persisted fields
+  now share validation and encoding before they are saved.
+- Fixed duplicate file signatures allowing more than one deletion to pair
+  with the same rename target. Rename classification now remains deterministic
+  without reusing a matched destination.
+- Fixed sensitive-path checks using separate configuration paths for one-off
+  and daemon matchers. A nonempty `ACD_SENSITIVE_GLOBS` value now consistently
+  replaces the default deny and allow lists.
 - Fixed `acd rewrite-commits` ignoring saved repository, profile, and global
   settings. Plan generation now uses the effective configured strategy,
   provider, model, format, timeout, and protected credential instead of reading
@@ -79,6 +88,10 @@
 
 ### Changed
 
+- Consolidated duplicated scheduling, capture, replay, AI response,
+  verification, settings, and self-publication recovery paths so shared
+  outcomes are finalized consistently. Added regression coverage for replay
+  probe timeouts in Event and Intent modes.
 - Made bare `acd configure` a one-time global setup with Everyday and Maximum
   Speed only. Everyday uses internal structural gates and never detects or
   runs project tests; Strict Review and full command validation require an
