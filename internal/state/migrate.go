@@ -72,7 +72,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // the candidate-lineage ledger without rewriting existing candidates. v18
 // adds the immutable self-publication journal without backfilling historical
 // publishes. v19 persists prepare-time publication completion semantics so
-// restart recovery cannot reinterpret repair state. New tables are pure DDL;
+// restart recovery cannot reinterpret repair state. v20 adds the general
+// operation/checkpoint ledger and correlates new self-publication rows with
+// it. New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE
@@ -194,6 +196,24 @@ BEGIN
 END;`); err != nil {
 			return fmt.Errorf(
 				"state: migrate self-publication completion identity: %w", err)
+		}
+	}
+	if cur < 20 {
+		if err := addColumnIfMissing(ctx, tx, "self_publications", "operation_id", "TEXT REFERENCES operations(id)"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+DROP TRIGGER IF EXISTS self_publications_identity_immutable;
+CREATE TRIGGER self_publications_identity_immutable
+BEFORE UPDATE OF operation_id, branch_ref, branch_generation, source_head,
+                 target_commit_oid, target_tree_oid, membership_digest,
+                 member_count, completion_published_ts,
+                 completion_candidate_status, completion_soft_deadline
+ON self_publications
+BEGIN
+    SELECT RAISE(ABORT, 'self-publication identity is immutable');
+END;`); err != nil {
+			return fmt.Errorf("state: migrate self-publication operation identity: %w", err)
 		}
 	}
 	return nil
