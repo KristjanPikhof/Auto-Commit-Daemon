@@ -205,15 +205,9 @@ func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result = Result{
-		Status:         StatusNeedsAttention,
-		NeedsAttention: true,
-		ExitCode:       -1,
-		Mode:           request.Command.mode,
-		ApprovalID:     request.Command.approvalID,
-		CommandDigest:  request.Command.digest,
-		CommitOID:      request.CommitOID,
-	}
+	result = initialResult(request.Command.mode, request.CommitOID)
+	result.ApprovalID = request.Command.approvalID
+	result.CommandDigest = request.Command.digest
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -242,16 +236,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr
 	if err != nil {
 		return result, err
 	}
-	defer func() {
-		markerErr := markWorkspaceCleanupRequired(ws)
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if cleanupErr := cleanupWorkspace(cleanupCtx, worktree.Root, ws); cleanupErr != nil {
-			result.Status = StatusNeedsAttention
-			result.NeedsAttention = true
-			retErr = errors.Join(retErr, markerErr, cleanupErr)
-		}
-	}()
+	defer finishWorkspaceRun(worktree.Root, ws, &result, &retErr)
 
 	started := time.Now()
 	output := &tailBuffer{capacity: OutputLimit * 2}
@@ -303,13 +288,7 @@ func (r Runner) CheckStructural(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result = Result{
-		Status:         StatusNeedsAttention,
-		NeedsAttention: true,
-		Mode:           ModeStructural,
-		ExitCode:       -1,
-		CommitOID:      request.CommitOID,
-	}
+	result = initialResult(ModeStructural, request.CommitOID)
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -339,24 +318,34 @@ func (r Runner) CheckStructural(
 	if err != nil {
 		return result, err
 	}
-	defer func() {
-		markerErr := markWorkspaceCleanupRequired(ws)
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second,
-		)
-		defer cancel()
-		if cleanupErr := cleanupWorkspace(
-			cleanupCtx, worktree.Root, ws,
-		); cleanupErr != nil {
-			result.Status = StatusNeedsAttention
-			result.NeedsAttention = true
-			retErr = errors.Join(retErr, markerErr, cleanupErr)
-		}
-	}()
+	defer finishWorkspaceRun(worktree.Root, ws, &result, &retErr)
 	result.Status = StatusPassed
 	result.NeedsAttention = false
 	result.ExitCode = 0
 	return result, nil
+}
+
+func initialResult(mode Mode, commitOID string) Result {
+	return Result{
+		Status:         StatusNeedsAttention,
+		NeedsAttention: true,
+		Mode:           mode,
+		CommitOID:      commitOID,
+		ExitCode:       -1,
+	}
+}
+
+func finishWorkspaceRun(repoRoot string, ws workspace, result *Result, retErr *error) {
+	markerErr := markWorkspaceCleanupRequired(ws)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cleanupErr := cleanupWorkspace(cleanupCtx, repoRoot, ws)
+	if cleanupErr == nil {
+		return
+	}
+	result.Status = StatusNeedsAttention
+	result.NeedsAttention = true
+	*retErr = errors.Join(*retErr, markerErr, cleanupErr)
 }
 
 // CleanupStale removes marked workspaces whose creating process is no longer
