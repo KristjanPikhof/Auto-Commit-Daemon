@@ -129,32 +129,7 @@ func OpenAt(ctx context.Context, dbPath string) (*StatsDB, error) {
 //
 // Re-opening an existing database is a no-op for schema purposes.
 func Open(ctx context.Context, roots paths.Roots) (*StatsDB, error) {
-	dbPath := roots.StatsDBPath()
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
-		return nil, fmt.Errorf("central: mkdir stats parent: %w", err)
-	}
-
-	dsn := buildStatsDSN(dbPath)
-	conn, err := sql.Open(statsDriverName, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("central: sql.Open stats: %w", err)
-	}
-	// Stats DB sees one writer (aggregator) and a handful of readers (CLI).
-	// Keep the pool conservative — same shape as the per-repo state DB.
-	conn.SetMaxOpenConns(8)
-	conn.SetMaxIdleConns(4)
-
-	if err := conn.PingContext(ctx); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("central: ping stats: %w", err)
-	}
-
-	s := &StatsDB{conn: conn, path: dbPath}
-	if err := s.bootstrap(ctx); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return s, nil
+	return OpenAt(ctx, roots.StatsDBPath())
 }
 
 // buildStatsDSN composes the DSN for stats.db. PRAGMAs match per-repo state
