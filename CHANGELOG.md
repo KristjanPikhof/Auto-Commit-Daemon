@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Changed
+
+- Rebuilt ACD around durable private-ref checkpoints that complete before any
+  grouping, provider, verification, or Git publication work.
+- Replaced the public lifecycle model with eight root commands, five product
+  states, one stable JSON envelope, and hidden two-release compatibility
+  aliases.
+- Added one user-level supervisor with one isolated worker per Git common
+  directory; filesystem polling remains the universal protection path and
+  integrations provide optional hints only.
+- Changed fresh defaults to deterministic Intent/Fast with structural
+  verification and no credential or diff egress requirement. The one-shot
+  v19 to v20 cutover preserves existing effective publication settings.
+
+### Added
+
+- Added rootless Git checkpoint commits, GC-safe private refs, observation and
+  coverage epochs, checkpoint publication links, retention, and crash recovery.
+- Added full-checkpoint restore with mandatory preview, pre-restore and result
+  checkpoints, exact filesystem preimages, unchanged `HEAD` and index, undo,
+  rollback, and forward repair.
+- Added transactional setup, all-repository migration, structured integration
+  ownership, service rendering, isolated self-test, rollback, and safe default
+  uninstall with separately confirmed data purge.
+- Added registry v2 common-directory/worktree identities and the v20 operation,
+  checkpoint, publication, and restore records.
+
 ## v2026-08-07
 
 ### Fixed
