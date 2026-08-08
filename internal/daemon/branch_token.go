@@ -356,6 +356,10 @@ func LoadBranchHead(ctx context.Context, db *state.DB) (string, error) {
 //
 // Returns (active, expiresRFC3339, error).
 func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time) (bool, string, error) {
+	return maybeSetRewindGraceWithDuration(ctx, repoDir, db, prevToken, newToken, now, resolveRewindGrace())
+}
+
+func maybeSetRewindGraceWithDuration(ctx context.Context, repoDir string, db *state.DB, prevToken, newToken string, now time.Time, grace time.Duration) (bool, string, error) {
 	prevHead := tokenSHA(prevToken)
 	newHead := tokenSHA(newToken)
 	prevBranchRef := tokenBranchRef(prevToken)
@@ -363,7 +367,6 @@ func maybeSetRewindGrace(ctx context.Context, repoDir string, db *state.DB, prev
 	if prevHead == "" || newHead == "" || prevBranchRef == "" || newBranchRef == "" || prevBranchRef != newBranchRef {
 		return false, "", nil
 	}
-	grace := resolveRewindGrace()
 	if grace <= 0 {
 		return false, "", nil
 	}
@@ -437,7 +440,10 @@ func resolveRewindGrace() time.Duration {
 // Best-effort: any DB / parse failure short-circuits with the corresponding
 // error and the marker is left as-is.
 func ClampRewindGraceAtStartup(ctx context.Context, db *state.DB, now time.Time) (clamped bool, original, replacement string, err error) {
-	grace := resolveRewindGrace()
+	return clampRewindGraceAtStartupWithDuration(ctx, db, now, resolveRewindGrace())
+}
+
+func clampRewindGraceAtStartupWithDuration(ctx context.Context, db *state.DB, now time.Time, grace time.Duration) (clamped bool, original, replacement string, err error) {
 	if grace <= 0 {
 		return false, "", "", nil
 	}
