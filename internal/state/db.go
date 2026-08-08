@@ -34,6 +34,11 @@ const driverName = "sqlite"
 // DBFileName is the per-repo SQLite filename inside .git/acd/.
 const DBFileName = "state.db"
 
+// ErrSetupRequired prevents the v20 runtime from performing the repository's
+// one-shot migration as an incidental side effect. Only transactional setup
+// may create or upgrade a runtime database.
+var ErrSetupRequired = errors.New("state: checkpoint-first setup required")
+
 // DB wraps the per-repo SQLite handles plus a small amount of derived metadata.
 //
 // All exported helpers in this package take *DB and a context.Context, so the
@@ -159,6 +164,90 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 	}
 
 	return d, nil
+}
+
+// OpenRuntime opens a database only when setup has already committed schema
+// v20. Unlike Open, it never creates a file or runs a migration for an older
+// repository. This is the entry point for supervisor-managed workers.
+func OpenRuntime(ctx context.Context, dbPath string) (*DB, error) {
+	version, err := ReadUserVersion(ctx, dbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: state database does not exist", ErrSetupRequired)
+		}
+		return nil, err
+	}
+	if version != SchemaVersion {
+		return nil, fmt.Errorf("%w: state database schema is v%d, want v%d",
+			ErrSetupRequired, version, SchemaVersion)
+	}
+	return Open(ctx, dbPath)
+}
+
+// OpenReadOnly opens an existing state database without creating directories,
+// migrating its schema, or exposing a writer-capable connection. It is used by
+// setup preflight when legacy capture state must be proved before the cutover.
+func OpenReadOnly(ctx context.Context, dbPath string) (*DB, error) {
+	if dbPath == "" {
+		return nil, fmt.Errorf("state: empty dbPath")
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(ON)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	dsn := "file:" + dbPath + "?" + q.Encode()
+	conn, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("state: open read-only: %w", err)
+	}
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("state: ping read-only: %w", err)
+	}
+	readConn, err := sql.Open(driverName, dsn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("state: open read-only pool: %w", err)
+	}
+	readConn.SetMaxOpenConns(4)
+	readConn.SetMaxIdleConns(4)
+	if err := readConn.PingContext(ctx); err != nil {
+		_ = readConn.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("state: ping read-only: %w", err)
+	}
+	return &DB{conn: conn, readConn: readConn, path: dbPath}, nil
+}
+
+// ReadUserVersion inspects an existing SQLite file without creating or
+// migrating it. Setup uses this for planning and workers use it as a cutover
+// gate before opening a writer.
+func ReadUserVersion(ctx context.Context, dbPath string) (int, error) {
+	if dbPath == "" {
+		return 0, fmt.Errorf("state: empty dbPath")
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return 0, err
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(ON)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return 0, fmt.Errorf("state: inspect schema: %w", err)
+	}
+	defer conn.Close()
+	var version int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return 0, fmt.Errorf("state: inspect schema version: %w", err)
+	}
+	return version, nil
 }
 
 // buildDSN composes the modernc.org/sqlite DSN with the PRAGMAs required by
