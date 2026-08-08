@@ -659,6 +659,8 @@ CREATE TABLE IF NOT EXISTS checkpoints(
                            ('prepared','completed','needs_action')),
     created_ts          REAL NOT NULL,
     completed_ts        REAL,
+	retained            INTEGER NOT NULL DEFAULT 1 CHECK (retained IN (0,1)),
+	pruned_ts           REAL,
     error               TEXT NOT NULL DEFAULT '',
     CHECK (length(worktree_id) = 16),
     CHECK (coverage_epoch <= observation_epoch),
