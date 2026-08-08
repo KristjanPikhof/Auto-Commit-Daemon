@@ -419,11 +419,11 @@ func codexLegacyJSONManagedKeyNote(path string) string {
 // destructive) form first, then the full-overwrite form as an alternative so
 // users with custom hooks are not surprised by silent config loss.
 var driftRemediationCommands = map[string]string{
-	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
-	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
-	"cursor":      "acd setup cursor  # merge output into ~/.cursor/hooks.json; to overwrite: cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak && acd setup cursor --raw > ~/.cursor/hooks.json",
-	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
-	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
+	"claude-code": "acd setup --integrations=claude-code",
+	"codex":       "acd setup --integrations=codex",
+	"cursor":      "acd setup --integrations=cursor",
+	"opencode":    "acd setup --integrations=opencode",
+	"pi":          "acd setup --integrations=pi",
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
@@ -500,8 +500,12 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
 		return true
 	}
+	if strings.Contains(body, "acd internal session open") &&
+		strings.Contains(body, "acd internal hint --kind wake") {
+		return true
+	}
 	if harness == "cursor" {
-		return cursorLifecycleCommandOK("wake", body)
+		return false
 	}
 	return false
 }
@@ -544,6 +548,9 @@ var codexTouchInvocation = regexp.MustCompile(
 )
 
 func codexStopHasSoftBoundary(command string) bool {
+	if strings.Contains(command, "acd internal hint --kind soft_boundary") {
+		return true
+	}
 	for _, invocation := range codexTouchInvocation.FindAllString(command, -1) {
 		for _, field := range strings.Fields(invocation) {
 			field = strings.Trim(field, `'"(){}[]`)
@@ -579,13 +586,15 @@ func countCursorStaleLifecycleCommands(body []byte) int {
 func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
 	switch wantSubcmd {
 	case "wake":
-		return strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")
+		return (strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")) ||
+			(strings.Contains(command, "acd internal session open") &&
+				strings.Contains(command, "acd internal hint --kind wake"))
 	case "start":
-		return strings.Contains(command, "acd start")
+		return strings.Contains(command, "acd start") || strings.Contains(command, "acd internal session open")
 	case "flush":
-		return strings.Contains(command, "acd flush --logical")
+		return strings.Contains(command, "acd flush --logical") || strings.Contains(command, "acd internal hint --kind logical_boundary")
 	case "stop":
-		return strings.Contains(command, "acd stop")
+		return strings.Contains(command, "acd stop") || strings.Contains(command, "acd internal session close")
 	}
 	return false
 }
