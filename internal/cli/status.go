@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
 	_ "modernc.org/sqlite"
@@ -35,42 +36,51 @@ type statusClient struct {
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
-	Repo                  string                    `json:"repo"`
-	RepoHash              string                    `json:"repo_hash"`
-	Daemon                string                    `json:"daemon"`
-	Stale                 bool                      `json:"stale"`
-	PID                   int                       `json:"pid"`
-	StartedTS             int64                     `json:"started_ts,omitempty"`
-	UptimeSeconds         int64                     `json:"uptime_seconds,omitempty"`
-	HeartbeatTS           int64                     `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeSeconds   int64                     `json:"heartbeat_age_seconds,omitempty"`
-	BranchRef             string                    `json:"branch_ref,omitempty"`
-	BranchGenToken        string                    `json:"branch_generation_token,omitempty"`
-	Clients               []statusClient            `json:"clients"`
-	PendingEvents         int                       `json:"pending_events"`
-	BlockedConflicts      int                       `json:"blocked_conflicts"`
-	ActiveBarriers        int                       `json:"active_barriers,omitempty"`
-	ActiveTerminalEvents  int                       `json:"active_terminal_events,omitempty"`
-	FailedEvents          int                       `json:"failed_events"`
-	FailedBlockingPending int                       `json:"failed_blocking_pending"`
-	LastCommitOID         string                    `json:"last_commit_oid,omitempty"`
-	LastCommitTS          int64                     `json:"last_commit_ts,omitempty"`
-	LastCommitMessage     string                    `json:"last_commit_message,omitempty"`
-	CaptureErrors         int                       `json:"capture_errors"`
-	Paused                bool                      `json:"paused,omitempty"`
-	Pause                 *pauseInfo                `json:"pause,omitempty"`
-	BackpressurePaused    bool                      `json:"backpressure_paused,omitempty"`
-	BackpressurePausedAt  string                    `json:"backpressure_paused_at,omitempty"`
-	EventsDroppedTotal    int64                     `json:"events_dropped_total,omitempty"`
-	DecisionCounts        map[string]int            `json:"decision_counts,omitempty"`
-	RecentDecisions       []eventEntry              `json:"recent_decisions,omitempty"`
-	DecisionCursor        int64                     `json:"decision_cursor,omitempty"`
-	IntentStrategy        intentStrategyReport      `json:"intent_strategy"`
-	RuntimeConfig         runtimeConfigReport       `json:"runtime_config"`
-	Configuration         configReadinessReport     `json:"configuration"`
-	Replay                replayObservabilityReport `json:"replay"`
-	IntentV2              intentV2Report            `json:"intent_v2"`
-	SelfPublication       selfPublicationReport     `json:"self_publication"`
+	Repo                          string                    `json:"repo"`
+	RepoHash                      string                    `json:"repo_hash"`
+	Daemon                        string                    `json:"daemon"`
+	Stale                         bool                      `json:"stale"`
+	PID                           int                       `json:"pid"`
+	StartedTS                     int64                     `json:"started_ts,omitempty"`
+	UptimeSeconds                 int64                     `json:"uptime_seconds,omitempty"`
+	HeartbeatTS                   int64                     `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeSeconds           int64                     `json:"heartbeat_age_seconds,omitempty"`
+	BranchRef                     string                    `json:"branch_ref,omitempty"`
+	BranchGenToken                string                    `json:"branch_generation_token,omitempty"`
+	Clients                       []statusClient            `json:"clients"`
+	PendingEvents                 int                       `json:"pending_events"`
+	BlockedConflicts              int                       `json:"blocked_conflicts"`
+	ActiveBarriers                int                       `json:"active_barriers,omitempty"`
+	ActiveTerminalEvents          int                       `json:"active_terminal_events,omitempty"`
+	FailedEvents                  int                       `json:"failed_events"`
+	FailedBlockingPending         int                       `json:"failed_blocking_pending"`
+	LastCommitOID                 string                    `json:"last_commit_oid,omitempty"`
+	LastCommitTS                  int64                     `json:"last_commit_ts,omitempty"`
+	LastCommitMessage             string                    `json:"last_commit_message,omitempty"`
+	CaptureErrors                 int                       `json:"capture_errors"`
+	Paused                        bool                      `json:"paused,omitempty"`
+	Pause                         *pauseInfo                `json:"pause,omitempty"`
+	BackpressurePaused            bool                      `json:"backpressure_paused,omitempty"`
+	BackpressurePausedAt          string                    `json:"backpressure_paused_at,omitempty"`
+	EventsDroppedTotal            int64                     `json:"events_dropped_total,omitempty"`
+	DecisionCounts                map[string]int            `json:"decision_counts,omitempty"`
+	RecentDecisions               []eventEntry              `json:"recent_decisions,omitempty"`
+	DecisionCursor                int64                     `json:"decision_cursor,omitempty"`
+	IntentStrategy                intentStrategyReport      `json:"intent_strategy"`
+	RuntimeConfig                 runtimeConfigReport       `json:"runtime_config"`
+	Configuration                 configReadinessReport     `json:"configuration"`
+	Replay                        replayObservabilityReport `json:"replay"`
+	IntentV2                      intentV2Report            `json:"intent_v2"`
+	SelfPublication               selfPublicationReport     `json:"self_publication"`
+	CheckpointProtectionAvailable bool                      `json:"checkpoint_protection_available"`
+	Protected                     bool                      `json:"protected"`
+	ObservationEpoch              int64                     `json:"observation_epoch,omitempty"`
+	CoveredEpoch                  int64                     `json:"covered_epoch,omitempty"`
+	LatestCheckpointID            string                    `json:"latest_checkpoint_id,omitempty"`
+	UnpublishedCheckpoints        int                       `json:"unpublished_checkpoints,omitempty"`
+	CheckpointRetentionOverBudget bool                      `json:"checkpoint_retention_over_budget,omitempty"`
+	FullPollTS                    float64                   `json:"full_poll_ts,omitempty"`
+	WatcherQueueDepth             int                       `json:"watcher_queue_depth,omitempty"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -185,6 +195,58 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 	defer conn.Close()
 	if err := conn.PingContext(ctx); err != nil {
 		return report, fmt.Errorf("ping state.db: %w", err)
+	}
+	var schemaVersion int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&schemaVersion); err != nil {
+		return report, fmt.Errorf("read schema version: %w", err)
+	}
+	if schemaVersion >= 20 {
+		report.CheckpointProtectionAvailable = true
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionObservationEpoch); ok {
+			report.ObservationEpoch, _ = strconv.ParseInt(value, 10, 64)
+		}
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionCoveredEpoch); ok {
+			report.CoveredEpoch, _ = strconv.ParseInt(value, 10, 64)
+		}
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionCheckpointID); ok {
+			report.LatestCheckpointID = value
+		}
+		complete := false
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete); ok {
+			complete = strings.EqualFold(value, "true")
+		}
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionRetentionOverBudget); ok {
+			report.CheckpointRetentionOverBudget = value == "true" || value == "needs_action"
+		}
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionFullPollTS); ok {
+			report.FullPollTS, _ = strconv.ParseFloat(value, 64)
+		}
+		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionWatcherQueueDepth); ok {
+			report.WatcherQueueDepth, _ = strconv.Atoi(value)
+		}
+		var prepared, needsAction int
+		if err := conn.QueryRowContext(ctx, `
+SELECT
+  COALESCE(SUM(CASE WHEN phase='prepared' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN phase='needs_action' THEN 1 ELSE 0 END), 0)
+FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
+			return report, fmt.Errorf("checkpoint phases: %w", err)
+		}
+		if err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM checkpoints cp
+WHERE cp.phase='completed'
+  AND EXISTS (
+      SELECT 1
+      FROM checkpoint_events ce
+      JOIN capture_events e ON e.seq=ce.event_seq
+      WHERE ce.checkpoint_id=cp.id AND e.state<>'published'
+  )`).Scan(&report.UnpublishedCheckpoints); err != nil {
+			return report, fmt.Errorf("unpublished checkpoints: %w", err)
+		}
+		report.Protected = complete && report.LatestCheckpointID != "" &&
+			report.ObservationEpoch == report.CoveredEpoch &&
+			prepared == 0 && needsAction == 0
 	}
 
 	// daemon_state singleton.
