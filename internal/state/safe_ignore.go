@@ -143,6 +143,22 @@ func NewSafeIgnoreMatcher() *SafeIgnoreMatcher {
 	return &SafeIgnoreMatcher{patterns: SafeIgnorePatterns()}
 }
 
+// NewSafeIgnoreMatcherFromValues builds a repository-scoped matcher without
+// changing process environment. The enabled value uses the established
+// false-like semantics and extra appends only valid relative patterns.
+func NewSafeIgnoreMatcherFromValues(enabled, extra string) *SafeIgnoreMatcher {
+	if safeIgnoreDisabled(enabled) {
+		return &SafeIgnoreMatcher{}
+	}
+	patterns := make([]string, 0, len(DefaultSafeIgnorePatterns))
+	for _, raw := range append(append([]string(nil), DefaultSafeIgnorePatterns...), splitAndTrim(extra)...) {
+		if normalized, ok := normalizeSafeIgnorePattern(raw); ok {
+			patterns = append(patterns, normalized)
+		}
+	}
+	return &SafeIgnoreMatcher{patterns: dedupeStrings(patterns)}
+}
+
 // Match reports whether rel matches any safe-ignore pattern.
 func (m *SafeIgnoreMatcher) Match(rel string) bool {
 	return m.match(rel, true)
