@@ -227,6 +227,56 @@ func TestReconcile_LargeChainHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestProveUnpublishedChainIsReadOnly(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	before, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before: %v", err)
+	}
+	after, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, "doc.md", before, "base")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update base: %v", err)
+	}
+	seq, _, _ := seedBlockedModify(t, ctx, f, "doc.md", before, after, base)
+
+	readOnlyDB, err := state.OpenReadOnly(ctx, f.db.Path())
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer readOnlyDB.Close()
+	proof, err := ProveUnpublishedChain(ctx, f.dir, readOnlyDB, RecoveryReconcileOptions{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq:         seq,
+	})
+	if err != nil {
+		t.Fatalf("ProveUnpublishedChain: %v", err)
+	}
+	if !proof.Handled || proof.Outcome != state.EventStateRecovered ||
+		proof.FirstSeq != seq || proof.LastSeq != seq || proof.EventCount != 1 {
+		t.Fatalf("proof=%+v want one recovered event", proof)
+	}
+	gotState, oid := readEventState(t, ctx, f.db, seq)
+	if gotState != state.EventStateBlockedConflict || oid.Valid {
+		t.Fatalf("proof changed event state=%q oid=%v", gotState, oid)
+	}
+	if count := countRecoverySnapshots(t, ctx, f.db); count != 0 {
+		t.Fatalf("proof created %d recovery snapshots", count)
+	}
+	if refs := recoveryRefs(t, ctx, f.dir); len(refs) != 0 {
+		t.Fatalf("proof created recovery refs: %v", refs)
+	}
+	if _, err := readOnlyDB.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET state = 'published' WHERE seq = ?`, seq); err == nil {
+		t.Fatal("read-only state handle accepted a write")
+	}
+}
+
 // TestReplay_SelfHealsBlockedWhenHeadAlreadyMatches covers the happy path:
 // a blocked_conflict row whose AfterOID matches HEAD's blob is promoted to
 // published with the handled_external_after_block decision, without minting
