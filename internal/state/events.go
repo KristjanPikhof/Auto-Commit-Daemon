@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 )
 
 // Capture event lifecycle state values stored in capture_events.state.
@@ -209,6 +210,69 @@ WHERE state = ?`, EventStatePending).Scan(&summary.Count, &summary.OldestSeq); e
 		return PendingCaptureQueueSummary{}, fmt.Errorf("state: count all pending capture events: %w", err)
 	}
 	return summary, nil
+}
+
+type UnresolvedCapturePair struct {
+	BranchRef  string
+	Generation int64
+	FirstSeq   int64
+	LastSeq    int64
+}
+
+// ReadUnresolvedCapturePairs inspects an existing repository database without
+// opening a writer or applying migrations.
+func ReadUnresolvedCapturePairs(ctx context.Context, dbPath string) ([]UnresolvedCapturePair, error) {
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(ON)")
+	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, `
+SELECT branch_ref, branch_generation, MIN(seq), MAX(seq)
+FROM capture_events
+WHERE state IN ('pending','blocked_conflict','failed')
+GROUP BY branch_ref, branch_generation
+ORDER BY branch_ref, branch_generation`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pairs []UnresolvedCapturePair
+	for rows.Next() {
+		var pair UnresolvedCapturePair
+		if err := rows.Scan(&pair.BranchRef, &pair.Generation, &pair.FirstSeq, &pair.LastSeq); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, pair)
+	}
+	return pairs, rows.Err()
+}
+
+// ListUnresolvedCapturePairs returns every immutable pair that setup must
+// prove or preserve before the one-shot v20 cutover can commit.
+func ListUnresolvedCapturePairs(ctx context.Context, d *DB) ([]UnresolvedCapturePair, error) {
+	rows, err := d.readSQL().QueryContext(ctx, `
+SELECT branch_ref, branch_generation, MIN(seq), MAX(seq)
+FROM capture_events
+WHERE state IN ('pending','blocked_conflict','failed')
+GROUP BY branch_ref, branch_generation
+ORDER BY branch_ref, branch_generation`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pairs []UnresolvedCapturePair
+	for rows.Next() {
+		var pair UnresolvedCapturePair
+		if err := rows.Scan(&pair.BranchRef, &pair.Generation, &pair.FirstSeq, &pair.LastSeq); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, pair)
+	}
+	return pairs, rows.Err()
 }
 
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
