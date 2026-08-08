@@ -105,6 +105,31 @@ type Options struct {
 	// the DB on exit — caller owns the lifetime.
 	DB *state.DB
 
+	// SkipDaemonLock is reserved for the supervisor's repository worker. The
+	// worker acquires the one canonical common-directory lock before starting
+	// all linked-worktree loops in its process. Direct daemon entry points must
+	// leave this false.
+	SkipDaemonLock bool
+
+	// OperationGate serializes protection/publication passes with an explicit
+	// worker mutation such as restore. The supervisor worker owns the gate;
+	// ordinary direct daemon callers leave it nil.
+	OperationGate *sync.RWMutex
+
+	// PublicationHeld is consulted at every safe boundary. Setup workers use
+	// it to prove checkpoint coverage before a global cutover commits. A true
+	// result never pauses protection and never mutates the user's Git history.
+	PublicationHeld func() bool
+
+	// Protection settings are resolved per worktree by the supervisor. They
+	// must not be overlaid through process environment because one worker may
+	// host multiple linked worktrees with different repository settings.
+	MaxFileBytes               int64
+	SensitiveMatcher           *state.SensitiveMatcher
+	SafeIgnoreMatcher          *state.SafeIgnoreMatcher
+	RewindGrace                *time.Duration
+	ShadowRetentionGenerations *int64
+
 	// Logger emits all run-loop progress. Nil falls back to slog.Default().
 	Logger *slog.Logger
 
@@ -225,6 +250,10 @@ type Options struct {
 	// Trace receives best-effort decision records. Nil uses ACD_TRACE env
 	// wiring; disabled env returns a no-op logger.
 	Trace acdtrace.Logger
+	// PromptTrace is the repository-scoped sensitive prompt trace sink. Nil
+	// preserves the direct-daemon compatibility path that reads the legacy
+	// process environment.
+	PromptTrace prompttrace.Logger
 
 	// IntentPlanner overrides the intent planner used by Replay. Production
 	// leaves this nil; tests inject a recorder to assert run-loop gate
@@ -331,9 +360,13 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("close trace writer", "err", err.Error())
 		}
 	}()
-	promptTracer, err := prompttrace.NewFromEnv(opts.RepoPath, opts.GitDir)
-	if err != nil {
-		logger.Warn("initialize prompt trace writer", "err", err.Error())
+	promptTracer := opts.PromptTrace
+	if promptTracer == nil {
+		var err error
+		promptTracer, err = prompttrace.NewFromEnv(opts.RepoPath, opts.GitDir)
+		if err != nil {
+			logger.Warn("initialize prompt trace writer", "err", err.Error())
+		}
 	}
 	if promptTracer != nil {
 		defer func() {
@@ -536,17 +569,20 @@ func Run(ctx context.Context, opts Options) error {
 	clientTTL := resolveClientTTL(opts.ClientTTL)
 	eventRetention := opts.EventRetention // resolved inside PruneCaptureEvents
 
-	// 1. Acquire daemon.lock. Sentinel returned on contention.
-	dlock, err := AcquireDaemonLock(opts.GitDir)
-	if err != nil {
-		if errors.Is(err, ErrDaemonLockHeld) {
-			logger.Warn("daemon.lock contended; another daemon is alive",
-				"git_dir", opts.GitDir)
-			return err
+	// 1. Acquire daemon.lock. A supervisor worker may already own the one
+	// common-directory lock for every linked worktree it manages.
+	if !opts.SkipDaemonLock {
+		dlock, err := AcquireDaemonLock(opts.GitDir)
+		if err != nil {
+			if errors.Is(err, ErrDaemonLockHeld) {
+				logger.Warn("daemon.lock contended; another daemon is alive",
+					"git_dir", opts.GitDir)
+				return err
+			}
+			return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
 		}
-		return fmt.Errorf("daemon: acquire daemon.lock: %w", err)
+		defer func() { _ = dlock.Release() }()
 	}
-	defer func() { _ = dlock.Release() }()
 	cutoverBlock := ""
 	if rootsErr == nil {
 		if cutover, cutoverErr := EnsureIntentV2RuntimeCutover(
@@ -666,7 +702,15 @@ func Run(ctx context.Context, opts Options) error {
 	// jumped backward and was later corrected), the marker can sit far
 	// beyond the configured grace window. Cap to 2*grace; legitimate values
 	// stay untouched.
-	if clamped, original, replacement, err := ClampRewindGraceAtStartup(ctx, opts.DB, now()); err != nil {
+	rewindGrace := resolveRewindGrace()
+	if opts.RewindGrace != nil {
+		rewindGrace = *opts.RewindGrace
+	}
+	shadowRetention := resolveShadowRetentionGenerations()
+	if opts.ShadowRetentionGenerations != nil {
+		shadowRetention = *opts.ShadowRetentionGenerations
+	}
+	if clamped, original, replacement, err := clampRewindGraceAtStartupWithDuration(ctx, opts.DB, now(), rewindGrace); err != nil {
 		logger.Warn("clamp rewind grace meta at startup", "err", err.Error())
 	} else if clamped {
 		logger.Warn("clamped wall-clock-skewed rewind grace marker at startup",
@@ -708,11 +752,16 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("save daemon_state", "err", err.Error())
 		}
 	}
-	heartbeatNow("running", "daemon started")
 	checkpointStore := checkpointpkg.Store{DB: opts.DB}
 	if err := checkpointStore.RecoverPrepared(ctx, opts.RepoPath); err != nil {
 		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
 	}
+	if err := checkpointStore.RecoverRetention(ctx, opts.RepoPath); err != nil {
+		return fmt.Errorf("daemon: recover checkpoint retention: %w", err)
+	}
+	// Do not advertise running until every crash journal has been recovered;
+	// setup and status use this stamp as the worker readiness barrier.
+	heartbeatNow("running", "daemon started")
 	var shutdownCh <-chan struct{}
 	recoveryRootCtx := ctx
 	recoverSelfPublicationsPass := func(
@@ -1042,7 +1091,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 		if !branchTransitionBlocked && transition == TokenTransitionDiverged {
-			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, prevToken, currentToken, now())
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGraceWithDuration(ctx, opts.RepoPath, opts.DB, prevToken, currentToken, now(), rewindGrace)
 			if rewindErr != nil {
 				logger.Warn("detect startup rewind grace", "err", rewindErr.Error())
 			} else if rewindPaused {
@@ -1182,7 +1231,7 @@ func Run(ctx context.Context, opts Options) error {
 			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
 		}
 		if cctx.BranchRef != "" {
-			if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+			if pruned, pErr := pruneShadowGenerationsWithRetention(ctx, opts.DB, cctx, shadowRetention); pErr != nil {
 				logger.Warn("prune old shadow generations", "err", pErr.Error())
 			} else if pruned > 0 {
 				logger.Info("pruned old shadow generations", "rows", pruned)
@@ -1212,8 +1261,14 @@ func Run(ctx context.Context, opts Options) error {
 
 	ignoreChecker := git.NewIgnoreChecker(opts.RepoPath)
 	defer func() { _ = ignoreChecker.Close() }()
-	matcher := state.NewSensitiveMatcher()
-	safeIgnore := state.NewSafeIgnoreMatcher()
+	matcher := opts.SensitiveMatcher
+	if matcher == nil {
+		matcher = state.NewSensitiveMatcher()
+	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
 
 	// 3a. fsnotify watcher (D11 hybrid). Disabled by default so existing
 	// poll-only tests stay deterministic; the run loop subscribes to a
@@ -1555,6 +1610,7 @@ func Run(ctx context.Context, opts Options) error {
 			liveHead := tokenSHA(newToken)
 			tokenHead := tokenSHA(currentToken)
 			liveBranchRef := tokenBranchRef(newToken)
+			crossTickRewindDetected := false
 			if liveHead != "" && tokenHead != "" && liveBranchRef != "" {
 				persistedHead, lhErr := LoadBranchHead(ctx, opts.DB)
 				if lhErr != nil {
@@ -1569,16 +1625,27 @@ func Run(ctx context.Context, opts Options) error {
 							"err", aErr.Error())
 					} else if ok {
 						synthesizedPrev := branchTokenRev(persistedHead, liveBranchRef)
-						rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(
-							ctx, opts.RepoPath, opts.DB, synthesizedPrev, newToken, now())
+						rewindPaused, rewindUntil, rewindErr := maybeSetRewindGraceWithDuration(
+							ctx, opts.RepoPath, opts.DB, synthesizedPrev, newToken, now(), rewindGrace)
 						if rewindErr != nil {
 							logger.Warn(logPrefix+" cross-tick rewind grace failed",
 								"err", rewindErr.Error())
 						} else if rewindPaused {
+							crossTickRewindDetected = true
+							seeded, seedErr := ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx)
+							if seedErr != nil {
+								logger.Warn(logPrefix+" reseed shadow after cross-tick rewind",
+									"err", seedErr.Error())
+								traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
+								return true
+							}
+							traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded),
+								"cross-tick rewind shadow reseed", seeded)
 							logger.Info("replay paused after cross-tick same-SHA rewind",
 								"persisted_head", persistedHead,
 								"live_head", liveHead,
-								"until", rewindUntil)
+								"until", rewindUntil,
+								"shadow_rows", seeded)
 							recordTrace(tracer, acdtrace.Event{
 								Repo:       opts.RepoPath,
 								BranchRef:  liveBranchRef,
@@ -1607,7 +1674,14 @@ func Run(ctx context.Context, opts Options) error {
 			// last stamped — otherwise an idle daemon writes a meta row on
 			// every tick. A failure here just means the next probe sees the
 			// same stale value, matching the previous unconditional behaviour.
-			if liveHead != "" && liveHead != lastStampedBranchHead {
+			// A self-publication journal can update MetaKeyBranchHead before
+			// the run loop adopts its target in memory. If the user rewinds in
+			// that small window, lastStampedBranchHead may still equal the live
+			// HEAD even though the durable value is the abandoned publication
+			// target. A detected cross-tick rewind must therefore overwrite the
+			// durable value unconditionally; otherwise every later tick sees the
+			// same stale target and re-arms the grace window forever.
+			if liveHead != "" && (liveHead != lastStampedBranchHead || crossTickRewindDetected) {
 				if err := state.MetaSet(ctx, opts.DB, MetaKeyBranchHead, liveHead); err != nil {
 					logger.Warn(logPrefix+" stamp branch head per-tick",
 						"err", err.Error())
@@ -1799,7 +1873,7 @@ func Run(ctx context.Context, opts Options) error {
 		pruneShadowAfterAccept := false
 		if transition == TokenTransitionDiverged {
 			prevGeneration := cctx.BranchGeneration
-			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGrace(ctx, opts.RepoPath, opts.DB, oldToken, newToken, now())
+			rewindPaused, rewindUntil, rewindErr := maybeSetRewindGraceWithDuration(ctx, opts.RepoPath, opts.DB, oldToken, newToken, now(), rewindGrace)
 			if rewindErr != nil {
 				logger.Warn(logPrefix+" detect rewind grace failed", "err", rewindErr.Error())
 			} else if rewindPaused {
@@ -2035,7 +2109,7 @@ func Run(ctx context.Context, opts Options) error {
 				_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyManualPauseResumedAt)
 			}
 			if pruneShadowAfterAccept {
-				if pruned, pErr := pruneShadowGenerations(ctx, opts.DB, cctx); pErr != nil {
+				if pruned, pErr := pruneShadowGenerationsWithRetention(ctx, opts.DB, cctx, shadowRetention); pErr != nil {
 					logger.Warn("prune old shadow generations", "err", pErr.Error())
 				} else if pruned > 0 {
 					logger.Info("pruned old shadow generations", "rows", pruned)
@@ -2384,19 +2458,46 @@ func Run(ctx context.Context, opts Options) error {
 		// genuinely cannot answer "is replay paused?", assume yes.
 		daemonPaused := pauseErr != nil || daemonPaus.Active
 		if branchTransitionBlocked {
-			logger.Warn("capture/replay paused for branch transition settle")
+			logger.Warn("publication paused for branch transition settle; protection remains active")
 		} else if operationPaused {
-			logger.Warn("git operation in progress; capture/replay paused",
+			logger.Warn("git operation in progress; publication paused and protection remains active",
 				"operation", operationName)
 		} else if detachedHeadPaused {
 			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
 			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
-			logger.Warn("detached HEAD detected; capture/replay paused")
+			logger.Warn("detached HEAD detected; publication paused and protection remains active")
 		} else if daemonPaused {
-			logger.Warn("daemon paused; capture skipped",
+			logger.Warn("publication paused; protection remains active",
 				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
 			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
-		} else if cctx.BaseHead != "" {
+		}
+		publicationHeld := opts.PublicationHeld != nil && opts.PublicationHeld()
+		if publicationHeld {
+			logger.Info("publication held by transactional setup; protection remains active")
+		}
+		unsafePublication := branchTransitionBlocked || operationPaused || detachedHeadPaused || daemonPaused || publicationHeld
+		if opts.OperationGate != nil {
+			opts.OperationGate.RLock()
+		}
+		observationEpoch, observationErr := BeginProtectionObservation(passCtx, opts.DB)
+		if observationErr != nil {
+			capErr = observationErr
+		}
+		if capErr == nil && unsafePublication {
+			ignoreChecker.Invalidate()
+			capSum, capErr = ProtectWorktree(passCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
+				IgnoreChecker:     ignoreChecker,
+				SensitiveMatcher:  matcher,
+				SafeIgnoreMatcher: safeIgnore,
+				Trace:             tracer,
+				GitDir:            opts.GitDir,
+				CheckpointStore:   &checkpointStore,
+				WorktreeID:        checkpointpkg.WorktreeID(opts.RepoPath),
+				CheckpointReason:  state.CheckpointReasonPoll,
+				MaxFileBytes:      opts.MaxFileBytes,
+				ObservationEpoch:  observationEpoch,
+			})
+		} else if capErr == nil && cctx.BaseHead != "" {
 			// git check-ignore keeps ignore files loaded for the lifetime
 			// of its --stdin process. Refresh once per capture pass so
 			// newly-created or edited .gitignore files are honored even
@@ -2417,6 +2518,9 @@ func Run(ctx context.Context, opts Options) error {
 				CheckpointStore:   &checkpointStore,
 				WorktreeID:        checkpointpkg.WorktreeID(opts.RepoPath),
 				CheckpointReason:  state.CheckpointReasonPoll,
+				MaxFileBytes:      opts.MaxFileBytes,
+				DisablePendingCap: true,
+				ObservationEpoch:  observationEpoch,
 			})
 		}
 
@@ -2542,6 +2646,9 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
+		if opts.OperationGate != nil {
+			opts.OperationGate.RUnlock()
+		}
 		runtimeLease.Release()
 		if _, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
 			logger.Warn("queue settled experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
@@ -2630,6 +2737,23 @@ func Run(ctx context.Context, opts Options) error {
 				logger.Warn("prune events", "err", pErr.Error())
 			} else if n > 0 {
 				logger.Info("pruned events", "rows", n)
+			}
+			retention, retentionErr := checkpointStore.ApplyRetention(ctx, opts.RepoPath,
+				checkpointpkg.WorktreeID(opts.RepoPath), nowTS)
+			if retentionErr != nil {
+				logger.Warn("prune checkpoints", "err", retentionErr.Error())
+				_ = state.MetaSet(context.Background(), opts.DB, MetaKeyProtectionRetentionOverBudget, "needs_action")
+			} else {
+				value := "false"
+				if retention.OverBudget {
+					value = "true"
+					logger.Warn("checkpoint content exceeds soft budget",
+						"bytes", retention.ContentBytes, "protected_bytes", retention.ProtectedBytes)
+				}
+				_ = state.MetaSet(context.Background(), opts.DB, MetaKeyProtectionRetentionOverBudget, value)
+				if retention.Pruned > 0 {
+					logger.Info("pruned published checkpoints", "checkpoints", retention.Pruned)
+				}
 			}
 			lastPrune = nowTS
 		}
