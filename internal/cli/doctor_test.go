@@ -1234,7 +1234,7 @@ func TestDoctor_DriftWarningClaudeCodeWakeOnly(t *testing.T) {
 	if !strings.Contains(notes, "installed snippet drift") {
 		t.Fatalf("expected drift warning, got notes=%v", cc.Notes)
 	}
-	if !strings.Contains(notes, "acd setup claude-code --raw") {
+	if !strings.Contains(notes, "acd setup --integrations=claude-code") {
 		t.Fatalf("drift note missing remediation command, got notes=%v", cc.Notes)
 	}
 }
@@ -1787,11 +1787,11 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 				t.Fatalf("expected at least 2 active hook bodies for %s, got %d", tc.harness, len(bodies))
 			}
 			for i, b := range bodies {
-				if !strings.Contains(b, "acd start") {
-					t.Fatalf("%s active hook[%d] missing 'acd start' in body=%q", tc.harness, i, b)
+				if !strings.Contains(b, "acd internal session open") {
+					t.Fatalf("%s active hook[%d] missing session open in body=%q", tc.harness, i, b)
 				}
-				if !strings.Contains(b, "acd wake") {
-					t.Fatalf("%s active hook[%d] missing 'acd wake' in body=%q", tc.harness, i, b)
+				if !strings.Contains(b, "acd internal hint --kind wake") {
+					t.Fatalf("%s active hook[%d] missing wake hint in body=%q", tc.harness, i, b)
 				}
 			}
 			// Now strip the FIRST `acd start \` line under any
@@ -1799,7 +1799,7 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 			// only remove a line that begins (after whitespace) with
 			// `acd start` — the regression we are guarding against: drift
 			// detection silently never fires for real OpenCode/Pi configs.
-			drifted := stripFirstAcdStart(t, string(body))
+			drifted := strings.ReplaceAll(string(body), "acd internal session open", "acd internal session broken")
 			note := scanHookBodyDrift(tc.harness, []byte(drifted))
 			if note == "" {
 				t.Fatalf("%s drift snippet should report drift, got empty note", tc.harness)
@@ -1828,8 +1828,8 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 		}
 	}
 	drifted := strings.Replace(string(body),
-		`acd wake --session-id`,
-		`acd woke --session-id`, 1)
+		`acd internal hint --kind wake`,
+		`acd internal hint --kind woke`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("cursor drift snippet should report drift, got empty note")
@@ -1842,8 +1842,8 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
 	drifted := strings.Replace(string(body),
-		`acd start --harness cursor`,
-		`acd wake --session-id SID`, 1)
+		`acd internal session open`,
+		`acd internal hint --kind wake`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("sessionStart wired to wake should report drift")
@@ -1863,8 +1863,8 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 func TestJSONDrift_CursorRejectsMissingWakeCommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
 	drifted := strings.Replace(string(body),
-		`acd wake --session-id`,
-		`acd woke --session-id`, 1)
+		`acd internal hint --kind wake`,
+		`acd internal hint --kind woke`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("active hook without acd wake should report drift")
@@ -1915,7 +1915,7 @@ func TestDoctor_DriftWarningCursorActiveHook(t *testing.T) {
 	if !strings.Contains(notes, "installed snippet drift") {
 		t.Fatalf("expected drift warning, got notes=%v", cur.Notes)
 	}
-	if !strings.Contains(notes, "acd setup cursor") {
+	if !strings.Contains(notes, "acd setup --integrations=cursor") {
 		t.Fatalf("drift note missing remediation command, got notes=%v", cur.Notes)
 	}
 }
@@ -1927,28 +1927,9 @@ func TestDriftRemediation_CursorCanonicalPath(t *testing.T) {
 	if !ok {
 		t.Fatal("driftRemediationCommands missing entry for cursor")
 	}
-	for _, want := range []string{
-		"acd setup cursor",
-		"merge output into ~/.cursor/hooks.json",
-		"cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak",
-		"acd setup cursor --raw > ~/.cursor/hooks.json",
-	} {
+	for _, want := range []string{"acd setup --integrations=cursor"} {
 		if !strings.Contains(cmd, want) {
 			t.Fatalf("cursor remediation missing %q\nfull: %s", want, cmd)
-		}
-	}
-	tokens := extractPathTokensAfter(t, cmd, []string{
-		"merge output into ",
-		"cp ",
-		"--raw > ",
-	})
-	if len(tokens) == 0 {
-		t.Fatalf("cursor remediation: extracted 0 path tokens\nfull: %s", cmd)
-	}
-	for _, tok := range tokens {
-		normalized := strings.TrimSuffix(tok, ".bak")
-		if !strings.HasSuffix(normalized, "/.cursor/hooks.json") {
-			t.Fatalf("cursor remediation path token %q does not end with /.cursor/hooks.json\nfull: %s", tok, cmd)
 		}
 	}
 }
@@ -1972,65 +1953,16 @@ func TestDriftRemediation_CursorCanonicalPath(t *testing.T) {
 // but a future format like `~/.config/opencode/hooks.yaml.tmpl` would
 // confuse a naive Contains check).
 func TestDriftRemediation_OpenCodePiCanonicalPaths(t *testing.T) {
-	cases := []struct {
-		harness            string
-		mustContain        []string // every substring must appear in the hint
-		canonicalPathToken string   // each extracted path token must end with this
-	}{
-		{
-			harness: "opencode",
-			mustContain: []string{
-				"acd setup opencode",
-				"merge output into ~/.config/opencode/hook/hooks.yaml",
-				"cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak",
-				"acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
-			},
-			canonicalPathToken: "/hook/hooks.yaml",
-		},
-		{
-			harness: "pi",
-			mustContain: []string{
-				"acd setup pi",
-				"merge output into ~/.pi/agent/hook/hooks.yaml",
-				"cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak",
-				"acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
-			},
-			canonicalPathToken: "/agent/hook/hooks.yaml",
-		},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.harness, func(t *testing.T) {
-			cmd, ok := driftRemediationCommands[tc.harness]
+	for _, harness := range []string{"opencode", "pi"} {
+		harness := harness
+		t.Run(harness, func(t *testing.T) {
+			cmd, ok := driftRemediationCommands[harness]
 			if !ok {
-				t.Fatalf("driftRemediationCommands missing entry for %q", tc.harness)
+				t.Fatalf("driftRemediationCommands missing entry for %q", harness)
 			}
-			for _, want := range tc.mustContain {
-				if !strings.Contains(cmd, want) {
-					t.Fatalf("%s remediation missing %q\nfull: %s", tc.harness, want, cmd)
-				}
-			}
-			// Tighter assertion: extract every path-shaped token that
-			// appears after `merge output into `, `cp `, or `--raw > ` and
-			// confirm it ends with the canonical suffix. A leaked legacy
-			// token would end in `/hooks.yaml` (opencode) or `/hook/hooks.yaml`
-			// (pi) which differ from the canonical suffix.
-			tokens := extractPathTokensAfter(t, cmd, []string{
-				"merge output into ",
-				"cp ",
-				"--raw > ",
-			})
-			if len(tokens) == 0 {
-				t.Fatalf("%s remediation: extracted 0 path tokens\nfull: %s", tc.harness, cmd)
-			}
-			for _, tok := range tokens {
-				// Strip the `.bak` suffix used by the cp recipe so the
-				// canonical-suffix check applies uniformly to backup paths.
-				normalized := strings.TrimSuffix(tok, ".bak")
-				if !strings.HasSuffix(normalized, tc.canonicalPathToken) {
-					t.Fatalf("%s remediation path token %q does not end with canonical suffix %q\nfull: %s",
-						tc.harness, tok, tc.canonicalPathToken, cmd)
-				}
+			want := "acd setup --integrations=" + harness
+			if cmd != want {
+				t.Fatalf("%s remediation=%q, want %q", harness, cmd, want)
 			}
 		})
 	}
