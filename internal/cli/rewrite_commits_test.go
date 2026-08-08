@@ -14,9 +14,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -123,10 +123,7 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "deterministic")
 
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		t.Fatalf("repo hash: %v", err)
-	}
+	repoHash := central.CanonicalID(repo)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
 			Fields: config.Overrides{
@@ -140,7 +137,7 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
 		selection: git.RewriteSelectionOptions{Last: 1},
 		planOnly:  true,
 	}, false)
