@@ -22,14 +22,16 @@
 //
 // Versioning:
 //
-//	{"version": 1, "repos": [...]}
+//	{"version": 2, "repos": [...]}
 //
-// A document with version > 1 is rejected with ErrUnsupportedVersion so an
+// A document with version > 2 is rejected with ErrUnsupportedVersion so an
 // older binary cannot silently downgrade-write a newer registry.
 package central
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,12 +50,13 @@ import (
 )
 
 // RegistryVersion is the current schema version. Future bumps must be paired
-// with a forward migration in Load (and a documented compatibility window).
-const RegistryVersion = 1
+// with an explicit migration plan. Load deliberately preserves older versions
+// so read-only commands never perform the one-shot cutover implicitly.
+const RegistryVersion = 2
 
 // ErrUnsupportedVersion is returned when a registry on disk reports a
 // version newer than this binary understands. Older versions are accepted
-// and re-saved at RegistryVersion.
+// and retain their version until setup migrates them transactionally.
 var ErrUnsupportedVersion = errors.New("central: registry version unsupported")
 
 // Registry is the in-memory representation of registry.json (§6.2).
@@ -66,6 +69,10 @@ type Registry struct {
 type RepoRecord struct {
 	Path               string   `json:"path"`
 	RepoHash           string   `json:"repo_hash"`
+	RepositoryID       string   `json:"repository_id,omitempty"`
+	WorktreeID         string   `json:"worktree_id,omitempty"`
+	CommonDir          string   `json:"common_dir,omitempty"`
+	LegacyRepoHash     string   `json:"legacy_repo_hash,omitempty"`
 	StateDB            string   `json:"state_db"`
 	FirstRegisteredTS  int64    `json:"first_registered_ts"`
 	LastSeenTS         int64    `json:"last_seen_ts"`
@@ -138,7 +145,7 @@ type LegacyDuplicateChange struct {
 	Reason      string `json:"reason"`
 }
 
-// NewRegistry returns an empty v1 registry.
+// NewRegistry returns an empty v2 registry.
 func NewRegistry() *Registry {
 	return &Registry{Version: RegistryVersion, Repos: []RepoRecord{}}
 }
@@ -307,13 +314,33 @@ func (r *Registry) RegisterResolvedRepo(wt git.Worktree, harness string, now int
 	if wt.GitDir == "" {
 		return RepoRegistrationResult{}, fmt.Errorf("central: RegisterResolvedRepo: empty git dir")
 	}
-	repoHash, err := paths.RepoHash(wt.Root)
+	legacyRepoHash, err := paths.RepoHash(wt.Root)
 	if err != nil {
 		return RepoRegistrationResult{}, fmt.Errorf("central: repo hash: %w", err)
 	}
+	commonDir := wt.CommonDir
+	if commonDir == "" {
+		commonDir, err = git.GitCommonDir(context.Background(), wt.Root)
+		if err != nil {
+			return RepoRegistrationResult{}, fmt.Errorf("central: git common dir: %w", err)
+		}
+	}
+	repositoryID := canonicalID(commonDir)
+	worktreeID := canonicalID(wt.Root)
 	stateDB := state.DBPathFromGitDir(wt.GitDir)
 	_, existed := r.FindRepo(wt.Root, stateDB)
-	r.UpsertRepo(wt.Root, repoHash, stateDB, harness, now)
+	r.UpsertRepo(wt.Root, repositoryID, stateDB, harness, now)
+	for i := range r.Repos {
+		if SameRepoPath(r.Repos[i].Path, wt.Root) ||
+			sameCleanPath(canonicalStateDB(r.Repos[i].StateDB), canonicalStateDB(stateDB)) {
+			r.Repos[i].RepositoryID = repositoryID
+			r.Repos[i].WorktreeID = worktreeID
+			r.Repos[i].CommonDir = commonDir
+			r.Repos[i].LegacyRepoHash = legacyRepoHash
+			r.Repos[i].RepoHash = repositoryID
+			break
+		}
+	}
 	rec, ok := r.FindRepo(wt.Root, stateDB)
 	if !ok {
 		return RepoRegistrationResult{}, fmt.Errorf("central: registered repo row not found after upsert")
@@ -323,6 +350,70 @@ func (r *Registry) RegisterResolvedRepo(wt git.Worktree, harness string, now int
 		Inserted:  !existed,
 		Refreshed: existed,
 	}, nil
+}
+
+// CanonicalID returns the 16-hex v2 identity for one canonical filesystem
+// path. Repository IDs hash Git common directories; worktree IDs hash roots.
+func CanonicalID(path string) string { return canonicalID(path) }
+
+func canonicalID(path string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(path)))
+	return hex.EncodeToString(digest[:8])
+}
+
+// PlanRegistryV2 resolves every registered worktree and returns a detached v2
+// document. The input is never mutated, so setup can include the result in a
+// global plan digest and abort before any write when one identity is missing.
+func PlanRegistryV2(ctx context.Context, current *Registry) (*Registry, error) {
+	if current == nil {
+		return nil, errors.New("central: nil registry")
+	}
+	planned := &Registry{Version: RegistryVersion, Repos: make([]RepoRecord, 0, len(current.Repos))}
+	for _, existing := range current.Repos {
+		wt, err := git.ResolveWorktree(ctx, existing.Path)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("central: resolve registered worktree %s: %w", existing.Path, err)
+			}
+			summary, summaryErr := state.ReadLegacyWorkSummary(ctx, existing.StateDB)
+			if summaryErr != nil {
+				return nil, fmt.Errorf("central: inspect missing registered worktree %s: %w", existing.Path, summaryErr)
+			}
+			if summary.Unpublished > 0 || summary.Terminal > 0 || summary.OpenPublication > 0 {
+				return nil, fmt.Errorf("central: missing registered worktree %s has unresolved captured work", existing.Path)
+			}
+			// A missing worktree with no surviving unresolved state cannot be
+			// supervised, but it also must not brick setup for every live repo.
+			// Preserve the row as disabled migration metadata instead of
+			// silently deleting it. If the path returns, the user can explicitly
+			// enable it again after its identity is resolved.
+			existing.LifecycleState = RepoLifecycleDisabled
+			commonDir := filepath.Join(existing.Path, ".git")
+			if strings.TrimSpace(existing.StateDB) != "" {
+				commonDir = filepath.Dir(filepath.Dir(existing.StateDB))
+			}
+			legacy := existing.RepoHash
+			existing.RepositoryID = canonicalID(commonDir)
+			existing.WorktreeID = canonicalID(existing.Path)
+			existing.CommonDir = commonDir
+			existing.LegacyRepoHash = legacy
+			existing.RepoHash = existing.RepositoryID
+			planned.Repos = append(planned.Repos, existing)
+			continue
+		}
+		legacy := existing.RepoHash
+		repositoryID := canonicalID(wt.CommonDir)
+		existing.Path = wt.Root
+		existing.StateDB = state.DBPathFromGitDir(wt.GitDir)
+		existing.RepositoryID = repositoryID
+		existing.WorktreeID = canonicalID(wt.Root)
+		existing.CommonDir = wt.CommonDir
+		existing.LegacyRepoHash = legacy
+		existing.RepoHash = repositoryID
+		planned.Repos = append(planned.Repos, existing)
+	}
+	planned.Normalize()
+	return planned, nil
 }
 
 // FindRepo returns the row matching path or any supplied state DB path. It
@@ -533,6 +624,18 @@ func mergeRepoRecord(dst *RepoRecord, src RepoRecord) {
 		}
 		if src.RepoHash != "" {
 			dst.RepoHash = src.RepoHash
+		}
+		if src.RepositoryID != "" {
+			dst.RepositoryID = src.RepositoryID
+		}
+		if src.WorktreeID != "" {
+			dst.WorktreeID = src.WorktreeID
+		}
+		if src.CommonDir != "" {
+			dst.CommonDir = src.CommonDir
+		}
+		if src.LegacyRepoHash != "" {
+			dst.LegacyRepoHash = src.LegacyRepoHash
 		}
 		if shouldReplaceStateDB(dst.StateDB, src.StateDB) {
 			dst.StateDB = src.StateDB
