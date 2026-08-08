@@ -222,25 +222,29 @@ func treeBlobOIDs(t *testing.T, repo, tree, path string) map[string]string {
 
 func assertSquashBacklogControlHealth(t *testing.T, ctx context.Context, env []string, repo string) {
 	t.Helper()
-	res := runAcd(t, ctx, env, "--repo", repo, "--json")
-	if res.ExitCode != 0 {
-		t.Fatalf("bare acd exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	type statusEnvelope struct {
+		State string `json:"state"`
+		Data  struct {
+			Enabled       bool   `json:"enabled"`
+			Protected     bool   `json:"protected"`
+			Worker        string `json:"worker"`
+			PendingEvents int    `json:"pending_events"`
+			BlockedEvents int    `json:"blocked_events"`
+		} `json:"data"`
 	}
-	var health struct {
-		Health        string `json:"health"`
-		Daemon        string `json:"daemon"`
-		Enabled       bool   `json:"enabled"`
-		PendingEvents int    `json:"pending_events"`
-		BlockedEvents int    `json:"blocked_events"`
-	}
-	if err := json.Unmarshal([]byte(res.Stdout), &health); err != nil {
-		t.Fatalf("decode bare acd health: %v\n%s", err, res.Stdout)
-	}
-	if !health.Enabled || health.Daemon != "running" || health.PendingEvents != 0 || health.BlockedEvents != 0 {
-		t.Fatalf("bare acd health=%+v", health)
-	}
-	if health.Health != "healthy" && health.Health != "degraded" {
-		t.Fatalf("bare acd health class=%q want healthy or degraded", health.Health)
+	var last ExecResult
+	var health statusEnvelope
+	waitFor(t, "protected squash backlog control health", 10*time.Second, func() bool {
+		last = runAcd(t, ctx, env, "--repo", repo, "--json")
+		if last.ExitCode != 0 || json.Unmarshal([]byte(last.Stdout), &health) != nil {
+			return false
+		}
+		return health.Data.Enabled && health.Data.Protected && health.Data.Worker == "running" &&
+			health.Data.PendingEvents == 0 && health.Data.BlockedEvents == 0
+	})
+	if health.State != "protected" {
+		t.Fatalf("bare acd state=%q want protected\nstdout=%s\nstderr=%s",
+			health.State, last.Stdout, last.Stderr)
 	}
 }
 
