@@ -29,8 +29,8 @@ func TestCommitAll_FlagsRegistered(t *testing.T) {
 	}
 }
 
-// TestCommitAll_HelpExposesCommand verifies the root command tree wires the
-// command in and the help text mentions it.
+// TestCommitAll_HelpHidesCompatibilityCommand verifies the compatibility
+// route remains callable without exposing repair internals in root help.
 func TestCommitAll_HelpExposesCommand(t *testing.T) {
 	root := newRootCmd()
 	var out bytes.Buffer
@@ -40,8 +40,12 @@ func TestCommitAll_HelpExposesCommand(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("root help: %v", err)
 	}
-	if !strings.Contains(out.String(), "acd commit-all") {
-		t.Fatalf("root help missing commit-all entry:\n%s", out.String())
+	if strings.Contains(out.String(), "commit-all") {
+		t.Fatalf("root help exposes commit-all compatibility route:\n%s", out.String())
+	}
+	command, _, err := root.Find([]string{"commit-all"})
+	if err != nil || command == nil || !command.Hidden {
+		t.Fatalf("commit-all compatibility route missing or visible: command=%v err=%v", command, err)
 	}
 }
 
