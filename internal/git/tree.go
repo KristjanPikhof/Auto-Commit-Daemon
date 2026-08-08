@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -110,6 +111,23 @@ func HashObjectStdin(ctx context.Context, repoDir string, content []byte) (strin
 		Dir:   repoDir,
 		Stdin: bytes.NewReader(content),
 	}, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// HashObjectStdinReadOnly computes the Git blob ID without writing the object.
+// It is used by restore preview, whose contract forbids repository mutation.
+func HashObjectStdinReadOnly(ctx context.Context, repoDir string, content []byte) (string, error) {
+	return HashObjectReaderReadOnly(ctx, repoDir, bytes.NewReader(content))
+}
+
+// HashObjectReaderReadOnly computes the Git blob ID for a stream without
+// writing the object. Unlike the byte-slice helper, it can verify an existing
+// large Git blob without retaining the complete file in memory.
+func HashObjectReaderReadOnly(ctx context.Context, repoDir string, content io.Reader) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Stdin: content}, "hash-object", "--stdin")
 	if err != nil {
 		return "", err
 	}
