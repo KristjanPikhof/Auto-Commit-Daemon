@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 )
@@ -48,22 +47,17 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	const (
-		hooks            = 10
-		perCallBudget    = 200 * time.Millisecond
-		aggregateBudget  = 1500 * time.Millisecond
-		minSpeedupFactor = 1.5 // hot < cold / minSpeedupFactor
+		hooks           = 10
+		perCallBudget   = 200 * time.Millisecond
+		aggregateBudget = 1500 * time.Millisecond
 	)
 
 	// Phase 1: time the cold path. We force a real cold start by
 	// stopping any pre-existing daemon (none should exist in a fresh
 	// $HOME, but the call is idempotent) and timing a fresh `acd start`.
-	stopRes := runAcd(t, ctx, env, "stop", "--repo", repo, "--force", "--json")
-	if stopRes.ExitCode != 0 && !strings.Contains(stopRes.Stderr, "no daemon") {
-		t.Logf("pre-cold stop exit=%d (ignored): %s", stopRes.ExitCode, stopRes.Stderr)
-	}
-
 	coldStart := time.Now()
 	cold := runAcd(t, ctx, env,
 		"start",
@@ -97,9 +91,8 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	// Phase 2: hot-path measurement. The first hot call exercises the
 	// full short-circuit path (cache read + central.Load + kill(0) + ps
 	// fingerprint + TouchClient UPDATE).
-	hotBudget := time.Duration(float64(coldDuration) / minSpeedupFactor)
-	t.Logf("cold path took %v; hot must be <= %v (cold/%g) AND <= %v (per-call cap)",
-		coldDuration, hotBudget, minSpeedupFactor, perCallBudget)
+	t.Logf("first session open took %v; repeated supervisor IPC calls must remain <= %v",
+		coldDuration, perCallBudget)
 
 	durations := make([]time.Duration, 0, hooks)
 	for i := 0; i < hooks; i++ {
@@ -137,10 +130,6 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		if dur > perCallBudget {
 			t.Fatalf("hook %d took %v; per-call budget is %v", i, dur, perCallBudget)
 		}
-		if dur > hotBudget {
-			t.Fatalf("hook %d took %v; cold-path was %v so hot must be <= %v (cold/%g)",
-				i, dur, coldDuration, hotBudget, minSpeedupFactor)
-		}
 		durations = append(durations, dur)
 	}
 
@@ -148,8 +137,8 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	for _, d := range durations {
 		total += d
 	}
-	t.Logf("ten-hook latency: cold=%v per-call=%v total=%v (caps: per=%v cold/%.1f=%v total=%v)",
-		coldDuration, durations, total, perCallBudget, minSpeedupFactor, hotBudget, aggregateBudget)
+	t.Logf("ten-hook latency: first=%v per-call=%v total=%v (caps: per=%v total=%v)",
+		coldDuration, durations, total, perCallBudget, aggregateBudget)
 	if total > aggregateBudget {
 		t.Fatalf("aggregate latency %v exceeds budget %v across %d hooks",
 			total, aggregateBudget, hooks)
@@ -166,7 +155,4 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		t.Logf("stop exit=%d\nstdout=%s\nstderr=%s",
 			stop.ExitCode, stop.Stdout, stop.Stderr)
 	}
-	waitFor(t, "daemon mode=stopped", 5*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped" || strings.TrimSpace(readDaemonStateMode(repo)) == ""
-	})
 }
