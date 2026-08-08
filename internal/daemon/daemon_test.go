@@ -3652,6 +3652,19 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	if !ok {
 		t.Fatal("ancestry probe expected seedHead to be ancestor of advanced")
 	}
+	advancedOID, err := git.LsTreeBlobOID(ctx, f.dir, advanced, "advanced.txt")
+	if err != nil {
+		t.Fatalf("resolve advanced.txt blob: %v", err)
+	}
+	if err := state.UpsertShadowPath(ctx, f.db, state.ShadowPath{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Path: "advanced.txt", Operation: "modify",
+		Mode:     sql.NullString{String: "100644", Valid: true},
+		OID:      sql.NullString{String: advancedOID, Valid: true},
+		BaseHead: advanced, Fidelity: "full",
+	}); err != nil {
+		t.Fatalf("seed stale published shadow row: %v", err)
+	}
 
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
@@ -3714,6 +3727,13 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 			t.Fatalf("MetaGet paused_until: %v", err)
 		}
 		if ok && got != "" {
+			waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+			if _, found, shadowErr := state.GetShadowPath(ctx, f.db,
+				"refs/heads/main", 1, "advanced.txt"); shadowErr != nil {
+				t.Fatalf("read advanced.txt shadow after rewind: %v", shadowErr)
+			} else if found {
+				t.Fatal("cross-tick rewind retained shadow content from the abandoned published head")
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
