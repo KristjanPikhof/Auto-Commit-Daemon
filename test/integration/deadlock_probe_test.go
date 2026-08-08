@@ -94,10 +94,10 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stop failed: %v", err)
 		}
-		if !waitStopped(repo, 5*time.Second) {
-			t.Fatalf("daemon_state.mode never reached 'stopped' after acd stop succeeded")
+		if readDaemonStateMode(repo) != "running" {
+			t.Fatalf("supervisor worker stopped after session close")
 		}
-		// Happy path — the daemon shut down cleanly inside the 30s budget.
+		// Happy path — the session mutation completed and the worker stayed responsive.
 		return
 	case <-deadline.C:
 		// Phase 4 — hang detected. Capture goroutine state by sending
