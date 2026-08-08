@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -125,8 +126,8 @@ func TestRegistry_LoadOldRowsDefaultToEnabled(t *testing.T) {
 	if rec.LifecycleStateName() != RepoLifecycleEnabled || rec.LifecycleUpdatedTS != 0 {
 		t.Fatalf("lifecycle=%+v, want enabled old row", rec)
 	}
-	if reg.Version != RegistryVersion {
-		t.Fatalf("version=%d, want %d", reg.Version, RegistryVersion)
+	if reg.Version != 1 {
+		t.Fatalf("version=%d, want preserved legacy version 1", reg.Version)
 	}
 }
 
@@ -336,10 +337,12 @@ func TestRegistry_RegisterResolvedRepoRefreshPreservesFirstTimestamp(t *testing.
 	if err != nil {
 		t.Fatalf("resolve worktree: %v", err)
 	}
-	wantHash, err := paths.RepoHash(wt.Root)
+	wantLegacyHash, err := paths.RepoHash(wt.Root)
 	if err != nil {
 		t.Fatalf("RepoHash: %v", err)
 	}
+	wantRepositoryID := CanonicalID(wt.CommonDir)
+	wantWorktreeID := CanonicalID(wt.Root)
 	wantStateDB := state.DBPathFromGitDir(wt.GitDir)
 
 	reg := NewRegistry()
@@ -361,7 +364,10 @@ func TestRegistry_RegisterResolvedRepoRefreshPreservesFirstTimestamp(t *testing.
 		t.Fatalf("repos=%d, want 1", len(reg.Repos))
 	}
 	rec := second.Record
-	if rec.Path != wt.Root || rec.RepoHash != wantHash || rec.StateDB != wantStateDB {
+	if rec.Path != wt.Root || rec.RepoHash != wantRepositoryID ||
+		rec.RepositoryID != wantRepositoryID || rec.WorktreeID != wantWorktreeID ||
+		rec.CommonDir != wt.CommonDir || rec.LegacyRepoHash != wantLegacyHash ||
+		rec.StateDB != wantStateDB {
 		t.Fatalf("record=%+v, want resolved worktree metadata", rec)
 	}
 	if rec.FirstRegisteredTS != 10 || rec.LastSeenTS != 30 {
@@ -370,6 +376,110 @@ func TestRegistry_RegisterResolvedRepoRefreshPreservesFirstTimestamp(t *testing.
 	wantHarnesses := []string{"codex", "pi"}
 	if !reflect.DeepEqual(rec.Harnesses, wantHarnesses) {
 		t.Fatalf("harnesses=%v, want %v", rec.Harnesses, wantHarnesses)
+	}
+}
+
+func TestPlanRegistryV2GroupsLinkedWorktreesByCommonDirectory(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatalf("symbolic-ref HEAD: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "--allow-empty", "-m", "seed"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	linked := filepath.Join(t.TempDir(), "linked")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "worktree", "add", "-b", "linked", linked); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+
+	mainWT, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatalf("resolve main worktree: %v", err)
+	}
+	linkedWT, err := git.ResolveWorktree(ctx, linked)
+	if err != nil {
+		t.Fatalf("resolve linked worktree: %v", err)
+	}
+	legacy := &Registry{Version: 1, Repos: []RepoRecord{
+		{Path: mainWT.Root, RepoHash: "main-legacy", StateDB: state.DBPathFromGitDir(mainWT.GitDir)},
+		{Path: linkedWT.Root, RepoHash: "linked-legacy", StateDB: state.DBPathFromGitDir(linkedWT.GitDir)},
+	}}
+
+	planned, err := PlanRegistryV2(ctx, legacy)
+	if err != nil {
+		t.Fatalf("PlanRegistryV2: %v", err)
+	}
+	if planned.Version != RegistryVersion || len(planned.Repos) != 2 {
+		t.Fatalf("planned=%+v, want two v2 rows", planned)
+	}
+	if planned.Repos[0].RepositoryID != planned.Repos[1].RepositoryID {
+		t.Fatalf("repository IDs differ: %+v", planned.Repos)
+	}
+	if planned.Repos[0].WorktreeID == planned.Repos[1].WorktreeID {
+		t.Fatalf("worktree IDs match: %+v", planned.Repos)
+	}
+	if planned.Repos[0].LegacyRepoHash != "main-legacy" || planned.Repos[1].LegacyRepoHash != "linked-legacy" {
+		t.Fatalf("legacy hashes not preserved: %+v", planned.Repos)
+	}
+	if legacy.Version != 1 || legacy.Repos[0].RepositoryID != "" {
+		t.Fatalf("input mutated: %+v", legacy)
+	}
+}
+
+func TestPlanRegistryV2DisablesMissingRepositoryWithoutState(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "deleted-repository")
+	legacy := &Registry{Version: 1, Repos: []RepoRecord{{
+		Path: missing, RepoHash: "legacy-missing",
+		StateDB: filepath.Join(missing, ".git", "acd", "state.db"),
+	}}}
+
+	planned, err := PlanRegistryV2(context.Background(), legacy)
+	if err != nil {
+		t.Fatalf("PlanRegistryV2: %v", err)
+	}
+	if len(planned.Repos) != 1 {
+		t.Fatalf("planned repos=%d want 1", len(planned.Repos))
+	}
+	got := planned.Repos[0]
+	if !got.LifecycleDisabled() || got.RepositoryID == "" || got.WorktreeID == "" ||
+		got.LegacyRepoHash != "legacy-missing" {
+		t.Fatalf("missing repository was not preserved as disabled migration metadata: %+v", got)
+	}
+	if legacy.Repos[0].LifecycleDisabled() {
+		t.Fatalf("input registry was mutated: %+v", legacy.Repos[0])
+	}
+}
+
+func TestPlanRegistryV2RejectsMissingRepositoryWithUnresolvedState(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "deleted-repository")
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "base",
+		Operation: "create", Path: "protected.txt", Fidelity: "exact",
+	}, []state.CaptureOp{{Op: "create", Path: "protected.txt", Fidelity: "exact"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &Registry{Version: 1, Repos: []RepoRecord{{
+		Path: missing, RepoHash: "legacy-missing", StateDB: dbPath,
+	}}}
+
+	_, err = PlanRegistryV2(ctx, legacy)
+	if err == nil || !strings.Contains(err.Error(), "unresolved captured work") {
+		t.Fatalf("PlanRegistryV2 error=%v, want unresolved-work refusal", err)
 	}
 }
 
