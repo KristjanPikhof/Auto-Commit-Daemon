@@ -1113,7 +1113,7 @@ func validateRepositoryConfigureMode(strategy, preset string) error {
 }
 
 func configureTerminalTooShort(output io.Writer) bool {
-	file, ok := output.(*os.File)
+	file, ok := output.(interface{ Fd() uintptr })
 	if !ok || !term.IsTerminal(file.Fd()) {
 		return false
 	}
