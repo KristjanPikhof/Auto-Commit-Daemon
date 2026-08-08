@@ -4,7 +4,7 @@ acd_auto_start() {
     if command -v acd >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
         local repo=$(git rev-parse --show-toplevel)
         export ACD_SESSION_ID=${ACD_SESSION_ID:-$(uuidgen)}
-        acd start --session-id "$ACD_SESSION_ID" --harness shell \
+        acd internal session open --session-id "$ACD_SESSION_ID" --harness shell \
                   --watch-pid "$$" --repo "$repo" >/dev/null 2>&1
     fi
 }
