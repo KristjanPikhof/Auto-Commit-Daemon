@@ -84,7 +84,7 @@ func (s Store) Create(ctx context.Context, request Request) (Result, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	id, err := newID(now)
+	id, err := NewID(now)
 	if err != nil {
 		return Result{}, err
 	}
@@ -193,7 +193,8 @@ func (s Store) RecoverPrepared(ctx context.Context, repoRoot string) error {
 	return nil
 }
 
-func newID(now time.Time) (string, error) {
+// NewID returns the public checkpoint identifier format.
+func NewID(now time.Time) (string, error) {
 	random := make([]byte, 8)
 	if _, err := rand.Read(random); err != nil {
 		return "", fmt.Errorf("checkpoint: random id: %w", err)
