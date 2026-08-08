@@ -43,6 +43,68 @@ type RecoveryRefResult struct {
 	Reused    bool
 }
 
+// RefExpectation is an exact private-ref target used by transactional
+// uninstall and migration cleanup.
+type RefExpectation struct {
+	Ref string `json:"ref"`
+	OID string `json:"oid"`
+}
+
+// DeleteRefsCAS deletes all refs in one Git reference transaction. If any
+// expected target changed, Git aborts the complete transaction.
+func DeleteRefsCAS(ctx context.Context, repoDir string, refs []RefExpectation) error {
+	commands := make([]string, 0, len(refs))
+	for _, item := range refs {
+		if !isValidFullRef(item.Ref) || !strings.HasPrefix(item.Ref, "refs/acd/") ||
+			item.OID == "" || strings.ContainsAny(item.OID, " \t\r\n\x00") {
+			return fmt.Errorf("git: invalid private ref expectation %q", item.Ref)
+		}
+		commands = append(commands, "delete "+item.Ref+" "+item.OID)
+	}
+	return applyRefCommands(ctx, repoDir, commands)
+}
+
+// CreateRefsCAS recreates all expected refs atomically and only while each is
+// absent. It is the rollback counterpart of DeleteRefsCAS.
+func CreateRefsCAS(ctx context.Context, repoDir string, refs []RefExpectation) error {
+	commands := make([]string, 0, len(refs))
+	for _, item := range refs {
+		if !isValidFullRef(item.Ref) || !strings.HasPrefix(item.Ref, "refs/acd/") ||
+			item.OID == "" || strings.ContainsAny(item.OID, " \t\r\n\x00") {
+			return fmt.Errorf("git: invalid private ref expectation %q", item.Ref)
+		}
+		commands = append(commands, "create "+item.Ref+" "+item.OID)
+	}
+	return applyRefCommands(ctx, repoDir, commands)
+}
+
+func applyRefCommands(ctx context.Context, repoDir string, commands []string) error {
+	if len(commands) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DefaultWriteTimeout)
+	defer cancel()
+	var input strings.Builder
+	input.WriteString("start\n")
+	for _, command := range commands {
+		input.WriteString(command)
+		input.WriteByte('\n')
+	}
+	input.WriteString("prepare\ncommit\n")
+	cmd := exec.CommandContext(ctx, "git", "update-ref", "--no-deref", "--stdin")
+	cmd.Dir = repoDir
+	cmd.Env = scrubEnv(nil)
+	cmd.Stdin = strings.NewReader(input.String())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git: reference transaction: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 type synchronizedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
