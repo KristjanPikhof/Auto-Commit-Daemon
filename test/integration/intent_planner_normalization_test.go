@@ -27,6 +27,7 @@ import (
 // uses deterministic fallback for one safe capture instead of publishing the
 // contradictory grouped plan.
 func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -140,6 +141,7 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 }
 
 func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -246,6 +248,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 }
 
 func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
