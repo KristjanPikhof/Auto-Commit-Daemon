@@ -121,12 +121,19 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 	if err != nil {
 		return fmt.Errorf("acd stop: load registry: %w", err)
 	}
+	return runStopRegistry(ctx, out, force, jsonOut, reg)
+}
+
+func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, reg *central.Registry) error {
 	out_all := stopAllResult{
 		Stopped:  []stopRepoResult{},
 		Deferred: []stopRepoResult{},
 		Failed:   []stopRepoResult{},
 	}
 	for _, rec := range reg.Repos {
+		if rec.LifecycleDisabled() {
+			continue
+		}
 		// Use the caller's force mode for each repo; without --force,
 		// the default graceful stop path applies.
 		res, err := stopOneRepoForAll(ctx, rec.Path, "", force)
@@ -168,7 +175,15 @@ func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
 		}
 	}
 	if len(out_all.Failed) > 0 {
-		return fmt.Errorf("acd stop --all: %d repo(s) failed to stop", len(out_all.Failed))
+		details := make([]string, 0, len(out_all.Failed))
+		for _, failed := range out_all.Failed {
+			reason := failed.Reason
+			if reason == "" {
+				reason = "daemon still running"
+			}
+			details = append(details, fmt.Sprintf("%s: %s", failed.Repo, reason))
+		}
+		return fmt.Errorf("acd stop --all: %d repo(s) failed to stop: %s", len(out_all.Failed), strings.Join(details, "; "))
 	}
 	return nil
 }
