@@ -60,6 +60,7 @@ import (
 // the typed-error retry surface. EmptySelected is a clean proxy for
 // "real semantic failure that the retry path absorbs".
 func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -222,6 +223,7 @@ WHERE planner_protocol='v2' AND status='published'`); got != "1" {
 // subject must be the second provider subject, not the first-pass subject and
 // not a generic basename fallback.
 func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
