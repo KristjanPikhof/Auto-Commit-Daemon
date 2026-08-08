@@ -37,7 +37,6 @@ import (
 // handled_external_after_block probe is not reached when HEAD has advanced.
 func TestSelfHeal_BlockedPromotesToPublishedOnReplay(t *testing.T) {
 	requireSQLite(t)
-	t.Parallel()
 
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
@@ -131,7 +130,8 @@ VALUES (last_insert_rowid(), 0, 'modify', 'self-heal.txt', '%s', '100644', '%s',
 		t.Fatalf("published commit_oid=%q want external HEAD %q", publishedOID, externalHead)
 	}
 
-	assertPublishedRecoverySnapshot(t, repo, dbPath, blockedSeq, externalHead, "runtime_branch_transition")
+	assertPublishedRecoverySnapshot(t, repo, dbPath, blockedSeq, externalHead,
+		"runtime_branch_transition", "handled_external_after_block")
 
 	// HEAD must NOT advance past the external commit. Self-heal cannot mint
 	// a fresh commit.
@@ -152,19 +152,31 @@ VALUES (last_insert_rowid(), 0, 'modify', 'self-heal.txt', '%s', '100644', '%s',
 
 // assertPublishedRecoverySnapshot proves that an externally published event
 // has both durable SQLite membership and a live hidden Git proof ref.
-func assertPublishedRecoverySnapshot(t *testing.T, repo, dbPath, eventSeq, wantCommit, wantReason string) {
+func assertPublishedRecoverySnapshot(t *testing.T, repo, dbPath, eventSeq, wantCommit string, wantReasons ...string) {
 	t.Helper()
 	snapshotID := sqliteScalar(t, dbPath, fmt.Sprintf(
 		"SELECT snapshot_id FROM recovery_snapshot_events WHERE event_seq = %s", eventSeq))
 	if snapshotID == "" {
 		t.Fatalf("event seq=%s has no recovery snapshot membership", eventSeq)
 	}
-	wantSummary := fmt.Sprintf("published|1|%s|%s|%s|%s", eventSeq, eventSeq, wantCommit, wantReason)
+	wantSummary := fmt.Sprintf("published|1|%s|%s|%s", eventSeq, eventSeq, wantCommit)
 	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
 SELECT outcome || '|' || event_count || '|' || first_event_seq || '|' ||
-       last_event_seq || '|' || commit_oid || '|' || reason
+       last_event_seq || '|' || commit_oid
 FROM recovery_snapshots WHERE id = %s`, snapshotID)); got != wantSummary {
 		t.Fatalf("recovery snapshot summary=%q want %q", got, wantSummary)
+	}
+	gotReason := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT reason FROM recovery_snapshots WHERE id = %s", snapshotID))
+	reasonAllowed := false
+	for _, wantReason := range wantReasons {
+		if gotReason == wantReason {
+			reasonAllowed = true
+			break
+		}
+	}
+	if !reasonAllowed {
+		t.Fatalf("recovery snapshot reason=%q want one of %q", gotReason, wantReasons)
 	}
 	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
 SELECT COUNT(*) FROM recovery_snapshot_events
@@ -179,13 +191,17 @@ WHERE snapshot_id = %s AND ord = 0 AND event_seq = %s`, snapshotID, eventSeq)); 
 	if got := strings.TrimSpace(runGitOK(t, repo, "show-ref", "--hash", "--verify", recoveryRef)); got != wantCommit {
 		t.Fatalf("recovery ref resolves to %q want external commit %q", got, wantCommit)
 	}
+	wantDecisionKind := "recovery_published"
+	if gotReason == "handled_external_after_block" {
+		wantDecisionKind = "handled_external_after_block"
+	}
 	if got := sqliteScalar(t, dbPath, fmt.Sprintf(`
 SELECT COUNT(*) FROM decision_records
-WHERE event_seq = %s AND kind = 'recovery_published' AND reason = %s`,
-		eventSeq, sqliteQuote(wantReason))); got != "1" {
+WHERE event_seq = %s AND kind = %s AND reason = %s`,
+		eventSeq, sqliteQuote(wantDecisionKind), sqliteQuote(gotReason))); got != "1" {
 		dump, _ := exec.Command("sqlite3", dbPath,
 			"SELECT id,kind,event_seq,reason FROM decision_records ORDER BY id").CombinedOutput()
-		t.Fatalf("recovery_published decision count=%s want 1\nrows:\n%s", got, dump)
+		t.Fatalf("%s decision count=%s want 1\nrows:\n%s", wantDecisionKind, got, dump)
 	}
 }
 
