@@ -127,8 +127,18 @@ func CommitTreeDurable(ctx context.Context, repoDir, treeOID, message, name, ema
 // namespace. An identical existing target is idempotent; a different target
 // is retained and reported as an ambiguity.
 func EnsureCheckpointRef(ctx context.Context, repoDir, ref, commitOID string) (created bool, err error) {
-	if !strings.HasPrefix(ref, CheckpointRefPrefix) || len(ref) == len(CheckpointRefPrefix) {
-		return false, fmt.Errorf("git: checkpoint ref %q must be below %s", ref, CheckpointRefPrefix)
+	return EnsurePrivateRefDurable(ctx, repoDir, CheckpointRefPrefix, ref, commitOID)
+}
+
+// EnsurePrivateRefDurable performs create-only CAS below one explicit ACD
+// namespace. Setup's migration bridge uses refs/acd/migration/ while normal
+// checkpoint capture remains restricted to CheckpointRefPrefix.
+func EnsurePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, commitOID string) (created bool, err error) {
+	if prefix != CheckpointRefPrefix && prefix != "refs/acd/migration/" {
+		return false, fmt.Errorf("git: unsupported private ref prefix %q", prefix)
+	}
+	if !strings.HasPrefix(ref, prefix) || len(ref) == len(prefix) {
+		return false, fmt.Errorf("git: private ref %q must be below %s", ref, prefix)
 	}
 	if err := verifyObjectType(ctx, repoDir, commitOID, "commit"); err != nil {
 		return false, err
@@ -165,6 +175,36 @@ func EnsureCheckpointRef(ctx context.Context, repoDir, ref, commitOID string) (c
 			ErrCheckpointRefCollision, ref, observed, commitOID)
 	}
 	return true, nil
+}
+
+// DeletePrivateRefDurable removes exactly the expected ACD-owned ref target.
+// A missing ref is idempotent; a moved ref fails closed.
+func DeletePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, expectedOID string) error {
+	if prefix != CheckpointRefPrefix && prefix != "refs/acd/migration/" {
+		return fmt.Errorf("git: unsupported private ref prefix %q", prefix)
+	}
+	if !strings.HasPrefix(ref, prefix) || len(ref) == len(prefix) || expectedOID == "" {
+		return errors.New("git: invalid private ref deletion")
+	}
+	observed, err := RevParse(ctx, repoDir, ref)
+	if errors.Is(err, ErrRefNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if observed != expectedOID {
+		return fmt.Errorf("%w: %s points at %s, want %s", ErrCheckpointRefCollision, ref, observed, expectedOID)
+	}
+	if _, err := runDurable(ctx, repoDir, nil, "reference", "update-ref", "--no-deref", "-d", ref, expectedOID); err != nil {
+		return err
+	}
+	if observed, err := RevParse(ctx, repoDir, ref); err == nil {
+		return fmt.Errorf("git: private ref %s remained at %s", ref, observed)
+	} else if !errors.Is(err, ErrRefNotFound) {
+		return err
+	}
+	return nil
 }
 
 func runDurable(ctx context.Context, repoDir string, stdin io.Reader, fsync string, args ...string) ([]byte, error) {
