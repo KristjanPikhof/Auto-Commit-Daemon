@@ -29,9 +29,115 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
+
+func ensureCheckpointRuntime(t *testing.T, env []string, repo, bin string) {
+	t.Helper()
+	roots, repositoryID := prepareCheckpointRegistration(t, env, repo)
+	workerSocket := supervisor.WorkerSocketPath(roots, repositoryID)
+	if _, err := os.Stat(workerSocket); err == nil {
+		return
+	}
+	if _, err := os.Stat(roots.SupervisorSocketPath()); err == nil {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(workerSocket); err == nil {
+				return
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("integration supervisor did not reconcile worker %s", repositoryID)
+	}
+	if err := os.MkdirAll(roots.State, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(roots.State, "integration-supervisor.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(bin, "internal", "supervisor", "run")
+	command.Env = env
+	command.Stdout = logFile
+	command.Stderr = logFile
+	if err := command.Start(); err != nil {
+		logFile.Close()
+		t.Fatalf("start integration supervisor: %v", err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Signal(os.Interrupt)
+			_ = command.Wait()
+		}
+		_ = logFile.Close()
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(workerSocket); err == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	body, _ := os.ReadFile(logPath)
+	t.Fatalf("integration supervisor did not become ready: %s", body)
+}
+
+func prepareCheckpointRegistration(t *testing.T, env []string, repo string) (paths.Roots, string) {
+	t.Helper()
+	home := envValue(env, "HOME")
+	if home == "" {
+		t.Fatal("checkpoint integration runtime requires HOME")
+	}
+	rootFor := func(name string, fallback ...string) string {
+		value := envValue(env, name)
+		if value != "" && filepath.IsAbs(value) {
+			return value
+		}
+		return filepath.Join(append([]string{home}, fallback...)...)
+	}
+	roots := paths.Roots{
+		State:  filepath.Join(rootFor("XDG_STATE_HOME", ".local", "state"), "acd"),
+		Share:  filepath.Join(rootFor("XDG_DATA_HOME", ".local", "share"), "acd"),
+		Config: filepath.Join(rootFor("XDG_CONFIG_HOME", ".config"), "acd"),
+	}
+	wt, err := gitpkg.ResolveWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve checkpoint integration worktree: %v", err)
+	}
+	db, err := state.Open(context.Background(), state.DBPathFromGitDir(wt.GitDir))
+	if err != nil {
+		t.Fatalf("prepare v20 integration state: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var repositoryID string
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		registry.Version = central.RegistryVersion
+		result, err := registry.RegisterResolvedRepo(wt, "integration", time.Now().Unix())
+		repositoryID = result.Record.RepositoryID
+		return err
+	}); err != nil {
+		t.Fatalf("register checkpoint integration repo: %v", err)
+	}
+	return roots, repositoryID
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return strings.TrimPrefix(env[i], prefix)
+		}
+	}
+	return ""
+}
 
 // activateIntentV2Runtime installs an explicit, already-applied Intent Fast v2
 // revision before daemon startup. Integration tests may still use environment
@@ -529,6 +635,11 @@ func waitFor(t *testing.T, name string, timeout time.Duration, pred func() bool)
 func withIsolatedHome(t *testing.T) []string {
 	t.Helper()
 	home := t.TempDir()
+	shortState, err := os.MkdirTemp("/tmp", "acd-it-state-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortState) })
 	env := os.Environ()
 	for i, kv := range env {
 		if strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
@@ -545,7 +656,7 @@ func withIsolatedHome(t *testing.T) []string {
 	}
 	out = append(out,
 		"HOME="+home,
-		"XDG_STATE_HOME=",
+		"XDG_STATE_HOME="+shortState,
 		"XDG_DATA_HOME=",
 		"XDG_CONFIG_HOME=",
 	)
@@ -895,21 +1006,24 @@ func readHeartbeatTs(repoDir string) float64 {
 }
 
 // initStateDBSchema brings <repo>/.git/acd/state.db into existence with the
-// canonical schema applied. The integration suite cannot import the internal
-// state package, so we use the production `acd` binary itself: a brief
-// `acd start` + `acd stop` cycle migrates the schema, after which we are
-// free to seed arbitrary rows for the populated-state scenarios.
+// canonical schema applied without starting a supervisor-owned worker. This
+// keeps fixture seeding deterministic under the checkpoint-first lifecycle.
 //
 // Returns the absolute path to the state.db.
 func initStateDBSchema(t *testing.T, ctx context.Context, env []string, repo, sessionID string) string {
 	t.Helper()
-	startSession(t, ctx, env, repo, sessionID, "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		t.Fatalf("state.db not created by start/stop bootstrap: %v", err)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("initialize v20 state fixture %s: %v", sessionID, err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v20 state fixture: %v", err)
+	}
+	prepareCheckpointRegistration(t, env, repo)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("state.db not created by fixture bootstrap: %v", err)
+	}
+	_ = env
 	return dbPath
 }
