@@ -83,6 +83,54 @@ func (r Roots) StatsDBPath() string {
 	return filepath.Join(r.Share, "stats.db")
 }
 
+// ManagedBinaryPath is the supervisor-owned executable copied by setup.
+func (r Roots) ManagedBinaryPath() string {
+	return filepath.Join(r.Share, "bin", "acd")
+}
+
+// OperationsDBPath is the global immutable setup/service operation journal.
+func (r Roots) OperationsDBPath() string {
+	return filepath.Join(r.Share, "operations.db")
+}
+
+// SupervisorSocketPath is the local user-only JSONL IPC endpoint.
+func (r Roots) SupervisorSocketPath() string {
+	return filepath.Join(r.State, "run", "supervisor.sock")
+}
+
+// WorkerStatusPath is the supervisor-visible runtime state written by a
+// launchd-managed repository worker. The caller must validate repositoryID
+// before using the resulting path.
+func (r Roots) WorkerStatusPath(repositoryID string) string {
+	return filepath.Join(filepath.Dir(r.SupervisorSocketPath()), "worker-"+repositoryID+".json")
+}
+
+// SetupPublicationHoldPath is present only while transactional setup is
+// proving held workers. Workers continue checkpoint protection while this
+// exact marker exists, but do not publish normal Git commits.
+func (r Roots) SetupPublicationHoldPath() string {
+	return filepath.Join(r.State, "run", "setup-publication-hold.json")
+}
+
+// SupervisorLogPath is the user supervisor log.
+func (r Roots) SupervisorLogPath() string {
+	return filepath.Join(r.State, "supervisor.log")
+}
+
+// SetupOperationDir contains private backups for one setup transaction.
+func (r Roots) SetupOperationDir(operationID string) string {
+	return filepath.Join(r.SetupRoot(), operationID)
+}
+
+// SetupRoot contains setup transaction directories and retained recovery
+// manifests. Callers must still validate each operation-owned child.
+func (r Roots) SetupRoot() string { return filepath.Join(r.State, "setup") }
+
+// IntegrationsOwnershipPath records strict-JSON ownership outside host files.
+func (r Roots) IntegrationsOwnershipPath() string {
+	return filepath.Join(r.Config, "integrations.json")
+}
+
 // ConfigPath returns ~/.config/acd/config.json.
 func (r Roots) ConfigPath() string {
 	return filepath.Join(r.Config, "config.json")
