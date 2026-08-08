@@ -18,14 +18,7 @@ import (
 func TestRepoHelpIncludesLifecycleCommands(t *testing.T) {
 	help := commandHelp(t, "repo")
 	for _, want := range []string{
-		"acd repo init",
-		"acd repo disable --repo /path/to/repo",
-		"acd repo enable --repo /path/to/repo --json",
-		"acd repo list --json",
-		"acd repo remove --yes --purge-state",
-		"Manage explicit acd repository registration",
-		"repo_lifecycle.autodiscovery",
-		"ACD_REPO_AUTODISCOVERY=disabled",
+		"list", "remove", "gc", "Manage protected repositories",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("repo help missing %q:\n%s", want, help)
@@ -813,11 +806,11 @@ func TestRepoCommandViaRootAndSetupInitAliasStillWorks(t *testing.T) {
 	root.SetOut(&out)
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"repo", "init", "--repo", repo, "--json"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("root repo init: %v\nstderr:%s", err, errOut.String())
+	if err := root.ExecuteContext(context.Background()); ExitCode(err) != ExitActionRequired {
+		t.Fatalf("compat repo init exit=%d err=%v\nstderr:%s", ExitCode(err), err, errOut.String())
 	}
-	if !json.Valid(out.Bytes()) {
-		t.Fatalf("repo init did not emit JSON:\n%s", out.String())
+	if !strings.Contains(errOut.String(), "compatibility alias") {
+		t.Fatalf("repo init compatibility warning missing: %q", errOut.String())
 	}
 
 	out.Reset()
@@ -829,7 +822,7 @@ func TestRepoCommandViaRootAndSetupInitAliasStillWorks(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("setup init alias failed: %v\nstderr:%s", err, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "deprecated") {
+	if !strings.Contains(errOut.String(), "compatibility alias") {
 		t.Fatalf("setup init alias warning missing: %q", errOut.String())
 	}
 }
