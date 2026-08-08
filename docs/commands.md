@@ -1,345 +1,193 @@
 # Command reference
 
-Start with `acd`. It reads the current repository, tells you whether ACD is
-healthy, and gives you one next action. Most people only need `acd`, `acd on`,
-and `acd off` during normal work.
+## Public root commands
 
-Commands use the Git worktree containing your current directory. Pass
-`--repo /path/to/repo` when you want to target another worktree. Add `--json`
-to commands that support structured output, and use
-`acd <command> --help` for every flag and example.
+`acd` with no subcommand is identical to `acd status`. Root help exposes only:
 
-## Daily control
-
-| Command | Use it for | What it changes |
+| Command | Mutates | Confirmation |
 |---|---|---|
-| `acd` | Check one repo and get a recommended next action. | Nothing. It reads health only. |
-| `acd on` | Register or enable the repo and make sure its daemon is running. | Desired state, registration, client heartbeat, and daemon process as needed. |
-| `acd off` | Stop ACD for this repo until you turn it on again. | Desired state and daemon process. Captured state stays in `.git/acd`. |
-| `acd status` | Inspect the daemon, clients, queue, branch, pauses, and recent decisions. | Nothing. |
-| `acd list` | Watch enabled repos from one terminal. | Nothing, unless you open the interactive manager. |
+| `acd setup` | Binary, service, registry, configuration, integrations, repository schema and checkpoint refs | Shows one exact plan and asks once. |
+| `acd status` | Nothing | None. |
+| `acd on` | Repository desired state through the supervisor | None; idempotent. |
+| `acd off` | Final checkpoint and repository desired state | `--force` only when protection cannot be confirmed. |
+| `acd history` | Nothing | None. |
+| `acd restore ID` | Nothing by default; working tree with `--yes` | Preview is mandatory. |
+| `acd doctor` | Nothing unless bundle output is requested | Bundle path is explicit. |
+| `acd uninstall` | Service, binary, owned integrations and desired state | Shows a plan; data purge needs a second confirmation. |
 
-The short loop is:
+## Setup
 
 ~~~bash
-acd
+acd setup
+acd setup --dry-run
+acd setup --integrations=auto
+acd setup --integrations=none
+acd setup --integrations=claude-code,codex
+acd setup --yes --non-interactive --expect-plan sha256:...
+~~~
+
+`--dry-run` performs no file write, command execution, service action, provider
+call, integration change, migration, state open for writing, or Git ref
+creation. `--expect-plan` is required for noninteractive apply when existing
+installation or v19 state is detected.
+
+Setup validates the OS, architecture, Git durability support, repository,
+service manager, disk space, configuration, and integration files. It backs up
+every touched file, applies one all-repository v19 to v20 cutover, runs an
+isolated self-test, and commits only after all held workers report complete
+current coverage.
+
+## Status
+
+Every human status answers:
+
+1. Is ACD enabled?
+2. Are current eligible changes protected?
+3. Are they published to Git?
+4. Is user action required?
+5. What exact command should run next?
+
+State priority is `off`, `needs_action`, `publishing`, `waiting`, `protected`.
+The independent `protected` boolean may remain true in the middle three
+publication/repair states.
+
+Read-only status falls back to existing v20 SQLite projections when the
+supervisor is unavailable. Mutations never fall back to direct unsupervised
+writes.
+
+## On and off
+
+~~~bash
 acd on
 acd off
+acd off --force
 ~~~
 
-Use `acd configure` for guided strategy, preset, provider, credential, and
-safety setup. Use `acd settings` for profiles, experiments, and advanced
-overrides. See [Configure ACD](settings.md).
+`off` requests a complete checkpoint barrier before disabling. If that barrier
+fails, the repository stays enabled and the command returns `needs_action`.
+`--force` explicitly accepts disabling without confirmed current protection.
 
-## Configure ACD
-
-Bare `acd configure` saves global defaults. It offers Everyday work and
-Maximum speed, then shows one final approval. It reuses valid provider details.
-A fresh or incomplete OpenAI-compatible setup asks for the endpoint and model,
-plus a masked API key when no credential exists. Global setup never detects or
-runs a project command.
+## History and restore
 
 ~~~bash
-acd configure
-acd configure --replace
-acd configure --accessible
-acd configure --strategy intent --preset balanced
-acd configure --repo .
-acd configure --repo . --inherit
-acd configure --repo . --strategy intent --preset quality --wait
-acd configure --dry-run --json
+acd history
+acd history --activity
+acd history explain
+acd history rewrite
+acd restore cp-...
+acd restore cp-... --yes
 ~~~
 
-Dry-run performs no provider call, command execution, credential or settings
-write, daemon start, or hook change.
+Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
+only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
+and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
+worktree identity, index digest, and target ref.
 
-After approval, global configure tests the provider before any write, saves
-global defaults, and does not open repository state or start a daemon. Running
-repositories keep their immutable active revision.
-
-`--replace` starts global setup from the current built-in values and replaces
-the prior global layer after the normal preview and provider test. It does not
-change repositories that still have their own override.
-
-An explicit `--repo` enables repository setup and adds Strict Review.
-Repository Everyday and Maximum Speed run no project tests. Strict Review
-reuses or detects an approved full command, queues a durable background
-validation job, and blocks publication while capture continues. `--wait`
-follows only that strict job. Custom commands remain an advanced
-`acd settings` action.
-
-`acd configure --repo . --inherit` removes the repository field and profile
-overrides, tests the inherited provider, creates one runtime revision from the
-global result, and enables ACD. It conflicts with strategy, preset, credential,
-and wait options because it selects the global result exactly.
-
-`acd settings` opens the advanced terminal settings lab:
+## Doctor and support
 
 ~~~bash
-acd settings
-acd settings --profile fast
-acd settings --global
-acd settings --accessible
+acd doctor
+acd support diagnose
+acd support logs
+acd support repair
+acd support repair --yes
+acd support bundle
 ~~~
 
-Repository scope is the default. Profile edits are reusable. Global saves do
-not fan out to running repositories. Accessible mode uses linear prompts, and
-`TERM=dumb` selects it automatically. Rich mode requires interactive stdin and
-stdout; `--json` is not supported for the interactive command.
+Support repair previews a safely provable interrupted restore and, with
+`--yes`, completes its post-restore checkpoint. It refuses if the working tree
+no longer matches the interrupted restore target.
 
-Accessible mode is action-first and keyboard-only. **Change strategy or
-preset** comes before **Quick provider setup** and **Advanced settings**.
-
-Credential commands never print the secret:
+## Uninstall
 
 ~~~bash
-acd auth set
-printf '%s\n' "$ACD_AI_API_KEY" | acd auth set --stdin
-acd auth status --json
-acd auth remove --yes
+acd uninstall --dry-run
+acd uninstall
+acd uninstall --purge-data
 ~~~
 
-`ACD_AI_API_KEY` remains higher priority than the protected file.
+Default uninstall completes checkpoint barriers, stops workers and the
+supervisor, removes only verified owned integration entries, removes the
+managed service and binary, disables repositories, and preserves every state
+database and private ref.
 
-Provider tests use one fixed synthetic request and may incur one provider
-charge. Endpoint credentials and subprocess execution require confirmation for
-the test. Repository diff egress is not part of the synthetic request, so that
-confirmation is required only for apply or experiment activation. The UI can
-ask inside the session; the `--confirm-endpoint-credentials`,
-`--confirm-subprocess`, and `--confirm-diff-egress` flags pre-authorize their
-specific risks. See the [settings guide](settings.md) for the full contract.
+Data purge requires `--purge-data` plus the second
+`--confirm-purge-data` confirmation. Noninteractive apply also requires
+`--yes --non-interactive --expect-plan <digest>`.
 
-Bare `acd` reports one of these states:
+## Advanced namespaces
 
-| State | Meaning |
+~~~text
+acd config get|set|edit|reset|credentials
+acd support diagnose|logs|repair|bundle
+acd repo list|remove|gc
+acd history rewrite
+~~~
+
+They are callable but hidden from root help.
+
+Configuration defaults to repository scope inside a worktree and global scope
+outside one. `--scope repo|profile|global` is explicit. Interactive editors
+reject `--json` rather than ignoring it.
+
+## Persistent flags
+
+| Flag | Contract |
 |---|---|
-| `healthy` | The daemon is running and no action is needed. |
-| `waiting` | Intent mode is waiting for its batch boundary, or replay is inside the automatic rewind grace period. |
-| `degraded` | ACD is still running, usually with deterministic planner fallback. |
-| `needs_attention` | The daemon, pause state, or replay queue needs inspection. |
-| `off` | This repo is disabled. |
-| `not_a_repo` | The selected path is not inside a Git worktree. |
+| `--repo PATH` | Resolves a worktree target, or is rejected for global-only operations. |
+| `--json` | Uses the common envelope, or is rejected for interactive TUI operations. |
+| `--quiet` | Suppresses progress but never the final result. |
+| `--log-level LEVEL` | Configures the CLI logger for that invocation only. |
 
-Bare `acd` returns its classification as information, including unhealthy
-states. `acd on` returns a failure when it cannot leave the repo running in a
-healthy state.
+No accepted persistent flag is silently ignored.
 
-`acd status --watch` refreshes one repo. `acd list` behaves differently based
-on its output:
+## JSON contract
 
-| Command | Behavior |
+Every JSON response is written once to stdout, including nonzero exits:
+
+~~~json
+{
+  "ok": true,
+  "state": "protected",
+  "changed": false,
+  "actions": [],
+  "next_action": null,
+  "data": {},
+  "error": null
+}
+~~~
+
+`ok` means the command executed; it does not mean the repository is healthy.
+Errors use `code`, `message`, `retryable`, and redacted `details`. Actions are
+ordered objects with `kind`, `status`, `target`, and `detail`.
+
+| Exit | Meaning |
 |---|---|
-| `acd list` in a terminal | Opens the compact live dashboard. |
-| `acd list` in a pipe | Prints one compact snapshot. |
-| `acd list --once` | Prints one snapshot even in a terminal. |
-| `acd list --once --verbose` | Adds clients, last commit, full paths, and status notes. |
-| `acd list --json` | Prints one machine-readable snapshot. |
-| `acd list --interactive` | Opens the repo lifecycle manager. |
+| `0` | Completed with no required action. |
+| `1` | Unexpected internal failure. |
+| `2` | Invalid command or flag combination. |
+| `3` | Valid result that requires user action. |
+| `4` | Transient supervisor or worker unavailability. |
 
-Watch mode and `--json` cannot be combined.
+## Compatibility aliases
 
-## Set up an AI tool
+Aliases are retained for this release and the next, hidden from help, and may
+be removed no earlier than the third checkpoint-first release.
 
-`acd setup [harness]` prints the hook snippet for one supported integration. It
-does not edit the target configuration file.
-
-~~~bash
-acd setup claude-code
-acd setup codex
-acd setup cursor
-acd setup opencode
-acd setup pi
-acd setup shell
-~~~
-
-Use `--raw` when you need only the snippet body:
-
-~~~bash
-acd setup codex --raw
-~~~
-
-Redirecting raw output with `>` replaces the destination file. Merge the
-snippet by hand when that file already contains custom hooks or settings. Run
-`acd doctor` after setup to check the installed hook against the current
-template.
-
-The adapter guides under [`templates/`](../templates/) contain the exact
-configuration path, hook mapping, verification steps, and uninstall steps for
-each harness.
-
-## See what ACD is doing
-
-| Command | What it answers | Notes |
-|---|---|---|
-| `acd status` | Is this repo running, waiting, paused, blocked, or degraded? | Use `--watch` for a live view or `--json` for automation. |
-| `acd events` | What did ACD capture, group, publish, skip, or block? | `--watch` starts at the current activity tail unless `--since` is set. |
-| `acd explain` | Why did one path or commit behave this way? | Use `--path FILE`, `--commit REV`, or `--last`. |
-| `acd diagnose` | Which branch anchor, pause, queue barrier, or planner state needs attention? | Read-only. Start here before recovery. |
-| `acd logs` | What did the daemon write to its raw JSONL log? | Use `--lines N` and `--follow`. |
-| `acd prompt` | What did a traced AI request contain? | Traces exist only when `ACD_AI_PROMPT_TRACE=1` was set at daemon start. |
-| `acd doctor` | Are the binary, hooks, provider settings, registry, and runtime healthy? | `--bundle` writes a sanitized zip for support. |
-
-Useful examples:
-
-~~~bash
-acd events --watch
-acd explain --path internal/state/schema.go
-acd explain --commit HEAD
-acd diagnose --json
-acd logs --lines 100 --follow
-acd prompt --last
-acd doctor --bundle --output /tmp
-~~~
-
-`acd events` is the activity history intended for normal use. `acd logs` is
-the lower-level daemon log. Prompt traces may contain source text, so review
-them before sharing.
-
-## Recover a repo
-
-ACD normally resolves queued work by itself. If the branch already contains
-every captured change, ACD marks that work published. Otherwise it saves the
-captured chain under `refs/acd/recovery/*`, reseeds from the current branch,
-and captures any work that is still present in the worktree.
-
-Use this manual sequence when `acd` says the repo needs attention:
-
-~~~bash
-acd
-acd diagnose --json
-acd fix --dry-run
-acd off
-acd fix --yes
-acd on
-acd
-~~~
-
-`acd fix --dry-run` only prints the plan. `acd fix --yes` backs up the SQLite
-state, reruns its safety checks, and applies safe recovery while the daemon is
-off. It never changes the live worktree, index, or branch.
-
-Use the force mode when you want ACD to save the captured chain without first
-trying to prove that the branch already contains it:
-
-~~~bash
-acd fix --force --dry-run
-acd off
-acd fix --force --yes
-acd on
-~~~
-
-Here, `--force` selects archive-only recovery. It does not authorize the write
-by itself, and it does not delete captured work. `--yes` is still required.
-
-| Command | Purpose |
+| Old name | Destination |
 |---|---|
-| `acd pause --reason "branch surgery"` | Stop capture and replay while keeping the daemon registered. |
-| `acd pause --ttl 1h --reason "maintenance"` | Add a pause that expires automatically. |
-| `acd resume --yes` | Remove a manual pause marker. |
-| `acd resume --accept-overflow` | Clear durable capture backpressure and accept that filesystem events may have been missed. |
+| `configure`, `settings` | `config edit` |
+| `auth` | `config credentials` |
+| `events` | `history --activity` |
+| `explain` | `history explain` |
+| `rewrite-commits` | `history rewrite` |
+| `diagnose`, `logs`, `fix`, `recover`, `prompt` | Matching `support` operation |
+| `list`, `stats`, `gc` | Matching `repo` operation |
+| `start`, `stop`, `wake`, `touch`, `flush` | Hidden internal session/hint protocol |
+| `daemon run` | Hidden internal worker entrypoint |
+| Hook extractors | Hidden internal integration helpers |
+| `version` | `acd --version` |
+| `setup <integration> --raw` | Hidden `setup integration <name> --print` route |
 
-Use `--accept-overflow` only after reading `acd diagnose`. It is separate from
-`--yes` because it accepts a different risk.
-
-See [user-workflows.md](user-workflows.md) for archived-work inspection,
-generated-file cleanup, branch surgery, and symptom-based recovery.
-
-## Commit work made while ACD was off
-
-`acd commit-all` captures a dirty worktree and replays it with the configured
-commit strategy. It first resolves any older unpublished chain, then reseeds
-from `HEAD` before capturing the live files.
-
-~~~bash
-acd off
-acd commit-all --dry-run
-acd commit-all --yes
-acd on
-~~~
-
-The command refuses detached HEAD, an in-progress Git operation, a manual
-pause, and a live daemon when it reaches the write phase. `--json` requires
-`--yes` for an apply run. If any captured work remains unpublished, the command
-returns a failure instead of reporting a partial drain as success.
-
-## Rewrite local commit messages
-
-`acd rewrite-commits` creates a reviewable message-only plan for a linear range
-on the current branch. The daemon never starts a rewrite on its own.
-
-~~~bash
-acd rewrite-commits --from-nr 5 --plan-out rewrite.json --plan-only
-acd rewrite-commits --show-plan rewrite.json
-
-acd off
-acd rewrite-commits --apply-plan rewrite.json --dry-run
-acd rewrite-commits --apply-plan rewrite.json --yes
-acd on
-~~~
-
-Use `--from-sha`, `--from-nr`, `--range-sha`, `--range-nr`, or `--last` to
-select commits. Creating a new plan requires intent mode and a working
-non-deterministic provider. Showing, editing, or applying a saved plan does not
-call the provider.
-
-Apply verifies the branch, creates backup refs, recreates commits with the new
-messages, and moves the branch only after the checks pass. File contents stay
-the same. Merge commits, detached HEAD, a live daemon, pending captures, and a
-branch that no longer matches the plan are refused.
-
-For a fresh selection, `--json` prints the resolved selection and exits before
-plan generation. Use normal text output when you want to generate a plan.
-
-See [rewrite-commits.md](rewrite-commits.md) for selectors, plan editing,
-progress output, and backup recovery.
-
-## Manage registered repos
-
-Most repos need no manual registration because harness hooks call `acd start`.
-Use `acd on` and `acd off` for normal control. The `acd repo` commands are for
-explicit registry administration.
-
-| Command | What it does |
-|---|---|
-| `acd repo init` | Creates or opens `.git/acd/state.db` and registers an attached worktree without starting a daemon. |
-| `acd repo disable` | Disables a registered repo, stops its daemon, clears start caches, and preserves state. |
-| `acd repo enable` | Enables a registered repo without starting its daemon. |
-| `acd repo list` | Lists every registry row, including disabled, missing, and state-database-missing repos. |
-| `acd repo manage` | Opens the interactive lifecycle manager. |
-| `acd repo remove --dry-run` | Previews registration removal. |
-| `acd repo remove --yes` | Removes the registry row and start caches, but keeps `.git/acd`. |
-| `acd repo remove --yes --purge-state` | Removes the registry row and deletes `.git/acd` state. |
-
-`acd repo disable` and `acd repo enable` require an existing registry row. In
-contrast, `acd off` records the disabled state even for a repo ACD has not seen
-before, and `acd on` can register and start it in one command.
-
-## Maintenance and build information
-
-| Command | What it does |
-|---|---|
-| `acd stats` | Reports central commit, event, file, byte, and error totals for the last seven days. Use `--since 30d` to change the window. |
-| `acd gc` | Merges duplicate registry rows and removes missing or long-dead entries. It does not delete repo state databases or captured events. |
-| `acd version` | Prints the version and commit embedded in the binary. |
-
-`acd stats` may initialize the central statistics database. `acd gc` changes
-the central registry, so run `acd list` or `acd repo list` first when you want
-to inspect what is registered.
-
-## Hook protocol
-
-Harness templates call these commands automatically. Use `acd setup` instead
-of wiring them by hand unless you are building an adapter.
-
-| Command | Hook contract |
-|---|---|
-| `acd start` | Register a client session and start or refresh the repo daemon. Harnesses pass `--session-id`, `--harness`, and sometimes `--watch-pid`. |
-| `acd stop` | Stop one repo, deregister one session, or stop every daemon with `--all`. `--force` bypasses session refcounts. |
-| `acd wake` | Refresh a session heartbeat and nudge the daemon. It requires `--session-id` and does not bypass intent batch waits. |
-| `acd touch` | Refresh a session heartbeat. `--soft-boundary` records a semantic evaluation boundary and nudges the daemon; Codex uses it for Stop. |
-| `acd flush` | Refresh a heartbeat. With `--logical`, ask the next replay pass to drain the visible intent window now. |
-
-Soft and logical boundaries require an already registered session. They
-trigger candidate evaluation but cannot bypass atomicity, verification,
-detached HEAD, Git operations, manual pauses, branch generation, conflicts, or
-other replay safety checks.
+Manual compatibility calls warn on stderr. Recognized integration calls
+suppress terminal warnings and emit only a rate-limited diagnostic.
