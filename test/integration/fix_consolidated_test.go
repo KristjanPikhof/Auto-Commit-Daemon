@@ -19,6 +19,7 @@ import (
 // exact HEAD matches publish the full pair, while explicit --force archives a
 // non-matching pair without deleting or retargeting its captured rows.
 func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -120,6 +121,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 // immutable whole-pair recovery; purge refuses ambiguous selectors and requires
 // explicit --all before preserving every planned pair.
 func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -183,7 +185,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 		t.Fatalf("acd purge-events --blocked --yes unexpectedly succeeded\nstdout=%s\nstderr=%s",
 			purge.Stdout, purge.Stderr)
 	}
-	if !strings.Contains(purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
+	if !strings.Contains(purge.Stdout+purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
 		t.Fatalf("purge-events selective refusal missing\nstdout=%s\nstderr=%s",
 			purge.Stdout, purge.Stderr)
 	}
@@ -222,6 +224,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 }
 
 func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -276,6 +279,7 @@ VALUES ('refs/heads/main', %s, '%s', 'delete', 'build/output.js', 'rescan', %f, 
 	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
 		t.Fatalf("seed generated pending rows: %v\n%s", err, out)
 	}
+	prepareCheckpointRegistration(t, env, repo)
 
 	diagnose := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
 	if diagnose.ExitCode != 0 {
