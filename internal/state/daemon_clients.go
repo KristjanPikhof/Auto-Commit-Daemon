@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 )
 
 // Client is one row of the daemon_clients refcount table (§6.1).
@@ -19,6 +20,26 @@ type Client struct {
 	WatchFP      sql.NullString
 	RegisteredTS float64
 	LastSeenTS   float64
+}
+
+// ReadClientRegistration projects compatibility session state without opening
+// a writer or migrating the repository database.
+func ReadClientRegistration(ctx context.Context, dbPath, sessionID string) (exists bool, count int, err error) {
+	q := url.Values{}
+	q.Add("mode", "ro")
+	q.Add("_pragma", "query_only(ON)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return false, 0, fmt.Errorf("state: open client projection: %w", err)
+	}
+	defer conn.Close()
+	if err := conn.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM daemon_clients WHERE session_id=?), COUNT(*) FROM daemon_clients`,
+		sessionID).Scan(&exists, &count); err != nil {
+		return false, 0, fmt.Errorf("state: read client projection: %w", err)
+	}
+	return exists, count, nil
 }
 
 // RegisterClient inserts (or refreshes) a client row. registered_ts is set on
