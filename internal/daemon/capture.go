@@ -12,7 +12,9 @@
 //   - Sensitive default-deny via state.SensitiveMatcher.
 //   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
-//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) -> meta-only.
+//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) are accepted
+//     only when their exact bytes already match a normal indexed Git blob;
+//     other oversized content remains incomplete/meta-only.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
 //     ino+dev+mode verification (TOCTOU defense against symlink swap).
 package daemon
@@ -98,11 +100,14 @@ const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
 const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
 
 const (
-	MetaKeyProtectionObservationEpoch = "protection.observation_epoch"
-	MetaKeyProtectionCoveredEpoch     = "protection.covered_epoch"
-	MetaKeyProtectionCheckpointID     = "protection.checkpoint_id"
-	MetaKeyProtectionComplete         = "protection.complete"
-	MetaKeyProtectionTreeDigest       = "protection.tree_digest"
+	MetaKeyProtectionObservationEpoch    = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch        = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID        = "protection.checkpoint_id"
+	MetaKeyProtectionComplete            = "protection.complete"
+	MetaKeyProtectionRetentionOverBudget = "protection.retention_over_budget"
+	MetaKeyProtectionFullPollTS          = "protection.full_poll_ts"
+	MetaKeyProtectionWatcherQueueDepth   = "protection.watcher_queue_depth"
+	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
 )
 
 // CaptureBackpressureClearRatio is the high-water fraction of
@@ -957,6 +962,39 @@ func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx Ca
 	return summary, nil
 }
 
+// ScanProtectedEntries performs the same privacy and safety filtered scan used
+// by checkpoint capture without mutating SQLite, refs, the index, or shadow
+// state. Restore preview uses it to compare the live protected scope with a
+// retained checkpoint.
+func ScanProtectedEntries(ctx context.Context, repoRoot string, opts CaptureOpts) ([]checkpoint.Entry, []state.CheckpointExclusion, CaptureSummary, error) {
+	matcher := opts.SensitiveMatcher
+	if matcher == nil {
+		matcher = state.NewSensitiveMatcher()
+	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
+	live, protected, summary, err := walkLive(ctx, repoRoot, walkOpts{
+		matcher:       matcher,
+		safeIgnore:    safeIgnore,
+		ignoreChecker: opts.IgnoreChecker,
+		submodules:    opts.SubmodulePaths,
+		maxBytes:      resolveMaxFileBytes(opts.MaxFileBytes),
+		durable:       opts.CheckpointStore != nil,
+		hashOnly:      opts.CheckpointStore == nil,
+	})
+	if err != nil {
+		return nil, nil, summary, err
+	}
+	if summary.Errors > 0 || summary.Oversize > 0 {
+		return nil, checkpointExclusions(protected), summary,
+			fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)", summary.Errors, summary.Oversize)
+	}
+	entries, _ := checkpointEntries(live)
+	return entries, checkpointExclusions(protected), summary, nil
+}
+
 func completeProtectionCheckpoint(
 	ctx context.Context,
 	repoRoot string,
@@ -1042,6 +1080,23 @@ func nextProtectionObservationEpoch(ctx context.Context, db *state.DB) int64 {
 	return 1
 }
 
+// BeginProtectionObservation marks protection incomplete before a scan or an
+// accepted semantic hint can return. A later completed checkpoint is the only
+// path that advances covered_epoch and restores protection.complete=true.
+func BeginProtectionObservation(ctx context.Context, db *state.DB) (int64, error) {
+	if db == nil {
+		return 0, errors.New("daemon: protection observation requires state")
+	}
+	epoch := nextProtectionObservationEpoch(ctx, db)
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		MetaKeyProtectionObservationEpoch: strconv.FormatInt(epoch, 10),
+		MetaKeyProtectionComplete:         "false",
+	}); err != nil {
+		return 0, fmt.Errorf("daemon: begin protection observation: %w", err)
+	}
+	return epoch, nil
+}
+
 func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
 	values := []struct {
 		key   string
@@ -1051,6 +1106,8 @@ func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, c
 		{MetaKeyProtectionCheckpointID, checkpointID},
 		{MetaKeyProtectionTreeDigest, liveDigest},
 		{MetaKeyProtectionComplete, "true"},
+		{MetaKeyProtectionFullPollTS, strconv.FormatFloat(float64(time.Now().UnixNano())/float64(time.Second), 'f', -1, 64)},
+		{MetaKeyProtectionWatcherQueueDepth, "0"},
 	}
 	for _, value := range values {
 		if err := state.MetaSet(ctx, db, value.key, value.value); err != nil {
@@ -1060,11 +1117,17 @@ func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, c
 	return nil
 }
 
-func checkpointEntries(live map[string]LiveEntry) ([]checkpoint.Entry, string) {
-	entries := make([]checkpoint.Entry, 0, len(live))
-	for _, entry := range live {
-		entries = append(entries, checkpoint.Entry{Path: entry.Path, Mode: entry.Mode, OID: entry.OID})
-	}
+// CompleteProtectionCoverage records that checkpointID durably covers the
+// supplied observation. Recovery paths use it only after independently
+// proving the complete protected entry set.
+func CompleteProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID string, entries []checkpoint.Entry) error {
+	return persistProtectionCoverage(ctx, db, epoch, checkpointID, ProtectionEntriesDigest(entries))
+}
+
+// ProtectionEntriesDigest returns the canonical digest used by checkpoint
+// reuse and protection status. Callers may supply entries in any order.
+func ProtectionEntriesDigest(entries []checkpoint.Entry) string {
+	entries = append([]checkpoint.Entry(nil), entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	hash := sha256.New()
 	for _, entry := range entries {
@@ -1075,7 +1138,16 @@ func checkpointEntries(live map[string]LiveEntry) ([]checkpoint.Entry, string) {
 		hash.Write([]byte(entry.OID))
 		hash.Write([]byte{0})
 	}
-	return entries, "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func checkpointEntries(live map[string]LiveEntry) ([]checkpoint.Entry, string) {
+	entries := make([]checkpoint.Entry, 0, len(live))
+	for _, entry := range live {
+		entries = append(entries, checkpoint.Entry{Path: entry.Path, Mode: entry.Mode, OID: entry.OID})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, ProtectionEntriesDigest(entries)
 }
 
 func checkpointExclusions(protectedSkips map[string]skippedPresent) []state.CheckpointExclusion {
@@ -1289,6 +1361,7 @@ type walkOpts struct {
 	maxBytes      int64
 	db            *state.DB
 	durable       bool
+	hashOnly      bool
 }
 
 type skippedPresent struct {
@@ -1597,7 +1670,9 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		}
 		var oid string
 		var herr error
-		if opts.durable {
+		if opts.hashOnly {
+			oid, herr = git.HashObjectStdinReadOnly(ctx, repoRoot, []byte(target))
+		} else if opts.durable {
 			oid, herr = git.HashObjectStdinDurable(ctx, repoRoot, []byte(target))
 		} else {
 			oid, _, herr = git.HashSymlinkBlob(ctx, repoRoot, target)
@@ -1628,6 +1703,13 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		return LiveEntry{}, false, "non_regular", nil
 	}
 	if post.Size() > opts.maxBytes {
+		entry, reusable, reuseErr := reuseIndexedBlob(ctx, repoRoot, c.rel, f, post)
+		if reuseErr != nil {
+			return LiveEntry{}, false, "", reuseErr
+		}
+		if reusable {
+			return entry, true, "", nil
+		}
 		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
 		return LiveEntry{}, false, "oversize", nil
 	}
@@ -1643,7 +1725,9 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 	}
 	var oid string
 	var herr error
-	if opts.durable {
+	if opts.hashOnly {
+		oid, herr = git.HashObjectStdinReadOnly(ctx, repoRoot, buf)
+	} else if opts.durable {
 		oid, herr = git.HashObjectStdinDurable(ctx, repoRoot, buf)
 	} else {
 		oid, herr = git.HashObjectStdin(ctx, repoRoot, buf)
@@ -1656,6 +1740,36 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		Mode: gitModeFor(post.Mode()),
 		OID:  oid,
 	}, true, "", nil
+}
+
+// reuseIndexedBlob accepts an oversized regular file only when hashing its
+// exact worktree bytes proves they already exist as the path's ordinary
+// stage-0 index blob. This keeps dirty and untracked oversized content
+// fail-closed while avoiding a duplicate object write for large tracked
+// assets that Git already protects.
+func reuseIndexedBlob(ctx context.Context, repoRoot, path string, file *os.File, before os.FileInfo) (LiveEntry, bool, error) {
+	entries, err := git.LsFilesStaged(ctx, repoRoot, path)
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	if len(entries) != 1 || entries[0].Stage != 0 || entries[0].Path != path || entries[0].Mode != gitModeFor(before.Mode()) {
+		return LiveEntry{}, false, nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return LiveEntry{}, false, err
+	}
+	oid, err := git.HashObjectReaderReadOnly(ctx, repoRoot, file)
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	if !sameFileSnapshot(before, after) || oid != entries[0].OID {
+		return LiveEntry{}, false, nil
+	}
+	return LiveEntry{Path: path, Mode: entries[0].Mode, OID: entries[0].OID}, true, nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the
@@ -1683,6 +1797,13 @@ func sameFile(pre, post os.FileInfo) bool {
 		return false
 	}
 	return true
+}
+
+func sameFileSnapshot(pre, post os.FileInfo) bool {
+	return sameFile(pre, post) &&
+		pre.Size() == post.Size() &&
+		pre.Mode() == post.Mode() &&
+		pre.ModTime().Equal(post.ModTime())
 }
 
 // gitModeFor maps a Go fs.Mode onto a git tree mode for regular files.
