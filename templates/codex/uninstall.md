@@ -1,10 +1,12 @@
 # Uninstall acd from Codex
 
-1. Remove the acd-managed entries from `~/.codex/hooks.json`. If the file
+1. Prefer `acd uninstall`, which removes only verified ACD-owned entries from
+   `~/.codex/hooks.json`. For manual cleanup, if the file
    contains only the acd block you can delete it outright. If you have merged
    custom (non-acd) hooks, remove only hook objects whose command contains
-   `acd hook-stdin-extract` and calls `acd start`, `acd wake`, or
-   `acd touch` (including current `acd touch --soft-boundary` and legacy
+   `acd internal integration stdin-extract` and calls
+   `acd internal session open`, `acd internal hint --kind wake`, or
+   `acd internal hint --kind soft_boundary` (including legacy
    heartbeat-only Stop hooks),
    then delete an event key (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
    `PostToolUse`, `Stop`) only if no hooks remain under it. Older installs may
@@ -15,19 +17,12 @@
    also remove `hooks = true` from the `[features]` table in
    `~/.codex/config.toml`. Do not add `hooks = false` unless you want to disable
    all Codex lifecycle hooks.
-4. The daemon shuts down on its own once Codex exits and the refcount sweep clears the `watch_pid` row. Force-stop any survivors with:
+4. Preview the transactional uninstall, which checkpoints enabled repositories
+   before stopping the supervisor:
    ~~~bash
-   acd stop --all
+   acd uninstall --dry-run
    ~~~
-5. (Optional) Remove the acd binary:
-   ~~~bash
-   rm ~/.local/bin/acd
-   # or
-   brew uninstall acd
-   ~~~
-6. (Optional) Remove all acd state and logs:
-   ~~~bash
-   rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
-   ~~~
+5. Remove protected data only through `acd uninstall --purge-data`, after
+   reviewing the exact plan and supplying its second confirmation.
 
 The hook log lives at `~/.local/state/acd/codex-hook.log`; remove it if you want a fully clean slate.
