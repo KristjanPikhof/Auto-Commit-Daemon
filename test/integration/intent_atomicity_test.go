@@ -53,6 +53,7 @@ import (
 // reports len 4). This is the integration-level acceptance of the
 // "intent group publishes atomically" contract from b1.
 func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -193,6 +194,7 @@ WHERE planner_protocol='v2' AND status='published'`); got != "1" {
 // the prefix and suffix together. The deferred capture remains in
 // planner_state with defer_count >= 1.
 func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -318,6 +320,7 @@ WHERE capture.path IN ('split-b.txt','split-c.txt')
 }
 
 func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -487,8 +490,9 @@ WHERE planner_protocol='v2'`); got != "3" {
 	if status.ExitCode != 0 {
 		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
 	}
-	if !strings.Contains(status.Stdout, `"latest_planner_protocol": "v2"`) {
-		t.Fatalf("status JSON missing native v2 candidate protocol:\n%s",
+	if !strings.Contains(status.Stdout, `"state": "protected"`) ||
+		!strings.Contains(status.Stdout, `"published": true`) {
+		t.Fatalf("product status did not report protected, published state:\n%s",
 			status.Stdout)
 	}
 	events := runAcd(t, ctx, fullEnv, "events", "--repo", repo, "--json", "--limit", "20")
