@@ -27,6 +27,8 @@ const (
 var (
 	ErrCheckpointIdentityMismatch = errors.New("state: checkpoint identity mismatch")
 	ErrCheckpointPhaseConflict    = errors.New("state: illegal checkpoint phase transition")
+	ErrCheckpointNotFound         = errors.New("state: checkpoint not found")
+	ErrCheckpointAmbiguous        = errors.New("state: checkpoint id is ambiguous")
 )
 
 // CheckpointExclusion records privacy-safe scan outcomes. Category is a
@@ -35,6 +37,65 @@ var (
 type CheckpointExclusion struct {
 	Category string
 	Count    int64
+}
+
+// ResolveCheckpoint resolves an exact ID or unique prefix from an existing
+// v20 database without migrating it. Only completed checkpoints are valid
+// restore targets.
+func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoint, error) {
+	if strings.TrimSpace(idOrPrefix) == "" {
+		return Checkpoint{}, ErrCheckpointNotFound
+	}
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("mode", "ro")
+	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	defer conn.Close()
+	var version int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return Checkpoint{}, err
+	}
+	if version < 20 {
+		return Checkpoint{}, ErrSetupRequired
+	}
+	rows, err := conn.QueryContext(ctx, checkpointSelect+`
+ WHERE phase='completed' AND retained=1 AND id LIKE ? ESCAPE '\' ORDER BY seq DESC LIMIT 2`, escapeLike(idOrPrefix)+"%")
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	defer rows.Close()
+	var matches []Checkpoint
+	for rows.Next() {
+		checkpoint, scanErr := scanCheckpoint(rows)
+		if scanErr != nil {
+			return Checkpoint{}, scanErr
+		}
+		matches = append(matches, checkpoint)
+	}
+	if err := rows.Err(); err != nil {
+		return Checkpoint{}, err
+	}
+	if len(matches) == 0 {
+		return Checkpoint{}, ErrCheckpointNotFound
+	}
+	for _, checkpoint := range matches {
+		if checkpoint.ID == idOrPrefix {
+			return checkpoint, nil
+		}
+	}
+	if len(matches) != 1 {
+		return Checkpoint{}, ErrCheckpointAmbiguous
+	}
+	return matches[0], nil
+}
+
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
 }
 
 // Checkpoint is the durable SQLite identity for one full protected worktree
@@ -57,6 +118,8 @@ type Checkpoint struct {
 	CreatedTS        float64
 	CompletedTS      sql.NullFloat64
 	Error            string
+	Retained         bool
+	PrunedTS         sql.NullFloat64
 	EventSeqs        []int64
 	Exclusions       []CheckpointExclusion
 }
@@ -395,7 +458,8 @@ func validCheckpointReason(reason string) bool {
 const checkpointSelect = `
 SELECT id, seq, operation_id, worktree_id, reason, observation_epoch,
        coverage_epoch, observed_head, observed_ref, tree_oid, commit_oid,
-       checkpoint_ref, phase, created_ts, completed_ts, error
+       checkpoint_ref, phase, created_ts, completed_ts, error,
+       retained, pruned_ts
 FROM checkpoints`
 
 type checkpointQuery interface {
@@ -475,7 +539,7 @@ func scanCheckpoint(row checkpointRows) (Checkpoint, error) {
 		&checkpoint.ObservedHead, &checkpoint.ObservedRef,
 		&checkpoint.TreeOID, &checkpoint.CommitOID, &checkpoint.Ref,
 		&checkpoint.Phase, &checkpoint.CreatedTS, &checkpoint.CompletedTS,
-		&checkpoint.Error,
+		&checkpoint.Error, &checkpoint.Retained, &checkpoint.PrunedTS,
 	); err != nil {
 		return Checkpoint{}, err
 	}
