@@ -32,7 +32,7 @@ var (
 		return ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd()))
 	}
 	settingsOutputTTY = func(w io.Writer) bool {
-		f, ok := w.(*os.File)
+		f, ok := w.(interface{ Fd() uintptr })
 		return ok && (isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd()))
 	}
 )
