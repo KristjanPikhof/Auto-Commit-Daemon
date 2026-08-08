@@ -76,7 +76,8 @@ func TestSelfHeal_ParallelCommitterDoesNotBlock(t *testing.T) {
 	if publishedOID != externalHead {
 		t.Fatalf("published commit_oid=%q want external HEAD %q", publishedOID, externalHead)
 	}
-	assertPublishedRecoverySnapshot(t, repo, dbPath, pendingSeq, externalHead, "runtime_branch_transition")
+	assertPublishedRecoverySnapshot(t, repo, dbPath, pendingSeq, externalHead,
+		"runtime_branch_transition", "handled_external_after_block")
 	assertNoSelfHealTerminalRows(t, dbPath)
 
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
@@ -151,7 +152,6 @@ func TestSelfHeal_PauseSurvivesDaemonRestart(t *testing.T) {
 	// marker durability and that HEAD has not advanced.
 
 	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
 
 	startSession(t, ctx, env, repo, "selfheal-restart-b", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
@@ -201,6 +201,9 @@ func TestSelfHeal_RewindGracePausesReplay(t *testing.T) {
 
 	writeFile(t, filepath.Join(repo, "rewind.txt"), "before rewind\n")
 	wakeSession(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), repo, "selfheal-rewind")
+	if flushed := runAcd(t, ctx, envWith(env, "ACD_REWIND_GRACE_SECONDS=2"), "flush", "--logical", "--session-id", "selfheal-rewind", "--repo", repo); flushed.ExitCode != 0 {
+		t.Fatalf("rewind fixture logical boundary failed: %s", flushed.Stderr)
+	}
 	firstCommit := waitForCommitContaining(t, repo, "rewind.txt", 8*time.Second)
 	if firstCommit == seedHead {
 		t.Fatalf("daemon did not create a first rewind.txt commit")
@@ -302,6 +305,9 @@ func TestSelfHeal_FastForwardDuringRewindGrace_NoPhantoms(t *testing.T) {
 	target := filepath.Join(repo, "ff-grace.txt")
 	writeFile(t, target, "ff content\n")
 	wakeSession(t, ctx, testEnv, repo, "selfheal-ff-grace")
+	if flushed := runAcd(t, ctx, testEnv, "flush", "--logical", "--session-id", "selfheal-ff-grace", "--repo", repo); flushed.ExitCode != 0 {
+		t.Fatalf("fast-forward fixture logical boundary failed: %s", flushed.Stderr)
+	}
 	h2 := waitForCommitContaining(t, repo, "ff-grace.txt", 8*time.Second)
 	if h2 == seedHead {
 		t.Fatal("daemon did not commit H2")
@@ -381,26 +387,22 @@ func requireSQLite(t *testing.T) {
 func assertStatusPaused(t *testing.T, ctx context.Context, env []string, repo, wantSource string) {
 	t.Helper()
 	res := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
-	if res.ExitCode != 0 {
+	if res.ExitCode != 3 {
 		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
 	}
 	var rep struct {
-		Paused bool `json:"paused"`
-		Pause  *struct {
-			Source string `json:"source"`
-		} `json:"pause"`
+		State string `json:"state"`
+		Data  struct {
+			ActionRequired bool   `json:"action_required"`
+			Summary        string `json:"summary"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(res.Stdout), &rep); err != nil {
 		t.Fatalf("decode status json: %v\nstdout=%s", err, res.Stdout)
 	}
-	if !rep.Paused {
-		t.Fatalf("acd status paused=false, want true\nstdout=%s", res.Stdout)
-	}
-	if rep.Pause == nil {
-		t.Fatalf("acd status pause object nil, want source=%q\nstdout=%s", wantSource, res.Stdout)
-	}
-	if rep.Pause.Source != wantSource {
-		t.Fatalf("acd status pause.source=%q want %q\nstdout=%s", rep.Pause.Source, wantSource, res.Stdout)
+	if rep.State != "needs_action" || !rep.Data.ActionRequired ||
+		!strings.Contains(strings.ToLower(rep.Data.Summary), "paused") {
+		t.Fatalf("acd status did not report %s pause as needs_action\nstdout=%s", wantSource, res.Stdout)
 	}
 }
 
@@ -437,12 +439,23 @@ func waitForEventState(t *testing.T, dbPath, path, want string, timeout time.Dur
 
 func waitForEventSeqAfterState(t *testing.T, dbPath, path string, afterSeq int64, want string, timeout time.Duration) {
 	t.Helper()
-	waitFor(t, fmt.Sprintf("%s seq>%d state=%s", path, afterSeq, want), timeout, func() bool {
-		got := sqliteScalar(t, dbPath,
-			fmt.Sprintf("SELECT state FROM capture_events WHERE path = %s AND seq > %d ORDER BY seq DESC LIMIT 1",
-				sqliteQuote(path), afterSeq))
-		return got == want
-	})
+	query := fmt.Sprintf("SELECT state FROM capture_events WHERE path = %s AND seq > %d ORDER BY seq DESC LIMIT 1",
+		sqliteQuote(path), afterSeq)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if sqliteScalar(t, dbPath, query) == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	rows := sqliteScalar(t, dbPath,
+		fmt.Sprintf("SELECT group_concat(seq || ':' || operation || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = %s ORDER BY seq", sqliteQuote(path)))
+	meta := sqliteScalar(t, dbPath,
+		"SELECT group_concat(key || '=' || value, char(10)) FROM daemon_meta WHERE key IN ('replay.paused_until', 'protection.complete', 'protection.observation_epoch', 'protection.covered_epoch') ORDER BY key")
+	checkpoints := sqliteScalar(t, dbPath,
+		"SELECT group_concat(id || ':' || phase || ':' || reason, char(10)) FROM checkpoints ORDER BY seq")
+	t.Fatalf("%s seq>%d did not reach state=%s within %v\nrows:\n%s\nmeta:\n%s\ncheckpoints:\n%s",
+		path, afterSeq, want, timeout, rows, meta, checkpoints)
 }
 
 func latestEventState(t *testing.T, dbPath, path string) string {
