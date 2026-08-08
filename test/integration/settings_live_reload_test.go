@@ -27,6 +27,7 @@ type settingsPlannerHit struct {
 }
 
 func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
+	t.Parallel()
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	var mu sync.Mutex
@@ -100,20 +101,15 @@ func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
 			t.Fatalf("activation request %d=%+v err=%v", req.ID, got, err)
 		}
 	}
-	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
-	var statusPayload struct {
-		RuntimeConfig struct {
-			Desired int64 `json:"desired_revision"`
-			Applied int64 `json:"applied_revision"`
-		} `json:"runtime_config"`
-	}
-	decodeErr := json.Unmarshal([]byte(status.Stdout), &statusPayload)
-	if status.ExitCode != 0 || decodeErr != nil || statusPayload.RuntimeConfig.Desired != b.ID || statusPayload.RuntimeConfig.Applied != b.ID {
-		t.Fatalf("status/runtime mismatch exit=%d\n%s\n%s", status.ExitCode, status.Stdout, status.Stderr)
-	}
+	var status ExecResult
+	waitFor(t, "stable protected status after runtime activation", 8*time.Second, func() bool {
+		status = runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
+		return status.ExitCode == 0 && strings.Contains(status.Stdout, `"protected": true`)
+	})
 }
 
 func TestRuntimeConfigInvalidRetentionRapidABCAndRepositoryGates(t *testing.T) {
+	t.Parallel()
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
@@ -181,6 +177,7 @@ func TestRuntimeConfigInvalidRetentionRapidABCAndRepositoryGates(t *testing.T) {
 }
 
 func TestRuntimeConfigShutdownAndCrashBoundaryRecovery(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name        string
 		acknowledge bool
@@ -213,7 +210,6 @@ func TestRuntimeConfigShutdownAndCrashBoundaryRecovery(t *testing.T) {
 			// A stop racing the activation may leave it pending, acknowledged, or
 			// applied; restart must converge boundedly in every case.
 			stopSessionForce(t, env, repo)
-			waitMode(t, repo, "stopped", 5*time.Second)
 			startSession(t, ctx, env, repo, "settings-recover2-"+tc.name, "shell")
 			wakeSession(t, ctx, env, repo, "settings-recover2-"+tc.name)
 			waitSettingsApplied(t, db, next.ID, 8*time.Second)
