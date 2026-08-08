@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,8 +14,9 @@ var ErrNotWorktree = errors.New("git: path is not inside a worktree")
 
 // Worktree identifies the canonical Git worktree root and its absolute git dir.
 type Worktree struct {
-	Root   string
-	GitDir string
+	Root      string
+	GitDir    string
+	CommonDir string
 }
 
 // ResolveWorktree resolves repoPath (or the current working directory when
@@ -48,11 +50,15 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 
 	root, err := ShowToplevel(ctx, abs)
 	if err != nil {
-		return Worktree{}, fmt.Errorf("%w: %s", ErrNotWorktree, abs)
+		return Worktree{}, fmt.Errorf("%w: %s: %v", ErrNotWorktree, abs, err)
 	}
 	gitDir, err := AbsoluteGitDir(ctx, abs)
 	if err != nil {
 		return Worktree{}, fmt.Errorf("git: resolve absolute git dir for %s: %w", abs, err)
+	}
+	commonDir, err := GitCommonDir(ctx, abs)
+	if err != nil {
+		return Worktree{}, fmt.Errorf("git: resolve common dir for %s: %w", abs, err)
 	}
 	root = filepath.Clean(root)
 	if realRoot, err := filepath.EvalSymlinks(root); err == nil {
@@ -65,5 +71,28 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 	if realGitDir, err := filepath.EvalSymlinks(gitDir); err == nil {
 		gitDir = filepath.Clean(realGitDir)
 	}
-	return Worktree{Root: root, GitDir: gitDir}, nil
+	commonDir = filepath.Clean(commonDir)
+	if realCommonDir, err := filepath.EvalSymlinks(commonDir); err == nil {
+		commonDir = filepath.Clean(realCommonDir)
+	}
+	return Worktree{Root: root, GitDir: gitDir, CommonDir: commonDir}, nil
+}
+
+// GitCommonDir returns the canonical absolute Git common directory shared by
+// linked worktrees. Ordinary repositories return their .git directory.
+func GitCommonDir(ctx context.Context, dir string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: dir, Timeout: DefaultReadTimeout},
+		"rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	common := filepath.Clean(string(bytes.TrimSpace(out)))
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(dir, common)
+	}
+	common, err = filepath.Abs(common)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(common), nil
 }
