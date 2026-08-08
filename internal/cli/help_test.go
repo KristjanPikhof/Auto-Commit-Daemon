@@ -12,27 +12,17 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		command string
 		want    []string
 	}{
-		{"on", []string{"acd on --repo /path/to/repo", "idempotent", "State is preserved"}},
-		{"off", []string{"acd off --repo /path/to/repo", "idempotent", "preserves .git/acd state"}},
-		{"settings", []string{"acd settings --profile fast", "synthetic content only", "--accessible"}},
-		{"start", []string{"acd start --repo /path/to/repo", "--session-id", "acd status"}},
-		{"stop", []string{"acd stop --session-id", "acd stop --all --json", "active sessions"}},
-		{"status", []string{"current working directory", "blocked-vs-waiting recovery state", "acd explain"}},
-		{"fix", []string{"acd fix --dry-run", "single recovery entrypoint", "--force"}},
-		{"list", []string{"acd list --watch --interval 5s", "acd list --interactive", "--interval"}},
-		{"logs", []string{"raw JSONL", "acd logs --repo /path/to/repo --lines 50 --follow", "--lines"}},
-		{"prompt", []string{"ACD_AI_PROMPT_TRACE", "acd prompt --seq 42 --json", "--last"}},
-		{"doctor", []string{"acd doctor --bundle", "sanitized diagnostic files", "acd explain --path"}},
-		{"rewrite-commits", []string{"ACD_COMMIT_STRATEGY", "--show-plan", "current branch linear ranges only"}},
-		{"diagnose", []string{"state read-only", "waiting/draining", "acd fix --dry-run"}},
-		{"recover", []string{"DEPRECATED", "acd fix", "--clear-pause"}},
-		{"pause", []string{"acd pause --ttl 1h", "acd resume", "acd status"}},
-		{"resume", []string{"acd resume --repo /path/to/repo --yes", "--accept-overflow", "acd status"}},
-		{"setup", []string{"acd setup codex", "Supported harnesses", "prints snippets only"}},
-		{"wake", []string{"acd wake --session-id", "acd touch", "current working directory"}},
-		{"stats", []string{"acd stats --since 30d", "all registered repos", "--json"}},
-		{"gc", []string{"acd gc --json", "30 days", "acd list"}},
-		{"repo", []string{"acd repo disable --repo /path/to/repo", "acd repo manage", "repo remove to preview or remove"}},
+		{"setup", []string{"acd setup --dry-run", "--non-interactive", "--integrations"}},
+		{"status", []string{"protected and published", "--repo"}},
+		{"on", []string{"Enable checkpoint protection", "--repo"}},
+		{"off", []string{"final durable checkpoint", "--force"}},
+		{"history", []string{"protected checkpoints", "--activity", "rewrite"}},
+		{"restore", []string{"restore ID", "--yes"}},
+		{"doctor", []string{"protection problems", "--bundle", "--output"}},
+		{"uninstall", []string{"preserving protected repository data", "--dry-run", "--purge-data"}},
+		{"config", []string{"get", "set", "credentials"}},
+		{"support", []string{"diagnose", "logs", "repair", "bundle"}},
+		{"repo", []string{"list", "remove", "gc"}},
 	}
 
 	for _, tt := range tests {
@@ -54,7 +44,7 @@ func commandHelp(t *testing.T, command string) string {
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&errOut)
-	root.SetArgs([]string{command, "--help"})
+	root.SetArgs(append(strings.Fields(command), "--help"))
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("execute %s help: %v\nstderr:\n%s", command, err, errOut.String())
 	}
