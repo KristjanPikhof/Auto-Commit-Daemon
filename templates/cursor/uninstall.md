@@ -1,30 +1,25 @@
 # Uninstall acd from Cursor
 
-1. Remove the acd-managed entries from `~/.cursor/hooks.json`. The shipped
+1. Prefer `acd uninstall`, which removes only verified ACD-owned entries from
+   `~/.cursor/hooks.json`. The shipped
    template (`templates/cursor/hooks.json`) wires exactly five events:
    `sessionStart`, `postToolUse`, `afterFileEdit`, `stop`, and `sessionEnd`,
    plus top-level `"version": 1`. If the file contains only the acd block you
    can delete it outright. If you merged custom (non-acd) hooks, remove only
-   hook objects whose command contains `acd hook-cursor-extract` and calls
-   `acd start`, `acd wake`, `acd flush --logical`, or `acd stop`, then delete
+   hook objects whose command contains `acd internal integration cursor-extract`
+   and calls `acd internal session open`, `acd internal hint --kind wake`,
+   `acd internal hint --kind logical_boundary`, or
+   `acd internal session close`, then delete
    an event key only if no hooks remain under it. Remove `version` only if
    nothing else needs it. Older installs may also have a top-level
    `_acd_managed` key; remove it if present.
-2. Stop any running daemons (Cursor does not use `watch-pid` refcount; sessions
-   may linger until explicitly stopped):
+2. Preview the transactional uninstall, which checkpoints enabled repositories
+   before stopping the supervisor:
    ~~~bash
-   acd stop --all
+   acd uninstall --dry-run
    ~~~
-3. (Optional) Remove the acd binary:
-   ~~~bash
-   rm ~/.local/bin/acd
-   # or
-   brew uninstall acd
-   ~~~
-4. (Optional) Remove all acd state and logs:
-   ~~~bash
-   rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
-   ~~~
+3. Remove protected data only through `acd uninstall --purge-data`, after
+   reviewing the exact plan and supplying its second confirmation.
 
 The hook log lives at `~/.local/state/acd/cursor-hook.log`; remove it if you
 want a fully clean slate.
