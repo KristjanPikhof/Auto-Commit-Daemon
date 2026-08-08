@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
@@ -20,10 +23,11 @@ func loadRestartEnvironment(repo string) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve config paths: %w", err)
 	}
-	repoHash, err := paths.RepoHash(repo)
+	wt, err := gitpkg.ResolveWorktree(context.Background(), repo)
 	if err != nil {
 		return nil, fmt.Errorf("resolve repository identity: %w", err)
 	}
+	repoHash := central.CanonicalID(wt.Root)
 	doc, err := config.NewStore(roots).Load()
 	if err != nil {
 		return nil, err
