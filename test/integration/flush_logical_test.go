@@ -46,6 +46,7 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, bin)
 
 	startRes := runAcd(t, ctx, env,
 		"start", "--repo", repo,
@@ -122,12 +123,11 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 	}
 }
 
-// TestFlush_LogicalRefusalsAreNoops covers the refusal contract: a manual
-// pause marker, detached HEAD, or in-progress git operation must NOT
-// enqueue a flush_request and must NOT signal the daemon. The exit code
-// stays zero so the harness Stop hook never surfaces a spurious nonzero
-// to the surrounding agent.
+// TestFlush_LogicalRefusalsAreNoops covers the checkpoint-first contract:
+// semantic hints remain accepted while publication is paused. Unsafe Git
+// state can delay publication, but it cannot block protection observations.
 func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
+	t.Parallel()
 	bin := buildAcdBinary(t)
 	binDir := filepath.Dir(bin)
 
@@ -137,6 +137,7 @@ func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, bin)
 
 	if startRes := runAcd(t, ctx, env, "start",
 		"--repo", repo,
@@ -164,8 +165,7 @@ func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
 		_ = runAcd(t, ctx, env, "resume", "--repo", repo, "--yes")
 	}()
 
-	// flush --logical against a paused repo: ok=true, refused_reason set,
-	// no flush_request enqueued. The hook hot path must stay quiet.
+	// flush --logical against a paused repo remains an accepted semantic hint.
 	flushRes := runAcd(t, ctx, env, "flush",
 		"--repo", repo, "--session-id", sessionID,
 		"--logical", "--json",
@@ -174,21 +174,12 @@ func TestFlush_LogicalRefusalsAreNoops(t *testing.T) {
 		t.Fatalf("paused acd flush --logical must exit 0, got %d\nstdout=%s\nstderr=%s",
 			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
 	}
-	if !strings.Contains(flushRes.Stdout, `"refused_reason"`) {
-		t.Fatalf("expected refused_reason in flush output, got:\n%s", flushRes.Stdout)
-	}
-	if !strings.Contains(flushRes.Stdout, `"manual_pause"`) {
-		t.Fatalf("expected refused_reason=manual_pause, got:\n%s", flushRes.Stdout)
-	}
-
-	// State.db must have no flush_request rows from the refused call.
+	// The worker records a hard boundary and a non-blocking publication request;
+	// the publication scheduler remains responsible for the pause safety gate.
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	pending := sqliteScalar(t, dbPath,
 		"SELECT COUNT(*) FROM flush_requests WHERE command = 'flush_logical'")
-	if pending != "0" {
-		// Drain query for diagnostics.
-		body := sqliteScalar(t, dbPath,
-			"SELECT id||':'||command||':'||status FROM flush_requests")
-		t.Fatalf("refused flush enqueued %s rows; expected 0\nrows: %s", pending, body)
+	if pending == "0" {
+		t.Fatal("paused logical hint did not enqueue a publication boundary")
 	}
 }
