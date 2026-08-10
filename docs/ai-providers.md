@@ -12,7 +12,7 @@ credential, network request, or source egress.
 Configure through the advanced namespace:
 
 ~~~bash
-acd config set publication.provider deterministic
+acd config set ai.provider deterministic
 acd config credentials
 acd config edit
 ~~~

@@ -6,14 +6,16 @@
 
 | Command | Mutates | Confirmation |
 |---|---|---|
-| `acd setup` | Binary, service, registry, configuration, integrations, repository schema and checkpoint refs | Shows one exact plan and asks once. |
+| `acd setup` | Binary, Linux service, registry, configuration, integrations, repository schema and checkpoint refs | Shows one exact plan and asks once. |
 | `acd status` | Nothing | None. |
 | `acd on` | Repository desired state through the supervisor | None; idempotent. |
 | `acd off` | Final checkpoint and repository desired state | `--force` only when protection cannot be confirmed. |
+| `acd list` | Nothing | None; live on a TTY and one-shot through a pipe or `--once`. |
+| `acd commit-all` | Checkpoint and normal local Git publication | Preview unless `--yes` is supplied. |
 | `acd history` | Nothing | None. |
 | `acd restore ID` | Nothing by default; working tree with `--yes` | Preview is mandatory. |
 | `acd doctor` | Nothing unless bundle output is requested | Bundle path is explicit. |
-| `acd uninstall` | Service, binary, owned integrations and desired state | Shows a plan; data purge needs a second confirmation. |
+| `acd uninstall` | Supervisor process, Linux service, binary, owned integrations and desired state | Shows a plan; data purge needs a second confirmation. |
 
 ## Setup
 
@@ -26,14 +28,14 @@ acd setup --integrations=claude-code,codex
 acd setup --yes --non-interactive --expect-plan sha256:...
 ~~~
 
-`--dry-run` performs no file write, command execution, service action, provider
-call, integration change, migration, state open for writing, or Git ref
-creation. `--expect-plan` is required for noninteractive apply when existing
-installation or v19 state is detected.
+`--dry-run` performs no file write, command execution, supervisor or service
+action, provider call, integration change, migration, state open for writing,
+or Git ref creation. `--expect-plan` is required for noninteractive apply when
+existing installation or v19 state is detected.
 
 Setup validates the OS, architecture, Git durability support, repository,
-service manager, disk space, configuration, and integration files. It backs up
-every touched file, applies one all-repository v19 to v20 cutover, runs an
+platform lifecycle, disk space, configuration, and integration files. It backs
+up every touched file, applies one all-repository v19 to v20 cutover, runs an
 isolated self-test, and commits only after all held workers report complete
 current coverage.
 
@@ -53,7 +55,9 @@ publication/repair states.
 
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
-writes.
+writes. On macOS, mutating commands first start the session-owned supervisor
+from the invoking Terminal or agent; this uses the caller's existing folder
+access and requires no Full Disk Access.
 
 ## On and off
 
@@ -83,6 +87,28 @@ only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
 worktree identity, index digest, and target ref.
 
+## Repository dashboard and commit-all
+
+~~~bash
+acd list
+acd list --once
+acd list --watch --interval 5s
+acd list --json
+acd commit-all --dry-run
+acd commit-all --yes
+~~~
+
+`list` shows enabled worktrees using product states only: enabled, protected,
+published to Git, action required, state, and next action. Disabled, missing,
+and stale registry records remain available under hidden `acd repo list`.
+
+`commit-all` first completes a durable checkpoint, records the highest event
+sequence covered by the barrier, and drains only that bounded target through
+the managed worker. Later edits cannot extend the wait. Event mode may create
+one commit per capture; Intent mode may create several semantically atomic
+commits. The command never combines everything into one commit merely because
+of its name.
+
 ## Doctor and support
 
 ~~~bash
@@ -108,8 +134,9 @@ acd uninstall --purge-data
 
 Default uninstall completes checkpoint barriers, stops workers and the
 supervisor, removes only verified owned integration entries, removes the
-managed service and binary, disables repositories, and preserves every state
-database and private ref.
+managed Linux service (when present) and binary, disables repositories, and
+preserves every state database and private ref. macOS has no installed service
+file in session mode.
 
 Data purge requires `--purge-data` plus the second
 `--confirm-purge-data` confirmation. Noninteractive apply also requires
@@ -119,9 +146,9 @@ Data purge requires `--purge-data` plus the second
 
 ~~~text
 acd config get|set|edit|reset|credentials
-acd support diagnose|logs|repair|bundle
+acd support diagnose|logs|repair|recover|prompt|bundle
 acd repo list|remove|gc
-acd history rewrite
+acd history activity|explain|rewrite
 ~~~
 
 They are callable but hidden from root help.
@@ -178,11 +205,11 @@ be removed no earlier than the third checkpoint-first release.
 |---|---|
 | `configure`, `settings` | `config edit` |
 | `auth` | `config credentials` |
-| `events` | `history --activity` |
+| `events` | `history activity` |
 | `explain` | `history explain` |
 | `rewrite-commits` | `history rewrite` |
 | `diagnose`, `logs`, `fix`, `recover`, `prompt` | Matching `support` operation |
-| `list`, `stats`, `gc` | Matching `repo` operation |
+| `stats`, `gc` | Matching `repo` operation |
 | `start`, `stop`, `wake`, `touch`, `flush` | Hidden internal session/hint protocol |
 | `daemon run` | Hidden internal worker entrypoint |
 | Hook extractors | Hidden internal integration helpers |

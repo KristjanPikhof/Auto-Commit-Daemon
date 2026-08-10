@@ -20,12 +20,18 @@ acd setup
 ~~~
 
 Setup inspects the machine and repository, prints an exact plan, asks once,
-and applies the plan transactionally. It installs one user-level supervisor,
+and applies the plan transactionally. It configures one user-level supervisor,
 enables the current repository, merges detected optional integrations, and
 runs an isolated checkpoint/publish/restore self-test. On failure it restores
-every touched file and prior service state.
+every touched file and prior process/service state.
 
-Preview without writes or service actions:
+On macOS, ACD starts the supervisor from the Terminal or agent session that
+invoked it. This keeps repository access within permissions the user already
+granted and does not require Full Disk Access. After logout or restart, the
+first `acd on` or supported agent hook starts the supervisor again. Linux uses
+the persistent user systemd service.
+
+Preview without writes or supervisor/service actions:
 
 ~~~bash
 acd setup --dry-run
@@ -73,7 +79,7 @@ repair.
 
 ## Commands
 
-Root help exposes exactly eight commands:
+Root help exposes exactly ten commands:
 
 | Command | Purpose |
 |---|---|
@@ -81,6 +87,8 @@ Root help exposes exactly eight commands:
 | `acd status` | Answer whether changes are enabled, protected, published, and actionable. |
 | `acd on` | Enable checkpoint protection. |
 | `acd off` | Complete a final checkpoint barrier, then disable protection. |
+| `acd list` | Show enabled repositories with protection and publication state. |
+| `acd commit-all` | Checkpoint now and drain the bounded publication target. |
 | `acd history` | List retained checkpoints and their Git publication state. |
 | `acd restore ID` | Preview a full-checkpoint restore; add `--yes` to apply it. |
 | `acd doctor` | Explain installation or protection problems and the exact next command. |
@@ -90,14 +98,20 @@ Advanced commands are callable under hidden namespaces:
 
 ~~~text
 acd config get|set|edit|reset|credentials
-acd support diagnose|logs|repair|bundle
+acd support diagnose|logs|repair|recover|prompt|bundle
 acd repo list|remove|gc
-acd history rewrite
+acd history activity|explain|rewrite
 ~~~
 
 Old command names remain hidden compatibility aliases for two releases. A
 manual use prints a warning. Optional integrations use hidden local hint APIs
 without terminal noise. All aliases invoke the checkpoint-first runtime.
+
+`acd commit-all` does not squash the worktree into one commit. It freezes the
+checkpoint-backed event target and lets the configured event or Intent
+publication strategy create the same reviewable, atomic local commits it
+would create during normal operation. Edits made after the barrier are left
+for the next publication pass.
 
 See [the command reference](docs/commands.md) for flags, JSON, exit codes, and
 the compatibility map.
@@ -172,7 +186,7 @@ a worktree it defaults to global scope. Make scope explicit with
 
 ~~~bash
 acd config get
-acd config set publication.preset fast
+acd config set commit.preset fast
 acd config edit
 acd config credentials
 ~~~
@@ -193,7 +207,9 @@ default
 Credentials stay in the protected existing credential store. The deterministic
 default requires none. Diff egress remains off unless explicitly approved.
 
-See [settings](docs/settings.md) and [AI providers](docs/ai-providers.md).
+See [settings](docs/settings.md), the generated
+[configuration reference](docs/configuration-reference.md), and
+[AI providers](docs/ai-providers.md).
 
 ## Setup, upgrade, and uninstall safety
 
@@ -224,7 +240,7 @@ staged reversibly until the uninstall transaction commits.
 | Supervisor log | `${XDG_STATE_HOME:-$HOME/.local/state}/acd/supervisor.log` |
 | Global operation history | `${XDG_DATA_HOME:-$HOME/.local/share}/acd/operations.db` |
 | Repository state | `<git-dir>/acd/state.db` |
-| macOS service | `~/Library/LaunchAgents/io.github.kristjanpikhof.acd.plist` |
+| macOS lifecycle | Session-owned; no installed service file |
 | Linux service | `~/.config/systemd/user/acd-supervisor.service` |
 
 Linux requires a working systemd user manager. ACD does not ship a second

@@ -26,9 +26,9 @@ distinct capture settings while sharing one common-directory worker.
 
 ~~~bash
 acd config get
-acd config get publication.preset
-acd config set publication.preset fast
-acd config set --scope global publication.provider deterministic
+acd config get commit.preset
+acd config set commit.preset fast
+acd config set --scope global ai.provider deterministic
 acd config edit
 acd config reset
 acd config credentials
@@ -43,12 +43,12 @@ silently ignoring it.
 Fresh setup persists:
 
 ~~~text
-provider = deterministic
-strategy = intent
-preset = fast
-verification = structural
-repair = disabled
-diff egress = disabled
+ai.provider = deterministic
+commit.strategy = intent
+commit.preset = fast
+intent.verification = structural
+intent.repair.enabled = false
+ai.diff_egress = false
 ~~~
 
 The deterministic path needs no API key. Migration preserves every existing
@@ -71,3 +71,7 @@ self-test never require network access.
 Hot fields apply between safe worker passes. Restart-required fields apply
 when the supervisor next starts that repository worker. Changing a global
 value does not start stopped repositories or fan out an implicit restart.
+
+See the generated [configuration reference](configuration-reference.md) for
+every supported setting, environment variable, default, apply boundary,
+persistence rule, and sensitivity classification.

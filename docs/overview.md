@@ -29,6 +29,13 @@ canonical Git common directory and runs one isolated worker for each group.
 The supervisor never opens repository SQLite as a writer. Workers own their
 repositories under the canonical common-directory lock.
 
+On macOS the supervisor and workers are descendants of the authorized
+Terminal or agent session. ACD therefore needs no Full Disk Access and does
+not install a launchd service. Mutating commands and supported integration
+hints start the session supervisor when it is absent; after logout or reboot,
+protection resumes on that first invocation. Linux uses a persistent systemd
+user service.
+
 Local newline-delimited JSON IPC uses schema v1, request IDs, strict method
 validation, worktree identity, and bounded deadlines. Mutations fail closed if
 the supervisor or worker is unavailable. Read-only status may use an existing
@@ -83,10 +90,10 @@ checkpoint and completing the operation.
 
 ## Global transactions
 
-Setup, upgrade, uninstall, configuration, registry, integration, and service
-mutations are recorded in the global operations database. Plans have immutable
-SHA-256 digests. Every touched file has a type/mode/owner/digest preimage and
-prior service desired state.
+Setup, upgrade, uninstall, configuration, registry, integration, and platform
+lifecycle mutations are recorded in the global operations database. Plans have
+immutable SHA-256 digests. Every touched file has a type/mode/owner/digest
+preimage and prior platform lifecycle state.
 
 The v19 to v20 cutover spans every registered repository. A temporary
 protection bridge covers concurrent edits, repository locks are acquired in

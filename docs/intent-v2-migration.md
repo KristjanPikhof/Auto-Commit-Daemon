@@ -23,8 +23,9 @@ the complete cutover.
 4. Create and verify WAL-consistent v19 database backups.
 5. Preserve provable unpublished chains as checkpoint or recovery history.
 6. Create complete migration checkpoints, including bridge-observed edits.
-7. apply schema v20 to every repository and registry v2 globally.
-8. Install the managed binary, supervisor service, and owned integrations.
+7. Apply schema v20 to every repository and registry v2 globally.
+8. Install the managed binary and owned integrations, then start the macOS
+   session supervisor or install the Linux user service.
 9. Run the isolated checkpoint/publish/restore self-test.
 10. Hold new workers until schema, version, ownership, recovery, and current
     coverage are proven.
@@ -41,7 +42,7 @@ Intent/Fast.
 
 Before global commit, setup stops held v20 workers, restores every preimage and
 v19 database, CAS-deletes only refs it created at their exact expected targets,
-and restores the prior service desired state. A bridge ref with otherwise
+and restores the prior session or service state. A bridge ref with otherwise
 unrepresented work is retained with a local recovery manifest.
 
 After commit, new changes may exist only in v20 checkpoints, so downgrade is

@@ -4,8 +4,8 @@ Intent groups captured changes from completed checkpoints into coherent local
 Git commits. It never participates in checkpoint durability.
 
 ~~~bash
-acd config set publication.strategy intent
-acd config set publication.preset fast
+acd config set commit.strategy intent
+acd config set commit.preset fast
 ~~~
 
 ## Inputs and assignment
