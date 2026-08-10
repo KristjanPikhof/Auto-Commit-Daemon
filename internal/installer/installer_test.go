@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
@@ -20,8 +21,8 @@ import (
 
 type recordingExecutor struct{ calls []string }
 
-func (r *recordingExecutor) Run(_ context.Context, name string, _ ...string) error {
-	r.calls = append(r.calls, name)
+func (r *recordingExecutor) Run(_ context.Context, name string, args ...string) error {
+	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
 	return nil
 }
 
@@ -291,6 +292,74 @@ func TestApplyQuiesceFailureDoesNotRestoreUncreatedMigrationBackups(t *testing.T
 	}
 	if strings.Contains(err.Error(), "state-v19.db") || strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("pre-migration rollback tried to restore an uncreated database backup: %v", err)
+	}
+}
+
+func TestQuiesceSetupStopsSupervisorBeforeWorkersAndRestoresOnFailure(t *testing.T) {
+	ctx := context.Background()
+	roots := paths.Roots{State: t.TempDir(), Share: t.TempDir(), Config: t.TempDir()}
+	service := supervisor.ServiceDefinition{Platform: "systemd"}
+	prior := ServiceState{Loaded: true, Enabled: true}
+	executor := &recordingExecutor{}
+	_, err := quiesceSetup(ctx, roots, executor, service, prior,
+		func(context.Context) error {
+			if got := executor.calls; len(got) != 1 || got[0] != "systemctl --user disable --now acd-supervisor.service" {
+				return errors.New("supervisor was not stopped before repository workers")
+			}
+			return errors.New("injected worker quiesce failure")
+		})
+	if err == nil || !strings.Contains(err.Error(), "injected worker quiesce failure") {
+		t.Fatalf("quiesce error=%v calls=%v", err, executor.calls)
+	}
+	want := []string{
+		"systemctl --user disable --now acd-supervisor.service",
+		"systemctl --user daemon-reload",
+		"systemctl --user enable acd-supervisor.service",
+		"systemctl --user start acd-supervisor.service",
+	}
+	if strings.Join(executor.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("service calls=%v want=%v", executor.calls, want)
+	}
+}
+
+func TestApplyFencesSessionRestartsThroughMigration(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("session lifecycle fencing is macOS-only")
+	}
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	plan, err := BuildPlan(ctx, roots, Options{Repo: repo, Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiesceCalls := 0
+	_, err = Apply(ctx, roots, plan, ApplyOptions{
+		Executor: &recordingExecutor{},
+		Quiesce: func(context.Context) error {
+			quiesceCalls++
+			if quiesceCalls != 2 {
+				return nil
+			}
+			probeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			lock, lockErr := supervisor.AcquireSessionLifecycleLock(probeCtx, roots)
+			if lockErr == nil {
+				lock.Release()
+				return errors.New("session lifecycle was not fenced during migration")
+			}
+			if !errors.Is(lockErr, context.DeadlineExceeded) {
+				return lockErr
+			}
+			return nil
+		},
+		Ready:    readyImmediately,
+		SelfTest: selfTestImmediately,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quiesceCalls != 2 {
+		t.Fatalf("quiesce calls=%d want=2", quiesceCalls)
 	}
 }
 

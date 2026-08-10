@@ -287,24 +287,44 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup preview became stale before quiescence", true)
 		return Result{}, err
 	}
-	emitProgress(options, "quiesce", "Stopping legacy workers at a safe checkpoint boundary")
-	quiesced := options.Quiesce != nil
-	if quiesced {
-		if err := options.Quiesce(ctx); err != nil {
-			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup quiescence failed", true)
-			return Result{}, err
+	emitProgress(options, "quiesce", "Stopping the legacy supervisor and workers at a safe checkpoint boundary")
+	serviceQuiesced, err := quiesceSetup(ctx, roots, options.Executor, plan.Service, plan.PriorService, options.Quiesce)
+	if err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup quiescence failed", true)
+		return Result{}, err
+	}
+	sessionLock, err := acquireSetupSessionFence(ctx, roots, plan.Service, options.Quiesce)
+	if err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup session quiescence failed", true)
+		if serviceQuiesced {
+			err = errors.Join(err, restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService))
+		}
+		return Result{}, err
+	}
+	releaseSessionLock := func() {
+		if sessionLock != nil {
+			sessionLock.Release()
+			sessionLock = nil
 		}
 	}
+	restoreQuiescedService := func(cause error) error {
+		releaseSessionLock()
+		if !serviceQuiesced {
+			return cause
+		}
+		return errors.Join(cause, restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService))
+	}
+	quiesced := options.Quiesce != nil || serviceQuiesced
 	if err := revalidateSetupPlan(ctx, roots, plan, quiesced); err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup preview became stale after quiescence", true)
-		return Result{}, err
+		return Result{}, restoreQuiescedService(err)
 	}
 	if err := journal.Advance(ctx, plan.OperationID, "quiesced", "", false); err != nil {
-		return Result{}, err
+		return Result{}, restoreQuiescedService(err)
 	}
 	if err := os.MkdirAll(plan.BackupRoot, 0o700); err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup backup directory failed", true)
-		return Result{}, err
+		return Result{}, restoreQuiescedService(err)
 	}
 
 	emitProgress(options, "backup", "Backing up existing ACD files and repository state")
@@ -315,22 +335,23 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	backups, err := backupFiles(plan.BackupRoot, targets, plan.PriorService)
 	if err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "backup failed", true)
-		return Result{}, err
+		return Result{}, restoreQuiescedService(err)
 	}
 	if err := journal.Advance(ctx, plan.OperationID, "backed_up", "", false); err != nil {
-		return Result{}, err
+		return Result{}, restoreQuiescedService(err)
 	}
 	rollbackFiles := func(cause error) error {
 		emitProgress(options, "rollback", "Setup failed; restoring all backed-up state")
 		fileErr := restoreFiles(backups)
-		if fileErr != nil || errors.Is(cause, errPostMutationProof) {
-			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback preserved a concurrent host edit", true)
-			emitProgress(options, "needs_attention", "Rollback preserved a concurrent host edit; run `acd doctor`")
+		serviceErr := restoreQuiescedService(nil)
+		if fileErr != nil || serviceErr != nil || errors.Is(cause, errPostMutationProof) {
+			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
+			emitProgress(options, "needs_attention", "Rollback could not be fully verified; run `acd doctor`")
 		} else {
 			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "setup rolled back", true)
 			emitProgress(options, "rolled_back", "Rollback completed; the previous ACD state is unchanged")
 		}
-		return errors.Join(cause, fileErr)
+		return errors.Join(cause, fileErr, serviceErr)
 	}
 	emitProgress(options, "install_binary", "Installing the managed binary for setup preflight")
 	managedBody, err := os.ReadFile(plan.SourceExecutable)
@@ -393,6 +414,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		if migrationApplied {
 			dbErr = migration.Rollback(plan.Repositories)
 		}
+		releaseSessionLock()
 		serviceErr := restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService)
 		rollbackErr := errors.Join(stopErr, fileErr, dbErr, serviceErr, manifestErr)
 		if rollbackErr != nil || errors.Is(cause, errPostMutationProof) {
@@ -425,11 +447,6 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	emitProgress(options, "install", "Installing the managed binary, supervisor, and registry")
-	if plan.PriorService.Loaded {
-		if err := unloadService(ctx, roots, options.Executor, plan.Service); err != nil {
-			return Result{}, rollback(err)
-		}
-	}
 	plan.Registry.Normalize()
 	registryDigest, err := jsonFileDigest(plan.Registry)
 	if err != nil {
@@ -467,6 +484,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	emitProgress(options, "service", supervisorStartProgress(plan.Service))
+	releaseSessionLock()
 	if err := loadService(ctx, roots, options.Executor, plan.Service); err != nil {
 		return Result{}, rollback(err)
 	}
@@ -1017,6 +1035,60 @@ func unloadLegacyLaunchd(ctx context.Context, executor Executor) error {
 		return nil
 	}
 	return executor.Run(ctx, "launchctl", "bootout", target)
+}
+
+func quiesceSetup(
+	ctx context.Context,
+	roots paths.Roots,
+	executor Executor,
+	service supervisor.ServiceDefinition,
+	prior ServiceState,
+	stopWorkers func(context.Context) error,
+) (bool, error) {
+	if prior.Loaded {
+		if err := unloadService(ctx, roots, executor, service); err != nil {
+			return false, errors.Join(err,
+				restoreServiceState(context.Background(), roots, executor, service, prior))
+		}
+	}
+	if stopWorkers != nil {
+		if err := stopWorkers(ctx); err != nil {
+			if !prior.Loaded {
+				return false, err
+			}
+			return false, errors.Join(err,
+				restoreServiceState(context.Background(), roots, executor, service, prior))
+		}
+	}
+	return prior.Loaded, nil
+}
+
+func acquireSetupSessionFence(
+	ctx context.Context,
+	roots paths.Roots,
+	service supervisor.ServiceDefinition,
+	stopWorkers func(context.Context) error,
+) (*supervisor.SessionLifecycleLock, error) {
+	if service.Platform != "session" {
+		return nil, nil
+	}
+	lock, err := supervisor.AcquireSessionLifecycleLock(ctx, roots)
+	if err != nil {
+		return nil, err
+	}
+	// A hook may have started a supervisor between the initial shutdown and
+	// lock acquisition. Recheck shutdown while starts are fenced.
+	if err := shutdownSupervisor(ctx, roots); err != nil {
+		lock.Release()
+		return nil, err
+	}
+	if stopWorkers != nil {
+		if err := stopWorkers(ctx); err != nil {
+			lock.Release()
+			return nil, err
+		}
+	}
+	return lock, nil
 }
 
 func shutdownSupervisor(ctx context.Context, roots paths.Roots) error {
