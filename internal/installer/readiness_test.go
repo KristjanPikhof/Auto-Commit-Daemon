@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
@@ -53,6 +54,25 @@ func TestWaitSupervisorWorkersReadyWaitsForEveryWorkerSocket(t *testing.T) {
 	}
 	if !slices.Contains(counts, 1) || counts[len(counts)-1] != 2 {
 		t.Fatalf("readiness progress=%v", counts)
+	}
+}
+
+func TestGroupSetupBarrierRecordsSerializesLinkedWorktrees(t *testing.T) {
+	records := []central.RepoRecord{
+		{RepositoryID: "repo-a", WorktreeID: "a-main"},
+		{RepositoryID: "repo-b", WorktreeID: "b-main"},
+		{RepositoryID: "repo-a", WorktreeID: "a-linked"},
+		{RepositoryID: "repo-c", WorktreeID: "c-main"},
+	}
+	groups := groupSetupBarrierRecords(records)
+	if len(groups) != 3 {
+		t.Fatalf("groups=%v", groups)
+	}
+	if got := []string{groups[0][0].WorktreeID, groups[0][1].WorktreeID}; !slices.Equal(got, []string{"a-main", "a-linked"}) {
+		t.Fatalf("linked worktree order=%v", got)
+	}
+	if groups[1][0].RepositoryID != "repo-b" || groups[2][0].RepositoryID != "repo-c" {
+		t.Fatalf("repository group order=%v", groups)
 	}
 }
 

@@ -177,6 +177,11 @@ func ApplyAllWithProgress(ctx context.Context, plans []RepositoryPlan, progress 
 		locks = append(locks, heldLock{lock: lock})
 	}
 	defer releaseLocks(locks)
+	for _, plan := range plans {
+		if err := revalidateRepositoryPlan(ctx, plan); err != nil {
+			return nil, err
+		}
+	}
 
 	for _, plan := range plans {
 		_ = os.Remove(createdRefsPath(plan))
@@ -201,6 +206,26 @@ func ApplyAllWithProgress(ctx context.Context, plans []RepositoryPlan, progress 
 	return results, nil
 }
 
+func revalidateRepositoryPlan(ctx context.Context, reviewed RepositoryPlan) error {
+	current, err := Preflight(ctx, reviewed.Record, reviewed.BackupPath)
+	if err != nil {
+		return fmt.Errorf("migration: revalidate %s: %w", reviewed.Record.Path, err)
+	}
+	for _, snapshot := range reviewed.BridgeSnapshots {
+		operationID := strings.Split(strings.TrimPrefix(snapshot.Ref, migrationRefPrefix), "/")[0]
+		if err := validateBridgeSnapshot(ctx, operationID, snapshot); err != nil {
+			return fmt.Errorf("migration: revalidate retained bridge %s: %w", snapshot.Ref, err)
+		}
+	}
+	current.BridgeSnapshots = reviewed.BridgeSnapshots
+	reviewedBody, _ := json.Marshal(reviewed)
+	currentBody, _ := json.Marshal(current)
+	if string(currentBody) != string(reviewedBody) {
+		return fmt.Errorf("migration: repository state changed after preview: %s", reviewed.Record.Path)
+	}
+	return nil
+}
+
 func applyRepository(ctx context.Context, plan RepositoryPlan) (Result, error) {
 	if plan.Missing {
 		result := Result{Record: plan.Record}
@@ -223,6 +248,9 @@ func applyRepository(ctx context.Context, plan RepositoryPlan) (Result, error) {
 	}
 	defer db.Close()
 	result := Result{Record: plan.Record}
+	if err := daemon.RecoverSelfPublicationsBeforePlanning(ctx, wt.Root, db); err != nil {
+		return Result{}, fmt.Errorf("migration: recover publication journal before membership repair: %w", err)
+	}
 	for index, pair := range plan.Pairs {
 		recovered, err := daemon.ReconcileUnpublishedChain(ctx, wt.Root, db, daemon.RecoveryReconcileOptions{
 			GitDir: wt.GitDir, BranchRef: pair.BranchRef, BranchGeneration: pair.Generation,
@@ -263,6 +291,9 @@ func applyRepository(ctx context.Context, plan RepositoryPlan) (Result, error) {
 		}
 		result.CreatedRefs = append(result.CreatedRefs, proof)
 		result.BridgeCheckpoints = append(result.BridgeCheckpoints, imported.ID)
+	}
+	if _, err := state.ReconcileCheckpointIntentMemberships(ctx, db, plan.Record.WorktreeID); err != nil {
+		return Result{}, fmt.Errorf("migration: reconcile checkpoint publication membership: %w", err)
 	}
 	store := checkpoint.Store{DB: db}
 	entries, exclusions, err := scanProtectedEntriesForMigration(ctx, wt.Root, &store)

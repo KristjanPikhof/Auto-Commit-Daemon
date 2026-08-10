@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,6 +41,8 @@ type Options struct {
 	SkipServiceCheck bool
 }
 
+const setupBarrierConcurrency = 4
+
 type Action struct {
 	Kind   string `json:"kind"`
 	Target string `json:"target"`
@@ -47,33 +50,36 @@ type Action struct {
 }
 
 type Plan struct {
-	OperationID       string                       `json:"operation_id"`
-	Digest            string                       `json:"digest"`
-	ExistingInstall   bool                         `json:"existing_install"`
-	RequiresExpected  bool                         `json:"requires_expected_plan"`
-	Repo              string                       `json:"repo"`
-	RepositoryID      string                       `json:"repository_id"`
-	WorktreeID        string                       `json:"worktree_id"`
-	ManagedBinary     string                       `json:"managed_binary"`
-	SourceExecutable  string                       `json:"source_executable"`
-	Service           supervisor.ServiceDefinition `json:"service"`
-	PriorService      ServiceState                 `json:"prior_service"`
-	Registry          *central.Registry            `json:"registry"`
-	Repositories      []migration.RepositoryPlan   `json:"repositories"`
-	RecoveryManifests []string                     `json:"recovery_manifests,omitempty"`
-	Actions           []Action                     `json:"actions"`
-	FreshDefaults     bool                         `json:"fresh_defaults"`
-	Integrations      []string                     `json:"integrations"`
-	IntegrationPlans  []integrationpkg.Plan        `json:"integration_plans"`
-	BackupRoot        string                       `json:"backup_root"`
+	OperationID         string                       `json:"operation_id"`
+	Digest              string                       `json:"digest"`
+	ExistingInstall     bool                         `json:"existing_install"`
+	RequiresExpected    bool                         `json:"requires_expected_plan"`
+	Repo                string                       `json:"repo"`
+	RepositoryID        string                       `json:"repository_id"`
+	WorktreeID          string                       `json:"worktree_id"`
+	ManagedBinary       string                       `json:"managed_binary"`
+	SourceExecutable    string                       `json:"source_executable"`
+	Service             supervisor.ServiceDefinition `json:"service"`
+	PriorService        ServiceState                 `json:"prior_service"`
+	Registry            *central.Registry            `json:"registry"`
+	Repositories        []migration.RepositoryPlan   `json:"repositories"`
+	RecoveryManifests   []string                     `json:"recovery_manifests,omitempty"`
+	Actions             []Action                     `json:"actions"`
+	FreshDefaults       bool                         `json:"fresh_defaults"`
+	Integrations        []string                     `json:"integrations"`
+	IntegrationPlans    []integrationpkg.Plan        `json:"integration_plans"`
+	OwnershipDigest     string                       `json:"integration_ownership_digest"`
+	BackupRoot          string                       `json:"backup_root"`
+	ServiceCheckSkipped bool                         `json:"-"`
 }
 
 type ServiceState struct {
-	Installed     bool `json:"installed"`
-	Loaded        bool `json:"loaded"`
-	Enabled       bool `json:"enabled"`
-	LegacyLoaded  bool `json:"legacy_loaded,omitempty"`
-	SessionLoaded bool `json:"session_loaded,omitempty"`
+	Installed     bool   `json:"installed"`
+	FileDigest    string `json:"file_digest"`
+	Loaded        bool   `json:"loaded"`
+	Enabled       bool   `json:"enabled"`
+	LegacyLoaded  bool   `json:"legacy_loaded,omitempty"`
+	SessionLoaded bool   `json:"session_loaded,omitempty"`
 }
 
 type ApplyOptions struct {
@@ -200,6 +206,10 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	for _, item := range integrationPlans {
 		integrations = append(integrations, item.Name)
 	}
+	ownershipDigest, err := currentFileDigest(roots.IntegrationsOwnershipPath())
+	if err != nil {
+		return Plan{}, err
+	}
 	plan := Plan{
 		OperationID: opID, ExistingInstall: existing, RequiresExpected: existing,
 		Repo: wt.Root, RepositoryID: registration.Record.RepositoryID, WorktreeID: registration.Record.WorktreeID,
@@ -207,7 +217,8 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		PriorService: priorService, Registry: planned,
 		Repositories: repoPlans, RecoveryManifests: recoveryManifests,
 		FreshDefaults: !existing, Integrations: integrations,
-		IntegrationPlans: integrationPlans, BackupRoot: backupRoot,
+		IntegrationPlans: integrationPlans, OwnershipDigest: ownershipDigest, BackupRoot: backupRoot,
+		ServiceCheckSkipped: options.SkipServiceCheck,
 	}
 	plan.Actions = []Action{
 		{Kind: "backup", Target: backupRoot, Detail: "Back up every existing file and repository database"},
@@ -251,13 +262,15 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if plan.Digest == "" || digestPlan(plan) != plan.Digest {
 		return Result{}, errors.New("setup: plan digest mismatch")
 	}
+	lifecycleLock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
+	if err != nil {
+		return Result{}, fmt.Errorf("setup: acquire user lifecycle lock: %w", err)
+	}
+	defer lifecycleLock.Release()
 	if options.Executor == nil {
 		options.Executor = OSExecutor{}
 	}
 	emitProgress(options, "prepare", "Preparing the setup transaction")
-	if err := os.MkdirAll(plan.BackupRoot, 0o700); err != nil {
-		return Result{}, err
-	}
 	journal, err := globalops.Open(ctx, roots.OperationsDBPath())
 	if err != nil {
 		return Result{}, err
@@ -268,6 +281,29 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		steps = append(steps, globalops.Step{Sequence: i + 1, Kind: action.Kind, Target: action.Target, Phase: "planned"})
 	}
 	if err := journal.Prepare(ctx, globalops.Operation{ID: plan.OperationID, Kind: "setup", Phase: "planned", PlanDigest: plan.Digest}, steps); err != nil {
+		return Result{}, err
+	}
+	if err := revalidateSetupPlan(ctx, roots, plan, false); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup preview became stale before quiescence", true)
+		return Result{}, err
+	}
+	emitProgress(options, "quiesce", "Stopping legacy workers at a safe checkpoint boundary")
+	quiesced := options.Quiesce != nil
+	if quiesced {
+		if err := options.Quiesce(ctx); err != nil {
+			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup quiescence failed", true)
+			return Result{}, err
+		}
+	}
+	if err := revalidateSetupPlan(ctx, roots, plan, quiesced); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup preview became stale after quiescence", true)
+		return Result{}, err
+	}
+	if err := journal.Advance(ctx, plan.OperationID, "quiesced", "", false); err != nil {
+		return Result{}, err
+	}
+	if err := os.MkdirAll(plan.BackupRoot, 0o700); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup backup directory failed", true)
 		return Result{}, err
 	}
 
@@ -286,16 +322,33 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	rollbackFiles := func(cause error) error {
 		emitProgress(options, "rollback", "Setup failed; restoring all backed-up state")
-		err := rollbackSetupFiles(journal, plan.OperationID, backups, cause)
-		emitProgress(options, "rolled_back", "Rollback completed; the previous ACD state is unchanged")
-		return err
+		fileErr := restoreFiles(backups)
+		if fileErr != nil || errors.Is(cause, errPostMutationProof) {
+			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback preserved a concurrent host edit", true)
+			emitProgress(options, "needs_attention", "Rollback preserved a concurrent host edit; run `acd doctor`")
+		} else {
+			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "setup rolled back", true)
+			emitProgress(options, "rolled_back", "Rollback completed; the previous ACD state is unchanged")
+		}
+		return errors.Join(cause, fileErr)
 	}
 	emitProgress(options, "install_binary", "Installing the managed binary for setup preflight")
-	if err := copyAtomic(plan.ManagedBinary, plan.SourceExecutable); err != nil {
+	managedBody, err := os.ReadFile(plan.SourceExecutable)
+	if err != nil {
+		return Result{}, rollbackFiles(err)
+	}
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.ManagedBinary, sha256String(managedBody)); err != nil {
+		return Result{}, rollbackFiles(err)
+	}
+	if err := writeAtomic(plan.ManagedBinary, managedBody, 0o755); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	holdBody, _ := json.Marshal(map[string]string{"operation_id": plan.OperationID, "plan_digest": plan.Digest})
-	if err := writeAtomic(roots.SetupPublicationHoldPath(), append(holdBody, '\n'), 0o600); err != nil {
+	holdBody = append(holdBody, '\n')
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), sha256String(holdBody)); err != nil {
+		return Result{}, rollbackFiles(err)
+	}
+	if err := writeAtomic(roots.SetupPublicationHoldPath(), holdBody, 0o600); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	activeRepositories := 0
@@ -342,7 +395,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		}
 		serviceErr := restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService)
 		rollbackErr := errors.Join(stopErr, fileErr, dbErr, serviceErr, manifestErr)
-		if rollbackErr != nil {
+		if rollbackErr != nil || errors.Is(cause, errPostMutationProof) {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
 			emitProgress(options, "needs_attention", "Rollback could not be fully verified; run `acd doctor`")
 		} else {
@@ -356,15 +409,6 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			emitProgress(options, "rolled_back", message)
 		}
 		return errors.Join(cause, rollbackErr)
-	}
-	emitProgress(options, "quiesce", "Stopping legacy workers at a safe checkpoint boundary")
-	if options.Quiesce != nil {
-		if err := options.Quiesce(ctx); err != nil {
-			return Result{}, rollback(err)
-		}
-	}
-	if err := journal.Advance(ctx, plan.OperationID, "quiesced", "", false); err != nil {
-		return Result{}, rollback(err)
 	}
 	emitProgress(options, "migrate", fmt.Sprintf("Migrating %d repositories to checkpoint storage", len(plan.Repositories)))
 	migrations, err := migration.ApplyAllWithProgress(ctx, plan.Repositories, func(update migration.Progress) {
@@ -380,52 +424,46 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "schema_applied", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	emitProgress(options, "install", "Installing the managed binary, supervisor, registry, and integrations")
+	emitProgress(options, "install", "Installing the managed binary, supervisor, and registry")
 	if plan.PriorService.Loaded {
 		if err := unloadService(ctx, roots, options.Executor, plan.Service); err != nil {
 			return Result{}, rollback(err)
 		}
 	}
+	plan.Registry.Normalize()
+	registryDigest, err := jsonFileDigest(plan.Registry)
+	if err != nil {
+		return Result{}, rollback(err)
+	}
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.RegistryPath(), registryDigest); err != nil {
+		return Result{}, rollback(err)
+	}
 	if err := central.Save(roots, plan.Registry); err != nil {
 		return Result{}, rollback(err)
 	}
-	if err := migrateRepositoryConfigKeys(roots, plan.Registry); err != nil {
+	prepareConfig := func(body []byte) error {
+		return preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.ConfigPath(), sha256String(body))
+	}
+	if err := migrateRepositoryConfigKeys(roots, plan.Registry, prepareConfig); err != nil {
 		return Result{}, rollback(err)
 	}
 	if plan.FreshDefaults {
-		if err := persistFreshDefaults(roots, plan.WorktreeID); err != nil {
+		if err := persistFreshDefaults(roots, plan.WorktreeID, prepareConfig); err != nil {
 			return Result{}, rollback(err)
 		}
+	}
+	serviceDigest := absentFileDigest
+	if plan.Service.Platform != "session" {
+		serviceDigest = sha256String(plan.Service.Content)
+	}
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.Service.Path, serviceDigest); err != nil {
+		return Result{}, rollback(err)
 	}
 	if plan.Service.Platform == "session" {
 		if err := os.Remove(plan.Service.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return Result{}, rollback(err)
 		}
 	} else if err := writeAtomic(plan.Service.Path, plan.Service.Content, 0o600); err != nil {
-		return Result{}, rollback(err)
-	}
-	for _, item := range plan.IntegrationPlans {
-		if item.Changed {
-			current, readErr := os.ReadFile(item.Target)
-			if errors.Is(readErr, os.ErrNotExist) {
-				current = nil
-			} else if readErr != nil {
-				return Result{}, rollback(readErr)
-			}
-			if sha256String(current) != item.BeforeDigest {
-				return Result{}, rollback(fmt.Errorf("setup: integration changed after preview: %s", item.Target))
-			}
-			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {
-				return Result{}, rollback(err)
-			}
-		}
-	}
-	if len(plan.IntegrationPlans) > 0 {
-		if err := integrationpkg.WriteOwnership(roots.IntegrationsOwnershipPath(), plan.IntegrationPlans); err != nil {
-			return Result{}, rollback(err)
-		}
-	}
-	if err := journal.Advance(ctx, plan.OperationID, "integrations_merged", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
 	emitProgress(options, "service", supervisorStartProgress(plan.Service))
@@ -448,16 +486,58 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	ready := options.Ready
+	readyPhase := "workers"
 	if ready == nil {
 		ready = func(ctx context.Context, roots paths.Roots, registry *central.Registry) error {
 			return waitSetupWorkersWithProgress(ctx, roots, registry, func(ready, total int) {
-				emitProgress(options, "workers", fmt.Sprintf(
+				emitProgress(options, readyPhase, fmt.Sprintf(
 					"Repository workers ready: %d of %d", ready, total))
+			}, func(completed, total int, path string) {
+				emitProgress(options, readyPhase, fmt.Sprintf(
+					"Confirming checkpoint coverage %d of %d: %s", completed, total, path))
 			})
 		}
 	}
 	emitProgress(options, "workers", "Waiting for repository workers to report complete protection")
 	if err := ready(ctx, roots, plan.Registry); err != nil {
+		return Result{}, rollback(err)
+	}
+	emitProgress(options, "integrations", "Merging optional integration hints after protection is ready")
+	for _, item := range plan.IntegrationPlans {
+		if item.Changed {
+			current, readErr := os.ReadFile(item.Target)
+			if errors.Is(readErr, os.ErrNotExist) {
+				current = nil
+			} else if readErr != nil {
+				return Result{}, rollback(readErr)
+			}
+			if sha256String(current) != item.BeforeDigest {
+				return Result{}, rollback(fmt.Errorf("setup: integration changed after preview: %s", item.Target))
+			}
+			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, item.AfterDigest); err != nil {
+				return Result{}, rollback(err)
+			}
+			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {
+				return Result{}, rollback(err)
+			}
+		}
+	}
+	if len(plan.IntegrationPlans) > 0 {
+		if current, err := currentFileDigest(roots.IntegrationsOwnershipPath()); err != nil || current != plan.OwnershipDigest {
+			return Result{}, rollback(fmt.Errorf("setup: integration ownership changed after preview"))
+		}
+		ownershipBody, err := integrationOwnershipContent(roots.IntegrationsOwnershipPath(), plan.IntegrationPlans)
+		if err != nil {
+			return Result{}, rollback(err)
+		}
+		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.IntegrationsOwnershipPath(), sha256String(ownershipBody)); err != nil {
+			return Result{}, rollback(err)
+		}
+		if err := integrationpkg.WriteOwnership(roots.IntegrationsOwnershipPath(), plan.IntegrationPlans); err != nil {
+			return Result{}, rollback(err)
+		}
+	}
+	if err := journal.Advance(ctx, plan.OperationID, "integrations_merged", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
 	emitProgress(options, "finalize", "Closing the migration observation gap and finalizing setup")
@@ -466,26 +546,35 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	// A barrier after the bridge's final observation proves every edit that
 	// could have arrived during cutover is represented by held v20 workers.
+	readyPhase = "final_workers"
+	emitProgress(options, readyPhase, "Running final checkpoint coverage verification")
 	if err := ready(ctx, roots, plan.Registry); err != nil {
 		return Result{}, rollback(err)
 	}
 	if err := journal.Advance(ctx, plan.OperationID, "workers_ready", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	if err := journal.Advance(ctx, plan.OperationID, "committed", "", true); err != nil {
+	if err := journal.Advance(ctx, plan.OperationID, "needs_attention", "setup final cleanup pending", false); err != nil {
 		return Result{}, rollback(err)
+	}
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), absentFileDigest); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "record publication hold cleanup", true)
+		return Result{}, fmt.Errorf("setup applied but publication hold cleanup proof needs attention: %w", err)
 	}
 	if err := os.Remove(roots.SetupPublicationHoldPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "remove publication hold", true)
-		return Result{}, fmt.Errorf("setup committed but publication remains held: %w; run `acd support repair`", err)
+		return Result{}, fmt.Errorf("setup applied but publication remains held: %w; run `acd support repair`", err)
 	}
 	if err := bridge.Cleanup(ctx); err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "cleanup migration bridge refs", true)
-		return Result{}, fmt.Errorf("setup committed but migration bridge cleanup needs attention: %w", err)
+		return Result{}, fmt.Errorf("setup applied but migration bridge cleanup needs attention: %w", err)
 	}
 	if err := migration.CleanupBridgeRecoveryManifests(ctx, plan.RecoveryManifests); err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "cleanup retained migration recovery refs", true)
-		return Result{}, fmt.Errorf("setup committed but retained migration recovery cleanup needs attention: %w", err)
+		return Result{}, fmt.Errorf("setup applied but retained migration recovery cleanup needs attention: %w", err)
+	}
+	if err := journal.Advance(ctx, plan.OperationID, "committed", "", true); err != nil {
+		return Result{}, fmt.Errorf("setup cleanup completed but final journal commit needs attention: %w", err)
 	}
 	emitProgress(options, "completed", "Setup transaction completed")
 	return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Migrations: migrations, Changed: true}, nil
@@ -497,13 +586,7 @@ func emitProgress(options ApplyOptions, phase, detail string) {
 	}
 }
 
-func rollbackSetupFiles(journal *globalops.Store, operationID string, backups []fileBackup, cause error) error {
-	fileErr := restoreFiles(backups)
-	_ = journal.Advance(context.Background(), operationID, "rolled_back", "setup rolled back", true)
-	return errors.Join(cause, fileErr)
-}
-
-func migrateRepositoryConfigKeys(roots paths.Roots, registry *central.Registry) error {
+func migrateRepositoryConfigKeys(roots paths.Roots, registry *central.Registry, prepare func([]byte) error) error {
 	if registry == nil {
 		return errors.New("setup: nil v2 registry")
 	}
@@ -526,7 +609,7 @@ func migrateRepositoryConfigKeys(roots paths.Roots, registry *central.Registry) 
 	if !needsWrite {
 		return nil
 	}
-	return store.Update(func(document *config.Document) error {
+	mutate := func(document *config.Document) error {
 		for _, record := range registry.Repos {
 			legacy := strings.TrimSpace(record.LegacyRepoHash)
 			if legacy == "" || legacy == record.WorktreeID {
@@ -548,7 +631,8 @@ func migrateRepositoryConfigKeys(roots paths.Roots, registry *central.Registry) 
 			delete(document.Settings.Repositories, legacy)
 		}
 		return nil
-	})
+	}
+	return updateConfigPrepared(store, document, mutate, prepare)
 }
 
 type fileBackup struct {
@@ -561,6 +645,7 @@ type fileBackup struct {
 	Mode       os.FileMode `json:"mode"`
 	Backup     string      `json:"backup"`
 	Digest     string      `json:"digest"`
+	PostDigest string      `json:"post_digest,omitempty"`
 }
 
 type backupManifest struct {
@@ -568,12 +653,17 @@ type backupManifest struct {
 	PriorService ServiceState `json:"prior_service"`
 }
 
+const absentFileDigest = "absent"
+
+var errPostMutationProof = errors.New("setup: post-mutation state was not durably recorded")
+
 func backupFiles(root string, targets []string, priorService ServiceState) ([]fileBackup, error) {
 	var backups []fileBackup
 	for i, target := range targets {
 		item := fileBackup{Target: target}
 		info, err := os.Lstat(target)
 		if errors.Is(err, os.ErrNotExist) {
+			item.Digest = absentFileDigest
 			backups = append(backups, item)
 			continue
 		}
@@ -599,8 +689,7 @@ func backupFiles(root string, targets []string, priorService ServiceState) ([]fi
 		}
 		backups = append(backups, item)
 	}
-	body, _ := json.MarshalIndent(backupManifest{Files: backups, PriorService: priorService}, "", "  ")
-	if err := writeAtomic(filepath.Join(root, "backup-manifest.json"), append(body, '\n'), 0o600); err != nil {
+	if err := persistBackupManifest(root, backups, priorService); err != nil {
 		return nil, err
 	}
 	return backups, nil
@@ -609,37 +698,187 @@ func backupFiles(root string, targets []string, priorService ServiceState) ([]fi
 func restoreFiles(backups []fileBackup) error {
 	var combined error
 	for _, item := range backups {
-		if !item.Exists {
-			if err := os.Remove(item.Target); err != nil && !errors.Is(err, os.ErrNotExist) {
-				combined = errors.Join(combined, err)
-			}
+		if item.PostDigest == "" {
 			continue
 		}
-		body, err := os.ReadFile(item.Backup)
-		if err != nil {
+		if err := restoreFileCAS(item); err != nil {
 			combined = errors.Join(combined, err)
-			continue
-		}
-		if sha256String(body) != item.Digest {
-			combined = errors.Join(combined, fmt.Errorf("setup: backup digest mismatch for %s", item.Target))
-			continue
-		}
-		if err := writeAtomic(item.Target, body, item.Mode.Perm()); err != nil {
-			combined = errors.Join(combined, err)
-			continue
-		}
-		if item.OwnerKnown {
-			if err := os.Chown(item.Target, int(item.UID), int(item.GID)); err != nil {
-				combined = errors.Join(combined, fmt.Errorf("setup: restore owner for %s: %w", item.Target, err))
-			}
 		}
 	}
 	return combined
 }
 
-func persistFreshDefaults(roots paths.Roots, repositoryID string) error {
+func restoreFileCAS(item fileBackup) error {
+	claimed, err := claimRollbackTarget(item.Target)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if !item.Exists {
+				return nil
+			}
+			if item.PostDigest == absentFileDigest {
+				return installBackupNoReplace(item)
+			}
+			return fmt.Errorf("setup: preserve concurrent edit at %s; operation output disappeared", item.Target)
+		}
+		return err
+	}
+	claimedDigest, digestErr := currentFileDigest(claimed)
+	if digestErr != nil || (claimedDigest != item.PostDigest && claimedDigest != item.Digest) {
+		restoreErr := restoreClaimNoReplace(claimed, item.Target)
+		return errors.Join(fmt.Errorf("setup: preserve concurrent edit at %s; current state no longer matches operation output", item.Target), digestErr, restoreErr)
+	}
+	if claimedDigest == item.Digest {
+		return restoreClaimNoReplace(claimed, item.Target)
+	}
+	if !item.Exists {
+		if err := os.Remove(claimed); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(item.Target); err == nil {
+			return fmt.Errorf("setup: preserve concurrent edit at %s created during rollback", item.Target)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if err := installBackupNoReplace(item); err != nil {
+		_ = os.Remove(claimed)
+		return err
+	}
+	return os.Remove(claimed)
+}
+
+func claimRollbackTarget(target string) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".acd-rollback-claim-")
+	if err != nil {
+		return "", err
+	}
+	claimed := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(claimed)
+		return "", err
+	}
+	if err := os.Remove(claimed); err != nil {
+		return "", err
+	}
+	if err := os.Rename(target, claimed); err != nil {
+		return "", err
+	}
+	return claimed, nil
+}
+
+func restoreClaimNoReplace(claimed, target string) error {
+	if err := os.Link(claimed, target); err != nil {
+		return fmt.Errorf("setup: concurrent edit occupied %s; retained displaced content at %s: %w", target, claimed, err)
+	}
+	return os.Remove(claimed)
+}
+
+func installBackupNoReplace(item fileBackup) error {
+	body, err := os.ReadFile(item.Backup)
+	if err != nil {
+		return err
+	}
+	if sha256String(body) != item.Digest {
+		return fmt.Errorf("setup: backup digest mismatch for %s", item.Target)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(item.Target), ".acd-rollback-restore-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(item.Mode.Perm()); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if item.OwnerKnown {
+		if err := tmp.Chown(int(item.UID), int(item.GID)); err != nil {
+			tmp.Close()
+			return fmt.Errorf("setup: restore owner for %s: %w", item.Target, err)
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(name, item.Target); err != nil {
+		return fmt.Errorf("setup: preserve concurrent edit at %s created during rollback: %w", item.Target, err)
+	}
+	dir, err := os.Open(filepath.Dir(item.Target))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func preparePostMutation(root string, backups []fileBackup, priorService ServiceState, target, postDigest string) error {
+	if postDigest == "" {
+		return fmt.Errorf("%w: empty post-mutation digest for %s", errPostMutationProof, target)
+	}
+	found := false
+	for index := range backups {
+		if filepath.Clean(backups[index].Target) == filepath.Clean(target) {
+			backups[index].PostDigest = postDigest
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: mutation target was not backed up: %s", errPostMutationProof, target)
+	}
+	if err := persistBackupManifest(root, backups, priorService); err != nil {
+		return fmt.Errorf("%w: persist manifest: %v", errPostMutationProof, err)
+	}
+	return nil
+}
+
+func currentFileDigest(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return absentFileDigest, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("setup: mutation target is not a regular file: %s", path)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return sha256String(body), nil
+}
+
+func jsonFileDigest(value any) (string, error) {
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return sha256String(append(body, '\n')), nil
+}
+
+func persistBackupManifest(root string, backups []fileBackup, priorService ServiceState) error {
+	body, _ := json.MarshalIndent(backupManifest{Files: backups, PriorService: priorService}, "", "  ")
+	return writeAtomic(filepath.Join(root, "backup-manifest.json"), append(body, '\n'), 0o600)
+}
+
+func persistFreshDefaults(roots paths.Roots, repositoryID string, prepareCallbacks ...func([]byte) error) error {
 	store := config.NewStore(roots)
-	return store.Update(func(document *config.Document) error {
+	document, err := store.Load()
+	if err != nil {
+		return err
+	}
+	mutate := func(document *config.Document) error {
 		fields := config.Overrides{}
 		values := map[string]any{
 			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "intent", config.FieldCommitPreset: "fast",
@@ -651,7 +890,67 @@ func persistFreshDefaults(roots paths.Roots, repositoryID string) error {
 		}
 		document.Settings.Repositories[repositoryID] = config.RepositorySettings{Fields: fields, Extra: map[string]json.RawMessage{}}
 		return nil
-	})
+	}
+	var prepare func([]byte) error
+	if len(prepareCallbacks) > 0 {
+		prepare = prepareCallbacks[0]
+	}
+	return updateConfigPrepared(store, document, mutate, prepare)
+}
+
+func updateConfigPrepared(store *config.Store, snapshot *config.Document, mutate func(*config.Document) error, prepare func([]byte) error) error {
+	snapshotBody, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	planned, err := config.ParseDocument(snapshotBody)
+	if err != nil {
+		return err
+	}
+	if err := mutate(planned); err != nil {
+		return err
+	}
+	planned.Generation++
+	if err := config.ValidateDocument(planned); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(planned, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	if prepare != nil {
+		if err := prepare(body); err != nil {
+			return err
+		}
+	}
+	return store.UpdateExpected(snapshot.Generation, mutate)
+}
+
+func integrationOwnershipContent(path string, plans []integrationpkg.Plan) ([]byte, error) {
+	document := integrationpkg.Ownership{Version: 1, Entries: map[string]integrationpkg.OwnedEntry{}}
+	if body, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(body, &document); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if document.Entries == nil {
+		document.Entries = map[string]integrationpkg.OwnedEntry{}
+	}
+	for _, plan := range plans {
+		document.Entries[plan.Target] = integrationpkg.OwnedEntry{
+			Name: plan.Name, Digest: plan.AfterDigest, TemplateVersion: integrationpkg.TemplateVersion,
+			Signatures: []string{"acd internal "}, Format: plan.Format,
+			Elements: append([]integrationpkg.OwnedElement(nil), plan.Owned...),
+		}
+	}
+	body, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(body, '\n'), nil
 }
 
 func supervisorActionKind(service supervisor.ServiceDefinition) string {
@@ -744,7 +1043,11 @@ func shutdownSupervisor(ctx context.Context, roots paths.Roots) error {
 }
 
 func inspectServiceState(ctx context.Context, roots paths.Roots, service supervisor.ServiceDefinition) ServiceState {
-	result := ServiceState{Installed: fileExists(service.Path)}
+	digest, err := currentFileDigest(service.Path)
+	if err != nil {
+		digest = "invalid"
+	}
+	result := ServiceState{Installed: fileExists(service.Path), FileDigest: digest}
 	if service.Platform == "session" {
 		result.SessionLoaded = supervisorSessionRunning(ctx, roots)
 		result.LegacyLoaded = exec.CommandContext(ctx, "launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), supervisor.ServiceLabel)).Run() == nil
@@ -847,7 +1150,7 @@ func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID st
 }
 
 func waitSetupWorkers(ctx context.Context, roots paths.Roots, registry *central.Registry) error {
-	return waitSetupWorkersWithProgress(ctx, roots, registry, nil)
+	return waitSetupWorkersWithProgress(ctx, roots, registry, nil, nil)
 }
 
 func waitSetupWorkersWithProgress(
@@ -855,6 +1158,7 @@ func waitSetupWorkersWithProgress(
 	roots paths.Roots,
 	registry *central.Registry,
 	progress func(ready, total int),
+	barrierProgress func(completed, total int, path string),
 ) error {
 	if registry == nil {
 		return errors.New("setup: v2 registry is unavailable")
@@ -865,10 +1169,10 @@ func waitSetupWorkersWithProgress(
 			repositories[record.RepositoryID] = true
 		}
 	}
-	if err := waitSupervisorWorkersReady(ctx, roots, repositories, 5*time.Minute, progress); err != nil {
+	if err := waitSupervisorWorkersReady(ctx, roots, repositories, 15*time.Minute, progress); err != nil {
 		return err
 	}
-	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 60 * time.Second}
+	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}
 	statusResponse, err := client.Do(ctx, supervisor.Request{Version: supervisor.ProtocolVersion, ID: "setup-version", Method: "status", DeadlineMS: time.Now().Add(10 * time.Second).UnixMilli()})
 	if err != nil {
 		return err
@@ -880,32 +1184,95 @@ func waitSetupWorkersWithProgress(
 	if status.Version != version.String() {
 		return fmt.Errorf("setup: supervisor version %q does not match managed binary %q", status.Version, version.String())
 	}
+	enabledRecords := make([]central.RepoRecord, 0, len(registry.Repos))
 	for _, record := range registry.Repos {
-		if record.LifecycleDisabled() {
-			continue
-		}
-		response, callErr := client.Do(ctx, supervisor.Request{
-			Version: supervisor.ProtocolVersion, ID: "setup-barrier-" + record.WorktreeID,
-			Method: "checkpoint_barrier", RepositoryID: record.RepositoryID,
-			WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(60 * time.Second).UnixMilli(),
-		})
-		if callErr != nil {
-			return callErr
-		}
-		if response.Error != nil {
-			return errors.New(response.Error.Message)
-		}
-		var barrier struct {
-			Protected bool `json:"protected"`
-		}
-		if err := decodeInto(response.Data, &barrier); err != nil || !barrier.Protected {
-			return fmt.Errorf("setup: worktree %s did not confirm checkpoint coverage", record.Path)
-		}
-		if schema, readErr := state.ReadUserVersion(ctx, record.StateDB); readErr != nil || schema != state.SchemaVersion {
-			return fmt.Errorf("setup: worktree %s schema is not v%d", record.Path, state.SchemaVersion)
+		if !record.LifecycleDisabled() {
+			enabledRecords = append(enabledRecords, record)
 		}
 	}
+	groups := groupSetupBarrierRecords(enabledRecords)
+	barrierCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan []central.RepoRecord, len(groups))
+	for _, group := range groups {
+		jobs <- group
+	}
+	close(jobs)
+	var (
+		workers    sync.WaitGroup
+		firstErr   error
+		errOnce    sync.Once
+		progressMu sync.Mutex
+		started    int
+	)
+	workerCount := min(setupBarrierConcurrency, len(groups))
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for group := range jobs {
+				for _, record := range group {
+					if barrierCtx.Err() != nil {
+						return
+					}
+					progressMu.Lock()
+					started++
+					position := started
+					progressMu.Unlock()
+					if barrierProgress != nil {
+						barrierProgress(position, len(enabledRecords), record.Path)
+					}
+					if err := confirmSetupCheckpointCoverage(barrierCtx, client, record); err != nil {
+						errOnce.Do(func() {
+							firstErr = err
+							cancel()
+						})
+						return
+					}
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	return firstErr
+}
+
+func confirmSetupCheckpointCoverage(ctx context.Context, client supervisor.Client, record central.RepoRecord) error {
+	response, callErr := client.Do(ctx, supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: "setup-barrier-" + record.WorktreeID,
+		Method: "checkpoint_barrier", RepositoryID: record.RepositoryID,
+		WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
+	})
+	if callErr != nil {
+		return fmt.Errorf("setup: worktree %s checkpoint barrier: %w", record.Path, callErr)
+	}
+	if response.Error != nil {
+		return fmt.Errorf("setup: worktree %s checkpoint barrier: %s", record.Path, response.Error.Message)
+	}
+	var barrier struct {
+		Protected bool `json:"protected"`
+	}
+	if err := decodeInto(response.Data, &barrier); err != nil || !barrier.Protected {
+		return fmt.Errorf("setup: worktree %s did not confirm checkpoint coverage", record.Path)
+	}
+	if schema, readErr := state.ReadUserVersion(ctx, record.StateDB); readErr != nil || schema != state.SchemaVersion {
+		return fmt.Errorf("setup: worktree %s schema is not v%d", record.Path, state.SchemaVersion)
+	}
 	return nil
+}
+
+func groupSetupBarrierRecords(records []central.RepoRecord) [][]central.RepoRecord {
+	byRepository := make(map[string]int)
+	groups := make([][]central.RepoRecord, 0, len(records))
+	for _, record := range records {
+		if index, ok := byRepository[record.RepositoryID]; ok {
+			groups[index] = append(groups[index], record)
+			continue
+		}
+		byRepository[record.RepositoryID] = len(groups)
+		groups = append(groups, []central.RepoRecord{record})
+	}
+	return groups
 }
 
 func waitSupervisorWorkersReady(
@@ -1111,13 +1478,6 @@ func decode[T any](value any) (T, error) {
 	return target, err
 }
 
-func copyAtomic(target, source string) error {
-	body, err := os.ReadFile(source)
-	if err != nil {
-		return err
-	}
-	return writeAtomic(target, body, 0o755)
-}
 func writeAtomic(path string, body []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err

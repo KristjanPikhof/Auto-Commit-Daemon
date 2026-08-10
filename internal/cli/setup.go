@@ -142,7 +142,12 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if err != nil {
 		return fmt.Errorf("acd setup: resolve paths: %w", err)
 	}
+	planningProgress := newSetupProgress(cmd.ErrOrStderr(), jsonOut || quiet, 10*time.Second)
+	planningProgress.Update(installer.Progress{
+		Phase: "plan", Detail: "Inspecting repositories and preparing the exact setup plan",
+	})
 	plan, err := installer.BuildPlan(cmd.Context(), roots, installer.Options{Repo: repo, Integrations: integrations, NonInteractive: nonInteractive, ExpectedPlan: expectedPlan})
+	planningProgress.Close()
 	if err != nil {
 		return fmt.Errorf("acd setup: %w", err)
 	}
@@ -196,6 +201,7 @@ type setupProgress struct {
 	silent   bool
 
 	mu       sync.Mutex
+	phase    string
 	detail   string
 	started  time.Time
 	stopOnce sync.Once
@@ -218,8 +224,11 @@ func (p *setupProgress) Update(update installer.Progress) {
 		return
 	}
 	p.mu.Lock()
+	if update.Phase != p.phase {
+		p.phase = update.Phase
+		p.started = time.Now()
+	}
 	p.detail = update.Detail
-	p.started = time.Now()
 	fmt.Fprintf(p.out, "Setup: %s\n", update.Detail)
 	p.mu.Unlock()
 }
@@ -234,8 +243,13 @@ func (p *setupProgress) heartbeat() {
 		select {
 		case <-ticker.C:
 			p.mu.Lock()
-			if p.detail != "" {
-				fmt.Fprintf(p.out, "Setup: still working on %s (%s elapsed)\n", strings.ToLower(p.detail), time.Since(p.started).Round(time.Second))
+			elapsed := time.Since(p.started)
+			if p.detail != "" && elapsed >= p.interval {
+				display := elapsed.Round(time.Second).String()
+				if elapsed < time.Second {
+					display = "<1s"
+				}
+				fmt.Fprintf(p.out, "Setup: still working on %s (%s elapsed)\n", strings.ToLower(p.detail), display)
 			}
 			p.mu.Unlock()
 		case <-p.stop:

@@ -85,6 +85,98 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return &Store{db: db, path: path}, nil
 }
 
+// OpenReadOnly opens an existing global journal without creating or migrating
+// it. Product status and repair previews use this path.
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	if path == "" {
+		return nil, errors.New("globalops: empty path")
+	}
+	q := url.Values{}
+	q.Add("mode", "ro")
+	q.Add("immutable", "0")
+	q.Add("_pragma", "busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, path: path}, nil
+}
+
+func (s *Store) OperationsByPhase(ctx context.Context, phase string) ([]Operation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id,kind,phase,plan_digest,error,created_ts,updated_ts
+FROM operations WHERE phase=? ORDER BY created_ts,id`, phase)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var operations []Operation
+	for rows.Next() {
+		var operation Operation
+		if err := rows.Scan(&operation.ID, &operation.Kind, &operation.Phase,
+			&operation.PlanDigest, &operation.Error, &operation.CreatedTS,
+			&operation.UpdatedTS); err != nil {
+			return nil, err
+		}
+		operations = append(operations, operation)
+	}
+	return operations, rows.Err()
+}
+
+func (s *Store) LatestCommittedSetup(ctx context.Context) (Operation, bool, error) {
+	var operation Operation
+	err := s.db.QueryRowContext(ctx, `
+SELECT id,kind,phase,plan_digest,error,created_ts,updated_ts
+FROM operations WHERE kind='setup' AND phase='committed'
+ORDER BY created_ts DESC,id DESC LIMIT 1`).Scan(
+		&operation.ID, &operation.Kind, &operation.Phase, &operation.PlanDigest,
+		&operation.Error, &operation.CreatedTS, &operation.UpdatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Operation{}, false, nil
+	}
+	return operation, err == nil, err
+}
+
+func (s *Store) LatestSetup(ctx context.Context) (Operation, bool, error) {
+	var operation Operation
+	err := s.db.QueryRowContext(ctx, `
+SELECT id,kind,phase,plan_digest,error,created_ts,updated_ts
+FROM operations WHERE kind='setup'
+ORDER BY created_ts DESC,id DESC LIMIT 1`).Scan(
+		&operation.ID, &operation.Kind, &operation.Phase, &operation.PlanDigest,
+		&operation.Error, &operation.CreatedTS, &operation.UpdatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Operation{}, false, nil
+	}
+	return operation, err == nil, err
+}
+
+func (s *Store) Steps(ctx context.Context, operationID string) ([]Step, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT operation_id,ord,kind,target,before_hash,after_hash,backup_path,phase
+FROM operation_steps WHERE operation_id=? ORDER BY ord`, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var steps []Step
+	for rows.Next() {
+		var step Step
+		if err := rows.Scan(&step.OperationID, &step.Sequence, &step.Kind,
+			&step.Target, &step.BeforeHash, &step.AfterHash,
+			&step.BackupPath, &step.Phase); err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
+	}
+	return steps, rows.Err()
+}
+
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -127,6 +219,30 @@ func (s *Store) Advance(ctx context.Context, id, phase, sanitizedError string, c
 		result, err = s.db.ExecContext(ctx, `UPDATE operations SET phase=?,error=?,updated_ts=?,completed_ts=? WHERE id=?`, phase, sanitizedError, now, now, id)
 	} else {
 		result, err = s.db.ExecContext(ctx, `UPDATE operations SET phase=?,error=?,updated_ts=? WHERE id=?`, phase, sanitizedError, now, id)
+	}
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// AdvanceIfPhase applies a proof-backed terminal transition only while the
+// operation still has the phase that was reviewed.
+func (s *Store) AdvanceIfPhase(ctx context.Context, id, fromPhase, toPhase, sanitizedError string, complete bool) error {
+	now := float64(time.Now().UnixNano()) / float64(time.Second)
+	var result sql.Result
+	var err error
+	if complete {
+		result, err = s.db.ExecContext(ctx, `
+UPDATE operations SET phase=?,error=?,updated_ts=?,completed_ts=?
+WHERE id=? AND phase=?`, toPhase, sanitizedError, now, now, id, fromPhase)
+	} else {
+		result, err = s.db.ExecContext(ctx, `
+UPDATE operations SET phase=?,error=?,updated_ts=?
+WHERE id=? AND phase=?`, toPhase, sanitizedError, now, id, fromPhase)
 	}
 	if err != nil {
 		return err

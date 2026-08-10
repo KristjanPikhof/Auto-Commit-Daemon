@@ -12,6 +12,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/globalops"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
@@ -163,8 +164,8 @@ func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 		t.Fatalf("result=%+v calls=%v", result, executor.calls)
 	}
 	if got := progressPhases(progress); !containsPhasesInOrder(got,
-		"prepare", "backup", "install_binary", "bridge", "quiesce", "migrate", "install",
-		"service", "self_test", "workers", "finalize", "completed") {
+		"prepare", "quiesce", "backup", "install_binary", "bridge", "migrate", "install",
+		"service", "self_test", "workers", "integrations", "finalize", "completed") {
 		t.Fatalf("progress phases=%v", got)
 	}
 	if body, err := os.ReadFile(plan.ManagedBinary); err != nil || string(body) != "binary" {
@@ -279,8 +280,6 @@ func TestApplyQuiesceFailureDoesNotRestoreUncreatedMigrationBackups(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan.Repositories[0].FromVersion = 19
-	plan.Digest = digestPlan(plan)
 	_, err = Apply(ctx, roots, plan, ApplyOptions{
 		Executor: &recordingExecutor{},
 		Quiesce:  func(context.Context) error { return errors.New("injected quiesce failure") },
@@ -292,6 +291,259 @@ func TestApplyQuiesceFailureDoesNotRestoreUncreatedMigrationBackups(t *testing.T
 	}
 	if strings.Contains(err.Error(), "state-v19.db") || strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("pre-migration rollback tried to restore an uncreated database backup: %v", err)
+	}
+}
+
+func TestSetupRejectsStaleRegistryPreviewAndRecordsNeedsAction(t *testing.T) {
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	plan, err := BuildPlan(ctx, roots, Options{Repo: repo, Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := central.NewRegistry()
+	changed.Repos = append(changed.Repos, central.RepoRecord{
+		Path: filepath.Join(t.TempDir(), "other"), StateDB: filepath.Join(t.TempDir(), "state.db"),
+		LifecycleState: central.RepoLifecycleDisabled,
+	})
+	if err := central.Save(roots, changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(ctx, roots, plan, ApplyOptions{Executor: &recordingExecutor{}}); err == nil ||
+		!strings.Contains(err.Error(), "state changed after preview") {
+		t.Fatalf("Apply stale preview error=%v", err)
+	}
+	journal, err := globalops.OpenReadOnly(ctx, roots.OperationsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	operations, err := journal.OperationsByPhase(ctx, "needs_attention")
+	if err != nil || len(operations) != 1 || operations[0].ID != plan.OperationID {
+		t.Fatalf("needs_attention=%+v err=%v", operations, err)
+	}
+	if _, err := os.Stat(plan.ManagedBinary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale setup mutated managed binary: %v", err)
+	}
+}
+
+func TestSetupRejectsStaleServiceFilePreview(t *testing.T) {
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	plan, err := BuildPlan(ctx, roots, Options{Repo: repo, Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(plan.Service.Path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plan.Service.Path, []byte("concurrent service edit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(ctx, roots, plan, ApplyOptions{Executor: &recordingExecutor{}}); err == nil ||
+		!strings.Contains(err.Error(), "state changed after preview") {
+		t.Fatalf("Apply stale service preview error=%v", err)
+	}
+	if body, err := os.ReadFile(plan.Service.Path); err != nil || string(body) != "concurrent service edit" {
+		t.Fatalf("service file=(%q,%v)", body, err)
+	}
+}
+
+func TestRollbackPreservesConcurrentHostEdit(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "config.json")
+	if err := os.WriteFile(target, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backups, err := backupFiles(filepath.Join(root, "backup"), []string{target}, ServiceState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postDigest := sha256String([]byte("setup output"))
+	if err := preparePostMutation(filepath.Join(root, "backup"), backups, ServiceState{}, target, postDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("setup output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("concurrent edit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreFiles(backups); err == nil || !strings.Contains(err.Error(), "preserve concurrent edit") {
+		t.Fatalf("restoreFiles error=%v", err)
+	}
+	if body, err := os.ReadFile(target); err != nil || string(body) != "concurrent edit" {
+		t.Fatalf("concurrent edit=(%q,%v)", body, err)
+	}
+}
+
+func TestRollbackPreparedMutationCanProveNoWriteOccurred(t *testing.T) {
+	tests := []struct {
+		name       string
+		before     []byte
+		postDigest string
+	}{
+		{name: "existing file remains", before: []byte("before"), postDigest: sha256String([]byte("setup output"))},
+		{name: "prepared deletion does not run", before: []byte("before"), postDigest: absentFileDigest},
+		{name: "prepared creation does not run", postDigest: sha256String([]byte("setup output"))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			target := filepath.Join(root, "config.json")
+			if test.before != nil {
+				if err := os.WriteFile(target, test.before, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			backupRoot := filepath.Join(root, "backup")
+			backups, err := backupFiles(backupRoot, []string{target}, ServiceState{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := preparePostMutation(backupRoot, backups, ServiceState{}, target, test.postDigest); err != nil {
+				t.Fatal(err)
+			}
+			if err := restoreFiles(backups); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(target)
+			if test.before == nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unmodified absent target=(%q,%v)", body, err)
+				}
+				return
+			}
+			if err != nil || string(body) != string(test.before) {
+				t.Fatalf("unmodified target=(%q,%v)", body, err)
+			}
+		})
+	}
+}
+
+func TestRollbackNoReplacePreservesEditAfterClaim(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "config.json")
+	backup := filepath.Join(root, "backup")
+	if err := os.WriteFile(backup, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("setup output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := claimRollbackTarget(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(claimed)
+	if err := os.WriteFile(target, []byte("concurrent edit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	item := fileBackup{Target: target, Exists: true, Backup: backup,
+		Digest: sha256String([]byte("before")), Mode: 0o600}
+	if err := installBackupNoReplace(item); err == nil || !strings.Contains(err.Error(), "preserve concurrent edit") {
+		t.Fatalf("installBackupNoReplace error=%v", err)
+	}
+	if body, err := os.ReadFile(target); err != nil || string(body) != "concurrent edit" {
+		t.Fatalf("concurrent target=(%q,%v)", body, err)
+	}
+}
+
+func TestSetupRollbackPreservesConcurrentEditAndNeedsAction(t *testing.T) {
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	plan, err := BuildPlan(ctx, roots, Options{Repo: repo, Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress []Progress
+	_, err = Apply(ctx, roots, plan, ApplyOptions{
+		Executor: &recordingExecutor{}, Ready: readyImmediately,
+		Progress: func(update Progress) { progress = append(progress, update) },
+		SelfTest: func(context.Context, Plan) error {
+			if err := os.WriteFile(roots.ConfigPath(), []byte("concurrent edit"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("injected self-test failure")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "preserve concurrent edit") {
+		t.Fatalf("Apply rollback error=%v", err)
+	}
+	if body, err := os.ReadFile(roots.ConfigPath()); err != nil || string(body) != "concurrent edit" {
+		t.Fatalf("concurrent config=(%q,%v)", body, err)
+	}
+	phases := progressPhases(progress)
+	if !containsPhasesInOrder(phases, "rollback", "needs_attention") || containsPhasesInOrder(phases, "rolled_back") {
+		t.Fatalf("rollback progress phases=%v", phases)
+	}
+	journal, err := globalops.OpenReadOnly(ctx, roots.OperationsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	operations, err := journal.OperationsByPhase(ctx, "needs_attention")
+	if err != nil || len(operations) != 1 || operations[0].ID != plan.OperationID {
+		t.Fatalf("needs_attention=%+v err=%v", operations, err)
+	}
+}
+
+func TestUninstallRejectsStaleRegistryPreviewAndRecordsNeedsAction(t *testing.T) {
+	ctx := context.Background()
+	roots, _, _ := installerFixture(t, ctx)
+	if err := central.Save(roots, central.NewRegistry()); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildUninstallPlan(ctx, roots, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := central.NewRegistry()
+	changed.Repos = append(changed.Repos, central.RepoRecord{
+		Path: filepath.Join(t.TempDir(), "other"), StateDB: filepath.Join(t.TempDir(), "state.db"),
+		LifecycleState: central.RepoLifecycleDisabled,
+	})
+	if err := central.Save(roots, changed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyUninstall(ctx, roots, plan, &recordingExecutor{}); err == nil ||
+		!strings.Contains(err.Error(), "state changed after preview") {
+		t.Fatalf("ApplyUninstall stale preview error=%v", err)
+	}
+	journal, err := globalops.OpenReadOnly(ctx, roots.OperationsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	operations, err := journal.OperationsByPhase(ctx, "needs_attention")
+	if err != nil || len(operations) != 1 || operations[0].ID != plan.OperationID {
+		t.Fatalf("needs_attention=%+v err=%v", operations, err)
+	}
+}
+
+func TestUninstallPurgeRetainsActiveLifecycleLock(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "acd")
+	lockPath := filepath.Join(root, "operations.lock")
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for path, body := range map[string]string{
+		lockPath: "lock", filepath.Join(root, "operations.db"): "journal",
+		filepath.Join(root, "bin", "acd"): "binary",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := purgeRootExcept(root, lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(lockPath); err != nil || string(body) != "lock" {
+		t.Fatalf("retained lock=(%q,%v)", body, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "operations.lock" {
+		t.Fatalf("purged share entries=%v err=%v", entries, err)
 	}
 }
 

@@ -1464,6 +1464,9 @@ func TestSetupProgressShowsPhaseAndHeartbeat(t *testing.T) {
 	if !strings.Contains(got, "Setup: still working on scanning registered repositories") {
 		t.Fatalf("missing heartbeat: %q", got)
 	}
+	if strings.Contains(got, "(0s elapsed)") {
+		t.Fatalf("zero-duration heartbeat: %q", got)
+	}
 }
 
 func TestSetupProgressIsSilentForQuietOrJSON(t *testing.T) {

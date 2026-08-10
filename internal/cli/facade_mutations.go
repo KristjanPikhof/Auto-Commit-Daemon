@@ -137,9 +137,31 @@ func newProductRepairCmd() *cobra.Command {
 }
 
 func runProductRepair(ctx context.Context, out io.Writer, repo string, apply, jsonOut bool) error {
-	record, roots, _, err := lookupRegisteredRepo("support repair", repo)
+	globalRoots, err := paths.Resolve()
 	if err != nil {
 		return err
+	}
+	globalPlans, err := previewGlobalRepairs(ctx, globalRoots)
+	if err != nil {
+		return fmt.Errorf("acd support repair: inspect global operations: %w", err)
+	}
+	hasGlobal := len(globalPlans) > 0
+	globalRepairable := true
+	for _, plan := range globalPlans {
+		if !plan.CanRepair {
+			globalRepairable = false
+			break
+		}
+	}
+	record, roots, _, err := lookupRegisteredRepo("support repair", repo)
+	if err != nil {
+		if hasGlobal && strings.TrimSpace(repo) == "" {
+			return runGlobalOnlyRepair(ctx, out, globalRoots, globalPlans, apply, jsonOut)
+		}
+		return err
+	}
+	if err := ensureMutationSupervisor(ctx, roots); err != nil {
+		return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
 	}
 	params, _ := json.Marshal(map[string]any{"apply": false})
 	request := supervisor.Request{Version: supervisor.ProtocolVersion,
@@ -154,40 +176,108 @@ func runProductRepair(ctx context.Context, out io.Writer, repo string, apply, js
 	if response.Error != nil {
 		return actionRequiredError("repair_unavailable", response.Error.Message)
 	}
-	plan, err := decodeProductData[restorepkg.RepairPlan](response.Data)
+	repositoryPlan, err := decodeProductData[restorepkg.RepairPlan](response.Data)
 	if err != nil {
 		return fmt.Errorf("acd support repair: decode preview: %w", err)
 	}
-	if !apply {
+	repositoryRepairable := repositoryPlan.OperationID == "" || repositoryPlan.CanRepair
+	preview := struct {
+		Global     []globalRepairPlan     `json:"global,omitempty"`
+		Repository *restorepkg.RepairPlan `json:"repository,omitempty"`
+	}{}
+	if hasGlobal {
+		preview.Global = globalPlans
+	}
+	if repositoryPlan.OperationID != "" {
+		preview.Repository = &repositoryPlan
+	}
+	if !hasGlobal && repositoryPlan.OperationID == "" {
 		if jsonOut {
-			next := "acd support repair --yes"
-			return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: productStateNeedsAction,
-				Actions: []productAction{}, NextAction: &next, Data: plan}, true)
+			return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: productStateProtected,
+				Actions: []productAction{}, Data: preview}, true)
 		}
-		fmt.Fprintf(out, "Repair interrupted restore %s.\n", plan.OperationID)
-		fmt.Fprintln(out, "Apply: acd support repair --yes")
+		fmt.Fprintln(out, "No interrupted operation needs repair.")
 		return nil
 	}
-	params, _ = json.Marshal(map[string]any{"apply": true, "operation_id": plan.OperationID})
-	request.ID = fmt.Sprintf("repair-apply-%d", time.Now().UnixNano())
-	request.Params = params
-	response, err = client.Do(ctx, request)
-	if err != nil {
-		return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
+	if !apply {
+		if jsonOut {
+			var next *string
+			if globalRepairable && repositoryRepairable {
+				value := "acd support repair --yes"
+				next = &value
+			}
+			return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: productStateNeedsAction,
+				Actions: []productAction{}, NextAction: next, Data: preview}, true)
+		}
+		if hasGlobal {
+			for _, plan := range globalPlans {
+				fmt.Fprintf(out, "Global setup operation %s needs repair.\n", plan.OperationID)
+				if plan.CanRepair {
+					fmt.Fprintf(out, "Proved safe through committed setup %s.\n", plan.ProvingOperationID)
+				} else {
+					fmt.Fprintf(out, "Cannot repair automatically: %s\n", plan.Refusal)
+				}
+			}
+		}
+		if repositoryPlan.OperationID != "" {
+			fmt.Fprintf(out, "Repository restore %s needs repair.\n", repositoryPlan.OperationID)
+		}
+		if globalRepairable && repositoryRepairable {
+			fmt.Fprintln(out, "Apply: acd support repair --yes")
+		}
+		return nil
 	}
-	if response.Error != nil {
-		return actionRequiredError("repair_failed", response.Error.Message)
+	if hasGlobal && !globalRepairable {
+		for _, plan := range globalPlans {
+			if !plan.CanRepair {
+				return actionRequiredError("repair_unavailable",
+					fmt.Sprintf("global setup operation %s: %s", plan.OperationID, plan.Refusal))
+			}
+		}
 	}
-	result, err := decodeProductData[restorepkg.Result](response.Data)
-	if err != nil {
-		return err
+	if !repositoryRepairable {
+		return actionRequiredError("repair_unavailable", repositoryPlan.Refusal)
+	}
+	actions := []productAction{}
+	for _, plan := range globalPlans {
+		if err := applyGlobalRepair(ctx, roots, plan); err != nil {
+			return actionRequiredError("repair_failed", err.Error())
+		}
+		actions = append(actions, productAction{Kind: "global_repair", Status: "completed", Target: plan.OperationID})
+		if !jsonOut {
+			fmt.Fprintf(out, "Resolved global setup operation %s.\n", plan.OperationID)
+		}
+	}
+	var result restorepkg.Result
+	if repositoryPlan.OperationID != "" {
+		params, _ = json.Marshal(map[string]any{"apply": true, "operation_id": repositoryPlan.OperationID})
+		request.ID = fmt.Sprintf("repair-apply-%d", time.Now().UnixNano())
+		request.Params = params
+		response, err = client.Do(ctx, request)
+		if err != nil {
+			return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
+		}
+		if response.Error != nil {
+			return actionRequiredError("repair_failed", response.Error.Message)
+		}
+		result, err = decodeProductData[restorepkg.Result](response.Data)
+		if err != nil {
+			return err
+		}
+		actions = append(actions, productAction{Kind: "repair", Status: "completed", Target: repositoryPlan.OperationID})
 	}
 	if jsonOut {
-		return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: productStateWaiting,
-			Changed: true, Actions: []productAction{{Kind: "repair", Status: "completed", Target: plan.OperationID}}, Data: result}, true)
+		stateName := productStateProtected
+		if repositoryPlan.OperationID != "" {
+			stateName = productStateWaiting
+		}
+		return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: stateName,
+			Changed: true, Actions: actions, Data: map[string]any{"preview": preview, "result": result}}, true)
 	}
-	fmt.Fprintf(out, "Completed interrupted restore %s.\n", plan.OperationID)
-	fmt.Fprintf(out, "Undo with: acd restore %s\n", result.UndoCheckpoint)
+	if repositoryPlan.OperationID != "" {
+		fmt.Fprintf(out, "Completed interrupted restore %s.\n", repositoryPlan.OperationID)
+		fmt.Fprintf(out, "Undo with: acd restore %s\n", result.UndoCheckpoint)
+	}
 	return nil
 }
 

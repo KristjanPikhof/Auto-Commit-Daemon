@@ -107,11 +107,13 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	if digestUninstallPlan(plan) != plan.Digest {
 		return Result{}, errors.New("uninstall: plan digest mismatch")
 	}
+	lifecycleLock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
+	if err != nil {
+		return Result{}, fmt.Errorf("uninstall: acquire user lifecycle lock: %w", err)
+	}
+	defer lifecycleLock.Release()
 	if executor == nil {
 		executor = OSExecutor{}
-	}
-	if err := os.MkdirAll(plan.BackupRoot, 0o700); err != nil {
-		return Result{}, err
 	}
 	journal, err := globalops.Open(ctx, roots.OperationsDBPath())
 	if err != nil {
@@ -125,6 +127,14 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	if err := journal.Prepare(ctx, globalops.Operation{ID: plan.OperationID, Kind: "uninstall", Phase: "planned", PlanDigest: plan.Digest}, steps); err != nil {
 		return Result{}, err
 	}
+	if err := revalidateUninstallPlan(ctx, roots, plan, false); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "uninstall preview became stale before shutdown", true)
+		return Result{}, err
+	}
+	if err := os.MkdirAll(plan.BackupRoot, 0o700); err != nil {
+		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "uninstall backup directory failed", true)
+		return Result{}, err
+	}
 	targets := []string{roots.RegistryPath(), roots.IntegrationsOwnershipPath(), plan.ManagedBinary, plan.Service.Path}
 	for _, item := range plan.Integrations {
 		targets = append(targets, item.Target)
@@ -134,6 +144,7 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 		return Result{}, err
 	}
 	sessionStarted := false
+	forceNeedsAction := false
 	var purgeTxn *purgeTransaction
 	rollback := func(cause error) error {
 		var purgeErr error
@@ -146,21 +157,26 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 		}
 		fileErr := restoreFiles(backups)
 		serviceErr := restoreServiceState(context.Background(), roots, executor, plan.Service, plan.PriorService)
-		_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "uninstall rolled back", true)
-		return errors.Join(cause, purgeErr, sessionErr, fileErr, serviceErr)
+		rollbackErr := errors.Join(purgeErr, sessionErr, fileErr, serviceErr)
+		if forceNeedsAction || rollbackErr != nil || errors.Is(cause, errPostMutationProof) {
+			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "uninstall rollback or shutdown needs attention", true)
+		} else {
+			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "uninstall rolled back", true)
+		}
+		return errors.Join(cause, rollbackErr)
 	}
-	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 60 * time.Second}
 	if plan.Service.Platform == "session" {
 		if err := supervisor.EnsureSession(ctx, roots, plan.Service.Binary, plan.Service.LogPath); err != nil {
 			return Result{}, rollback(err)
 		}
 		sessionStarted = true
 	}
+	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}
 	for _, record := range plan.Registry.Repos {
 		if record.LifecycleDisabled() {
 			continue
 		}
-		request := supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("uninstall-barrier-%d", time.Now().UnixNano()), Method: "checkpoint_barrier", RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(60 * time.Second).UnixMilli()}
+		request := supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("uninstall-barrier-%d", time.Now().UnixNano()), Method: "checkpoint_barrier", RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli()}
 		response, callErr := client.Do(ctx, request)
 		if callErr != nil {
 			return Result{}, rollback(callErr)
@@ -170,6 +186,11 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 		}
 	}
 	if err := stopSupervisorForUninstall(ctx, roots, client, 10*time.Second); err != nil {
+		forceNeedsAction = true
+		return Result{}, rollback(err)
+	}
+	if err := revalidateUninstallPlan(ctx, roots, plan, true); err != nil {
+		forceNeedsAction = true
 		return Result{}, rollback(err)
 	}
 	if plan.PriorService.Loaded {
@@ -183,12 +204,18 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 			if readErr != nil || sha256String(current) != item.BeforeDigest {
 				return Result{}, rollback(fmt.Errorf("uninstall: integration changed after preview: %s", item.Target))
 			}
+			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, item.AfterDigest); err != nil {
+				return Result{}, rollback(err)
+			}
 			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {
 				return Result{}, rollback(err)
 			}
 		}
 	}
 	for _, target := range []string{roots.IntegrationsOwnershipPath(), plan.Service.Path, plan.ManagedBinary} {
+		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, target, absentFileDigest); err != nil {
+			return Result{}, rollback(err)
+		}
 		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return Result{}, rollback(err)
 		}
@@ -196,6 +223,14 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	for i := range plan.Registry.Repos {
 		plan.Registry.Repos[i].LifecycleState = central.RepoLifecycleDisabled
 		plan.Registry.Repos[i].LifecycleUpdatedTS = time.Now().Unix()
+	}
+	plan.Registry.Normalize()
+	registryDigest, err := jsonFileDigest(plan.Registry)
+	if err != nil {
+		return Result{}, rollback(err)
+	}
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.RegistryPath(), registryDigest); err != nil {
+		return Result{}, rollback(err)
 	}
 	if err := central.Save(roots, plan.Registry); err != nil {
 		return Result{}, rollback(err)
@@ -219,13 +254,16 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 		if err := journal.Close(); err != nil {
 			return Result{}, err
 		}
-		for _, root := range []string{roots.State, roots.Config, roots.Share} {
+		for _, root := range []string{roots.State, roots.Config} {
 			if err := validateACDRoot(root); err != nil {
 				return Result{}, err
 			}
 			if err := os.RemoveAll(root); err != nil {
 				return Result{}, err
 			}
+		}
+		if err := purgeRootExcept(roots.Share, globalops.UserLockPath(roots.OperationsDBPath())); err != nil {
+			return Result{}, err
 		}
 	}
 	return result, nil
@@ -380,6 +418,30 @@ func (txn *purgeTransaction) release() error {
 func validateACDRoot(path string) error {
 	if !filepath.IsAbs(path) || filepath.Base(filepath.Clean(path)) != "acd" {
 		return fmt.Errorf("uninstall: refuse broad data root %s", path)
+	}
+	return nil
+}
+
+func purgeRootExcept(root, retainedPath string) error {
+	if err := validateACDRoot(root); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	retainedPath = filepath.Clean(retainedPath)
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if filepath.Clean(path) == retainedPath {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
 	}
 	return nil
 }

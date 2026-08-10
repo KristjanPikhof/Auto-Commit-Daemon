@@ -65,6 +65,34 @@ func TestApplyAllProgressAndErrorIdentifyRepository(t *testing.T) {
 	}
 }
 
+func TestApplyAllRejectsStaleMigrationPreview(t *testing.T) {
+	ctx := context.Background()
+	repo, wt := migrationRepo(t, ctx)
+	record := central.RepoRecord{
+		Path: wt.Root, StateDB: state.DBPathFromGitDir(wt.GitDir), CommonDir: wt.CommonDir,
+		RepositoryID: central.CanonicalID(wt.CommonDir), WorktreeID: central.CanonicalID(wt.Root),
+	}
+	backup := filepath.Join(t.TempDir(), "state-v19.db")
+	plan, err := Preflight(ctx, record, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, record.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyAll(ctx, []RepositoryPlan{plan}); err == nil ||
+		!strings.Contains(err.Error(), "state changed after preview") {
+		t.Fatalf("ApplyAll stale preview error=%v", err)
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale migration wrote backup %s: %v", repo, err)
+	}
+}
+
 func TestReplaceFileRemovesStaleSQLiteSidecars(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -169,6 +197,50 @@ func TestRetainedBridgeCheckpointImportsBeforeManifestCleanup(t *testing.T) {
 	}
 	if _, err := os.Stat(manifestPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("manifest cleanup=%v", err)
+	}
+}
+
+func TestMigrationRevalidationRejectsChangedRetainedBridgeRef(t *testing.T) {
+	ctx := context.Background()
+	repo, wt := migrationRepo(t, ctx)
+	operationID := "setup-stale-bridge"
+	treeOID, err := gitpkg.WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "bridge.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitOID, err := gitpkg.CommitTreeDurable(ctx, repo, treeOID,
+		"acd migration bridge "+operationID+"\n", checkpoint.IdentityName, checkpoint.IdentityEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := migrationRefPrefix + operationID + "/" + central.CanonicalID(wt.Root) + "/1"
+	if _, err := gitpkg.EnsurePrivateRefDurable(ctx, repo, migrationRefPrefix, ref, commitOID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := BridgeSnapshot{RepositoryID: central.CanonicalID(wt.CommonDir), WorktreeID: central.CanonicalID(wt.Root),
+		Repo: wt.Root, Ref: ref, CommitOID: commitOID, TreeOID: treeOID, CreatedTS: 1}
+	plan := RepositoryPlan{Record: central.RepoRecord{
+		Path: wt.Root, StateDB: state.DBPathFromGitDir(wt.GitDir), CommonDir: wt.CommonDir,
+		RepositoryID: snapshot.RepositoryID, WorktreeID: snapshot.WorktreeID,
+	}, BridgeSnapshots: []BridgeSnapshot{snapshot}, BackupPath: filepath.Join(t.TempDir(), "state-v19.db")}
+	otherTree, err := gitpkg.WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "other.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherCommit, err := gitpkg.CommitTreeDurable(ctx, repo, otherTree,
+		"changed retained bridge\n", checkpoint.IdentityName, checkpoint.IdentityEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitpkg.UpdateRef(ctx, repo, ref, otherCommit, commitOID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyAll(ctx, []RepositoryPlan{plan}); err == nil ||
+		!strings.Contains(err.Error(), "revalidate retained bridge") {
+		t.Fatalf("ApplyAll changed bridge error=%v", err)
+	}
+	if _, err := os.Stat(plan.Record.StateDB); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("changed bridge mutated state DB: %v", err)
 	}
 }
 
