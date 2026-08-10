@@ -148,9 +148,16 @@ func sessionReady(ctx context.Context, roots paths.Roots, ownerID string) (bool,
 	if err := json.Unmarshal(body, &status); err != nil {
 		return false, err
 	}
+	if status.Ownership == "" {
+		runningVersion := strings.TrimSpace(status.Version)
+		if runningVersion == "" {
+			runningVersion = "unknown"
+		}
+		return false, fmt.Errorf("an older ACD background process is still running (version %s); run `acd setup` to upgrade and restart it", runningVersion)
+	}
 	wantOwnership := "session:" + ownerID
 	if status.Ownership != wantOwnership {
-		return false, fmt.Errorf("supervisor: canonical socket belongs to another responsibility session; stop its ACD supervisor before retrying")
+		return false, errors.New("ACD was started by another macOS application or terminal session and cannot be reused safely; run `acd setup` to restart ACD from this session")
 	}
 	return true, nil
 }

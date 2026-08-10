@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -91,12 +92,12 @@ func TestEnsureSessionCleansUpNeverReadyChild(t *testing.T) {
 		defer ticker.Stop()
 		for {
 			body, readErr := os.ReadFile(pidPath)
-			if readErr == nil {
+			if readErr == nil && strings.TrimSpace(string(body)) != "" {
 				pidReady <- pidResult{body: body}
 				cancel()
 				return
 			}
-			if !errors.Is(readErr, os.ErrNotExist) {
+			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				pidReady <- pidResult{err: readErr}
 				cancel()
 				return
@@ -141,6 +142,10 @@ func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var advertised atomic.Value
+	advertised.Store(Status{
+		PID: os.Getpid(), Version: "v2026-08-07-161-ge473be00-dirty", Ownership: "session:owner-a",
+	})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -155,7 +160,7 @@ func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
 					Version: ProtocolVersion,
 					ID:      request.ID,
 					OK:      true,
-					Data:    Status{PID: os.Getpid(), Ownership: "session:owner-a"},
+					Data:    advertised.Load().(Status),
 				})
 			}
 			_ = conn.Close()
@@ -167,9 +172,20 @@ func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
 	})
 
 	ready, err := sessionReady(context.Background(), roots, "owner-b")
-	if ready || err == nil || !strings.Contains(err.Error(), "another responsibility session") {
+	if ready || err == nil || !strings.Contains(err.Error(), "another macOS application or terminal session") ||
+		!strings.Contains(err.Error(), "run `acd setup`") || strings.HasPrefix(err.Error(), "supervisor:") {
 		t.Fatalf("cross-owner readiness=(%v, %v), want refusal", ready, err)
 	}
+
+	advertised.Store(Status{PID: os.Getpid(), Version: "v2026-08-07-161-ge473be00-dirty"})
+	ready, err = sessionReady(context.Background(), roots, "owner-a")
+	if ready || err == nil || !strings.Contains(err.Error(), "older ACD background process") ||
+		!strings.Contains(err.Error(), "v2026-08-07-161-ge473be00-dirty") ||
+		!strings.Contains(err.Error(), "run `acd setup`") || strings.HasPrefix(err.Error(), "supervisor:") {
+		t.Fatalf("old-supervisor readiness=(%v, %v), want actionable upgrade refusal", ready, err)
+	}
+
+	advertised.Store(Status{PID: os.Getpid(), Ownership: "session:owner-a"})
 	ready, err = sessionReady(context.Background(), roots, "owner-a")
 	if err != nil || !ready {
 		t.Fatalf("matching-owner readiness=(%v, %v), want ready", ready, err)
