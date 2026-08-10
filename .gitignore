@@ -10,3 +10,4 @@
 .vscode/
 .claude/scheduled_tasks.lock
 .editorconfig
+internal/installer/<setup-operation>/
