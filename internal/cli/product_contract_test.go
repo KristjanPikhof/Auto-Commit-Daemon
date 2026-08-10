@@ -13,7 +13,7 @@ import (
 
 func TestChangedCommandCapabilityMatrix(t *testing.T) {
 	paths := [][]string{
-		{"setup"}, {"status"}, {"on"}, {"off"}, {"history"}, {"restore"},
+		{"setup"}, {"status"}, {"on"}, {"off"}, {"commit-all"}, {"history"}, {"restore"},
 		{"doctor"}, {"uninstall"}, {"config", "get"}, {"config", "set"},
 		{"config", "edit"}, {"config", "reset"}, {"config", "credentials"},
 		{"support", "diagnose"}, {"support", "logs"}, {"support", "repair"},

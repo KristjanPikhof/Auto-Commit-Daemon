@@ -32,6 +32,9 @@ func (c Client) Do(ctx context.Context, request Request) (Response, error) {
 	}
 	defer conn.Close()
 	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
 	if request.DeadlineMS > 0 {
 		requested := time.UnixMilli(request.DeadlineMS)
 		if requested.Before(deadline) {
@@ -41,11 +44,21 @@ func (c Client) Do(ctx context.Context, request Request) (Response, error) {
 	if err := conn.SetDeadline(deadline); err != nil {
 		return Response{}, err
 	}
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancellation()
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, fmt.Errorf("send supervisor request: %w", err)
 	}
 	var response Response
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&response); err != nil {
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, fmt.Errorf("read supervisor response: %w", err)
 	}
 	if response.Version != ProtocolVersion || response.ID != request.ID {

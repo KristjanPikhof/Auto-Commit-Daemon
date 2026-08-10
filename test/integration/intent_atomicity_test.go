@@ -486,15 +486,12 @@ WHERE planner_protocol='v2'`); got != "3" {
 		t.Fatalf("native v2 durable candidates=%s want 3", got)
 	}
 
-	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
-	if status.ExitCode != 0 {
-		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
-	}
-	if !strings.Contains(status.Stdout, `"state": "protected"`) ||
-		!strings.Contains(status.Stdout, `"published": true`) {
-		t.Fatalf("product status did not report protected, published state:\n%s",
-			status.Stdout)
-	}
+	waitFor(t, "product status reports protected, published state", 10*time.Second, func() bool {
+		status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
+		return status.ExitCode == 0 &&
+			strings.Contains(status.Stdout, `"state": "protected"`) &&
+			strings.Contains(status.Stdout, `"published": true`)
+	})
 	events := runAcd(t, ctx, fullEnv, "events", "--repo", repo, "--json", "--limit", "20")
 	if events.ExitCode != 0 {
 		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)

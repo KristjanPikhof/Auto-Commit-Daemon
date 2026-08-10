@@ -65,3 +65,23 @@ func TestRetentionKeepsNewestHundredAndRefsSurviveGC(t *testing.T) {
 		t.Fatalf("retained checkpoint after gc=(%q,%v), want %q", got, err, newestCommit)
 	}
 }
+
+func TestRetentionTreatsZeroMemberCheckpointAsProtectionOnly(t *testing.T) {
+	ctx := context.Background()
+	repo, db := checkpointFixture(t, ctx)
+	result, err := (Store{DB: db}).Create(ctx, Request{
+		RepoRoot: repo, WorktreeID: WorktreeID(repo),
+		Reason:           state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 1, CoverageEpoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := state.RetentionCheckpoints(ctx, db, WorktreeID(repo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != result.Checkpoint.ID || items[0].Published {
+		t.Fatalf("retention checkpoints=%+v", items)
+	}
+}

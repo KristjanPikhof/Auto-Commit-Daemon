@@ -21,7 +21,10 @@ func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]Ret
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT cp.id,cp.worktree_id,cp.reason,cp.checkpoint_ref,cp.commit_oid,
        cp.seq,cp.created_ts,cp.retained,
-       NOT EXISTS (
+       EXISTS (
+         SELECT 1 FROM checkpoint_events ce
+         WHERE ce.checkpoint_id=cp.id
+       ) AND NOT EXISTS (
          SELECT 1 FROM checkpoint_events ce JOIN capture_events e ON e.seq=ce.event_seq
          WHERE ce.checkpoint_id=cp.id AND e.state<>'published'
        ) AS published,

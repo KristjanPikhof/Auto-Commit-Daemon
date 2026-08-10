@@ -146,8 +146,8 @@ func sendInternalHint(ctx context.Context, repo, kind string, drain bool, sessio
 	params, _ := json.Marshal(map[string]any{"kind": kind, "drain_publication": drain,
 		"session_action": sessionAction, "session_id": sessionID, "harness": harness,
 		"watch_pid": watchPID})
-	request := supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("hint-%d", time.Now().UnixNano()), Method: method, RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(60 * time.Second).UnixMilli(), Params: params}
-	response, err := (&supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 60 * time.Second}).Do(ctx, request)
+	request := supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("hint-%d", time.Now().UnixNano()), Method: method, RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(), Params: params}
+	response, err := (&supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}).Do(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -404,6 +404,12 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 			return fmt.Errorf("acd worker: open %s: %w", record.Path, openErr)
 		}
 		closers = append(closers, db)
+		if recoverErr := daemon.RecoverSelfPublicationsBeforePlanning(cctx, wt.Root, db); recoverErr != nil {
+			return fmt.Errorf("acd worker: recover publication journal for %s: %w", record.Path, recoverErr)
+		}
+		if _, reconcileErr := state.ReconcileCheckpointIntentMemberships(cctx, db, record.WorktreeID); reconcileErr != nil {
+			return fmt.Errorf("acd worker: reconcile checkpoint publication state for %s: %w", record.Path, reconcileErr)
+		}
 		opts, logCloser, buildErr := buildDaemonRunOptions(wt.Root, wt.GitDir, db, errOut)
 		if buildErr != nil {
 			return buildErr
@@ -629,9 +635,9 @@ func waitRepositoryWorkerProtected(ctx context.Context, roots paths.Roots, repos
 				Version: supervisor.ProtocolVersion,
 				ID:      fmt.Sprintf("worker-ready-%s-%d", record.WorktreeID, time.Now().UnixNano()),
 				Method:  "checkpoint_barrier", RepositoryID: repositoryID,
-				WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(60 * time.Second).UnixMilli(),
+				WorktreeID: record.WorktreeID, DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
 			}
-			response, requestErr := supervisor.DoWorker(ctx, socket, request, 60*time.Second)
+			response, requestErr := supervisor.DoWorker(ctx, socket, request, supervisor.CheckpointBarrierTimeout)
 			if requestErr != nil || response.Error != nil {
 				allProtected = false
 				break
@@ -771,7 +777,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	if sessionErr := applyWorkerSessionParams(ctx, runtime.db, request.Params); sessionErr != nil {
 		return nil, protocolFailure("session_update_failed", sessionErr, true)
 	}
-	if request.Method == "hint" || request.Method == "checkpoint_barrier" {
+	if request.Method == "hint" {
 		if hintErr := applyWorkerActivityHint(ctx, runtime.db, request.Params); hintErr != nil {
 			return nil, protocolFailure("hint_failed", hintErr, true)
 		}
@@ -794,17 +800,54 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			DrainPublication bool `json:"drain_publication"`
 		}
 		_ = json.Unmarshal(request.Params, &params)
+		var drainAnchor publicationDrainTarget
+		runtime.gate.Lock()
+		if params.DrainPublication {
+			reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+			if unsafeErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("publication_status_failed", unsafeErr, true)
+			}
+			if reason != "" {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("publication_needs_action", errors.New(reason), false)
+			}
+			branchRef, branchErr := git.RunBranchRef(ctx, runtime.worktree.Root)
+			if branchErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("publication_status_failed", branchErr, true)
+			}
+			generation, anchorErr := daemon.LoadBranchGeneration(ctx, runtime.db)
+			if anchorErr == nil {
+				drainAnchor, anchorErr = snapshotPublicationDrainTarget(
+					ctx, runtime.db, branchRef, generation)
+			}
+			if anchorErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("publication_status_failed", anchorErr, true)
+			}
+		}
+		if hintErr := applyWorkerActivityHint(ctx, runtime.db, request.Params); hintErr != nil {
+			runtime.gate.Unlock()
+			return nil, protocolFailure("hint_failed", hintErr, true)
+		}
 		acceptedEpoch, beginErr := daemon.BeginProtectionObservation(ctx, runtime.db)
 		if beginErr != nil {
+			runtime.gate.Unlock()
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
 		h.wake()
-		deadline := time.NewTimer(30 * time.Second)
+		runtime.gate.Unlock()
+		deadline := time.NewTimer(checkpointBarrierWait(ctx))
 		defer deadline.Stop()
 		ticker := time.NewTicker(25 * time.Millisecond)
 		defer ticker.Stop()
 		var lastCovered, lastComplete, lastCheckpoint string
 		var lastReadErr error
+		var drainTarget publicationDrainTarget
+		var lastRemaining int64
+		var lastUnsafeCheck time.Time
+		lastProgress := time.Now()
 		for {
 			select {
 			case <-ctx.Done():
@@ -822,11 +865,55 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				coveredEpoch, parseErr := strconv.ParseInt(lastCovered, 10, 64)
 				if lastReadErr == nil && parseErr == nil && coveredEpoch >= acceptedEpoch && lastComplete == "true" {
 					if params.DrainPublication {
-						pending, pendingErr := state.CountAllPendingCaptureEvents(ctx, runtime.db)
-						if pendingErr != nil {
-							return nil, protocolFailure("publication_status_failed", pendingErr, true)
+						if drainTarget.EventSeqs == nil {
+							lastUnsafeCheck = time.Now()
+							runtime.gate.Lock()
+							reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+							if unsafeErr == nil && reason == "" {
+								drainTarget, unsafeErr = freezePublicationDrainTarget(
+									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint, drainAnchor)
+								if unsafeErr == nil {
+									lastRemaining = int64(len(drainTarget.EventSeqs))
+									lastProgress = time.Now()
+								}
+							}
+							runtime.gate.Unlock()
+							if unsafeErr != nil {
+								return nil, protocolFailure("publication_status_failed", unsafeErr, true)
+							}
+							if reason != "" {
+								return nil, protocolFailure("publication_needs_action", errors.New(reason), false)
+							}
+						} else if time.Since(lastUnsafeCheck) >= time.Second {
+							lastUnsafeCheck = time.Now()
+							runtime.gate.Lock()
+							reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+							runtime.gate.Unlock()
+							if unsafeErr != nil {
+								return nil, protocolFailure("publication_status_failed", unsafeErr, true)
+							}
+							if reason != "" {
+								return nil, protocolFailure("publication_needs_action", errors.New(reason), false)
+							}
 						}
-						if pending.Count > 0 {
+						progress, statusErr := publicationDrainStatus(ctx, runtime.db, drainTarget)
+						if statusErr != nil {
+							return nil, protocolFailure("publication_status_failed", statusErr, true)
+						}
+						if progress.Recovered > 0 || progress.Terminal > 0 {
+							return nil, protocolFailure("publication_needs_action", fmt.Errorf(
+								"target events did not publish (recovered=%d terminal=%d)",
+								progress.Recovered, progress.Terminal), false)
+						}
+						if progress.Remaining > 0 {
+							if progress.Remaining < lastRemaining {
+								lastRemaining = progress.Remaining
+								lastProgress = time.Now()
+							}
+							if time.Since(lastProgress) >= 30*time.Second {
+								return publicationDrainResult(lastCheckpoint, drainTarget, progress, false,
+									"publication made no progress for 30 seconds; ACD will keep retrying"), nil
+							}
 							continue
 						}
 						// Publishing settles its durable rows before finishing guarded
@@ -835,8 +922,12 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						// running.
 						runtime.gate.Lock()
 						runtime.gate.Unlock()
+						return publicationDrainResult(lastCheckpoint, drainTarget, progress, true, ""), nil
 					}
-					return map[string]any{"checkpoint_id": lastCheckpoint, "protected": true, "publication_drained": params.DrainPublication}, nil
+					return map[string]any{
+						"checkpoint_id": lastCheckpoint, "protected": true,
+						"publication_drained": false,
+					}, nil
 				}
 			}
 		}
@@ -899,6 +990,259 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	default:
 		return nil, &supervisor.ProtocolError{Code: "invalid_request", Message: "unsupported worker request"}
 	}
+}
+
+type publicationDrainTarget struct {
+	BranchRef  string
+	Generation int64
+	EventSeqs  []int64
+	MaxSeq     int64
+}
+
+type publicationDrainProgress struct {
+	Remaining, Published, Recovered, Terminal, Commits int64
+}
+
+func snapshotPublicationDrainTarget(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) (publicationDrainTarget, error) {
+	if branchRef == "" || generation <= 0 {
+		return publicationDrainTarget{}, errors.New("pre-barrier publication branch generation is unavailable")
+	}
+	target := publicationDrainTarget{
+		BranchRef: branchRef, Generation: generation, EventSeqs: []int64{},
+	}
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT seq FROM capture_events
+WHERE branch_ref=? AND branch_generation=? AND state='pending'
+ORDER BY seq`, branchRef, generation)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("snapshot pre-barrier publication backlog: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return publicationDrainTarget{}, fmt.Errorf("scan pre-barrier publication backlog: %w", err)
+		}
+		target.EventSeqs = append(target.EventSeqs, seq)
+		target.MaxSeq = seq
+	}
+	if err := rows.Err(); err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("iterate pre-barrier publication backlog: %w", err)
+	}
+	return target, nil
+}
+
+func freezePublicationDrainTarget(
+	ctx context.Context,
+	db *state.DB,
+	repoRoot, checkpointID string,
+	anchor publicationDrainTarget,
+) (publicationDrainTarget, error) {
+	if strings.TrimSpace(checkpointID) == "" {
+		return publicationDrainTarget{}, errors.New("publication checkpoint identity is unavailable")
+	}
+	if anchor.BranchRef == "" || anchor.Generation <= 0 {
+		return publicationDrainTarget{}, errors.New("pre-barrier publication branch generation is unavailable")
+	}
+	branchRef, err := git.RunBranchRef(ctx, repoRoot)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("resolve publication branch: %w", err)
+	}
+	if branchRef != anchor.BranchRef {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication branch changed after barrier: before=%s current=%s", anchor.BranchRef, branchRef)
+	}
+	tx, err := db.ReadSQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("begin publication target snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var observedRef, phase string
+	if err := tx.QueryRowContext(ctx, `
+SELECT observed_ref,phase FROM checkpoints WHERE id=?`, checkpointID).Scan(&observedRef, &phase); err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("load publication checkpoint: %w", err)
+	}
+	if phase != state.CheckpointCompleted || observedRef == "" {
+		return publicationDrainTarget{}, errors.New("publication checkpoint is not a completed attached snapshot")
+	}
+	if observedRef != anchor.BranchRef {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication checkpoint branch changed: before=%s checkpoint=%s", anchor.BranchRef, observedRef)
+	}
+
+	target := publicationDrainTarget{
+		BranchRef: anchor.BranchRef, Generation: anchor.Generation,
+		EventSeqs: make([]int64, len(anchor.EventSeqs)), MaxSeq: anchor.MaxSeq,
+	}
+	copy(target.EventSeqs, anchor.EventSeqs)
+	seen := make(map[int64]struct{}, len(target.EventSeqs))
+	for _, seq := range target.EventSeqs {
+		seen[seq] = struct{}{}
+	}
+	memberRows, err := tx.QueryContext(ctx, `
+SELECT e.seq,e.branch_ref,e.branch_generation
+FROM checkpoint_events ce
+JOIN capture_events e ON e.seq=ce.event_seq
+WHERE ce.checkpoint_id=?
+ORDER BY ce.ord`, checkpointID)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("load publication checkpoint membership: %w", err)
+	}
+	for memberRows.Next() {
+		var seq int64
+		var memberRef string
+		var memberGeneration int64
+		if err := memberRows.Scan(&seq, &memberRef, &memberGeneration); err != nil {
+			memberRows.Close()
+			return publicationDrainTarget{}, err
+		}
+		if memberRef != anchor.BranchRef || memberGeneration != anchor.Generation {
+			memberRows.Close()
+			return publicationDrainTarget{}, errors.New("publication checkpoint membership changed branch generation")
+		}
+		if _, exists := seen[seq]; exists {
+			continue
+		}
+		seen[seq] = struct{}{}
+		target.EventSeqs = append(target.EventSeqs, seq)
+		target.MaxSeq = max(target.MaxSeq, seq)
+	}
+	if err := memberRows.Err(); err != nil {
+		memberRows.Close()
+		return publicationDrainTarget{}, fmt.Errorf("iterate publication checkpoint membership: %w", err)
+	}
+	if err := memberRows.Close(); err != nil {
+		return publicationDrainTarget{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("commit publication target snapshot: %w", err)
+	}
+	branchAfter, err := git.RunBranchRef(ctx, repoRoot)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("revalidate publication branch: %w", err)
+	}
+	if branchAfter != anchor.BranchRef {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication branch changed while freezing target: before=%s current=%s", anchor.BranchRef, branchAfter)
+	}
+	return target, nil
+}
+
+func publicationDrainResult(
+	checkpointID string,
+	target publicationDrainTarget,
+	progress publicationDrainProgress,
+	drained bool,
+	waitingReason string,
+) map[string]any {
+	return map[string]any{
+		"checkpoint_id": checkpointID, "protected": true,
+		"publication_drained": drained, "target_event_seq": target.MaxSeq,
+		"target_events": len(target.EventSeqs), "published_events": progress.Published,
+		"remaining_events": progress.Remaining, "commits_created": progress.Commits,
+		"recovered_events": progress.Recovered, "terminal_events": progress.Terminal,
+		"waiting_reason": waitingReason,
+	}
+}
+
+func publicationDrainStatus(ctx context.Context, db *state.DB, target publicationDrainTarget) (publicationDrainProgress, error) {
+	var progress publicationDrainProgress
+	commits := map[string]struct{}{}
+	const batchSize = 500
+	for start := 0; start < len(target.EventSeqs); start += batchSize {
+		end := min(start+batchSize, len(target.EventSeqs))
+		args := make([]any, 0, end-start+2)
+		placeholders := make([]string, 0, end-start)
+		for _, seq := range target.EventSeqs[start:end] {
+			placeholders = append(placeholders, "?")
+			args = append(args, seq)
+		}
+		args = append(args, target.BranchRef, target.Generation)
+		rows, err := db.SQL().QueryContext(ctx, `
+SELECT state,COALESCE(commit_oid,'') FROM capture_events
+WHERE seq IN (`+strings.Join(placeholders, ",")+`)
+  AND branch_ref=? AND branch_generation=?`, args...)
+		if err != nil {
+			return progress, err
+		}
+		seen := 0
+		for rows.Next() {
+			var eventState, commitOID string
+			if err := rows.Scan(&eventState, &commitOID); err != nil {
+				rows.Close()
+				return progress, err
+			}
+			seen++
+			switch eventState {
+			case state.EventStatePending:
+				progress.Remaining++
+			case state.EventStatePublished:
+				progress.Published++
+				if commitOID != "" {
+					commits[commitOID] = struct{}{}
+				}
+			case state.EventStateRecovered:
+				progress.Recovered++
+			default:
+				progress.Terminal++
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return progress, err
+		}
+		if seen != end-start {
+			return progress, errors.New("publication target ownership changed")
+		}
+	}
+	progress.Commits = int64(len(commits))
+	return progress, nil
+}
+
+func publicationUnsafeReason(ctx context.Context, worktree git.Worktree) (string, error) {
+	branchRef, err := git.RunBranchRef(ctx, worktree.Root)
+	if err != nil {
+		return "", err
+	}
+	if branchRef == "" {
+		return "publication is paused on detached HEAD; attach a branch and run `acd commit-all --yes` again", nil
+	}
+	for _, marker := range []string{"rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "BISECT_LOG"} {
+		if _, err := os.Lstat(filepath.Join(worktree.GitDir, marker)); err == nil {
+			return "publication is paused during an active Git operation; finish it and run `acd commit-all --yes` again", nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	body, err := git.Run(ctx, git.RunOpts{Dir: worktree.Root},
+		"status", "--porcelain=v1", "-z", "--untracked-files=no")
+	if err != nil {
+		return "", err
+	}
+	for _, item := range strings.Split(string(body), "\x00") {
+		if len(item) < 2 {
+			continue
+		}
+		xy := item[:2]
+		if strings.Contains(xy, "U") || xy == "AA" || xy == "DD" {
+			return "publication is paused by unresolved Git conflicts; resolve them and run `acd commit-all --yes` again", nil
+		}
+		if xy[0] != ' ' && xy[0] != '?' {
+			return "publication is paused because the Git index contains staged changes; unstage them and run `acd commit-all --yes` again", nil
+		}
+	}
+	return "", nil
+}
+
+func checkpointBarrierWait(ctx context.Context) time.Duration {
+	if requestDeadline, ok := ctx.Deadline(); ok {
+		return max(time.Until(requestDeadline), time.Millisecond)
+	}
+	return supervisor.CheckpointBarrierTimeout
 }
 
 func applyWorkerActivityHint(ctx context.Context, db *state.DB, raw json.RawMessage) error {

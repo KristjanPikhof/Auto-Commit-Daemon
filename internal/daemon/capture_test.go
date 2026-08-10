@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1654,7 +1655,7 @@ func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
 	}
 }
 
-func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
+func TestCaptureCheckpointProtectsBeforeCappedEventsBecomePublishable(t *testing.T) {
 	t.Setenv(EnvMaxPendingEvents, "1")
 	f := newCaptureFixture(t)
 	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
@@ -1663,14 +1664,15 @@ func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
 		}
 	}
 	store := checkpointpkg.Store{DB: f.db}
-	summary, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
+	opts := CaptureOpts{
 		IgnoreChecker:    f.ig,
 		SensitiveMatcher: f.matcher,
 		CheckpointStore:  &store,
 		WorktreeID:       checkpointpkg.WorktreeID(f.dir),
 		ObservationEpoch: 11,
 		CheckpointReason: state.CheckpointReasonPoll,
-	})
+	}
+	summary, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1678,7 +1680,10 @@ func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
 		t.Fatalf("summary=%+v", summary)
 	}
 	if summary.EventsDropped != 0 || summary.BackpressurePaused {
-		t.Fatalf("checkpoint capture applied publication cap: %+v", summary)
+		t.Fatalf("checkpoint capture dropped deferred events: %+v", summary)
+	}
+	if summary.EventsAppended != 1 || summary.PendingDepth != 1 {
+		t.Fatalf("checkpoint capture ignored pending cap: %+v", summary)
 	}
 	projection, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 10)
 	if err != nil {
@@ -1691,7 +1696,7 @@ func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(publishable) != summary.EventsAppended || len(publishable) < 3 {
+	if len(publishable) != 1 {
 		t.Fatalf("publishable=%d appended=%d", len(publishable), summary.EventsAppended)
 	}
 	entries, err := git.LsTree(context.Background(), f.dir,
@@ -1709,6 +1714,34 @@ func TestCaptureCheckpointProtectsBeforeEventsBecomePublishable(t *testing.T) {
 		if !found {
 			t.Fatalf("checkpoint tree missing %s: %+v", path, entries)
 		}
+	}
+
+	if err := os.WriteFile(filepath.Join(f.dir, "four.txt"), []byte("four"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts.ObservationEpoch = 12
+	second, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Protected || second.CheckpointID == "" || second.EventsAppended != 0 {
+		t.Fatalf("saturated checkpoint did not remain protection-only: %+v", second)
+	}
+	latest, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Latest == nil || latest.Latest.ID != second.CheckpointID || len(latest.Latest.EventSeqs) != 0 {
+		t.Fatalf("latest saturated checkpoint=%+v", latest.Latest)
+	}
+
+	opts.ObservationEpoch = 13
+	third, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.CheckpointID != second.CheckpointID || third.EventsAppended != 0 {
+		t.Fatalf("unchanged saturated pass churned checkpoint: second=%+v third=%+v", second, third)
 	}
 }
 
@@ -1896,5 +1929,42 @@ func TestBeginProtectionObservationInvalidatesPriorCoverage(t *testing.T) {
 	complete, _, err := state.MetaGet(ctx, f.db, MetaKeyProtectionComplete)
 	if err != nil || complete != "false" {
 		t.Fatalf("protection complete=(%q,%v), want false", complete, err)
+	}
+}
+
+func TestBeginProtectionObservationJoinsConcurrentHints(t *testing.T) {
+	ctx := context.Background()
+	f := newCaptureFixture(t)
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyProtectionObservationEpoch: "11",
+		MetaKeyProtectionComplete:         "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const callers = 16
+	epochs := make(chan int64, callers)
+	errs := make(chan error, callers)
+	var group sync.WaitGroup
+	for range callers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			epoch, err := BeginProtectionObservation(ctx, f.db)
+			epochs <- epoch
+			errs <- err
+		}()
+	}
+	group.Wait()
+	close(epochs)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for epoch := range epochs {
+		if epoch != 12 {
+			t.Fatalf("epoch=%d want=12", epoch)
+		}
 	}
 }

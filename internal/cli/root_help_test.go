@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestRootHelpExposesExactlyEightProductCommands(t *testing.T) {
+func TestRootHelpExposesExactlyNineProductCommands(t *testing.T) {
 	root := newRootCmd()
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
@@ -20,7 +20,7 @@ func TestRootHelpExposesExactlyEightProductCommands(t *testing.T) {
 		t.Fatalf("stderr=%q", errOut.String())
 	}
 	got := out.String()
-	for _, command := range []string{"setup", "status", "on", "off", "history", "restore", "doctor", "uninstall"} {
+	for _, command := range []string{"setup", "status", "on", "off", "commit-all", "history", "restore", "doctor", "uninstall"} {
 		if !strings.Contains(got, "  "+command) {
 			t.Fatalf("help missing %s:\n%s", command, got)
 		}
@@ -36,8 +36,8 @@ func TestRootHelpExposesExactlyEightProductCommands(t *testing.T) {
 			visible++
 		}
 	}
-	if visible != 8 {
-		t.Fatalf("visible root commands=%d want=8", visible)
+	if visible != 9 {
+		t.Fatalf("visible root commands=%d want=9", visible)
 	}
 }
 

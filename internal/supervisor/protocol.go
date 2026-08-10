@@ -5,9 +5,13 @@ package supervisor
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
-const ProtocolVersion = 1
+const (
+	ProtocolVersion          = 1
+	CheckpointBarrierTimeout = 15 * time.Minute
+)
 
 type Request struct {
 	Version      int             `json:"version"`

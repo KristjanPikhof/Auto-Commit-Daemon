@@ -152,6 +152,7 @@ func newRootCmd() *cobra.Command {
 		newProductStatusCmd(),
 		newOnCmd(),
 		newOffCmd(),
+		newProductCommitAllCmd(),
 		newHistoryCmd(),
 		newRestoreCmd(),
 		newProductDoctorCmd(),
@@ -188,7 +189,6 @@ func newRootCmd() *cobra.Command {
 		hideCompatibility(newHookStdinExtractCmd(), "acd internal integration stdin-extract", true),
 		hideCompatibility(newHookCursorExtractCmd(), "acd internal integration cursor-extract", true),
 		hideCompatibility(newGCCmd(), "acd repo gc", false),
-		hideCompatibility(newCommitAllCmd(), "acd on", false),
 		hideCompatibility(newRewriteCommitsCmd(), "acd history rewrite", false),
 		hideCompatibility(newCompatDaemonCmd(), "acd internal worker run", true),
 	)

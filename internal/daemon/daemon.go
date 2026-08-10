@@ -2519,7 +2519,6 @@ func Run(ctx context.Context, opts Options) error {
 				WorktreeID:        checkpointpkg.WorktreeID(opts.RepoPath),
 				CheckpointReason:  state.CheckpointReasonPoll,
 				MaxFileBytes:      opts.MaxFileBytes,
-				DisablePendingCap: true,
 				ObservationEpoch:  observationEpoch,
 			})
 		}

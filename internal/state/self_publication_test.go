@@ -73,6 +73,99 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 	assertSelfPublicationSchema(t, reopened.SQL())
 }
 
+func TestSelfPublicationPrepareAtomicallyLinksOperation(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 1, "linked.txt")
+	publication := SelfPublication{
+		ID: "linked-publication", BranchRef: "refs/heads/main", BranchGeneration: 1,
+		SourceHead: "source", TargetCommitOID: "target", TargetTreeOID: "tree",
+		Members: []SelfPublicationMember{{EventSeq: seq}},
+	}
+	if created, err := PrepareSelfPublication(ctx, d, publication); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+	}
+	loaded, ok, err := SelfPublicationByID(ctx, d, publication.ID)
+	if err != nil || !ok || !loaded.OperationID.Valid {
+		t.Fatalf("publication=%+v ok=%t err=%v", loaded, ok, err)
+	}
+	var kind, phase, status, digest string
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT kind,phase,status,plan_digest FROM operations WHERE id=?`,
+		loaded.OperationID.String).Scan(&kind, &phase, &status, &digest); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "self_publication" || phase != OperationPrepared ||
+		status != OperationPrepared || digest != loaded.MembershipDigest {
+		t.Fatalf("operation=(%q,%q,%q,%q)", kind, phase, status, digest)
+	}
+}
+
+func TestSelfPublicationOperationTransitionsRequireExactCorrelation(t *testing.T) {
+	newPublication := func(t *testing.T, id string) (*DB, SelfPublication, int64, string) {
+		t.Helper()
+		db, _ := openTestDB(t)
+		seq := appendSelfPublicationEvent(t, db, "refs/heads/main", 1, id+".txt")
+		publication := SelfPublication{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 1,
+			SourceHead: "source", TargetCommitOID: "target", TargetTreeOID: "tree",
+			Members: []SelfPublicationMember{{EventSeq: seq}},
+		}
+		if created, err := PrepareSelfPublication(context.Background(), db, publication); err != nil || !created {
+			t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+		}
+		loaded, ok, err := SelfPublicationByID(context.Background(), db, id)
+		if err != nil || !ok || !loaded.OperationID.Valid {
+			t.Fatalf("publication=%+v ok=%t err=%v", loaded, ok, err)
+		}
+		return db, publication, seq, loaded.OperationID.String
+	}
+
+	t.Run("git applied", func(t *testing.T) {
+		db, publication, _, operationID := newPublication(t, "operation-mark")
+		if _, err := db.SQL().Exec(`UPDATE operations SET status='completed' WHERE id=?`, operationID); err != nil {
+			t.Fatal(err)
+		}
+		if applied, err := MarkSelfPublicationGitApplied(context.Background(), db, publication, 2); applied || !errors.Is(err, ErrSelfPublicationOwnershipChanged) {
+			t.Fatalf("MarkSelfPublicationGitApplied=(%t,%v)", applied, err)
+		}
+		loaded, ok, err := SelfPublicationByID(context.Background(), db, publication.ID)
+		if err != nil || !ok || loaded.Phase != SelfPublicationPrepared {
+			t.Fatalf("publication after rejected transition=%+v ok=%t err=%v", loaded, ok, err)
+		}
+	})
+
+	t.Run("completed", func(t *testing.T) {
+		db, publication, seq, operationID := newPublication(t, "operation-complete")
+		if applied, err := MarkSelfPublicationGitApplied(context.Background(), db, publication, 2); err != nil || !applied {
+			t.Fatalf("MarkSelfPublicationGitApplied=(%t,%v)", applied, err)
+		}
+		if _, err := db.SQL().Exec(`UPDATE operations SET status='rolled_back' WHERE id=?`, operationID); err != nil {
+			t.Fatal(err)
+		}
+		if completed, err := CompleteSelfPublication(context.Background(), db, publication,
+			SelfPublicationCompletion{PublishedTS: 3}); completed ||
+			!errors.Is(err, ErrSelfPublicationOwnershipChanged) {
+			t.Fatalf("CompleteSelfPublication=(%t,%v)", completed, err)
+		}
+		loaded, ok, err := SelfPublicationByID(context.Background(), db, publication.ID)
+		if err != nil || !ok || loaded.Phase != SelfPublicationGitApplied {
+			t.Fatalf("publication after rejected completion=%+v ok=%t err=%v", loaded, ok, err)
+		}
+		var eventState string
+		if err := db.SQL().QueryRow(`SELECT state FROM capture_events WHERE seq=?`, seq).Scan(&eventState); err != nil {
+			t.Fatal(err)
+		}
+		if eventState != EventStatePending {
+			t.Fatalf("event state=%q, want pending rollback", eventState)
+		}
+	})
+}
+
 func TestSelfPublicationV18CompletionMigrationIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")

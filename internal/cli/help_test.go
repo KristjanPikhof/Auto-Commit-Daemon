@@ -16,6 +16,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"status", []string{"protected and published", "--repo"}},
 		{"on", []string{"Enable checkpoint protection", "--repo"}},
 		{"off", []string{"final durable checkpoint", "--force"}},
+		{"commit-all", []string{"managed", "--dry-run", "--yes"}},
 		{"history", []string{"protected checkpoints", "--activity", "rewrite"}},
 		{"restore", []string{"restore ID", "--yes"}},
 		{"doctor", []string{"protection problems", "--bundle", "--output"}},

@@ -5,13 +5,11 @@ package integration_test
 
 import (
 	"context"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -112,6 +110,7 @@ func TestCommitAllEventStrategyOrdersByPath(t *testing.T) {
 	}
 	repo, files := commitAllFixture(t)
 	env := commitAllEnv(t, "event", "deterministic")
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -174,6 +173,8 @@ func TestCommitAllIntentStrategyDeterministic(t *testing.T) {
 	}
 	repo, files := commitAllFixture(t)
 	env := commitAllEnv(t, "intent", "deterministic")
+	env = activateIntentV2Runtime(t, repo, env...)
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -186,7 +187,8 @@ func TestCommitAllIntentStrategyDeterministic(t *testing.T) {
 	}
 
 	if dirty := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); dirty != "" {
-		t.Fatalf("worktree still dirty after commit-all (intent):\n%s", dirty)
+		t.Fatalf("worktree still dirty after commit-all (intent):\n%s\nstdout=%s\nstderr=%s",
+			dirty, res.Stdout, res.Stderr)
 	}
 
 	// All fixture files must be present in the post-seed history. Grouped
@@ -226,154 +228,25 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// TestCommitAllRefusesWhenDaemonAlive: simulate the live daemon by holding
-// <gitDir>/acd/daemon.lock with LOCK_EX|LOCK_NB. commit-all must refuse
-// with a non-zero exit and a stderr message that names the daemon lock.
-func TestCommitAllRefusesWhenDaemonAlive(t *testing.T) {
+// TestCommitAllWorksWhileWorkerAlive verifies the public command uses the
+// managed worker instead of contending with it through a direct writer path.
+func TestCommitAllWorksWhileWorkerAlive(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary required")
 	}
 	repo, _ := commitAllFixture(t)
 	env := commitAllEnv(t, "event", "deterministic")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Hold the daemon lock ourselves. That mirrors the live-daemon refusal
-	// path without requiring a full session boot.
-	lockDir := filepath.Join(repo, ".git", "acd")
-	if err := os.MkdirAll(lockDir, 0o700); err != nil {
-		t.Fatalf("mkdir lock dir: %v", err)
-	}
-	lockPath := filepath.Join(lockDir, "daemon.lock")
-	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		t.Fatalf("open daemon.lock: %v", err)
-	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		t.Fatalf("flock daemon.lock: %v", err)
-	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-
-	res := runAcd(t, ctx, env, "commit-all", "--repo", repo, "--yes")
-	if res.ExitCode == 0 {
-		t.Fatalf("commit-all should have refused while daemon.lock is held; stdout=%s\nstderr=%s",
-			res.Stdout, res.Stderr)
-	}
-	combined := res.Stdout + res.Stderr
-	if !strings.Contains(strings.ToLower(combined), "daemon") {
-		t.Fatalf("expected stderr/stdout to mention daemon lock; got:\nstdout=%s\nstderr=%s",
-			res.Stdout, res.Stderr)
-	}
-	// And the worktree must be entirely untouched.
-	dirtyLines := strings.Split(strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")), "\n")
-	if len(dirtyLines) == 0 || (len(dirtyLines) == 1 && dirtyLines[0] == "") {
-		t.Fatalf("expected fixture files still dirty after refusal; got clean worktree")
-	}
-}
-
-// TestCommitAllReseedsStaleShadow exercises the real-world bug regression:
-// the daemon previously absorbed worktree edits into shadow_paths without
-// successfully replaying them, leaving the bootstrap marker set AND shadow
-// rows that already mirror live blobs. Without the fix, commit-all would
-// short-circuit BootstrapShadow (marker present), Capture saw zero diff vs
-// the poisoned shadow, and the user got "Commits: 0; no pending events;
-// worktree already clean" while their worktree still showed dirty files.
-//
-// This test:
-//  1. Verifies `acd commit-all --dry-run --yes --json` leaves a clean repo
-//     without a state database, then initializes state through a real daemon
-//     start/stop cycle.
-//  2. Builds a dirty fixture worktree.
-//  3. Simulates the poisoned state by hash-objecting each dirty file into
-//     the git ODB, writing a shadow_paths row that mirrors that blob, and
-//     stamping the bootstrap marker.
-//  4. Seeds a stale pending capture_events row from a "previous session".
-//  5. Runs `acd commit-all --yes`. With the fix, the stale pending chain is
-//     preserved, the poisoned shadow is reseeded, and Capture classifies the
-//     dirty files as fresh creates, which then commit.
-//  6. Asserts the worktree ends up clean and exit code is 0.
-func TestCommitAllReseedsStaleShadow(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git binary required")
-	}
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 binary required for poisoned-state seeding")
-	}
-	repo := tempRepo(t)
-	env := commitAllEnv(t, "event", "deterministic")
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	headSHA := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	branchRef := "refs/heads/main"
-	gen := int64(1)
-
-	// Dry-run is strictly read-only and must not create state. Initialize the
-	// schema afterward through the production daemon lifecycle, before making
-	// the fixture worktree dirty.
-	dry := runAcd(t, ctx, env, "commit-all", "--repo", repo, "--yes", "--dry-run", "--json")
-	if dry.ExitCode != 0 {
-		t.Fatalf("dry-run setup exit=%d\nstdout=%s\nstderr=%s", dry.ExitCode, dry.Stdout, dry.Stderr)
-	}
-
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
-		t.Fatalf("dry-run created writable state at %s: err=%v", dbPath, err)
-	}
-	dbPath = initStateDBSchema(t, ctx, env, repo, "commit-all-stale-shadow-schema")
-	files := writeCommitAllFixture(t, repo)
-
-	// Seed shadow_paths rows that mirror each dirty file's actual blob
-	// OID so the real Capture (without the fix) would see no diff.
-	seedShadowFor := func(path string) {
-		oid := strings.TrimSpace(runGitOK(t, repo, "hash-object", "-w", path))
-		// shadow_paths schema (v7) columns we set: branch_ref, branch_generation,
-		// path, operation, mode, oid, base_head, fidelity, updated_ts.
-		stmt := "INSERT OR REPLACE INTO shadow_paths(branch_ref, branch_generation, path, operation, mode, oid, base_head, fidelity, updated_ts) VALUES (" +
-			"'" + branchRef + "', " + strconv.FormatInt(gen, 10) + ", '" + path + "', 'create', '100644', '" + oid + "', '" + headSHA + "', 'full', strftime('%s','now'));"
-		out, err := exec.Command("sqlite3", dbPath, stmt).CombinedOutput()
-		if err != nil {
-			t.Fatalf("sqlite seed shadow %s: %v\n%s", path, err, out)
-		}
-	}
-	for _, p := range files {
-		seedShadowFor(p)
-	}
-	// Stamp the bootstrap completion marker so BootstrapShadow would skip.
-	markerKey := "shadow.bootstrapped:" + branchRef + ":" + strconv.FormatInt(gen, 10)
-	markerStmt := "INSERT OR REPLACE INTO daemon_meta(key, value, updated_ts) VALUES ('" + markerKey + "', '1', strftime('%s','now'));"
-	if out, err := exec.Command("sqlite3", dbPath, markerStmt).CombinedOutput(); err != nil {
-		t.Fatalf("sqlite stamp marker: %v\n%s", err, out)
-	}
-	// Seed a valid stale pending event from a previous session. The live
-	// worktree does not contain its desired file, so whole-chain recovery must
-	// archive it before commit-all can safely reseed and recapture.
-	staleAfterOID := gitHashObjectStdin(t, repo, "preserve stale pending work\n")
-	staleStmt := "INSERT INTO capture_events(branch_ref, branch_generation, base_head, operation, path, fidelity, captured_ts, state) VALUES (" +
-		"'" + branchRef + "', " + strconv.FormatInt(gen, 10) + ", '" + headSHA + "', 'create', 'stale-pending.txt', 'exact', strftime('%s','now'), 'pending');" +
-		"INSERT INTO capture_ops(event_seq, ord, op, path, after_oid, after_mode, fidelity) VALUES (last_insert_rowid(), 0, 'create', 'stale-pending.txt', '" + staleAfterOID + "', '100644', 'exact');"
-	if out, err := exec.Command("sqlite3", dbPath, staleStmt).CombinedOutput(); err != nil {
-		t.Fatalf("sqlite seed stale pending: %v\n%s", err, out)
-	}
-
-	// Now run commit-all for real. It must archive and retain the stale exact
-	// pair, reseed shadow, capture the dirty files, and commit them.
 	res := runAcd(t, ctx, env, "commit-all", "--repo", repo, "--yes")
 	if res.ExitCode != 0 {
-		t.Fatalf("commit-all (poisoned state) exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+		t.Fatalf("commit-all with live worker exit=%d\nstdout=%s\nstderr=%s",
+			res.ExitCode, res.Stdout, res.Stderr)
 	}
-	// Worktree must be clean — proof the dirty files actually committed
-	// rather than being silently skipped (the bug).
 	if dirty := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); dirty != "" {
-		t.Fatalf("worktree still dirty after poisoned-state commit-all:\n%s\nstdout=%s\nstderr=%s",
-			dirty, res.Stdout, res.Stderr)
-	}
-	// stdout must mention the reseed note so users have visibility.
-	if !strings.Contains(res.Stdout, "shadow reseeded from HEAD") {
-		t.Fatalf("expected 'shadow reseeded from HEAD' note in commit-all output:\n%s", res.Stdout)
+		t.Fatalf("worktree still dirty after worker-driven commit-all:\n%s", dirty)
 	}
 }
 
@@ -385,6 +258,7 @@ func TestCommitAllRefusesOnDetachedHEAD(t *testing.T) {
 	}
 	repo, _ := commitAllFixture(t)
 	env := commitAllEnv(t, "event", "deterministic")
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -1,19 +1,135 @@
 package git
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const CheckpointRefPrefix = "refs/acd/checkpoints/v1/"
 
 var ErrCheckpointRefCollision = errors.New("git: checkpoint ref collision")
+
+// BlobHasher computes the object ID Git assigns to raw blob content. Keeping
+// this tiny value in the git package lets complete worktree scans avoid one
+// hash-object subprocess per file while still honoring SHA-1 and SHA-256
+// repositories.
+type BlobHasher struct {
+	newHash func() hash.Hash
+}
+
+// DurableBlob is one already-hashed blob that a checkpoint tree will retain.
+// Content is required only when the object does not already exist in Git.
+type DurableBlob struct {
+	OID     string
+	Content []byte
+}
+
+// NewBlobHasher resolves the repository's object format without mutating it.
+func NewBlobHasher(ctx context.Context, repoDir string) (BlobHasher, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"rev-parse", "--show-object-format")
+	if err != nil {
+		return BlobHasher{}, fmt.Errorf("git: resolve object format: %w", err)
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "sha1":
+		return BlobHasher{newHash: sha1.New}, nil
+	case "sha256":
+		return BlobHasher{newHash: sha256.New}, nil
+	default:
+		return BlobHasher{}, fmt.Errorf("git: unsupported object format %q", strings.TrimSpace(string(out)))
+	}
+}
+
+// BlobOID returns the exact Git object ID for content without writing it.
+func (h BlobHasher) BlobOID(content []byte) (string, error) {
+	if h.newHash == nil {
+		return "", errors.New("git: uninitialized blob hasher")
+	}
+	digest := h.newHash()
+	_, _ = io.WriteString(digest, "blob "+strconv.Itoa(len(content)))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(content)
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// EnsureBlobObjectsDurable proves every supplied blob exists with the exact
+// type, writing and fsyncing only objects Git does not already have. A normal
+// checkpoint scan mostly reuses blobs already retained by HEAD or the index,
+// so one bounded batch reread replaces thousands of per-file subprocesses.
+func EnsureBlobObjectsDurable(ctx context.Context, repoDir string, blobs []DurableBlob) error {
+	unique := make([]DurableBlob, 0, len(blobs))
+	seen := make(map[string]struct{}, len(blobs))
+	for _, blob := range blobs {
+		if blob.OID == "" {
+			return errors.New("git: durable blob has an empty object ID")
+		}
+		if _, ok := seen[blob.OID]; ok {
+			continue
+		}
+		seen[blob.OID] = struct{}{}
+		unique = append(unique, blob)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+
+	var input bytes.Buffer
+	for _, blob := range unique {
+		input.WriteString(blob.OID)
+		input.WriteByte('\n')
+	}
+	out, err := Run(ctx, RunOpts{
+		Dir: repoDir, Stdin: &input, Timeout: DefaultReadTimeout,
+	}, "cat-file", "--batch-check=%(objectname) %(objecttype)")
+	if err != nil {
+		return fmt.Errorf("git: batch reread durable blobs: %w", err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for index, blob := range unique {
+		if !scanner.Scan() {
+			if scanErr := scanner.Err(); scanErr != nil {
+				return fmt.Errorf("git: batch reread durable blobs: %w", scanErr)
+			}
+			return fmt.Errorf("git: batch reread durable blobs returned %d of %d rows", index, len(unique))
+		}
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 || fields[0] != blob.OID {
+			return errors.New("git: malformed durable blob batch response")
+		}
+		switch fields[1] {
+		case "blob":
+			continue
+		case "missing":
+			written, writeErr := HashObjectStdinDurable(ctx, repoDir, blob.Content)
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != blob.OID {
+				return fmt.Errorf("git: durable blob wrote %s, want %s", written, blob.OID)
+			}
+		default:
+			return fmt.Errorf("git: durable object %s has type %s, want blob", blob.OID, fields[1])
+		}
+	}
+	if scanner.Scan() {
+		return errors.New("git: durable blob batch returned extra rows")
+	}
+	return scanner.Err()
+}
 
 // DurabilitySupport validates the Git configuration knobs ACD relies on for
 // checkpoint object and reference fsync. It performs no repository writes.
@@ -154,7 +270,10 @@ func EnsurePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, commitOI
 	if !errors.Is(err, ErrRefNotFound) {
 		return false, fmt.Errorf("git: resolve checkpoint ref: %w", err)
 	}
-	const zeroOID = "0000000000000000000000000000000000000000"
+	zeroOID, err := repositoryZeroOID(ctx, repoDir)
+	if err != nil {
+		return false, err
+	}
 	if _, err := runDurable(ctx, repoDir, nil, "reference", "update-ref", "--no-deref", ref, commitOID, zeroOID); err != nil {
 		existing, readErr := RevParse(ctx, repoDir, ref)
 		if readErr == nil && existing == commitOID {
@@ -175,6 +294,22 @@ func EnsurePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, commitOI
 			ErrCheckpointRefCollision, ref, observed, commitOID)
 	}
 	return true, nil
+}
+
+func repositoryZeroOID(ctx context.Context, repoDir string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"rev-parse", "--show-object-format")
+	if err != nil {
+		return "", fmt.Errorf("git: resolve object format: %w", err)
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "sha1":
+		return strings.Repeat("0", sha1.Size*2), nil
+	case "sha256":
+		return strings.Repeat("0", sha256.Size*2), nil
+	default:
+		return "", fmt.Errorf("git: unsupported object format %q", strings.TrimSpace(string(out)))
+	}
 }
 
 // DeletePrivateRefDurable removes exactly the expected ACD-owned ref target.
