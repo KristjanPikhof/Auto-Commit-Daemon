@@ -192,7 +192,7 @@ func newRepoListCmd() *cobra.Command {
   acd repo list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runRepoList(cmd.Context(), cmd.OutOrStdout(), jsonOut)
+			return runProductRepoList(cmd.Context(), cmd.OutOrStdout(), jsonOut)
 		},
 	}
 }

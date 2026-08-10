@@ -151,7 +151,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 		t.Fatalf("acd recover --auto --yes exit=%d\nstdout=%s\nstderr=%s",
 			recover.ExitCode, recover.Stdout, recover.Stderr)
 	}
-	const wantRecoverDeprec = "acd recover is deprecated; use acd fix [--clear-pause]. See acd fix --help."
+	const wantRecoverDeprec = "warning: acd recover is a compatibility alias; use acd support recover"
 	if !strings.Contains(recover.Stderr, wantRecoverDeprec) {
 		t.Fatalf("recover stderr missing deprecation banner\nwant: %q\nstderr: %q",
 			wantRecoverDeprec, recover.Stderr)
@@ -357,10 +357,32 @@ func decodeFixPlan(t *testing.T, body string) fixPlanProbe {
 	if strings.TrimSpace(body) == "" {
 		return plan
 	}
-	if err := json.Unmarshal([]byte(body), &plan); err != nil {
-		t.Fatalf("decode fix plan json: %v\nbody=%s", err, body)
-	}
+	decodeProductEnvelopeData(t, body, &plan)
 	return plan
+}
+
+func decodeProductEnvelopeData(t *testing.T, body string, target any) {
+	t.Helper()
+	var envelope struct {
+		OK   *bool           `json:"ok"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode command json: %v\nbody=%s", err, body)
+	}
+	payload := []byte(body)
+	if envelope.OK != nil {
+		if !*envelope.OK {
+			t.Fatalf("command returned an error envelope: %s", body)
+		}
+		if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+			t.Fatalf("command envelope omitted data: %s", body)
+		}
+		payload = envelope.Data
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		t.Fatalf("decode command data: %v\nbody=%s", err, body)
+	}
 }
 
 func hasFixActionKind(actions []fixActionProbe, kind string) bool {

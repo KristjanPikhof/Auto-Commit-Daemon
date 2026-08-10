@@ -39,7 +39,6 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -467,9 +466,7 @@ func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery(t *testing.T) {
 		DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
 		DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs"`
 	}
-	if err := json.Unmarshal([]byte(res.Stdout), &report); err != nil {
-		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
-	}
+	decodeProductEnvelopeData(t, res.Stdout, &report)
 
 	afterTS := time.Now().Unix() + 1
 	if report.DeadBranchPruneLastRunTS < beforeTS || report.DeadBranchPruneLastRunTS > afterTS {
@@ -527,9 +524,7 @@ func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
 	// the "never ran" sentinel); the refs slice must be absent (omitempty
 	// + nil).
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(res.Stdout), &raw); err != nil {
-		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
-	}
+	decodeProductEnvelopeData(t, res.Stdout, &raw)
 	for _, key := range []string{
 		"dead_branch_prune_last_run_ts",
 		"dead_branch_prune_last_count",

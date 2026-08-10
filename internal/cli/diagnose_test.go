@@ -273,10 +273,13 @@ func TestDiagnose_JSONOutput(t *testing.T) {
 		t.Fatalf("execute diagnose: %v\nstderr:\n%s", err, errOut.String())
 	}
 
-	var rep diagnoseReport
-	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+	var envelope struct {
+		Data diagnoseReport `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
 		t.Fatalf("unmarshal diagnose JSON: %v\n%s", err, out.String())
 	}
+	rep := envelope.Data
 	if rep.Repo != repo {
 		t.Fatalf("repo=%q, want %q", rep.Repo, repo)
 	}
@@ -320,10 +323,13 @@ func TestDiagnose_BackpressureSurfaced(t *testing.T) {
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("execute diagnose: %v\nstderr:\n%s", err, errOut.String())
 	}
-	var rep diagnoseReport
-	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+	var envelope struct {
+		Data diagnoseReport `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
+	rep := envelope.Data
 	if !rep.BackpressurePaused {
 		t.Fatalf("BackpressurePaused=false; want true")
 	}

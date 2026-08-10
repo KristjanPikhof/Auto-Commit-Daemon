@@ -46,11 +46,10 @@ type productStatusData struct {
 	Command           string `json:"command"`
 	Registered        bool   `json:"registered"`
 	Enabled           bool   `json:"enabled"`
+	Worker            string `json:"worker"`
 	Protected         bool   `json:"protected"`
 	Published         bool   `json:"published"`
 	ActionRequired    bool   `json:"action_required"`
-	Worker            string `json:"worker"`
-	WorkerPID         int    `json:"worker_pid,omitempty"`
 	CheckpointID      string `json:"checkpoint_id,omitempty"`
 	PendingEvents     int    `json:"pending_events"`
 	BlockedEvents     int    `json:"blocked_events"`
@@ -97,11 +96,10 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			Command:           result.Command,
 			Registered:        result.Registered,
 			Enabled:           result.Enabled,
+			Worker:            result.Daemon,
 			Protected:         result.Protected,
 			Published:         result.Published,
 			ActionRequired:    actionRequired,
-			Worker:            result.Daemon,
-			WorkerPID:         result.DaemonPID,
 			CheckpointID:      result.CheckpointID,
 			PendingEvents:     result.PendingEvents,
 			BlockedEvents:     result.BlockedEvents,

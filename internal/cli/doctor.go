@@ -29,9 +29,16 @@ import (
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
+
+type doctorTargetContextKey struct{}
+
+func withDoctorTarget(ctx context.Context, repo string) context.Context {
+	return context.WithValue(ctx, doctorTargetContextKey{}, strings.TrimSpace(repo))
+}
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
@@ -235,26 +242,37 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 	rep.SafeIgnoreExtraEnv = os.Getenv(state.EnvSafeIgnoreExtra)
 	rep.SafeIgnoreActive = state.SafeIgnorePatterns()
 	rep.Harnesses = collectDoctorHarnesses()
-	rep.AI = collectDoctorAI()
 
 	roots, err := paths.Resolve()
 	if err != nil {
 		return rep, fmt.Errorf("resolve paths: %w", err)
+	}
+	target, _ := ctx.Value(doctorTargetContextKey{}).(string)
+	if target != "" {
+		if wt, resolveErr := gitpkg.ResolveWorktree(ctx, target); resolveErr == nil {
+			target = wt.Root
+		}
+	}
+	if target != "" {
+		rep.AI = collectDoctorAIForRepo(ctx, roots, target)
+	} else {
+		rep.AI = collectDoctorAI()
 	}
 	rep.RegistryPath = roots.RegistryPath()
 	reg, err := central.Load(roots)
 	if err != nil {
 		return rep, fmt.Errorf("load registry: %w", err)
 	}
-	rep.RegistryRepoCount = len(reg.Repos)
-
 	for _, rec := range reg.Repos {
+		if target != "" && filepath.Clean(rec.Path) != filepath.Clean(target) {
+			continue
+		}
 		rr := doctorRepoReport{
 			Path:      rec.Path,
-			RepoHash:  rec.RepoHash,
+			RepoHash:  fallback(rec.RepositoryID, rec.RepoHash),
 			StateDB:   rec.StateDB,
 			Harnesses: append([]string{}, rec.Harnesses...),
-			LogPath:   roots.RepoLogPath(rec.RepoHash),
+			LogPath:   roots.RepoLogPath(fallback(rec.RepositoryID, rec.RepoHash)),
 		}
 		rr.DaemonProcessPIDs = findDaemonProcesses(ctx, rec.Path)
 		rr.DaemonProcessCount = len(rr.DaemonProcessPIDs)
@@ -273,8 +291,43 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		}
 		rep.Repos = append(rep.Repos, rr)
 	}
+	rep.RegistryRepoCount = len(rep.Repos)
 
 	return rep, nil
+}
+
+func collectDoctorAIForRepo(ctx context.Context, roots paths.Roots, repo string) doctorAIReport {
+	service, err := settings.NewValidationService(ctx, settings.Options{Roots: roots, RepoPath: repo})
+	if err != nil {
+		report := collectDoctorAI()
+		report.Notes = append(report.Notes, "effective repository settings unavailable: "+err.Error())
+		return report
+	}
+	cfg, err := service.AuthoringProviderConfig()
+	if err != nil {
+		report := collectDoctorAI()
+		report.Notes = append(report.Notes, "effective repository provider unavailable: "+err.Error())
+		return report
+	}
+	provider := cfg.Mode
+	if provider == "" {
+		provider = "deterministic"
+	}
+	report := doctorAIReport{Provider: provider, APIKeySet: strings.TrimSpace(cfg.APIKey) != ""}
+	if provider == "openai-compat" && !report.APIKeySet {
+		report.Notes = append(report.Notes, "effective provider requires a credential; checkpoint protection remains active")
+	}
+	if strings.HasPrefix(provider, "subprocess:") {
+		name := strings.TrimSpace(strings.TrimPrefix(provider, "subprocess:"))
+		report.ProviderCommand = "acd-provider-" + name
+		if path, lookupErr := exec.LookPath(report.ProviderCommand); lookupErr == nil {
+			report.ProviderCommandFound = true
+			report.ProviderCommandPath = path
+		} else {
+			report.Notes = append(report.Notes, report.ProviderCommand+" not found on PATH")
+		}
+	}
+	return report
 }
 
 func collectDoctorHarnesses() []doctorHarnessReport {
@@ -1760,14 +1813,30 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		}
 	}
 
-	// registry.json — sanitize home dir prefix.
+	// registry.json mirrors the report scope so a repo-targeted bundle cannot
+	// disclose unrelated registered repository paths.
 	roots, err := paths.Resolve()
 	if err != nil {
 		return bundleResult{}, err
 	}
-	regBody, err := os.ReadFile(roots.RegistryPath())
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return bundleResult{}, fmt.Errorf("read registry: %w", err)
+	registry, err := central.Load(roots)
+	if err != nil {
+		return bundleResult{}, fmt.Errorf("load registry: %w", err)
+	}
+	included := make(map[string]struct{}, len(rep.Repos))
+	for _, repo := range rep.Repos {
+		included[filepath.Clean(repo.Path)] = struct{}{}
+	}
+	filtered := make([]central.RepoRecord, 0, len(registry.Repos))
+	for _, repo := range registry.Repos {
+		if _, ok := included[filepath.Clean(repo.Path)]; ok {
+			filtered = append(filtered, repo)
+		}
+	}
+	registry.Repos = filtered
+	regBody, err := json.MarshalIndent(registry, "", "  ")
+	if err != nil {
+		return bundleResult{}, fmt.Errorf("marshal registry: %w", err)
 	}
 	regBody = sanitizeBytes(regBody)
 	if err := add("registry.json", regBody); err != nil {

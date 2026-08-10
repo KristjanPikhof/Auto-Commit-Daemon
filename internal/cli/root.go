@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -22,7 +23,8 @@ var ErrNoCommand = errors.New("no command provided")
 func Execute() error {
 	root := newRootCmd()
 	var stdout *countingWriter
-	if commandLineRequestsJSON(os.Args[1:]) {
+	requestedJSON := commandLineRequestsJSON(os.Args[1:])
+	if requestedJSON {
 		stdout = &countingWriter{Writer: os.Stdout}
 		root.SetOut(stdout)
 	} else {
@@ -34,8 +36,7 @@ func Execute() error {
 		return nil
 	}
 	err = classifyCobraError(err)
-	jsonOut, _ := root.Flags().GetBool("json")
-	if !jsonOut || (stdout != nil && stdout.BytesWritten() != 0) {
+	if !requestedJSON || (stdout != nil && stdout.BytesWritten() != 0) {
 		return err
 	}
 	var commandErr *CommandError
@@ -57,8 +58,18 @@ func Execute() error {
 
 func commandLineRequestsJSON(args []string) bool {
 	for _, arg := range args {
-		if arg == "--json" || arg == "--json=true" {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--json" {
 			return true
+		}
+		value, found := strings.CutPrefix(arg, "--json=")
+		if found {
+			enabled, err := strconv.ParseBool(value)
+			if err == nil && enabled {
+				return true
+			}
 		}
 	}
 	return false
@@ -93,6 +104,59 @@ type invocation struct {
 	LogLevel slog.Level
 }
 
+type commandCapabilities struct {
+	Repository      bool
+	JSON            bool
+	Quiet           bool
+	Interactive     bool
+	Streaming       bool
+	JSONInteractive bool
+	JSONStreaming   bool
+}
+
+const capabilityAnnotationPrefix = "acd.capability."
+
+func withInvocationCapabilities(command *cobra.Command, capabilities commandCapabilities) *cobra.Command {
+	if command.Annotations == nil {
+		command.Annotations = map[string]string{}
+	}
+	values := map[string]bool{
+		"repository": capabilities.Repository, "json": capabilities.JSON,
+		"quiet": capabilities.Quiet, "interactive": capabilities.Interactive,
+		"streaming": capabilities.Streaming, "json_interactive": capabilities.JSONInteractive,
+		"json_streaming": capabilities.JSONStreaming,
+	}
+	for name, enabled := range values {
+		command.Annotations[capabilityAnnotationPrefix+name] = strconv.FormatBool(enabled)
+	}
+	return command
+}
+
+func invocationCapabilities(command *cobra.Command) commandCapabilities {
+	var annotations map[string]string
+	for current := command; current != nil; current = current.Parent() {
+		if current == command.Root() && current != command {
+			break
+		}
+		if _, declared := current.Annotations[capabilityAnnotationPrefix+"json"]; declared {
+			annotations = current.Annotations
+			break
+		}
+	}
+	if annotations == nil {
+		return commandCapabilities{}
+	}
+	enabled := func(name string) bool {
+		value, _ := strconv.ParseBool(annotations[capabilityAnnotationPrefix+name])
+		return value
+	}
+	return commandCapabilities{
+		Repository: enabled("repository"), JSON: enabled("json"), Quiet: enabled("quiet"),
+		Interactive: enabled("interactive"), Streaming: enabled("streaming"),
+		JSONInteractive: enabled("json_interactive"), JSONStreaming: enabled("json_streaming"),
+	}
+}
+
 func invocationFromContext(ctx context.Context) invocation {
 	value, _ := ctx.Value(invocationContextKey{}).(invocation)
 	return value
@@ -121,9 +185,6 @@ func newRootCmd() *cobra.Command {
 			if err != nil {
 				return invalidCommandError("acd: %v", err)
 			}
-			if jsonOut && commandRejectsJSON(c) {
-				return invalidCommandError("%s: --json is not supported for interactive commands", c.CommandPath())
-			}
 			if err := validateInvocationCapabilities(c); err != nil {
 				return err
 			}
@@ -135,6 +196,7 @@ func newRootCmd() *cobra.Command {
 			return nil
 		},
 	}
+	withInvocationCapabilities(cmd, commandCapabilities{Repository: true, JSON: true, Quiet: true})
 	cmd.CompletionOptions.HiddenDefaultCmd = true
 	cmd.SetHelpTemplate(rootHelpTemplate)
 	cmd.SetVersionTemplate("acd version {{.Version}}\n")
@@ -148,16 +210,16 @@ func newRootCmd() *cobra.Command {
 	repo := newProductRepoNamespaceCmd()
 	repo.Hidden = true
 	cmd.AddCommand(
-		newSetupCmd(),
-		newProductStatusCmd(),
-		newOnCmd(),
-		newOffCmd(),
-		newProductListCmd(),
-		newProductCommitAllCmd(),
-		newHistoryCmd(),
-		newRestoreCmd(),
-		newProductDoctorCmd(),
-		newUninstallCmd(),
+		withInvocationCapabilities(newSetupCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}),
+		withInvocationCapabilities(newProductStatusCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newOnCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newOffCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newProductListCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true, Streaming: true}),
+		withInvocationCapabilities(newProductCommitAllCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newHistoryCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newRestoreCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newProductDoctorCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newUninstallCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true}),
 		newConfigNamespaceCmd(),
 		newSupportNamespaceCmd(),
 		repo,
@@ -165,32 +227,35 @@ func newRootCmd() *cobra.Command {
 	)
 
 	cmd.AddCommand(
-		hideCompatibility(newSetupInitCompatCmd(), "acd setup", false),
-		hideCompatibility(newConfigureCmd(), "acd config edit", false),
-		hideCompatibility(newSettingsCmd(), "acd config edit", false),
-		hideCompatibility(newAuthCmd(), "acd config credentials", false),
-		hideCompatibility(newVersionCmd(), "acd --version", false),
-		hideCompatibility(newCompatStartCmd(), "the managed ACD supervisor", true),
-		hideCompatibility(newCompatStopCmd(), "the managed ACD supervisor", true),
-		hideCompatibility(newCompatHintCmd("wake", "wake"), "the managed ACD supervisor", true),
-		hideCompatibility(newCompatHintCmd("touch", "soft_boundary"), "the managed ACD supervisor", true),
-		hideCompatibility(newCompatHintCmd("flush", "logical_boundary"), "the managed ACD supervisor", true),
-		hideCompatibility(newEventsCmd(), "acd history --activity", false),
-		hideCompatibility(newPromptCmd(), "acd support diagnose", false),
-		hideCompatibility(newExplainCmd(), "acd history explain", false),
-		hideCompatibility(newFixCmd(), "acd support repair", false),
-		hideCompatibility(newLogsCmd(), "acd support logs", false),
-		hideCompatibility(newStatsCmd(), "acd repo list", false),
-		hideCompatibility(newDiagnoseCmd(), "acd support diagnose", false),
-		hideCompatibility(newRecoverCmd(), "acd support repair", false),
-		hideCompatibility(newPauseCmd(), "acd off", false),
-		hideCompatibility(newResumeCmd(), "acd on", false),
-		hideCompatibility(newPurgeEventsCmd(), "acd repo gc", false),
+		hideCompatibility(withInvocationCapabilities(newSetupInitCompatCmd(),
+			commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd setup", false),
+		hideCompatibility(withInvocationCapabilities(newConfigureCmd(),
+			commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}), "acd config edit", false),
+		hideCompatibility(withInvocationCapabilities(newSettingsCmd(),
+			commandCapabilities{Repository: true, Quiet: true, Interactive: true}), "acd config edit", false),
+		hideCompatibility(renameCompatibility(newConfigCredentialsCmd(), "auth"), "acd config credentials", false),
+		hideCompatibility(withInvocationCapabilities(newVersionCmd(), commandCapabilities{Quiet: true}), "acd --version", false),
+		hideCompatibility(withInvocationCapabilities(newCompatStartCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
+		hideCompatibility(withInvocationCapabilities(newCompatStopCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
+		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("wake", "wake"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
+		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("touch", "soft_boundary"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
+		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("flush", "logical_boundary"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
+		hideCompatibility(newEventsCompatibilityDelegate(), "acd history activity", false),
+		hideCompatibility(renameCompatibility(newSupportPromptCmd(), "prompt"), "acd support prompt", false),
+		hideCompatibility(renameCompatibility(newHistoryExplainCmd(), "explain"), "acd history explain", false),
+		hideCompatibility(renameCompatibility(newSupportRecoverCmd(), "fix"), "acd support recover", false),
+		hideCompatibility(newLogsCompatibilityDelegate(), "acd support logs", false),
+		hideCompatibility(renameCompatibility(newRepoStatsCmd(), "stats"), "acd repo stats", false),
+		hideCompatibility(renameCompatibility(newSupportDiagnoseCmd(), "diagnose"), "acd support diagnose", false),
+		hideCompatibility(newRecoverCompatibilityDelegate(), "acd support recover", false),
+		hideCompatibility(withInvocationCapabilities(newPauseCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd off", false),
+		hideCompatibility(withInvocationCapabilities(newResumeCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd on", false),
+		hideCompatibility(withInvocationCapabilities(newPurgeEventsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd support recover", false),
 		hideCompatibility(newHookStdinExtractCmd(), "acd internal integration stdin-extract", true),
 		hideCompatibility(newHookCursorExtractCmd(), "acd internal integration cursor-extract", true),
-		hideCompatibility(newGCCmd(), "acd repo gc", false),
-		hideCompatibility(newRewriteCommitsCmd(), "acd history rewrite", false),
-		hideCompatibility(newCompatDaemonCmd(), "acd internal worker run", true),
+		hideCompatibility(withInvocationCapabilities(newGCCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true}), "acd repo gc", false),
+		hideCompatibility(withInvocationCapabilities(newRewriteCommitsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}), "acd history rewrite", false),
+		hideCompatibility(withInvocationCapabilities(newCompatDaemonCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd internal worker run", true),
 	)
 
 	return cmd
@@ -211,20 +276,61 @@ func parseLogLevel(value string) (slog.Level, error) {
 	}
 }
 
-func commandRejectsJSON(command *cobra.Command) bool {
-	path := command.CommandPath()
-	return path == "acd settings" || path == "acd config edit" || path == "acd config advanced"
-}
-
 func validateInvocationCapabilities(command *cobra.Command) error {
+	capabilities := invocationCapabilities(command)
 	path := command.CommandPath()
-	if flagWasSet(command, "repo") {
-		switch path {
-		case "acd uninstall", "acd list", "acd repo list", "acd repo gc", "acd config credentials":
-			return invalidCommandError("%s: --repo is not supported by this global operation", path)
-		}
+	jsonOut := boolFlagEnabled(command, "json")
+	interactive := boolFlagEnabled(command, "interactive")
+	streamingFlag := enabledFlag(command, "watch", "follow")
+	streaming := streamingFlag != ""
+	if flagWasSet(command, "repo") && !capabilities.Repository {
+		return invalidCommandError("%s: --repo is not supported by this global operation", path)
+	}
+	if jsonOut && !capabilities.JSON {
+		return invalidCommandError("%s: --json is not supported for this command", path)
+	}
+	if flagWasSet(command, "quiet") && !capabilities.Quiet {
+		return invalidCommandError("%s: --quiet is not supported for this command", path)
+	}
+	if interactive && !capabilities.Interactive {
+		return invalidCommandError("%s: --interactive is not supported for this command", path)
+	}
+	if streaming && !capabilities.Streaming {
+		return invalidCommandError("%s: streaming output is not supported for this command", path)
+	}
+	if jsonOut && interactive && !capabilities.JSONInteractive {
+		return invalidCommandError("%s: --json cannot be combined with interactive output", path)
+	}
+	if jsonOut && streaming && !capabilities.JSONStreaming {
+		return invalidCommandError("%s: --%s does not support --json", path, streamingFlag)
 	}
 	return nil
+}
+
+func enabledFlag(command *cobra.Command, names ...string) string {
+	for _, name := range names {
+		if boolFlagEnabled(command, name) {
+			return name
+		}
+	}
+	return ""
+}
+
+func boolFlagEnabled(command *cobra.Command, name string) bool {
+	flag := command.Flags().Lookup(name)
+	if flag == nil {
+		flag = command.InheritedFlags().Lookup(name)
+	}
+	if flag == nil {
+		return false
+	}
+	value, err := strconv.ParseBool(flag.Value.String())
+	return err == nil && value
+}
+
+func renameCompatibility(command *cobra.Command, use string) *cobra.Command {
+	command.Use = use
+	return command
 }
 
 func flagWasSet(command *cobra.Command, name string) bool {
@@ -245,6 +351,7 @@ func classifyCobraError(err error) error {
 	message := err.Error()
 	invalidFragments := []string{
 		"unknown command", "unknown flag", "required flag", "accepts ",
+		"unknown shorthand flag", "flag needs an argument", "requires an argument",
 		"requires at least", "requires exactly", "invalid argument",
 	}
 	for _, fragment := range invalidFragments {

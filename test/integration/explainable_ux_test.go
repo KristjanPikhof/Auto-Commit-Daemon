@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -169,9 +168,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'obsolete-blocker.txt', '%s', '100644'
 			PendingCount int    `json:"pending_count"`
 		} `json:"actions"`
 	}
-	if err := json.Unmarshal([]byte(fixDryRun.Stdout), &plan); err != nil {
-		t.Fatalf("decode fix dry-run: %v\n%s", err, fixDryRun.Stdout)
-	}
+	decodeProductEnvelopeData(t, fixDryRun.Stdout, &plan)
 	if !plan.DryRun || len(plan.Actions) != 1 ||
 		plan.Actions[0].Kind != "reconcile_unpublished_chain" ||
 		plan.Actions[0].Seq != manualSeqNumber ||
@@ -436,11 +433,17 @@ func TestExplainableUX_EventsWatchStreamsAppendedDecisions(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	cursor := sqliteScalar(t, dbPath, "SELECT COALESCE(MAX(id), 0) FROM decision_records")
+	rejected := runAcd(t, ctx, env,
+		"events", "--repo", repo, "--watch", "--since", cursor, "--json")
+	if rejected.ExitCode != 2 || !strings.Contains(rejected.Stdout, "--watch does not support --json") {
+		t.Fatalf("events --watch --json exit=%d, want invalid input\nstdout=%s\nstderr=%s",
+			rejected.ExitCode, rejected.Stdout, rejected.Stderr)
+	}
 
 	watchCtx, stopWatch := context.WithCancel(ctx)
 	defer stopWatch()
 	cmd := exec.CommandContext(watchCtx, buildAcdBinary(t),
-		"events", "--repo", repo, "--watch", "--interval", "50ms", "--since", cursor, "--json")
+		"events", "--repo", repo, "--watch", "--interval", "50ms", "--since", cursor)
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -472,7 +475,7 @@ VALUES (%f, 'blocked', 'watch.txt', 'before-state mismatch', 'blocked_conflict',
 	for {
 		select {
 		case line := <-lines:
-			if strings.Contains(line, `"kind":"blocked"`) && strings.Contains(line, `"path":"watch.txt"`) {
+			if strings.Contains(line, "blocked") && strings.Contains(line, "watch.txt") {
 				stopWatch()
 				_ = cmd.Wait()
 				<-scanDone

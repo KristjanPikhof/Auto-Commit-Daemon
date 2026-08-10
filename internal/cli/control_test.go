@@ -176,6 +176,40 @@ func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusManualPauseOutranksIncompleteCheckpoint(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		Paused:                        true,
+		Pause:                         &pauseInfo{Source: "manual", Reason: "repo surgery"},
+		CheckpointProtectionAvailable: true,
+		ObservationEpoch:              7,
+		CoveredEpoch:                  6,
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+
+	applyControlStatus(&result, status)
+
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		!strings.Contains(result.Summary, "paused") ||
+		!strings.Contains(result.NextAction, "acd status") {
+		t.Fatalf("paused incomplete-checkpoint result=%+v", result)
+	}
+}
+
+func TestEnvelopeFromControlPreservesWorker(t *testing.T) {
+	want := controlResult{Daemon: "running", Health: controlHealthHealthy}
+
+	envelope := envelopeFromControl(want)
+	data, ok := envelope.Data.(productStatusData)
+	if !ok {
+		t.Fatalf("status data type=%T, want productStatusData", envelope.Data)
+	}
+	if data.Worker != want.Daemon {
+		t.Fatalf("worker=%q, want %q", data.Worker, want.Daemon)
+	}
+}
+
 func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -290,7 +324,7 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 				t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 			}
 			got := decodeControlResult(t, out.Bytes())
-			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "terminal replay") {
+			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "blocked publication") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
 			}
 		})
@@ -423,14 +457,14 @@ func TestApplyControlStatusRewindGraceDoesNotHideRecoveryBlockers(t *testing.T) 
 			mutate: func(status *statusReport) {
 				status.BackpressurePaused = true
 			},
-			want: "backpressure",
+			want: "durable storage",
 		},
 		{
 			name: "terminal barrier",
 			mutate: func(status *statusReport) {
 				status.ActiveBarriers = 1
 			},
-			want: "terminal replay",
+			want: "blocked publication",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -481,8 +515,8 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 		want   string
 	}{
 		{name: "pause", mutate: func(s *statusReport) { s.Paused = true }, want: "paused"},
-		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "backpressure"},
-		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "terminal replay"},
+		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "durable storage"},
+		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "blocked publication"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := statusReport{
@@ -677,7 +711,6 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 		Command: envelope.Data.Command, Repo: envelope.Data.Repo,
 		Health: health, Summary: envelope.Data.Summary, NextAction: next,
 		Registered: envelope.Data.Registered, Enabled: envelope.Data.Enabled,
-		Daemon: envelope.Data.Worker, DaemonPID: envelope.Data.WorkerPID,
 		PendingEvents: envelope.Data.PendingEvents, BlockedEvents: envelope.Data.BlockedEvents,
 		Changed: envelope.Changed, Actions: actions,
 		StatePreserved: envelope.Data.StatePreserved,

@@ -3,18 +3,25 @@ package cli
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	restorepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/restore"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
@@ -35,30 +42,25 @@ func newRestoreCmd() *cobra.Command {
 }
 
 func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, jsonOut bool) error {
-	record, roots, _, err := lookupRegisteredRepo("restore", repo)
+	record, roots, repoRoot, err := lookupRegisteredRepo("restore", repo)
 	if err != nil {
 		return err
 	}
 	if record.RepositoryID == "" || record.WorktreeID == "" {
 		return fmt.Errorf("acd restore: repository requires `acd setup` checkpoint cutover")
 	}
-	params, _ := json.Marshal(map[string]string{"id": id})
-	request := supervisor.Request{
-		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("restore-%d", time.Now().UnixNano()),
-		Method: "restore_plan", RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID,
-		DeadlineMS: time.Now().Add(5 * time.Minute).UnixMilli(), Params: params,
-	}
-	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Minute}
-	response, err := client.Do(ctx, request)
+	worktree, err := gitpkg.ResolveWorktree(ctx, repoRoot)
 	if err != nil {
-		return fmt.Errorf("acd restore: %w", err)
+		return fmt.Errorf("acd restore: resolve worktree: %w", err)
 	}
-	if response.Error != nil {
-		return fmt.Errorf("acd restore: %s", response.Error.Message)
-	}
-	plan, err := decodeProductData[restorepkg.Plan](response.Data)
+	policy, err := restorePreviewPolicy(roots, record)
 	if err != nil {
-		return fmt.Errorf("acd restore: decode preview: %w", err)
+		return fmt.Errorf("acd restore: resolve protection policy: %w", err)
+	}
+	plan, err := restorepkg.PreviewWithPolicy(ctx, worktree.Root, worktree.GitDir,
+		record.StateDB, id, policy)
+	if err != nil {
+		return fmt.Errorf("acd restore: preview: %w", err)
 	}
 	if !apply {
 		return renderRestorePlan(out, plan, jsonOut)
@@ -66,11 +68,17 @@ func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, json
 	if !plan.CanApply || plan.Refusal != "" {
 		return fmt.Errorf("acd restore: %s", plan.Refusal)
 	}
-	params, _ = json.Marshal(map[string]string{"id": plan.CheckpointID, "plan_digest": plan.PlanDigest})
-	request.ID = fmt.Sprintf("restore-apply-%d", time.Now().UnixNano())
-	request.Method = "restore_apply"
-	request.Params = params
-	response, err = client.Do(ctx, request)
+	if err := ensureMutationSupervisor(ctx, roots); err != nil {
+		return unavailableError(fmt.Sprintf("acd restore: supervisor unavailable: %v", err))
+	}
+	params, _ := json.Marshal(map[string]string{"id": plan.CheckpointID, "plan_digest": plan.PlanDigest})
+	request := supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("restore-apply-%d", time.Now().UnixNano()),
+		Method: "restore_apply", RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID,
+		DeadlineMS: time.Now().Add(5 * time.Minute).UnixMilli(), Params: params,
+	}
+	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Minute}
+	response, err := client.Do(ctx, request)
 	if err != nil {
 		return fmt.Errorf("acd restore: %w", err)
 	}
@@ -89,6 +97,26 @@ func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, json
 	fmt.Fprintf(out, "Undo with: acd restore %s\n", result.UndoCheckpoint)
 	fmt.Fprintln(out, "Git HEAD and the index were not changed.")
 	return nil
+}
+
+func restorePreviewPolicy(roots paths.Roots, record central.RepoRecord) (restorepkg.ProtectionPolicy, error) {
+	document, err := config.NewStore(roots).Load()
+	if err != nil {
+		return restorepkg.ProtectionPolicy{}, err
+	}
+	values, err := config.ResolveRestartEnvironment(document, record.WorktreeID, os.LookupEnv)
+	if err != nil {
+		return restorepkg.ProtectionPolicy{}, err
+	}
+	maxFileBytes, err := strconv.ParseInt(strings.TrimSpace(values["ACD_MAX_FILE_BYTES"]), 10, 64)
+	if err != nil {
+		return restorepkg.ProtectionPolicy{}, fmt.Errorf("ACD_MAX_FILE_BYTES=%q: %w", values["ACD_MAX_FILE_BYTES"], err)
+	}
+	return restorepkg.ProtectionPolicy{
+		Sensitive:    state.NewSensitiveMatcherFromValue(values["ACD_SENSITIVE_GLOBS"]),
+		SafeIgnore:   state.NewSafeIgnoreMatcherFromValues(values["ACD_SAFE_IGNORE"], values["ACD_SAFE_IGNORE_EXTRA"]),
+		MaxFileBytes: maxFileBytes,
+	}, nil
 }
 
 func renderRestorePlan(out io.Writer, plan restorepkg.Plan, jsonOut bool) error {
@@ -160,25 +188,17 @@ func runProductRepair(ctx context.Context, out io.Writer, repo string, apply, js
 		}
 		return err
 	}
-	if err := ensureMutationSupervisor(ctx, roots); err != nil {
-		return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
-	}
-	params, _ := json.Marshal(map[string]any{"apply": false})
-	request := supervisor.Request{Version: supervisor.ProtocolVersion,
-		ID: fmt.Sprintf("repair-%d", time.Now().UnixNano()), Method: "repair",
-		RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID,
-		DeadlineMS: time.Now().Add(5 * time.Minute).UnixMilli(), Params: params}
-	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Minute}
-	response, err := client.Do(ctx, request)
+	readDB, err := state.OpenReadOnly(ctx, record.StateDB)
 	if err != nil {
-		return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
+		return fmt.Errorf("acd support repair: open state read-only: %w", err)
 	}
-	if response.Error != nil {
-		return actionRequiredError("repair_unavailable", response.Error.Message)
+	repositoryPlan, err := restorepkg.PreviewRepair(ctx, readDB)
+	closeErr := readDB.Close()
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("acd support repair: preview repository repair: %w", err)
 	}
-	repositoryPlan, err := decodeProductData[restorepkg.RepairPlan](response.Data)
-	if err != nil {
-		return fmt.Errorf("acd support repair: decode preview: %w", err)
+	if closeErr != nil {
+		return fmt.Errorf("acd support repair: close state preview: %w", closeErr)
 	}
 	repositoryRepairable := repositoryPlan.OperationID == "" || repositoryPlan.CanRepair
 	preview := struct {
@@ -250,10 +270,17 @@ func runProductRepair(ctx context.Context, out io.Writer, repo string, apply, js
 	}
 	var result restorepkg.Result
 	if repositoryPlan.OperationID != "" {
-		params, _ = json.Marshal(map[string]any{"apply": true, "operation_id": repositoryPlan.OperationID})
-		request.ID = fmt.Sprintf("repair-apply-%d", time.Now().UnixNano())
-		request.Params = params
-		response, err = client.Do(ctx, request)
+		if err := ensureMutationSupervisor(ctx, roots); err != nil {
+			return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
+		}
+		params, _ := json.Marshal(map[string]any{"apply": true, "operation_id": repositoryPlan.OperationID})
+		request := supervisor.Request{Version: supervisor.ProtocolVersion,
+			ID: fmt.Sprintf("repair-apply-%d", time.Now().UnixNano()), Method: "repair",
+			RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID,
+			DeadlineMS: time.Now().Add(5 * time.Minute).UnixMilli(), Params: params}
+		response, err := (supervisor.Client{
+			SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Minute,
+		}).Do(ctx, request)
 		if err != nil {
 			return unavailableError(fmt.Sprintf("acd support repair: supervisor unavailable: %v", err))
 		}

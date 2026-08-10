@@ -72,9 +72,12 @@ func newInternalCmd() *cobra.Command {
 	_ = workerSupervise.MarkFlagRequired("share-root")
 	_ = workerSupervise.MarkFlagRequired("config-root")
 	worker.AddCommand(workerRun, workerSupervise)
-	hint := newInternalHintCmd()
+	hint := withInvocationCapabilities(newInternalHintCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true})
 	session := &cobra.Command{Use: "session", Hidden: true}
-	session.AddCommand(newInternalSessionCmd("open"), newInternalSessionCmd("close"))
+	session.AddCommand(
+		withInvocationCapabilities(newInternalSessionCmd("open"), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+		withInvocationCapabilities(newInternalSessionCmd("close"), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
+	)
 	integration := &cobra.Command{Use: "integration", Hidden: true}
 	stdinExtract := newHookStdinExtractCmd()
 	stdinExtract.Use = "stdin-extract"
@@ -157,7 +160,7 @@ func newCompatStartCmd() *cobra.Command {
 	var watchPID int
 	cmd := &cobra.Command{Use: "start", Hidden: true, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		if strings.TrimSpace(sessionID) == "" {
-			return invalidCommandError("acd start: --session-id is required")
+			return invalidCommandError("acd start is an integration-session alias; use `acd on` to enable protection")
 		}
 		if harness == "" {
 			harness = "manual"
@@ -228,6 +231,10 @@ func newCompatStopCmd() *cobra.Command {
 	cmd.RunE = func(command *cobra.Command, args []string) error {
 		if all {
 			return errors.New("acd stop --all is no longer supported; use acd off per repository")
+		}
+		sessionID, _ := command.Flags().GetString("session-id")
+		if strings.TrimSpace(sessionID) == "" {
+			return invalidCommandError("acd stop only closes an integration session; use `acd off` to disable protection")
 		}
 		return run(command, args)
 	}

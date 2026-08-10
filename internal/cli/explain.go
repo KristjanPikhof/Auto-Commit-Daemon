@@ -49,15 +49,15 @@ func newExplainCmd() *cobra.Command {
 With no flags, explain summarizes recent repo decisions and likely next steps.
 Use --path for one file, --commit for an ACD or externally-handled commit, or
 --last to explain HEAD.`,
-		Example: `  acd explain
-  acd explain --path internal/state/schema.go
-  acd explain --commit HEAD
-  acd explain --last
-  acd explain --since 42 --json`,
+		Example: `  acd history explain
+  acd history explain --path internal/state/schema.go
+  acd history explain --commit HEAD
+  acd history explain --last
+  acd history explain --since 42 --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runExplain(cmd.Context(), cmd.OutOrStdout(), repo, path, commit, last, since, limit, jsonOut)
+			return runProductExplain(cmd.Context(), cmd.OutOrStdout(), repo, path, commit, last, since, limit, jsonOut)
 		},
 	}
 	cmd.Flags().StringVar(&path, "path", "", "Explain ACD decisions for this repo-relative path")

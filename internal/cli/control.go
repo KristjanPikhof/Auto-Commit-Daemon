@@ -156,7 +156,7 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	if err := waitControlWorkerReady(ctx, lookup, 10*time.Second); err != nil {
 		return err
 	}
-	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, 60*time.Second); err != nil {
+	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
 		return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd on: initial checkpoint barrier failed: %v; run `acd doctor`", err))
 	}
 	actions = append(actions, "checkpointed")
@@ -235,7 +235,7 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 		res.Command = "off"
 		return renderControl(out, res, jsonOut)
 	}
-	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, 60*time.Second); err != nil {
+	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
 		if !force {
 			return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd off: final checkpoint barrier failed: %v; rerun with --force only if you accept unconfirmed protection", err))
 		}
@@ -354,7 +354,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		base.OK = false
 		base.Health = controlHealthNeedsAttention
 		base.Summary = "ACD could not read the current repository health."
-		base.NextAction = "Run `acd diagnose` for details."
+		base.NextAction = "Run `acd doctor` for details."
 		return base, nil
 	}
 	applyControlStatus(&base, status)
@@ -409,6 +409,7 @@ func controlDaemonRunning(ctx context.Context, rec central.RepoRecord) bool {
 }
 
 func applyControlStatus(res *controlResult, status statusReport) {
+	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
 	res.Daemon = status.Daemon
 	res.DaemonPID = status.PID
 	res.PendingEvents = status.PendingEvents
@@ -426,7 +427,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "This repository still uses the v19 protection ledger."
 		res.NextAction = "Run `acd setup` to perform the checkpoint-first cutover."
-	case status.CheckpointProtectionAvailable && !status.Protected:
+	case status.CheckpointProtectionAvailable && !status.Protected && !manualPause:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
@@ -434,38 +435,38 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	case status.Stale:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "The ACD daemon heartbeat is stale."
+		res.Summary = "ACD background protection has stopped responding."
 		res.NextAction = "Run `acd on` to restart it."
 	case status.Daemon != "running" || status.PID <= 0 || !identity.Alive(status.PID):
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD is enabled, but its daemon process is not running."
+		res.Summary = "ACD is enabled, but background protection is not running."
 		res.NextAction = "Run `acd on` to start it."
-	case status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace"):
+	case manualPause:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD capture and replay are paused."
+		res.Summary = "ACD protection and publication are paused."
 		res.NextAction = "Run `acd status` to review the pause reason."
 	case status.BackpressurePaused:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD capture is paused by durable backpressure."
-		res.NextAction = "Run `acd diagnose` before clearing backpressure."
+		res.Summary = "ACD protection is paused because durable storage is full."
+		res.NextAction = "Run `acd doctor` before clearing backpressure."
 	case status.Configuration.Configuration == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "Configuration validation needs attention; capture remains active."
-		res.NextAction = "Run `acd configure` to retry validation or select another experience."
+		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Replay is repeatedly failing; capture remains active."
-		res.NextAction = "Run `acd diagnose` to inspect the blocked sequence and candidate context."
+		res.Summary = "Git publication is repeatedly failing; checkpoint protection remains active."
+		res.NextAction = "Run `acd doctor` to inspect the blocked publication."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "A terminal replay event needs recovery on the active branch."
-		res.NextAction = "Run `acd diagnose` to inspect the blocker."
+		res.Summary = "A blocked publication needs recovery on the active branch."
+		res.NextAction = "Run `acd doctor` to inspect the blocker."
 	case status.SelfPublication.GitAppliedCount > 0:
 		res.Health = controlHealthPublishing
 		res.Summary = "Current changes are checkpointed while ACD publishes Git commits."
@@ -488,22 +489,22 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthDegraded
 		res.Summary = "The intent planner is degraded; deterministic fallback is keeping replay moving."
 		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
-			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd diagnose` for details."
+			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
 		} else {
-			res.NextAction = "No immediate action needed; ACD will probe the provider automatically after cooldown. Run `acd diagnose` for details."
+			res.NextAction = "No immediate action needed; ACD will probe the provider automatically after cooldown. Run `acd doctor` for details."
 		}
 	case status.IntentStrategy.PlannerHealthWarning != "":
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running, but persisted intent planner health metadata could not be read safely."
-		res.NextAction = "Run `acd diagnose` for the safe metadata warning."
+		res.NextAction = "Run `acd doctor` for the safe metadata warning."
 	case status.Replay.State == "degraded":
 		res.Health = controlHealthDegraded
 		res.Summary = "Replay encountered an error and remains retryable."
-		res.NextAction = "Run `acd diagnose` if the error repeats."
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the error repeats."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."
-		res.NextAction = "Run `acd diagnose` if the degraded state persists."
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the degraded state persists."
 	case status.PendingEvents > 0 && status.IntentStrategy.Active && status.IntentStrategy.BatchWaitActive:
 		res.Health = controlHealthWaiting
 		res.Summary = fmt.Sprintf("Intent mode is waiting normally with %d pending event(s).", status.PendingEvents)

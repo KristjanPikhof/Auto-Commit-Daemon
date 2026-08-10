@@ -38,6 +38,7 @@ plus acd prompt.`,
   acd logs --repo /path/to/repo --lines 50 --follow`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
+			jsonOut, _ := cmd.Flags().GetBool("json")
 			lines, _ := cmd.Flags().GetInt("lines")
 			follow, _ := cmd.Flags().GetBool("follow")
 			ctx := cmd.Context()
@@ -46,7 +47,7 @@ plus acd prompt.`,
 				ctx, stop = signal.NotifyContext(ctx, os.Interrupt)
 			}
 			defer stop()
-			return runLogs(ctx, cmd.OutOrStdout(), repo, lines, follow)
+			return runProductLogs(ctx, cmd.OutOrStdout(), repo, lines, follow, jsonOut)
 		},
 	}
 	cmd.Flags().Int("lines", defaultLogLines, "Number of log lines to print before exiting or following")
