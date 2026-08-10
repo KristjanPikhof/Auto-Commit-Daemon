@@ -618,12 +618,9 @@ func assertActiveHookSelfHeals(t *testing.T, label string, ctx context.Context, 
 	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
 }
 
-// assertActiveHookSelfHealsAfterStopAll tears the daemon down via
-// `acd stop --all --force` (registry-wide teardown rather than per-session
-// deregistration), then re-fires the active hook and asserts the daemon
-// comes back up with the same client registered. Covers P2-7 — the
-// stop --all path was previously not exercised in the harness E2E flows.
-func assertActiveHookSelfHealsAfterStopAll(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
+// assertActiveHookSurvivesRejectedStopAll proves the removed registry-wide
+// stop alias cannot disrupt a running worker or its registered client.
+func assertActiveHookSurvivesRejectedStopAll(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
 	t.Helper()
 	selfHealStop := runBash(t, ctx, env, "",
 		"acd stop --all --force >/dev/null 2>&1")
@@ -758,9 +755,8 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
 
-	// Cover P2-7: tear the daemon down via `acd stop --all --force` (not
-	// per-session deregistration) and prove the active hook still self-heals.
-	assertActiveHookSelfHealsAfterStopAll(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
+	// The removed registry-wide stop alias must not disrupt active hooks.
+	assertActiveHookSurvivesRejectedStopAll(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
 
 	// Negative-path: corrupt state.db so `acd start` fails. The new
 	// templates chain semantics must surface the failure as a nonzero hook
@@ -882,8 +878,8 @@ func runCodexE2E(t *testing.T, bin string) {
 
 	assertActiveHookSelfHeals(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
 
-	// Cover P2-7: stop --all teardown then re-fire the active hook.
-	assertActiveHookSelfHealsAfterStopAll(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
+	// The removed registry-wide stop alias must not disrupt active hooks.
+	assertActiveHookSurvivesRejectedStopAll(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
 
 	// Negative-path: corrupt state.db so `acd start` fails. Active hook
 	// must exit nonzero AND log "active hook failed" to the codex hook log.
