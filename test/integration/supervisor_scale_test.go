@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +20,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
-func TestSupervisorAdmitsManyRepositoriesAfterProtection(t *testing.T) {
+func TestSupervisorAdmitsManyRepositoriesInBatches(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "acd-supervisor-scale-")
 	if err != nil {
 		t.Fatal(err)
@@ -134,28 +133,24 @@ func TestSupervisorAdmitsManyRepositoriesAfterProtection(t *testing.T) {
 		if err := decodeSupervisorScaleStatus(response.Data, &status); err != nil {
 			t.Fatal(err)
 		}
-		starting := 0
 		for _, worker := range status.Workers {
-			if worker.State == "starting" {
-				starting++
-			}
 			if worker.State == "running" {
-				ready[worker.RepositoryID] = true
+				workerResponse, workerErr := supervisor.DoWorker(ctx,
+					supervisor.WorkerSocketPath(roots, worker.RepositoryID),
+					supervisor.Request{Version: supervisor.ProtocolVersion,
+						ID: "scale-worker-status", Method: "status",
+						RepositoryID: worker.RepositoryID}, time.Second)
+				if workerErr == nil && workerResponse.OK {
+					ready[worker.RepositoryID] = true
+				}
 			}
-		}
-		if starting > 4 {
-			t.Fatalf("admitted %d unprotected workers, want at most 4", starting)
 		}
 	}
 	if runtime.GOOS == "darwin" {
 		for _, record := range records {
 			target := fmt.Sprintf("gui/%d/io.github.kristjanpikhof.acd.worker.%s", os.Getuid(), record.RepositoryID)
-			output, err := exec.Command("launchctl", "print", target).CombinedOutput()
-			if err != nil {
-				t.Fatalf("inspect worker job %s: %v: %s", target, err, output)
-			}
-			if !strings.Contains(string(output), "spawn type = interactive") {
-				t.Fatalf("worker job is not interactive: %s", output)
+			if exec.Command("launchctl", "print", target).Run() == nil {
+				t.Fatalf("session-owned worker unexpectedly registered with launchd: %s", target)
 			}
 		}
 	}

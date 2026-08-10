@@ -14,7 +14,16 @@ import (
 )
 
 func WorkerSocketPath(roots interface{ SupervisorSocketPath() string }, repositoryID string) string {
+	if !validRepositoryID(repositoryID) {
+		return ""
+	}
 	return filepath.Join(filepath.Dir(roots.SupervisorSocketPath()), "worker-"+repositoryID+".sock")
+}
+
+type WorkerReadiness struct {
+	RepositoryID string `json:"repository_id"`
+	PID          int    `json:"pid"`
+	Ready        bool   `json:"ready"`
 }
 
 type WorkerHandler interface {

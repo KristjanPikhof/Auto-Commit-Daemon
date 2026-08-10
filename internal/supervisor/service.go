@@ -15,6 +15,8 @@ type ServiceDefinition struct {
 	Platform string `json:"platform"`
 	Path     string `json:"path"`
 	Content  []byte `json:"-"`
+	Binary   string `json:"binary"`
+	LogPath  string `json:"log_path"`
 }
 
 func RenderService(home, binary, logPath string) (ServiceDefinition, error) {
@@ -23,17 +25,16 @@ func RenderService(home, binary, logPath string) (ServiceDefinition, error) {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		content := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>internal</string><string>supervisor</string><string>run</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>StandardOutPath</key><string>%s</string>
-<key>StandardErrorPath</key><string>%s</string>
-</dict></plist>
-`, ServiceLabel, xmlEscape(binary), xmlEscape(logPath), xmlEscape(logPath))
-		return ServiceDefinition{Platform: "launchd", Path: filepath.Join(home, "Library", "LaunchAgents", ServiceLabel+".plist"), Content: []byte(content)}, nil
+		// A launchd process does not inherit the caller's macOS privacy grants.
+		// Keep the legacy plist path so setup can back up and remove an older
+		// service transactionally, but run the new supervisor as a descendant of
+		// the authorized terminal or agent session instead.
+		return ServiceDefinition{
+			Platform: "session",
+			Path:     filepath.Join(home, "Library", "LaunchAgents", ServiceLabel+".plist"),
+			Binary:   binary,
+			LogPath:  logPath,
+		}, nil
 	case "linux":
 		if !systemdUserManagerAvailable() {
 			return ServiceDefinition{}, fmt.Errorf("supervisor: systemd user manager is unavailable")
@@ -52,14 +53,23 @@ StandardError=append:%s
 [Install]
 WantedBy=default.target
 `, systemdEscape(binary), systemdEscape(logPath), systemdEscape(logPath))
-		return ServiceDefinition{Platform: "systemd", Path: filepath.Join(home, ".config", "systemd", "user", "acd-supervisor.service"), Content: []byte(content)}, nil
+		return ServiceDefinition{Platform: "systemd", Path: filepath.Join(home, ".config", "systemd", "user", "acd-supervisor.service"), Content: []byte(content), Binary: binary, LogPath: logPath}, nil
 	default:
 		return ServiceDefinition{}, fmt.Errorf("supervisor: unsupported operating system %s", runtime.GOOS)
 	}
 }
 
 func ValidateService(definition ServiceDefinition, binary string) error {
-	if definition.Path == "" || len(definition.Content) == 0 {
+	if definition.Path == "" || definition.Binary != binary || definition.LogPath == "" {
+		return fmt.Errorf("supervisor: incomplete service definition")
+	}
+	if definition.Platform == "session" {
+		if len(definition.Content) != 0 {
+			return fmt.Errorf("supervisor: session service must not install a background service file")
+		}
+		return nil
+	}
+	if len(definition.Content) == 0 {
 		return fmt.Errorf("supervisor: incomplete service definition")
 	}
 	text := string(definition.Content)

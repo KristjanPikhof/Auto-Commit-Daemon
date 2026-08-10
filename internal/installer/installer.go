@@ -47,42 +47,41 @@ type Action struct {
 }
 
 type Plan struct {
-	OperationID        string                       `json:"operation_id"`
-	Digest             string                       `json:"digest"`
-	ExistingInstall    bool                         `json:"existing_install"`
-	RequiresExpected   bool                         `json:"requires_expected_plan"`
-	Repo               string                       `json:"repo"`
-	RepositoryID       string                       `json:"repository_id"`
-	WorktreeID         string                       `json:"worktree_id"`
-	ManagedBinary      string                       `json:"managed_binary"`
-	SourceExecutable   string                       `json:"source_executable"`
-	Service            supervisor.ServiceDefinition `json:"service"`
-	PriorService       ServiceState                 `json:"prior_service"`
-	Registry           *central.Registry            `json:"registry"`
-	Repositories       []migration.RepositoryPlan   `json:"repositories"`
-	RecoveryManifests  []string                     `json:"recovery_manifests,omitempty"`
-	Actions            []Action                     `json:"actions"`
-	FreshDefaults      bool                         `json:"fresh_defaults"`
-	Integrations       []string                     `json:"integrations"`
-	IntegrationPlans   []integrationpkg.Plan        `json:"integration_plans"`
-	BackupRoot         string                       `json:"backup_root"`
-	ServiceAccessCheck bool                         `json:"service_access_check"`
+	OperationID       string                       `json:"operation_id"`
+	Digest            string                       `json:"digest"`
+	ExistingInstall   bool                         `json:"existing_install"`
+	RequiresExpected  bool                         `json:"requires_expected_plan"`
+	Repo              string                       `json:"repo"`
+	RepositoryID      string                       `json:"repository_id"`
+	WorktreeID        string                       `json:"worktree_id"`
+	ManagedBinary     string                       `json:"managed_binary"`
+	SourceExecutable  string                       `json:"source_executable"`
+	Service           supervisor.ServiceDefinition `json:"service"`
+	PriorService      ServiceState                 `json:"prior_service"`
+	Registry          *central.Registry            `json:"registry"`
+	Repositories      []migration.RepositoryPlan   `json:"repositories"`
+	RecoveryManifests []string                     `json:"recovery_manifests,omitempty"`
+	Actions           []Action                     `json:"actions"`
+	FreshDefaults     bool                         `json:"fresh_defaults"`
+	Integrations      []string                     `json:"integrations"`
+	IntegrationPlans  []integrationpkg.Plan        `json:"integration_plans"`
+	BackupRoot        string                       `json:"backup_root"`
 }
 
 type ServiceState struct {
-	Installed bool `json:"installed"`
-	Loaded    bool `json:"loaded"`
-	Enabled   bool `json:"enabled"`
+	Installed     bool `json:"installed"`
+	Loaded        bool `json:"loaded"`
+	Enabled       bool `json:"enabled"`
+	LegacyLoaded  bool `json:"legacy_loaded,omitempty"`
+	SessionLoaded bool `json:"session_loaded,omitempty"`
 }
 
 type ApplyOptions struct {
-	Executor           Executor
-	Quiesce            func(context.Context) error
-	SelfTest           func(context.Context, Plan) error
-	Ready              func(context.Context, paths.Roots, *central.Registry) error
-	ServiceAccessCheck func(context.Context, paths.Roots, Plan, Executor) error
-	ServiceAccessRetry func(context.Context, *ServiceAccessError) error
-	Progress           func(Progress)
+	Executor Executor
+	Quiesce  func(context.Context) error
+	SelfTest func(context.Context, Plan) error
+	Ready    func(context.Context, paths.Roots, *central.Registry) error
+	Progress func(Progress)
 }
 
 type Progress struct {
@@ -108,6 +107,10 @@ func (OSExecutor) Run(ctx context.Context, name string, args ...string) error {
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func (OSExecutor) StartSession(ctx context.Context, roots paths.Roots, service supervisor.ServiceDefinition) error {
+	return supervisor.EnsureSession(ctx, roots, service.Binary, service.LogPath)
 }
 
 func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, error) {
@@ -144,7 +147,7 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 			return Plan{}, err
 		}
 	}
-	priorService := inspectServiceState(ctx, service)
+	priorService := inspectServiceState(ctx, roots, service)
 
 	registry, err := central.Load(roots)
 	if err != nil {
@@ -205,21 +208,14 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		Repositories: repoPlans, RecoveryManifests: recoveryManifests,
 		FreshDefaults: !existing, Integrations: integrations,
 		IntegrationPlans: integrationPlans, BackupRoot: backupRoot,
-		ServiceAccessCheck: runtime.GOOS == "darwin" && !options.SkipServiceCheck,
 	}
 	plan.Actions = []Action{
 		{Kind: "backup", Target: backupRoot, Detail: "Back up every existing file and repository database"},
 		{Kind: "install_binary", Target: plan.ManagedBinary, Detail: "Atomically copy this ACD executable"},
 	}
-	if plan.ServiceAccessCheck {
-		plan.Actions = append(plan.Actions, Action{
-			Kind: "verify_service_access", Target: plan.ManagedBinary,
-			Detail: "Verify the background service can read every enabled repository",
-		})
-	}
 	plan.Actions = append(plan.Actions,
 		Action{Kind: "migrate", Target: "registered repositories", Detail: "Apply the all-or-nothing v19 to v20 checkpoint cutover"},
-		Action{Kind: "install_service", Target: plan.Service.Path, Detail: "Install the user supervisor"},
+		Action{Kind: supervisorActionKind(plan.Service), Target: supervisorActionTarget(plan), Detail: supervisorActionDetail(plan.Service)},
 		Action{Kind: "write_registry", Target: roots.RegistryPath(), Detail: "Persist common-directory and worktree identities"},
 		Action{Kind: "enable_repository", Target: wt.Root, Detail: "Enable checkpoint protection for the current repository"},
 		Action{Kind: "self_test", Target: backupRoot, Detail: "Run isolated checkpoint, publish, and restore verification"},
@@ -298,28 +294,6 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := copyAtomic(plan.ManagedBinary, plan.SourceExecutable); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
-	if plan.ServiceAccessCheck {
-		emitProgress(options, "service_access", "Verifying macOS background access before migration")
-		accessCheck := options.ServiceAccessCheck
-		if accessCheck == nil {
-			accessCheck = verifyMacOSServiceAccess
-		}
-		for {
-			err := accessCheck(ctx, roots, plan, options.Executor)
-			if err == nil {
-				break
-			}
-			var accessErr *ServiceAccessError
-			if !errors.As(err, &accessErr) || options.ServiceAccessRetry == nil {
-				return Result{}, rollbackFiles(err)
-			}
-			emitProgress(options, "service_access_required", "Waiting for macOS Full Disk Access")
-			if retryErr := options.ServiceAccessRetry(ctx, accessErr); retryErr != nil {
-				return Result{}, rollbackFiles(errors.Join(err, retryErr))
-			}
-			emitProgress(options, "service_access", "Rechecking macOS background access")
-		}
-	}
 	holdBody, _ := json.Marshal(map[string]string{"operation_id": plan.OperationID, "plan_digest": plan.Digest})
 	if err := writeAtomic(roots.SetupPublicationHoldPath(), append(holdBody, '\n'), 0o600); err != nil {
 		return Result{}, rollbackFiles(err)
@@ -358,7 +332,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		if supervisorStarted {
 			stopErr = errors.Join(
 				shutdownSupervisor(context.Background(), roots),
-				unloadService(context.Background(), options.Executor, plan.Service),
+				unloadService(context.Background(), roots, options.Executor, plan.Service),
 			)
 		}
 		fileErr := restoreFiles(backups)
@@ -366,7 +340,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		if migrationApplied {
 			dbErr = migration.Rollback(plan.Repositories)
 		}
-		serviceErr := restoreServiceState(context.Background(), options.Executor, plan.Service, plan.PriorService)
+		serviceErr := restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService)
 		rollbackErr := errors.Join(stopErr, fileErr, dbErr, serviceErr, manifestErr)
 		if rollbackErr != nil {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
@@ -408,7 +382,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	emitProgress(options, "install", "Installing the managed binary, supervisor, registry, and integrations")
 	if plan.PriorService.Loaded {
-		if err := unloadService(ctx, options.Executor, plan.Service); err != nil {
+		if err := unloadService(ctx, roots, options.Executor, plan.Service); err != nil {
 			return Result{}, rollback(err)
 		}
 	}
@@ -423,7 +397,11 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			return Result{}, rollback(err)
 		}
 	}
-	if err := writeAtomic(plan.Service.Path, plan.Service.Content, 0o600); err != nil {
+	if plan.Service.Platform == "session" {
+		if err := os.Remove(plan.Service.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return Result{}, rollback(err)
+		}
+	} else if err := writeAtomic(plan.Service.Path, plan.Service.Content, 0o600); err != nil {
 		return Result{}, rollback(err)
 	}
 	for _, item := range plan.IntegrationPlans {
@@ -450,8 +428,8 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "integrations_merged", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	emitProgress(options, "service", "Starting the user supervisor")
-	if err := loadService(ctx, options.Executor, plan.Service); err != nil {
+	emitProgress(options, "service", supervisorStartProgress(plan.Service))
+	if err := loadService(ctx, roots, options.Executor, plan.Service); err != nil {
 		return Result{}, rollback(err)
 	}
 	supervisorStarted = true
@@ -676,7 +654,44 @@ func persistFreshDefaults(roots paths.Roots, repositoryID string) error {
 	})
 }
 
-func loadService(ctx context.Context, executor Executor, service supervisor.ServiceDefinition) error {
+func supervisorActionKind(service supervisor.ServiceDefinition) string {
+	if service.Platform == "session" {
+		return "start_session_supervisor"
+	}
+	return "install_service"
+}
+
+func supervisorActionTarget(plan Plan) string {
+	if plan.Service.Platform == "session" {
+		return plan.ManagedBinary
+	}
+	return plan.Service.Path
+}
+
+func supervisorActionDetail(service supervisor.ServiceDefinition) string {
+	if service.Platform == "session" {
+		return "Start the supervisor from this authorized macOS session without Full Disk Access"
+	}
+	return "Install the user supervisor"
+}
+
+func supervisorStartProgress(service supervisor.ServiceDefinition) string {
+	if service.Platform == "session" {
+		return "Starting the repository-scoped macOS session supervisor"
+	}
+	return "Starting the user supervisor"
+}
+
+func loadService(ctx context.Context, roots paths.Roots, executor Executor, service supervisor.ServiceDefinition) error {
+	if service.Platform == "session" {
+		starter, ok := executor.(interface {
+			StartSession(context.Context, paths.Roots, supervisor.ServiceDefinition) error
+		})
+		if !ok {
+			return errors.New("setup: executor cannot start a macOS session supervisor")
+		}
+		return starter.StartSession(ctx, roots, service)
+	}
 	if service.Platform == "launchd" {
 		return executor.Run(ctx, "launchctl", "bootstrap", fmt.Sprintf("gui/%d", os.Getuid()), service.Path)
 	}
@@ -685,11 +700,24 @@ func loadService(ctx context.Context, executor Executor, service supervisor.Serv
 	}
 	return executor.Run(ctx, "systemctl", "--user", "enable", "--now", "acd-supervisor.service")
 }
-func unloadService(ctx context.Context, executor Executor, service supervisor.ServiceDefinition) error {
+func unloadService(ctx context.Context, roots paths.Roots, executor Executor, service supervisor.ServiceDefinition) error {
+	if service.Platform == "session" {
+		shutdownErr := shutdownSupervisor(ctx, roots)
+		legacyErr := unloadLegacyLaunchd(ctx, executor)
+		return errors.Join(shutdownErr, legacyErr)
+	}
 	if service.Platform == "launchd" {
 		return executor.Run(ctx, "launchctl", "bootout", fmt.Sprintf("gui/%d", os.Getuid()), service.Path)
 	}
 	return executor.Run(ctx, "systemctl", "--user", "disable", "--now", "acd-supervisor.service")
+}
+
+func unloadLegacyLaunchd(ctx context.Context, executor Executor) error {
+	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), supervisor.ServiceLabel)
+	if exec.CommandContext(ctx, "launchctl", "print", target).Run() != nil {
+		return nil
+	}
+	return executor.Run(ctx, "launchctl", "bootout", target)
 }
 
 func shutdownSupervisor(ctx context.Context, roots paths.Roots) error {
@@ -715,8 +743,15 @@ func shutdownSupervisor(ctx context.Context, roots paths.Roots) error {
 	return nil
 }
 
-func inspectServiceState(ctx context.Context, service supervisor.ServiceDefinition) ServiceState {
+func inspectServiceState(ctx context.Context, roots paths.Roots, service supervisor.ServiceDefinition) ServiceState {
 	result := ServiceState{Installed: fileExists(service.Path)}
+	if service.Platform == "session" {
+		result.SessionLoaded = supervisorSessionRunning(ctx, roots)
+		result.LegacyLoaded = exec.CommandContext(ctx, "launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), supervisor.ServiceLabel)).Run() == nil
+		result.Loaded = result.SessionLoaded || result.LegacyLoaded
+		result.Enabled = result.SessionLoaded
+		return result
+	}
 	if service.Platform == "launchd" {
 		command := exec.CommandContext(ctx, "launchctl", "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), supervisor.ServiceLabel))
 		result.Loaded = command.Run() == nil
@@ -728,10 +763,20 @@ func inspectServiceState(ctx context.Context, service supervisor.ServiceDefiniti
 	return result
 }
 
-func restoreServiceState(ctx context.Context, executor Executor, service supervisor.ServiceDefinition, prior ServiceState) error {
+func restoreServiceState(ctx context.Context, roots paths.Roots, executor Executor, service supervisor.ServiceDefinition, prior ServiceState) error {
+	if service.Platform == "session" {
+		var combined error
+		if prior.LegacyLoaded {
+			combined = errors.Join(combined, executor.Run(ctx, "launchctl", "bootstrap", fmt.Sprintf("gui/%d", os.Getuid()), service.Path))
+		}
+		if prior.SessionLoaded {
+			combined = errors.Join(combined, loadService(ctx, roots, executor, service))
+		}
+		return combined
+	}
 	if service.Platform == "launchd" {
 		if prior.Loaded {
-			return loadService(ctx, executor, service)
+			return loadService(ctx, roots, executor, service)
 		}
 		return nil
 	}
@@ -747,6 +792,15 @@ func restoreServiceState(ctx context.Context, executor Executor, service supervi
 		return executor.Run(ctx, "systemctl", "--user", "start", "acd-supervisor.service")
 	}
 	return nil
+}
+
+func supervisorSessionRunning(ctx context.Context, roots paths.Roots) bool {
+	requestCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	response, err := (&supervisor.Client{
+		SocketPath: roots.SupervisorSocketPath(), Timeout: 300 * time.Millisecond,
+	}).Do(requestCtx, supervisor.Request{Version: supervisor.ProtocolVersion, ID: "setup-session-state", Method: "status"})
+	return err == nil && response.Error == nil
 }
 
 func waitSupervisor(ctx context.Context, roots paths.Roots, repositoryID string) error {
@@ -896,7 +950,7 @@ func waitSupervisorWorkersReady(
 		}
 		for _, worker := range status.Workers {
 			lastStatus[worker.RepositoryID] = worker
-			if !pending[worker.RepositoryID] || worker.State != "running" {
+			if !pending[worker.RepositoryID] || worker.State != "running" || worker.PID <= 0 {
 				continue
 			}
 			workerResponse, workerErr := supervisor.DoWorker(ctx,
@@ -910,6 +964,15 @@ func waitSupervisorWorkersReady(
 			}
 			if workerResponse.Version != supervisor.ProtocolVersion {
 				lastProbeError[worker.RepositoryID] = "worker protocol version mismatch"
+				continue
+			}
+			if workerResponse.Error != nil {
+				lastProbeError[worker.RepositoryID] = workerResponse.Error.Message
+				continue
+			}
+			readiness, decodeErr := decode[supervisor.WorkerReadiness](workerResponse.Data)
+			if decodeErr != nil || !readiness.Ready || readiness.PID != worker.PID || readiness.RepositoryID != worker.RepositoryID {
+				lastProbeError[worker.RepositoryID] = "worker readiness identity mismatch"
 				continue
 			}
 			delete(pending, worker.RepositoryID)

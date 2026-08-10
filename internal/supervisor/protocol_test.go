@@ -30,6 +30,18 @@ func TestRequestValidationCoversRequiredMethods(t *testing.T) {
 	}
 }
 
+func TestSupervisorWorkerSocketPathRequiresCanonicalRepositoryID(t *testing.T) {
+	roots := paths.Roots{State: t.TempDir()}
+	for _, repositoryID := range []string{"", "  ", "repo-one", "0123456789ABCDEf", "0123456789abcdef0"} {
+		if got := WorkerSocketPath(roots, repositoryID); got != "" {
+			t.Fatalf("repository %q socket=%q", repositoryID, got)
+		}
+	}
+	if got := WorkerSocketPath(roots, "0123456789abcdef"); got == "" {
+		t.Fatal("canonical repository id did not produce a socket path")
+	}
+}
+
 func TestClientUsesOneJSONLineAndValidatesIdentity(t *testing.T) {
 	dir, err := os.MkdirTemp("/tmp", "acd-supervisor-")
 	if err != nil {
@@ -139,72 +151,49 @@ func TestStartableWorkerIDsBoundsAndOrdersStartupBatch(t *testing.T) {
 	}
 }
 
-func TestDarwinServiceKeepsSupervisorAtStandardPriority(t *testing.T) {
+func TestStartingLaunchdWorkersBoundsConcurrentProtection(t *testing.T) {
+	home := t.TempDir()
+	roots := paths.Roots{State: filepath.Join(home, "state"), Share: filepath.Join(home, "share"), Config: filepath.Join(home, "config")}
+	workers := make(map[string]*workerProcess)
+	for index := 0; index < maxConcurrentWorkerStarts; index++ {
+		id := fmt.Sprintf("%016d", index)
+		workers[id] = &workerProcess{id: id, launchd: true}
+		if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: id, State: "starting"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
+		t.Fatalf("starting launchd workers=%d want %d", got, maxConcurrentWorkerStarts)
+	}
+	workers["9999999999999999"] = &workerProcess{id: "9999999999999999", launchd: true}
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: "9999999999999999", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
+		t.Fatalf("running worker consumed admission slot: got %d", got)
+	}
+}
+
+func TestDarwinUsesSessionOwnedSupervisorWithoutServiceFile(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("launchd-only contract")
+		t.Skip("macOS-only contract")
 	}
 	definition, err := RenderService("/Users/test", "/Users/test/acd", "/Users/test/acd.log")
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(definition.Content)
-	if strings.Contains(text, "<key>ProcessType</key>") {
-		t.Fatalf("supervisor should not request elevated launchd priority: %s", text)
+	if definition.Platform != "session" || len(definition.Content) != 0 {
+		t.Fatalf("service=%+v, want session mode without installable content", definition)
+	}
+	if definition.Binary != "/Users/test/acd" || definition.LogPath != "/Users/test/acd.log" {
+		t.Fatalf("session paths=%+v", definition)
+	}
+	if err := ValidateService(definition, "/Users/test/acd"); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestServiceAccessCheckUsesManagedBinaryAndInteractiveLaunchdJob(t *testing.T) {
-	definition, err := RenderServiceAccessCheck(
-		"/Users/test/.local/share/acd/bin/acd",
-		"/Users/test/.local/state/acd/supervisor.log",
-		"setup-123-abcdef",
-		"/Users/test/.local/state/acd/setup/result.json",
-		[]string{"/Users/test/Desktop/project", "/Users/test/source"},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(definition.Content)
-	for _, required := range []string{
-		"<string>io.github.kristjanpikhof.acd.access-check.setup-123-abcdef</string>",
-		"<key>ProcessType</key><string>Interactive</string>",
-		"<string>/Users/test/.local/share/acd/bin/acd</string>",
-		"<string>access-check</string>",
-		"<string>/Users/test/Desktop/project</string>",
-		"<string>/Users/test/source</string>",
-	} {
-		if !strings.Contains(text, required) {
-			t.Fatalf("access-check service missing %q: %s", required, text)
-		}
-	}
-	if strings.Contains(text, "<key>KeepAlive</key>") {
-		t.Fatalf("one-shot access check must not restart: %s", text)
-	}
-}
-
-func TestServiceAccessStatusIsPrivateAndAtomic(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "result.json")
-	want := ServiceAccessStatus{State: "checking", Target: "/repo"}
-	if err := WriteServiceAccessStatus(path, want); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("access-check status mode=%o", info.Mode().Perm())
-	}
-	got, err := ReadServiceAccessStatus(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != want.State || got.Target != want.Target || got.UpdatedTS == 0 {
-		t.Fatalf("status=%+v want state=%q target=%q", got, want.State, want.Target)
-	}
-}
-
-func TestDarwinStartsWorkerInIndependentLaunchdJob(t *testing.T) {
+func TestLegacyDarwinWorkerLaunchdWrapperRemainsCleanable(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd-only contract")
 	}
@@ -213,7 +202,7 @@ func TestDarwinStartsWorkerInIndependentLaunchdJob(t *testing.T) {
 	var name string
 	var args []string
 	server := &Server{
-		Roots: roots, BinaryPath: "/managed/acd",
+		Roots: roots, BinaryPath: "/managed/acd", LaunchdWorkers: true,
 		command: func(_ context.Context, command string, commandArgs ...string) ([]byte, error) {
 			name = command
 			args = append([]string(nil), commandArgs...)

@@ -3,12 +3,8 @@ package cli
 // Tests for §7.9 — acd setup <harness>.
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -1480,41 +1476,18 @@ func TestSetupProgressIsSilentForQuietOrJSON(t *testing.T) {
 	}
 }
 
-func TestSetupAccessDenialRequiresUserAction(t *testing.T) {
-	err := classifySetupApplyError(&installer.ServiceAccessError{
-		Target: "/Users/test/Desktop/project", ManagedBinary: "/Users/test/.local/share/acd/bin/acd",
-		Cause: errors.New("background read timed out"),
-	})
-	var commandErr *CommandError
-	if !errors.As(err, &commandErr) {
-		t.Fatalf("error=%v, want CommandError", err)
-	}
-	if commandErr.Exit != ExitActionRequired || commandErr.Code != "service_access_required" {
-		t.Fatalf("command error=%+v", commandErr)
-	}
-	for _, required := range []string{"Full Disk Access", "/Users/test/.local/share/acd/bin/acd", "rerun `acd setup`"} {
-		if !strings.Contains(commandErr.Message, required) {
-			t.Fatalf("message missing %q: %s", required, commandErr.Message)
-		}
-	}
-}
-
-func TestSetupServiceAccessPromptRetriesOrCancels(t *testing.T) {
-	accessErr := &installer.ServiceAccessError{
-		Target: "/Users/test/Desktop/project", ManagedBinary: "/Users/test/.local/share/acd/bin/acd",
-	}
+func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
+	cmd := newSetupCmd()
 	var out bytes.Buffer
-	if err := promptSetupServiceAccess(context.Background(), &out,
-		bufio.NewReader(strings.NewReader("\n")), accessErr); err != nil {
-		t.Fatalf("retry prompt: %v", err)
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
 	}
-	for _, required := range []string{"Full Disk Access", "Command-Shift-G", accessErr.ManagedBinary} {
-		if !strings.Contains(out.String(), required) {
-			t.Fatalf("prompt missing %q: %s", required, out.String())
+	got := out.String()
+	for _, required := range []string{"macOS", "does not require Full Disk", "deterministic provider"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}
-	}
-	if err := promptSetupServiceAccess(context.Background(), io.Discard,
-		bufio.NewReader(strings.NewReader("cancel\n")), accessErr); err == nil {
-		t.Fatal("cancel unexpectedly retried")
 	}
 }

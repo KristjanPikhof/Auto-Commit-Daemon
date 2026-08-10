@@ -19,36 +19,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
-func TestWorkerAccessCheckReportsCompletedRepositoryRead(t *testing.T) {
-	repo := materializeTestRepo(t, false)
-	result := filepath.Join(t.TempDir(), "access.json")
-	if err := runWorkerAccessCheck(context.Background(), []string{repo}, result); err != nil {
-		t.Fatal(err)
-	}
-	status, err := supervisor.ReadServiceAccessStatus(result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.State != "completed" || status.Target != "" {
-		t.Fatalf("status=%+v", status)
-	}
-}
-
-func TestWorkerAccessCheckIdentifiesUnreadableRepository(t *testing.T) {
-	target := t.TempDir()
-	result := filepath.Join(t.TempDir(), "access.json")
-	if err := runWorkerAccessCheck(context.Background(), []string{target}, result); err == nil {
-		t.Fatal("non-repository access check unexpectedly succeeded")
-	}
-	status, err := supervisor.ReadServiceAccessStatus(result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.State != "failed" || status.Target != target || status.Error == "" {
-		t.Fatalf("status=%+v", status)
-	}
-}
-
 func TestSupervisorWorkerEnvironmentRequiresEnabledRepository(t *testing.T) {
 	repo := materializeTestRepo(t, false)
 	wt, err := gitpkg.ResolveWorktree(context.Background(), repo)
@@ -496,6 +466,62 @@ INSERT INTO capture_events(
 		seqs = append(seqs, seq)
 	}
 	return seqs
+}
+
+func TestWorkerHintWakesOnlyAddressedWorktree(t *testing.T) {
+	ctx := context.Background()
+	open := func(name string) *state.DB {
+		db, err := state.Open(ctx, filepath.Join(t.TempDir(), name+".db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+	first, second := open("first"), open("second")
+	woken := make(chan string, 1)
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{
+			"worktree-a": {db: first},
+			"worktree-b": {db: second},
+		},
+		wake: func(worktreeID string) { woken <- worktreeID },
+	}
+	_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "hint", WorktreeID: "worktree-a",
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	if got := <-woken; got != "worktree-a" {
+		t.Fatalf("wake target=%q", got)
+	}
+	if complete, ok, err := state.MetaGet(ctx, first, daemon.MetaKeyProtectionComplete); err != nil || !ok || complete != "false" {
+		t.Fatalf("addressed protection complete=%q ok=%t err=%v", complete, ok, err)
+	}
+	if _, ok, err := state.MetaGet(ctx, second, daemon.MetaKeyProtectionComplete); err != nil || ok {
+		t.Fatalf("sibling observation changed: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestSupervisorWorkerStatusRequiresCanonicalRepositoryIdentity(t *testing.T) {
+	handler := repositoryWorkerHandler{repositoryID: "0123456789abcdef"}
+	result, protocolErr := handler.HandleWorkerRequest(context.Background(), supervisor.Request{
+		Method: "status", RepositoryID: "0123456789abcdef",
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	readiness, ok := result.(supervisor.WorkerReadiness)
+	if !ok || !readiness.Ready || readiness.PID != os.Getpid() || readiness.RepositoryID != "0123456789abcdef" {
+		t.Fatalf("readiness=%+v", result)
+	}
+	_, protocolErr = handler.HandleWorkerRequest(context.Background(), supervisor.Request{
+		Method: "status", RepositoryID: "fedcba9876543210",
+	})
+	if protocolErr == nil || protocolErr.Code != "worker_identity_mismatch" {
+		t.Fatalf("identity error=%+v", protocolErr)
+	}
 }
 
 func TestPublicationUnsafeReasonRejectsStagedIndex(t *testing.T) {

@@ -27,25 +27,26 @@ func TestWaitSupervisorWorkersReadyWaitsForEveryWorkerSocket(t *testing.T) {
 	t.Cleanup(cancel)
 
 	workers := []supervisor.WorkerStatus{
-		{RepositoryID: "repo-one", State: "running"},
-		{RepositoryID: "repo-two", State: "running"},
+		{RepositoryID: "1111111111111111", PID: os.Getpid(), State: "running"},
+		{RepositoryID: "2222222222222222", PID: os.Getpid(), State: "running"},
 	}
 	startReadinessServer(t, ctx, roots.SupervisorSocketPath(), func(request supervisor.Request) supervisor.Response {
 		return supervisor.Response{Version: supervisor.ProtocolVersion, ID: request.ID, OK: true,
 			Data: supervisor.Status{Version: "test", Workers: workers}}
 	})
-	startReadinessServer(t, ctx, supervisor.WorkerSocketPath(roots, "repo-one"), readyWorkerResponse)
+	startReadinessServer(t, ctx, supervisor.WorkerSocketPath(roots, "1111111111111111"), readyWorkerResponse)
 	var secondAttempts atomic.Int32
-	startReadinessServer(t, ctx, supervisor.WorkerSocketPath(roots, "repo-two"), func(request supervisor.Request) supervisor.Response {
+	startReadinessServer(t, ctx, supervisor.WorkerSocketPath(roots, "2222222222222222"), func(request supervisor.Request) supervisor.Response {
 		if secondAttempts.Add(1) == 1 {
-			return supervisor.Response{ID: request.ID, OK: true}
+			return supervisor.Response{Version: supervisor.ProtocolVersion, ID: request.ID, OK: true,
+				Data: supervisor.WorkerReadiness{RepositoryID: request.RepositoryID, PID: os.Getpid() + 1, Ready: true}}
 		}
 		return readyWorkerResponse(request)
 	})
 
 	var counts []int
 	err = waitSupervisorWorkersReady(ctx, roots,
-		map[string]bool{"repo-one": true, "repo-two": true}, 2*time.Second,
+		map[string]bool{"1111111111111111": true, "2222222222222222": true}, 2*time.Second,
 		func(ready, _ int) { counts = append(counts, ready) })
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +58,7 @@ func TestWaitSupervisorWorkersReadyWaitsForEveryWorkerSocket(t *testing.T) {
 
 func readyWorkerResponse(request supervisor.Request) supervisor.Response {
 	return supervisor.Response{Version: supervisor.ProtocolVersion, ID: request.ID, OK: true,
-		Data: map[string]bool{"ready": true}}
+		Data: supervisor.WorkerReadiness{RepositoryID: request.RepositoryID, PID: os.Getpid(), Ready: true}}
 }
 
 func startReadinessServer(

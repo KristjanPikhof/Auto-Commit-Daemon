@@ -260,6 +260,9 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 }
 
 func callSupervisor(ctx context.Context, lookup controlRepoLookup, method string, params json.RawMessage, timeout time.Duration) (supervisor.Response, error) {
+	if err := ensureMutationSupervisor(ctx, lookup.Roots); err != nil {
+		return supervisor.Response{}, unavailableError(err.Error())
+	}
 	request := supervisor.Request{Version: supervisor.ProtocolVersion,
 		ID: fmt.Sprintf("control-%s-%d", method, time.Now().UnixNano()), Method: method,
 		RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID,

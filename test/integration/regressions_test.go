@@ -891,6 +891,17 @@ func regTrackedChildDeleteUnderSafeIgnoredDir(t *testing.T) {
 
 	startSession(t, ctx, env, repo, "safe-delete-1", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	activeShadowCount := func() string {
+		return sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM shadow_paths
+WHERE path = 'node_modules/pkg/generated.txt'
+  AND branch_ref = 'refs/heads/main'
+  AND branch_generation = CAST((SELECT value FROM daemon_meta WHERE key = 'branch.generation') AS INTEGER)`)
+	}
+	waitFor(t, "tracked safe-ignore child shadow seeded", 5*time.Second, func() bool {
+		return activeShadowCount() != "0"
+	})
 
 	if err := os.Remove(tracked); err != nil {
 		t.Fatalf("remove tracked child: %v", err)
@@ -900,18 +911,14 @@ func regTrackedChildDeleteUnderSafeIgnoredDir(t *testing.T) {
 	}
 	wakeSession(t, ctx, env, repo, "safe-delete-1")
 
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitFor(t, "safe-ignore delete protected decision", 8*time.Second, func() bool {
-		return sqliteScalar(t, dbPath,
+	waitFor(t, "safe-ignore delete protected and active shadow removed", 8*time.Second, func() bool {
+		protected := sqliteScalar(t, dbPath,
 			"SELECT COUNT(*) FROM decision_records WHERE path = 'node_modules/pkg/generated.txt' AND kind = 'protected' AND action_taken = 'no_delete_generated'") != "0"
+		return protected && activeShadowCount() == "0"
 	})
 	if got := sqliteScalar(t, dbPath,
 		"SELECT COUNT(*) FROM capture_events WHERE path = 'node_modules/pkg/generated.txt'"); got != "0" {
 		t.Fatalf("safe-ignore deleted child should not be queued, capture_events=%s", got)
-	}
-	if got := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM shadow_paths WHERE path = 'node_modules/pkg/generated.txt'"); got != "0" {
-		t.Fatalf("safe-ignore deleted child shadow row should be reconciled away, shadow_paths=%s", got)
 	}
 	if out, err := runGit(repo, "cat-file", "-e", "HEAD:node_modules/pkg/generated.txt"); err != nil {
 		t.Fatalf("acd must not mutate Git for protected safe-ignore delete; HEAD missing tracked child\n%s", out)

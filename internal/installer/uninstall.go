@@ -68,14 +68,20 @@ func BuildUninstallPlan(ctx context.Context, roots paths.Roots, purge bool) (Uni
 		return UninstallPlan{}, err
 	}
 	plan := UninstallPlan{OperationID: opID, PurgeData: purge, Service: service,
-		PriorService: inspectServiceState(ctx, service), ManagedBinary: roots.ManagedBinaryPath(),
+		PriorService: inspectServiceState(ctx, roots, service), ManagedBinary: roots.ManagedBinaryPath(),
 		Registry: registry, Integrations: removals, BackupRoot: roots.SetupOperationDir(opID)}
 	for _, record := range registry.Repos {
 		if !record.LifecycleDisabled() {
 			plan.Actions = append(plan.Actions, Action{Kind: "checkpoint_barrier", Target: record.Path, Detail: "Protect current changes before disabling"})
 		}
 	}
-	plan.Actions = append(plan.Actions, Action{Kind: "unload_service", Target: service.Path, Detail: "Stop workers and unload the user supervisor"})
+	supervisorTarget := service.Path
+	supervisorDetail := "Stop workers and unload the user supervisor"
+	if service.Platform == "session" {
+		supervisorTarget = service.Binary
+		supervisorDetail = "Stop the repository-scoped macOS session supervisor"
+	}
+	plan.Actions = append(plan.Actions, Action{Kind: "stop_supervisor", Target: supervisorTarget, Detail: supervisorDetail})
 	for _, item := range removals {
 		plan.Actions = append(plan.Actions, Action{Kind: "remove_integration", Target: item.Target, Detail: "Remove only verified ACD-owned entries"})
 	}
@@ -127,18 +133,29 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	if err != nil {
 		return Result{}, err
 	}
+	sessionStarted := false
 	var purgeTxn *purgeTransaction
 	rollback := func(cause error) error {
 		var purgeErr error
 		if purgeTxn != nil {
 			purgeErr = purgeTxn.rollback(context.Background())
 		}
+		var sessionErr error
+		if sessionStarted && !plan.PriorService.SessionLoaded {
+			sessionErr = shutdownSupervisor(context.Background(), roots)
+		}
 		fileErr := restoreFiles(backups)
-		serviceErr := restoreServiceState(context.Background(), executor, plan.Service, plan.PriorService)
+		serviceErr := restoreServiceState(context.Background(), roots, executor, plan.Service, plan.PriorService)
 		_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "uninstall rolled back", true)
-		return errors.Join(cause, purgeErr, fileErr, serviceErr)
+		return errors.Join(cause, purgeErr, sessionErr, fileErr, serviceErr)
 	}
 	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 60 * time.Second}
+	if plan.Service.Platform == "session" {
+		if err := supervisor.EnsureSession(ctx, roots, plan.Service.Binary, plan.Service.LogPath); err != nil {
+			return Result{}, rollback(err)
+		}
+		sessionStarted = true
+	}
 	for _, record := range plan.Registry.Repos {
 		if record.LifecycleDisabled() {
 			continue
@@ -152,10 +169,11 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 			return Result{}, rollback(errors.New(response.Error.Message))
 		}
 	}
-	shutdown, _ := client.Do(ctx, supervisor.Request{Version: supervisor.ProtocolVersion, ID: "uninstall-shutdown", Method: "shutdown", DeadlineMS: time.Now().Add(10 * time.Second).UnixMilli()})
-	_ = shutdown
+	if err := stopSupervisorForUninstall(ctx, roots, client, 10*time.Second); err != nil {
+		return Result{}, rollback(err)
+	}
 	if plan.PriorService.Loaded {
-		if err := unloadService(ctx, executor, plan.Service); err != nil {
+		if err := unloadService(ctx, roots, executor, plan.Service); err != nil {
 			return Result{}, rollback(err)
 		}
 	}

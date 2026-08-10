@@ -15,8 +15,8 @@ import (
 
 const workerLabelPrefix = ServiceLabel + ".worker."
 
-// WorkerRuntimeStatus lets a launchd-managed worker report failures without
-// requiring the supervisor and worker to share a process hierarchy.
+// WorkerRuntimeStatus lets the legacy launchd worker wrapper report failures
+// without requiring the supervisor and worker to share a process hierarchy.
 type WorkerRuntimeStatus struct {
 	RepositoryID string `json:"repository_id"`
 	PID          int    `json:"pid,omitempty"`

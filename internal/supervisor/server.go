@@ -32,9 +32,14 @@ type WorkerStatus struct {
 }
 
 type Status struct {
-	PID     int            `json:"pid"`
-	Version string         `json:"version"`
-	Workers []WorkerStatus `json:"workers"`
+	PID       int            `json:"pid"`
+	Version   string         `json:"version"`
+	Ownership string         `json:"ownership"`
+	Workers   []WorkerStatus `json:"workers"`
+}
+
+type ShutdownStatus struct {
+	Stopped bool `json:"stopped"`
 }
 
 type Handler interface {
@@ -46,6 +51,10 @@ type Server struct {
 	BinaryPath string
 	Version    string
 	Handler    Handler
+	// LaunchdWorkers is retained only for cleaning up or testing the legacy
+	// macOS worker wrapper. Product supervisors run workers as direct children
+	// so they keep the invoking session's repository access.
+	LaunchdWorkers bool
 
 	mu      sync.Mutex
 	workers map[string]*workerProcess
@@ -72,7 +81,10 @@ var restartDelays = []time.Duration{time.Second, 2 * time.Second, 5 * time.Secon
 // Starting every registered repository at once creates a Git/process storm on
 // login and during setup cutover. Keep each reconcile batch small; the regular
 // two-second reconcile tick starts the remaining workers promptly.
-const maxWorkerStartsPerReconcile = 4
+const (
+	maxWorkerStartsPerReconcile = 4
+	maxConcurrentWorkerStarts   = 8
+)
 
 func (s *Server) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -138,7 +150,14 @@ func (s *Server) Run(ctx context.Context) error {
 		go s.serveConnection(ctx, conn)
 	}
 	s.shutdownWorkers()
-	return nil
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownErr := s.waitWorkersStopped(shutdownCtx)
+	shutdownCancel()
+	if shutdownErr == nil {
+		return nil
+	}
+	s.forceKillWorkers()
+	return s.waitWorkersStopped(context.Background())
 }
 
 func removeStaleSocket(path string) error {
@@ -202,10 +221,15 @@ func (s *Server) handle(ctx context.Context, request Request) (any, *ProtocolErr
 		cancel := s.cancel
 		s.mu.Unlock()
 		s.shutdownWorkers()
+		if err := s.waitWorkersStopped(ctx); err != nil {
+			return nil, &ProtocolError{
+				Code: "shutdown_incomplete", Message: err.Error(), Retryable: true,
+			}
+		}
 		if cancel != nil {
 			time.AfterFunc(10*time.Millisecond, cancel)
 		}
-		return map[string]any{"stopped": true}, nil
+		return ShutdownStatus{Stopped: true}, nil
 	}
 	if s.Handler == nil {
 		return nil, &ProtocolError{Code: "not_supported", Message: "request is not supported by this supervisor", Retryable: false}
@@ -216,7 +240,7 @@ func (s *Server) handle(ctx context.Context, request Request) (any, *ProtocolErr
 func (s *Server) status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	status := Status{PID: os.Getpid(), Version: s.Version, Workers: make([]WorkerStatus, 0, len(s.workers))}
+	status := Status{PID: os.Getpid(), Version: s.Version, Ownership: os.Getenv(supervisorOwnershipEnv), Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
 		if worker.launchd {
@@ -280,7 +304,7 @@ func (s *Server) reconcile(ctx context.Context) error {
 		worker := s.workers[id]
 		if worker == nil {
 			worker = &workerProcess{id: id, signature: signature, desired: signature}
-			if runtime.GOOS == "darwin" {
+			if s.LaunchdWorkers && runtime.GOOS == "darwin" {
 				worker.launchd = s.launchdWorkerExists(ctx, id)
 			}
 			s.workers[id] = worker
@@ -302,10 +326,28 @@ func (s *Server) reconcile(ctx context.Context) error {
 		}
 	}
 	startLimit := maxWorkerStartsPerReconcile
+	if s.LaunchdWorkers && runtime.GOOS == "darwin" {
+		startLimit = min(startLimit, max(0,
+			maxConcurrentWorkerStarts-startingLaunchdWorkers(s.Roots, s.workers)))
+	}
 	for _, id := range startableWorkerIDs(s.workers, now, startLimit) {
 		s.startWorkerLocked(ctx, s.workers[id])
 	}
 	return nil
+}
+
+func startingLaunchdWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
+	count := 0
+	for _, worker := range workers {
+		if worker == nil || !worker.launchd {
+			continue
+		}
+		status, err := ReadWorkerRuntimeStatus(roots, worker.id)
+		if err != nil || status.State == "starting" {
+			count++
+		}
+	}
+	return count
 }
 
 func startableWorkerIDs(workers map[string]*workerProcess, now time.Time, limit int) []string {
@@ -330,11 +372,12 @@ func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
 	if _, err := os.Stat(s.Roots.SetupPublicationHoldPath()); err == nil {
 		args = append(args, "--publication-hold", s.Roots.SetupPublicationHoldPath())
 	}
-	if runtime.GOOS == "darwin" {
+	if s.LaunchdWorkers && runtime.GOOS == "darwin" {
 		s.startLaunchdWorkerLocked(ctx, worker, args)
 		return
 	}
 	cmd := exec.CommandContext(ctx, s.BinaryPath, args...)
+	cmd.Env = ProcessEnvironment(s.Roots, os.Environ())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -478,5 +521,38 @@ func (s *Server) shutdownWorkers() {
 	s.closing = true
 	for _, worker := range s.workers {
 		s.stopWorkerLocked(worker)
+	}
+}
+
+func (s *Server) waitWorkersStopped(ctx context.Context) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		remaining := 0
+		for _, worker := range s.workers {
+			if worker != nil && (worker.launchd || worker.cmd != nil) {
+				remaining++
+			}
+		}
+		s.mu.Unlock()
+		if remaining == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("supervisor: %d worker(s) did not stop: %w", remaining, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) forceKillWorkers() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, worker := range s.workers {
+		if worker != nil && worker.cmd != nil && worker.cmd.Process != nil {
+			_ = worker.cmd.Process.Kill()
+		}
 	}
 }

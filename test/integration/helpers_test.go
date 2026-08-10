@@ -13,7 +13,9 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,28 +35,104 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
+const (
+	integrationSupervisorOwnership = "ACD_INTERNAL_SUPERVISOR_OWNERSHIP="
+	checkpointWatchdogMode         = "ACD_INTEGRATION_CHECKPOINT_WATCHDOG"
+	checkpointWatchdogParentPID    = "ACD_INTEGRATION_CHECKPOINT_PARENT_PID"
+	checkpointWatchdogParentStart  = "ACD_INTEGRATION_CHECKPOINT_PARENT_START"
+	checkpointWatchdogParentArgv   = "ACD_INTEGRATION_CHECKPOINT_PARENT_ARGV"
+	checkpointWatchdogRegistry     = "ACD_INTEGRATION_CHECKPOINT_REGISTRY"
+)
+
+type checkpointRuntimeLimiter chan struct{}
+
+type checkpointProcessIdentity struct {
+	PID        int    `json:"pid"`
+	StartTime  string `json:"start_time"`
+	ArgvHash   string `json:"argv_hash"`
+	Unregister bool   `json:"unregister,omitempty"`
+}
+
+func (process checkpointProcessIdentity) fingerprint() identity.Fingerprint {
+	return identity.Fingerprint{StartTime: process.StartTime, ArgvHash: process.ArgvHash}
+}
+
+func (limiter checkpointRuntimeLimiter) acquire() func() {
+	limiter <- struct{}{}
+	var once sync.Once
+	return func() { once.Do(func() { <-limiter }) }
+}
+
+var (
+	checkpointRuntimeStartSlots = make(checkpointRuntimeLimiter, 4)
+	checkpointWatchdogOnce      sync.Once
+	checkpointWatchdogCommand   *exec.Cmd
+	checkpointWatchdogIdentity  checkpointProcessIdentity
+	checkpointWatchdogDir       string
+	checkpointWatchdogFile      string
+	checkpointWatchdogErr       error
+	checkpointWatchdogMu        sync.Mutex
+)
+
 func ensureCheckpointRuntime(t *testing.T, env []string, repo, bin string) {
+	ensureCheckpointRuntimeWithMode(t, env, repo, bin, false)
+}
+
+func ensureProductionCheckpointRuntime(t *testing.T, env []string, repo, bin string) {
+	ensureCheckpointRuntimeWithMode(t, env, repo, bin, true)
+}
+
+func ensureCheckpointRuntimeWithMode(t *testing.T, env []string, repo, bin string, productionSession bool) {
 	t.Helper()
 	roots, repositoryID := prepareCheckpointRegistration(t, env, repo)
+	if err := os.MkdirAll(filepath.Dir(roots.ManagedBinaryPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(roots.ManagedBinaryPath()); errors.Is(err, os.ErrNotExist) {
+		if err := os.Link(bin, roots.ManagedBinaryPath()); err != nil {
+			t.Fatalf("install integration managed binary: %v", err)
+		}
+		if err := os.Chmod(roots.ManagedBinaryPath(), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
 	workerSocket := supervisor.WorkerSocketPath(roots, repositoryID)
 	if _, err := os.Stat(workerSocket); err == nil {
+		assertCheckpointRuntimeOwnership(t, roots)
 		return
 	}
 	if _, err := os.Stat(roots.SupervisorSocketPath()); err == nil {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			if _, err := os.Stat(workerSocket); err == nil {
+				assertCheckpointRuntimeOwnership(t, roots)
 				return
 			}
 			time.Sleep(25 * time.Millisecond)
 		}
 		t.Fatalf("integration supervisor did not reconcile worker %s", repositoryID)
 	}
+	releaseRuntimeSlot := checkpointRuntimeStartSlots.acquire()
+	// Registered before runtime cleanup so LIFO ordering shuts down the
+	// supervisor before another test may acquire this capacity.
+	t.Cleanup(releaseRuntimeSlot)
+	if productionSession && runtime.GOOS == "darwin" {
+		startCheckpointSessionRuntime(t, roots, workerSocket)
+		return
+	}
+	startCheckpointSupervisorRuntime(t, env, roots, repositoryID, workerSocket)
+}
+
+func startCheckpointSupervisorRuntime(t *testing.T, env []string, roots paths.Roots, repositoryID, workerSocket string) {
+	t.Helper()
 	if err := os.MkdirAll(roots.State, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -62,30 +141,190 @@ func ensureCheckpointRuntime(t *testing.T, env []string, repo, bin string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(bin, "internal", "supervisor", "run")
-	command.Env = env
+	command := exec.Command(roots.ManagedBinaryPath(), "internal", "supervisor", "run")
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	command.Env = supervisor.ProcessEnvironment(roots, env)
+	if runtime.GOOS == "darwin" {
+		ownership, ownershipErr := checkpointResponsibilitySessionOwnership(context.Background())
+		if ownershipErr != nil {
+			_ = logFile.Close()
+			t.Fatalf("resolve integration supervisor ownership: %v", ownershipErr)
+		}
+		command.Env = append(command.Env, integrationSupervisorOwnership+ownership)
+	}
 	command.Stdout = logFile
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
-		logFile.Close()
+		_ = logFile.Close()
 		t.Fatalf("start integration supervisor: %v", err)
 	}
-	t.Cleanup(func() {
-		if command.Process != nil {
-			_ = command.Process.Signal(os.Interrupt)
-			_ = command.Wait()
-		}
+	process, err := captureOwnedCheckpointProcess(command, captureCheckpointProcessIdentity)
+	if err != nil {
 		_ = logFile.Close()
+		t.Fatalf("capture integration supervisor identity: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	_ = logFile.Close()
+	watchdogRegistered := false
+	t.Cleanup(func() {
+		shutdownCheckpointRuntime(t, roots, workerSocket, process)
+		waitCheckpointSupervisorCommand(t, done)
+		if matches, matchErr := checkpointProcessMatches(process); watchdogRegistered &&
+			(matchErr == nil && !matches || matchErr != nil && !identity.Alive(process.PID)) {
+			unregisterCheckpointRuntimeWatchdog(process)
+		}
 	})
+	registerCheckpointRuntimeWatchdog(t, process)
+	watchdogRegistered = true
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(workerSocket); err == nil {
+			assertCheckpointRuntimeOwnership(t, roots)
 			return
+		}
+		select {
+		case err := <-done:
+			body, _ := os.ReadFile(logPath)
+			t.Fatalf("integration supervisor exited before worker %s was ready: %v\n%s", repositoryID, err, body)
+		default:
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	body, _ := os.ReadFile(logPath)
 	t.Fatalf("integration supervisor did not become ready: %s", body)
+}
+
+func startCheckpointSessionRuntime(t *testing.T, roots paths.Roots, workerSocket string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := supervisor.EnsureSession(ctx, roots, roots.ManagedBinaryPath(), roots.SupervisorLogPath()); err != nil {
+		t.Fatalf("start production session-owned integration supervisor: %v", err)
+	}
+	status, err := checkpointRuntimeStatus(ctx, roots)
+	if err != nil {
+		t.Fatalf("inspect production session-owned integration supervisor: %v", err)
+	}
+	process := checkpointProcessIdentity{PID: status.PID}
+	watchdogRegistered := false
+	t.Cleanup(func() {
+		shutdownCheckpointRuntime(t, roots, workerSocket, process)
+		if matches, matchErr := checkpointProcessMatches(process); watchdogRegistered &&
+			(matchErr == nil && !matches || matchErr != nil && !identity.Alive(process.PID)) {
+			unregisterCheckpointRuntimeWatchdog(process)
+		}
+	})
+	process, err = captureCheckpointProcessIdentity(status.PID)
+	if err != nil {
+		t.Fatalf("capture production session supervisor identity: %v", err)
+	}
+	registerCheckpointRuntimeWatchdog(t, process)
+	watchdogRegistered = true
+	waitFor(t, "session-owned integration worker ready", 10*time.Second, func() bool {
+		_, err := os.Stat(workerSocket)
+		return err == nil
+	})
+	assertCheckpointRuntimeOwnership(t, roots)
+}
+
+func assertCheckpointRuntimeOwnership(t *testing.T, roots paths.Roots) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	status, err := checkpointRuntimeStatus(ctx, roots)
+	if err != nil {
+		t.Fatalf("inspect integration supervisor ownership: %v", err)
+	}
+	if !strings.HasPrefix(status.Ownership, "session:") {
+		t.Fatalf("integration supervisor ownership=%q, want session ownership", status.Ownership)
+	}
+}
+
+func checkpointRuntimeStatus(ctx context.Context, roots paths.Roots) (supervisor.Status, error) {
+	response, err := (supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Second}).Do(ctx,
+		supervisor.Request{Version: supervisor.ProtocolVersion, ID: "integration-ownership", Method: "status"})
+	if err != nil {
+		return supervisor.Status{}, err
+	}
+	if response.Error != nil {
+		return supervisor.Status{}, errors.New(response.Error.Message)
+	}
+	raw, err := json.Marshal(response.Data)
+	if err != nil {
+		return supervisor.Status{}, err
+	}
+	var status supervisor.Status
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return supervisor.Status{}, err
+	}
+	return status, nil
+}
+
+func shutdownCheckpointRuntime(t *testing.T, roots paths.Roots, workerSocket string, process checkpointProcessIdentity) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	response, err := (supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: 15 * time.Second}).Do(ctx,
+		supervisor.Request{Version: supervisor.ProtocolVersion, ID: "integration-shutdown", Method: "shutdown"})
+	cancel()
+	shutdownErr := err
+	if shutdownErr == nil && response.Error != nil {
+		shutdownErr = errors.New(response.Error.Message)
+	}
+	if shutdownErr == nil {
+		raw, marshalErr := json.Marshal(response.Data)
+		var status supervisor.ShutdownStatus
+		if marshalErr != nil {
+			shutdownErr = marshalErr
+		} else if decodeErr := json.Unmarshal(raw, &status); decodeErr != nil {
+			shutdownErr = decodeErr
+		} else if !status.Stopped {
+			shutdownErr = errors.New("shutdown response did not prove stopped")
+		}
+	}
+	if shutdownErr != nil {
+		_ = signalCheckpointProcess(process, syscall.SIGTERM)
+	}
+	if waitCheckpointRuntimeStopped(roots, workerSocket, process, 10*time.Second) {
+		return
+	}
+	_ = signalCheckpointProcess(process, syscall.SIGKILL)
+	if waitCheckpointRuntimeStopped(roots, workerSocket, process, 5*time.Second) {
+		return
+	}
+	if shutdownErr != nil {
+		t.Errorf("shut down integration supervisor: %v", shutdownErr)
+	}
+	t.Errorf("integration supervisor shutdown left pid %d or runtime sockets behind", process.PID)
+}
+
+func waitCheckpointRuntimeStopped(roots paths.Roots, workerSocket string, process checkpointProcessIdentity, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, supervisorErr := os.Stat(roots.SupervisorSocketPath())
+		_, workerErr := os.Stat(workerSocket)
+		if errors.Is(supervisorErr, os.ErrNotExist) && errors.Is(workerErr, os.ErrNotExist) {
+			matches, err := checkpointProcessMatches(process)
+			if err == nil && !matches || err != nil && !identity.Alive(process.PID) {
+				return true
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
+}
+
+func waitCheckpointSupervisorCommand(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+		t.Error("integration supervisor process was not reaped")
+	}
 }
 
 func prepareCheckpointRegistration(t *testing.T, env []string, repo string) (paths.Roots, string) {
@@ -137,6 +376,288 @@ func envValue(env []string, name string) string {
 		}
 	}
 	return ""
+}
+
+func registerCheckpointRuntimeWatchdog(t *testing.T, process checkpointProcessIdentity) {
+	t.Helper()
+	if err := startCheckpointRuntimeWatchdog(); err != nil {
+		_ = signalCheckpointProcess(process, syscall.SIGTERM)
+		t.Fatalf("start integration supervisor watchdog: %v", err)
+	}
+	if err := appendCheckpointWatchdogProcess(process); err != nil {
+		t.Fatalf("register integration supervisor watchdog PID: %v", err)
+	}
+}
+
+func startCheckpointRuntimeWatchdog() error {
+	checkpointWatchdogOnce.Do(func() {
+		checkpointWatchdogDir, checkpointWatchdogErr = os.MkdirTemp("", "acd-integration-watchdog-*")
+		if checkpointWatchdogErr != nil {
+			return
+		}
+		checkpointWatchdogFile = filepath.Join(checkpointWatchdogDir, "supervisors")
+		parent, err := captureCheckpointProcessIdentity(os.Getpid())
+		if err != nil {
+			checkpointWatchdogErr = err
+			return
+		}
+		checkpointWatchdogCommand = exec.Command(os.Args[0], "-test.run=^$")
+		checkpointWatchdogCommand.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		checkpointWatchdogCommand.Env = append(os.Environ(),
+			checkpointWatchdogMode+"=1",
+			checkpointWatchdogParentPID+"="+strconv.Itoa(parent.PID),
+			checkpointWatchdogParentStart+"="+parent.StartTime,
+			checkpointWatchdogParentArgv+"="+parent.ArgvHash,
+			checkpointWatchdogRegistry+"="+checkpointWatchdogFile,
+		)
+		checkpointWatchdogIdentity, checkpointWatchdogErr =
+			startOwnedCheckpointWatchdog(checkpointWatchdogCommand, captureCheckpointProcessIdentity)
+	})
+	return checkpointWatchdogErr
+}
+
+func unregisterCheckpointRuntimeWatchdog(process checkpointProcessIdentity) {
+	process.Unregister = true
+	_ = appendCheckpointWatchdogProcess(process)
+}
+
+func appendCheckpointWatchdogProcess(process checkpointProcessIdentity) error {
+	checkpointWatchdogMu.Lock()
+	defer checkpointWatchdogMu.Unlock()
+	file, err := os.OpenFile(checkpointWatchdogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(process)
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := fmt.Fprintln(file, string(body)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func stopCheckpointRuntimeWatchdog() {
+	command := checkpointWatchdogCommand
+	if command == nil || command.Process == nil {
+		if checkpointWatchdogDir != "" {
+			_ = os.RemoveAll(checkpointWatchdogDir)
+		}
+		return
+	}
+	_ = signalCheckpointProcess(checkpointWatchdogIdentity, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		_ = command.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = signalCheckpointProcess(checkpointWatchdogIdentity, syscall.SIGKILL)
+		<-done
+	}
+	_ = os.RemoveAll(checkpointWatchdogDir)
+}
+
+func runCheckpointRuntimeWatchdog() bool {
+	if os.Getenv(checkpointWatchdogMode) != "1" {
+		return false
+	}
+	parentPID, parentErr := strconv.Atoi(os.Getenv(checkpointWatchdogParentPID))
+	parent := checkpointProcessIdentity{
+		PID:       parentPID,
+		StartTime: os.Getenv(checkpointWatchdogParentStart),
+		ArgvHash:  os.Getenv(checkpointWatchdogParentArgv),
+	}
+	registry := os.Getenv(checkpointWatchdogRegistry)
+	if parentErr != nil || parent.PID <= 0 || parent.fingerprint().Empty() || registry == "" {
+		return true
+	}
+	for {
+		matches, err := checkpointProcessMatches(parent)
+		if err == nil && !matches || err != nil && !identity.Alive(parent.PID) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	body, err := os.ReadFile(registry)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	active := make(map[int]checkpointProcessIdentity)
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
+		var process checkpointProcessIdentity
+		if len(bytes.TrimSpace(line)) == 0 || json.Unmarshal(line, &process) != nil ||
+			process.PID <= 0 || process.fingerprint().Empty() {
+			continue
+		}
+		if process.Unregister {
+			if registered, ok := active[process.PID]; ok &&
+				identity.Match(registered.fingerprint(), process.fingerprint()) {
+				delete(active, process.PID)
+			}
+			continue
+		}
+		active[process.PID] = process
+	}
+	var cleanup sync.WaitGroup
+	for _, process := range active {
+		cleanup.Add(1)
+		go func() {
+			defer cleanup.Done()
+			cleanupCheckpointWatchdogProcess(
+				process, 10*time.Second, 100*time.Millisecond,
+				checkpointProcessMatches, identity.Alive, signalCheckpointProcess,
+			)
+		}()
+	}
+	cleanup.Wait()
+	return true
+}
+
+func cleanupCheckpointWatchdogProcess(
+	process checkpointProcessIdentity,
+	termGrace, retryInterval time.Duration,
+	matches func(checkpointProcessIdentity) (bool, error),
+	alive func(int) bool,
+	signal func(checkpointProcessIdentity, syscall.Signal) error,
+) {
+	termSent := false
+	var escalateAt time.Time
+	for {
+		matched, err := matches(process)
+		if err != nil {
+			if !alive(process.PID) {
+				return
+			}
+			time.Sleep(retryInterval)
+			continue
+		}
+		if !matched {
+			return
+		}
+		if !termSent {
+			if err := signal(process, syscall.SIGTERM); err == nil {
+				termSent = true
+				escalateAt = time.Now().Add(termGrace)
+			}
+			time.Sleep(retryInterval)
+			continue
+		}
+		if time.Now().Before(escalateAt) {
+			time.Sleep(retryInterval)
+			continue
+		}
+		// Revalidation is performed by signal. A transient refusal keeps the
+		// identity in this loop so escalation is retried instead of leaked.
+		_ = signal(process, syscall.SIGKILL)
+		time.Sleep(retryInterval)
+	}
+}
+
+func checkpointResponsibilitySessionOwnership(ctx context.Context) (string, error) {
+	// The general integration harness must pass each test's explicit ACD
+	// environment to its supervisor, while production EnsureSession reads the
+	// process-global environment. Mirror its responsibility identity here so
+	// direct test children remain accepted by ordinary CLI commands. The
+	// dedicated session runtime test still exercises EnsureSession itself.
+	pid := os.Getpid()
+	var command string
+	for depth := 0; depth < 64; depth++ {
+		output, err := exec.CommandContext(ctx, "/bin/ps", "-o", "ppid=,comm=", "-p", strconv.Itoa(pid)).Output()
+		if err != nil {
+			return "", err
+		}
+		fields := strings.Fields(strings.TrimSpace(string(output)))
+		if len(fields) < 2 {
+			return "", errors.New("invalid process ancestry")
+		}
+		parent, err := strconv.Atoi(fields[0])
+		if err != nil || parent < 0 {
+			return "", errors.New("invalid parent process")
+		}
+		command = strings.Join(fields[1:], " ")
+		if parent <= 1 {
+			digest := sha256.Sum256([]byte(strconv.Itoa(pid) + "\x00" + command))
+			return "session:" + hex.EncodeToString(digest[:16]), nil
+		}
+		pid = parent
+	}
+	return "", errors.New("process ancestry is too deep")
+}
+
+func captureCheckpointProcessIdentity(pid int) (checkpointProcessIdentity, error) {
+	fingerprint, err := identity.CaptureContext(context.Background(), pid)
+	if err != nil {
+		return checkpointProcessIdentity{}, err
+	}
+	return checkpointProcessIdentity{PID: pid, StartTime: fingerprint.StartTime, ArgvHash: fingerprint.ArgvHash}, nil
+}
+
+func captureOwnedCheckpointProcess(
+	command *exec.Cmd,
+	capture func(int) (checkpointProcessIdentity, error),
+) (checkpointProcessIdentity, error) {
+	if command == nil || command.Process == nil {
+		return checkpointProcessIdentity{}, errors.New("checkpoint runtime command is not started")
+	}
+	var captureErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		process, err := capture(command.Process.Pid)
+		if err == nil {
+			return process, nil
+		}
+		captureErr = err
+		if attempt < 4 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if command.SysProcAttr != nil && command.SysProcAttr.Setsid {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	} else {
+		_ = command.Process.Kill()
+	}
+	waitErr := command.Wait()
+	if waitErr != nil {
+		return checkpointProcessIdentity{}, fmt.Errorf("%w (owned child stopped: %v)", captureErr, waitErr)
+	}
+	return checkpointProcessIdentity{}, captureErr
+}
+
+func startOwnedCheckpointWatchdog(
+	command *exec.Cmd,
+	capture func(int) (checkpointProcessIdentity, error),
+) (checkpointProcessIdentity, error) {
+	if command == nil {
+		return checkpointProcessIdentity{}, errors.New("checkpoint watchdog command is nil")
+	}
+	if err := command.Start(); err != nil {
+		return checkpointProcessIdentity{}, err
+	}
+	return captureOwnedCheckpointProcess(command, capture)
+}
+
+func checkpointProcessMatches(expected checkpointProcessIdentity) (bool, error) {
+	actual, err := identity.CaptureContext(context.Background(), expected.PID)
+	if err != nil {
+		return false, err
+	}
+	return identity.Match(expected.fingerprint(), actual), nil
+}
+
+func signalCheckpointProcess(expected checkpointProcessIdentity, signal syscall.Signal) error {
+	actual, err := identity.CaptureContext(context.Background(), expected.PID)
+	if err != nil {
+		return err
+	}
+	if !identity.Match(expected.fingerprint(), actual) {
+		return errors.New("checkpoint runtime process identity changed")
+	}
+	return syscall.Kill(expected.PID, signal)
 }
 
 // activateIntentV2Runtime installs an explicit, already-applied Intent Fast v2
@@ -269,7 +790,15 @@ var (
 // TestMain removes package-scoped binary and repository fixtures after the
 // suite completes so /tmp stays clean.
 func TestMain(m *testing.M) {
+	if runCheckpointRuntimeWatchdog() {
+		return
+	}
+	if err := startCheckpointRuntimeWatchdog(); err != nil {
+		fmt.Fprintf(os.Stderr, "start integration checkpoint watchdog: %v\n", err)
+		os.Exit(1)
+	}
 	code := m.Run()
+	stopCheckpointRuntimeWatchdog()
 	if acdBinaryDir != "" {
 		_ = os.RemoveAll(acdBinaryDir)
 	}

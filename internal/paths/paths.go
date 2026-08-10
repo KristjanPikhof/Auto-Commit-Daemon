@@ -98,9 +98,8 @@ func (r Roots) SupervisorSocketPath() string {
 	return filepath.Join(r.State, "run", "supervisor.sock")
 }
 
-// WorkerStatusPath is the supervisor-visible runtime state written by a
-// launchd-managed repository worker. The caller must validate repositoryID
-// before using the resulting path.
+// WorkerStatusPath is the legacy launchd worker's supervisor-visible runtime
+// state. The caller must validate repositoryID before using the resulting path.
 func (r Roots) WorkerStatusPath(repositoryID string) string {
 	return filepath.Join(filepath.Dir(r.SupervisorSocketPath()), "worker-"+repositoryID+".json")
 }

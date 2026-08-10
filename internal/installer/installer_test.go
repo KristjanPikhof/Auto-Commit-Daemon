@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,12 +14,18 @@ import (
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 type recordingExecutor struct{ calls []string }
 
 func (r *recordingExecutor) Run(_ context.Context, name string, _ ...string) error {
 	r.calls = append(r.calls, name)
+	return nil
+}
+
+func (r *recordingExecutor) StartSession(_ context.Context, _ paths.Roots, _ supervisor.ServiceDefinition) error {
+	r.calls = append(r.calls, "session")
 	return nil
 }
 
@@ -109,6 +116,33 @@ func TestBuildPlanDisablesStaleMissingRowsAndEnablesCurrentRepo(t *testing.T) {
 	}
 }
 
+func TestBuildPlanUsesMacOSSessionSupervisorWithoutAccessProbe(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-only setup contract")
+	}
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	plan, err := BuildPlan(ctx, roots, Options{Repo: repo, Executable: executable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Service.Platform != "session" || len(plan.Service.Content) != 0 {
+		t.Fatalf("service=%+v, want session-owned supervisor", plan.Service)
+	}
+	foundSessionStart := false
+	for _, action := range plan.Actions {
+		if strings.Contains(action.Kind, "access") || strings.Contains(action.Detail, "grant") {
+			t.Fatalf("setup plan contains a permission probe: %+v", action)
+		}
+		if action.Kind == "start_session_supervisor" {
+			foundSessionStart = true
+		}
+	}
+	if !foundSessionStart {
+		t.Fatalf("setup plan does not disclose session supervisor: %+v", plan.Actions)
+	}
+}
+
 func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 	ctx := context.Background()
 	roots, repo, executable := installerFixture(t, ctx)
@@ -153,98 +187,6 @@ func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 	settings := doc.Settings.Repositories[plan.WorktreeID]
 	if string(settings.Fields[config.FieldProvider]) != `"deterministic"` || string(settings.Fields[config.FieldCommitStrategy]) != `"intent"` {
 		t.Fatalf("settings=%v", settings.Fields)
-	}
-}
-
-func TestApplyServiceAccessFailureStopsBeforeMigration(t *testing.T) {
-	ctx := context.Background()
-	roots, repo, executable := installerFixture(t, ctx)
-	if err := os.MkdirAll(filepath.Dir(roots.ManagedBinaryPath()), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(roots.ManagedBinaryPath(), []byte("prior-binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	plan, err := BuildPlan(ctx, roots, Options{
-		Repo: repo, Executable: executable, SkipServiceCheck: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.ServiceAccessCheck = true
-	plan.Digest = digestPlan(plan)
-	var progress []Progress
-	_, err = Apply(ctx, roots, plan, ApplyOptions{
-		Executor: &recordingExecutor{},
-		ServiceAccessCheck: func(context.Context, paths.Roots, Plan, Executor) error {
-			return &ServiceAccessError{
-				Target: repo, ManagedBinary: plan.ManagedBinary,
-				Cause: errors.New("injected background denial"),
-			}
-		},
-		Progress: func(update Progress) { progress = append(progress, update) },
-	})
-	var accessErr *ServiceAccessError
-	if !errors.As(err, &accessErr) {
-		t.Fatalf("error=%v, want ServiceAccessError", err)
-	}
-	body, readErr := os.ReadFile(roots.ManagedBinaryPath())
-	if readErr != nil || string(body) != "prior-binary" {
-		t.Fatalf("managed binary=(%q,%v), want restored prior binary", body, readErr)
-	}
-	phases := progressPhases(progress)
-	if !containsPhasesInOrder(phases, "prepare", "backup", "install_binary", "service_access", "rollback", "rolled_back") {
-		t.Fatalf("progress phases=%v", phases)
-	}
-	for _, phase := range phases {
-		if phase == "bridge" || phase == "migrate" {
-			t.Fatalf("migration started after access denial: %v", phases)
-		}
-	}
-}
-
-func TestApplyServiceAccessRetryContinuesSameTransaction(t *testing.T) {
-	ctx := context.Background()
-	roots, repo, executable := installerFixture(t, ctx)
-	plan, err := BuildPlan(ctx, roots, Options{
-		Repo: repo, Executable: executable, SkipServiceCheck: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.ServiceAccessCheck = true
-	plan.Digest = digestPlan(plan)
-	checks := 0
-	retries := 0
-	var progress []Progress
-	_, err = Apply(ctx, roots, plan, ApplyOptions{
-		Executor: &recordingExecutor{}, Ready: readyImmediately,
-		SelfTest: selfTestImmediately,
-		ServiceAccessCheck: func(context.Context, paths.Roots, Plan, Executor) error {
-			checks++
-			if checks == 1 {
-				return &ServiceAccessError{
-					Target: repo, ManagedBinary: plan.ManagedBinary,
-					Cause: errors.New("injected background denial"),
-				}
-			}
-			return nil
-		},
-		ServiceAccessRetry: func(context.Context, *ServiceAccessError) error {
-			retries++
-			return nil
-		},
-		Progress: func(update Progress) { progress = append(progress, update) },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if checks != 2 || retries != 1 {
-		t.Fatalf("checks=%d retries=%d", checks, retries)
-	}
-	if got := progressPhases(progress); !containsPhasesInOrder(got,
-		"service_access", "service_access_required", "service_access", "bridge", "migrate", "completed") {
-		t.Fatalf("progress phases=%v", got)
 	}
 }
 

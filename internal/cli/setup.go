@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -84,9 +83,10 @@ func newSetupCommand(initCompat bool) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   use,
 		Short: "Install or upgrade ACD transactionally",
-		Long: `Inspect the current installation, show one exact plan, and install or
-upgrade the user supervisor and current repository as one rollback-safe
-transaction. The default deterministic provider needs no API key.`,
+		Long: `Inspect the current installation, show one exact plan, and configure
+the supervisor and current repository as one rollback-safe transaction. macOS
+uses the invoking terminal or agent session and does not require Full Disk
+Access. The default deterministic provider needs no API key.`,
 		Example: `  acd setup
   acd setup --dry-run
   acd setup --yes --non-interactive --expect-plan sha256:...`,
@@ -177,15 +177,10 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		},
 		Progress: progress.Update,
 	}
-	if !nonInteractive && !jsonOut {
-		applyOptions.ServiceAccessRetry = func(ctx context.Context, accessErr *installer.ServiceAccessError) error {
-			return promptSetupServiceAccess(ctx, cmd.ErrOrStderr(), input, accessErr)
-		}
-	}
 	result, err := installer.Apply(cmd.Context(), roots, plan, applyOptions)
 	progress.Close()
 	if err != nil {
-		return classifySetupApplyError(err)
+		return fmt.Errorf("acd setup: %w", err)
 	}
 	if jsonOut {
 		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateProtected, Changed: true,
@@ -193,49 +188,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Setup complete. Repository protected: %s\n", plan.Repo)
 	return nil
-}
-
-func promptSetupServiceAccess(
-	ctx context.Context,
-	out io.Writer,
-	input *bufio.Reader,
-	accessErr *installer.ServiceAccessError,
-) error {
-	fmt.Fprintf(out, `
-macOS needs your permission before ACD can protect repositories in Desktop,
-Documents, or other privacy-controlled folders.
-
-1. Open System Settings > Privacy & Security > Full Disk Access.
-2. Click +, press Command-Shift-G, and enter:
-   %s
-3. Add and enable that binary, then return here.
-
-Press Enter to check again, or type "cancel" to roll back: `, accessErr.ManagedBinary)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		answer, err := input.ReadString('\n')
-		if err != nil && strings.TrimSpace(answer) == "" {
-			return err
-		}
-		switch strings.ToLower(strings.TrimSpace(answer)) {
-		case "", "retry", "r":
-			return nil
-		case "cancel", "c", "no", "n", "q", "quit":
-			return errors.New("macOS Full Disk Access was not granted")
-		default:
-			fmt.Fprint(out, "Press Enter to retry, or type \"cancel\" to roll back: ")
-		}
-	}
-}
-
-func classifySetupApplyError(err error) error {
-	var accessErr *installer.ServiceAccessError
-	if errors.As(err, &accessErr) {
-		return actionRequiredError("service_access_required", "acd setup: "+accessErr.Error())
-	}
-	return fmt.Errorf("acd setup: %w", err)
 }
 
 type setupProgress struct {

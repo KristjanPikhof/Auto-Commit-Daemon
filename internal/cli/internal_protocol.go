@@ -70,19 +70,7 @@ func newInternalCmd() *cobra.Command {
 	_ = workerSupervise.MarkFlagRequired("state-root")
 	_ = workerSupervise.MarkFlagRequired("share-root")
 	_ = workerSupervise.MarkFlagRequired("config-root")
-	var accessCheckPaths []string
-	var accessCheckResult string
-	workerAccessCheck := &cobra.Command{
-		Use: "access-check", Hidden: true, Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runWorkerAccessCheck(cmd.Context(), accessCheckPaths, accessCheckResult)
-		},
-	}
-	workerAccessCheck.Flags().StringSliceVar(&accessCheckPaths, "path", nil, "Repository paths to verify")
-	workerAccessCheck.Flags().StringVar(&accessCheckResult, "result", "", "Absolute result file")
-	_ = workerAccessCheck.MarkFlagRequired("path")
-	_ = workerAccessCheck.MarkFlagRequired("result")
-	worker.AddCommand(workerRun, workerSupervise, workerAccessCheck)
+	worker.AddCommand(workerRun, workerSupervise)
 	hint := newInternalHintCmd()
 	session := &cobra.Command{Use: "session", Hidden: true}
 	session.AddCommand(newInternalSessionCmd("open"), newInternalSessionCmd("close"))
@@ -137,6 +125,12 @@ func newInternalSessionCmd(action string) *cobra.Command {
 func sendInternalHint(ctx context.Context, repo, kind string, drain bool, sessionAction, sessionID, harness string, watchPID int) error {
 	record, roots, _, err := lookupRegisteredRepo("internal hint", repo)
 	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(record.RepositoryID) == "" || strings.TrimSpace(record.WorktreeID) == "" {
+		return fmt.Errorf("acd internal hint: repository setup is still in progress; retry after `acd setup` completes")
+	}
+	if err := ensureMutationSupervisor(ctx, roots); err != nil {
 		return err
 	}
 	method := "hint"
@@ -304,37 +298,6 @@ func runRepositoryWorker(ctx context.Context, _ io.Writer, errOut io.Writer, rep
 	return runRepositoryWorkerAtRoots(ctx, errOut, roots, repositoryID, publicationHold)
 }
 
-func runWorkerAccessCheck(ctx context.Context, targets []string, resultPath string) error {
-	if !filepath.IsAbs(resultPath) {
-		return errors.New("acd worker access-check: --result must be absolute")
-	}
-	if len(targets) == 0 {
-		return errors.New("acd worker access-check: at least one --path is required")
-	}
-	for _, target := range targets {
-		if !filepath.IsAbs(target) {
-			return fmt.Errorf("acd worker access-check: path must be absolute: %s", target)
-		}
-		status := supervisor.ServiceAccessStatus{State: "checking", Target: target}
-		if err := supervisor.WriteServiceAccessStatus(resultPath, status); err != nil {
-			return err
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := git.ResolveWorktree(probeCtx, target)
-		cancel()
-		if err != nil {
-			status.State = "failed"
-			status.Error = err.Error()
-			if writeErr := supervisor.WriteServiceAccessStatus(resultPath, status); writeErr != nil {
-				return errors.Join(err, writeErr)
-			}
-			return err
-		}
-	}
-	return supervisor.WriteServiceAccessStatus(resultPath,
-		supervisor.ServiceAccessStatus{State: "completed"})
-}
-
 func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots paths.Roots, repositoryID, publicationHold string) error {
 	canonicalHold := roots.SetupPublicationHoldPath()
 	if publicationHold != "" && filepath.Clean(publicationHold) != filepath.Clean(canonicalHold) {
@@ -373,7 +336,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 	signal.Notify(wakeSignals, syscall.SIGUSR1)
 	defer signal.Stop(wakeSignals)
 	var wakeMu sync.RWMutex
-	wakeTargets := make([]chan struct{}, 0, len(records))
+	wakeTargets := make(map[string]chan struct{}, len(records))
 	go func() {
 		for {
 			select {
@@ -410,7 +373,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		if _, reconcileErr := state.ReconcileCheckpointIntentMemberships(cctx, db, record.WorktreeID); reconcileErr != nil {
 			return fmt.Errorf("acd worker: reconcile checkpoint publication state for %s: %w", record.Path, reconcileErr)
 		}
-		opts, logCloser, buildErr := buildDaemonRunOptions(wt.Root, wt.GitDir, db, errOut)
+		opts, logCloser, buildErr := buildDaemonRunOptionsWithID(wt.Root, wt.GitDir, db, repositoryID)
 		if buildErr != nil {
 			return buildErr
 		}
@@ -431,7 +394,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		}
 		wakeCh := make(chan struct{}, 1)
 		wakeMu.Lock()
-		wakeTargets = append(wakeTargets, wakeCh)
+		wakeTargets[record.WorktreeID] = wakeCh
 		wakeMu.Unlock()
 		opts.WakeCh = wakeCh
 		opts.EmptySweepThreshold = math.MaxInt
@@ -444,14 +407,16 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 			errCh <- nil
 		}(wt.Root, opts)
 	}
-	workerHandler := &repositoryWorkerHandler{runtimes: runtimes, wake: func() {
+	workerHandler := &repositoryWorkerHandler{repositoryID: repositoryID, runtimes: runtimes, wake: func(worktreeID string) {
 		wakeMu.RLock()
 		defer wakeMu.RUnlock()
-		for _, target := range wakeTargets {
-			select {
-			case target <- struct{}{}:
-			default:
-			}
+		target, ok := wakeTargets[worktreeID]
+		if !ok {
+			return
+		}
+		select {
+		case target <- struct{}{}:
+		default:
 		}
 	}}
 	workerServerErr := make(chan error, 1)
@@ -765,11 +730,22 @@ type workerRuntime struct {
 }
 
 type repositoryWorkerHandler struct {
-	runtimes map[string]*workerRuntime
-	wake     func()
+	repositoryID string
+	runtimes     map[string]*workerRuntime
+	wake         func(string)
 }
 
 func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, request supervisor.Request) (any, *supervisor.ProtocolError) {
+	if request.Method == "status" && request.WorktreeID == "" {
+		if request.RepositoryID != h.repositoryID {
+			return nil, &supervisor.ProtocolError{
+				Code: "worker_identity_mismatch", Message: "worker repository identity does not match the request",
+			}
+		}
+		return supervisor.WorkerReadiness{
+			RepositoryID: h.repositoryID, PID: os.Getpid(), Ready: true,
+		}, nil
+	}
 	runtime, err := h.runtime(request.WorktreeID)
 	if err != nil {
 		return nil, protocolFailure("worktree_not_found", err, false)
@@ -793,7 +769,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		if _, beginErr := daemon.BeginProtectionObservation(ctx, runtime.db); beginErr != nil {
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
-		h.wake()
+		h.wake(request.WorktreeID)
 		return map[string]bool{"accepted": true}, nil
 	case "checkpoint_barrier":
 		var params struct {
@@ -836,7 +812,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			runtime.gate.Unlock()
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
-		h.wake()
+		h.wake(request.WorktreeID)
 		runtime.gate.Unlock()
 		deadline := time.NewTimer(checkpointBarrierWait(ctx))
 		defer deadline.Stop()
