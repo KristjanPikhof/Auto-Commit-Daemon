@@ -131,6 +131,27 @@ func TestRegistry_LoadOldRowsDefaultToEnabled(t *testing.T) {
 	}
 }
 
+func TestRegistry_LoadUnstampedRowsRemainLegacy(t *testing.T) {
+	roots := rootsForTest(t)
+	if err := os.MkdirAll(roots.Share, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"repos":[{"path":"/tmp/repo","repo_hash":"h1","state_db":"/tmp/repo/.git/acd/state.db"}]}`)
+	if err := os.WriteFile(roots.RegistryPath(), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := Load(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registry.Version != 1 {
+		t.Fatalf("unstamped registry version=%d, want legacy version 1", registry.Version)
+	}
+	if registry.Repos[0].RepositoryID != "" || registry.Repos[0].WorktreeID != "" {
+		t.Fatalf("unstamped registry was treated as migrated: %+v", registry.Repos[0])
+	}
+}
+
 func TestRegistry_DisableEnableRepoLifecycle(t *testing.T) {
 	reg := NewRegistry()
 	reg.UpsertRepo("/tmp/repo", "h1", "/tmp/repo/.git/acd/state.db", "codex", 10)

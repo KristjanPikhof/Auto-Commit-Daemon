@@ -269,6 +269,10 @@ func (s *Server) reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("supervisor: load registry: %w", err)
 	}
+	if registry.Version != central.RegistryVersion {
+		return fmt.Errorf("supervisor: registry v%d requires `acd setup` before v%d workers can start",
+			registry.Version, central.RegistryVersion)
+	}
 	desiredRecords := make(map[string][]central.RepoRecord)
 	for _, record := range registry.Repos {
 		if record.LifecycleDisabled() || record.RepositoryID == "" {

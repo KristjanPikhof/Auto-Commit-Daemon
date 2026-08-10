@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
@@ -117,6 +118,24 @@ func TestServerSocketPermissionsAndStatus(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("server did not stop")
+	}
+}
+
+func TestServerRefusesLegacyRegistry(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "acd-legacy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	roots := paths.Roots{State: filepath.Join(root, "s"), Share: filepath.Join(root, "d"), Config: filepath.Join(root, "c")}
+	registry := central.NewRegistry()
+	registry.Version = 1
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	err = (&Server{Roots: roots, BinaryPath: "/bin/false", Version: "test"}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "registry v1 requires `acd setup`") {
+		t.Fatalf("legacy registry startup error=%v", err)
 	}
 }
 
