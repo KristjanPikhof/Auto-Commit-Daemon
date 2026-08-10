@@ -1178,10 +1178,6 @@ func supervisorSessionRunning(ctx context.Context, roots paths.Roots) bool {
 	return err == nil && response.Error == nil
 }
 
-func waitSupervisor(ctx context.Context, roots paths.Roots, repositoryID string) error {
-	return waitSupervisorReady(ctx, roots, repositoryID, nil)
-}
-
 func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID string, processDone <-chan struct{}) error {
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
@@ -1212,7 +1208,7 @@ func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID st
 						supervisor.Request{Version: supervisor.ProtocolVersion,
 							ID: "setup-worker-ready", Method: "status",
 							RepositoryID: repositoryID}, time.Second)
-					if workerErr == nil && workerResponse.Version == supervisor.ProtocolVersion {
+					if workerErr == nil && workerReadinessMatches(workerResponse, worker) {
 						return nil
 					}
 				}
@@ -1401,16 +1397,7 @@ func waitSupervisorWorkersReady(
 				lastProbeError[worker.RepositoryID] = workerErr.Error()
 				continue
 			}
-			if workerResponse.Version != supervisor.ProtocolVersion {
-				lastProbeError[worker.RepositoryID] = "worker protocol version mismatch"
-				continue
-			}
-			if workerResponse.Error != nil {
-				lastProbeError[worker.RepositoryID] = workerResponse.Error.Message
-				continue
-			}
-			readiness, decodeErr := decode[supervisor.WorkerReadiness](workerResponse.Data)
-			if decodeErr != nil || !readiness.Ready || readiness.PID != worker.PID || readiness.RepositoryID != worker.RepositoryID {
+			if !workerReadinessMatches(workerResponse, worker) {
 				lastProbeError[worker.RepositoryID] = "worker readiness identity mismatch"
 				continue
 			}
@@ -1436,6 +1423,15 @@ func waitSupervisorWorkersReady(
 		}
 	}
 	return nil
+}
+
+func workerReadinessMatches(response supervisor.Response, worker supervisor.WorkerStatus) bool {
+	if !response.OK || response.Version != supervisor.ProtocolVersion || response.Error != nil {
+		return false
+	}
+	readiness, err := decode[supervisor.WorkerReadiness](response.Data)
+	return err == nil && readiness.Ready && readiness.PID == worker.PID &&
+		readiness.RepositoryID == worker.RepositoryID
 }
 
 func summarizePendingWorkers(
