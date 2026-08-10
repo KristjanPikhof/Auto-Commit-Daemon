@@ -1,20 +1,12 @@
 # Uninstall acd from OpenCode
 
-1. Remove the `# acd-managed: true` block and its five `acd-*` hooks from
-   `~/.config/opencode/hook/hooks.yaml`.
-2. Stop any running daemons:
+1. Prefer `acd uninstall`, which removes the verified ACD-owned hook block
+   from `~/.config/opencode/hook/hooks.yaml`. For manual cleanup, remove only
+   the `# acd-managed: true` block and its five `acd-*` hooks.
+2. Preview the transactional uninstall, which checkpoints enabled repositories
+   before stopping the supervisor:
    ~~~bash
-   acd stop --all
+   acd uninstall --dry-run
    ~~~
-3. To delete captured state for a repo, do this before removing the binary:
-   ~~~bash
-   acd repo remove --repo /path/to/repo --yes --purge-state
-   ~~~
-4. (Optional) Remove the binary and global ACD data:
-   ~~~bash
-   rm ~/.local/bin/acd
-   rm -rf ~/.local/share/acd ~/.local/state/acd ~/.config/acd
-   # or remove the Homebrew binary with: brew uninstall acd
-   ~~~
-
-Per-repo `.git/acd` directories remain unless you remove them explicitly.
+3. Remove protected data only through `acd uninstall --purge-data`, after
+   reviewing the exact plan and supplying its second confirmation.
