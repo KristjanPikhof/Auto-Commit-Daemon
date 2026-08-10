@@ -152,6 +152,7 @@ func newRootCmd() *cobra.Command {
 		newProductStatusCmd(),
 		newOnCmd(),
 		newOffCmd(),
+		newProductListCmd(),
 		newProductCommitAllCmd(),
 		newHistoryCmd(),
 		newRestoreCmd(),
@@ -179,7 +180,6 @@ func newRootCmd() *cobra.Command {
 		hideCompatibility(newExplainCmd(), "acd history explain", false),
 		hideCompatibility(newFixCmd(), "acd support repair", false),
 		hideCompatibility(newLogsCmd(), "acd support logs", false),
-		hideCompatibility(newListCmd(), "acd repo list", false),
 		hideCompatibility(newStatsCmd(), "acd repo list", false),
 		hideCompatibility(newDiagnoseCmd(), "acd support diagnose", false),
 		hideCompatibility(newRecoverCmd(), "acd support repair", false),
@@ -220,7 +220,7 @@ func validateInvocationCapabilities(command *cobra.Command) error {
 	path := command.CommandPath()
 	if flagWasSet(command, "repo") {
 		switch path {
-		case "acd uninstall", "acd repo list", "acd repo gc", "acd config credentials":
+		case "acd uninstall", "acd list", "acd repo list", "acd repo gc", "acd config credentials":
 			return invalidCommandError("%s: --repo is not supported by this global operation", path)
 		}
 	}

@@ -11,6 +11,7 @@ Commands:
   status      Show whether this repository is protected and published
   on          Enable protection for this repository
   off         Complete a final checkpoint and disable protection
+  list        Show protection and Git publication across repositories
   commit-all  Checkpoint and publish all current changes
   history     Show checkpoints and their Git publication state
   restore     Preview or restore a checkpoint into the working tree

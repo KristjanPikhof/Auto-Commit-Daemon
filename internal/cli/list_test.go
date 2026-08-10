@@ -111,7 +111,7 @@ func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	if strings.Contains(got, "Updated:") {
 		t.Fatalf("--once should not use watch frames:\n%s", got)
 	}
-	if !strings.Contains(got, "REPO") || !strings.Contains(got, "DAEMON") {
+	if !strings.Contains(got, "REPOSITORY") || !strings.Contains(got, "PROTECTED") || strings.Contains(got, "DAEMON") {
 		t.Fatalf("expected compact table header:\n%s", got)
 	}
 }
@@ -131,10 +131,17 @@ func TestList_JSONOnTTYUsesOneShot(t *testing.T) {
 		t.Fatalf("json must not select watch mode:\n%s", stdout.String())
 	}
 	var got struct {
-		Repos []listEntry `json:"repos"`
+		OK    bool         `json:"ok"`
+		State productState `json:"state"`
+		Data  struct {
+			Repos []productListEntry `json:"repos"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("expected JSON output, got: %q err=%v", stdout.String(), err)
+	}
+	if !got.OK || got.State != productStateProtected || got.Data.Repos == nil {
+		t.Fatalf("unexpected product envelope: %+v", got)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 
 func TestChangedCommandCapabilityMatrix(t *testing.T) {
 	paths := [][]string{
-		{"setup"}, {"status"}, {"on"}, {"off"}, {"commit-all"}, {"history"}, {"restore"},
+		{"setup"}, {"status"}, {"on"}, {"off"}, {"list"}, {"commit-all"}, {"history"}, {"restore"},
 		{"doctor"}, {"uninstall"}, {"config", "get"}, {"config", "set"},
 		{"config", "edit"}, {"config", "reset"}, {"config", "credentials"},
 		{"support", "diagnose"}, {"support", "logs"}, {"support", "repair"},
@@ -36,6 +36,7 @@ func TestChangedCommandCapabilityMatrix(t *testing.T) {
 func TestGlobalAndInteractiveFlagsAreExplicitlyRejected(t *testing.T) {
 	cases := [][]string{
 		{"uninstall", "--repo", ".", "--dry-run"},
+		{"list", "--repo", ".", "--once"},
 		{"repo", "list", "--repo", "."},
 		{"repo", "gc", "--repo", "."},
 		{"config", "credentials", "--repo", "."},
