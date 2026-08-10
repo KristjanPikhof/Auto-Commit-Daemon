@@ -358,7 +358,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err != nil {
 		return Result{}, rollbackFiles(err)
 	}
-	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.ManagedBinary, sha256String(managedBody)); err != nil {
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.ManagedBinary, fileDigest(managedBody, 0o755)); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	if err := writeAtomic(plan.ManagedBinary, managedBody, 0o755); err != nil {
@@ -366,7 +366,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	holdBody, _ := json.Marshal(map[string]string{"operation_id": plan.OperationID, "plan_digest": plan.Digest})
 	holdBody = append(holdBody, '\n')
-	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), sha256String(holdBody)); err != nil {
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), fileDigest(holdBody, 0o600)); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	if err := writeAtomic(roots.SetupPublicationHoldPath(), holdBody, 0o600); err != nil {
@@ -459,7 +459,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	prepareConfig := func(body []byte) error {
-		return preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.ConfigPath(), sha256String(body))
+		return preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.ConfigPath(), fileDigest(body, 0o600))
 	}
 	if err := migrateRepositoryConfigKeys(roots, plan.Registry, prepareConfig); err != nil {
 		return Result{}, rollback(err)
@@ -471,7 +471,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	serviceDigest := absentFileDigest
 	if plan.Service.Platform != "session" {
-		serviceDigest = sha256String(plan.Service.Content)
+		serviceDigest = fileDigest(plan.Service.Content, 0o600)
 	}
 	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.Service.Path, serviceDigest); err != nil {
 		return Result{}, rollback(err)
@@ -532,7 +532,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			if sha256String(current) != item.BeforeDigest {
 				return Result{}, rollback(fmt.Errorf("setup: integration changed after preview: %s", item.Target))
 			}
-			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, item.AfterDigest); err != nil {
+			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, fileDigest(item.Content, 0o600)); err != nil {
 				return Result{}, rollback(err)
 			}
 			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {
@@ -548,7 +548,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		if err != nil {
 			return Result{}, rollback(err)
 		}
-		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.IntegrationsOwnershipPath(), sha256String(ownershipBody)); err != nil {
+		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.IntegrationsOwnershipPath(), fileDigest(ownershipBody, 0o600)); err != nil {
 			return Result{}, rollback(err)
 		}
 		if err := integrationpkg.WriteOwnership(roots.IntegrationsOwnershipPath(), plan.IntegrationPlans); err != nil {
@@ -700,7 +700,7 @@ func backupFiles(root string, targets []string, priorService ServiceState) ([]fi
 			item.OwnerKnown = true
 			item.UID, item.GID = stat.Uid, stat.Gid
 		}
-		item.Digest = sha256String(body)
+		item.Digest = fileDigest(body, info.Mode())
 		item.Backup = filepath.Join(root, "files", fmt.Sprintf("%04d", i))
 		if err := writeAtomic(item.Backup, body, 0o600); err != nil {
 			return nil, err
@@ -797,7 +797,7 @@ func installBackupNoReplace(item fileBackup) error {
 	if err != nil {
 		return err
 	}
-	if sha256String(body) != item.Digest {
+	if fileDigest(body, item.Mode) != item.Digest {
 		return fmt.Errorf("setup: backup digest mismatch for %s", item.Target)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(item.Target), ".acd-rollback-restore-")
@@ -806,10 +806,6 @@ func installBackupNoReplace(item fileBackup) error {
 	}
 	name := tmp.Name()
 	defer os.Remove(name)
-	if err := tmp.Chmod(item.Mode.Perm()); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
 		return err
@@ -819,6 +815,10 @@ func installBackupNoReplace(item fileBackup) error {
 			tmp.Close()
 			return fmt.Errorf("setup: restore owner for %s: %w", item.Target, err)
 		}
+	}
+	if err := tmp.Chmod(fileModeBits(item.Mode)); err != nil {
+		tmp.Close()
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -874,7 +874,7 @@ func currentFileDigest(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return sha256String(body), nil
+	return fileDigest(body, info.Mode()), nil
 }
 
 func jsonFileDigest(value any) (string, error) {
@@ -882,7 +882,7 @@ func jsonFileDigest(value any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return sha256String(append(body, '\n')), nil
+	return fileDigest(append(body, '\n'), 0o600), nil
 }
 
 func persistBackupManifest(root string, backups []fileBackup, priorService ServiceState) error {
@@ -1531,6 +1531,14 @@ func clearPlanRecordTimestamps(record *central.RepoRecord) {
 func sha256String(body []byte) string {
 	sum := sha256.Sum256(body)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func fileDigest(body []byte, mode os.FileMode) string {
+	return sha256String([]byte(fmt.Sprintf("mode:%#o\x00%s", fileModeBits(mode), body)))
+}
+
+func fileModeBits(mode os.FileMode) os.FileMode {
+	return mode.Perm() | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
 }
 func newOperationID(prefix string) (string, error) {
 	body := make([]byte, 8)
