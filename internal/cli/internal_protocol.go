@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -367,8 +368,14 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 			return fmt.Errorf("acd worker: open %s: %w", record.Path, openErr)
 		}
 		closers = append(closers, db)
-		if recoverErr := daemon.RecoverSelfPublicationsBeforePlanning(cctx, wt.Root, db); recoverErr != nil {
-			return fmt.Errorf("acd worker: recover publication journal for %s: %w", record.Path, recoverErr)
+		restorePending, pendingErr := state.RestoreRepairPending(cctx, db)
+		if pendingErr != nil {
+			return fmt.Errorf("acd worker: inspect interrupted restore for %s: %w", record.Path, pendingErr)
+		}
+		if !restorePending {
+			if recoverErr := daemon.RecoverSelfPublicationsBeforePlanning(cctx, wt.Root, db); recoverErr != nil {
+				return fmt.Errorf("acd worker: recover publication journal for %s: %w", record.Path, recoverErr)
+			}
 		}
 		if _, reconcileErr := state.ReconcileCheckpointIntentMemberships(cctx, db, record.WorktreeID); reconcileErr != nil {
 			return fmt.Errorf("acd worker: reconcile checkpoint publication state for %s: %w", record.Path, reconcileErr)
@@ -387,10 +394,11 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		opts.SkipDaemonLock = true
 		opts.SkipSignals = true
 		gate := &sync.RWMutex{}
+		restoreHeld := &atomic.Bool{}
+		restoreHeld.Store(restorePending)
 		opts.OperationGate = gate
 		opts.PublicationHeld = func() bool {
-			info, statErr := os.Lstat(canonicalHold)
-			return statErr == nil && info.Mode().IsRegular()
+			return workerPublicationHeld(canonicalHold, restoreHeld)
 		}
 		wakeCh := make(chan struct{}, 1)
 		wakeMu.Lock()
@@ -398,7 +406,14 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		wakeMu.Unlock()
 		opts.WakeCh = wakeCh
 		opts.EmptySweepThreshold = math.MaxInt
-		runtimes[record.WorktreeID] = &workerRuntime{record: record, worktree: wt, db: db, gate: gate}
+		runtimes[record.WorktreeID] = &workerRuntime{
+			record: record, worktree: wt, db: db, gate: gate,
+			policy: restorepkg.ProtectionPolicy{
+				Sensitive: opts.SensitiveMatcher, SafeIgnore: opts.SafeIgnoreMatcher,
+				MaxFileBytes: opts.MaxFileBytes,
+			},
+			restoreHeld: restoreHeld,
+		}
 		go func(path string, runOpts daemon.Options) {
 			if runErr := daemon.Run(cctx, runOpts); runErr != nil && !errors.Is(runErr, context.Canceled) {
 				errCh <- fmt.Errorf("%s: %w", path, runErr)
@@ -723,10 +738,12 @@ func truthyConfig(value string) bool {
 }
 
 type workerRuntime struct {
-	record   central.RepoRecord
-	worktree git.Worktree
-	db       *state.DB
-	gate     *sync.RWMutex
+	record      central.RepoRecord
+	worktree    git.Worktree
+	db          *state.DB
+	gate        *sync.RWMutex
+	policy      restorepkg.ProtectionPolicy
+	restoreHeld *atomic.Bool
 }
 
 type repositoryWorkerHandler struct {
@@ -923,7 +940,8 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		runtime.gate.Lock()
 		defer runtime.gate.Unlock()
-		plan, previewErr := restorepkg.Preview(ctx, runtime.worktree.Root, runtime.worktree.GitDir, runtime.db.Path(), params.ID)
+		plan, previewErr := restorepkg.PreviewWithPolicy(ctx, runtime.worktree.Root,
+			runtime.worktree.GitDir, runtime.db.Path(), params.ID, runtime.policy)
 		if previewErr != nil {
 			return nil, protocolFailure("restore_preview_failed", previewErr, false)
 		}
@@ -933,7 +951,12 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		if params.PlanDigest == "" || params.PlanDigest != plan.PlanDigest {
 			return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "restore plan changed; preview again"}
 		}
+		setRestorePublicationHold(runtime, true)
 		result, applyErr := restorepkg.Apply(ctx, runtime.db, plan)
+		holdErr := refreshRestorePublicationHold(ctx, runtime)
+		if holdErr != nil {
+			return nil, protocolFailure("restore_status_failed", holdErr, true)
+		}
 		if applyErr != nil {
 			return nil, protocolFailure("restore_apply_failed", applyErr, false)
 		}
@@ -950,6 +973,10 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		defer runtime.gate.Unlock()
 		plan, previewErr := restorepkg.PreviewRepair(ctx, runtime.db)
 		if previewErr != nil {
+			if errors.Is(previewErr, sql.ErrNoRows) {
+				setRestorePublicationHold(runtime, false)
+				return restorepkg.RepairPlan{}, nil
+			}
 			return nil, protocolFailure("repair_preview_failed", previewErr, false)
 		}
 		if !params.Apply {
@@ -958,7 +985,12 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		if params.OperationID == "" || params.OperationID != plan.OperationID {
 			return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "repair plan changed; preview again"}
 		}
-		result, repairErr := restorepkg.Repair(ctx, runtime.worktree.Root, runtime.db, plan)
+		result, repairErr := restorepkg.RepairWithPolicy(ctx, runtime.worktree.Root,
+			runtime.db, plan, runtime.policy)
+		holdErr := refreshRestorePublicationHold(ctx, runtime)
+		if holdErr != nil {
+			return nil, protocolFailure("restore_status_failed", holdErr, true)
+		}
 		if repairErr != nil {
 			return nil, protocolFailure("repair_failed", repairErr, false)
 		}
@@ -966,6 +998,29 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	default:
 		return nil, &supervisor.ProtocolError{Code: "invalid_request", Message: "unsupported worker request"}
 	}
+}
+
+func refreshRestorePublicationHold(ctx context.Context, runtime *workerRuntime) error {
+	pending, err := state.RestoreRepairPending(ctx, runtime.db)
+	if err != nil {
+		return err
+	}
+	setRestorePublicationHold(runtime, pending)
+	return nil
+}
+
+func setRestorePublicationHold(runtime *workerRuntime, held bool) {
+	if runtime.restoreHeld != nil {
+		runtime.restoreHeld.Store(held)
+	}
+}
+
+func workerPublicationHeld(setupMarker string, restoreHeld *atomic.Bool) bool {
+	if restoreHeld != nil && restoreHeld.Load() {
+		return true
+	}
+	info, err := os.Lstat(setupMarker)
+	return err == nil && info.Mode().IsRegular()
 }
 
 type publicationDrainTarget struct {

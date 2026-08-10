@@ -158,6 +158,15 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if _, err := selfTestRequest(ctx, client, registration.Record, "checkpoint_barrier", drainParams); err != nil {
 		return err
 	}
+	// Keep publication from racing the restore assertions. The restore itself
+	// still runs through the real worker and operation gate; this hold only
+	// prevents the restoration checkpoint from being published between the
+	// apply response and the byte-for-byte HEAD/index checks below.
+	holdPath := scratchRoots.SetupPublicationHoldPath()
+	if err := os.WriteFile(holdPath, []byte("self-test restore verification\n"), 0o600); err != nil {
+		return fmt.Errorf("setup self-test: hold publication for restore verification: %w", err)
+	}
+	defer os.Remove(holdPath)
 	headBefore, err := gitpkg.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		return err

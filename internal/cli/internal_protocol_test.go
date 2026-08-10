@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,9 +17,54 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	restorepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/restore"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
+
+func TestWorkerPublicationHoldIncludesInterruptedRestore(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "setup-publication-hold")
+	restoreHeld := &atomic.Bool{}
+	if workerPublicationHeld(marker, restoreHeld) {
+		t.Fatal("worker started held without a setup marker or interrupted restore")
+	}
+	restoreHeld.Store(true)
+	if !workerPublicationHeld(marker, restoreHeld) {
+		t.Fatal("interrupted restore did not hold worker publication")
+	}
+	restoreHeld.Store(false)
+	if err := os.WriteFile(marker, []byte("setup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !workerPublicationHeld(marker, restoreHeld) {
+		t.Fatal("setup marker did not hold worker publication")
+	}
+}
+
+func TestWorkerRepairPreviewRemainsAvailableDuringRestoreHold(t *testing.T) {
+	db, err := state.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	held := &atomic.Bool{}
+	held.Store(true)
+	handler := repositoryWorkerHandler{runtimes: map[string]*workerRuntime{
+		"worktree": {db: db, gate: &sync.RWMutex{}, restoreHeld: held},
+	}}
+	result, protocolErr := handler.HandleWorkerRequest(context.Background(), supervisor.Request{
+		Method: "repair", WorktreeID: "worktree",
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	if plan, ok := result.(restorepkg.RepairPlan); !ok || plan.OperationID != "" {
+		t.Fatalf("repair preview=%+v", result)
+	}
+	if held.Load() {
+		t.Fatal("repair preview did not clear a stale restore hold")
+	}
+}
 
 func TestSupervisorWorkerEnvironmentRequiresEnabledRepository(t *testing.T) {
 	repo := materializeTestRepo(t, false)

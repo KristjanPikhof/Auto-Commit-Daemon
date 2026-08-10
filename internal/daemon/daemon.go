@@ -922,7 +922,10 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
-		if operation, active := gitOperationInProgress(opts.GitDir); active {
+		if opts.PublicationHeld != nil && opts.PublicationHeld() {
+			logger.Info("startup self-publication recovery deferred by publication hold")
+			startupPublicationBlocked = true
+		} else if operation, active := gitOperationInProgress(opts.GitDir); active {
 			logger.Info("startup self-publication recovery deferred during git operation",
 				"operation", operation)
 			startupPublicationBlocked = true
@@ -1518,6 +1521,9 @@ func Run(ctx context.Context, opts Options) error {
 	recoverActiveSelfPublications := func() (blocked, hasMore bool) {
 		if cctx.BranchRef == "" {
 			return false, false
+		}
+		if opts.PublicationHeld != nil && opts.PublicationHeld() {
+			return true, false
 		}
 		recovered, recoverErr := recoverSelfPublicationsPass(recoveryRootCtx, cctx)
 		if recoverErr != nil {
@@ -2296,6 +2302,9 @@ func Run(ctx context.Context, opts Options) error {
 			})
 		}
 
+		if opts.OperationGate != nil {
+			opts.OperationGate.RLock()
+		}
 		if !operationPaused && cctx.BranchRef != "" {
 			if pauseStatus, pauseErr :=
 				daemonPauseState(ctx, opts.GitDir, opts.DB); pauseErr != nil {
@@ -2312,6 +2321,9 @@ func Run(ctx context.Context, opts Options) error {
 			if processBranchTokenChange("branch token") {
 				branchTransitionBlocked = true
 			}
+		}
+		if opts.OperationGate != nil {
+			opts.OperationGate.RUnlock()
 		}
 
 		// 4e. Drain pending flush_requests; each bounded batch triggers one
@@ -2471,14 +2483,14 @@ func Run(ctx context.Context, opts Options) error {
 				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
 			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
 		}
+		if opts.OperationGate != nil {
+			opts.OperationGate.RLock()
+		}
 		publicationHeld := opts.PublicationHeld != nil && opts.PublicationHeld()
 		if publicationHeld {
 			logger.Info("publication held by transactional setup; protection remains active")
 		}
 		unsafePublication := branchTransitionBlocked || operationPaused || detachedHeadPaused || daemonPaused || publicationHeld
-		if opts.OperationGate != nil {
-			opts.OperationGate.RLock()
-		}
 		observationEpoch, observationErr := BeginProtectionObservation(passCtx, opts.DB)
 		if observationErr != nil {
 			capErr = observationErr
@@ -2528,7 +2540,8 @@ func Run(ctx context.Context, opts Options) error {
 			repErr        error
 			replayChecked bool
 		)
-		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused && !daemonPaused && cctx.BaseHead != "" {
+		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused &&
+			!daemonPaused && !publicationHeld && cctx.BaseHead != "" {
 			replayChecked = true
 			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
 			// pending queue cannot starve flush_request claims, heartbeat

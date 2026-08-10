@@ -40,8 +40,92 @@ type OperationStep struct {
 	Phase        string
 }
 
+// BeginRestoreApply records the durable pre-restore checkpoint and makes the
+// restore repairable before the first working-tree mutation.
+func BeginRestoreApply(ctx context.Context, db *DB, operationID, preCheckpointID string) error {
+	if db == nil || operationID == "" || preCheckpointID == "" {
+		return errors.New("state: incomplete restore apply transition")
+	}
+	now := float64(time.Now().UnixNano()) / float64(time.Second)
+	conn, err := db.conn.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA synchronous=FULL"); err != nil {
+		return fmt.Errorf("state: enable full restore durability: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "PRAGMA synchronous=NORMAL") }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE restore_operations
+SET pre_restore_checkpoint_id=?,phase=?,updated_ts=?
+WHERE operation_id=? AND phase=?`, preCheckpointID, OperationApplying, now,
+		operationID, OperationPrepared)
+	if err != nil {
+		return fmt.Errorf("state: begin restore apply: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE operations SET phase=?,status=?,error=?,updated_ts=?
+WHERE id=? AND status=?`, OperationApplying, OperationActive, "", now,
+		operationID, OperationPrepared)
+	if err != nil {
+		return fmt.Errorf("state: activate restore operation: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
+// FinishRestoreOperation moves the specialized and general journals together
+// so recovery never observes a completed restore paired with an active parent.
+func FinishRestoreOperation(
+	ctx context.Context,
+	db *DB,
+	operationID, preCheckpointID, postCheckpointID, phase, status, sanitizedError string,
+) error {
+	if db == nil || operationID == "" || phase == "" || status == "" {
+		return errors.New("state: incomplete restore finish transition")
+	}
+	now := float64(time.Now().UnixNano()) / float64(time.Second)
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE restore_operations
+SET pre_restore_checkpoint_id=COALESCE(NULLIF(?,''),pre_restore_checkpoint_id),
+    post_restore_checkpoint_id=COALESCE(NULLIF(?,''),post_restore_checkpoint_id),
+    phase=?,updated_ts=? WHERE operation_id=?`, preCheckpointID, postCheckpointID,
+		phase, now, operationID)
+	if err != nil {
+		return fmt.Errorf("state: finish restore operation: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE operations
+SET phase=?,status=?,error=?,updated_ts=?,completed_ts=CASE WHEN ? IN (?,?) THEN ? ELSE completed_ts END
+WHERE id=?`, phase, status, sanitizedError, now, status,
+		OperationCompleted, OperationRolledBack, now, operationID)
+	if err != nil {
+		return fmt.Errorf("state: finish parent operation: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 type RestoreOperation struct {
 	OperationID        string
+	WorktreeID         string
 	TargetCheckpointID string
 	PreCheckpointID    sql.NullString
 	PostCheckpointID   sql.NullString
@@ -149,15 +233,55 @@ SET pre_restore_checkpoint_id=COALESCE(NULLIF(?,''),pre_restore_checkpoint_id),
 func RepairableRestoreOperation(ctx context.Context, db *DB) (RestoreOperation, error) {
 	var operation RestoreOperation
 	err := db.conn.QueryRowContext(ctx, `
-SELECT r.operation_id,r.target_checkpoint_id,r.pre_restore_checkpoint_id,
+SELECT r.operation_id,o.worktree_id,r.target_checkpoint_id,r.pre_restore_checkpoint_id,
        r.post_restore_checkpoint_id,r.plan_digest,r.phase,o.status,o.created_ts
 FROM restore_operations r JOIN operations o ON o.id=r.operation_id
-WHERE o.status=? AND r.phase='applying'
-ORDER BY o.created_ts DESC LIMIT 1`, OperationNeedsAttention).Scan(
-		&operation.OperationID, &operation.TargetCheckpointID, &operation.PreCheckpointID,
+WHERE o.status IN (?,?) AND r.phase IN ('applying','applied')
+ORDER BY o.created_ts DESC LIMIT 1`, OperationActive, OperationNeedsAttention).Scan(
+		&operation.OperationID, &operation.WorktreeID, &operation.TargetCheckpointID, &operation.PreCheckpointID,
 		&operation.PostCheckpointID, &operation.PlanDigest, &operation.Phase,
 		&operation.OperationStatus, &operation.OperationCreatedTS)
 	return operation, err
+}
+
+// RestoreRepairPending reports whether this worktree has an interrupted
+// restore that must hold capture and publication while the repair RPC remains
+// available.
+func RestoreRepairPending(ctx context.Context, db *DB) (bool, error) {
+	if db == nil {
+		return false, errors.New("state: restore repair check requires a database")
+	}
+	_, err := RepairableRestoreOperation(ctx, db)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// RestoreOperationSteps returns the immutable path proof ledger in execution
+// order. Repair uses it to distinguish exact before/after states from edits
+// that were not authored by the interrupted restore.
+func RestoreOperationSteps(ctx context.Context, db *DB, operationID string) ([]OperationStep, error) {
+	if db == nil || operationID == "" {
+		return nil, errors.New("state: restore operation steps require an operation")
+	}
+	rows, err := db.readSQL().QueryContext(ctx, `
+SELECT operation_id,ord,kind,target,before_digest,after_digest,proof_id,phase
+FROM operation_steps WHERE operation_id=? ORDER BY ord`, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var steps []OperationStep
+	for rows.Next() {
+		var step OperationStep
+		if err := rows.Scan(&step.OperationID, &step.Sequence, &step.Kind, &step.Target,
+			&step.BeforeDigest, &step.AfterDigest, &step.ProofID, &step.Phase); err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
+	}
+	return steps, rows.Err()
 }
 
 func UncheckpointedEventSeqsSince(ctx context.Context, db *DB, capturedAfter float64) ([]int64, error) {
