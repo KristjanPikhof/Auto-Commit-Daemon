@@ -548,6 +548,27 @@ func TestRollbackRestoresModeWhenContentIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestFileDigestDetectsModeOnlyDrift(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(target, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := currentFileDigest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := currentFileDigest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("mode-only drift did not change the file proof")
+	}
+}
+
 func TestSetupRollbackPreservesConcurrentEditAndNeedsAction(t *testing.T) {
 	ctx := context.Background()
 	roots, repo, executable := installerFixture(t, ctx)
