@@ -101,15 +101,23 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 			}
 		}
 	}
+	candidateIDs := make(map[string]bool, len(candidates))
+	for _, item := range candidates {
+		candidateIDs[item.ID] = true
+	}
+	protectedObjects := make(map[string]bool)
 	for _, item := range checkpoints {
-		if !item.Retained || containsRetentionCandidate(candidates, item.ID) {
+		if !item.Retained || candidateIDs[item.ID] {
 			continue
 		}
 		if !item.Published || item.Unresolved || item.Reason == state.CheckpointReasonPreRestore {
 			for oid := range inventories[item.ID] {
-				summary.ProtectedBytes += objectSizes[oid]
+				protectedObjects[oid] = true
 			}
 		}
+	}
+	for oid := range protectedObjects {
+		summary.ProtectedBytes += objectSizes[oid]
 	}
 	for _, item := range candidates {
 		digest := sha256.Sum256([]byte(item.ID + "\x00" + item.Ref + "\x00" + item.CommitOID))
@@ -130,19 +138,10 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 	}
 	summary.Retained = 0
 	for _, item := range checkpoints {
-		if item.Retained && !containsRetentionCandidate(candidates, item.ID) {
+		if item.Retained && !candidateIDs[item.ID] {
 			summary.Retained++
 		}
 	}
 	summary.OverBudget = summary.ContentBytes > DefaultContentBudget
 	return summary, nil
-}
-
-func containsRetentionCandidate(items []state.RetentionCheckpoint, id string) bool {
-	for _, item := range items {
-		if item.ID == id {
-			return true
-		}
-	}
-	return false
 }

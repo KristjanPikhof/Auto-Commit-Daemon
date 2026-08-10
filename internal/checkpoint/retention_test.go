@@ -85,3 +85,25 @@ func TestRetentionTreatsZeroMemberCheckpointAsProtectionOnly(t *testing.T) {
 		t.Fatalf("retention checkpoints=%+v", items)
 	}
 }
+
+func TestRetentionDeduplicatesProtectedObjectBytes(t *testing.T) {
+	ctx := context.Background()
+	repo, db := checkpointFixture(t, ctx)
+	store := Store{DB: db}
+	for epoch := int64(1); epoch <= 2; epoch++ {
+		if _, err := store.Create(ctx, Request{
+			RepoRoot: repo, WorktreeID: WorktreeID(repo),
+			Reason:           state.CheckpointReasonManualBarrier,
+			ObservationEpoch: epoch, CoverageEpoch: epoch,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary, err := store.ApplyRetention(ctx, repo, WorktreeID(repo), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProtectedBytes > summary.ContentBytes {
+		t.Fatalf("protected bytes=%d exceed retained content=%d", summary.ProtectedBytes, summary.ContentBytes)
+	}
+}
