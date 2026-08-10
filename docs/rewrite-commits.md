@@ -23,6 +23,15 @@ Imperative subjects are at most 50 characters with no period, followed by a
 blank line and `- ` context bullets wrapped at 72. Conventional mode accepts
 scope-less supported types and the same body contract.
 
-Use `--progress human`, `--progress json`, or `--progress off` for the existing
-progress contract. JSONL progress is written to stderr so stdout remains the
-single command result.
+Progress defaults to `--progress auto`, which writes human-readable progress
+when stderr is a terminal and stays silent otherwise. Use `--progress plain`,
+`--progress json`, or `--progress off` to override it. Human-readable proposal
+and recreation events include the current and total commit counts:
+
+~~~text
+rewrite-commits: proposal [42/169]: proposal accepted
+rewrite-commits: apply_recreate_selected [42/169]: recreated selected commit
+~~~
+
+JSONL progress is written to stderr so stdout remains the single command
+result.

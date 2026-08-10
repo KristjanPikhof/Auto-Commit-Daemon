@@ -89,18 +89,22 @@ func (s rewriteProgressSink) Emit(event rewriteProgressEvent) error {
 		enc := json.NewEncoder(s.out)
 		return enc.Encode(event)
 	case rewriteProgressModePlain:
+		position := ""
+		if event.Current > 0 && event.Total > 0 {
+			position = fmt.Sprintf(" [%d/%d]", event.Current, event.Total)
+		}
 		if event.Phase == "" && event.Message == "" {
 			return nil
 		}
 		if event.Message == "" {
-			_, err := fmt.Fprintf(s.out, "rewrite-commits: %s\n", event.Phase)
+			_, err := fmt.Fprintf(s.out, "rewrite-commits: %s%s\n", event.Phase, position)
 			return err
 		}
 		if event.Phase == "" {
-			_, err := fmt.Fprintf(s.out, "rewrite-commits: %s\n", event.Message)
+			_, err := fmt.Fprintf(s.out, "rewrite-commits:%s %s\n", position, event.Message)
 			return err
 		}
-		_, err := fmt.Fprintf(s.out, "rewrite-commits: %s: %s\n", event.Phase, event.Message)
+		_, err := fmt.Fprintf(s.out, "rewrite-commits: %s%s: %s\n", event.Phase, position, event.Message)
 		return err
 	default:
 		return nil
