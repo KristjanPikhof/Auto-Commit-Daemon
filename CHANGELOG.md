@@ -12,8 +12,15 @@
 - Added one user-level supervisor with one isolated worker per Git common
   directory; filesystem polling remains the universal protection path and
   integrations provide optional hints only.
-- On macOS, run the supervisor and workers from the authorized Terminal or
-  agent session so setup needs no Full Disk Access; Linux retains systemd.
+- On macOS, share one owner-only supervisor across same-user terminals and
+  agent applications, with peer UID validation and no Full Disk Access;
+  Linux retains systemd.
+- Added journaled compatible runtime replacement and a bounded setup mode that
+  avoid repeating all-repository migration scans and self-tests after ordinary
+  source rebuilds.
+- Made integration session-start and active wake failures fail closed while
+  idle, stop, and close hints preserve the real exit code, log it, and return
+  success.
 - Changed fresh defaults to deterministic Intent/Fast with structural
   verification and no credential or diff egress requirement. The one-shot
   v19 to v20 cutover preserves existing effective publication settings.

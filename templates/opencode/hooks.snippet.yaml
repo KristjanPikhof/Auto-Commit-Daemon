@@ -12,7 +12,8 @@ hooks:
             --harness opencode \
             --watch-pid "$PPID" \
             --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
-              printf '[%s] session-start failed exit=%d cmd=acd-start\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              rc=$?
+              printf '[%s] session-start failed exit=%d cmd=acd-start\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
               exit 1
             }
 
@@ -31,7 +32,8 @@ hooks:
             && acd internal hint --kind wake \
               --session-id "$OPENCODE_SESSION_ID" \
               --repo "$OPENCODE_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
-              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              rc=$?
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
               exit 1
             }
 
@@ -50,7 +52,8 @@ hooks:
             && acd internal hint --kind wake \
               --session-id "$OPENCODE_SESSION_ID" \
               --repo "$OPENCODE_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
-              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
+              rc=$?
+              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
               exit 1
             }
 
@@ -63,7 +66,11 @@ hooks:
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd internal hint --kind logical_boundary \
             --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG"
+            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
+              rc=$?
+              printf '[%s] logical-boundary failed exit=%d cmd=acd-flush-logical\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
+              exit 0
+            }
 
   - id: acd-stop
     event: session.deleted
@@ -74,4 +81,8 @@ hooks:
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
           acd internal session close \
             --session-id "$OPENCODE_SESSION_ID" \
-            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG"
+            --repo "$OPENCODE_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
+              rc=$?
+              printf '[%s] session-close failed exit=%d cmd=acd-stop\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
+              exit 0
+            }

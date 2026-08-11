@@ -29,12 +29,14 @@ canonical Git common directory and runs one isolated worker for each group.
 The supervisor never opens repository SQLite as a writer. Workers own their
 repositories under the canonical common-directory lock.
 
-On macOS the supervisor and workers are descendants of the authorized
-Terminal or agent session. ACD therefore needs no Full Disk Access and does
-not install a launchd service. Mutating commands and supported integration
-hints start the session supervisor when it is absent; after logout or reboot,
-protection resumes on that first invocation. Linux uses a persistent systemd
-user service.
+On macOS the supervisor and workers are descendants of the first authorized
+Terminal or agent application that starts them. One owner-only socket is shared
+by all processes for that user; the server verifies the peer UID before reading
+a request, and repository IDs are still restricted by the registered allowlist.
+ACD therefore needs no Full Disk Access and does not install a launchd service.
+Mutating commands and supported integration hints start the supervisor when it
+is absent; after logout or reboot, protection resumes on that first invocation.
+Linux uses a persistent systemd user service.
 
 Local newline-delimited JSON IPC uses schema v1, request IDs, strict method
 validation, worktree identity, and bounded deadlines. Mutations fail closed if
@@ -44,6 +46,20 @@ SQLite projection.
 The supervisor restarts a crashed worker after 1, 2, 5, 10, then 30 seconds.
 Backoff resets after five healthy minutes. Repeated crashes surface as
 `needs_action` while bounded retries continue.
+
+The supervisor advertises protocol, registry, repository-state, and integration
+compatibility plus the exact managed-binary digest. A newer compatible CLI
+checkpoints enabled repositories, journals and atomically replaces the binary
+and owned hooks, restarts the supervisor, and rolls back on failed readiness.
+A missing or mismatched compatibility tuple remains a fail-closed full-setup
+boundary.
+
+Integration session-start and active wake hooks fail nonzero when protection
+cannot start or wake. Idle, stop, and session-close boundary hints preserve and
+log the real command exit code but return success, because they refine commit
+grouping and cleanup rather than establish current protection. Hook-triggered
+compatible upgrades are detached only after the current hint succeeds; an
+interactive mutation waits for the same journaled replacement to finish.
 
 ## Repository identity
 
