@@ -18,6 +18,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
 	_ "modernc.org/sqlite"
@@ -81,6 +82,11 @@ type statusReport struct {
 	CheckpointRetentionOverBudget bool                      `json:"checkpoint_retention_over_budget,omitempty"`
 	FullPollTS                    float64                   `json:"full_poll_ts,omitempty"`
 	WatcherQueueDepth             int                       `json:"watcher_queue_depth,omitempty"`
+	Busy                          bool                      `json:"busy"`
+	OperationalState              string                    `json:"operational_state"`
+	WorktreeClean                 bool                      `json:"worktree_clean"`
+	AllChangesCommittedInGit      bool                      `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -400,6 +406,7 @@ WHERE cp.phase='completed'
 		return report, fmt.Errorf("intent strategy: %w", err)
 	} else {
 		report.IntentStrategy = intentStrategy
+		report.IntentStrategy.RejectLogPath = plannerRejectLogPath(rec.StateDB)
 	}
 	if err := statusDecisionSummary(ctx, conn, &report); err != nil {
 		return report, err
@@ -431,8 +438,44 @@ WHERE cp.phase='completed'
 	} else {
 		report.SelfPublication = publication
 	}
+	changes, err := productWorktreeChangeCount(ctx, rec.Path)
+	if err != nil {
+		return report, fmt.Errorf("worktree status: %w", err)
+	}
+	report.WorktreeClean = changes == 0
+	report.AllChangesCommittedInGit = report.WorktreeClean
+	report.CheckpointPublishedByACD = report.Protected &&
+		report.UnpublishedCheckpoints == 0 && report.PendingEvents == 0
+	report.Busy = report.Daemon == "running" && !report.Stale &&
+		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
+			report.Configuration.Configuration == "validating")
+	report.OperationalState = statusOperationalState(report)
 
 	return report, nil
+}
+
+func statusOperationalState(report statusReport) string {
+	switch {
+	case report.Stale || report.Daemon != "running" || report.PID <= 0 ||
+		!identity.Alive(report.PID):
+		return "stopped"
+	case report.Configuration.Configuration == "needs_attention" ||
+		report.Replay.State == "needs_attention" ||
+		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
+		return "needs_attention"
+	case report.IntentStrategy.PlannerHealth != nil &&
+		(report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
+			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
+		return "fallback"
+	case report.Replay.State == "degraded":
+		return "retrying"
+	case report.PendingEvents > 0 && report.IntentStrategy.BatchWaitActive:
+		return "waiting"
+	case report.Busy:
+		return "busy"
+	default:
+		return "healthy_idle"
+	}
 }
 
 func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
@@ -582,6 +625,16 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
 	renderSelfPublicationHuman(out, r.SelfPublication, "")
+	fmt.Fprintf(out, "Operational state: %s", valueOrUnset(r.OperationalState))
+	if r.Busy {
+		fmt.Fprint(out, " (heartbeat fresh; work in progress)")
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(r.WorktreeClean))
+	fmt.Fprintf(out, "All changes committed in Git: %s\n",
+		yesNo(r.AllChangesCommittedInGit))
+	fmt.Fprintf(out, "Latest protection checkpoint published by ACD: %s\n",
+		yesNo(r.CheckpointPublishedByACD))
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))
 	for _, c := range r.Clients {

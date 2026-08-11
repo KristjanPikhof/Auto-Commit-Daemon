@@ -141,7 +141,7 @@ func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 	}
 }
 
-func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
+func TestApplyControlStatusDurableReplayBlockNeedsAttention(t *testing.T) {
 	status := statusReport{
 		Daemon: "running", PID: os.Getpid(),
 		Replay: replayObservabilityReport{
@@ -151,7 +151,7 @@ func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
 	result := controlResult{OK: true, Health: controlHealthHealthy}
 	applyControlStatus(&result, status)
 	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, "repeatedly failing") {
+		!strings.Contains(result.Summary, "durable block") {
 		t.Fatalf("control result=%+v", result)
 	}
 }

@@ -42,21 +42,26 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
-	Repo              string `json:"repo"`
-	Command           string `json:"command"`
-	Registered        bool   `json:"registered"`
-	Enabled           bool   `json:"enabled"`
-	Worker            string `json:"worker"`
-	Protected         bool   `json:"protected"`
-	Published         bool   `json:"published"`
-	ActionRequired    bool   `json:"action_required"`
-	CheckpointID      string `json:"checkpoint_id,omitempty"`
-	PendingEvents     int    `json:"pending_events"`
-	BlockedEvents     int    `json:"blocked_events"`
-	Summary           string `json:"summary"`
-	StatePreserved    bool   `json:"state_preserved"`
-	CLIVersion        string `json:"cli_version,omitempty"`
-	SupervisorVersion string `json:"supervisor_version,omitempty"`
+	Repo                     string `json:"repo"`
+	Command                  string `json:"command"`
+	Registered               bool   `json:"registered"`
+	Enabled                  bool   `json:"enabled"`
+	Worker                   string `json:"worker"`
+	Protected                bool   `json:"protected"`
+	Published                bool   `json:"published"`
+	Busy                     bool   `json:"busy"`
+	OperationalState         string `json:"operational_state"`
+	WorktreeClean            bool   `json:"worktree_clean"`
+	AllChangesCommittedInGit bool   `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool   `json:"checkpoint_published_by_acd"`
+	ActionRequired           bool   `json:"action_required"`
+	CheckpointID             string `json:"checkpoint_id,omitempty"`
+	PendingEvents            int    `json:"pending_events"`
+	BlockedEvents            int    `json:"blocked_events"`
+	Summary                  string `json:"summary"`
+	StatePreserved           bool   `json:"state_preserved"`
+	CLIVersion               string `json:"cli_version,omitempty"`
+	SupervisorVersion        string `json:"supervisor_version,omitempty"`
 }
 
 func envelopeFromControl(result controlResult) productEnvelope {
@@ -92,21 +97,26 @@ func envelopeFromControl(result controlResult) productEnvelope {
 		Actions:    actions,
 		NextAction: next,
 		Data: productStatusData{
-			Repo:              result.Repo,
-			Command:           result.Command,
-			Registered:        result.Registered,
-			Enabled:           result.Enabled,
-			Worker:            result.Daemon,
-			Protected:         result.Protected,
-			Published:         result.Published,
-			ActionRequired:    actionRequired,
-			CheckpointID:      result.CheckpointID,
-			PendingEvents:     result.PendingEvents,
-			BlockedEvents:     result.BlockedEvents,
-			Summary:           result.Summary,
-			StatePreserved:    result.StatePreserved,
-			CLIVersion:        result.CLIVersion,
-			SupervisorVersion: result.SupervisorVersion,
+			Repo:                     result.Repo,
+			Command:                  result.Command,
+			Registered:               result.Registered,
+			Enabled:                  result.Enabled,
+			Worker:                   result.Daemon,
+			Protected:                result.Protected,
+			Published:                result.Published,
+			Busy:                     result.Busy,
+			OperationalState:         result.OperationalState,
+			WorktreeClean:            result.WorktreeClean,
+			AllChangesCommittedInGit: result.AllChangesCommittedInGit,
+			CheckpointPublishedByACD: result.CheckpointPublishedByACD,
+			ActionRequired:           actionRequired,
+			CheckpointID:             result.CheckpointID,
+			PendingEvents:            result.PendingEvents,
+			BlockedEvents:            result.BlockedEvents,
+			Summary:                  result.Summary,
+			StatePreserved:           result.StatePreserved,
+			CLIVersion:               result.CLIVersion,
+			SupervisorVersion:        result.SupervisorVersion,
 		},
 	}
 }
@@ -125,6 +135,9 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	fmt.Fprintf(out, "Enabled: %s\n", yesNo(data.Enabled))
 	fmt.Fprintf(out, "Protected: %s\n", yesNo(data.Protected))
 	fmt.Fprintf(out, "Published to Git: %s\n", yesNo(data.Published))
+	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(data.WorktreeClean))
+	fmt.Fprintf(out, "All changes committed in Git: %s\n", yesNo(data.AllChangesCommittedInGit))
+	fmt.Fprintf(out, "Latest protection checkpoint published by ACD: %s\n", yesNo(data.CheckpointPublishedByACD))
 	fmt.Fprintf(out, "Action required: %s\n", yesNo(data.ActionRequired))
 	if envelope.NextAction == nil {
 		fmt.Fprintln(out, "Next: No action needed.")

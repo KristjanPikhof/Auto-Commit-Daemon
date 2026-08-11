@@ -37,26 +37,31 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	OK                bool     `json:"ok"`
-	Command           string   `json:"command"`
-	Repo              string   `json:"repo"`
-	Health            string   `json:"health"`
-	Summary           string   `json:"summary"`
-	NextAction        string   `json:"next_action"`
-	Registered        bool     `json:"registered"`
-	Enabled           bool     `json:"enabled"`
-	Daemon            string   `json:"daemon"`
-	DaemonPID         int      `json:"daemon_pid"`
-	PendingEvents     int      `json:"pending_events"`
-	BlockedEvents     int      `json:"blocked_events"`
-	Changed           bool     `json:"changed"`
-	Actions           []string `json:"actions"`
-	StatePreserved    bool     `json:"state_preserved"`
-	Protected         bool     `json:"protected"`
-	Published         bool     `json:"published"`
-	CheckpointID      string   `json:"checkpoint_id,omitempty"`
-	CLIVersion        string   `json:"cli_version,omitempty"`
-	SupervisorVersion string   `json:"supervisor_version,omitempty"`
+	OK                       bool     `json:"ok"`
+	Command                  string   `json:"command"`
+	Repo                     string   `json:"repo"`
+	Health                   string   `json:"health"`
+	Summary                  string   `json:"summary"`
+	NextAction               string   `json:"next_action"`
+	Registered               bool     `json:"registered"`
+	Enabled                  bool     `json:"enabled"`
+	Daemon                   string   `json:"daemon"`
+	DaemonPID                int      `json:"daemon_pid"`
+	PendingEvents            int      `json:"pending_events"`
+	BlockedEvents            int      `json:"blocked_events"`
+	Changed                  bool     `json:"changed"`
+	Actions                  []string `json:"actions"`
+	StatePreserved           bool     `json:"state_preserved"`
+	Protected                bool     `json:"protected"`
+	Published                bool     `json:"published"`
+	Busy                     bool     `json:"busy"`
+	OperationalState         string   `json:"operational_state"`
+	WorktreeClean            bool     `json:"worktree_clean"`
+	AllChangesCommittedInGit bool     `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool     `json:"checkpoint_published_by_acd"`
+	CheckpointID             string   `json:"checkpoint_id,omitempty"`
+	CLIVersion               string   `json:"cli_version,omitempty"`
+	SupervisorVersion        string   `json:"supervisor_version,omitempty"`
 }
 
 type controlRepoLookup struct {
@@ -416,6 +421,11 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	res.BlockedEvents = status.BlockedConflicts
 	res.Protected = status.Protected
 	res.Published = status.Protected && status.UnpublishedCheckpoints == 0 && status.PendingEvents == 0
+	res.Busy = status.Busy
+	res.OperationalState = status.OperationalState
+	res.WorktreeClean = status.WorktreeClean
+	res.AllChangesCommittedInGit = status.AllChangesCommittedInGit
+	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	res.CheckpointID = status.LatestCheckpointID
 
 	switch {
@@ -460,7 +470,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Git publication is repeatedly failing; checkpoint protection remains active."
+		res.Summary = "A durable block has stopped Git publication; this blocked publication needs recovery while checkpoint protection remains active."
 		res.NextAction = "Run `acd doctor` to inspect the blocked publication."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
@@ -499,8 +509,8 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "Run `acd doctor` for the safe metadata warning."
 	case status.Replay.State == "degraded":
 		res.Health = controlHealthDegraded
-		res.Summary = "Replay encountered an error and remains retryable."
-		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the error repeats."
+		res.Summary = fmt.Sprintf("Replay is retrying after %d consecutive error(s); checkpoint protection remains active.", status.Replay.ErrorRepeatCount)
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the retrying state persists."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."
