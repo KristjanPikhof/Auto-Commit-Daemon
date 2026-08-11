@@ -111,7 +111,7 @@ func buildCompatibleSetupPlan(
 	} else {
 		plan.Actions = []Action{
 			{Kind: "backup", Target: plan.BackupRoot, Detail: "Back up the managed binary and integration files"},
-			{Kind: "checkpoint", Target: "enabled repositories", Detail: "Drain repository workers at a safe checkpoint boundary"},
+			{Kind: "checkpoint", Target: "enabled repositories", Detail: "Protect repository changes at a safe checkpoint boundary"},
 			{Kind: "install_binary", Target: plan.ManagedBinary, Detail: "Atomically replace the compatible ACD runtime"},
 		}
 		for _, name := range integrations {
@@ -358,7 +358,10 @@ func checkpointUpgradeRepositories(ctx context.Context, roots paths.Roots, regis
 					if record.LifecycleDisabled() || barrierCtx.Err() != nil {
 						continue
 					}
-					params, _ := json.Marshal(map[string]any{"kind": "checkpoint", "drain_publication": true})
+					// Runtime replacement needs a durable checkpoint, not a Git
+					// publication. Detached worktrees remain protected and resume
+					// normal publication after the supervisor restarts.
+					params, _ := json.Marshal(map[string]any{"kind": "checkpoint", "drain_publication": false})
 					request := supervisor.Request{Version: supervisor.ProtocolVersion, ID: "runtime-upgrade-checkpoint-" + record.WorktreeID,
 						Method: "checkpoint_barrier", RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID,
 						DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(), Params: params}

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -104,6 +105,67 @@ func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
 		if action.Kind == "migrate" || action.Kind == "self_test" {
 			t.Fatalf("compatible plan contains full setup action: %+v", action)
 		}
+	}
+}
+
+func TestCheckpointUpgradeRepositoriesDoesNotDrainPublication(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "acd-upgrade-checkpoint-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	roots := paths.Roots{State: filepath.Join(root, "state", "acd")}
+	if err := os.MkdirAll(filepath.Dir(roots.SupervisorSocketPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", roots.SupervisorSocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	requestC := make(chan supervisor.Request, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		var request supervisor.Request
+		if json.NewDecoder(bufio.NewReader(conn)).Decode(&request) != nil {
+			return
+		}
+		requestC <- request
+		_ = json.NewEncoder(conn).Encode(supervisor.Response{
+			Version: supervisor.ProtocolVersion, ID: request.ID, OK: true,
+			Data: map[string]any{"protected": true},
+		})
+	}()
+
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/detached-worktree", RepositoryID: "repository", WorktreeID: "worktree",
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := checkpointUpgradeRepositories(ctx, roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-requestC:
+		if request.Method != "checkpoint_barrier" {
+			t.Fatalf("method=%q want checkpoint_barrier", request.Method)
+		}
+		var params struct {
+			DrainPublication bool `json:"drain_publication"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params.DrainPublication {
+			t.Fatal("compatible runtime upgrade must protect state without draining Git publication")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }
 
