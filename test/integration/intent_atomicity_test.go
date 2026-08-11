@@ -314,8 +314,8 @@ WHERE capture.path IN ('split-b.txt','split-c.txt')
 			waiting)
 	}
 
-	if hits.Load() != 3 {
-		t.Fatalf("planner hits=%d want 3 (initial plan plus two configured corrections)", hits.Load())
+	if hits.Load() != 1 {
+		t.Fatalf("planner hits=%d want 1 (structural failure skips remote correction)", hits.Load())
 	}
 }
 

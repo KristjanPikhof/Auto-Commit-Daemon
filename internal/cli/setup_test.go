@@ -1313,6 +1313,7 @@ func TestSetup_ApplyFlag_NonZero(t *testing.T) {
 func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	chdirForTest(t, initCLIResolverRepo(t))
 
 	settings := filepath.Join(home, ".claude", "settings.json")
 	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
@@ -1363,6 +1364,7 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	chdirForTest(t, initCLIResolverRepo(t))
 
 	files := map[string]string{
 		filepath.Join(home, ".claude", "settings.json"): `{"_acd_managed": true}`,

@@ -24,6 +24,18 @@
 - Changed fresh defaults to deterministic Intent/Fast with structural
   verification and no credential or diff egress requirement. The one-shot
   v19 to v20 cutover preserves existing effective publication settings.
+- Intent planning now repairs only mechanically proven missing dependency
+  declarations, permits at most one effective remote correction, and uses
+  validated deterministic fallback for invalid output without a retry loop.
+- A full Intent planning window now waits for the repository settle window.
+  Durable boundaries, logical flushes, dependency-safe forced aging, and the
+  maximum pending age still release work.
+- Status now distinguishes retrying replay, durable publication blocks, busy
+  workers with fresh heartbeats, clean Git state, checkpoint protection, and
+  checkpoints published by ACD.
+- Linked worktrees now keep planner reject logs in their exact Git directories.
+  Shared daemon logs include worktree and Git-directory identity on each
+  worktree record, while rejected raw responses remain redacted by default.
 
 ### Added
 

@@ -40,26 +40,18 @@ import (
 	"time"
 )
 
-// TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError simulates an
-// openai-compat planner whose first response trips the typed validator
-// with IntentPlanValidationEmptySelected — selected_seqs comes back as
-// an empty array which normalization cannot heal. The composed retry
+// TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError simulates an
+// openai-compat planner whose first response trips the typed validator with
+// an empty ready-candidate subject. That metadata-only failure is eligible
+// for the single bounded remote correction. The composed retry
 // loop must:
 //
-//  1. Detect the *IntentPlanValidationError{Code:
-//     IntentPlanValidationEmptySelected} on attempt 1.
+//  1. Detect the eligible ready_subject_empty validation finding on attempt 1.
 //  2. Re-prompt the same provider with the validator message appended.
 //  3. Accept the valid plan returned on attempt 2.
 //  4. Publish the grouped commit WITHOUT recording an intent_planner_error
 //     row (the retry suppresses the failure inside Compose).
-//
-// We deliberately do NOT exercise the bad_deferred_reason shape here:
-// the openai-compat provider's NormalizeIntentPlanDeferredReasons pass
-// drops spurious entries before ValidateIntentPlan ever runs (see
-// intent_planner_normalization_test.go), so that path never reaches
-// the typed-error retry surface. EmptySelected is a clean proxy for
-// "real semantic failure that the retry path absorbs".
-func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
+func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -68,15 +60,21 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 	env := withIsolatedHome(t)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
-	var hits atomic.Int32
+	var plannerHits atomic.Int32
+	var rewriteHits atomic.Int32
 	var sawRetryCorrection atomic.Bool
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call := hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
+		if req.ToolChoice.Function.Name == "commit_message" {
+			rewriteHits.Add(1)
+			writeIntentMessageRewriteResponse(t, w, req)
+			return
+		}
+		call := plannerHits.Add(1)
 		seqs := offeredIntentSeqsLenient(t, req)
 		if len(seqs) < 2 {
 			http.Error(w, "expected at least two offered captures", http.StatusBadRequest)
@@ -95,20 +93,7 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 		}
 
 		var plan map[string]any
-		if call == 1 {
-			// First attempt: empty selected_seqs. Normalization cannot heal
-			// this; ValidateIntentPlan returns
-			// IntentPlanValidationError{Code: IntentPlanValidationEmptySelected}
-			// and the composed loop will retry once with RetryCorrection set.
-			plan = map[string]any{
-				"selected_seqs":    []int64{},
-				"deferred_seqs":    seqs,
-				"subject":          "First-attempt placeholder",
-				"body":             "Will be retried.",
-				"grouping_reason":  "intentional first-attempt failure",
-				"deferred_reasons": buildDeferredReasons(seqs),
-			}
-		} else {
+		if call != 1 {
 			// Second attempt: clean grouped plan. The retry path must
 			// accept this and the daemon must NOT log an
 			// intent_planner_error decision.
@@ -122,8 +107,9 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 			}
 		}
 		if call == 1 {
-			writeNativeIntentCandidatesResponse(
-				t, w, "call_recovery", []map[string]any{})
+			writeNativeIntentCandidatesResponse(t, w, "call_recovery", []map[string]any{
+				nativeReadyIntentCandidate("recovery-group", seqs, "", "- Correct the accepted candidate metadata.", "group related recovery changes"),
+			})
 		} else {
 			writeIntentPlanResponse(t, w, "call_recovery", plan)
 		}
@@ -186,10 +172,13 @@ func TestIntentPlannerRecovery_RetryAbsorbsEmptySelectedError(t *testing.T) {
 		t.Fatalf("commit count=%d want %d (retry must publish single grouped commit)", got, want)
 	}
 	if subj := headSubject(t, repo); subj != "Recovered after retry" {
-		t.Fatalf("HEAD subject=%q want %q (second-attempt subject must land)", subj, "Recovered after retry")
+		t.Fatalf("HEAD subject=%q want corrected plan subject", subj)
 	}
-	if hits.Load() < 2 {
-		t.Fatalf("planner hits=%d want >= 2 (retry must invoke provider twice)", hits.Load())
+	if plannerHits.Load() != 2 {
+		t.Fatalf("planner hits=%d want 2 (retry must invoke provider twice)", plannerHits.Load())
+	}
+	if rewriteHits.Load() != 0 {
+		t.Fatalf("message rewrite hits=%d want 0 for acceptable corrected message", rewriteHits.Load())
 	}
 	if !sawRetryCorrection.Load() {
 		t.Fatal("retry attempt did not include a Correction: block in the user prompt")

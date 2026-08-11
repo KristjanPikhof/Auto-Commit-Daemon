@@ -68,6 +68,14 @@ of SHA-256 over its canonical Git common directory. A worktree uses the same
 construction over its canonical root. Old path hashes remain migration
 metadata only.
 
+The worker daemon log is stored at
+`${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log`. Linked
+worktrees share that common-directory log. Each worktree record includes
+`repo_hash`, `worktree`, and `git_dir`; attached-branch records also include
+`branch_ref` and the known `branch_generation`. Planner reject logs are not
+shared. They stay under the exact worktree Git directory described in
+[AI providers](ai-providers.md#failure-behavior).
+
 ## Checkpoint store
 
 A checkpoint is a rootless Git commit whose tree contains the complete

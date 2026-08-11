@@ -26,9 +26,14 @@ A group publishes only after cohesion, completeness, separation, dependency,
 materialization, verification, and revertibility checks. No preset bypasses
 hard dependencies, materialization, or required verification.
 
-Candidate evaluation begins on quiet time, soft or logical boundary, maximum
-age, or capacity. Optional integrations may provide boundaries, but filesystem
-protection does not depend on them.
+Candidate evaluation normally waits until the newest capture has been quiet for
+the configured settle window. Filling the planning window does not skip that
+wait. A durable soft or hard activity boundary, an explicit logical flush, a
+dependency-safe forced-aging window, or the maximum pending age can release
+work sooner. Window
+and high-water limits still bound each planning pass and the pending queue.
+Optional integrations may provide boundaries, but filesystem protection does
+not depend on them.
 
 ## Presets
 
@@ -38,15 +43,33 @@ protection does not depend on them.
 | Balanced | Dependency-aware partition and fast verification; bounded safe repair may be enabled. |
 | Quality | Waits for a valid high-cohesion result rather than weakening safety. |
 
-Provider, grouping, or verification failure changes product state to `waiting`
-without changing completed checkpoints.
+## Planner recovery
+
+ACD repairs a missing candidate dependency only when an existing hard capture
+edge proves it. The repaired plan must pass the complete validator. It is not
+used when the plan has a cycle, an unknown owner, invalid membership, invalid
+ordering, or another structural defect.
+
+An eligible metadata error can receive one remote correction. The effective
+correction maximum is one even if an older saved setting contains a larger
+value. Fast and Balanced move directly to their validated deterministic
+fallback when local repair does not apply or the correction fails. ACD handles
+this automatically and needs no additional setup.
+
+ACD uses `needs_attention` only when it cannot prove a safe preset outcome.
+Examples include unresolved dependency ambiguity, failed materialization or
+verification, a revertibility failure, or uncertain branch ownership and
+exact-ref state. Quality also waits rather than weakening its acceptance
+rules. Provider and grouping failures that have a safe fallback remain
+retrying or waiting without changing completed checkpoints.
 
 ## Publication safety
 
 The publication path prepares exact source, target, tree, and membership before
 literal branch-ref CAS. Completion atomically records normal commit mappings
 and checkpoint publication links. Startup recovery proves the same immutable
-facts. Ambiguity remains `needs_action` and never causes a guessed settlement.
+facts. Ambiguity remains `needs_attention` and never causes a guessed
+settlement.
 
 Balanced/Quality repair is restricted to a private contiguous ACD-authored
 first-parent suffix at exact `HEAD`; it rejects merges, tags, other refs, Git

@@ -54,3 +54,11 @@ The provider circuit opens immediately on transport failure or after three
 validation/safety failures, uses 30-second, 2-minute, then 10-minute cooldowns,
 and permits one half-open probe. Cancellation releases a probe without
 changing provider health.
+
+Rejected plans are written to the exact worktree Git directory at
+`<gitDir>/acd/planner-rejects.jsonl`. Linked worktrees therefore keep separate
+reject logs. By default each row omits the raw response and records its byte
+count, SHA-256 digest, typed failure, and a small parsed-plan summary. Explicit
+raw-retention opt-in stores the response as well. The current file rotates at
+5 MiB and keeps one `.1` file. A reject-log write failure never blocks capture
+or publication fallback.
