@@ -326,19 +326,44 @@ func TestNewIntentRejectsWriter_ConcurrentAppendsDoNotInterleave(t *testing.T) {
 	}
 }
 
-// TestLogRejectedIntentPlan_NoLoggerIsNoOp asserts that the helper is
-// safe to call before ConfigureIntentRejectsLogger. Tests in this package
-// commonly never configure a logger; the call must be a silent no-op so
-// adding LogRejectedIntentPlan to providers does not break unit tests.
+// TestLogRejectedIntentPlan_NoLoggerIsNoOp asserts that an unbound context is
+// a silent no-op, so CLI and unit-test callers cannot inherit another run's
+// destination.
 func TestLogRejectedIntentPlan_NoLoggerIsNoOp(t *testing.T) {
-	prev := SetIntentRejectsLoggerForTest(nil)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
 	// Must not panic, must not return error (function returns nothing).
 	LogRejectedIntentPlan(context.Background(), "openai-compat",
 		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 1}}},
 		`{"raw":true}`,
 		errors.New("validator failure"),
 	)
+}
+
+func TestLogRejectedIntentPlan_NilWriterMasksParent(t *testing.T) {
+	w := NewIntentRejectsWriter(t.TempDir(), time.Now)
+	parent := WithIntentRejectsWriter(context.Background(), w)
+	ctx := WithIntentRejectsWriter(parent, nil)
+	LogRejectedIntentPlan(ctx, "disabled",
+		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 1}}},
+		`{"selected_seqs":[]}`, errors.New("must not persist"))
+	if _, err := os.Stat(w.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("masked writer created log: %v", err)
+	}
+}
+
+func TestLogRejectedIntentPlan_WriteFailureIsBestEffort(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("block"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	w := NewIntentRejectsWriter(filepath.Join(blocker, "acd"), time.Now)
+	ctx := WithIntentRejectsWriter(context.Background(), w)
+	LogRejectedIntentPlan(ctx, "best-effort",
+		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 1}}},
+		`{"selected_seqs":[]}`, errors.New("must not escape"))
+	if _, err := os.Stat(w.Path()); err == nil {
+		t.Fatalf("rejects path unexpectedly exists after write failure")
+	}
 }
 
 // TestLogRejectedIntentPlan_PersistsTypedCode asserts the helper extracts
@@ -348,20 +373,19 @@ func TestLogRejectedIntentPlan_NoLoggerIsNoOp(t *testing.T) {
 func TestLogRejectedIntentPlan_PersistsTypedCode(t *testing.T) {
 	dir := t.TempDir()
 	w := NewIntentRejectsWriter(dir, time.Now)
-	prev := SetIntentRejectsLoggerForTest(w)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+	ctx := WithIntentRejectsWriter(context.Background(), w)
 
 	typed := &IntentPlanValidationError{
 		Code:    IntentPlanValidationOfferedWindow,
 		Seq:     42,
 		Message: "intent planner: selected seq 42 outside offered window",
 	}
-	LogRejectedIntentPlan(context.Background(), "openai-compat",
+	LogRejectedIntentPlan(ctx, "openai-compat",
 		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 1}, {Seq: 2}}},
 		`{"selected_seqs":[42]}`,
 		typed,
 	)
-	LogRejectedIntentPlan(context.Background(), "subprocess:foo",
+	LogRejectedIntentPlan(ctx, "subprocess:foo",
 		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 5}}},
 		"",
 		errors.New("plain"),
@@ -408,15 +432,14 @@ func TestLogRejectedIntentPlan_PersistsTypedCode(t *testing.T) {
 func TestLogRejectedIntentPlan_DefaultsToRedacted(t *testing.T) {
 	dir := t.TempDir()
 	w := NewIntentRejectsWriter(dir, time.Now)
-	prev := SetIntentRejectsLoggerForTest(w)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+	ctx := WithIntentRejectsWriter(context.Background(), w)
 
 	// Ensure the env opt-in is unset for this test.
 	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
 	resetIntentRejectsRawWarnOnceForTest(t)
 
 	raw := `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan","arguments":"{\"selected_seqs\":[101],\"deferred_seqs\":[102,103],\"subject\":\"x\",\"body\":\"\",\"grouping_reason\":\"y\",\"deferred_reasons\":[]}"}}]}}]}`
-	LogRejectedIntentPlan(context.Background(), "openai-compat",
+	LogRejectedIntentPlan(ctx, "openai-compat",
 		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}, {Seq: 103}}},
 		raw,
 		&IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonMissing, Seq: 102, Message: "missing reason"},
@@ -457,14 +480,13 @@ func TestLogRejectedIntentPlan_VerbatimOnEnvOptIn(t *testing.T) {
 		t.Run("env="+val, func(t *testing.T) {
 			dir := t.TempDir()
 			w := NewIntentRejectsWriter(dir, time.Now)
-			prev := SetIntentRejectsLoggerForTest(w)
-			t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+			ctx := WithIntentRejectsWriter(context.Background(), w)
 
 			t.Setenv("ACD_INTENT_REJECTS_RAW", val)
 			resetIntentRejectsRawWarnOnceForTest(t)
 
 			raw := `{"selected_seqs":[101],"deferred_seqs":[]}`
-			LogRejectedIntentPlan(context.Background(), "openai-compat",
+			LogRejectedIntentPlan(ctx, "openai-compat",
 				IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}}},
 				raw,
 				&IntentPlanValidationError{Code: IntentPlanValidationShape, Message: "missing seq"},
@@ -500,14 +522,13 @@ func TestLogRejectedIntentPlan_VerbatimOnEnvOptIn(t *testing.T) {
 func TestLogRejectedIntentPlan_RedactedRoundTripsParsedPlanSummary(t *testing.T) {
 	dir := t.TempDir()
 	w := NewIntentRejectsWriter(dir, time.Now)
-	prev := SetIntentRejectsLoggerForTest(w)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+	ctx := WithIntentRejectsWriter(context.Background(), w)
 
 	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
 	resetIntentRejectsRawWarnOnceForTest(t)
 
 	raw := `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan","arguments":"{\"selected_seqs\":[101,102],\"deferred_seqs\":[103],\"subject\":\"x\",\"body\":\"\",\"grouping_reason\":\"y\",\"deferred_reasons\":[]}"}}]}}]}`
-	LogRejectedIntentPlan(context.Background(), "openai-compat",
+	LogRejectedIntentPlan(ctx, "openai-compat",
 		IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: 101}, {Seq: 102}, {Seq: 103}}},
 		raw,
 		&IntentPlanValidationError{Code: IntentPlanValidationDeferredReasonMissing, Seq: 103, Message: "missing reason"},
@@ -544,22 +565,43 @@ func resetIntentRejectsRawWarnOnceForTest(t *testing.T) {
 	t.Cleanup(func() { intentRejectsRawWarnOnce = prev })
 }
 
-// TestConfigureIntentRejectsLogger_EmptyDirDisables asserts that
-// configuring with an empty gitDir clears the writer so subsequent calls
-// no-op. The CLI / pre-daemon paths use this to disable the writer in
-// contexts where state lives nowhere on disk.
-func TestConfigureIntentRejectsLogger_EmptyDirDisables(t *testing.T) {
-	dir := t.TempDir()
-	prev := SetIntentRejectsLoggerForTest(nil)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(prev) })
+// TestIntentRejectsWriter_ContextIsolation proves independent contexts cannot
+// redirect or inherit one another's rows.
+func TestIntentRejectsWriter_ContextIsolation(t *testing.T) {
+	left := NewIntentRejectsWriter(filepath.Join(t.TempDir(), "left"), time.Now)
+	right := NewIntentRejectsWriter(filepath.Join(t.TempDir(), "right"), time.Now)
+	leftCtx := WithIntentRejectsWriter(context.Background(), left)
+	rightCtx := WithIntentRejectsWriter(context.Background(), right)
 
-	ConfigureIntentRejectsLogger(dir)
-	if got := IntentRejectsLoggerForTest(); got == nil {
-		t.Fatalf("expected configured writer, got nil")
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func(seq int64) {
+			defer wg.Done()
+			LogRejectedIntentPlan(leftCtx, "left",
+				IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: seq}}},
+				`{"selected_seqs":[]}`, errors.New("left reject"))
+		}(int64(i + 1))
+		go func(seq int64) {
+			defer wg.Done()
+			LogRejectedIntentPlan(rightCtx, "right",
+				IntentPlanRequest{OfferedCaptures: []OfferedCapture{{Seq: seq}}},
+				`{"selected_seqs":[]}`, errors.New("right reject"))
+		}(int64(i + 101))
 	}
-	ConfigureIntentRejectsLogger("")
-	if got := IntentRejectsLoggerForTest(); got != nil {
-		t.Fatalf("expected nil writer after empty configure, got %#v", got)
+	wg.Wait()
+
+	for name, writer := range map[string]*IntentRejectsWriter{"left": left, "right": right} {
+		body, err := os.ReadFile(writer.Path())
+		if err != nil {
+			t.Fatalf("read %s rejects: %v", name, err)
+		}
+		if got := lineCount(body); got != 50 {
+			t.Fatalf("%s rows=%d want 50", name, got)
+		}
+		if strings.Contains(string(body), `"provider":"`+map[string]string{"left": "right", "right": "left"}[name]+`"`) {
+			t.Fatalf("%s log contains cross-directory row", name)
+		}
 	}
 }
 

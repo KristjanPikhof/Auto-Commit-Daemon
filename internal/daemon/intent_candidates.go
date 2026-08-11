@@ -187,6 +187,11 @@ func EvaluateIntentCandidates(
 	}
 	if input.RetryLimit < 0 {
 		input.RetryLimit = 0
+	} else if input.RetryLimit > 1 {
+		// Intent v2 permits one bounded remote correction. Keep accepting the
+		// existing setting for compatibility, but never let it create a retry
+		// loop.
+		input.RetryLimit = 1
 	}
 	nowSeconds := float64(input.Now.UnixNano()) / 1e9
 	if _, err := state.FinalizeExpiredIntentCandidates(
@@ -643,6 +648,9 @@ func chooseIntentCandidatePlan(
 		if planner != nil {
 			plan, err := ai.PlanIntentV2WithCompatibility(
 				ctx, planner, plannerRequest)
+			if rejected, ok := ai.RejectedIntentPlanV2(err); ok {
+				plan = rejected
+			}
 			plannerCallFailed := err != nil
 			var continuations []intentCandidateContinuation
 			if err == nil {
@@ -670,12 +678,24 @@ func chooseIntentCandidatePlan(
 				}
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, ctx.Err()
 			}
-			for attempt := 0; attempt < retryLimit; attempt++ {
-				var validation *ai.IntentPlanV2ValidationError
-				if !errors.As(err, &validation) ||
-					len(validation.Findings) == 0 {
-					break
+			var validation *ai.IntentPlanV2ValidationError
+			if errors.As(err, &validation) && len(validation.Findings) > 0 {
+				if repaired, ok := repairIntentCandidateDependencies(
+					intentCandidateContinuationValidationRequest(req, continuations),
+					plan,
+				); ok {
+					if health != nil {
+						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
+						}
+					}
+					return repaired, "repaired_dependency_declarations",
+						ai.SanitizePlannerError(err.Error()), retryCount, false,
+						continuations, nil
 				}
+			}
+			if retryLimit > 0 && validation != nil &&
+				ai.IntentPlanV2CorrectionEligible(validation.Findings) {
 				retry := plannerRequest
 				retry.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
 				retryCount++
@@ -726,14 +746,12 @@ func chooseIntentCandidatePlan(
 	switch preset {
 	case config.PresetFast:
 		plan := deterministicIntentCandidatePlan(req, false, true)
-		if _, ok := planner.(ai.IntentMessageRewriter); ok {
-			rewritten, rewriteErr := ai.ApplyIntentV2MessageQuality(
-				ctx, planner, req, plan)
-			if rewriteErr != nil {
-				return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
-					false, nil, rewriteErr
-			}
-			plan = rewritten
+		var messageErr error
+		plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
+			ctx, planner, req, plan, plannerFailure)
+		if messageErr != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
+				false, nil, messageErr
 		}
 		continuations, _, err := continuePersistedIntentCandidates(
 			req, &plan, intentCandidateContinuationOptions{
@@ -752,14 +770,12 @@ func chooseIntentCandidatePlan(
 			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil, nil
 		}
 		plan, fallbackNeedsAttention := balancedIntentCandidatePlan(req)
-		if _, ok := planner.(ai.IntentMessageRewriter); ok {
-			rewritten, rewriteErr := ai.ApplyIntentV2MessageQuality(
-				ctx, planner, req, plan)
-			if rewriteErr != nil {
-				return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
-					false, nil, rewriteErr
-			}
-			plan = rewritten
+		var messageErr error
+		plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
+			ctx, planner, req, plan, plannerFailure)
+		if messageErr != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
+				false, nil, messageErr
 		}
 		continuations, companionNeedsAttention, err :=
 			continuePersistedIntentCandidates(
@@ -793,6 +809,100 @@ func chooseIntentCandidatePlan(
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil,
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
+}
+
+func applyIntentFallbackMessageQuality(
+	ctx context.Context,
+	planner interface{ Name() string },
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+	plannerFailure string,
+) (ai.IntentPlanV2, string, error) {
+	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
+		return plan, plannerFailure, nil
+	}
+	rewritten, err := ai.ApplyIntentV2MessageQuality(ctx, planner, req, plan)
+	if err == nil {
+		return rewritten, plannerFailure, nil
+	}
+	if ctx.Err() != nil {
+		return ai.IntentPlanV2{}, plannerFailure, ctx.Err()
+	}
+	messageFailure := "message quality fallback: " + err.Error()
+	if plannerFailure != "" {
+		messageFailure = plannerFailure + "; " + messageFailure
+	}
+	return plan, ai.SanitizePlannerError(messageFailure), nil
+}
+
+// repairIntentCandidateDependencies adds only dependency declarations already
+// proven by hard capture edges. It works on a deep clone and returns success
+// only when the complete v2 validator accepts the result, so cycles, unknown
+// owners, non-topological plans, and unrelated structural defects leave the
+// original plan untouched.
+func repairIntentCandidateDependencies(
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) (ai.IntentPlanV2, bool) {
+	repaired := cloneIntentPlanV2(plan)
+	owner := make(map[int64]string, len(req.OfferedCaptures))
+	output := make(map[string]struct{}, len(repaired.Candidates))
+	for _, candidate := range repaired.Candidates {
+		output[candidate.CandidateID] = struct{}{}
+		for _, seq := range candidate.SelectedSeqs {
+			owner[seq] = candidate.CandidateID
+		}
+	}
+	for _, candidate := range req.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			if _, exists := owner[seq]; !exists {
+				owner[seq] = candidate.CandidateID
+			}
+		}
+	}
+
+	changed := false
+	for _, edge := range req.Dependencies {
+		if edge.Strength != ai.IntentDependencyHard {
+			continue
+		}
+		fromID, fromOK := owner[edge.FromSeq]
+		toID, toOK := owner[edge.ToSeq]
+		if !fromOK || !toOK || fromID == toID {
+			continue
+		}
+		if _, toIsOutput := output[toID]; !toIsOutput {
+			return plan, false
+		}
+		for i := range repaired.Candidates {
+			candidate := &repaired.Candidates[i]
+			if candidate.CandidateID != toID ||
+				containsIntentString(candidate.DependsOnCandidates, fromID) {
+				continue
+			}
+			candidate.DependsOnCandidates = append(
+				candidate.DependsOnCandidates, fromID)
+			changed = true
+		}
+	}
+	if !changed || ai.ValidateIntentPlanV2(req, repaired) != nil {
+		return plan, false
+	}
+	return repaired, true
+}
+
+func cloneIntentPlanV2(plan ai.IntentPlanV2) ai.IntentPlanV2 {
+	clone := plan
+	clone.Candidates = append([]ai.IntentCandidateAssignment(nil), plan.Candidates...)
+	for i := range clone.Candidates {
+		clone.Candidates[i].SelectedSeqs = append(
+			[]int64(nil), plan.Candidates[i].SelectedSeqs...)
+		clone.Candidates[i].MissingCompanions = append(
+			[]string(nil), plan.Candidates[i].MissingCompanions...)
+		clone.Candidates[i].DependsOnCandidates = append(
+			[]string(nil), plan.Candidates[i].DependsOnCandidates...)
+	}
+	return clone
 }
 
 func evaluateIntentCandidateAssignment(

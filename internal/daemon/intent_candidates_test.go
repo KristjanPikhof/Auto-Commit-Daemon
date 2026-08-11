@@ -18,9 +18,10 @@ import (
 )
 
 type intentCandidatePlannerStub struct {
-	plan ai.IntentPlanV2
-	err  error
-	req  ai.IntentPlanRequestV2
+	plan  ai.IntentPlanV2
+	err   error
+	req   ai.IntentPlanRequestV2
+	calls int
 }
 
 func (p *intentCandidatePlannerStub) Name() string { return "intent-v2-test" }
@@ -29,6 +30,7 @@ func (p *intentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, error) {
+	p.calls++
 	p.req = req
 	return p.plan, p.err
 }
@@ -49,17 +51,18 @@ func (p *correctingIntentCandidatePlannerStub) PlanIntentV2(
 	if p.calls == 1 {
 		return ai.IntentPlanV2{
 			ProtocolVersion: ai.IntentPlannerProtocolV2,
-			Candidates: []ai.IntentCandidateAssignment{{
-				CandidateID: "mega",
-				SelectedSeqs: []int64{
-					req.OfferedCaptures[0].Seq,
-					req.OfferedCaptures[1].Seq,
+			Candidates: []ai.IntentCandidateAssignment{
+				{
+					CandidateID: "candidate-a", SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
+					Purpose: "separate independent change", Readiness: ai.IntentCandidateReady,
+					GroupingReason: "capture has independent evidence",
 				},
-				Purpose:        "mix independent changes",
-				Readiness:      ai.IntentCandidateReady,
-				Subject:        "Mix independent changes",
-				GroupingReason: "same time window",
-			}},
+				{
+					CandidateID: "candidate-b", SelectedSeqs: []int64{req.OfferedCaptures[1].Seq},
+					Purpose: "separate independent change", Readiness: ai.IntentCandidateReady,
+					Subject: "Separate independent change", GroupingReason: "capture has independent evidence",
+				},
+			},
 		}, nil
 	}
 	var candidates []ai.IntentCandidateAssignment
@@ -131,6 +134,31 @@ type failingIntentCandidatePlannerStub struct {
 
 func (p *failingIntentCandidatePlannerStub) Name() string {
 	return "intent-v2-failing-test"
+}
+
+type modelWideFailingIntentCandidatePlannerStub struct {
+	plannerCalls int
+	rewriteCalls int
+}
+
+func (p *modelWideFailingIntentCandidatePlannerStub) Name() string {
+	return "intent-v2-model-wide-failing-test"
+}
+
+func (p *modelWideFailingIntentCandidatePlannerStub) PlanIntentV2(
+	context.Context,
+	ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.plannerCalls++
+	return ai.IntentPlanV2{}, errors.New("provider planning unavailable")
+}
+
+func (p *modelWideFailingIntentCandidatePlannerStub) RewriteIntentMessage(
+	context.Context,
+	ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	p.rewriteCalls++
+	return ai.Result{}, errors.New("provider message rewrite unavailable")
 }
 
 func (p *failingIntentCandidatePlannerStub) PlanIntentV2(
@@ -397,9 +425,9 @@ func TestIntentCandidateEngineHonorsCorrectionRetryBudget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if planner.calls != 1+retryLimit {
-				t.Fatalf("planner calls=%d want=%d",
-					planner.calls, 1+retryLimit)
+			if planner.calls != 1 {
+				t.Fatalf("structural planner calls=%d want=1",
+					planner.calls)
 			}
 			if result.Fallback != "hard_dependency_component" ||
 				result.PlannerFailure == "" {
@@ -608,7 +636,7 @@ func TestIntentCandidateEngineCancellationReleasesHalfOpenProbe(t *testing.T) {
 	}
 }
 
-func TestIntentCandidateEngineRetriesDisconnectedGroupingWithCorrection(t *testing.T) {
+func TestIntentCandidateEngineRetriesEligibleMetadataWithCorrection(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
@@ -637,6 +665,128 @@ func TestIntentCandidateEngineRetriesDisconnectedGroupingWithCorrection(t *testi
 	}
 	if result.Fallback != "" || len(result.Decisions) != 2 {
 		t.Fatalf("corrected result=%+v", result)
+	}
+}
+
+func TestIntentCandidatePlanRepairsProvenHardDependencyDeclaration(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{
+			{Seq: 86512, Path: "a.go", Op: "modify"},
+			{Seq: 86519, Path: "b.go", Op: "modify"},
+		},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 86512, ToSeq: 86519, Strength: ai.IntentDependencyHard,
+			Kind: "object_reference", EvidenceHash: "sha256:proven",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{
+				CandidateID: "prerequisite", SelectedSeqs: []int64{86512},
+				Purpose: "update prerequisite", Readiness: ai.IntentCandidateReady,
+				Subject: "Update prerequisite", Body: "- preserve exact body",
+				GroupingReason: "independent candidate",
+			},
+			{
+				CandidateID: "dependent", SelectedSeqs: []int64{86519},
+				Purpose: "update dependent", Readiness: ai.IntentCandidateReady,
+				Subject: "Update dependent", Body: "- preserve exact body",
+				GroupingReason: "independent candidate",
+			},
+		},
+	}
+	original := cloneIntentPlanV2(plan)
+	repaired, ok := repairIntentCandidateDependencies(req, plan)
+	if !ok {
+		t.Fatal("proven dependency was not repaired")
+	}
+	if !reflect.DeepEqual(plan, original) {
+		t.Fatalf("original plan mutated: got=%+v want=%+v", plan, original)
+	}
+	wantDependencies := []string{"prerequisite"}
+	if !reflect.DeepEqual(repaired.Candidates[1].DependsOnCandidates, wantDependencies) {
+		t.Fatalf("dependencies=%v want=%v",
+			repaired.Candidates[1].DependsOnCandidates, wantDependencies)
+	}
+	repaired.Candidates[1].DependsOnCandidates = nil
+	original.Candidates[1].DependsOnCandidates = nil
+	if !reflect.DeepEqual(repaired, original) {
+		t.Fatalf("repair changed non-dependency fields: got=%+v want=%+v",
+			repaired, original)
+	}
+}
+
+func TestIntentCandidateEngineRepairsDependencyWithoutPlannerRetry(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	prerequisite := appendIntentCandidateCapture(
+		t, db, "a.go", "create", "", "a")
+	dependent := appendIntentCandidateCapture(
+		t, db, "b.go", "create", "", "b")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{CandidateID: "prerequisite", SelectedSeqs: []int64{prerequisite.Event.Seq}, Purpose: "update prerequisite", Readiness: ai.IntentCandidateReady, Subject: "Update prerequisite", GroupingReason: "separate hard-linked change"},
+			{CandidateID: "dependent", SelectedSeqs: []int64{dependent.Event.Seq}, Purpose: "update dependent", Readiness: ai.IntentCandidateReady, Subject: "Update dependent", GroupingReason: "separate hard-linked change"},
+		},
+	}}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{prerequisite, dependent},
+		Hints: []IntentDependencyHint{{
+			PrerequisiteSeq: prerequisite.Event.Seq,
+			DependentSeq:    dependent.Event.Seq,
+			Strength:        ai.IntentDependencyHard,
+			Kind:            "object_reference",
+			Evidence:        "mechanically proven",
+		}},
+		Planner: planner, RetryLimit: 9, RetryLimitSet: true,
+		Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("EvaluateIntentCandidates: %v", err)
+	}
+	if planner.calls != 1 || result.RetryCount != 0 ||
+		result.Fallback != "repaired_dependency_declarations" ||
+		result.PlannerFailure == "" || result.NeedsAttention {
+		t.Fatalf("repair result calls=%d result=%+v", planner.calls, result)
+	}
+	if len(result.Decisions) != 2 ||
+		!reflect.DeepEqual(result.Decisions[1].Assignment.DependsOnCandidates,
+			[]string{result.Decisions[0].Assignment.CandidateID}) {
+		t.Fatalf("repair decisions=%+v", result.Decisions)
+	}
+	if len(planner.plan.Candidates[1].DependsOnCandidates) != 0 {
+		t.Fatalf("planner plan mutated=%+v", planner.plan)
+	}
+}
+
+func TestIntentCandidatePlanRefusesNonTopologicalDependencyRepair(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{
+			{Seq: 1, Path: "a.go", Op: "modify"},
+			{Seq: 2, Path: "b.go", Op: "modify"},
+		},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 2, ToSeq: 1, Strength: ai.IntentDependencyHard,
+			Kind: "object_reference", EvidenceHash: "sha256:proven",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{CandidateID: "dependent", SelectedSeqs: []int64{1}, Purpose: "dependent", Readiness: ai.IntentCandidateReady, Subject: "Update dependent", GroupingReason: "independent candidate"},
+			{CandidateID: "later-prerequisite", SelectedSeqs: []int64{2}, Purpose: "prerequisite", Readiness: ai.IntentCandidateReady, Subject: "Update prerequisite", GroupingReason: "independent candidate"},
+		}}
+	if repaired, ok := repairIntentCandidateDependencies(req, plan); ok || !reflect.DeepEqual(repaired, plan) {
+		t.Fatalf("unsafe repair accepted: ok=%v plan=%+v", ok, repaired)
 	}
 }
 
@@ -848,14 +998,78 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateEngineModelWideFailureKeepsValidatedFallback(t *testing.T) {
+	for _, preset := range []config.PresetName{
+		config.PresetFast,
+		config.PresetBalanced,
+	} {
+		t.Run(string(preset), func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			first := appendIntentCandidateCapture(
+				t, db, "internal/a.go", "create", "", "a")
+			second := appendIntentCandidateCapture(
+				t, db, "internal/b.go", "create", "", "b")
+			planner := &modelWideFailingIntentCandidatePlannerStub{}
+			result, err := EvaluateIntentCandidates(ctx, db,
+				IntentCandidateEvaluation{
+					BranchRef: "refs/heads/main", BranchGeneration: 1,
+					Captures: []IntentCandidateCapture{first, second},
+					Planner:  planner, RetryLimit: 9, RetryLimitSet: true,
+					Preset: preset, VerificationMode: "structural",
+					Materialize: func(
+						context.Context,
+						[]IntentCandidateCapture,
+					) error {
+						return nil
+					},
+				})
+			if err != nil {
+				t.Fatalf("EvaluateIntentCandidates: %v", err)
+			}
+			if planner.plannerCalls != 1 || planner.rewriteCalls != 1 ||
+				result.RetryCount != 0 || result.Fallback == "" ||
+				result.NeedsAttention || len(result.Decisions) == 0 {
+				t.Fatalf("bounded fallback planner=%d rewrite=%d result=%+v",
+					planner.plannerCalls, planner.rewriteCalls, result)
+			}
+			if !strings.Contains(result.PlannerFailure,
+				"provider planning unavailable") ||
+				!strings.Contains(result.PlannerFailure,
+					"message quality fallback") {
+				t.Fatalf("planner failure=%q", result.PlannerFailure)
+			}
+			publishable := 0
+			for _, decision := range result.Decisions {
+				if !decision.Publishable {
+					continue
+				}
+				publishable++
+				if decision.Assignment.Subject == "" || !decision.Atomicity.Valid {
+					t.Fatalf("fallback decision=%+v", decision)
+				}
+			}
+			if publishable == 0 {
+				t.Fatalf("fallback published no safe decision: %+v", result)
+			}
+		})
+	}
+}
+
 func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
+	setNextIntentCandidateSeq(t, db, 86512)
 	prerequisite := appendIntentCandidateCapture(
 		t, db, "same.go", "create", "", "first")
+	setNextIntentCandidateSeq(t, db, 86519)
 	dependent := appendIntentCandidateCapture(
 		t, db, "same.go", "modify", "first", "second")
+	if prerequisite.Event.Seq != 86512 || dependent.Event.Seq != 86519 {
+		t.Fatalf("observed dependent shape=%d->%d",
+			prerequisite.Event.Seq, dependent.Event.Seq)
+	}
 	const candidateID = "persisted-dependent"
 	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
 		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,
@@ -905,10 +1119,16 @@ func TestIntentCandidateEngineFallbackContinuesPersistedPrerequisite(t *testing.
 	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
+	setNextIntentCandidateSeq(t, db, 86508)
 	prerequisite := appendIntentCandidateCapture(
 		t, db, "same.go", "create", "", "first")
+	setNextIntentCandidateSeq(t, db, 86525)
 	dependent := appendIntentCandidateCapture(
 		t, db, "same.go", "modify", "first", "second")
+	if prerequisite.Event.Seq != 86508 || dependent.Event.Seq != 86525 {
+		t.Fatalf("observed prerequisite shape=%d->%d",
+			prerequisite.Event.Seq, dependent.Event.Seq)
+	}
 	const candidateID = "persisted-prerequisite"
 	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
 		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,

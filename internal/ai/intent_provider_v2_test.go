@@ -3,13 +3,16 @@ package ai
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,13 +254,12 @@ func TestOpenAIPlanIntentV2RejectsMalformedResponseWithRedactedLog(t *testing.T)
 	req := sampleIntentPlanV2Request(t)
 	dir := t.TempDir()
 	writer := NewIntentRejectsWriter(dir, time.Now)
-	previous := SetIntentRejectsLoggerForTest(writer)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(previous) })
+	ctx := WithIntentRejectsWriter(context.Background(), writer)
 	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 200, `{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan_v2","arguments":"{\"protocol_version\":\"v2\",\"candidates\":[],\"secret\":\"do-not-store\"}"}}]}}]}`
 	})
-	_, err := p.PlanIntentV2(context.Background(), req)
+	_, err := p.PlanIntentV2(ctx, req)
 	var typed *IntentPlanV2ValidationError
 	if !errors.As(err, &typed) {
 		t.Fatalf("error=%T %v", err, err)
@@ -268,6 +270,66 @@ func TestOpenAIPlanIntentV2RejectsMalformedResponseWithRedactedLog(t *testing.T)
 	}
 	if strings.Contains(string(raw), "do-not-store") || !strings.Contains(string(raw), `"raw_response_redacted":true`) {
 		t.Fatalf("reject log redaction failed: %s", raw)
+	}
+}
+
+func TestOpenAIPlanIntentV2ConcurrentRejectWritersStayIsolated(t *testing.T) {
+	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
+	req := sampleIntentPlanV2Request(t)
+	type plannerRun struct {
+		name   string
+		writer *IntentRejectsWriter
+		ctx    context.Context
+		plan   IntentPlannerV2
+		hash   string
+	}
+	runs := make([]plannerRun, 0, 2)
+	for _, name := range []string{"main", "linked"} {
+		writer := NewIntentRejectsWriter(filepath.Join(t.TempDir(), name, "acd"), time.Now)
+		raw := fmt.Sprintf(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"capture_intent_plan_v2","arguments":"{\"protocol_version\":\"v2\",\"candidates\":[],\"run\":\"%s\"}"}}]}}]}`, name)
+		provider, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+			return 200, raw
+		})
+		sum := sha256.Sum256([]byte(raw))
+		runs = append(runs, plannerRun{
+			name:   name,
+			writer: writer,
+			ctx:    WithIntentRejectsWriter(context.Background(), writer),
+			plan:   provider,
+			hash:   fmt.Sprintf("%x", sum),
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, current := range runs {
+		current := current
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := current.plan.PlanIntentV2(current.ctx, req); err == nil {
+					t.Errorf("%s planner call %d unexpectedly succeeded", current.name, i)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, current := range runs {
+		body, err := os.ReadFile(current.writer.Path())
+		if err != nil {
+			t.Fatalf("read %s rejects: %v", current.name, err)
+		}
+		if got := strings.Count(string(body), "\n"); got != 20 {
+			t.Fatalf("%s rows=%d want 20", current.name, got)
+		}
+		if !strings.Contains(string(body), current.hash) {
+			t.Fatalf("%s log missing own response hash %s", current.name, current.hash)
+		}
+		otherHash := map[string]string{"main": runs[1].hash, "linked": runs[0].hash}[current.name]
+		if strings.Contains(string(body), otherHash) {
+			t.Fatalf("%s log contains cross-directory response hash %s", current.name, otherHash)
+		}
 	}
 }
 
@@ -481,8 +543,7 @@ func TestSubprocessPlanIntentV2MalformedEnvelopeUsesRedactedRejectLog(t *testing
 	skipIfWindows(t)
 	dir := t.TempDir()
 	writer := NewIntentRejectsWriter(filepath.Join(dir, "rejects"), time.Now)
-	previous := SetIntentRejectsLoggerForTest(writer)
-	t.Cleanup(func() { SetIntentRejectsLoggerForTest(previous) })
+	ctx := WithIntentRejectsWriter(context.Background(), writer)
 	t.Setenv("ACD_INTENT_REJECTS_RAW", "")
 	bin := writePluginScript(t, dir, "malformed-envelope", `
 while IFS= read -r line; do
@@ -503,7 +564,7 @@ done
 	})
 	t.Cleanup(func() { _ = p.Close() })
 
-	_, err := p.PlanIntentV2(context.Background(), sampleIntentPlanV2Request(t))
+	_, err := p.PlanIntentV2(ctx, sampleIntentPlanV2Request(t))
 	var typed *IntentPlanV2ValidationError
 	if !errors.As(err, &typed) {
 		t.Fatalf("error=%T %v", err, err)

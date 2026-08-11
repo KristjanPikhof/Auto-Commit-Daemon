@@ -402,6 +402,36 @@ func TestDecodeIntentPlanV2RejectsUnknownAndMultipleValues(t *testing.T) {
 	}
 }
 
+func TestDecodeIntentPlanV2PreservesRejectedPlanForLocalRepair(t *testing.T) {
+	req := mustIntentPlanRequestV2(t,
+		[]OfferedCapture{
+			{Seq: 1, Path: "a.go", Op: "modify"},
+			{Seq: 2, Path: "b.go", Op: "modify"},
+		},
+		[]IntentCaptureDependency{{
+			FromSeq: 1, ToSeq: 2, Strength: IntentDependencyHard,
+			Kind: "object_reference", EvidenceHash: "sha256:proven",
+		}},
+	)
+	raw := []byte(`{"protocol_version":"v2","candidates":[` +
+		`{"candidate_id":"a","selected_seqs":[1],"purpose":"update a","readiness":"ready","subject":"Update a","grouping_reason":"separate change"},` +
+		`{"candidate_id":"b","selected_seqs":[2],"purpose":"update b","readiness":"ready","subject":"Update b","grouping_reason":"separate change"}]}`)
+	plan, err := DecodeIntentPlanV2(raw, req)
+	if err == nil || len(plan.Candidates) != 2 {
+		t.Fatalf("decoded rejected plan=%+v err=%v", plan, err)
+	}
+	preserved, ok := RejectedIntentPlanV2(err)
+	if !ok || len(preserved.Candidates) != 2 ||
+		preserved.Candidates[1].CandidateID != "b" {
+		t.Fatalf("preserved plan=%+v ok=%v", preserved, ok)
+	}
+	preserved.Candidates[0].SelectedSeqs[0] = 99
+	again, ok := RejectedIntentPlanV2(err)
+	if !ok || again.Candidates[0].SelectedSeqs[0] != 1 {
+		t.Fatalf("preserved plan was not cloned: %+v", again)
+	}
+}
+
 func TestNewIntentAtomicityReportRequiresAllSevenGates(t *testing.T) {
 	report := NewIntentAtomicityReport("candidate",
 		IntentAtomicityGateResult{Gate: IntentAtomicityCohesion, Status: IntentAtomicityPassed},
@@ -459,6 +489,35 @@ func TestBuildIntentAtomicityCorrectionIsBounded(t *testing.T) {
 	}
 	if !strings.Contains(got, "candidate_disconnected") {
 		t.Fatalf("correction = %q", got)
+	}
+}
+
+func TestIntentPlanV2CorrectionEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		want bool
+	}{
+		{code: "ready_subject_empty", want: true},
+		{code: "candidate_dependency_unknown", want: true},
+		{code: "capture_outside_window", want: false},
+		{code: "forced_capture_deferred", want: false},
+		{code: "candidate_disconnected", want: false},
+		{code: "hard_dependency_undeclared", want: false},
+		{code: "capture_unassigned", want: false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			got := IntentPlanV2CorrectionEligible([]IntentAtomicityFinding{{
+				Code: tc.code,
+			}})
+			if got != tc.want {
+				t.Fatalf("eligible=%v want=%v", got, tc.want)
+			}
+		})
+	}
+	if IntentPlanV2CorrectionEligible([]IntentAtomicityFinding{
+		{Code: "ready_subject_empty"}, {Code: "candidate_disconnected"},
+	}) {
+		t.Fatal("mixed safe and structural findings must skip correction")
 	}
 }
 

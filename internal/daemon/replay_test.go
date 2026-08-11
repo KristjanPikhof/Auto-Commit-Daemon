@@ -2863,7 +2863,7 @@ func TestReplay_IntentStrategySettleWindowKeepsRapidFiveTogether(t *testing.T) {
 	}
 }
 
-func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
+func TestReplay_IntentStrategyFullWindowWaitsForSettleWindow(t *testing.T) {
 	runBoundedParallel(t)
 
 	f := newCaptureFixture(t)
@@ -2885,7 +2885,7 @@ func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
 		plan: ai.IntentPlan{
 			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
 			Subject:        "Full window",
-			GroupingReason: "full window bypasses settle wait",
+			GroupingReason: "full window settled after repository quiet",
 		},
 	}
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
@@ -2898,13 +2898,35 @@ func TestReplay_IntentStrategyFullWindowBypassesSettleWindow(t *testing.T) {
 		IntentMaxPendingAge: 2 * time.Hour,
 	})
 	if err != nil {
-		t.Fatalf("Replay: %v", err)
+		t.Fatalf("Replay before settle: %v", err)
+	}
+	if sum.Published != 0 || !sum.Skipped || sum.SkippedReason != "skipped_due_intent_settle_window" {
+		t.Fatalf("summary=%+v want active full window held for settle", sum)
+	}
+	if planner.calls != 0 {
+		t.Fatalf("planner calls=%d want 0 before repository quiet", planner.calls)
+	}
+
+	for _, ev := range pending {
+		setCaptureEventTimestamp(t, ctx, f.db, ev.Seq, time.Now().Add(-time.Minute))
+	}
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir:              f.gitDir,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		IntentPlanner:       planner,
+		IntentWindow:        2,
+		IntentMinPending:    2,
+		IntentSettleWindow:  10 * time.Second,
+		IntentMaxPendingAge: 2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Replay after settle: %v", err)
 	}
 	if sum.Published != 2 || sum.Skipped {
-		t.Fatalf("summary=%+v want full window to plan without settle wait", sum)
+		t.Fatalf("summary=%+v want quiet full window published", sum)
 	}
 	if planner.calls != 1 {
-		t.Fatalf("planner calls=%d want 1", planner.calls)
+		t.Fatalf("planner calls=%d want 1 after repository quiet", planner.calls)
 	}
 	gotOffered := offeredCaptureSeqs(planner.requests[0])
 	wantOffered := []int64{pending[0].Seq, pending[1].Seq}
@@ -2929,6 +2951,9 @@ func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *te
 	if err != nil {
 		t.Fatalf("PendingEvents: %v", err)
 	}
+	for _, ev := range pending {
+		setCaptureEventTimestamp(t, ctx, f.db, ev.Seq, time.Now().Add(-time.Minute))
+	}
 	planner := &recordingIntentPlanner{
 		plan: ai.IntentPlan{
 			SelectedSeqs:   []int64{pending[0].Seq, pending[1].Seq},
@@ -2944,6 +2969,7 @@ func TestReplay_IntentStrategyBatchGateUsesVisiblePendingBeyondReplayLimit(t *te
 		IntentPlanner:       planner,
 		IntentWindow:        2,
 		IntentMinPending:    3,
+		IntentSettleWindow:  10 * time.Second,
 		IntentMaxPendingAge: time.Hour,
 	})
 	if err != nil {
@@ -3000,6 +3026,7 @@ func TestReplay_IntentStrategyPlansWhenOldestPendingReachesMaxAge(t *testing.T) 
 		IntentPlanner:       planner,
 		IntentWindow:        2,
 		IntentMinPending:    3,
+		IntentSettleWindow:  time.Hour,
 		IntentMaxPendingAge: time.Hour,
 	})
 	if err != nil {
@@ -3045,6 +3072,7 @@ func TestReplay_IntentStrategyFlushBypassesBatchWait(t *testing.T) {
 		IntentPlanner:         planner,
 		IntentWindow:          10,
 		IntentMinPending:      3,
+		IntentSettleWindow:    time.Hour,
 		IntentMaxPendingAge:   time.Hour,
 		IntentBypassBatchWait: true,
 	})
@@ -3170,6 +3198,7 @@ func TestReplay_IntentStrategyForcedAgingBypassesBatchWait(t *testing.T) {
 		IntentPlanner:       planner,
 		IntentWindow:        10,
 		IntentMinPending:    3,
+		IntentSettleWindow:  time.Hour,
 		IntentMaxPendingAge: time.Hour,
 		IntentDeferLimit:    1,
 	})

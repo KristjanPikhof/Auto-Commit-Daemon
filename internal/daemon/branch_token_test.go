@@ -9,6 +9,37 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func TestWorktreeLogDetachedStateTransitionsPersistOnce(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+
+	transition, err := syncDetachedHeadState(ctx, f.db, true, now)
+	if err != nil || transition != detachedHeadEntered {
+		t.Fatalf("enter transition=%v err=%v", transition, err)
+	}
+	transition, err = syncDetachedHeadState(ctx, f.db, true, now.Add(time.Second))
+	if err != nil || transition != detachedHeadUnchanged {
+		t.Fatalf("steady detached transition=%v err=%v", transition, err)
+	}
+	stamp, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused)
+	if err != nil || !ok || stamp == "" {
+		t.Fatalf("detached marker=%q ok=%v err=%v", stamp, ok, err)
+	}
+
+	transition, err = syncDetachedHeadState(ctx, f.db, false, now.Add(2*time.Second))
+	if err != nil || transition != detachedHeadReattached {
+		t.Fatalf("reattach transition=%v err=%v", transition, err)
+	}
+	transition, err = syncDetachedHeadState(ctx, f.db, false, now.Add(3*time.Second))
+	if err != nil || transition != detachedHeadUnchanged {
+		t.Fatalf("steady attached transition=%v err=%v", transition, err)
+	}
+	if _, ok, err := state.MetaGet(ctx, f.db, MetaKeyDetachedHeadPaused); err != nil || ok {
+		t.Fatalf("detached marker remains: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestClassifyTokenTransition_LegacyTokenForcesDiverged(t *testing.T) {
 	f := newDaemonFixture(t)
 	ctx := context.Background()
