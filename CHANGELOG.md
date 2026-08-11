@@ -36,6 +36,14 @@
 - Linked worktrees now keep planner reject logs in their exact Git directories.
   Shared daemon logs include worktree and Git-directory identity on each
   worktree record, while rejected raw responses remain redacted by default.
+- Exact-chain recovery now checkpoints enabled linked worktrees, temporarily
+  stops their shared repository worker, and restores protection automatically.
+  Repeated capture transitions that already reached their recorded result are
+  accepted without weakening mismatch checks.
+- Status now treats a fresh worker that is actively completing a protection
+  checkpoint as a normal wait instead of asking the user to intervene.
+- `acd on` now applies safe exact-chain recovery after its initial checkpoint.
+  Archive-only recovery still requires explicit consent.
 
 ### Added
 

@@ -78,7 +78,9 @@ acd on
 
 Off performs a final checkpoint barrier. If protection cannot be confirmed it
 stays enabled; only `acd off --force` accepts that risk. Neither command deletes
-checkpoint history.
+checkpoint history. On starts or upgrades the shared repository worker and
+applies safe exact-chain recovery automatically. If recovery would require
+archive-only `--force`, ACD stops and asks for explicit consent.
 
 ## Diagnose locally
 
@@ -91,6 +93,19 @@ acd support bundle
 
 Normal output contains privacy-safe counts. Support output stays local and
 redacts credentials, provider responses, and raw source content by default.
+
+If status reports a durable publication block, preview and apply exact-chain
+recovery:
+
+~~~bash
+acd support recover --dry-run
+acd support recover --yes
+~~~
+
+Apply mode checkpoints every enabled linked worktree in the repository. It
+then stops the shared repository worker, rechecks the plan, performs recovery,
+and starts protection again. You do not need to run `acd off` first. Other
+repositories keep running.
 
 ## Upgrade from v19
 

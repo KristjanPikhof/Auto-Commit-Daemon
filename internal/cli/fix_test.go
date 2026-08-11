@@ -14,6 +14,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -962,6 +963,50 @@ func TestFix_StalePairPreservesOriginalProvenance(t *testing.T) {
 	}
 }
 
+func TestFix_ReconcileAcceptsDuplicateIdempotentCapture(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOID, err := git.LsTreeBlobOID(ctx, repo, head, "seed.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, repo, []byte("duplicate captured state\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+		Operation: "modify", Path: "seed.txt", Fidelity: "rescan",
+	}
+	op := state.CaptureOp{
+		Op: "modify", Path: "seed.txt", Fidelity: "rescan",
+		BeforeOID: sql.NullString{String: beforeOID, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: afterOID, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}
+	event.State = state.EventStateBlockedConflict
+	event.Error = sql.NullString{String: "history moved", Valid: true}
+	first := appendFixEvent(t, ctx, db, event, []state.CaptureOp{op})
+	event.State = state.EventStatePending
+	event.Error = sql.NullString{}
+	second := appendFixEvent(t, ctx, db, event, []state.CaptureOp{op})
+
+	plan := runFixJSON(t, repo, false, true, false, false)
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
+	action := findFixAction(plan, fixActionReconcileUnpublishedChain)
+	if action == nil || action.RecoveryRef == "" || action.RowsChanged != 2 {
+		t.Fatalf("duplicate recovery action=%+v", action)
+	}
+	got, err := git.LsTreeBlobOID(ctx, repo, action.RecoveryRef, "seed.txt")
+	if err != nil || got != afterOID {
+		t.Fatalf("recovery ref seed oid=%q err=%v want %s", got, err, afterOID)
+	}
+}
+
 func TestFix_MissingObjectLeavesWholePairUnchanged(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
@@ -999,27 +1044,44 @@ func TestFix_MissingObjectLeavesWholePairUnchanged(t *testing.T) {
 	}
 }
 
-func TestFix_RefusesWhileDaemonIsLive(t *testing.T) {
-	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+func TestFix_QuiescesManagedRuntimeWhenDaemonIsLive(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running"}); err != nil {
 		t.Fatalf("SaveDaemonState: %v", err)
 	}
-	before, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum before: %v", err)
+	oldPrepare := prepareFixMutationSupervisor
+	oldQuiesce := withQuiescedFixRuntime
+	t.Cleanup(func() {
+		prepareFixMutationSupervisor = oldPrepare
+		withQuiescedFixRuntime = oldQuiesce
+	})
+	prepareFixMutationSupervisor = func(context.Context, paths.Roots) error { return nil }
+	quiesceCalls := 0
+	withQuiescedFixRuntime = func(operationCtx context.Context, _ paths.Roots, _ string, operation func(context.Context) error) error {
+		quiesceCalls++
+		if err := state.SaveDaemonState(operationCtx, db, state.DaemonState{Mode: "stopped"}); err != nil {
+			return err
+		}
+		return operation(operationCtx)
 	}
+
 	var out bytes.Buffer
-	err = runFix(ctx, &out, repo, false, true, false, false, true)
-	if err == nil || !strings.Contains(err.Error(), "unsafe conditions") {
-		t.Fatalf("runFix err=%v want live-daemon refusal", err)
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
+		t.Fatalf("runFix: %v\n%s", err, out.String())
 	}
-	after, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum after: %v", err)
+	if quiesceCalls != 1 {
+		t.Fatalf("quiesce calls=%d want 1", quiesceCalls)
 	}
-	if before != after {
-		t.Fatalf("live-daemon refusal mutated state.db: before=%s after=%s", before, after)
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
+	var plan fixPlan
+	if err := json.Unmarshal(out.Bytes(), &plan); err != nil {
+		t.Fatalf("decode plan: %v\n%s", err, out.String())
+	}
+	if plan.RowsChanged != 2 {
+		t.Fatalf("rows changed=%d want 2", plan.RowsChanged)
 	}
 }
 
@@ -1050,6 +1112,49 @@ func TestFix_ApplyRefusesDaemonLockAcquiredAfterPlan(t *testing.T) {
 	if got := countRowsWhere(t, db, "recovery_snapshots", "1 = 1"); got != 0 {
 		t.Fatalf("daemon-lock refusal wrote recovery snapshot: %d", got)
 	}
+}
+
+func TestFix_QuiescesSharedRuntimeWhenLinkedWorktreeHoldsCanonicalLock(t *testing.T) {
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("hold canonical lock: %v", err)
+	}
+	lockReleased := false
+	t.Cleanup(func() {
+		if !lockReleased {
+			_ = lock.Release()
+		}
+	})
+
+	oldPrepare := prepareFixMutationSupervisor
+	oldQuiesce := withQuiescedFixRuntime
+	t.Cleanup(func() {
+		prepareFixMutationSupervisor = oldPrepare
+		withQuiescedFixRuntime = oldQuiesce
+	})
+	prepareFixMutationSupervisor = func(context.Context, paths.Roots) error { return nil }
+	quiesceCalls := 0
+	withQuiescedFixRuntime = func(operationCtx context.Context, _ paths.Roots, _ string, operation func(context.Context) error) error {
+		quiesceCalls++
+		if err := lock.Release(); err != nil {
+			return err
+		}
+		lockReleased = true
+		return operation(operationCtx)
+	}
+
+	var out bytes.Buffer
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
+		t.Fatalf("runFix: %v\n%s", err, out.String())
+	}
+	if quiesceCalls != 1 {
+		t.Fatalf("quiesce calls=%d want 1", quiesceCalls)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
 }
 
 func runFixJSON(t *testing.T, repo string, dryRun, yes, force, clearPause bool) fixPlan {

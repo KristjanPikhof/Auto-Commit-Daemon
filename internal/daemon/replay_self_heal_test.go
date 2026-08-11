@@ -15,6 +15,37 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func TestApplyRecoveryOpsInMemoryAcceptsIdempotentDuplicateTransitions(t *testing.T) {
+	entry := func(path, oid string) git.IndexEntry {
+		return git.IndexEntry{Path: path, Mode: git.RegularFileMode, OID: oid}
+	}
+	null := func(value string) sql.NullString { return sql.NullString{String: value, Valid: true} }
+
+	index := map[string]git.IndexEntry{
+		"modified.txt": entry("modified.txt", "after-modify"),
+		"created.txt":  entry("created.txt", "after-create"),
+		"renamed.txt":  entry("renamed.txt", "after-rename"),
+	}
+	ops := []state.CaptureOp{
+		{Op: "modify", Path: "modified.txt", BeforeOID: null("before-modify"), BeforeMode: null(git.RegularFileMode), AfterOID: null("after-modify"), AfterMode: null(git.RegularFileMode)},
+		{Op: "create", Path: "created.txt", AfterOID: null("after-create"), AfterMode: null(git.RegularFileMode)},
+		{Op: "delete", Path: "deleted.txt", BeforeOID: null("before-delete"), BeforeMode: null(git.RegularFileMode)},
+		{Op: "rename", Path: "renamed.txt", OldPath: null("old.txt"), BeforeOID: null("before-rename"), BeforeMode: null(git.RegularFileMode), AfterOID: null("after-rename"), AfterMode: null(git.RegularFileMode)},
+	}
+	if conflict := applyRecoveryOpsInMemory(index, ops); conflict != "" {
+		t.Fatalf("idempotent duplicate transitions conflicted: %s", conflict)
+	}
+
+	conflicting := []state.CaptureOp{{
+		Op: "modify", Path: "modified.txt",
+		BeforeOID: null("different-before"), BeforeMode: null(git.RegularFileMode),
+		AfterOID: null("different-after"), AfterMode: null(git.RegularFileMode),
+	}}
+	if conflict := applyRecoveryOpsInMemory(index, conflicting); !strings.Contains(conflict, "before-state mismatch") {
+		t.Fatalf("conflicting transition=%q want before-state mismatch", conflict)
+	}
+}
+
 // seedBlockedModify lands a blocked_conflict row whose ops describe a
 // before->after modify. The shared fixture uses HEAD=base; tests advance
 // HEAD via an external commit after seeding so the self-heal probe sees

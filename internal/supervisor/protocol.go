@@ -41,6 +41,7 @@ var validMethods = map[string]struct{}{
 	"status": {}, "enable_repository": {}, "disable_repository": {},
 	"checkpoint_barrier": {}, "hint": {}, "history": {},
 	"restore_plan": {}, "restore_apply": {}, "repair": {}, "shutdown": {},
+	"maintenance_begin": {}, "maintenance_renew": {}, "maintenance_end": {},
 	"worker_environment": {},
 }
 

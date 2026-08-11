@@ -1285,10 +1285,12 @@ func materializeRecoveryState(
 
 func applyRecoveryOpsInMemory(index map[string]git.IndexEntry, ops []state.CaptureOp) string {
 	for _, op := range ops {
-		beforeMatches := func(path string) bool {
+		matches := func(path, mode, oid string) bool {
 			entry, ok := index[path]
-			return ok && entry.Mode == op.BeforeMode.String && entry.OID == op.BeforeOID.String
+			return ok && entry.Mode == mode && entry.OID == oid
 		}
+		beforeMatches := func(path string) bool { return matches(path, op.BeforeMode.String, op.BeforeOID.String) }
+		afterMatches := func(path string) bool { return matches(path, op.AfterMode.String, op.AfterOID.String) }
 		after := git.IndexEntry{Mode: op.AfterMode.String, OID: op.AfterOID.String, Path: op.Path}
 		switch op.Op {
 		case "create":
@@ -1297,17 +1299,26 @@ func applyRecoveryOpsInMemory(index map[string]git.IndexEntry, ops []state.Captu
 			}
 			index[op.Path] = after
 		case "modify", "mode":
+			if afterMatches(op.Path) {
+				continue
+			}
 			if !beforeMatches(op.Path) {
 				return fmt.Sprintf("%s before-state mismatch for %s", op.Op, op.Path)
 			}
 			index[op.Path] = after
 		case "delete":
+			if _, present := index[op.Path]; !present {
+				continue
+			}
 			if !beforeMatches(op.Path) {
 				return fmt.Sprintf("delete before-state mismatch for %s", op.Path)
 			}
 			delete(index, op.Path)
 		case "rename":
 			oldPath := op.OldPath.String
+			if _, sourcePresent := index[oldPath]; !sourcePresent && afterMatches(op.Path) {
+				continue
+			}
 			if !beforeMatches(oldPath) {
 				return fmt.Sprintf("rename source mismatch for %s", oldPath)
 			}

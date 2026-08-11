@@ -16,9 +16,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -28,6 +30,11 @@ const (
 	fixActionClearDrainedBackpressure  = "clear_drained_backpressure"
 	fixActionDropGeneratedPending      = "drop_generated_pending"
 	fixActionReconcileUnpublishedChain = "reconcile_unpublished_chain"
+)
+
+var (
+	prepareFixMutationSupervisor = ensureMutationSupervisor
+	withQuiescedFixRuntime       = withQuiescedRepositoryRuntime
 )
 
 type fixPlan struct {
@@ -46,6 +53,7 @@ type fixPlan struct {
 	Suggestions        []string                `json:"suggestions,omitempty"`
 	RowsChanged        int64                   `json:"rows_changed"`
 	ForceRequired      bool                    `json:"force_required,omitempty"`
+	RuntimeQuiescence  bool                    `json:"runtime_quiescence_required,omitempty"`
 	Incomplete         bool                    `json:"incomplete,omitempty"`
 	VerifyErrors       []string                `json:"verify_errors,omitempty"`
 	RemainingBlockers  *fixBlockerVerification `json:"remaining_blockers,omitempty"`
@@ -110,9 +118,10 @@ without --force it prints a dry-run plan only. --yes applies safe recovery:
 each stuck unpublished branch/generation pair is either proven present at a
 stable HEAD or preserved at a hidden recovery ref before its queue state
 changes. --force selects archive-only recovery for otherwise unresolved pairs;
-it never deletes captured work. --force without --yes is still dry-run. All
-actions refuse while a live daemon owns the state DB, and state.db is backed
-up before any mutation.`,
+it never deletes captured work. --force without --yes is still dry-run. Apply
+mode checkpoints enabled linked worktrees, temporarily stops this repository's
+shared worker, and restores protection after recovery. state.db is backed up
+before any mutation.`,
 		Example: `  acd fix --dry-run
   acd fix --yes
   acd fix --force --dry-run
@@ -166,12 +175,21 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 		return fmt.Errorf("acd fix: refusing to mutate state while unsafe conditions remain")
 	}
 	if len(plan.Actions) > 0 {
-		if err := applyFixPlan(ctx, rec.StateDB, &plan); err != nil {
-			markFixIncomplete(&plan, err)
+		var applyErr error
+		if plan.RuntimeQuiescence {
+			applyErr = applyFixPlanWithRuntimeQuiesced(ctx, rec, force, clearPause, &plan)
+		} else {
+			applyErr = applyFixPlan(ctx, rec.StateDB, &plan)
+			if errors.Is(applyErr, daemon.ErrDaemonLockHeld) {
+				applyErr = applyFixPlanWithRuntimeQuiesced(ctx, rec, force, clearPause, &plan)
+			}
+		}
+		if applyErr != nil {
+			markFixIncomplete(&plan, applyErr)
 			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
 				return rerr
 			}
-			return err
+			return applyErr
 		}
 	} else if force {
 		conn, err := openStateDBReadOnly(ctx, rec.StateDB)
@@ -187,6 +205,33 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 		}
 	}
 	return renderFix(out, plan, jsonOut)
+}
+
+func applyFixPlanWithRuntimeQuiesced(
+	ctx context.Context,
+	rec central.RepoRecord,
+	force, clearPause bool,
+	plan *fixPlan,
+) error {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return fmt.Errorf("acd fix: resolve runtime roots: %w", err)
+	}
+	if err := prepareFixMutationSupervisor(ctx, roots); err != nil {
+		return fmt.Errorf("acd fix: prepare managed runtime maintenance: %w", err)
+	}
+	return withQuiescedFixRuntime(ctx, roots, rec.RepositoryID, func(operationCtx context.Context) error {
+		fresh, buildErr := buildFixPlan(operationCtx, rec.Path, rec.StateDB, false, force, clearPause)
+		if buildErr != nil {
+			return buildErr
+		}
+		if len(fresh.Unsafe) > 0 {
+			*plan = fresh
+			return errors.New("acd fix: unsafe conditions appeared after runtime quiescence")
+		}
+		*plan = fresh
+		return applyFixPlan(operationCtx, rec.StateDB, plan)
+	})
 }
 
 func markFixIncomplete(plan *fixPlan, err error) {
@@ -242,8 +287,9 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if alive, desc, err := daemonAliveSQL(ctx, conn); err != nil {
 		return fixPlan{}, err
 	} else if alive {
-		plan.Unsafe = append(plan.Unsafe, desc)
-		plan.Suggestions = append(plan.Suggestions, "Stop the daemon before applying `acd fix --yes`, or rerun with --dry-run for inspection only.")
+		plan.RuntimeQuiescence = true
+		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
+			"%s; apply mode will checkpoint enabled worktrees, stop the shared runtime, recover, and restart protection automatically.", desc))
 	}
 	if branchRef == "" {
 		plan.Unsafe = append(plan.Unsafe, "detached HEAD is not safe for guided state mutation")

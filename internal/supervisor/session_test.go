@@ -17,8 +17,129 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
+
+func TestRepositoryMaintenanceLeaseStopsWorkerAndFencesRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signals")
+	}
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state", "acd"), Share: filepath.Join(root, "share", "acd"),
+		Config: filepath.Join(root, "config", "acd"),
+	}
+	const repositoryID = "0123456789abcdef"
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/repo", StateDB: "/repo/state.db", RepositoryID: repositoryID, WorktreeID: "fedcba9876543210",
+	}}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sleep", "60")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	worker := &workerProcess{id: repositoryID, cmd: command, signature: "registered", desired: "registered"}
+	server := &Server{Roots: roots, BinaryPath: "/does/not/exist", workers: map[string]*workerProcess{repositoryID: worker}}
+	go func() {
+		_ = command.Wait()
+		server.mu.Lock()
+		if current := server.workers[repositoryID]; current != nil && current.cmd == command {
+			current.cmd = nil
+			current.intentional = false
+		}
+		server.mu.Unlock()
+	}()
+	t.Cleanup(func() { _ = command.Process.Kill() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, protocolErr := server.beginMaintenance(ctx, repositoryID)
+	if protocolErr != nil {
+		t.Fatalf("begin maintenance: %+v", protocolErr)
+	}
+	lease := raw.(MaintenanceLease)
+	if lease.Token == "" || lease.RepositoryID != repositoryID {
+		t.Fatalf("lease=%+v", lease)
+	}
+	if err := syscall.Kill(command.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("worker pid %d survived maintenance begin: %v", command.Process.Pid, err)
+	}
+	if err := server.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	if heldWorker := server.workers[repositoryID]; heldWorker != nil && heldWorker.cmd != nil {
+		server.mu.Unlock()
+		t.Fatal("maintenance hold allowed worker restart")
+	}
+	server.mu.Unlock()
+
+	params, _ := json.Marshal(map[string]string{"token": lease.Token})
+	if _, protocolErr := server.renewMaintenance(repositoryID, params); protocolErr != nil {
+		t.Fatalf("renew maintenance: %+v", protocolErr)
+	}
+	if _, protocolErr := server.endMaintenance(ctx, repositoryID, params); protocolErr != nil {
+		t.Fatalf("end maintenance: %+v", protocolErr)
+	}
+	server.mu.Lock()
+	_, held := server.maintenance[repositoryID]
+	restarts := server.workers[repositoryID].restarts
+	server.mu.Unlock()
+	if held || restarts == 0 {
+		t.Fatalf("maintenance held=%v restart attempts=%d", held, restarts)
+	}
+}
+
+func TestRepositoryMaintenanceLeaseRequiresOwnerTokenAndExpires(t *testing.T) {
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state", "acd"), Share: filepath.Join(root, "share", "acd"),
+		Config: filepath.Join(root, "config", "acd"),
+	}
+	const repositoryID = "0123456789abcdef"
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/repo", StateDB: "/repo/state.db", RepositoryID: repositoryID, WorktreeID: "fedcba9876543210",
+	}}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		Roots: roots, BinaryPath: "/does/not/exist", workers: make(map[string]*workerProcess),
+		maintenance: map[string]MaintenanceLease{
+			repositoryID: {RepositoryID: repositoryID, Token: "owner-token", ExpiresAt: time.Now().Add(time.Minute)},
+		},
+	}
+	wrongParams, _ := json.Marshal(map[string]string{"token": "wrong-token"})
+	if _, protocolErr := server.renewMaintenance(repositoryID, wrongParams); protocolErr == nil || protocolErr.Code != "maintenance_lease_lost" {
+		t.Fatalf("renew with wrong token error=%+v", protocolErr)
+	}
+	if _, protocolErr := server.endMaintenance(context.Background(), repositoryID, wrongParams); protocolErr == nil || protocolErr.Code != "maintenance_lease_lost" {
+		t.Fatalf("end with wrong token error=%+v", protocolErr)
+	}
+	server.mu.Lock()
+	lease := server.maintenance[repositoryID]
+	lease.ExpiresAt = time.Now().Add(-time.Second)
+	server.maintenance[repositoryID] = lease
+	server.mu.Unlock()
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server.mu.Lock()
+	_, held := server.maintenance[repositoryID]
+	worker := server.workers[repositoryID]
+	server.mu.Unlock()
+	if held {
+		t.Fatal("expired maintenance lease remained active")
+	}
+	if worker == nil || worker.restarts == 0 {
+		t.Fatalf("expired lease did not restore worker start attempt: %+v", worker)
+	}
+}
 
 func TestEnsureSessionLeavesNonDarwinServiceLifecycleUnchanged(t *testing.T) {
 	if runtime.GOOS == "darwin" {

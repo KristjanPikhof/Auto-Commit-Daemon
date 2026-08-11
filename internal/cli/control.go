@@ -60,6 +60,7 @@ type controlResult struct {
 	AllChangesCommittedInGit bool     `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool     `json:"checkpoint_published_by_acd"`
 	CheckpointID             string   `json:"checkpoint_id,omitempty"`
+	RecoveryRequired         bool     `json:"-"`
 	CLIVersion               string   `json:"cli_version,omitempty"`
 	SupervisorVersion        string   `json:"supervisor_version,omitempty"`
 }
@@ -78,8 +79,10 @@ func newOnCmd() *cobra.Command {
 		Long: `Enable checkpoint protection for the current repository.
 
 The command is idempotent and asks the user supervisor to reconcile the
-repository's worker. Run acd setup first when the checkpoint-first cutover has
-not been completed. Existing checkpoint history is preserved.`,
+repository's worker. It applies safe exact-chain recovery automatically after
+the initial checkpoint. Archive-only recovery still requires explicit consent.
+Run acd setup first when the checkpoint-first cutover has not been completed.
+Existing checkpoint history is preserved.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -142,7 +145,7 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return controlWorktreeError("on", repoFlag, err)
 	}
 
-	actions := make([]string, 0, 2)
+	actions := make([]string, 0, 3)
 	if !lookup.Registered {
 		return actionRequiredError("setup_required", "acd on: repository is not configured; run `acd setup`")
 	}
@@ -169,6 +172,24 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
 		return err
+	}
+	if res.RecoveryRequired {
+		recoveryErr := runFix(ctx, io.Discard, lookup.Worktree.Root, false, true, false, false, true)
+		res, err = inspectControl(ctx, lookup.Worktree.Root)
+		if err != nil {
+			return err
+		}
+		if recoveryErr != nil {
+			res.Command = "on"
+			res.Changed = len(actions) > 0
+			res.Actions = append(actions, "recovery_failed")
+			res.StatePreserved = true
+			if renderErr := renderControl(out, res, jsonOut); renderErr != nil {
+				return renderErr
+			}
+			return actionRequiredError("recovery_failed", fmt.Sprintf("acd on: automatic exact-chain recovery failed: %v", recoveryErr))
+		}
+		actions = append(actions, "recovered")
 	}
 	res.Command = "on"
 	res.Changed = len(actions) > 0
@@ -437,11 +458,6 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "This repository still uses the v19 protection ledger."
 		res.NextAction = "Run `acd setup` to perform the checkpoint-first cutover."
-	case status.CheckpointProtectionAvailable && !status.Protected && !manualPause:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
-		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
 	case status.Stale:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -469,14 +485,25 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
+		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A durable block has stopped Git publication; this blocked publication needs recovery while checkpoint protection remains active."
-		res.NextAction = "Run `acd doctor` to inspect the blocked publication."
+		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
+		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A blocked publication needs recovery on the active branch."
-		res.NextAction = "Run `acd doctor` to inspect the blocker."
+		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
+	case status.CheckpointProtectionAvailable && !status.Protected && status.Busy:
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD is scanning recent changes and completing their protection checkpoint."
+		res.NextAction = "No action needed; checkpoint protection completes automatically."
+	case status.CheckpointProtectionAvailable && !status.Protected:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
+		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
 	case status.SelfPublication.GitAppliedCount > 0:
 		res.Health = controlHealthPublishing
 		res.Summary = "Current changes are checkpointed while ACD publishes Git commits."

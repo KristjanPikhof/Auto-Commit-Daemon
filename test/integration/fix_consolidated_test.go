@@ -6,14 +6,100 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
+
+func TestControlOnRecoversDuplicateCaptureWithLinkedWorktreeWorkerLive(t *testing.T) {
+	requireSQLite(t)
+	repo := tempRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	runGitOK(t, repo, "worktree", "add", "-q", "-b", "linked-recovery", linked)
+	t.Cleanup(func() { _, _ = runGit(repo, "worktree", "remove", "--force", linked) })
+	env := withIsolatedHome(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	mainDB := initStateDBSchema(t, ctx, env, repo, "linked-recovery-main")
+	roots, repositoryID := prepareCheckpointRegistration(t, env, linked)
+	linkedRepositoryID := repositoryID
+	_, mainRepositoryID := prepareCheckpointRegistration(t, env, repo)
+	if linkedRepositoryID != mainRepositoryID {
+		t.Fatalf("linked worktrees have distinct repository ids: main=%s linked=%s", mainRepositoryID, linkedRepositoryID)
+	}
+
+	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	beforeOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:.gitignore"))
+	afterOID := gitHashObjectStdin(t, repo, "duplicate captured state\n")
+	now := nowFloatSeconds()
+	seed := fmt.Sprintf(`
+INSERT INTO capture_events(branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state,error)
+VALUES ('refs/heads/main',1,'%s','modify','.gitignore','rescan',%f,'blocked_conflict','history moved');
+INSERT INTO capture_ops(event_seq,ord,op,path,before_oid,before_mode,after_oid,after_mode,fidelity)
+VALUES (last_insert_rowid(),0,'modify','.gitignore','%s','100644','%s','100644','rescan');
+INSERT INTO capture_events(branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state)
+VALUES ('refs/heads/main',1,'%s','modify','.gitignore','rescan',%f,'pending');
+INSERT INTO capture_ops(event_seq,ord,op,path,before_oid,before_mode,after_oid,after_mode,fidelity)
+VALUES (last_insert_rowid(),0,'modify','.gitignore','%s','100644','%s','100644','rescan');
+`, head, now, beforeOID, afterOID, head, now+0.001, beforeOID, afterOID)
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
+	before := mustIntegrationWorkerStatus(t, ctx, roots, repositoryID)
+	off := runAcd(t, ctx, env, "off", "--repo", repo, "--json")
+	if off.ExitCode != 0 {
+		t.Fatalf("off exit=%d\nstdout=%s\nstderr=%s", off.ExitCode, off.Stdout, off.Stderr)
+	}
+	sqliteExec(t, mainDB, seed)
+
+	on := runAcd(t, ctx, env, "on", "--repo", repo, "--json")
+	if on.ExitCode != 0 || strings.Contains(on.Stdout, `"action_required": true`) {
+		t.Fatalf("on exit=%d\nstdout=%s\nstderr=%s", on.ExitCode, on.Stdout, on.Stderr)
+	}
+	if got := sqliteScalar(t, mainDB, "SELECT group_concat(state, ',') FROM (SELECT state FROM capture_events ORDER BY seq)"); got != "recovered,recovered" {
+		t.Fatalf("duplicate capture states=%q", got)
+	}
+	after := mustIntegrationWorkerStatus(t, ctx, roots, repositoryID)
+	if before.PID <= 0 || after.PID <= 0 {
+		t.Fatalf("shared worker missing: before=%+v after=%+v", before, after)
+	}
+	if before.PID != after.PID {
+		if err := syscall.Kill(before.PID, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("old shared worker pid %d survived recovery: %v", before.PID, err)
+		}
+	}
+	status := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
+	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"pending_events": 0`) ||
+		!strings.Contains(status.Stdout, `"blocked_events": 0`) || strings.Contains(status.Stdout, `"action_required": true`) {
+		t.Fatalf("post-recovery status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
+	}
+}
+
+func mustIntegrationWorkerStatus(t *testing.T, ctx context.Context, roots paths.Roots, repositoryID string) supervisor.WorkerStatus {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := checkpointRuntimeStatus(ctx, roots)
+		if err == nil {
+			for _, worker := range status.Workers {
+				if worker.RepositoryID == repositoryID && worker.PID > 0 && worker.State == "running" {
+					return worker
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("worker %s did not become ready", repositoryID)
+	return supervisor.WorkerStatus{}
+}
 
 // TestFix_ReconcilesWholeExactPairs pins the immutable recovery contract:
 // exact HEAD matches publish the full pair, while explicit --force archives a

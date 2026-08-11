@@ -154,6 +154,14 @@ func TestApplyControlStatusDurableReplayBlockNeedsAttention(t *testing.T) {
 		!strings.Contains(result.Summary, "durable block") {
 		t.Fatalf("control result=%+v", result)
 	}
+	if !result.RecoveryRequired {
+		t.Fatal("durable replay block did not request automatic recovery")
+	}
+	if !strings.Contains(result.NextAction, "acd support recover --dry-run") ||
+		!strings.Contains(result.NextAction, "acd support recover --yes") ||
+		strings.Contains(result.NextAction, "acd doctor") {
+		t.Fatalf("next action=%q", result.NextAction)
+	}
 }
 
 func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
@@ -173,6 +181,27 @@ func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
 	}
 	if !strings.Contains(result.NextAction, "acd doctor") {
 		t.Fatalf("next action=%q", result.NextAction)
+	}
+}
+
+func TestApplyControlStatusBusyCheckpointCompletesAutomatically(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		Busy:                          true,
+		CheckpointProtectionAvailable: true,
+		ObservationEpoch:              7,
+		CoveredEpoch:                  6,
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+
+	applyControlStatus(&result, status)
+
+	if !result.OK || result.Health != controlHealthWaiting || result.Protected {
+		t.Fatalf("busy checkpoint result=%+v", result)
+	}
+	if !strings.Contains(result.NextAction, "completes automatically") || strings.Contains(result.NextAction, "acd doctor") {
+		t.Fatalf("busy checkpoint next action=%q", result.NextAction)
 	}
 }
 
@@ -326,6 +355,10 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			got := decodeControlResult(t, out.Bytes())
 			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "blocked publication") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
+			}
+			if !strings.Contains(got.NextAction, "acd support recover --dry-run") ||
+				!strings.Contains(got.NextAction, "acd support recover --yes") {
+				t.Fatalf("active tail recovery action=%q", got.NextAction)
 			}
 		})
 	}
