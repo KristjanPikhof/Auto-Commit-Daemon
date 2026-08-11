@@ -153,9 +153,9 @@ func TestCheckpointRuntimeLimiterHoldsFifthUntilRelease(t *testing.T) {
 	}
 }
 
-func TestCheckpointRuntimeUsesSessionOwnershipOnDarwin(t *testing.T) {
+func TestCheckpointRuntimeUsesSharedUserOwnershipOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skip("session ownership is a macOS runtime contract")
+		t.Skip("shared user ownership is a macOS runtime contract")
 	}
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)

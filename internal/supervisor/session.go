@@ -2,8 +2,6 @@ package supervisor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,18 +18,14 @@ import (
 
 const sessionStartTimeout = 15 * time.Second
 
-// EnsureSession starts the macOS supervisor from the current authorized
-// terminal or agent process. Unlike launchd, the child remains in the caller's
-// macOS privacy responsibility chain and therefore needs no Full Disk Access.
+// EnsureSession starts the per-user macOS supervisor from the current
+// authorized process. The owner-only socket and peer credential check allow
+// every application running as the same user to reuse the process.
 func EnsureSession(ctx context.Context, roots paths.Roots, binary, logPath string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
-	ownerID, err := responsibilitySessionIdentity(ctx)
-	if err != nil {
-		return err
-	}
-	return ensureSessionForOwner(ctx, roots, binary, logPath, ownerID)
+	return ensureSessionForOwner(ctx, roots, binary, logPath, userSupervisorOwnership())
 }
 
 func ensureSessionForOwner(ctx context.Context, roots paths.Roots, binary, logPath, ownerID string) error {
@@ -40,7 +33,7 @@ func ensureSessionForOwner(ctx context.Context, roots paths.Roots, binary, logPa
 		return errors.New("supervisor: incomplete session configuration")
 	}
 	if ownerID == "" {
-		return errors.New("supervisor: responsibility session identity is unavailable")
+		return errors.New("supervisor: user ownership identity is unavailable")
 	}
 	ready, err := sessionReady(ctx, roots, ownerID)
 	if err != nil {
@@ -120,11 +113,7 @@ func ensureSessionForOwner(ctx context.Context, roots paths.Roots, binary, logPa
 }
 
 func sessionRunning(ctx context.Context, roots paths.Roots) bool {
-	ownerID, err := responsibilitySessionIdentity(ctx)
-	if err != nil {
-		return false
-	}
-	ready, _ := sessionReady(ctx, roots, ownerID)
+	ready, _ := sessionReady(ctx, roots, userSupervisorOwnership())
 	return ready
 }
 
@@ -155,9 +144,8 @@ func sessionReady(ctx context.Context, roots paths.Roots, ownerID string) (bool,
 		}
 		return false, fmt.Errorf("an older ACD background process is still running (version %s); run `acd setup` to upgrade and restart it", runningVersion)
 	}
-	wantOwnership := "session:" + ownerID
-	if status.Ownership != wantOwnership {
-		return false, errors.New("ACD was started by another macOS application or terminal session and cannot be reused safely; run `acd setup` to restart ACD from this session")
+	if status.Ownership != ownerID {
+		return false, errors.New("ACD supervisor ownership is incompatible with this user; run `acd setup` once to replace the legacy session supervisor")
 	}
 	return true, nil
 }
@@ -226,30 +214,8 @@ func stopSessionChild(command *exec.Cmd, done <-chan error) {
 	}
 }
 
-func responsibilitySessionIdentity(ctx context.Context) (string, error) {
-	pid := os.Getpid()
-	var command string
-	for depth := 0; depth < 64; depth++ {
-		output, err := exec.CommandContext(ctx, "/bin/ps", "-o", "ppid=,comm=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			return "", fmt.Errorf("supervisor: identify responsibility session: %w", err)
-		}
-		fields := strings.Fields(strings.TrimSpace(string(output)))
-		if len(fields) < 2 {
-			return "", errors.New("supervisor: identify responsibility session: invalid process ancestry")
-		}
-		parent, err := strconv.Atoi(fields[0])
-		if err != nil || parent < 0 {
-			return "", errors.New("supervisor: identify responsibility session: invalid parent process")
-		}
-		command = strings.Join(fields[1:], " ")
-		if parent <= 1 {
-			digest := sha256.Sum256([]byte(strconv.Itoa(pid) + "\x00" + command))
-			return hex.EncodeToString(digest[:16]), nil
-		}
-		pid = parent
-	}
-	return "", errors.New("supervisor: identify responsibility session: process ancestry is too deep")
+func userSupervisorOwnership() string {
+	return fmt.Sprintf("user:%d", os.Getuid())
 }
 
 func releaseSessionStartLock(file *os.File) {

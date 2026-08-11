@@ -157,6 +157,17 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if dryRun {
 		return renderSetupPlan(cmd, plan, jsonOut)
 	}
+	if len(plan.Actions) == 1 && plan.Actions[0].Kind == "verify_compatible_runtime" {
+		if jsonOut {
+			return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateProtected,
+				Changed: false, Actions: []productAction{}, Data: plan}, true)
+		}
+		if err := renderSetupPlan(cmd, plan, false); err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "Setup already current; no repository scan or migration was needed.")
+		return nil
+	}
 	if !jsonOut {
 		if err := renderSetupPlan(cmd, plan, false); err != nil {
 			return err

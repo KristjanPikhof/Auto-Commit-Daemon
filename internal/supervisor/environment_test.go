@@ -55,7 +55,7 @@ func TestSessionProcessEnvironmentDropsUnrelatedSecrets(t *testing.T) {
 			t.Fatalf("process environment retained %q", unexpected)
 		}
 	}
-	if got := sessionProcessEnvironment(roots, []string{"HOME=/Users/test"}, "owner-a"); !slices.Contains(got, supervisorOwnershipEnv+"=session:owner-a") {
+	if got := sessionProcessEnvironment(roots, []string{"HOME=/Users/test"}, "user:501"); !slices.Contains(got, supervisorOwnershipEnv+"=user:501") {
 		t.Fatalf("session environment missing ownership attestation: %v", got)
 	}
 }

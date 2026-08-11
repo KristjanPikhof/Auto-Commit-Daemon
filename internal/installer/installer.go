@@ -50,6 +50,7 @@ type Action struct {
 }
 
 type Plan struct {
+	Mode                string                       `json:"mode"`
 	OperationID         string                       `json:"operation_id"`
 	Digest              string                       `json:"digest"`
 	ExistingInstall     bool                         `json:"existing_install"`
@@ -159,6 +160,11 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if err != nil {
 		return Plan{}, err
 	}
+	if plan, ok, compatibleErr := buildCompatibleSetupPlan(ctx, roots, options, wt, executable, service, priorService, registry); compatibleErr != nil {
+		return Plan{}, compatibleErr
+	} else if ok {
+		return plan, nil
+	}
 	existing := registry.Version < central.RegistryVersion || len(registry.Repos) > 0 || fileExists(roots.ManagedBinaryPath()) || fileExists(service.Path) || fileExists(roots.ConfigPath())
 	planned, err := central.PlanRegistryV2(ctx, registry)
 	if err != nil && len(registry.Repos) > 0 {
@@ -211,6 +217,7 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		return Plan{}, err
 	}
 	plan := Plan{
+		Mode:        "full",
 		OperationID: opID, ExistingInstall: existing, RequiresExpected: existing,
 		Repo: wt.Root, RepositoryID: registration.Record.RepositoryID, WorktreeID: registration.Record.WorktreeID,
 		ManagedBinary: roots.ManagedBinaryPath(), SourceExecutable: executable, Service: service,
@@ -261,6 +268,23 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptions) (Result, error) {
 	if plan.Digest == "" || digestPlan(plan) != plan.Digest {
 		return Result{}, errors.New("setup: plan digest mismatch")
+	}
+	if plan.Mode == "compatible_upgrade" {
+		forceReplacement := false
+		for _, integrationPlan := range plan.IntegrationPlans {
+			if integrationPlan.Changed {
+				forceReplacement = true
+				break
+			}
+		}
+		changed, err := ApplyCompatibleRuntime(ctx, roots, RuntimeUpgradeOptions{
+			SourceExecutable: plan.SourceExecutable,
+			SourceVersion:    version.String(),
+			Compatibility:    RuntimeCompatibility(),
+			Integrations:     strings.Join(plan.Integrations, ","),
+			Force:            forceReplacement,
+		})
+		return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Changed: changed}, err
 	}
 	lifecycleLock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
 	if err != nil {
@@ -1251,6 +1275,13 @@ func waitSetupWorkersWithProgress(
 	}
 	if status.Version != version.String() {
 		return fmt.Errorf("setup: supervisor version %q does not match managed binary %q", status.Version, version.String())
+	}
+	managedDigest, err := version.FileDigest(roots.ManagedBinaryPath())
+	if err != nil {
+		return fmt.Errorf("setup: digest managed binary: %w", err)
+	}
+	if status.BinaryDigest != managedDigest || !status.Compatibility.Equal(RuntimeCompatibility()) {
+		return errors.New("setup: supervisor did not advertise the installed runtime compatibility contract")
 	}
 	enabledRecords := make([]central.RepoRecord, 0, len(registry.Repos))
 	for _, record := range registry.Repos {

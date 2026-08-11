@@ -28,7 +28,7 @@ func WorkerEnvironment(environ []string) map[string]string {
 }
 
 func sessionProcessEnvironment(roots paths.Roots, environ []string, ownerID string) []string {
-	return append(ProcessEnvironment(roots, environ), supervisorOwnershipEnv+"=session:"+ownerID)
+	return append(ProcessEnvironment(roots, environ), supervisorOwnershipEnv+"="+ownerID)
 }
 
 func ValidWorkerEnvironment(values map[string]string) bool {

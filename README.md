@@ -19,17 +19,27 @@ From the Git repository you want to protect:
 acd setup
 ~~~
 
-Setup inspects the machine and repository, prints an exact plan, asks once,
-and applies the plan transactionally. It configures one user-level supervisor,
-enables the current repository, merges detected optional integrations, and
-runs an isolated checkpoint/publish/restore self-test. On failure it restores
+The first setup inspects the machine and repository, prints an exact plan,
+asks once, and applies the plan transactionally. It configures one user-level
+supervisor, enables the current repository, merges detected optional
+integrations, and runs an isolated checkpoint/publish/restore self-test. Later
+compatible upgrades use a bounded binary-and-hooks transaction without
+rescanning or migrating every repository. On failure either path restores
 every touched file and prior process/service state.
 
-On macOS, ACD starts the supervisor from the Terminal or agent session that
-invoked it. This keeps repository access within permissions the user already
-granted and does not require Full Disk Access. After logout or restart, the
-first `acd on` or supported agent hook starts the supervisor again. Linux uses
-the persistent user systemd service.
+On macOS, the first ACD mutation starts one shared supervisor for the current
+user. Other terminals and agent applications reuse its owner-only socket after
+a same-user peer credential check, so switching applications does not require
+setup. The process inherits the permissions of the application that started
+it and does not require Full Disk Access. After logout or restart, the first
+`acd on` or supported agent hook starts it again. Linux uses the persistent
+user systemd service.
+
+After the compatibility contract is installed, invoking a newer compatible
+ACD build from source upgrades the managed runtime automatically at a safe
+checkpoint boundary. Protocol, registry, or state-schema changes still require
+the full reviewed `acd setup` migration. The first release introducing this
+contract may therefore require one final full setup.
 
 Preview without writes or supervisor/service actions:
 

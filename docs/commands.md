@@ -39,6 +39,10 @@ up every touched file, applies one all-repository v19 to v20 cutover, runs an
 isolated self-test, and commits only after all held workers report complete
 current coverage.
 
+After that cutover, compatible setup plans use a bounded binary-and-hooks
+transaction. They checkpoint enabled workers but do not rescan repository
+databases, rerun migrations, or repeat the isolated migration self-test.
+
 ## Status
 
 Every human status answers:
@@ -55,9 +59,11 @@ publication/repair states.
 
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
-writes. On macOS, mutating commands first start the session-owned supervisor
-from the invoking Terminal or agent; this uses the caller's existing folder
-access and requires no Full Disk Access.
+writes. On macOS, mutating commands first start or reuse the shared per-user
+supervisor. The owner-only socket verifies the peer UID, and the process uses
+the permissions inherited from the application that first started it. A newer
+compatible source build replaces the managed runtime automatically; schema or
+protocol changes still require full `acd setup`.
 
 ## On and off
 
