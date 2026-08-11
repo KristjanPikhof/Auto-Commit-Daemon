@@ -46,6 +46,105 @@ func TestApplyRecoveryOpsInMemoryAcceptsIdempotentDuplicateTransitions(t *testin
 	}
 }
 
+func TestRecoveryChainAcceptsProvenLaterBaseReset(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B from abandoned base\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C from current base\n"))
+	unrelated, _ := git.HashObjectStdin(ctx, f.dir, []byte("unrelated\n"))
+	base := commitSingleFileTree(t, ctx, f.dir, "doc.md", a, "base A")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, base, ""); err != nil {
+		t.Fatalf("update base: %v", err)
+	}
+	seq1 := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: b, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	markRecoveryBarrier(t, ctx, f, seq1, base, "modify before-state mismatch for doc.md")
+	currentBase := commitTreeWithIndexUpdates(t, ctx, f, base, "current base",
+		git.RegularFileMode+" "+unrelated+"\tunrelated.txt")
+	seq2 := appendRecoveryEvent(t, ctx, f, currentBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, currentBase, base); err != nil {
+		t.Fatalf("update current base: %v", err)
+	}
+
+	opts := RecoveryReconcileOptions{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq: seq1, GitDir: f.gitDir,
+	}
+	proved, err := ProveUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("ProveUnpublishedChain: %v", err)
+	}
+	if !proved.Handled || proved.Outcome != state.EventStateRecovered || proved.EventCount != 2 {
+		t.Fatalf("proved=%+v want two-event recovered chain", proved)
+	}
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("ReconcileUnpublishedChain: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStateRecovered || result.EventCount != 2 {
+		t.Fatalf("result=%+v want two-event recovered chain", result)
+	}
+	for _, seq := range []int64{seq1, seq2} {
+		if got, _ := readEventState(t, ctx, f.db, seq); got != state.EventStateRecovered {
+			t.Fatalf("seq=%d state=%q want recovered", seq, got)
+		}
+	}
+	got, err := git.LsTreeBlobOID(ctx, f.dir, result.RecoveryRef, "doc.md")
+	if err != nil || got != c {
+		t.Fatalf("recovery doc blob=%s err=%v want %s", got, err, c)
+	}
+}
+
+func TestRecoveryChainRejectsUnprovenLaterBaseReset(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	claimedBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("not in base\n"))
+	base := commitSingleFileTree(t, ctx, f.dir, "doc.md", a, "base A")
+	seq1 := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: a, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: b, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	markRecoveryBarrier(t, ctx, f, seq1, base, "modify before-state mismatch for doc.md")
+	currentBase := commitTreeWithIndexUpdates(t, ctx, f, base, "current base")
+	seq2 := appendRecoveryEvent(t, ctx, f, currentBase, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID: sql.NullString{String: claimedBefore, Valid: true}, BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID: sql.NullString{String: c, Valid: true}, AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, currentBase, ""); err != nil {
+		t.Fatalf("update current base: %v", err)
+	}
+
+	_, err := ProveUnpublishedChain(ctx, f.dir, f.db, RecoveryReconcileOptions{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration, FirstSeq: seq1,
+	})
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("provenance mismatch seq=%d", seq2)) {
+		t.Fatalf("ProveUnpublishedChain error=%v want seq=%d provenance mismatch", err, seq2)
+	}
+	for _, seq := range []int64{seq1, seq2} {
+		got, _ := readEventState(t, ctx, f.db, seq)
+		want := state.EventStatePending
+		if seq == seq1 {
+			want = state.EventStateBlockedConflict
+		}
+		if got != want {
+			t.Fatalf("seq=%d state=%q want %q", seq, got, want)
+		}
+	}
+}
+
 // seedBlockedModify lands a blocked_conflict row whose ops describe a
 // before->after modify. The shared fixture uses HEAD=base; tests advance
 // HEAD via an external commit after seeding so the self-heal probe sees
