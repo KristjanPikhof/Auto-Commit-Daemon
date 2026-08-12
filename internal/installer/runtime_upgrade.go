@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -25,9 +26,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
 
-// RuntimeUpgradeOptions describes a replacement that does not change any
-// durable schema. Compatible upgrades never inspect or migrate repository
-// databases and therefore remain bounded by the checkpoint barriers only.
+// RuntimeUpgradeOptions describes a compatible managed-runtime replacement.
+// Additive state migrations are backed up and rolled back with the binary.
 type RuntimeUpgradeOptions struct {
 	SourceExecutable string
 	SourceVersion    string
@@ -545,6 +545,16 @@ func checkpointUpgradeRepositories(ctx context.Context, roots paths.Roots, regis
 						err = errors.New(response.Error.Message)
 					}
 					if err != nil {
+						// A schema-forward repository can leave the old worker
+						// unable to open state. A clean Git worktree has no
+						// uncheckpointed content, so it is already durable and
+						// safe to hand to the compatible replacement runtime.
+						if cleanErr := proveRuntimeUpgradeGitDurable(
+							barrierCtx, record); cleanErr == nil {
+							continue
+						} else {
+							err = errors.Join(err, cleanErr)
+						}
 						once.Do(func() { first = fmt.Errorf("runtime upgrade: checkpoint %s: %w", record.Path, err); cancel() })
 						return
 					}
@@ -554,6 +564,95 @@ func checkpointUpgradeRepositories(ctx context.Context, roots paths.Roots, regis
 	}
 	workers.Wait()
 	return first
+}
+
+func proveRuntimeUpgradeGitDurable(
+	ctx context.Context,
+	record central.RepoRecord,
+) error {
+	if record.Path == "" {
+		return errors.New("runtime upgrade: repository path is missing")
+	}
+	worktree, err := git.ResolveWorktree(ctx, record.Path)
+	if err != nil {
+		return fmt.Errorf("runtime upgrade: resolve worktree: %w", err)
+	}
+	status, err := git.Run(ctx, git.RunOpts{Dir: worktree.Root},
+		"status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("runtime upgrade: verify Git durability: %w", err)
+	}
+	if len(status) != 0 {
+		if err := proveRuntimeUpgradeCheckpoint(ctx, record); err != nil {
+			return errors.Join(errors.New(
+				"runtime upgrade: worker is unavailable and the worktree has uncheckpointed changes"), err)
+		}
+	}
+	return nil
+}
+
+func proveRuntimeUpgradeCheckpoint(
+	ctx context.Context,
+	record central.RepoRecord,
+) error {
+	if record.StateDB == "" {
+		return errors.New("runtime upgrade: repository state path is missing")
+	}
+	version, err := state.ReadUserVersion(ctx, record.StateDB)
+	if err != nil {
+		return fmt.Errorf("runtime upgrade: inspect protected state: %w", err)
+	}
+	if version != state.SchemaVersion &&
+		!state.CanRuntimeMigrate(version, state.SchemaVersion) {
+		return fmt.Errorf(
+			"runtime upgrade: protected state schema v%d is not runtime-compatible",
+			version)
+	}
+	db, err := state.OpenReadOnly(ctx, record.StateDB)
+	if err != nil {
+		return fmt.Errorf("runtime upgrade: open protected state: %w", err)
+	}
+	defer db.Close()
+	values := make(map[string]string)
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT key,value FROM daemon_meta
+WHERE key IN (
+ 'protection.complete','protection.observation_epoch',
+ 'protection.covered_epoch','protection.checkpoint_id'
+)`)
+	if err != nil {
+		return fmt.Errorf("runtime upgrade: read protection proof: %w", err)
+	}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			rows.Close()
+			return err
+		}
+		values[key] = value
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	observation, observationErr := strconv.ParseInt(
+		values["protection.observation_epoch"], 10, 64)
+	covered, coveredErr := strconv.ParseInt(
+		values["protection.covered_epoch"], 10, 64)
+	checkpointID := values["protection.checkpoint_id"]
+	if values["protection.complete"] != "true" || observationErr != nil ||
+		coveredErr != nil || observation <= 0 || covered < observation ||
+		checkpointID == "" {
+		return errors.New("runtime upgrade: latest observation lacks a completed checkpoint")
+	}
+	var phase string
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT phase FROM checkpoints WHERE id=?`, checkpointID).Scan(&phase); err != nil {
+		return fmt.Errorf("runtime upgrade: verify completed checkpoint: %w", err)
+	}
+	if phase != state.CheckpointCompleted {
+		return fmt.Errorf("runtime upgrade: checkpoint %s is %s", checkpointID, phase)
+	}
+	return nil
 }
 
 func waitForSupervisorStopped(ctx context.Context, path string) error {

@@ -186,6 +186,88 @@ func TestCheckpointUpgradeRepositoriesDoesNotDrainPublication(t *testing.T) {
 	}
 }
 
+func TestCheckpointUpgradeRepositoriesUsesCleanGitDurabilityWhenWorkerIsDown(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	if err := git.Init(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", "tracked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: repo},
+		"-c", "user.name=ACD Test", "-c", "user.email=acd@test.invalid",
+		"commit", "-m", "Add tracked file"); err != nil {
+		t.Fatal(err)
+	}
+	record := central.RepoRecord{
+		Path: repo, RepositoryID: "0123456789abcdef",
+		WorktreeID: "fedcba9876543210",
+	}
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{record}
+	roots := paths.Roots{State: filepath.Join(t.TempDir(), "state", "acd")}
+
+	if err := checkpointUpgradeRepositories(ctx, roots, registry); err != nil {
+		t.Fatalf("clean worker-down upgrade proof: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("unsafe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := checkpointUpgradeRepositories(ctx, roots, registry)
+	if err == nil || !strings.Contains(err.Error(), "uncheckpointed changes") {
+		t.Fatalf("dirty worker-down upgrade error=%v", err)
+	}
+
+	stateDB := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(ctx, stateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := state.Checkpoint{
+		ID:          "cp-1786517000000-0123456789abcdef",
+		OperationID: "op-runtime-upgrade-protection",
+		WorktreeID:  record.WorktreeID, Reason: state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 7, CoverageEpoch: 7, ObservedHead: "head",
+		ObservedRef: "refs/heads/main", TreeOID: "tree", CommitOID: "commit",
+		Ref: "refs/acd/checkpoints/v1/" + record.WorktreeID +
+			"/cp-1786517000000-0123456789abcdef",
+		CreatedTS: 1,
+	}
+	if created, err := state.PrepareCheckpoint(ctx, db, checkpoint,
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"); err != nil || !created {
+		t.Fatalf("prepare protection checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		"protection.complete":          "true",
+		"protection.observation_epoch": "7",
+		"protection.covered_epoch":     "7",
+		"protection.checkpoint_id":     checkpoint.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registry.Repos[0].StateDB = stateDB
+	if err := checkpointUpgradeRepositories(ctx, roots, registry); err != nil {
+		t.Fatalf("protected dirty worker-down upgrade proof: %v", err)
+	}
+}
+
 func TestBackupCompatibleRuntimeStateCoversEnabledSafeMigrations(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
