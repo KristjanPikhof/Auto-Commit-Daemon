@@ -12,25 +12,30 @@ import (
 )
 
 type intentPlannerWindowSummary struct {
-	ID                  int64                                         `json:"id"`
-	PlannedTS           int64                                         `json:"planned_ts"`
-	Time                string                                        `json:"time"`
-	Provider            string                                        `json:"provider,omitempty"`
-	Model               string                                        `json:"model,omitempty"`
-	BranchRef           string                                        `json:"branch_ref,omitempty"`
-	BranchGeneration    int64                                         `json:"branch_generation,omitempty"`
-	Source              string                                        `json:"source,omitempty"`
-	CommitFormat        string                                        `json:"commit_format,omitempty"`
-	Forced              bool                                          `json:"forced,omitempty"`
-	ForcedReason        string                                        `json:"forced_reason,omitempty"`
-	ValidationFailure   string                                        `json:"validation_failure,omitempty"`
-	OfferedSeqs         []int64                                       `json:"offered_seqs,omitempty"`
-	VisibleOriginalSeqs []int64                                       `json:"visible_original_seqs,omitempty"`
-	HiddenSeqs          []int64                                       `json:"hidden_seqs,omitempty"`
-	SelectedGroups      []state.IntentPlannerWindowGroup              `json:"selected_groups,omitempty"`
-	DeferredSeqs        []int64                                       `json:"deferred_seqs,omitempty"`
-	DeferredReasons     []state.IntentPlannerWindowDeferredReason     `json:"deferred_reasons,omitempty"`
-	Event               *intentPlannerWindowEventParticipationSummary `json:"event,omitempty"`
+	ID                     int64                                         `json:"id"`
+	PlannedTS              int64                                         `json:"planned_ts"`
+	Time                   string                                        `json:"time"`
+	Provider               string                                        `json:"provider,omitempty"`
+	Model                  string                                        `json:"model,omitempty"`
+	BranchRef              string                                        `json:"branch_ref,omitempty"`
+	BranchGeneration       int64                                         `json:"branch_generation,omitempty"`
+	Source                 string                                        `json:"source,omitempty"`
+	CommitFormat           string                                        `json:"commit_format,omitempty"`
+	Forced                 bool                                          `json:"forced,omitempty"`
+	ForcedReason           string                                        `json:"forced_reason,omitempty"`
+	ValidationFailure      string                                        `json:"validation_failure,omitempty"`
+	OfferedSeqs            []int64                                       `json:"offered_seqs,omitempty"`
+	VisibleOriginalSeqs    []int64                                       `json:"visible_original_seqs,omitempty"`
+	HiddenSeqs             []int64                                       `json:"hidden_seqs,omitempty"`
+	SelectedGroups         []state.IntentPlannerWindowGroup              `json:"selected_groups,omitempty"`
+	DeferredSeqs           []int64                                       `json:"deferred_seqs,omitempty"`
+	DeferredReasons        []state.IntentPlannerWindowDeferredReason     `json:"deferred_reasons,omitempty"`
+	PlanAttempt            int                                           `json:"plan_attempt,omitempty"`
+	PlanAttemptLimit       int                                           `json:"plan_attempt_limit,omitempty"`
+	UnresolvedCaptureCount int                                           `json:"unresolved_capture_count,omitempty"`
+	PreservedGroupCount    int                                           `json:"preserved_group_count,omitempty"`
+	ResolutionMode         string                                        `json:"resolution_mode,omitempty"`
+	Event                  *intentPlannerWindowEventParticipationSummary `json:"event,omitempty"`
 }
 
 type intentPlannerWindowEventParticipationSummary struct {
@@ -65,7 +70,58 @@ LIMIT 1`)
 	if len(windows) == 0 {
 		return nil, nil
 	}
+	if err := enrichIntentPlannerWindowRun(ctx, conn, &windows[0]); err != nil {
+		return nil, err
+	}
 	return &windows[0], nil
+}
+
+func enrichIntentPlannerWindowRun(ctx context.Context, conn *sql.DB, win *intentPlannerWindowSummary) error {
+	ok, err := sqliteTableExists(ctx, conn, "intent_plan_runs")
+	if err != nil || !ok {
+		return err
+	}
+	var resolution sql.NullString
+	err = conn.QueryRowContext(ctx, `
+SELECT attempt_count, attempt_limit, unresolved_seqs, preserved_groups,
+       resolution_mode
+FROM intent_plan_runs
+WHERE branch_ref=? AND branch_generation=?
+ORDER BY updated_ts DESC LIMIT 1`, win.BranchRef, win.BranchGeneration).Scan(
+		&win.PlanAttempt, &win.PlanAttemptLimit, newJSONArrayCount(&win.UnresolvedCaptureCount),
+		newJSONArrayCount(&win.PreservedGroupCount), &resolution)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("query latest intent plan run: %w", err)
+	}
+	win.ResolutionMode = resolution.String
+	return nil
+}
+
+type jsonArrayCount struct{ target *int }
+
+func newJSONArrayCount(target *int) *jsonArrayCount { return &jsonArrayCount{target: target} }
+
+func (c *jsonArrayCount) Scan(src any) error {
+	var raw []byte
+	switch value := src.(type) {
+	case string:
+		raw = []byte(value)
+	case []byte:
+		raw = value
+	case nil:
+		raw = []byte("[]")
+	default:
+		return fmt.Errorf("unsupported JSON array value %T", src)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return err
+	}
+	*c.target = len(values)
+	return nil
 }
 
 func loadIntentPlannerWindowForEventSQL(ctx context.Context, conn *sql.DB, eventSeq int64) (*intentPlannerWindowSummary, error) {

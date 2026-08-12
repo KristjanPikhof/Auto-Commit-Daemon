@@ -92,6 +92,7 @@ type IntentPlannerHealthSnapshot struct {
 	LastError           string                    `json:"last_error,omitempty"`
 	BypassCount         uint64                    `json:"bypass_count"`
 	UpdatedTS           float64                   `json:"updated_ts,omitempty"`
+	RecoveryReady       bool                      `json:"recovery_ready,omitempty"`
 }
 
 type intentPlannerHealthRecord struct {
@@ -123,6 +124,8 @@ func DecodeIntentPlannerHealthSnapshot(raw string) (IntentPlannerHealthSnapshot,
 		return IntentPlannerHealthSnapshot{}, ErrIntentPlannerHealthInvalidRecord
 	}
 	snapshot.LastError = ai.SanitizePlannerError(snapshot.LastError)
+	snapshot.RecoveryReady = snapshot.State == IntentPlannerCircuitOpen &&
+		snapshot.NextProbeTS > 0 && snapshot.NextProbeTS <= float64(time.Now().UnixNano())/1e9
 	return snapshot, nil
 }
 
@@ -584,6 +587,10 @@ func (h *IntentPlannerHealth) loadRecord(record intentPlannerHealthRecord, now t
 }
 
 func (h *IntentPlannerHealth) snapshotLocked() IntentPlannerHealthSnapshot {
+	now := time.Now()
+	if h.now != nil {
+		now = h.now()
+	}
 	return IntentPlannerHealthSnapshot{
 		State:               h.state,
 		ProviderFingerprint: h.fingerprint,
@@ -596,6 +603,8 @@ func (h *IntentPlannerHealth) snapshotLocked() IntentPlannerHealthSnapshot {
 		LastError:           h.lastError,
 		BypassCount:         h.bypassCount,
 		UpdatedTS:           intentPlannerHealthTimestamp(h.updatedAt),
+		RecoveryReady: h.state == IntentPlannerCircuitOpen &&
+			!h.retryAt.IsZero() && !now.Before(h.retryAt),
 	}
 }
 

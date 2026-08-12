@@ -43,6 +43,11 @@ type productCommitAllResult struct {
 	WorktreeChanges    int     `json:"worktree_changes,omitempty"`
 	PendingEvents      int     `json:"pending_events,omitempty"`
 	DryRun             bool    `json:"dry_run,omitempty"`
+	SemanticGroupCount int     `json:"semantic_group_count,omitempty"`
+	PlanAttempt        int     `json:"plan_attempt,omitempty"`
+	PlanAttemptLimit   int     `json:"plan_attempt_limit,omitempty"`
+	ResolutionMode     string  `json:"resolution_mode,omitempty"`
+	SingletonCount     int     `json:"singleton_count,omitempty"`
 }
 
 func newProductCommitAllCmd() *cobra.Command {
@@ -229,6 +234,23 @@ completed:
 			follow.TerminalEvents += prior.TerminalEvents
 			follow.CommitsCreated += prior.CommitsCreated
 			result = follow
+		}
+	}
+	if result.PublicationDrained && fileExists(lookup.Record.StateDB) {
+		conn, openErr := openStateDBReadOnly(ctx, lookup.Record.StateDB)
+		if openErr == nil {
+			if win, loadErr := loadLastIntentPlannerWindowSQL(ctx, conn); loadErr == nil && win != nil {
+				result.SemanticGroupCount = len(win.SelectedGroups)
+				result.PlanAttempt = win.PlanAttempt
+				result.PlanAttemptLimit = win.PlanAttemptLimit
+				result.ResolutionMode = win.ResolutionMode
+				for _, group := range win.SelectedGroups {
+					if len(group.SelectedSeqs) == 1 {
+						result.SingletonCount++
+					}
+				}
+			}
+			_ = conn.Close()
 		}
 	}
 	return finishProductCommitAll(out, result, jsonOut)
@@ -506,6 +528,11 @@ func renderProductCommitAll(out io.Writer, result productCommitAllResult, stateN
 	fmt.Fprintf(out, "Protected checkpoint: %s\n", result.CheckpointID)
 	fmt.Fprintf(out, "Resolved target events: %d/%d in %d Git commit(s).\n",
 		result.PublishedEvents, result.TargetEvents, result.CommitsCreated)
+	if result.ResolutionMode != "" {
+		fmt.Fprintf(out, "Intent grouping: %d group(s), plan attempt %d/%d, resolution=%s, singletons=%d.\n",
+			result.SemanticGroupCount, result.PlanAttempt, result.PlanAttemptLimit,
+			result.ResolutionMode, result.SingletonCount)
+	}
 	if result.RecoveredEvents > 0 {
 		fmt.Fprintf(out, "Recovered safely and recaptured: %d event(s).\n",
 			result.RecoveredEvents)

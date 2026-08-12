@@ -42,32 +42,39 @@ type IntentPlannerWindowEvent struct {
 // record. JSON fields are arrays of seqs/groups only; prompt traces remain the
 // opt-in source for exact prompts and diffs.
 type IntentPlannerWindow struct {
-	ID                  int64
-	PlannedTS           float64
-	Provider            sql.NullString
-	Model               sql.NullString
-	BranchRef           string
-	BranchGeneration    int64
-	Source              sql.NullString
-	CommitFormat        sql.NullString
-	Forced              bool
-	ForcedReason        sql.NullString
-	ValidationFailure   sql.NullString
-	OfferedSeqs         []int64
-	VisibleOriginalSeqs []int64
-	HiddenSeqs          []int64
-	SelectedGroups      []IntentPlannerWindowGroup
-	DeferredSeqs        []int64
-	DeferredReasons     []IntentPlannerWindowDeferredReason
-	Events              []IntentPlannerWindowEvent
-	ConfigRevisionID    sql.NullInt64
-	ConfigProfile       sql.NullString
-	DurationMS          sql.NullInt64
-	RetryCount          int
-	FallbackUsed        bool
-	Outcome             sql.NullString
-	ExperimentID        sql.NullInt64
-	ExperimentConsumed  bool
+	ID                     int64
+	PlannedTS              float64
+	Provider               sql.NullString
+	Model                  sql.NullString
+	BranchRef              string
+	BranchGeneration       int64
+	Source                 sql.NullString
+	CommitFormat           sql.NullString
+	Forced                 bool
+	ForcedReason           sql.NullString
+	ValidationFailure      sql.NullString
+	OfferedSeqs            []int64
+	VisibleOriginalSeqs    []int64
+	HiddenSeqs             []int64
+	SelectedGroups         []IntentPlannerWindowGroup
+	DeferredSeqs           []int64
+	DeferredReasons        []IntentPlannerWindowDeferredReason
+	Events                 []IntentPlannerWindowEvent
+	ConfigRevisionID       sql.NullInt64
+	ConfigProfile          sql.NullString
+	DurationMS             sql.NullInt64
+	RetryCount             int
+	FallbackUsed           bool
+	Outcome                sql.NullString
+	PlanFingerprint        sql.NullString
+	PlanAttempt            int
+	PlanAttemptLimit       int
+	UnresolvedCaptureCount int
+	PreservedGroupCount    int
+	ResolutionMode         sql.NullString
+	SingletonCount         int
+	ExperimentID           sql.NullInt64
+	ExperimentConsumed     bool
 }
 
 // AppendIntentPlannerWindow records one planner-visible window plus a compact
@@ -92,7 +99,8 @@ func AppendIntentPlannerWindow(ctx context.Context, d *DB, win IntentPlannerWind
 	if win.DurationMS.Valid && win.DurationMS.Int64 < 0 {
 		return 0, fmt.Errorf("state: planner window duration must be non-negative")
 	}
-	if win.RetryCount < 0 {
+	if win.RetryCount < 0 || win.PlanAttempt < 0 || win.PlanAttemptLimit < 0 ||
+		win.UnresolvedCaptureCount < 0 || win.PreservedGroupCount < 0 || win.SingletonCount < 0 {
 		return 0, fmt.Errorf("state: planner window retry count must be non-negative")
 	}
 	offered, err := marshalArray(win.OfferedSeqs)
@@ -132,14 +140,19 @@ INSERT INTO intent_planner_windows(
     commit_format, forced, forced_reason, validation_failure, offered_seqs,
     visible_original_seqs, hidden_seqs, selected_groups, deferred_seqs,
     deferred_reasons, config_revision_id, config_profile, duration_ms,
-    retry_count, fallback_used, outcome, experiment_id, experiment_consumed
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+    retry_count, fallback_used, outcome, plan_fingerprint, plan_attempt,
+    plan_attempt_limit, unresolved_capture_count, preserved_group_count,
+    resolution_mode, singleton_count, experiment_id, experiment_consumed
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
 	res, err := tx.ExecContext(ctx, insWindow,
 		win.PlannedTS, win.Provider, win.Model, win.BranchRef, win.BranchGeneration,
 		win.Source, win.CommitFormat, boolInt(win.Forced), win.ForcedReason,
 		win.ValidationFailure, offered, visible, hidden, groups, deferred,
 		deferredReasons, win.ConfigRevisionID, win.ConfigProfile, win.DurationMS,
-		win.RetryCount, boolInt(win.FallbackUsed), win.Outcome, win.ExperimentID,
+		win.RetryCount, boolInt(win.FallbackUsed), win.Outcome,
+		win.PlanFingerprint, win.PlanAttempt, win.PlanAttemptLimit,
+		win.UnresolvedCaptureCount, win.PreservedGroupCount, win.ResolutionMode,
+		win.SingletonCount, win.ExperimentID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("state: insert intent planner window: %w", err)
@@ -197,7 +210,9 @@ SELECT id, planned_ts, provider, model, branch_ref, branch_generation, source,
        commit_format, forced, forced_reason, validation_failure, offered_seqs,
        visible_original_seqs, hidden_seqs, selected_groups, deferred_seqs,
        deferred_reasons, config_revision_id, config_profile, duration_ms,
-       retry_count, fallback_used, outcome, experiment_id, experiment_consumed
+       retry_count, fallback_used, outcome, plan_fingerprint, plan_attempt,
+       plan_attempt_limit, unresolved_capture_count, preserved_group_count,
+       resolution_mode, singleton_count, experiment_id, experiment_consumed
 FROM intent_planner_windows
 ORDER BY id DESC
 LIMIT ?`, limit)
@@ -231,7 +246,9 @@ SELECT w.id, w.planned_ts, w.provider, w.model, w.branch_ref, w.branch_generatio
        w.offered_seqs, w.visible_original_seqs, w.hidden_seqs, w.selected_groups,
        w.deferred_seqs, w.deferred_reasons, w.config_revision_id,
        w.config_profile, w.duration_ms, w.retry_count, w.fallback_used,
-       w.outcome, w.experiment_id, w.experiment_consumed
+       w.outcome, w.plan_fingerprint, w.plan_attempt, w.plan_attempt_limit,
+       w.unresolved_capture_count, w.preserved_group_count, w.resolution_mode,
+       w.singleton_count, w.experiment_id, w.experiment_consumed
 FROM intent_planner_windows w
 JOIN intent_planner_window_events e ON e.window_id = w.id
 WHERE e.event_seq = ?
@@ -298,7 +315,10 @@ func scanIntentPlannerWindows(rows *sql.Rows) ([]IntentPlannerWindow, error) {
 			&win.ValidationFailure, &offered, &visible, &hidden, &groups,
 			&deferred, &deferredReasons, &win.ConfigRevisionID,
 			&win.ConfigProfile, &win.DurationMS, &win.RetryCount, &fallback,
-			&win.Outcome, &win.ExperimentID, &consumed,
+			&win.Outcome, &win.PlanFingerprint, &win.PlanAttempt,
+			&win.PlanAttemptLimit, &win.UnresolvedCaptureCount,
+			&win.PreservedGroupCount, &win.ResolutionMode, &win.SingletonCount,
+			&win.ExperimentID, &consumed,
 		); err != nil {
 			return nil, fmt.Errorf("state: scan intent planner window: %w", err)
 		}
