@@ -871,6 +871,10 @@ func chooseIntentCandidatePlan(
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
 	plan := deterministicIntentCandidatePlan(req, true, false)
+	fallbackNeedsAttention := false
+	if preset == config.PresetBalanced {
+		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(req)
+	}
 	var messageErr error
 	plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
 		ctx, planner, req, plan, plannerFailure)
@@ -906,7 +910,7 @@ func chooseIntentCandidatePlan(
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
-		companionNeedsAttention, continuations, run, nil
+		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
 }
 
 func validatePlannerSemanticRationale(

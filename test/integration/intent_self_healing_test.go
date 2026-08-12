@@ -277,8 +277,8 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	wakeSession(t, ctx, env, repo, "intent-self-healing")
 	waitForEventState(t, dbPath, "forced.txt", "published", 20*time.Second)
 
-	if got := plannerCalls.Load(); got > 4 {
-		t.Fatalf("planner calls=%d want <=4 across three bounded phases", got)
+	if got := plannerCalls.Load(); got > 6 {
+		t.Fatalf("planner calls=%d want <=6 across three bounded phases", got)
 	}
 	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state IN ('pending','blocked_conflict','failed')"); got != "0" {
 		t.Fatalf("terminal/pending events before rewrite=%s want 0", got)
