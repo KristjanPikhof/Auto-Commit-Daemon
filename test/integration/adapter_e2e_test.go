@@ -1059,7 +1059,7 @@ func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
 		t.Fatalf("acd setup auto-detect with legacy codex TOML exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
 	}
-	if !strings.Contains(res.Stdout, "Setup plan sha256:") {
+	if !strings.Contains(res.Stdout, "Setup plan: sha256:") {
 		t.Fatalf("setup should render the transactional plan; output:\n%s", res.Stdout)
 	}
 	if strings.Contains(res.Stdout, "acd setup codex") {

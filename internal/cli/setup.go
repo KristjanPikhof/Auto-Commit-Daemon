@@ -82,11 +82,14 @@ func newSetupCommand(initCompat bool) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   use,
-		Short: "Install or upgrade ACD transactionally",
-		Long: `Inspect the current installation, show one exact plan, and configure
-the supervisor and current repository as one rollback-safe transaction. macOS
-uses the invoking terminal or agent session and does not require Full Disk
-Access. The default deterministic provider needs no API key.`,
+		Short: "Safely install or upgrade ACD",
+		Long: `Inspect the current installation and show the exact setup plan before
+changing anything. The plan installs or upgrades ACD, starts its background
+service, and protects the current repository as one rollback-safe operation.
+
+Start with --dry-run when you want a preview. The default setup works without
+an API key. On macOS, run setup from the terminal or coding tool that should
+own the ACD service. Full Disk Access is not required.`,
 		Example: `  acd setup
   acd setup --dry-run
   acd setup --yes --non-interactive --expect-plan sha256:...`,
@@ -117,11 +120,11 @@ Access. The default deterministic provider needs no API key.`,
 			return runTransactionalSetup(cmd, dryRun, yes, nonInteractive, expectedPlan, integrations)
 		},
 	}
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the exact setup plan without any writes or service actions")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the setup plan without changing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the reviewed setup plan")
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, "Disable prompts; requires --yes")
-	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Require this exact sha256 plan digest")
-	cmd.Flags().StringVar(&integrations, "integrations", "auto", "auto, none, or comma-separated integration names")
+	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
+	cmd.Flags().StringVar(&integrations, "integrations", "auto", "Coding-tool integrations: auto, none, or a comma-separated list")
 	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Compatibility: print a harness snippet without instructions")
 	_ = cmd.Flags().MarkHidden("raw")
 	return cmd
@@ -165,7 +168,8 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		if err := renderSetupPlan(cmd, plan, false); err != nil {
 			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Setup already current; no repository scan or migration was needed.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD is already up to date.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Next: No action needed.")
 		return nil
 	}
 	if !jsonOut {
@@ -202,7 +206,10 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateProtected, Changed: true,
 			Actions: []productAction{{Kind: "setup", Status: "completed", Target: plan.Repo}}, Data: result}, true)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Setup complete. Repository protected: %s\n", plan.Repo)
+	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
+	fmt.Fprintf(cmd.OutOrStdout(), "Repository: %s\n", plan.Repo)
+	fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD is installed and protection is on.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Next: Run `acd status` at any time to check protection.")
 	return nil
 }
 
@@ -286,11 +293,46 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff,
 			Actions: []productAction{}, Data: plan}, true)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Setup plan %s\n", plan.Digest)
+	fmt.Fprintf(cmd.OutOrStdout(), "Setup plan: %s\n", plan.Digest)
 	for index, action := range plan.Actions {
-		fmt.Fprintf(cmd.OutOrStdout(), "%d. %s: %s (%s)\n", index+1, action.Kind, action.Target, action.Detail)
+		fmt.Fprintf(cmd.OutOrStdout(), "%d. %s\n", index+1, setupActionDescription(action))
+		if action.Target != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "   Target: %s\n", action.Target)
+		}
 	}
+	fmt.Fprintln(cmd.OutOrStdout(), "Changed: no. Review this plan before applying it.")
 	return nil
+}
+
+func setupActionDescription(action installer.Action) string {
+	switch action.Kind {
+	case "backup":
+		return "Back up the current ACD installation and repository protection data"
+	case "install_binary":
+		return "Install the new ACD program safely"
+	case "migrate":
+		return "Upgrade registered repositories to the current protection format"
+	case "start_supervisor", "start_session_supervisor", "restart_session_supervisor", "install_service":
+		return "Start ACD's background service"
+	case "write_registry":
+		return "Update the list of protected repositories"
+	case "enable_repository":
+		return "Turn on protection for the current repository"
+	case "self_test":
+		return "Verify checkpoint protection, Git publication, and restore in an isolated test"
+	case "import_recovery_checkpoints":
+		return "Keep recovery checkpoints created by an earlier upgrade"
+	case "disable_missing_repository":
+		return "Keep a missing repository registration disabled without deleting its record"
+	case "merge_integration":
+		return "Update the coding-tool integration without changing unrelated settings"
+	case "verify_compatible_runtime":
+		return "Check that ACD and its coding-tool integrations are current"
+	case "checkpoint":
+		return "Protect current changes before the upgrade"
+	default:
+		return action.Detail
+	}
 }
 
 func runSetup(cmd *cobra.Command, harness string, raw bool) error {
@@ -376,8 +418,8 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 	}
 
 	// Header.
-	fmt.Fprintf(out, "%s acd setup %s — copy the snippet below into your harness config\n", cp, harness)
-	fmt.Fprintf(out, "%s ─────────────────────────────────────────────────────────────\n", cp)
+	fmt.Fprintf(out, "%s acd setup %s: copy the snippet below into your harness config\n", cp, harness)
+	fmt.Fprintf(out, "%s -------------------------------------------------------------\n", cp)
 
 	if harness == "shell" {
 		// Shell harness: print direnv snippet first, then zshrc snippet.
@@ -385,7 +427,7 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 			return err
 		}
 
-		fmt.Fprintf(out, "\n%s ── zshrc variant ─────────────────────────────────────────────\n", cp)
+		fmt.Fprintf(out, "\n%s zshrc variant\n", cp)
 
 		if err := printSnippet(out, embeddedFS, shellZshrcSnippet); err != nil {
 			return err
@@ -403,7 +445,7 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 		// Fallback generic footer if README is somehow missing.
 		fmt.Fprintf(out, "\n%s Copy the snippet above into your %s config and restart the harness.\n", cp, harness)
 	} else {
-		fmt.Fprintf(out, "\n%s ── install instructions ───────────────────────────────────────\n", cp)
+		fmt.Fprintf(out, "\n%s install instructions\n", cp)
 		// Re-format each README line as a comment so the whole output
 		// can be pasted as a single block without confusing the host config
 		// parser.
@@ -416,7 +458,7 @@ func runSetup(cmd *cobra.Command, harness string, raw bool) error {
 		}
 	}
 
-	fmt.Fprintf(out, "%s ─────────────────────────────────────────────────────────────\n", cp)
+	fmt.Fprintf(out, "%s -------------------------------------------------------------\n", cp)
 	return nil
 }
 

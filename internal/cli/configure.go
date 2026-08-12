@@ -152,16 +152,16 @@ ACD never edits harness hook files.
 
 --dry-run prints the final projection without provider calls, command
 execution, credential/settings writes, daemon starts, or hook changes.`,
-		Example: `  acd configure
-  acd configure --replace
-  acd configure --repo .
-  acd configure --repo . --inherit
-  acd configure --repo . --strategy intent --preset quality --wait
-  acd configure --accessible
-  acd configure --strategy intent --preset balanced
-  printf '%s\n' "$ACD_AI_API_KEY" | acd configure --credential-stdin
-  acd configure --dry-run
-  acd configure --dry-run --json`,
+		Example: `  acd config edit
+  acd config edit --replace
+  acd config edit --repo .
+  acd config edit --repo . --inherit
+  acd config edit --repo . --strategy intent --preset quality --wait
+  acd config edit --accessible
+  acd config edit --strategy intent --preset balanced
+  printf '%s\n' "$ACD_AI_API_KEY" | acd config edit --credential-stdin
+  acd config edit --dry-run
+  acd config edit --dry-run --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			opts.Repo, _ = cmd.Flags().GetString("repo")
@@ -182,30 +182,30 @@ execution, credential/settings writes, daemon starts, or hook changes.`,
 
 func runConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if opts.JSON && !opts.DryRun {
-		return errors.New("acd configure: --json requires --dry-run")
+		return errors.New("acd config edit: --json requires --dry-run")
 	}
 	if opts.CredentialStdin && opts.DryRun {
-		return errors.New("acd configure: --credential-stdin has no effect with --dry-run")
+		return errors.New("acd config edit: --credential-stdin has no effect with --dry-run")
 	}
 	if opts.Wait && opts.DryRun {
-		return errors.New("acd configure: --wait cannot be used with --dry-run")
+		return errors.New("acd config edit: --wait cannot be used with --dry-run")
 	}
 	repositoryScope := cmd.Flags().Changed("repo")
 	if opts.Replace && repositoryScope {
-		return errors.New("acd configure: --replace configures global defaults and conflicts with --repo")
+		return errors.New("acd config edit: --replace configures global defaults and conflicts with --repo")
 	}
 	if opts.Inherit && !repositoryScope {
-		return errors.New("acd configure: --inherit requires an explicit --repo")
+		return errors.New("acd config edit: --inherit requires an explicit --repo")
 	}
 	if opts.Replace && opts.Inherit {
-		return errors.New("acd configure: --replace conflicts with --inherit")
+		return errors.New("acd config edit: --replace conflicts with --inherit")
 	}
 	if opts.Inherit && (cmd.Flags().Changed("strategy") ||
 		cmd.Flags().Changed("preset") || opts.CredentialStdin || opts.Wait) {
-		return errors.New("acd configure: --inherit conflicts with --strategy, --preset, --credential-stdin, and --wait")
+		return errors.New("acd config edit: --inherit conflicts with --strategy, --preset, --credential-stdin, and --wait")
 	}
 	if opts.Wait && !repositoryScope {
-		return errors.New("acd configure: --wait requires an explicit --repo and Strict Review")
+		return errors.New("acd config edit: --wait requires an explicit --repo and Strict Review")
 	}
 	if repositoryScope {
 		return runRepositoryConfigure(cmd, opts)
@@ -223,7 +223,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd configure: resolve paths: %w", err)
+		return fmt.Errorf("acd config edit: resolve paths: %w", err)
 	}
 	if opts.DryRun {
 		selection := dryRunConfigureSelection(
@@ -250,7 +250,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		(!settingsInputTTY(cmd.InOrStdin()) ||
 			!settingsOutputTTY(cmd.OutOrStdout())) {
 		return errors.New(
-			"acd configure: rich mode requires interactive stdin and stdout; use --accessible",
+			"acd config edit: rich mode requires interactive stdin and stdout; use --accessible",
 		)
 	}
 	wizardInput := cmd.InOrStdin()
@@ -267,7 +267,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		roots, os.LookupEnv,
 	)
 	if err != nil {
-		return fmt.Errorf("acd configure: credential status: %w", err)
+		return fmt.Errorf("acd config edit: credential status: %w", err)
 	}
 
 	lookup := configureLookupEnv(string(stagedCredential))
@@ -276,14 +276,14 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: prepare global preview: %w", err,
+			"acd config edit: prepare global preview: %w", err,
 		)
 	}
 	authoring, err := previewService.AuthoringPreview()
 	if err != nil {
 		previewService.Close()
 		return fmt.Errorf(
-			"acd configure: resolve global defaults: %w", err,
+			"acd config edit: resolve global defaults: %w", err,
 		)
 	}
 	defaults := authoring.Values
@@ -311,7 +311,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		authoring.Sources[config.FieldModel],
 	)
 	if err := previewService.Close(); err != nil {
-		return fmt.Errorf("acd configure: close global preview: %w", err)
+		return fmt.Errorf("acd config edit: close global preview: %w", err)
 	}
 
 	explicitMode := cmd.Flags().Changed("strategy") ||
@@ -329,7 +329,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("acd configure: wizard: %w", err)
+		return fmt.Errorf("acd config edit: wizard: %w", err)
 	}
 	selection.Strategy, selection.Preset, err =
 		normalizeConfigureMode(selection.Strategy, selection.Preset)
@@ -362,7 +362,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: open global settings service: %w", err,
+			"acd config edit: open global settings service: %w", err,
 		)
 	}
 	defer service.Close()
@@ -384,7 +384,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: resolve reviewed global settings: %w", err,
+			"acd config edit: resolve reviewed global settings: %w", err,
 		)
 	}
 	report, err := buildResolvedConfigureReport(
@@ -420,17 +420,17 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: final confirmation: %w", err,
+			"acd config edit: final confirmation: %w", err,
 		)
 	}
 	if !approval.Apply {
 		return errors.New(
-			"acd configure: final preview declined; no provider call or write was made",
+			"acd config edit: final preview declined; no provider call or write was made",
 		)
 	}
 	if report.RepairEnabled && !approval.Repair {
 		return errors.New(
-			"acd configure: automatic repair declined; no provider call or write was made",
+			"acd config edit: automatic repair declined; no provider call or write was made",
 		)
 	}
 	selection.RepairApproved = approval.Repair
@@ -440,7 +440,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: confirm reviewed global settings: %w", err,
+			"acd config edit: confirm reviewed global settings: %w", err,
 		)
 	}
 	if len(validation.Missing) > 0 {
@@ -450,7 +450,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	if validation.SourceGeneration != authoring.Generation {
 		return errors.New(
-			"acd configure: global settings changed while the preview was open; rerun configure",
+			"acd config edit: global settings changed while the preview was open; rerun configure",
 		)
 	}
 
@@ -466,13 +466,13 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"acd configure: test provider failed: %w; no configuration was changed",
+			"acd config edit: test provider failed: %w; no configuration was changed",
 			err,
 		)
 	}
 	if !tested.Success {
 		return errors.New(
-			"acd configure: provider test failed; no configuration was changed",
+			"acd config edit: provider test failed; no configuration was changed",
 		)
 	}
 	fmt.Fprintln(cmd.ErrOrStderr(), "[1/3] Provider test passed.")
@@ -489,14 +489,14 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			previousCredentialSet = true
 		} else if !errors.Is(err, credentials.ErrNotFound) {
 			return fmt.Errorf(
-				"acd configure: inspect protected credential: %w", err,
+				"acd config edit: inspect protected credential: %w", err,
 			)
 		}
 		if err := configureCredentialWrite(
 			roots, selection.Credential,
 		); err != nil {
 			return fmt.Errorf(
-				"acd configure: persist protected credential: %w", err,
+				"acd config edit: persist protected credential: %w", err,
 			)
 		}
 		fmt.Fprintln(
@@ -528,7 +528,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			previousCredentialSet, previousCredential,
 		)
 		return fmt.Errorf(
-			"acd configure: save global defaults failed: %w; rollback: %s",
+			"acd config edit: save global defaults failed: %w; rollback: %s",
 			err, rollback,
 		)
 	}
@@ -561,7 +561,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	fmt.Fprintln(
 		cmd.OutOrStdout(),
-		"Project tests: not configured; use `acd configure --repo .` for Strict Review",
+		"Project tests: not configured; use `acd config edit --repo .` for Strict Review",
 	)
 	fmt.Fprintln(cmd.OutOrStdout(), "Daemon: not started")
 	for _, guidance := range report.HarnessGuidance {
@@ -580,11 +580,11 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	repo, err := resolveRepo(opts.Repo)
 	if err != nil {
-		return fmt.Errorf("acd configure: %w", err)
+		return fmt.Errorf("acd config edit: %w", err)
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd configure: resolve paths: %w", err)
+		return fmt.Errorf("acd config edit: resolve paths: %w", err)
 	}
 	detected := detectVerificationCommands(repo)
 	if opts.DryRun {
@@ -612,7 +612,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		strings.EqualFold(os.Getenv("TERM"), "dumb") ||
 		configureTerminalTooShort(cmd.OutOrStdout())
 	if !accessible && (!settingsInputTTY(cmd.InOrStdin()) || !settingsOutputTTY(cmd.OutOrStdout())) {
-		return errors.New("acd configure: rich mode requires interactive stdin and stdout; use --accessible")
+		return errors.New("acd config edit: rich mode requires interactive stdin and stdout; use --accessible")
 	}
 	explicitMode := cmd.Flags().Changed("strategy") ||
 		cmd.Flags().Changed("preset")
@@ -622,7 +622,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		)
 		if existingErr != nil {
 			return fmt.Errorf(
-				"acd configure: inspect unfinished setup: %w", existingErr,
+				"acd config edit: inspect unfinished setup: %w", existingErr,
 			)
 		}
 		if found {
@@ -639,7 +639,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 					)
 				}
 				fmt.Fprintln(cmd.OutOrStdout(),
-					"Safe to close this terminal. Use `acd configure --wait` to follow it.")
+					"Safe to close this terminal. Use `acd config edit --wait` to follow it.")
 				return nil
 			case state.ConfigValidationFailed,
 				state.ConfigValidationTimedOut,
@@ -653,7 +653,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 				)
 				if choiceErr != nil {
 					return fmt.Errorf(
-						"acd configure: choose recovery: %w", choiceErr,
+						"acd config edit: choose recovery: %w", choiceErr,
 					)
 				}
 				switch choice {
@@ -663,19 +663,19 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 					)
 					if retryErr != nil {
 						return fmt.Errorf(
-							"acd configure: retry validation: %w", retryErr,
+							"acd config edit: retry validation: %w", retryErr,
 						)
 					}
 					if !retried {
 						return errors.New(
-							"acd configure: validation is no longer retryable; rerun configure",
+							"acd config edit: validation is no longer retryable; rerun configure",
 						)
 					}
 					if err := configureEnable(
 						cmd.Context(), io.Discard, repo, false,
 					); err != nil {
 						return fmt.Errorf(
-							"acd configure: enable validation worker: %w", err,
+							"acd config edit: enable validation worker: %w", err,
 						)
 					}
 					fmt.Fprintf(cmd.OutOrStdout(),
@@ -715,19 +715,19 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 
 	source, hasCredential, err := configureCredentialStatus(roots, os.LookupEnv)
 	if err != nil {
-		return fmt.Errorf("acd configure: credential status: %w", err)
+		return fmt.Errorf("acd config edit: credential status: %w", err)
 	}
 	lookup := configureLookupEnv(string(stagedCredential))
 	previewService, err := openConfigureValidationService(cmd.Context(), settings.Options{
 		Roots: roots, RepoPath: repo, LookupEnv: lookup,
 	})
 	if err != nil {
-		return fmt.Errorf("acd configure: prepare read-only preview: %w", err)
+		return fmt.Errorf("acd config edit: prepare read-only preview: %w", err)
 	}
 	defer previewService.Close()
 	authoring, err := previewService.AuthoringPreview()
 	if err != nil {
-		return fmt.Errorf("acd configure: resolve authoring defaults: %w", err)
+		return fmt.Errorf("acd config edit: resolve authoring defaults: %w", err)
 	}
 	defaults := authoring.Values
 	if opts.Inherit {
@@ -775,7 +775,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 			RepositoryScoped:     true,
 		})
 		if err != nil {
-			return fmt.Errorf("acd configure: wizard: %w", err)
+			return fmt.Errorf("acd config edit: wizard: %w", err)
 		}
 	}
 	selection.Strategy, selection.Preset, err = normalizeConfigureMode(selection.Strategy, selection.Preset)
@@ -795,18 +795,18 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	if opts.Wait && selection.VerificationMode != "full" {
 		return errors.New(
-			"acd configure: --wait is available only for repository Strict Review",
+			"acd config edit: --wait is available only for repository Strict Review",
 		)
 	}
 	if err := previewService.Close(); err != nil {
-		return fmt.Errorf("acd configure: close initial preview: %w", err)
+		return fmt.Errorf("acd config edit: close initial preview: %w", err)
 	}
 	lookup = configureLookupEnv(selection.Credential)
 	previewService, err = openConfigureValidationService(cmd.Context(), settings.Options{
 		Roots: roots, RepoPath: repo, LookupEnv: lookup,
 	})
 	if err != nil {
-		return fmt.Errorf("acd configure: resolve reviewed preview: %w", err)
+		return fmt.Errorf("acd config edit: resolve reviewed preview: %w", err)
 	}
 	defer previewService.Close()
 	draft := selectionDraft(selection)
@@ -816,7 +816,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	providerConfirmations := selectionProviderConfirmations(selection)
 	validation, err := previewService.Validate(cmd.Context(), draft, providerConfirmations)
 	if err != nil {
-		return fmt.Errorf("acd configure: resolve reviewed settings: %w", err)
+		return fmt.Errorf("acd config edit: resolve reviewed settings: %w", err)
 	}
 	report, err := buildResolvedConfigureReport(repo, selection, source, false, validation)
 	if err != nil {
@@ -839,18 +839,18 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 			Action:           report.ConfigurationAction,
 		})
 	if err != nil {
-		return fmt.Errorf("acd configure: final confirmation: %w", err)
+		return fmt.Errorf("acd config edit: final confirmation: %w", err)
 	}
 	if !approval.Apply {
-		return errors.New("acd configure: final preview declined; no provider call, command, or write was made")
+		return errors.New("acd config edit: final preview declined; no provider call, command, or write was made")
 	}
 	if (report.Verification.Mode == "fast" ||
 		report.Verification.Mode == "full") &&
 		!approval.Verification {
-		return errors.New("acd configure: exact verification command declined; no provider call, command, or write was made")
+		return errors.New("acd config edit: exact verification command declined; no provider call, command, or write was made")
 	}
 	if report.RepairEnabled && !approval.Repair {
-		return errors.New("acd configure: automatic repair declined; no provider call, command, or write was made")
+		return errors.New("acd config edit: automatic repair declined; no provider call, command, or write was made")
 	}
 	selection.VerificationApproved = approval.Verification
 	selection.RepairApproved = approval.Repair
@@ -860,54 +860,54 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	validation, err = previewService.Validate(cmd.Context(), draft, confirmations)
 	if err != nil {
 		return progress.fail("confirm reviewed settings", err,
-			"No configuration was changed; rerun acd configure.")
+			"No configuration was changed; rerun acd config edit.")
 	}
 	if len(validation.Missing) > 0 {
 		return progress.fail("confirm reviewed settings",
 			&settings.ConfirmationRequiredError{Missing: validation.Missing},
-			"No configuration was changed; rerun acd configure and approve every displayed risk.")
+			"No configuration was changed; rerun acd config edit and approve every displayed risk.")
 	}
 
 	service, err := openConfigureSettingsService(cmd.Context(), settings.Options{
 		Roots: roots, RepoPath: repo, LookupEnv: lookup,
 	})
 	if err != nil {
-		return progress.fail("open settings service", err, "No changes were made; rerun acd configure.")
+		return progress.fail("open settings service", err, "No changes were made; rerun acd config edit.")
 	}
 	defer service.Close()
 	snapshot, err := service.Snapshot(cmd.Context(), settings.ScopeRepository, "")
 	if err != nil {
-		return progress.fail("read runtime state", err, "No configuration was changed; rerun acd configure.")
+		return progress.fail("read runtime state", err, "No configuration was changed; rerun acd config edit.")
 	}
 	if snapshot.SavedGeneration != authoring.Generation {
 		return progress.fail("check authoring generation",
 			errors.New("settings changed while the preview was open"),
-			"No changes were made; rerun acd configure to review the latest values.")
+			"No changes were made; rerun acd config edit to review the latest values.")
 	}
 	liveValidation, err := service.Validate(cmd.Context(), draft, confirmations)
 	if err != nil {
-		return progress.fail("validate approved settings", err, "No configuration was changed; rerun acd configure.")
+		return progress.fail("validate approved settings", err, "No configuration was changed; rerun acd config edit.")
 	}
 	if liveValidation.Fingerprint != validation.Fingerprint ||
 		liveValidation.Preset.Reference() != validation.Preset.Reference() ||
 		liveValidation.Preset.Customized != validation.Preset.Customized {
 		return progress.fail("check approved preview",
 			errors.New("effective settings changed after confirmation"),
-			"No changes were made; rerun acd configure to approve the current projection.")
+			"No changes were made; rerun acd config edit to approve the current projection.")
 	}
 	if len(liveValidation.Missing) > 0 {
 		return progress.fail("validate approval contract",
 			&settings.ConfirmationRequiredError{Missing: liveValidation.Missing},
-			"No changes were made; rerun acd configure and approve every displayed risk.")
+			"No changes were made; rerun acd config edit and approve every displayed risk.")
 	}
 	progress.begin(1, "Testing provider with synthetic content...")
 	tested, err := service.TestProvider(cmd.Context(), draft, confirmations)
 	if err != nil {
-		return progress.fail("test provider", err, "No configuration was changed; correct the provider and rerun acd configure.")
+		return progress.fail("test provider", err, "No configuration was changed; correct the provider and rerun acd config edit.")
 	}
 	if !tested.Success {
 		return progress.fail("test provider", errors.New("synthetic provider test did not pass"),
-			"No configuration was changed; correct the provider and rerun acd configure.")
+			"No configuration was changed; correct the provider and rerun acd config edit.")
 	}
 	progress.complete("provider_test:passed")
 	progress.success(1, "Provider test passed.")
@@ -918,7 +918,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		)
 		if targetErr != nil {
 			return progress.fail("resolve validation target", targetErr,
-				"No configuration was changed; restore an attached valid HEAD and rerun acd configure.")
+				"No configuration was changed; restore an attached valid HEAD and rerun acd config edit.")
 		}
 		command := report.Verification.Command
 		sum := sha256.Sum256([]byte(command))
@@ -977,7 +977,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		rollback := rollbackConfigureCredential(roots, selection.Credential != "",
 			previousCredentialSet, previousCredential)
 		return progress.failWithRollback("save settings", err, rollback,
-			"Settings were not saved; rerun acd configure after resolving the reported conflict.")
+			"Settings were not saved; rerun acd config edit after resolving the reported conflict.")
 	}
 	if opts.Inherit {
 		progress.complete("repository_override:removed")
@@ -996,7 +996,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		rollback := rollbackConfigureCredential(roots, selection.Credential != "",
 			previousCredentialSet, previousCredential)
 		return progress.failWithRollback("create runtime revision", err, rollback,
-			"Repository settings were saved but not activated; rerun acd configure to test and activate them.")
+			"Repository settings were saved but not activated; rerun acd config edit to test and activate them.")
 	}
 	progress.complete(fmt.Sprintf("runtime_revision:%d", applied.RevisionID))
 	if applied.ValidationRunID > 0 {
@@ -1076,10 +1076,10 @@ func normalizeConfigureMode(strategy, preset string) (string, string, error) {
 		}
 	}
 	if strategy != "event" && strategy != "intent" {
-		return "", "", fmt.Errorf("acd configure: unsupported strategy %q", strategy)
+		return "", "", fmt.Errorf("acd config edit: unsupported strategy %q", strategy)
 	}
 	if preset != "fast" && preset != "balanced" && preset != "quality" {
-		return "", "", fmt.Errorf("acd configure: unsupported preset %q", preset)
+		return "", "", fmt.Errorf("acd config edit: unsupported preset %q", preset)
 	}
 	return strategy, preset, nil
 }
@@ -1087,7 +1087,7 @@ func normalizeConfigureMode(strategy, preset string) (string, string, error) {
 func validateGlobalConfigureMode(strategy, preset string) error {
 	if strategy == "intent" && preset == "quality" {
 		return errors.New(
-			"acd configure: Strict Review requires an explicit --repo; global setup supports Everyday or Maximum Speed",
+			"acd config edit: Strict Review requires an explicit --repo; global setup supports Everyday or Maximum Speed",
 		)
 	}
 	if (strategy == "intent" && preset == "balanced") ||
@@ -1095,7 +1095,7 @@ func validateGlobalConfigureMode(strategy, preset string) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"acd configure: %s.%s is not a global experience; use intent.balanced (Everyday) or event.fast (Maximum Speed)",
+		"acd config edit: %s.%s is not a global experience; use intent.balanced (Everyday) or event.fast (Maximum Speed)",
 		strategy, preset,
 	)
 }
@@ -1107,7 +1107,7 @@ func validateRepositoryConfigureMode(strategy, preset string) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"acd configure: %s.%s is not a guided repository experience; use intent.balanced, event.fast, or intent.quality",
+		"acd config edit: %s.%s is not a guided repository experience; use intent.balanced, event.fast, or intent.quality",
 		strategy, preset,
 	)
 }
@@ -1157,22 +1157,22 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 		return err
 	}
 	if selection.Provider == "deterministic" && (strategy != "event" || preset != "fast") {
-		return errors.New("acd configure: deterministic provider is supported only by Event Fast")
+		return errors.New("acd config edit: deterministic provider is supported only by Event Fast")
 	}
 	if selection.CommitFormat != "imperative" && selection.CommitFormat != "conventional" {
-		return fmt.Errorf("acd configure: unsupported commit format %q", selection.CommitFormat)
+		return fmt.Errorf("acd config edit: unsupported commit format %q", selection.CommitFormat)
 	}
 	if selection.Provider == "openai-compat" && !hasCredential && strings.TrimSpace(selection.Credential) == "" {
-		return errors.New("acd configure: OpenAI-compatible provider credential is required")
+		return errors.New("acd config edit: OpenAI-compatible provider credential is required")
 	}
 	needsDiff := strategy == "intent" || preset != "fast"
 	if needsDiff && !selection.DiffContextApproved {
-		return errors.New("acd configure: regular selected preset requires explicit redacted diff-context approval")
+		return errors.New("acd config edit: regular selected preset requires explicit redacted diff-context approval")
 	}
 	if (selection.VerificationMode == "fast" ||
 		selection.VerificationMode == "full") &&
 		strings.TrimSpace(selection.VerificationCommand) == "" {
-		return errors.New("acd configure: no project verification command is available for this experience")
+		return errors.New("acd config edit: no project verification command is available for this experience")
 	}
 	return nil
 }
@@ -1255,19 +1255,19 @@ func loadGlobalConfigurePreview(
 	)
 	if err != nil {
 		return settings.AuthoringPreview{}, fmt.Errorf(
-			"acd configure: read global defaults: %w", err,
+			"acd config edit: read global defaults: %w", err,
 		)
 	}
 	preview, previewErr := service.AuthoringPreview()
 	closeErr := service.Close()
 	if previewErr != nil {
 		return settings.AuthoringPreview{}, fmt.Errorf(
-			"acd configure: resolve global defaults: %w", previewErr,
+			"acd config edit: resolve global defaults: %w", previewErr,
 		)
 	}
 	if closeErr != nil {
 		return settings.AuthoringPreview{}, fmt.Errorf(
-			"acd configure: close global preview: %w", closeErr,
+			"acd config edit: close global preview: %w", closeErr,
 		)
 	}
 	return preview, nil
@@ -1297,7 +1297,7 @@ func builtInConfigureValues(strategy, preset string) (map[string]string, error) 
 		raw, err := json.Marshal(value)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"acd configure: encode built-in field %q: %w", name, err,
+				"acd config edit: encode built-in field %q: %w", name, err,
 			)
 		}
 		overrides[name] = raw
@@ -1307,7 +1307,7 @@ func builtInConfigureValues(strategy, preset string) (map[string]string, error) 
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"acd configure: resolve built-in defaults: %w", err,
+			"acd config edit: resolve built-in defaults: %w", err,
 		)
 	}
 	out := make(map[string]string)
@@ -1369,7 +1369,7 @@ func selectionConfirmations(selection settingsui.ConfigureSelection) []ai.Confir
 func buildConfigureReport(repo string, selection settingsui.ConfigureSelection, source credentials.Source, dryRun bool) (configureReport, error) {
 	definition, ok := config.LookupPreset(config.CommitStrategy(selection.Strategy), config.PresetName(selection.Preset))
 	if !ok {
-		return configureReport{}, errors.New("acd configure: selected preset is unavailable")
+		return configureReport{}, errors.New("acd config edit: selected preset is unavailable")
 	}
 	verificationStatus := "not_required"
 	switch selection.VerificationMode {
@@ -1558,7 +1558,7 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 	fmt.Fprintf(out, "Diff context: %s\n", report.DiffContext)
 	fmt.Fprintf(out, "Verification: %s", report.Verification.Mode)
 	if report.Verification.Command != "" {
-		fmt.Fprintf(out, " — exact command: %s", safeCommandPreview(report.Verification.Command))
+		fmt.Fprintf(out, ". Exact command: %s", safeCommandPreview(report.Verification.Command))
 	}
 	fmt.Fprintln(out)
 	if report.Verification.CommandSource != "" {
@@ -1905,7 +1905,7 @@ func (p configureProgress) failWithRollback(stage string, cause error, rollback,
 	if len(p.completed) > 0 {
 		completed = strings.Join(p.completed, ", ")
 	}
-	message := fmt.Sprintf("acd configure: %s failed: %s; completed stages: %s",
+	message := fmt.Sprintf("acd config edit: %s failed: %s; completed stages: %s",
 		safePreviewText(stage, 64), safePreviewText(cause.Error(), 512), completed)
 	if rollback != "" {
 		message += "; rollback: " + rollback
@@ -2012,14 +2012,14 @@ func readConfigureCredentialLine(input io.Reader) ([]byte, io.Reader, error) {
 	reader := bufio.NewReader(io.LimitReader(input, maxCredentialInput+1))
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, reader, fmt.Errorf("acd configure: read credential: %w", err)
+		return nil, reader, fmt.Errorf("acd config edit: read credential: %w", err)
 	}
 	if len(line) > maxCredentialInput {
-		return nil, reader, errors.New("acd configure: credential input is too large")
+		return nil, reader, errors.New("acd config edit: credential input is too large")
 	}
 	value := []byte(strings.TrimSpace(line))
 	if len(value) == 0 {
-		return nil, reader, errors.New("acd configure: credential input is empty")
+		return nil, reader, errors.New("acd config edit: credential input is empty")
 	}
 	return value, reader, nil
 }
@@ -2109,7 +2109,7 @@ func waitForConfigureValidation(
 	for {
 		run, err := state.ConfigValidationByID(ctx, db, runID)
 		if err != nil {
-			return fmt.Errorf("acd configure: read validation job: %w", err)
+			return fmt.Errorf("acd config edit: read validation job: %w", err)
 		}
 		if run.Status != lastStatus {
 			fmt.Fprintf(out, "Validation: %s (attempt %d)\n",
@@ -2138,7 +2138,7 @@ func waitForConfigureValidation(
 				fmt.Fprintln(out, tail)
 			}
 			return errors.New(
-				"acd configure: validation needs attention; run `acd configure` to retry or select another experience",
+				"acd config edit: validation needs attention; run `acd config edit` to retry or select another experience",
 			)
 		}
 		select {

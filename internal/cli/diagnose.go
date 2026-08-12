@@ -212,7 +212,7 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		report.Configuration = readiness
 		if readiness.Configuration == "needs_attention" {
 			report.Remediation = append(report.Remediation,
-				"Run `acd configure` to retry validation or select another experience.")
+				"Run `acd config edit` to retry validation or select another experience.")
 		}
 	}
 	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {

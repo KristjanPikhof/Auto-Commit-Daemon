@@ -18,7 +18,7 @@ import (
 func TestRepoHelpIncludesLifecycleCommands(t *testing.T) {
 	help := commandHelp(t, "repo")
 	for _, want := range []string{
-		"list", "remove", "gc", "Manage protected repositories",
+		"list", "remove", "gc", "List every registered repository",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("repo help missing %q:\n%s", want, help)
@@ -474,7 +474,7 @@ func TestRepoRemoveInteractive_ConfirmRemovesSelectedRow(t *testing.T) {
 	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader("2\nremove\n"), "", false, false, false, false); err != nil {
 		t.Fatalf("interactive remove: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(out.String(), "Preview:") || !strings.Contains(out.String(), "removed "+repo2) {
+	if !strings.Contains(out.String(), "Preview:") || !strings.Contains(out.String(), "Removed registration: "+repo2) {
 		t.Fatalf("interactive output missing preview/remove:\n%s", out.String())
 	}
 	reg, err := central.Load(roots)
@@ -528,7 +528,7 @@ func TestRepoRemoveInteractive_PurgeStateConfirmed(t *testing.T) {
 	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader("1\nremove\npurge\n"), "", false, false, true, false); err != nil {
 		t.Fatalf("interactive purge confirm: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(out.String(), "state: purged "+stateDir) {
+	if !strings.Contains(out.String(), "Protected data: permanently deleted from "+stateDir) {
 		t.Fatalf("missing purge result:\n%s", out.String())
 	}
 	if fileExists(stateDir) {
@@ -685,7 +685,7 @@ func TestRepoList_HumanOutputOmitsStateDBColumn(t *testing.T) {
 		t.Fatalf("runRepoList: %v", err)
 	}
 	text := out.String()
-	for _, want := range []string{"REPO", "DAEMON", "CLIENTS", "PENDING", "BLOCKED", "STATUS", repo, "stopped"} {
+	for _, want := range []string{"REPOSITORY", "WORKER", "TOOLS", "WAITING", "BLOCKED", "STATUS", repo, "stopped"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("human repo list output missing %q:\n%s", want, text)
 		}

@@ -313,7 +313,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup preview became stale before quiescence", true)
 		return Result{}, err
 	}
-	emitProgress(options, "quiesce", "Stopping the legacy supervisor and workers at a safe checkpoint boundary")
+	emitProgress(options, "quiesce", "Saving current changes and stopping old background services")
 	serviceQuiesced, err := quiesceSetup(ctx, roots, options.Executor, plan.Service, plan.PriorService, options.Quiesce)
 	if err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup quiescence failed", true)
@@ -379,7 +379,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		}
 		return errors.Join(cause, fileErr, serviceErr)
 	}
-	emitProgress(options, "install_binary", "Installing the managed binary for setup preflight")
+	emitProgress(options, "install_binary", "Installing ACD for setup checks")
 	managedBody, err := os.ReadFile(plan.SourceExecutable)
 	if err != nil {
 		return Result{}, rollbackFiles(err)
@@ -404,7 +404,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			activeRepositories++
 		}
 	}
-	emitProgress(options, "bridge", fmt.Sprintf("Scanning %d enabled repositories and protecting edits during migration", activeRepositories))
+	emitProgress(options, "bridge", fmt.Sprintf("Checking %d enabled repositories and protecting changes during the upgrade", activeRepositories))
 	bridge, err := migration.StartBridgeWithProgress(ctx, plan.OperationID, plan.Registry.Repos, 500*time.Millisecond,
 		func(completed, total int, repo string) {
 			emitProgress(options, "bridge", fmt.Sprintf("Scanning repository %d of %d: %s", completed, total, repo))
@@ -458,7 +458,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		}
 		return errors.Join(cause, rollbackErr)
 	}
-	emitProgress(options, "migrate", fmt.Sprintf("Migrating %d repositories to checkpoint storage", len(plan.Repositories)))
+	emitProgress(options, "migrate", fmt.Sprintf("Upgrading protection data for %d repositories", len(plan.Repositories)))
 	migrations, err := migration.ApplyAllWithProgress(ctx, plan.Repositories, func(update migration.Progress) {
 		emitProgress(options, "migrate", fmt.Sprintf("Migrating repository %d of %d: %s", update.Completed, update.Total, update.Repo))
 	})
@@ -472,7 +472,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "schema_applied", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	emitProgress(options, "install", "Installing the managed binary, supervisor, and registry")
+	emitProgress(options, "install", "Installing ACD, its background service, and the repository list")
 	plan.Registry.Normalize()
 	registryDigest, err := jsonFileDigest(plan.Registry)
 	if err != nil {
@@ -546,7 +546,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := ready(ctx, roots, plan.Registry); err != nil {
 		return Result{}, rollback(err)
 	}
-	emitProgress(options, "integrations", "Merging optional integration hints after protection is ready")
+	emitProgress(options, "integrations", "Updating coding-tool integrations without changing unrelated settings")
 	for _, item := range plan.IntegrationPlans {
 		if item.Changed {
 			current, readErr := os.ReadFile(item.Target)
@@ -584,7 +584,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "integrations_merged", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	emitProgress(options, "finalize", "Closing the migration observation gap and finalizing setup")
+	emitProgress(options, "finalize", "Checking for changes made during setup and finishing safely")
 	if _, err := bridge.Finalize(ctx); err != nil {
 		return Result{}, rollback(err)
 	}
@@ -620,7 +620,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "committed", "", true); err != nil {
 		return Result{}, fmt.Errorf("setup cleanup completed but final journal commit needs attention: %w", err)
 	}
-	emitProgress(options, "completed", "Setup transaction completed")
+	emitProgress(options, "completed", "Setup completed")
 	return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Migrations: migrations, Changed: true}, nil
 }
 

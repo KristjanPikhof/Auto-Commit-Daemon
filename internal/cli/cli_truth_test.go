@@ -96,19 +96,19 @@ func TestControlTruthStateMatrix(t *testing.T) {
 		}, wantState: "retrying", wantHealth: controlHealthDegraded, wantText: "3 consecutive"},
 		{name: "durable block", mutate: func(s *statusReport) {
 			s.Replay = replayObservabilityReport{State: "needs_attention"}
-		}, wantState: "needs_attention", wantHealth: controlHealthNeedsAttention, wantText: "durable block"},
+		}, wantState: "needs_attention", wantHealth: controlHealthNeedsAttention, wantText: "safety block"},
 		{name: "circuit fallback", mutate: func(s *statusReport) {
 			s.IntentStrategy.PlannerHealth = healthOpen
 			s.PendingEvents = 1
-		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "evidence-based"},
+		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "safe local grouping"},
 		{name: "batch wait", mutate: func(s *statusReport) {
 			s.PendingEvents = 2
 			s.IntentStrategy = intentStrategyReport{Active: true, BatchWaitActive: true}
-		}, wantState: "waiting", wantHealth: controlHealthWaiting, wantText: "waiting normally"},
+		}, wantState: "waiting", wantHealth: controlHealthWaiting, wantText: "waiting to group"},
 		{name: "busy", mutate: func(s *statusReport) {
 			s.PendingEvents = 2
 			s.Busy = true
-		}, wantState: "busy", wantHealth: controlHealthHealthy, wantText: "draining"},
+		}, wantState: "busy", wantHealth: controlHealthHealthy, wantText: "publishing"},
 		{name: "healthy idle", mutate: func(*statusReport) {},
 			wantState: "healthy_idle", wantHealth: controlHealthHealthy, wantText: "normally"},
 	} {

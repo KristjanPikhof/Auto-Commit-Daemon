@@ -43,7 +43,7 @@ func renderRewritePlanEdit(plan state.RewritePlan, format string) ([]byte, error
 		}
 		return json.MarshalIndent(doc, "", "  ")
 	default:
-		return nil, fmt.Errorf("acd rewrite-commits: unsupported --format %q", format)
+		return nil, fmt.Errorf("acd history rewrite: unsupported --format %q", format)
 	}
 }
 
@@ -54,7 +54,7 @@ func parseRewritePlanEdit(data []byte, format string, base state.RewritePlan) ([
 	case rewriteEditFormatJSON:
 		return parseRewritePlanEditJSON(data, base)
 	default:
-		return nil, fmt.Errorf("acd rewrite-commits: unsupported --format %q", format)
+		return nil, fmt.Errorf("acd history rewrite: unsupported --format %q", format)
 	}
 }
 
@@ -70,17 +70,17 @@ func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.Rewr
 			continue
 		}
 		if !strings.HasPrefix(trimmed, "commit ") {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan: expected commit line, got %q", line)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan: expected commit line, got %q", line)
 		}
 		oid := strings.TrimSpace(strings.TrimPrefix(trimmed, "commit "))
 		if oid == "" {
-			return nil, errors.New("acd rewrite-commits: invalid text plan: empty commit oid")
+			return nil, errors.New("acd history rewrite: invalid text plan: empty commit oid")
 		}
 		if !s.Scan() {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan for %s: missing message marker", oid)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: missing message marker", oid)
 		}
 		if strings.TrimSpace(s.Text()) != "message <<ACD_COMMIT_MESSAGE" {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan for %s: expected message marker", oid)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: expected message marker", oid)
 		}
 		var msg []string
 		closed := false
@@ -93,23 +93,23 @@ func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.Rewr
 			msg = append(msg, line)
 		}
 		if !closed {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan for %s: missing end marker", oid)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: missing end marker", oid)
 		}
 		blocks = append(blocks, block{oid: oid, message: strings.TrimRight(strings.Join(msg, "\n"), "\n")})
 	}
 	if err := s.Err(); err != nil {
-		return nil, fmt.Errorf("acd rewrite-commits: read text plan: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: read text plan: %w", err)
 	}
 	if len(blocks) != len(base.Commits) {
-		return nil, fmt.Errorf("acd rewrite-commits: invalid text plan: got %d commit block(s), want %d", len(blocks), len(base.Commits))
+		return nil, fmt.Errorf("acd history rewrite: invalid text plan: got %d commit block(s), want %d", len(blocks), len(base.Commits))
 	}
 	out := make([]state.RewritePlanCommit, len(base.Commits))
 	for i, baseCommit := range base.Commits {
 		if blocks[i].oid != baseCommit.OldOID {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan: commit %d oid %q, want %q", i+1, blocks[i].oid, baseCommit.OldOID)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan: commit %d oid %q, want %q", i+1, blocks[i].oid, baseCommit.OldOID)
 		}
 		if strings.TrimSpace(blocks[i].message) == "" {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid text plan: commit %s has empty message", blocks[i].oid)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan: commit %s has empty message", blocks[i].oid)
 		}
 		if err := validateEditedRewriteMessage(base, baseCommit, blocks[i].message); err != nil {
 			return nil, err
@@ -135,28 +135,28 @@ func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.Rewr
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: %w", err)
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
-			return nil, errors.New("acd rewrite-commits: invalid JSON plan: trailing JSON value")
+			return nil, errors.New("acd history rewrite: invalid JSON plan: trailing JSON value")
 		}
-		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: trailing data: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: trailing data: %w", err)
 	}
 	if strings.TrimSpace(doc.PlanID) != "" && doc.PlanID != base.ID {
-		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: plan_id %q, want %q", doc.PlanID, base.ID)
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: plan_id %q, want %q", doc.PlanID, base.ID)
 	}
 	if len(doc.Commits) != len(base.Commits) {
-		return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: got %d commit(s), want %d", len(doc.Commits), len(base.Commits))
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: got %d commit(s), want %d", len(doc.Commits), len(base.Commits))
 	}
 	out := make([]state.RewritePlanCommit, len(base.Commits))
 	for i, baseCommit := range base.Commits {
 		got := doc.Commits[i]
 		if got.OldOID != baseCommit.OldOID {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: commit %d oid %q, want %q", i+1, got.OldOID, baseCommit.OldOID)
+			return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: commit %d oid %q, want %q", i+1, got.OldOID, baseCommit.OldOID)
 		}
 		if strings.TrimSpace(got.Message) == "" {
-			return nil, fmt.Errorf("acd rewrite-commits: invalid JSON plan: commit %s has empty message", got.OldOID)
+			return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: commit %s has empty message", got.OldOID)
 		}
 		if err := validateEditedRewriteMessage(base, baseCommit, got.Message); err != nil {
 			return nil, err
@@ -182,7 +182,7 @@ func validateEditedRewriteMessage(plan state.RewritePlan, commit state.RewritePl
 		CommitFormat:    ai.CommitFormatConventional,
 	}, result)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: invalid conventional message for %s: %w", commit.OldOID, err)
+		return fmt.Errorf("acd history rewrite: invalid conventional message for %s: %w", commit.OldOID, err)
 	}
 	return nil
 }
@@ -201,7 +201,7 @@ func rewritePlanMessagesEqual(a, b []state.RewritePlanCommit) bool {
 
 func promptRewriteYesNo(in io.Reader, out io.Writer, question string, defaultYes bool) (bool, error) {
 	if !isInteractiveInput(in) {
-		return false, errors.New("acd rewrite-commits: interactive prompt required; use --yes, --plan-only, --review/--no-review, or --apply-plan/--apply with --yes/--dry-run for noninteractive use")
+		return false, errors.New("acd history rewrite: interactive prompt required; use --yes, --plan-only, --review/--no-review, or --apply-plan/--apply with --yes/--dry-run for noninteractive use")
 	}
 	suffix := "[y/N]"
 	if defaultYes {
@@ -242,7 +242,7 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 	}
 	editor := strings.TrimSpace(os.Getenv("EDITOR"))
 	if editor == "" {
-		return nil, false, errors.New("acd rewrite-commits: EDITOR is not set")
+		return nil, false, errors.New("acd history rewrite: EDITOR is not set")
 	}
 	dir, err := os.MkdirTemp("", "acd-rewrite-plan-*")
 	if err != nil {
@@ -262,7 +262,7 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return nil, false, fmt.Errorf("acd rewrite-commits: editor failed: %w", err)
+		return nil, false, fmt.Errorf("acd history rewrite: editor failed: %w", err)
 	}
 	edited, err := os.ReadFile(path)
 	if err != nil {
@@ -280,7 +280,7 @@ func persistEditedRewritePlan(ctx context.Context, repo string, plan state.Rewri
 		return plan, nil
 	}
 	if strings.TrimSpace(plan.ID) == "" {
-		return state.RewritePlan{}, errors.New("acd rewrite-commits: cannot save edited plan revision without a saved plan id")
+		return state.RewritePlan{}, errors.New("acd history rewrite: cannot save edited plan revision without a saved plan id")
 	}
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
@@ -288,19 +288,19 @@ func persistEditedRewritePlan(ctx context.Context, repo string, plan state.Rewri
 	}
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: open state db: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: open state db: %w", err)
 	}
 	defer db.Close()
 	id, err := state.CreateEditedRewritePlanRevision(ctx, db, plan.ID, commits, state.RewritePlanValidationValid)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: save edited plan: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: save edited plan: %w", err)
 	}
 	updated, ok, err := state.LoadRewritePlan(ctx, db, id)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: load edited plan: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: load edited plan: %w", err)
 	}
 	if !ok {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: edited plan %q not found after save", id)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: edited plan %q not found after save", id)
 	}
 	return updated, nil
 }

@@ -80,14 +80,15 @@ type controlRepoLookup struct {
 func newOnCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "on",
-		Short: "Enable checkpoint protection for this repository",
-		Long: `Enable checkpoint protection for the current repository.
+		Short: "Start protecting this repository",
+		Long: `Start ACD protection for this repository.
 
-The command is idempotent and asks the user supervisor to reconcile the
-repository's worker. It applies safe exact-chain recovery automatically after
-the initial checkpoint. Archive-only recovery still requires explicit consent.
-Run acd setup first when the checkpoint-first cutover has not been completed.
-Existing checkpoint history is preserved.`,
+ACD replaces any managed background worker for this repository, waits for the
+new worker to be ready, and confirms that current changes have a durable
+checkpoint. Running the command again is safe. Existing checkpoints are kept.
+
+If ACD has not been installed or upgraded for checkpoint protection, run
+acd setup first. Recovery that needs your approval is never applied silently.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -104,12 +105,16 @@ func newOffCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "off",
-		Short: "Take a final checkpoint and disable protection",
-		Long: `Complete a final durable checkpoint barrier, then disable protection.
+		Short: "Save a final checkpoint and stop protection",
+		Long: `Save a final durable checkpoint, then stop ACD protection for this
+repository.
 
-The command is idempotent and preserves checkpoint history and repository
-state. If the final checkpoint cannot be confirmed, ACD remains enabled and
-returns needs_action unless --force is supplied.`,
+Existing checkpoints and ACD state are kept, so you can turn protection on
+again later. Running the command again is safe.
+
+If ACD cannot confirm the final checkpoint, protection stays on and the output
+explains what to do next. Use --force only when you accept stopping without a
+confirmed current checkpoint.`,
 		Example: `  acd off
   acd off --repo /path/to/repo
   acd off --json`,
@@ -120,7 +125,7 @@ returns needs_action unless --force is supplied.`,
 			return runControlOffWithForce(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut, force)
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "Disable even when the final checkpoint cannot be confirmed")
+	cmd.Flags().BoolVar(&force, "force", false, "Stop even if ACD cannot confirm the final checkpoint")
 	return cmd
 }
 
@@ -373,7 +378,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 	if lookup.Record.RepositoryID == "" || lookup.Record.WorktreeID == "" {
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
-		base.Summary = "This repository has not completed the checkpoint-first cutover."
+		base.Summary = "This repository needs the current ACD protection format."
 		base.NextAction = "Run `acd setup` to upgrade and enable protection."
 		return base, nil
 	}
@@ -381,7 +386,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		applyDisabledControlTruth(ctx, &base, lookup)
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
-		base.Summary = "ACD is durably disabled for this repository."
+		base.Summary = "ACD protection is turned off for this repository."
 		base.NextAction = "Run `acd on` to enable it."
 		return base, nil
 	}
@@ -390,7 +395,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		base.OK = false
 		base.Health = controlHealthNeedsAttention
 		base.Daemon = "stopped"
-		base.Summary = "The registered ACD state database is missing."
+		base.Summary = "ACD cannot find this repository's protection database."
 		base.NextAction = "Run `acd on` to recreate state and start ACD."
 		return base, nil
 	}
@@ -548,12 +553,12 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	switch {
 	case status.CheckpointRetentionOverBudget:
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Protected checkpoint content exceeds the configured soft budget; no protected data was dropped."
-		res.NextAction = "Run `acd repo gc` to review retention and storage usage."
+		res.Summary = "Protected checkpoints use more storage than the configured limit. No protected data was deleted."
+		res.NextAction = "Run `acd repo gc` to review storage use and safe cleanup."
 	case status.IntentV2.SchemaVersion > 0 && !status.CheckpointProtectionAvailable:
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "This repository still uses the v19 protection ledger."
-		res.NextAction = "Run `acd setup` to perform the checkpoint-first cutover."
+		res.Summary = "This repository uses an older ACD protection format."
+		res.NextAction = "Run `acd setup` to upgrade it safely."
 	case status.Stale:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -572,43 +577,43 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	case status.BackpressurePaused:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD protection is paused because durable storage is full."
+		res.Summary = "ACD protection is paused because its protected storage is full."
 		res.NextAction = "Run `acd doctor` before clearing backpressure."
 	case status.Configuration.Configuration == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Configuration validation needs attention; capture remains active."
+		res.Summary = "The saved configuration did not pass validation. ACD is still protecting changes."
 		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
 	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "The durable publication drain reached a genuine safety block."
-		res.NextAction = "Run `acd doctor` to inspect the blocked drain."
+		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
+		res.NextAction = "Run `acd doctor` to see what blocked publication."
 	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is draining the protected target through local atomic dependency groups."
-		res.NextAction = "No action needed; the local fallback continues automatically."
+		res.Summary = "ACD is publishing the protected changes in safe local groups."
+		res.NextAction = "No action needed. ACD will continue automatically."
 	case status.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
 		status.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is self-healing the durable publication plan."
-		res.NextAction = "No action needed; publication recovery continues automatically."
+		res.Summary = "ACD is rebuilding the publication plan after a recoverable problem."
+		res.NextAction = "No action needed. Recovery continues automatically."
 	case status.PublicationDrain.Phase == state.PublicationDrainSemantic:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is building and publishing the frozen semantic target."
-		res.NextAction = "No action needed; provider waits do not cancel the drain."
+		res.Summary = "ACD is grouping and publishing the changes selected by commit-all."
+		res.NextAction = "No action needed. A provider delay will not cancel this work."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "A durable block has stopped Git publication; this blocked publication needs recovery while checkpoint protection remains active."
-		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
+		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
+		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A blocked publication needs recovery on the active branch."
-		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
+		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.CheckpointProtectionAvailable && !status.Protected && status.Busy:
 		res.Health = controlHealthWaiting
 		res.Summary = "ACD is scanning recent changes and completing their protection checkpoint."
@@ -624,9 +629,9 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "No action needed."
 	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
 		res.Health = controlHealthWaiting
-		res.Summary = "ACD rewind safety grace is active."
+		res.Summary = "ACD is briefly paused because Git history changed."
 		if status.Pause.RemainingSeconds > 0 {
-			res.Summary = fmt.Sprintf("ACD rewind safety grace is active (%s remaining).",
+			res.Summary = fmt.Sprintf("ACD is briefly paused because Git history changed (%s remaining).",
 				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
 		}
 		res.NextAction = "No action needed; capture and replay resume automatically."
@@ -637,13 +642,13 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	case status.PendingEvents == 0 && status.IntentStrategy.LastPlannerWindow != nil &&
 		status.IntentStrategy.LastPlannerWindow.ResolutionMode == "evidence_partition":
 		res.Health = controlHealthHealthy
-		res.Summary = "Intent plan completed using evidence-based grouping."
-		res.NextAction = "No action needed; a provider connection in cooldown will retry with the next batch."
+		res.Summary = "ACD safely grouped and published the last batch without the AI provider."
+		res.NextAction = "No action needed. ACD will retry the provider with the next batch."
 	case status.IntentStrategy.PlannerHealth != nil &&
 		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
 		res.Health = controlHealthDegraded
-		res.Summary = "Planner connection unavailable; evidence-based grouping is keeping replay moving."
+		res.Summary = "The AI provider is unavailable, so ACD is using safe local grouping."
 		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
 			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
 		} else {
@@ -651,11 +656,11 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		}
 	case status.IntentStrategy.PlannerHealthWarning != "":
 		res.Health = controlHealthDegraded
-		res.Summary = "ACD is running, but persisted intent planner health metadata could not be read safely."
+		res.Summary = "ACD is running, but it could not read saved AI provider health information."
 		res.NextAction = "Run `acd doctor` for the safe metadata warning."
 	case status.Replay.State == "degraded":
 		res.Health = controlHealthDegraded
-		res.Summary = fmt.Sprintf("Replay is retrying after %d consecutive error(s); checkpoint protection remains active.", status.Replay.ErrorRepeatCount)
+		res.Summary = fmt.Sprintf("Git publication is retrying after %d consecutive error(s). Checkpoint protection remains active.", status.Replay.ErrorRepeatCount)
 		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the retrying state persists."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
@@ -663,11 +668,11 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the degraded state persists."
 	case status.PendingEvents > 0 && status.IntentStrategy.Active && status.IntentStrategy.BatchWaitActive:
 		res.Health = controlHealthWaiting
-		res.Summary = fmt.Sprintf("Intent mode is waiting normally with %d pending event(s).", status.PendingEvents)
-		res.NextAction = "No action needed; ACD will publish at the configured batch boundary."
+		res.Summary = fmt.Sprintf("ACD is waiting to group %d protected change(s) into a useful commit.", status.PendingEvents)
+		res.NextAction = "No action needed. ACD will publish when the batch is ready."
 	case status.PendingEvents > 0:
 		res.Health = controlHealthHealthy
-		res.Summary = fmt.Sprintf("ACD is running and draining %d pending event(s).", status.PendingEvents)
+		res.Summary = fmt.Sprintf("ACD is publishing %d protected change(s).", status.PendingEvents)
 		res.NextAction = "No action needed."
 	default:
 		res.Health = controlHealthHealthy

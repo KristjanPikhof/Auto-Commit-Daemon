@@ -457,12 +457,12 @@ func loadIntentV2Report(ctx context.Context, conn *sql.DB) (intentV2Report, erro
 	}
 	if value, ok, _ := metaLookup(ctx, conn,
 		"intent.v2.cutover_required"); ok && parseIntentV2MetaBool(value) {
-		report.NeedsAttention = "Intent v2 cutover is required; run acd configure"
+		report.NeedsAttention = "Intent v2 cutover is required; run acd config edit"
 		report.ReplayState = "needs_attention"
 	}
 	if strings.HasPrefix(strings.ToLower(report.MigrationState),
 		"needs_attention") && report.NeedsAttention == "" {
-		report.NeedsAttention = "Intent v2 migration needs attention; run acd configure"
+		report.NeedsAttention = "Intent v2 migration needs attention; run acd config edit"
 	}
 	if report.NeedsAttention != "" {
 		report.ReplayState = "needs_attention"

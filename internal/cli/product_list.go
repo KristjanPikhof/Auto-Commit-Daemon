@@ -38,11 +38,13 @@ func newProductListCmd() *cobra.Command {
 	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "Show protection and Git publication across repositories",
-		Long: `Show enabled repositories with their checkpoint protection and local Git
-publication state. On a terminal the dashboard refreshes until interrupted;
-pipes and --once print one snapshot. Registry cleanup details remain available
-through the advanced acd repo list command.`,
+		Short: "Show protection across all enabled repositories",
+		Long: `Show whether each enabled repository is protected, published to local
+Git, or needs action.
+
+In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
+--once for one snapshot. Use acd repo list to include disabled or missing
+registrations.`,
 		Example: `  acd list
   acd list --once
   acd list --watch --interval 5s

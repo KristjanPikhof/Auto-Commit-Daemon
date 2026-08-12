@@ -186,8 +186,12 @@ verbose views, and q to exit.`,
 func newRepoListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List every repo registry row for management",
-		Long:  `List every repo in the central registry, including stopped, missing, and state-db-missing rows that daemon-focused acd list may hide.`,
+		Short: "List every registered repository",
+		Long: `List all repository registrations, including repositories that are
+disabled, missing, stopped, or missing their ACD database.
+
+Use acd list for the simpler dashboard of enabled repositories. This command
+is intended for registration cleanup and troubleshooting.`,
 		Example: `  acd repo list
   acd repo list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -320,10 +324,13 @@ func newRepoRemoveCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "remove",
-		Short: "Preview or remove the current repo registration",
-		Long: `Preview or remove the current repo from the central registry.
+		Short: "Preview or remove a repository registration",
+		Long: `Preview or remove one repository from ACD's registry.
 
-Without --yes, bare acd repo remove starts an interactive registry manager. Use --dry-run or --json for a non-mutating preview. Pass --yes to remove the target repo registration and clear start caches. State is preserved unless --purge-state is also confirmed interactively or supplied with --yes.`,
+Use --dry-run for a read-only preview. Add --yes to remove the registration and
+its start cache. Protected checkpoints and the repository database are kept
+unless you also pass --purge-state. Without flags, the command opens the
+interactive repository manager.`,
 		Example: `  acd repo remove
   acd repo remove --repo /path/to/repo
   acd repo remove --dry-run
@@ -336,9 +343,9 @@ Without --yes, bare acd repo remove starts an interactive registry manager. Use 
 			return runRepoRemoveWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), repoFlag, dryRun, yes, purgeState, jsonOut)
 		},
 	}
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview removal without mutating registry or state")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview removal without changing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the removal")
-	cmd.Flags().BoolVar(&purgeState, "purge-state", false, "Delete .git/acd state after removing the registry row; requires --yes or interactive confirmation")
+	cmd.Flags().BoolVar(&purgeState, "purge-state", false, "Permanently delete checkpoints and the ACD database; requires confirmation")
 	return cmd
 }
 
@@ -419,7 +426,7 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 		}{Repos: entries})
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPO\tDAEMON\tCLIENTS\tPENDING\tBLOCKED\tSTATUS")
+	fmt.Fprintln(tw, "REPOSITORY\tWORKER\tTOOLS\tWAITING\tBLOCKED\tSTATUS")
 	for _, entry := range entries {
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%s\n",
 			homeShort(entry.Path),
@@ -431,6 +438,10 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("acd repo list: flush: %w", err)
+	}
+	if len(entries) == 0 {
+		fmt.Fprintln(out, "No repositories are registered.")
+		fmt.Fprintln(out, "Next: Run `acd on` inside a Git repository to protect it.")
 	}
 	return nil
 }
@@ -1034,28 +1045,33 @@ func renderRepoRemove(out io.Writer, res repoRemoveResult, jsonOut bool) error {
 		return enc.Encode(res)
 	}
 	if res.DryRun {
-		action := "would remove"
+		action := "Would remove this registration"
 		if res.NotFound {
-			action = "not registered"
+			action = "This repository is not registered"
 		}
-		fmt.Fprintf(out, "acd repo remove: dry-run: %s %s\n", action, res.Target.Path)
+		fmt.Fprintf(out, "Repository: %s\n", res.Target.Path)
+		fmt.Fprintf(out, "Preview: %s.\n", action)
 		if res.RemovedRecord != nil {
-			fmt.Fprintf(out, "state: %s (preserved by default)\n", res.RemovedRecord.StateDB)
+			fmt.Fprintf(out, "Protected data: kept at %s\n", res.RemovedRecord.StateDB)
 		}
 		if res.PurgeState {
-			fmt.Fprintln(out, "state: would purge with --yes --purge-state")
+			fmt.Fprintln(out, "Protected data: would be permanently deleted with --yes --purge-state")
 		}
+		fmt.Fprintln(out, "Changed: no")
+		fmt.Fprintln(out, "Next: Add `--yes` to apply this preview.")
 		return nil
 	}
 	if res.NotFound {
-		fmt.Fprintf(out, "acd repo remove: not registered %s\n", res.Target.Path)
+		fmt.Fprintf(out, "Status: %s is not registered.\n", res.Target.Path)
+		fmt.Fprintln(out, "Next: No action needed.")
 		return nil
 	}
-	fmt.Fprintf(out, "acd repo remove: removed %s\n", res.Target.Path)
+	fmt.Fprintf(out, "Removed registration: %s\n", res.Target.Path)
 	if res.StatePurged {
-		fmt.Fprintf(out, "state: purged %s\n", res.Safety.StateDir)
+		fmt.Fprintf(out, "Protected data: permanently deleted from %s\n", res.Safety.StateDir)
 	} else {
-		fmt.Fprintf(out, "state: preserved %s\n", res.Safety.StateDB)
+		fmt.Fprintf(out, "Protected data: kept at %s\n", res.Safety.StateDB)
 	}
+	fmt.Fprintln(out, "Next: No action needed.")
 	return nil
 }

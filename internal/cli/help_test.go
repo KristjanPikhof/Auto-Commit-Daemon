@@ -13,15 +13,15 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		want    []string
 	}{
 		{"setup", []string{"acd setup --dry-run", "--non-interactive", "--integrations"}},
-		{"status", []string{"protected and published", "--repo"}},
-		{"on", []string{"Enable checkpoint protection", "--repo"}},
+		{"status", []string{"current changes are protected", "exact next command", "--repo"}},
+		{"on", []string{"Start ACD protection", "background worker", "--repo"}},
 		{"off", []string{"final durable checkpoint", "--force"}},
-		{"list", []string{"checkpoint protection and local Git", "--watch", "--once"}},
-		{"commit-all", []string{"managed", "--dry-run", "--yes"}},
-		{"history", []string{"protected checkpoints", "--activity", "activity", "rewrite"}},
+		{"list", []string{"each enabled repository", "Ctrl-C", "--watch", "--once"}},
+		{"commit-all", []string{"does not squash", "--dry-run", "--yes"}},
+		{"history", []string{"recent protected checkpoints", "--activity", "activity", "rewrite"}},
 		{"restore", []string{"restore ID", "--yes"}},
-		{"doctor", []string{"protection problems", "--bundle", "--output"}},
-		{"uninstall", []string{"preserving protected repository data", "--dry-run", "--purge-data"}},
+		{"doctor", []string{"safe next step", "--bundle", "--output"}},
+		{"uninstall", []string{"kept by default", "--dry-run", "--purge-data"}},
 		{"config", []string{"get", "set", "credentials"}},
 		{"support", []string{"diagnose", "logs", "repair", "recover", "prompt", "bundle"}},
 		{"repo", []string{"list", "remove", "gc", "stats"}},
@@ -42,6 +42,63 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 				if !strings.Contains(help, want) {
 					t.Fatalf("%s help missing %q:\n%s", tt.command, want, help)
 				}
+			}
+		})
+	}
+}
+
+func TestRootHelpLinksPublicationAndRewriteWorkflows(t *testing.T) {
+	help := commandHelp(t, "")
+	for _, want := range []string{
+		"acd commit-all --dry-run",
+		"acd history rewrite --help",
+		"acd config edit",
+		"acd repo --help",
+		"acd support --help",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("root help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestRewriteAllExplainsTheSafeReplacement(t *testing.T) {
+	help := commandHelp(t, "rewrite-all")
+	for _, want := range []string{"does not rewrite all", "acd history rewrite", "--plan-only", "--dry-run", "--yes"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("rewrite-all help missing %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestCanonicalHelpIsCompleteAndPlain(t *testing.T) {
+	commands := []string{
+		"setup", "status", "on", "off", "list", "commit-all", "history",
+		"history activity", "history explain", "history rewrite", "restore", "doctor", "uninstall",
+		"config", "config get", "config set", "config edit", "config reset", "config credentials",
+		"config credentials set", "config credentials status", "config credentials remove",
+		"support", "support diagnose", "support logs", "support repair", "support recover",
+		"support prompt", "support bundle", "repo", "repo list", "repo remove", "repo gc", "repo stats",
+	}
+	for _, path := range commands {
+		t.Run(path, func(t *testing.T) {
+			root := newRootCmd()
+			command, _, err := root.Find(strings.Fields(path))
+			if err != nil {
+				t.Fatalf("find command: %v", err)
+			}
+			if strings.TrimSpace(command.Long) == "" {
+				t.Error("missing plain-language explanation")
+			}
+			if strings.TrimSpace(command.Example) == "" {
+				t.Error("missing example")
+			}
+			help := commandHelp(t, path)
+			if strings.ContainsAny(help, "—–") {
+				t.Errorf("help contains an em or en dash:\n%s", help)
+			}
+			if strings.Contains(help, "acd configure") || strings.Contains(help, "acd rewrite-commits") {
+				t.Errorf("help recommends a hidden compatibility command:\n%s", help)
 			}
 		})
 	}

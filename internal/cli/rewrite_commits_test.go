@@ -26,35 +26,20 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 		"Aliases:",
 		"edit-commits",
 		"edit-commit",
-		"ACD_COMMIT_STRATEGY",
-		"ACD_AI_PROVIDER",
 		"--from-sha 8f4c2a1",
-		"--from-nr 5",
-		"--range-nr 5-12",
 		"--range-sha",
-		"--last 4",
-		"--from 5",
-		"--git-range",
-		"--base",
-		"--head",
+		"--last 5",
 		"--plan-out",
 		"--show-plan",
 		"--edit",
 		"$EDITOR",
-		"new plan id is printed",
-		"standalone JSON plan file",
-		"--apply-plan",
+		"standalone plan file",
 		"--apply",
-		"--review",
-		"--no-review",
 		"--plan-only",
-		"--format",
 		"--progress",
-		"Progress goes to stderr",
-		"backup recovery",
-		"current branch linear ranges only",
-		"merge commit rewrites are refused",
-		"no daemon automation",
+		"private backup ref",
+		"Merge commits are",
+		"Normal ACD protection never runs this command",
 	} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("rewrite-commits help missing %q:\n%s", want, help)
@@ -67,13 +52,13 @@ func TestRewriteCommitsAliasHelpIncludesEditContract(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			help := commandHelp(t, command)
 			for _, want := range []string{
-				"--edit <plan-id-or-file>",
+				"--edit",
 				"$EDITOR",
-				"saved plan id",
-				"standalone JSON plan file",
+				"saved plan ID",
+				"standalone plan file",
 				"--plan-only",
 				"--dry-run",
-				"no new plan is generated",
+				"does not create a new AI request",
 			} {
 				if !strings.Contains(help, want) {
 					t.Fatalf("%s help missing %q:\n%s", command, want, help)
@@ -224,8 +209,8 @@ func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
 	got := out.String()
 	assertRewritePlanNextFooter(t, got)
 	for _, prefix := range []string{
-		"  acd rewrite-commits --show-plan ",
-		"  acd rewrite-commits --apply-plan ",
+		"  acd history rewrite --show-plan ",
+		"  acd history rewrite --apply-plan ",
 	} {
 		var found bool
 		for _, line := range strings.Split(got, "\n") {
@@ -613,7 +598,7 @@ func TestRewriteCommitsApplyPlanRequiresConfirmationButBypassesProviderGate(t *t
 	if err != nil {
 		t.Fatalf("apply-plan dry-run returned error: %v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "no second AI call") {
+	if got := out.String(); !strings.Contains(got, "No new AI request was made") {
 		t.Fatalf("apply-plan output missing no-AI-call note: %q", got)
 	}
 }
@@ -645,7 +630,7 @@ func TestRewriteCommitsApplyProgressJSON(t *testing.T) {
 	if got := progressEventPhases(events); strings.Join(got, ",") != "apply_validate,apply_validate" {
 		t.Fatalf("apply phases=%v want validation only; events=%+v", got, events)
 	}
-	if !strings.Contains(stdout.String(), "Dry run: plan can apply") {
+	if !strings.Contains(stdout.String(), "Status: This plan can be applied") {
 		t.Fatalf("stdout missing dry-run result:\n%s", stdout.String())
 	}
 }
@@ -793,8 +778,8 @@ func TestRewriteCommitsApplyRefusesPendingCaptureQueue(t *testing.T) {
 
 	var out bytes.Buffer
 	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{applyPlan: planPath, yes: true}, false)
-	if err == nil || !strings.Contains(err.Error(), "pending event") || !strings.Contains(err.Error(), strconv.FormatInt(seq, 10)) {
-		t.Fatalf("apply with pending queue err = %v, want pending refusal with seq %d", err, seq)
+	if err == nil || !strings.Contains(err.Error(), "protected change") || !strings.Contains(err.Error(), "acd commit-all") {
+		t.Fatalf("apply with pending queue err = %v, want clear next step for seq %d", err, seq)
 	}
 }
 
@@ -838,8 +823,8 @@ func TestRewriteCommitsApplyRefusesPendingCaptureQueueHiddenBehindBarrier(t *tes
 
 	var out bytes.Buffer
 	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{applyPlan: planPath, yes: true}, false)
-	if err == nil || !strings.Contains(err.Error(), "pending event") || !strings.Contains(err.Error(), strconv.FormatInt(seq, 10)) {
-		t.Fatalf("apply with barrier-hidden pending queue err = %v, want pending refusal with seq %d", err, seq)
+	if err == nil || !strings.Contains(err.Error(), "protected change") || !strings.Contains(err.Error(), "acd commit-all") {
+		t.Fatalf("apply with barrier-hidden pending queue err = %v, want clear next step for seq %d", err, seq)
 	}
 }
 
@@ -975,7 +960,7 @@ func TestRewriteCommitsProgressModesKeepJSONStdoutClean(t *testing.T) {
 		if err != nil {
 			t.Fatalf("runRewriteCommits: %v", err)
 		}
-		if !strings.Contains(stderr.String(), "rewrite-commits: selection [1/1]: selected 1 commit") {
+		if !strings.Contains(stderr.String(), "History rewrite: Selected commits [1/1]: selected 1 commit") {
 			t.Fatalf("stderr missing plain progress:\n%s", stderr.String())
 		}
 		if err := json.Unmarshal(stdout.Bytes(), &rewriteSelectionReport{}); err != nil {
@@ -1025,11 +1010,11 @@ func TestRewriteProgressPlainIncludesBoundedCounts(t *testing.T) {
 	}
 
 	want := strings.Join([]string{
-		"rewrite-commits: proposal [42/169]: requesting proposal",
-		"rewrite-commits: proposal [42/169]: proposal accepted",
-		"rewrite-commits: apply_recreate_selected [42/169]: recreated selected commit",
-		"rewrite-commits: apply_recreate_unchanged [2/3]: recreated unchanged descendant",
-		"rewrite-commits: validation: status valid",
+		"History rewrite: Commit messages [42/169]: generating a message",
+		"History rewrite: Commit messages [42/169]: message ready",
+		"History rewrite: Applying messages [42/169]: applied the new message",
+		"History rewrite: Keeping later commits [2/3]: kept a later commit unchanged",
+		"History rewrite: Plan check: plan is valid",
 		"",
 	}, "\n")
 	if got := out.String(); got != want {

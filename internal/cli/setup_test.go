@@ -1327,7 +1327,7 @@ func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected auto-detected setup to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
-	if !strings.Contains(out, "merge_integration: claude-code") {
+	if !strings.Contains(out, "Target: claude-code") {
 		t.Errorf("transactional plan did not include detected claude-code integration:\n%s", out)
 	}
 }
@@ -1356,7 +1356,7 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected repo-local codex auto-detect to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
-	if strings.Contains(out, "merge_integration: codex") {
+	if strings.Contains(out, "Target: codex") {
 		t.Errorf("transactional setup must not treat repo-local hooks as a user-level owned integration:\n%s", out)
 	}
 }
@@ -1384,7 +1384,7 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 		t.Fatalf("transactional setup should merge all detected integrations: %v\nstderr:\n%s", err, stderr)
 	}
 	for _, want := range []string{"claude-code", "codex"} {
-		if !strings.Contains(out, "merge_integration: "+want) {
+		if !strings.Contains(out, "Target: "+want) {
 			t.Errorf("multi-detect plan missing %q: %q", want, out)
 		}
 	}
@@ -1441,7 +1441,7 @@ func TestSetup_HelpHidesInitAlias(t *testing.T) {
 	got := outBuf.String()
 
 	// The Setup section must mention "acd setup".
-	if !strings.Contains(got, "setup       Install or upgrade ACD transactionally") {
+	if !strings.Contains(got, "setup       Safely install or upgrade ACD") {
 		t.Errorf("root help missing 'acd setup' in Setup section:\n%s", got)
 	}
 
@@ -1503,7 +1503,7 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	for _, required := range []string{"macOS", "does not require Full Disk", "deterministic provider"} {
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "works without", "API key"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

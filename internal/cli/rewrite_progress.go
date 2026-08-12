@@ -55,7 +55,7 @@ func newRewriteProgressSink(mode string, quiet bool, out io.Writer) (rewriteProg
 		progressMode = rewriteProgressModeAuto
 	}
 	if !validRewriteProgressMode(string(progressMode)) {
-		return rewriteProgressSink{}, fmt.Errorf("acd rewrite-commits: --progress must be auto, plain, json, or off")
+		return rewriteProgressSink{}, fmt.Errorf("acd history rewrite: --progress must be auto, plain, json, or off")
 	}
 	if out == nil {
 		out = io.Discard
@@ -89,24 +89,84 @@ func (s rewriteProgressSink) Emit(event rewriteProgressEvent) error {
 		enc := json.NewEncoder(s.out)
 		return enc.Encode(event)
 	case rewriteProgressModePlain:
+		phase := rewriteProgressPhaseLabel(event.Phase)
+		message := rewriteProgressMessage(event.Message)
 		position := ""
 		if event.Current > 0 && event.Total > 0 {
 			position = fmt.Sprintf(" [%d/%d]", event.Current, event.Total)
 		}
-		if event.Phase == "" && event.Message == "" {
+		if phase == "" && message == "" {
 			return nil
 		}
-		if event.Message == "" {
-			_, err := fmt.Fprintf(s.out, "rewrite-commits: %s%s\n", event.Phase, position)
+		if message == "" {
+			_, err := fmt.Fprintf(s.out, "History rewrite: %s%s\n", phase, position)
 			return err
 		}
-		if event.Phase == "" {
-			_, err := fmt.Fprintf(s.out, "rewrite-commits:%s %s\n", position, event.Message)
+		if phase == "" {
+			_, err := fmt.Fprintf(s.out, "History rewrite:%s %s\n", position, message)
 			return err
 		}
-		_, err := fmt.Fprintf(s.out, "rewrite-commits: %s%s: %s\n", event.Phase, position, event.Message)
+		_, err := fmt.Fprintf(s.out, "History rewrite: %s%s: %s\n", phase, position, message)
 		return err
 	default:
 		return nil
+	}
+}
+
+func rewriteProgressPhaseLabel(phase string) string {
+	switch phase {
+	case "selection":
+		return "Selected commits"
+	case "provider":
+		return "AI provider"
+	case "proposal":
+		return "Commit messages"
+	case "save":
+		return "Saved plan"
+	case "validation", "apply_validate":
+		return "Plan check"
+	case "next":
+		return "Next"
+	case "apply_backup":
+		return "Recovery backup"
+	case "apply_recreate_selected":
+		return "Applying messages"
+	case "apply_recreate_unchanged":
+		return "Keeping later commits"
+	case "apply_update_ref":
+		return "Finishing"
+	case "apply_reconcile":
+		return "ACD records"
+	default:
+		return phase
+	}
+}
+
+func rewriteProgressMessage(message string) string {
+	switch message {
+	case "requesting proposal":
+		return "generating a message"
+	case "proposal accepted":
+		return "message ready"
+	case "proposal failed":
+		return "could not generate a message"
+	case "checking repository":
+		return "checking the repository"
+	case "validated plan":
+		return "plan is safe to apply"
+	case "created backup refs":
+		return "created a recovery backup"
+	case "recreated selected commit":
+		return "applied the new message"
+	case "recreated unchanged descendant":
+		return "kept a later commit unchanged"
+	case "updating branch ref":
+		return "updating the branch"
+	case "reconciled state OIDs":
+		return "updated ACD records"
+	case "status valid":
+		return "plan is valid"
+	default:
+		return message
 	}
 }

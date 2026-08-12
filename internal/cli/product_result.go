@@ -140,28 +140,43 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	if !ok {
 		return fmt.Errorf("acd: unsupported human result %T", envelope.Data)
 	}
-	fmt.Fprintf(out, "Enabled: %s\n", yesNo(data.Enabled))
-	fmt.Fprintf(out, "Protected: %s\n", yesNo(data.Protected))
+	fmt.Fprintf(out, "State: %s\n", envelope.State)
+	fmt.Fprintf(out, "ACD protection: %s\n", onOff(data.Enabled))
+	fmt.Fprintf(out, "Current changes protected: %s\n", yesNo(data.Protected))
 	fmt.Fprintf(out, "Published to Git: %s\n", yesNo(data.Published))
-	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(data.WorktreeClean))
-	fmt.Fprintf(out, "All changes committed in Git: %s\n", yesNo(data.AllChangesCommittedInGit))
-	fmt.Fprintf(out, "Latest protection checkpoint published by ACD: %s\n", yesNo(data.CheckpointPublishedByACD))
 	if data.PublicationDrain.ID != "" {
-		fmt.Fprintf(out, "Publication drain: %s phase=%s remaining=%d/%d\n",
-			data.PublicationDrain.ID, data.PublicationDrain.Phase,
+		fmt.Fprintf(out, "Commit-all progress: %d of %d protected change(s) left, %s\n",
 			data.PublicationDrain.RemainingEvents,
-			data.PublicationDrain.TargetEvents)
+			data.PublicationDrain.TargetEvents,
+			publicationPhaseLabel(data.PublicationDrain.Phase))
 	}
-	fmt.Fprintf(out, "Action required: %s\n", yesNo(data.ActionRequired))
+	fmt.Fprintf(out, "Action needed: %s\n", yesNo(data.ActionRequired))
+	if data.Summary != "" {
+		fmt.Fprintf(out, "Status: %s\n", data.Summary)
+	}
 	if envelope.NextAction == nil {
 		fmt.Fprintln(out, "Next: No action needed.")
 	} else {
 		fmt.Fprintf(out, "Next: %s\n", *envelope.NextAction)
 	}
-	if data.Summary != "" {
-		fmt.Fprintf(out, "Status: %s\n", data.Summary)
-	}
 	return nil
+}
+
+func publicationPhaseLabel(phase string) string {
+	switch phase {
+	case "checkpointing":
+		return "saving the checkpoint"
+	case "normalizing":
+		return "preparing a safe publication plan"
+	case "semantic":
+		return "grouping and publishing commits"
+	case "event_fallback":
+		return "publishing safe commit groups"
+	case "needs_action":
+		return "blocked and waiting for action"
+	default:
+		return "working"
+	}
 }
 
 func renderJSONEnvelope(out io.Writer, envelope productEnvelope) error {
@@ -181,4 +196,11 @@ func yesNo(value bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func onOff(value bool) string {
+	if value {
+		return "on"
+	}
+	return "off"
 }
